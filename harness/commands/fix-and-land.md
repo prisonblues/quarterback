@@ -225,11 +225,23 @@ turns the merge off.
    release_claim(claim_id="<$claim_id>")
    ```
 
+   ```bash
+   qb-release issue <n>          # the issue this PR closes — see the note below
+   ```
+
    - **`verdict="ready"` is the one assertion that lets a queue head merge**, and it is pinned to
      this commit: the board clears it the moment the head moves, which is the thing an agent's own
      memory of "preland said READY" structurally cannot do. Say it here rather than at 4a, because
      at 4a it was not true yet — and everyone behind you reads it to know the line is about to
      move rather than merely occupied.
+   - **`release_claim` gives back the MERGE claim; `qb-release` gives back the WORK claim** (#337).
+     They are two claims on two resources: `kind=merge` on the base, taken above and held across
+     the merge, and the `kind=work` claim on the issue that `create-worktree` took at checkout —
+     machine-held, no session, 8h TTL, and untouched by anything on the landing path. On
+     2026-08-22 four issues were still claimed hours after their PRs had merged. Forgetting it
+     breaks nothing (the worktree teardown releases it too, and the TTL is under both) but it
+     holds a slot: under `in_flight.max` the count is highest immediately after the fleet has been
+     most productive. Exit 0 also means "nothing to release", so it is safe to run twice.
    - **Being at the head of the queue is not the claim.** The queue orders; `kind=merge` is the
      one slot held across the merge itself, and the board's own answer says as much: *"take
      `kind=merge` on this base before you merge"*. Two agents at the head of two different bases,

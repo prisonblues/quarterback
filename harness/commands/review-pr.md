@@ -714,3 +714,9 @@ issue in `deferred_to`.
 
 `gh pr merge --merge --delete-branch` — preserve individual commits; never
 squash; delete the remote branch after.
+
+Then hand back the claim on the issue the PR closes: `qb-release issue <n>` (#337).
+`create-worktree` took a `kind=work` claim on it at checkout — held by the machine,
+no session, 8h TTL — and merging a PR does not touch it; on 2026-08-22 four issues
+were still claimed hours after their PRs had merged. Exit 0 also means "already
+handed back", so it is safe to run twice, and the worktree teardown does it again.

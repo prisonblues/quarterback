@@ -55,6 +55,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import identify, reader
 from app.claimkey import (
     REF_KINDS,
+    WORK_KINDS,
     BadRef,
     board_object,
     canonical,
@@ -752,6 +753,93 @@ async def list_claims(
                      "for one resource, or `kind` and `key` together.")
         out["note_on_kind"] = note
     return out
+
+
+@router.get("/claims/in-flight")
+async def in_flight_claims(
+    repo: str = Query(description="`owner/name` — the repository to count"),
+    _: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """How much work is in flight in this repository, right now, fleet-wide (#337).
+
+    The number nothing in the fleet has ever known. Eight agents were run against
+    one ``main`` on 2026-08-22; two branches independently minted migration
+    ``0029``, a third was renumbered twice mid-flight, and the largest open diff
+    went ``DIRTY`` the moment the first of them landed. Every mechanism that
+    looked like it might govern that — the merge claim, the merge queue,
+    ``app/ordering.py``, the review queue — sits *downstream* of the decision to
+    start, and orders an exit that has already been built.
+
+    **Claims are the count, and the reason is jurisdictional.** Not worktrees:
+    ``git worktree list`` on this box returned 48, mostly debris from finished
+    work, and a count that conflates dead trees with live work bounds the wrong
+    thing. Not open PRs: by then the branch exists. A claim is what the board has
+    authority over — an unlanded unit of work inside this system is represented
+    by one, and one outside it was never told to us and is not ours to police.
+    A claim also self-heals, which is the property a worktree count could not
+    have: a TTL frees a dead holder's slot with nobody intervening (#135), where
+    a worktree reaper would have to tell a stalled agent from a slow one.
+
+    **What counts is a unit of work in a REPOSITORY.** Three things are live
+    ``work`` claims and are deliberately not units of work:
+
+    * ``plan:<uuid>`` / ``item:<uuid>`` — board objects. :func:`board_object`
+      names them and they are skipped; a claim on a plan is a claim on the
+      ordering, and the planner holding it is not a ninth agent in flight.
+    * ``plan-order:<repo>`` — #232's ordering claim. :func:`repo_of` answers None
+      for it, so it drops out without a special case, which is the point of
+      asking the key rather than matching on strings.
+    * ``kind=merge`` — the last few seconds of a branch's life (#99), and by
+      definition work that is already built. Excluded by the kind filter, since
+      :data:`WORK_KINDS` is what this counts.
+
+    So the answer is: live claims naming an issue or a PR in this repo, whoever
+    holds them. **Whoever** matters — the bound is per repository and the fleet
+    is several machines against one board, so a per-holder count would admit
+    ``max`` agents *per box*. It is also why a human starting a ninth thing by
+    hand is absorbed rather than exempt: they run ``create-worktree`` and take
+    the same claim an agent does, and the count neither knows nor cares which it
+    was.
+
+    **A count, not a list a caller re-derives one from** — the argument
+    :func:`held_claims` makes about itself, applied to the second gate. The repo
+    attribution is :func:`app.claimkey.repo_of`, read off the key; a client that
+    filtered ``GET /claims`` by key shape would be a fourth implementation of the
+    join #172 is about, and enforcement built on a re-derivation is enforcement
+    that can disagree with the board about what is held.
+
+    Nothing here decides anything. The ceiling lives in the repo's policy file
+    and the refusal happens at the checkout (``create-worktree``); this endpoint
+    only answers how many, so that a caller with no bound configured never asks.
+    """
+    try:
+        repo = canonical_repo(repo)
+    except BadRef as e:
+        raise HTTPException(422, str(e)) from None
+    now = _utcnow()
+    # Narrowed in SQL to the kinds that can FOLD onto `work` — not to `work`
+    # alone. Every write canonicalises (see `ClaimRequest`), but rows written
+    # before #172 did not, and a claim stored as `kind='issue'` is the same claim
+    # under the same unique index. Counting the canonical spelling only would
+    # under-report the window and admit an agent into a slot that is taken.
+    rows = list(await session.scalars(
+        select(ResourceLease).where(
+            ResourceLease.kind.in_(tuple(WORK_KINDS)),
+            ResourceLease.released_at.is_(None),
+            ResourceLease.expires_at > now,
+        ).order_by(ResourceLease.acquired_at.desc())
+    ))
+    claims = [claim_view(c) for c in rows
+              if board_object(c.kind, c.key) is None and repo_of(c.kind, c.key) == repo]
+    return {
+        "repo": repo,
+        # The one field a gate reads.
+        "count": len(claims),
+        "claims": claims,
+        "holders": sorted({c["holder"] for c in claims}),
+        "checked": now.isoformat(),
+    }
 
 
 async def _board_scopes(

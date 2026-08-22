@@ -901,6 +901,7 @@ git diff --stat                                                    # read this b
 git add -A CHANGELOG.md README.md changelog.d
 git commit -m "chore(release): stamp vNEXT" && git push
 gh pr merge <pr> --merge --delete-branch
+qb-release issue <n>                                               # the issue the PR closes
 ```
 
 - **`--ttl 1800`, not the board's hour.** Keying on the base widened what a leaked claim costs —
@@ -953,6 +954,15 @@ gh pr merge <pr> --merge --delete-branch
 - **`--merge`, never `--squash`.** Preserve the commits: the fix commits and the
   rounds that reviewed them are the record of this cycle, and a squash throws away
   the correspondence between them.
+- **Hand back the issue claim once the merge lands** (#337): `qb-release issue <n>`,
+  where `<n>` is the issue the PR closes. `create-worktree` took a `kind=work` claim
+  on it at checkout, held by the machine with an 8h TTL, and merging a PR does not
+  touch it — on 2026-08-22 four issues were still claimed hours after their PRs had
+  merged, one of them shipped as v2.78. Nothing breaks if you forget: the teardown
+  releases it too, and the TTL is under both. What it costs is a slot — under
+  `in_flight.max` the count is highest right after the fleet has been most
+  productive, which is the wrong way round. Exit 0 also means "already handed back",
+  so running it twice is free.
 
 **The rounds you just ran are an input to that verdict, not a substitute for it.**
 preland reads the round the panel *recorded on the board*, so a round that never

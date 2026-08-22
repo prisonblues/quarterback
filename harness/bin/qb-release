@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""qb-release — hand a claim back. The other half of `qb-claim`'s pickup gate.
+
+  qb-release                            the issue this checkout's branch names
+  qb-release issue 337                  this checkout's repo, issue 337
+  qb-release pr 347
+  qb-release --branch feat/issue-337    the issue that branch names
+
+  0  released  — it is free again (or there was nothing live to hand back)
+  1  refused   — somebody else holds it; it is not ours to release
+  2  unknown   — it is not released, and not because somebody else holds it
+
+**The verb the checkout claim did not have.** `create-worktree` takes a
+`kind=work` claim with an 8h TTL, held by the MACHINE (`session: null`), and
+until this existed nothing gave it back when the work landed. #277's `stop` half
+releases a SESSION's claims, and these have no session — they were taken by a
+script, on behalf of a worktree, before the agent that would use it existed. So
+the only thing that ever freed one was the TTL. Measured on 2026-08-22: four plan
+items still carried live claims after their PRs had merged, one of them shipped
+as v2.78 hours earlier.
+
+That is a bug on its own — a claim that outlives its work is #135's original
+complaint — and it is disqualifying for anything that COUNTS claims, because the
+count is then highest immediately after the fleet has been most productive.
+
+**Keyed the same way `qb-claim` keys it, which is to say not here (#172).** The
+resource is named — kind and value — and the board derives the key. A release
+that composed its own key would look up a spelling nothing wrote and report,
+truthfully and uselessly, that there was nothing to release.
+
+**Nothing to release is exit 0, not an error.** This runs on teardown paths that
+must not fail because the work was already handed back — `remove-worktree` after
+`/drop-worktree` after the land step, three chances at one claim by design. A
+release is idempotent on the board too (`released_at` is set once, and the row
+stays as history), so the second caller is not doing damage, it is doing nothing.
+
+**1 is a HOLDER, exactly as in `qb-claim`.** A 403 means the claim belongs to
+another machine or another session, so this is not the agent to hand it back —
+which is a definite answer and a different thing from a board that cannot be
+reached. Everything else is 2. A caller that must not stop for a board outage
+(every teardown here) ignores the code; the distinction is for a human reading
+the line, and for the tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+RELEASED, REFUSED, UNKNOWN = 0, 1, 2
+
+#: Kinds identified by a BOARD id rather than by something inside a repository —
+#: `qb-claim`'s list, for the same reason: sending a repo alongside one of these
+#: would give a single row two keys depending on where the caller was standing.
+REPOLESS = frozenset({"plan", "item"})
+
+#: The issue number a branch names, or nothing. Deliberately the same expression
+#: `create-worktree`'s `branch_issue` uses, because this is the release of what
+#: that took: `feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`. The
+#: digits must be the whole tail of the `issue-` token, or `issue-172x` and
+#: `myissue-9` would both name numbers nobody meant.
+BRANCH_ISSUE = re.compile(r"(^|/)issue-(\d+)(-|$)")
+
+#: HTTP answers where the board DECIDED rather than being unavailable, and what
+#: to say about each. `qb-claim`'s split, restated for the one code that differs:
+#: a 403 here is somebody else's claim, which is exit 1.
+DEFINITE = {
+    401: "the token this host resolved was refused — rotate or re-provision it; "
+         "the next attempt fails identically",
+    422: "the board does not key that resource — check the kind (issue | pr | "
+         "branch | plan | item), the value, and that this checkout's origin "
+         "remote reads `owner/name`",
+}
+
+
+def branch_issue(branch: str) -> str | None:
+    m = BRANCH_ISSUE.search(branch or "")
+    return m.group(2) if m else None
+
+
+def current_branch(repo_path: str) -> str | None:
+    """The branch this checkout is on, or None. Never raises — a detached HEAD, a
+    missing git and a directory that is not a checkout are all "cannot say"."""
+    try:
+        done = subprocess.run(["git", "-C", repo_path, "rev-parse",
+                               "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+    except Exception:                                             # noqa: BLE001
+        return None
+    name = done.stdout.strip()
+    return None if done.returncode != 0 or name in ("", "HEAD") else name
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-release", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("kind", nargs="?", help="issue | pr | branch | plan | item")
+    ap.add_argument("value", nargs="?",
+                    help="the issue/PR number, branch name, or board id")
+    ap.add_argument("--branch", default=None,
+                    help="release the issue THIS branch name carries, rather than "
+                         "the one the checkout is on")
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose origin remote names the repo")
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                    help="your session id (default: $CLAUDE_CODE_SESSION_ID). A claim "
+                         "that named a session is owned by it; the checkout claim "
+                         "names none and belongs to the machine")
+    ap.add_argument("--json", action="store_true",
+                    help="print what was released, as JSON")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    kind, value = args.kind, args.value
+    if kind and not value:
+        say(f"unknown: `{kind}` names a kind but no resource — say which one, "
+            f"e.g. `qb-release issue 337`")
+        return UNKNOWN
+    if not kind:
+        # Derived from the branch, for the same reason `create-worktree` derives
+        # the claim it takes: a number typed a second time is a number that can
+        # be typed wrong, and releasing somebody else's claim is worse than
+        # releasing nothing.
+        branch = args.branch or current_branch(args.repo_path)
+        if not branch:
+            say("unknown: no resource named and no branch to read one off — "
+                "pass `issue <n>`, or run this inside a checkout")
+            return UNKNOWN
+        issue = branch_issue(branch)
+        if not issue:
+            # Not a failure: most branches name no issue, and a teardown of one
+            # of them has nothing to hand back.
+            say(f"nothing: '{branch}' names no issue, so no claim was taken for it")
+            return RELEASED
+        kind, value = "issue", issue
+
+    repo = None
+    if kind.lower() not in REPOLESS:
+        repo = repo_slug(args.repo_path)
+        if not repo:
+            say(f"unknown: no owner/name could be read from the git remote at "
+                f"{args.repo_path!r} — a claim is keyed on the repo, and guessing "
+                f"one from a directory name is how two agents claimed one issue "
+                f"under two keys")
+            return UNKNOWN
+
+    try:
+        client, _cfg = board_client()
+    except Exception as e:                                        # noqa: BLE001
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    try:
+        # Asked for by REF. The board derives the key, so this looks up the row
+        # `qb-claim` actually wrote rather than a spelling of it (#172).
+        found = client.get("/claims", {"ref_kind": kind, "ref_value": str(value),
+                                       "repo": repo})
+    except urllib.error.HTTPError as e:
+        return _http(e, say, "could not ask what is held")
+    except Exception as e:                                        # noqa: BLE001
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    live = found.get("claims") or []
+    if not live:
+        say(f"nothing: no live claim on {kind} {value} — already handed back, or "
+            f"never taken")
+        return RELEASED
+
+    released = []
+    for claim in live:
+        body = {"claim_id": claim.get("claim_id")}
+        if args.session:
+            body["session"] = args.session
+        try:
+            client.post("/claim/release", body)
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                # Definite, and it names somebody. A claim stamped with another
+                # session on this same box is the common case, and it is not an
+                # error in the caller — it is the ownership rule working.
+                say(f"refused: {claim.get('kind')}/{claim.get('key')} is held by "
+                    f"{claim.get('holder')}"
+                    + (f" (session {claim['session']})" if claim.get("session") else "")
+                    + " — not this agent's to hand back")
+                return REFUSED
+            return _http(e, say, f"could not release {claim.get('key')}")
+        except Exception as e:                                    # noqa: BLE001
+            say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+            return UNKNOWN
+        released.append(claim)
+        say(f"released: {claim.get('kind')}/{claim.get('key')} — free for the "
+            f"next agent")
+
+    if args.json and not args.quiet:
+        print(json.dumps({"released": released}, indent=2))
+    return RELEASED
+
+
+def _http(e: urllib.error.HTTPError, say, what: str) -> int:
+    """One HTTP failure, reported as what it is. Always exit 2 — a 403 is handled
+    at its own call site, where the claim it refers to is in hand."""
+    detail = _detail(e)
+    if e.code in DEFINITE:
+        say(f"unknown: the board REFUSED this and will refuse it again — "
+            f"HTTP {e.code}: {_message(detail)}")
+        say(f"  not an outage: {DEFINITE[e.code]}")
+    else:
+        say(f"unknown: {what} — the board answered HTTP {e.code}: {_message(detail)}")
+    return UNKNOWN
+
+
+def _detail(e: urllib.error.HTTPError):
+    """The board's own message, parsed if it is JSON. Never raises."""
+    try:
+        body = json.loads(e.read().decode())
+    except Exception:                                             # noqa: BLE001
+        return e.reason
+    return body.get("detail", body) if isinstance(body, dict) else body
+
+
+def _message(detail) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("error") or detail)
+    return str(detail) if detail else "no detail"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""qb-admit — is there room in this repo for another unit of work? (#337)
+
+  qb-admit                          this checkout's repo, this repo's rules
+  qb-admit --repo-path ../other     another checkout
+  qb-admit --json                   the whole answer, including the count
+
+  0  room      — start it (or: no bound is configured, which is the default)
+  1  full      — the window is closed; the reason names who has the slots
+  2  unknown   — cannot tell: no board, no token, an outage, a malformed ceiling
+
+**Nothing in the fleet has ever known how much work was in flight.** Eight agents
+were run against one `main` on 2026-08-22. Two branches minted migration `0029`
+independently — both authors ran `migration_reconcile.py preflight` and both were
+told GO, because that tool compares a branch against `main` and cannot see an
+unlanded sibling. A third migration was renumbered twice mid-flight. The largest
+open diff went DIRTY the moment the first of them landed. Every mechanism that
+looks like it governs this — the merge claim, the merge queue, `app/ordering.py`,
+the review queue — sits downstream of the decision to start and orders an exit
+that has already been built.
+
+**The count is claims, and it is asked of the board, not worked out here.** See
+`GET /claims/in-flight`: live `work` claims naming an issue or a PR in this repo,
+fleet-wide, whoever holds them. A client that filtered `GET /claims` by key shape
+would be a fourth implementation of the join #172 is about.
+
+**Advisory, and it can be exceeded.** This counts, and then the caller claims:
+two checkouts starting in the same second both see room and both proceed, so a
+simultaneous fan-out — precisely the shape #337 is about — can put the window
+over its ceiling by however many raced. Nothing here is a lock, and the claim
+table says the same about itself in as many words: what it removes is collisions
+between agents that ask. Making it exact means moving admission INTO the board so
+the count and the insert are one transaction (a `POST /claim` that refuses when
+the window is full, serialised on the repo), which is a change to the shared
+claim path and deliberately not in the change that ships the bound off by
+default. What the racy version still buys is the rolling behaviour it exists for:
+past the first burst, every checkout is admitted one at a time against a count
+that is by then truthful.
+
+**Unbounded is the default and it costs nothing — not even a request.** With no
+`in_flight.max` in the repo's rules this returns 0 before it has looked for a
+board, a token or a network, so a fleet that never opts in cannot be slowed,
+broken or made noisier by this existing. That is deliberate: the bound ships off,
+and the way to prove landing it changes nothing is that the unconfigured path
+does nothing at all.
+
+**A malformed ceiling fails OPEN, loudly.** `max: "five"` exits 2 with the reason
+named, and `create-worktree` proceeds (unless `--require-claim`). The two
+failures are not symmetric: refusing every checkout on the fleet over a typo in a
+config file is a worse morning than admitting one agent too many, and a fleet
+that has throttled itself is the harder of the two to diagnose from a phone.
+
+**Why the rules file is read here rather than by `harness_rules.py`.** That
+module lives in `share/quarterback-harness/loops` and this lives in `bin/`; the
+package installs them as separate store paths, so a bin script cannot import it
+(`remove-worktree`'s `default_branch` mirrors the same module for the same
+reason). What is duplicated is kept to the two key names and the file-preference
+order, and `harness/tests/test_in_flight_drift.py` fails if this file and `DEFAULTS`
+ever disagree about either.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+from pathlib import Path
+
+ROOM, FULL, UNKNOWN = 0, 1, 2
+
+#: The repo's policy baseline, in preference order — `harness_rules._read_rules`'
+#: order, and the same reason: the tracked sample is the policy, and an untracked
+#: `.harness-rules` beside it is one box's overlay, which may narrow a reviewer
+#: seat and nothing else. A repo still on the pre-split layout carries only the
+#: second name, so both are tried.
+RULES_FILES = (".harness-rules.sample", ".harness-rules")
+
+#: The block and the keys, spelled once. `tests/test_in_flight_drift.py` pins
+#: these against `harness_rules.DEFAULTS` — see harness/tests/test_in_flight_drift.py.
+BLOCK = "in_flight"
+MAX_KEY = "max"
+MIN_KEY = "min"
+
+
+def read_bound(root: str) -> tuple[int | None, object, str, str]:
+    """``(max, min, where, problem)`` for this checkout. Never raises.
+
+    ``max`` is None for "no bound" — which is both the absent case and the
+    configured-null case, deliberately the same answer. ``problem`` is non-empty
+    when the file said something this cannot act on, and the caller then reports
+    it and does NOT enforce.
+    """
+    for name in RULES_FILES:
+        path = Path(root) / name
+        if not path.is_file():
+            continue
+        try:
+            rules = json.loads(path.read_text())
+        except Exception as e:                                    # noqa: BLE001
+            # Not silently ignored. A rules file that will not parse is policy
+            # gone quiet, and this is the one caller that would otherwise read
+            # "unparseable" as "unbounded" for the rest of the fleet's life.
+            return None, None, str(path), f"{path} would not parse: {e}"
+        block = rules.get(BLOCK)
+        if block is None:
+            return None, None, str(path), ""
+        if not isinstance(block, dict):
+            return None, None, str(path), (
+                f"`{BLOCK}` in {path} is {type(block).__name__}, not an object — "
+                f"it takes {{\"{MAX_KEY}\": <int|null>, \"{MIN_KEY}\": <int|null>}}")
+        ceiling = block.get(MAX_KEY)
+        floor = block.get(MIN_KEY)
+        if ceiling is None:
+            return None, floor, str(path), ""
+        # `bool` is an `int` in Python and `true` is a plausible thing to type
+        # into a switch-shaped key, so it is refused rather than counted as 1.
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+            return None, floor, str(path), (
+                f"`{BLOCK}.{MAX_KEY}` in {path} is {ceiling!r} — it takes a "
+                f"non-negative integer, or null for no bound. NOT enforcing it")
+        return ceiling, floor, str(path), ""
+    return None, None, "", ""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-admit", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose rules and origin remote are read")
+    ap.add_argument("--json", action="store_true",
+                    help="print the whole answer on stdout")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    def out(**fields) -> None:
+        if args.json and not args.quiet:
+            print(json.dumps(fields, indent=2))
+
+    ceiling, floor, where, problem = read_bound(args.repo_path)
+    if problem:
+        say(f"unknown: {problem}")
+        out(bounded=False, problem=problem, rules=where)
+        return UNKNOWN
+    if ceiling is None:
+        # The default, and the whole of it. No board, no token, no request, no
+        # line on stderr: an unconfigured repo behaves exactly as it did before
+        # this existed.
+        out(bounded=False, rules=where, min=floor)
+        return ROOM
+
+    # Imported HERE, not at the top: the unbounded path above must not depend on
+    # a board client being importable, and `qbdata` is a sibling file that a
+    # partial install can be missing.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from qbdata import board_client, repo_slug
+    except Exception as e:                                        # noqa: BLE001
+        say(f"unknown: a bound is set ({BLOCK}.{MAX_KEY}={ceiling} in {where}) but "
+            f"the board client is not importable — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    repo = repo_slug(args.repo_path)
+    if not repo:
+        say(f"unknown: no owner/name could be read from the git remote at "
+            f"{args.repo_path!r} — the window is per repository, and a directory "
+            f"name is not one")
+        return UNKNOWN
+
+    try:
+        client, _cfg = board_client()
+        answer = client.get("/claims/in-flight", {"repo": repo})
+    except urllib.error.HTTPError as e:
+        say(f"unknown: the board answered HTTP {e.code} asking how much of {repo} "
+            f"is in flight — the bound is not enforced for this checkout")
+        return UNKNOWN
+    except Exception as e:                                        # noqa: BLE001
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    count = answer.get("count")
+    if not isinstance(count, int):
+        say(f"unknown: the board's answer carried no count ({answer!r})")
+        return UNKNOWN
+
+    holders = answer.get("holders") or []
+    out(bounded=True, rules=where, max=ceiling, min=floor, repo=repo,
+        count=count, room=count < ceiling, holders=holders,
+        claims=answer.get("claims") or [])
+    if count < ceiling:
+        say(f"room: {count} of {ceiling} in flight in {repo}")
+        return ROOM
+
+    say(f"full: {count} of {ceiling} units of work are already in flight in "
+        f"{repo} ({BLOCK}.{MAX_KEY} in {where})")
+    for claim in (answer.get("claims") or [])[:12]:
+        say(f"  {claim.get('key')} — {claim.get('holder')}: "
+            f"{claim.get('note') or 'no note'} (until {claim.get('expires')})")
+    say("  The window is per repository and counts the whole fleet, so a slot "
+        "opens when one of those is handed back — on land, on teardown, or when "
+        "its TTL runs out.")
+    return FULL
+
+
+if __name__ == "__main__":
+    sys.exit(main())
