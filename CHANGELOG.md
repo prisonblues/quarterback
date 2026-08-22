@@ -17,7 +17,7 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
-## vNEXT — an order the rules derive, and a record of what they claimed
+## v2.71 — an order the rules derive, and a record of what they claimed
 
 The plan has had an order since v2.39 and one writer for it: a human. That is the right
 rule — "if any agent may reorder it, the plan thrashes and stops being the shared intent it

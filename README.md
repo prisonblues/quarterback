@@ -1140,7 +1140,7 @@ full — including what was broken before it, which is the part no diff recovers
   same guard one level out. The population is *PRs this board has panelled* and that is said in
   the response, not only here — an empty `collides` means "none of the PRs I have seen", never
   "none exist".
-- **vNEXT** — an order the rules derive, and a record of what they claimed. The plan has had
+- **v2.71** — an order the rules derive, and a record of what they claimed. The plan has had
   one writer for its order since v2.39 — a human, so that it stays shared intent rather than
   something every agent rewrites — and nowhere to put the other thing: *what order do the
   facts imply?*, which is mechanical for most of a plan and was being worked out by hand,
