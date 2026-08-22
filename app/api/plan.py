@@ -635,14 +635,19 @@ def _ordering_view(open_views: list[dict]) -> dict:
     by_source: dict[str, int] = {}
     for view in open_views:
         by_source[view["rank_source"]] = by_source.get(view["rank_source"], 0) + 1
+    # In the read's own order, which is what makes `from_rank` below meaningful.
     unchosen = [v for v in open_views if v["rank_source"] == "appended"]
     return {
         "trusted": not unchosen,
         "by_source": by_source,
         "unchosen": len(unchosen),
-        # The rank at which the order stops meaning anything. Null when there is
-        # nothing unchosen, rather than a sentinel a client has to know about.
-        "from_rank": min((v["rank"] for v in unchosen), default=None),
+        # Where the order stops meaning anything: the rank of the first item, IN
+        # THIS READ'S OWN ORDER, whose position nobody chose. Taken in list order
+        # rather than as the smallest rank, because a repo read carries the fleet
+        # band after the repo's own items and the two are separate 1..n sequences
+        # — `min` over both would name a rank the reader never reaches first.
+        # Null when nothing is unchosen, rather than a sentinel to know about.
+        "from_rank": unchosen[0]["rank"] if unchosen else None,
         "hint": None if not unchosen else
                 "those items are in the order the adds arrived in, because nobody "
                 "chose one: pass `after`/`before` to POST /plan/item when you know "
@@ -2721,12 +2726,22 @@ async def submit_plan(
             plan_items.append(PlanItem(
                 repo=repo, title=title, ref_kind=item.ref_kind, ref_value=ref,
                 note=_norm_text(item.note), added_by=author, rank=rank + position,
-                # Not `appended`: the submitter wrote this list in this order, so
-                # the sequence WITHIN the plan is a decision somebody took. Where
-                # the block itself sits still is an append, which is why it is not
-                # `ordered` either — a submitted plan is a proposal, and #183's
-                # `ordering` report says so.
-                rank_source="submitted",
+                # The submitter wrote this list in this order, so every item after
+                # the first sits where somebody put it — `submitted` rather than
+                # `appended`, and not `ordered` either, because a submitted plan is
+                # a proposal and #183's `ordering` report says so.
+                #
+                # **The FIRST item is an append, and marking it otherwise would
+                # hide the one seam a submission really does leave.** Where the
+                # block itself goes is decided by `_next_rank` and by nobody:
+                # submit two plans into one scope and the second sits behind the
+                # first for no reason anyone stated. Calling all of them
+                # `submitted` reported that scope as fully trusted, which is
+                # exactly the "17 chosen, 11 by arrival, nothing telling them
+                # apart" this issue is about — one boundary instead of eleven, but
+                # the same lie. So each submission contributes exactly one
+                # unchosen position, and `from_rank` names the seam.
+                rank_source="appended" if position == 0 else "submitted",
                 depends_on=[]))
         for row in plan_items:
             session.add(row)

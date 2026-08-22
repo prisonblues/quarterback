@@ -42,9 +42,11 @@ _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 #:   ``POST /plan/item`` could do, which is an ordering judgement ("this is the
 #:   least important open item") asserted on the caller's behalf without being
 #:   asked.
-#: * ``submitted`` — it arrived inside a ``POST /plan/submit`` batch, so the
-#:   submitter chose the order WITHIN the plan; where the block itself sits is
-#:   still an append.
+#: * ``submitted`` — it arrived inside a ``POST /plan/submit`` batch, below an
+#:   item the submitter deliberately put above it. The batch's FIRST item is
+#:   ``appended``, not ``submitted``: where the block itself sits was decided by
+#:   "after everything already here" and by nobody, so each submission leaves
+#:   exactly one position nobody chose.
 #: * ``placed`` — an agent said where it goes, relative to a named neighbour.
 #: * ``ordered`` — a human set it with ``POST /plan/reorder``.
 #:
