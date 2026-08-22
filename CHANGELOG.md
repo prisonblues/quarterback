@@ -17,6 +17,49 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.81 — two migration guards, adopted while the field is still empty
+
+Nothing here checked the **end state** of the migration chain. `test_migration_reconcile.py`
+checks the graph is a graph, and the two per-migration modules each check one revision's own
+before and after; between them they would all pass on a chain that builds a schema the models
+do not declare. That gap is where `alembic stamp` lives — a revision recorded without its SQL
+having run, so the version table asserts a schema that was never built and the divergence
+surfaces weeks later, on somebody else's machine, as `column does not exist`. Renumbering
+makes it sharper here than elsewhere: revision identity *is* the number, so a renumber
+changes what a stored `version_num` means, and three worktree databases had to be dropped for
+exactly that.
+
+Both guards arrive from lexray, which paid for them.
+
+`tests/test_migration_drift.py` builds a throwaway database, replays every revision from
+empty, and diffs the result against `app/models`. Any disagreement fails the build, and the
+failure names the operations alembic would still have to perform. It also pins the version
+table to one row at the chain's own head: more than one is a multi-head state, whose fix is a
+merge migration and never a stamp.
+
+`tests/test_migrations_self_contained.py` AST-scans `migrations/versions/` against an
+**allowlist** — the standard library plus `alembic`/`sqlalchemy` — rather than a denylist of
+`app`, because every first-party package carries the identical hazard. A migration that
+imports live code emits SQL for whatever columns the models have *today*, so the day a later
+migration adds one, the older migration references a column that does not exist yet at that
+point in the chain. Applied revisions never re-run, so it is invisible on every database
+already past it and detonates only on a fresh replay — which is exactly what the other guard
+does. Detect and prevent, one mechanism in two halves.
+
+All 32 migrations were already clean, which is the argument for doing it now: the cheapest
+moment to fence a field is before anything has wandered into it.
+
+The allowlist half also ships. `harness/templates/test_migrations_self_contained.py` is the
+same file with its four constants blanked, for any repo the harness sets up, kept
+byte-identical to this one by a parity test — the answer `templates/dbtarget.py` already uses
+to the objection that a scaffolded test drifts from the version somebody maintains. The drift
+test does not ship: it needs a live database, a models import path and a project's own
+alembic invocation, so a template of it would be wrong for most repos in two of those three.
+
+README gains a **Database migrations** section: never stamp always upgrade, dev and test
+databases are disposable, migrations do not import the app, and multiple rows in
+`alembic_version` mean a merge migration.
+
 ## v2.80 — Every decision owed to a human now leaves the fleet by one door, and it is the board
 
 The harness stops and says *a human has to answer this* in four places. Each one reported somewhere different, and none of them reported to the board — the one surface a human actually watches, and the one already carrying exactly this traffic from every other project in the fleet. `epic.py` printed its not-agent-doable ruling to stdout, so an unattended epic run's entire human-decision output lived in a systemd journal. `preland` returned an exit code. A panel seat had no way to say it at all. A fixer's escalation reached a PR comment thread and a new issue.
