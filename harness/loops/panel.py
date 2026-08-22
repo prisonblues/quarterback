@@ -413,6 +413,12 @@ def _payload_defaults() -> dict:
         # round to attribute against. All-zero is a different statement: a round
         # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
+        # #67's tally, on the same terms and empty where the same question does
+        # not arise. Two objects rather than one: `recurrence_counts` is what the
+        # panel MEASURED and `premise_counts` is what the judge SAID, and the whole
+        # value of asking twice is that they can disagree.
+        "recurrence_counts": {},
+        "premise_counts": {},
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
         # so the skipped PR answers `payload['round_stop']` with "no cycle ran"
         # rather than with a KeyError.
@@ -948,6 +954,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # able to tell from "not a cycle run".
                 "provenance_counts": ({b: 0 for b in PROVENANCE}
                                       if skip_prior.rounds else {}),
+                # #67's two tallies follow the same rule, for the same reason.
+                "recurrence_counts": ({b: 0 for b in RECURRENCE}
+                                      if skip_prior.rounds else {}),
+                "premise_counts": ({b: 0 for b in (*PREMISE_VERDICTS, "not-said")}
+                                   if skip_prior.rounds else {}),
                 # A skipped PR still collides with everything it touches, and it
                 # is the case most likely to be re-merged unattended. The paths
                 # are already in hand here — the diff never is.
@@ -1480,6 +1491,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "prior_rounds": len(prior.rounds),
             "prior_findings": len(prior.keys),
             "provenance_counts": ({b: 0 for b in PROVENANCE} if prior.rounds else {}),
+            "recurrence_counts": ({b: 0 for b in RECURRENCE} if prior.rounds else {}),
+            "premise_counts": ({b: 0 for b in (*PREMISE_VERDICTS, "not-said")}
+                               if prior.rounds else {}),
             "reviewers_selected": sorted(selected),
             "reviewers_override": override_note,
             # NOT optional, and the reason is this whole feature's own failure mode
@@ -2032,7 +2046,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # and nothing reporting it. Degrading correctly is exactly what made it silent.
     findings, judge_skip, coverage_note = adjudicate(
         clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage,
-        ci=ci_text, code_tree=code_tree, budget_usd=budget_usd)
+        ci=ci_text, code_tree=code_tree, budget_usd=budget_usd,
+        # #67's question, asked of the judge because it is the only party in the
+        # round already holding both the previous round's complaints and the
+        # commit that answered them. Empty on a round 1 and on any cycle whose
+        # baseline named no findings, which leaves the prompt exactly as it was.
+        recurrence=recurrence_brief(prior.fixed_findings, prior.head_round))
     # Now nothing reads the tree again: the reviewers copied out of it inside the
     # executor and the judge has just finished with it. Removed here rather than at
     # the end of `run` because a PR's checkout is the largest thing this process
@@ -2498,6 +2517,64 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `provenance_of` walks `fix_added` through `_same_file` on every call.
     tally = Counter(provenance_of(c) for c in outstanding)
     provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
+
+    # ---- recurrence (#67): is this finding standing where the last fix pass was
+    # working, on a complaint that pass was sent to answer?
+    #
+    # The third question over the same two inputs. `new_this_round` asks whether
+    # anyone raised this before; `provenance` asks whether the fix pass wrote the
+    # line it sits on; this asks whether the fixes are making PROGRESS — a fix that
+    # patches a wrong assumption produces the next round's findings, and a fix that
+    # removes the assumption does not.
+    #
+    # NOTHING READS IT TO STOP A RUN, and that is a decision rather than an
+    # omission. #67 asks for the instrument before the gate in as many words — two
+    # pull requests in one day is an observation, not a calibrated rule — so this
+    # is deliberately absent from `round_stop`, from `stop["veto"]` (which decides
+    # `confident`) and from every ceiling in `panel_caps`. It is recorded, tallied
+    # and printed, and a few dozen cycles of it are what would justify wiring it to
+    # anything.
+    if prior.fixed_here and not fix_diff and attributable:
+        # Said, because the silence is otherwise unreadable: the previous round DID
+        # name work, so an all-`unknown` tally here is the fix range failing rather
+        # than a cycle that is not circling. `provenance` posts its own note on the
+        # same condition; this one names the other measurement that went with it.
+        notes.append("recurrence unavailable for the same reason — no fix range, so "
+                     "no finding can be placed against the last pass's own lines")
+
+    def recurrence_of(c: Canonical) -> tuple[str, str | None]:
+        """`(bucket, the earlier finding it stands on)`, or `(None, None)` where the
+        question does not arise — the same three cases `provenance_of` declines on,
+        and declined for the same reason. A defect an earlier round already raised
+        is not circling: it is the SAME complaint, which `new_this_round` already
+        says and which a fix pass demonstrably did not clear."""
+        if not attributable or not is_new(c):
+            return None, None
+        return _recurrence(c.file or "", c.line, fix_added, prior.fixed_here,
+                           bool(fix_diff))
+
+    # Memoised for the reason `is_new` is: `recurrence_of` walks `fix_added` and
+    # `fixed_here` through `_same_file` on every call, and the payload asks each
+    # finding twice (bucket, then the key it stands on) on top of the tally.
+    recurrence_seen: dict[str, tuple[str | None, str | None]] = {}
+
+    def recurrence_at(c: Canonical) -> tuple[str | None, str | None]:
+        if c.key not in recurrence_seen:
+            recurrence_seen[c.key] = recurrence_of(c)
+        return recurrence_seen[c.key]
+
+    # Over `outstanding`, exactly as provenance is counted, so the two tallies share
+    # a denominator and can be read against each other.
+    r_tally = Counter(recurrence_at(c)[0] for c in outstanding)
+    recurrence_counts = ({b: r_tally.get(b, 0) for b in RECURRENCE}
+                         if attributable else {})
+    # The judge's own answer to the sharper question, counted beside the mechanical
+    # one. Its denominator is the same population and its blank is the commonest
+    # value — the judge was not asked, or had nothing to say — so it is counted as
+    # a bucket of its own rather than left to be inferred from a shortfall.
+    p_tally = Counter(c.premise_verdict or "not-said" for c in outstanding)
+    premise_counts = ({b: p_tally.get(b, 0) for b in (*PREMISE_VERDICTS, "not-said")}
+                      if attributable else {})
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Only a round 1 of an actual cycle MINTS one.
@@ -2723,16 +2800,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # decline to fix one would say the panel may leave a red quality gate red.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
+                    "recurrence": recurrence_at(c)[0],
+                    "recurs_of": recurrence_at(c)[1],
                     "escalated": c.key in held,
                     "below_fix_floor": below_floor(c),
                     "budgeted_fix": budgeted(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c),
+                            "recurrence": recurrence_at(c)[0],
+                            "recurs_of": recurrence_at(c)[1],
                             "escalated": c.key in held,
                             "below_fix_floor": below_floor(c),
                             "budgeted_fix": False} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c),
+                       "recurrence": recurrence_at(c)[0],
+                       "recurs_of": recurrence_at(c)[1],
                        "escalated": False,
                        "below_fix_floor": False,
                        "budgeted_fix": False} for c in dismissed],
@@ -2748,6 +2831,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # three files and a resolution order.
         "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
+        "recurrence_counts": recurrence_counts,
+        "premise_counts": premise_counts,
         "skipped": result.skipped,
         "run_key": run_key,
     }
@@ -2906,6 +2991,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             lines.append("  - of those: " + ", ".join(detail)
                          + ". A signal, not a verdict — a fix can break something at a "
                            "distance, so `missed` is evidence rather than proof.")
+        # #67, and printed on the same rule and for the same reason: the operator
+        # deciding whether to go again is the one the distinction is FOR.
+        #
+        # It says what it is and stops. No recommendation, no threshold crossed,
+        # no stop. And it deliberately does not read as an accusation, because the
+        # replay behind `_recurrence` says the mechanical half cannot support one:
+        # on 36 rounds of this board's history it fires on about four new findings
+        # in five, on the cycles #67 calls circling and on the ones it does not
+        # alike. The number is a rate worth watching accumulate; the sentence that
+        # would tell an operator to stop is not available yet, and printing one
+        # would be inventing it.
+        rc = payload["recurrence_counts"]
+        revisited, at_site = rc.get("revisited") or 0, rc.get("fix-site") or 0
+        if revisited or at_site:
+            said = [f"**{revisited}** where the last round complained and the fixer "
+                    "then worked" if revisited else "",
+                    f"{at_site} where the fixer worked and nobody had complained"
+                    if at_site else ""]
+            lines.append("  - on the last fix pass's own lines: "
+                         + ", ".join(s for s in said if s)
+                         + ". A position, not a verdict (#67) — a round past the "
+                           "first is reading the fix commit, so this is usually most "
+                           "of them. Nothing stops on it.")
+        # What the judge said when asked the sharper question directly, and the half
+        # that can actually see a repeated premise: the mechanical count above knows
+        # the fixer was working here and not whether this finding says its
+        # assumption was wrong. Reported apart rather than folded in — two
+        # witnesses, and a round where they disagree is the row worth reading.
+        mc = payload["premise_counts"]
+        if mc.get("invalidates") or mc.get("unclear"):
+            said = [f"**{mc['invalidates']}** contradict the premise of the fix before "
+                    "them" if mc.get("invalidates") else "",
+                    f"{mc['unclear']} it could not tell" if mc.get("unclear") else ""]
+            lines.append("  - the judge, asked per finding: "
+                         + ", ".join(s for s in said if s)
+                         + f", {mc.get('separate', 0)} separate defects. A fix that "
+                           "patches a wrong assumption produces the next round's "
+                           "findings; one that removes it does not.")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "blocked": "🚧 gated — a run exists and will not execute without a human",
               "none": "🚫 no run exists for this commit",

@@ -146,7 +146,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
 #                        changed files v2.23, provenance v2.26, outcomes v2.37,
-#                        needs-a-human #279)
+#                        needs-a-human #279, recurrence #67)
 POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
                                                                     accounts, changed_files
                                                                     [, changed_files_dropped]
@@ -154,6 +154,10 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, head_sha_dropped]
                                                                     [, provenance_unknown]
                                                                     [, provenance_counts_unusable]
+                                                                    [, recurrence_unknown]
+                                                                    [, recurrence_counts_unusable]
+                                                                    [, premise_verdict_unknown]
+                                                                    [, premise_counts_unusable]
                                                                     [, needs_human_unknown]
                                                                     [, needs_human_refused]
                                                                     [, unreadable_fields]}
@@ -163,7 +167,8 @@ GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scoreca
                                                                   unread_files as a count)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
-                                                                 + head_sha/unread_files/provenance)
+                                                                 + head_sha/unread_files/provenance
+                                                                 + recurrence/premise_verdict)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -177,7 +182,8 @@ POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,             
                           `attested_by` is a CLAIM the caller makes, not a signature — the
                           board authenticates `set_by` and cannot authenticate a human
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
-                                                                     by_provenance, by_outcome,
+                                                                     by_provenance, by_recurrence,
+                                                                     by_premise, by_outcome,
                                                                      by_outcome_attested}
                           by_model rows carry precision (the judge's) beside precision_after
                           (what survived the fix) — the GAP is the measurement. Read it
@@ -730,6 +736,25 @@ the answer could not be placed. `provenance_runs` says how much of a window coul
 and counts only judged runs: the per-member counters are tallied over confirmed findings, so an
 unjudged run can only contribute zeros to the sums it annotates.
 
+**Is the loop making progress, or patching the same wrong assumption?** A fix that patches a wrong
+assumption produces the next round's findings; a fix that removes it does not — and a round cap
+fires at the same point either way. #67 adds the measurement, and deliberately not the gate. Each
+finding records where it stands relative to the fix pass before it (`recurrence`: `revisited` where
+the previous round complained about that file, the fixer wrote in it and this finding is on top of
+what it wrote; `fix-site` where nobody had complained; `elsewhere`; `unknown`), the earlier finding
+it stands on (`recurs_of`), and — asked of the **judge**, as one more key on the verdict it is
+already writing — whether it invalidates the premise of that fix or is a separate defect
+(`premise_verdict`). `GET /review/stats` splits both across a window (`by_recurrence`, `by_premise`).
+
+The mechanical half was replayed over 36 rounds from 26 pull requests before it shipped, and it
+**does not discriminate**: `revisited` fires on ~80% of a round's new findings, at the same rate on
+the three cycles #67 calls circling as on every other cycle, at every radius tried. Under increment
+scope (#41) a later round *reads the fix commit*, so its findings are normally at the fix's site.
+That negative result is why the bucket is named for a position rather than for a verdict, why the
+judge is asked the sharper question separately, and why nothing stops on either — a heuristic that
+triggers redesigns cheaply is worse than the round cap it would replace. The rate is kept because it
+is the baseline any later rule has to beat.
+
 **"A human has to look at this" is a class, not a sentence.** Some findings no fix round can
 settle: which of these product options, whether that name is the right word, whether the pane
 actually renders on a real screen, whether the credential path works on the box it has to work on.
@@ -997,6 +1022,12 @@ the **record** and not the lock — by the time it runs the merge has happened, 
 number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
+
+The tags are annotated, so writing one means writing an object, and git will not write an
+object without a tagger. `backfill` supplies one itself where the environment cannot name
+anybody — a CI runner has no `user.name` and no GECOS field to guess from, which is how #379
+cost `v2.99` and `v3` their tags. A resolvable identity is never overridden: where `git var
+GIT_COMMITTER_IDENT` answers, the tag is from whoever ran the command.
 
 ### A released entry is immutable
 
@@ -1639,6 +1670,8 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.98** — two branches can no longer mint the same migration id.
 - **v2.99** — something acts on a stale harness, and stops one step short of your password.
 - **v3** — the release number gets an allocator, and it is a git tag.
+- **v3.1** — the review loop starts measuring whether its fixes are getting anywhere.
+- **v3.2** — a release gets its tag on a machine that has never been told who it is.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
