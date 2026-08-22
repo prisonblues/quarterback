@@ -697,3 +697,44 @@ def test_the_read_half_trusts_the_same_store_as_the_write_half(monkeypatch):
     preland.board_request("review/findings", {"repo": "o/r", "pr": 1})
     assert "context" in seen
     assert (seen["context"] is None) == (nh.ssl_context() is None)
+
+
+def test_the_ci_states_only_a_person_can_clear_are_the_ones_that_announce(door):
+    """#324 made `qbdata.CI_STATES` the one closed vocabulary for CI state, and
+    added `blocked`: a run exists and will not execute until somebody presses
+    the button. That is a new human door and it announces.
+
+    `red` and `pending` do not, and that is the line the whole preland half of
+    #274 is drawn on — a failing build is work an agent does, a pending one
+    clears itself, and putting either on a person's queue turns the board into a
+    CI log with an addressee.
+    """
+    assert set(preland.CI_HUMAN_CLASSES) < set(preland.CI_REFUSALS)
+    assert set(preland.CI_HUMAN_CLASSES) == {"blocked", "none", "unknown"}
+    assert set(preland.CI_HUMAN_CLASSES.values()) <= set(nh.NEEDS_HUMAN_CLASSES)
+    # …and "the lookup failed" is not "somebody has to decide something".
+    assert preland.CI_HUMAN_CLASSES["unknown"] == "environment"
+
+
+def test_a_gated_ci_run_reaches_a_person_and_a_red_one_does_not(door, monkeypatch):
+    """End to end through `check_ci`, because the mapping above is only worth
+    anything if the check actually reads it."""
+    def report(state, blocking=True):
+        monkeypatch.setattr(preland, "ci_report",
+                            lambda pr, repo: _Report(state, blocking))
+        return preland.check_ci({"statusCheckRollup": []}, "o/r")
+
+    gated = report("blocked")
+    assert [h["class"] for h in gated.human] == ["decision"]
+    assert gated.reasons and gated.reasons[0] == gated.human[0]["reason"]
+    assert report("red").human == []
+    assert report("pending").human == []
+    assert report("green", blocking=False).reasons == []
+
+
+class _Report:
+    """The three fields `check_ci` reads off #324's report."""
+
+    def __init__(self, state, blocking):
+        self.state, self.blocking = state, blocking
+        self.summary, self.reason, self.last_executed = state, "", None
