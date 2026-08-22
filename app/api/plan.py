@@ -615,8 +615,14 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
     }
 
 
-def _ordering_view(open_views: list[dict]) -> dict:
+def _order_trust(open_views: list[dict]) -> dict:
     """How much of this order anybody actually decided — #183's minimum fix.
+
+    Distinct from ``GET /plan/order`` (#232), and the pair is deliberate: that
+    read says what order the RULES imply and never touches the live sequence;
+    this says who chose the order already in force. A proposal and a provenance.
+    They share one argument — an order whose chosen and unchosen parts are
+    indistinguishable gets trusted uniformly, and usually too much.
 
     ``next`` used to answer rank 1 with no caveat while the human's stated top
     priority sat at rank 20, under a note shouting that its own rank was a lie.
@@ -655,7 +661,7 @@ def _ordering_view(open_views: list[dict]) -> dict:
     }
 
 
-def _next_caveat(nxt: dict | None, ordering: dict, open_n: int) -> str | None:
+def _next_caveat(nxt: dict | None, trust: dict, open_n: int) -> str | None:
     """What ``next`` must say when the order it walked is not one anybody decided.
 
     Returned beside the item rather than instead of it: the answer is still the
@@ -663,12 +669,12 @@ def _next_caveat(nxt: dict | None, ordering: dict, open_n: int) -> str | None:
     it must not get is unqualified confidence — this is the issue's sharpest
     complaint, and the minimum fix it asks for even if placement never landed.
     """
-    if nxt is None or ordering["trusted"]:
+    if nxt is None or trust["trusted"]:
         return None
     mine = " including this one," if nxt["rank_source"] == "appended" else ""
     return (
-        f"{ordering['unchosen']} of {open_n} open items sit where they were "
-        f"appended,{mine} from rank {ordering['from_rank']} down: nobody chose "
+        f"{trust['unchosen']} of {open_n} open items sit where they were "
+        f"appended,{mine} from rank {trust['from_rank']} down: nobody chose "
         "those positions. This is the first item that is free, in an order that is "
         "partly just the order things were added — read the notes before you treat "
         "it as a priority."
@@ -1250,7 +1256,9 @@ async def read_plan(
     sequence and part the order the adds happened to arrive in, with nothing in
     the data telling the two apart (#183). ``ordering`` reports that from the rows
     themselves, and ``next.caveat`` carries it to the agent that reads only the
-    headline.
+    headline. That is provenance for the order in force; ``GET /plan/order``
+    (#232) is the other question — what order the rules would imply — and neither
+    one writes anything.
     """
     _refuse_phase(phase)
     now = _utcnow()
@@ -1284,7 +1292,7 @@ async def read_plan(
         views = open_views[:limit]
     unclaimed = [v for v in open_views
                  if not v["claim"] and not v["blocked_by"] and not v["covered_by"]]
-    ordering = _ordering_view(open_views)
+    trust = _order_trust(open_views)
     nxt = unclaimed[0] if unclaimed else None
     by_state = await _counts_by_state(session, repo, plan_id, exact)
     in_scope = sum(by_state.values()) if include_done else by_state.get("open", 0)
@@ -1314,10 +1322,13 @@ async def read_plan(
         # The caveat rides on `next` and not only in `ordering`, because the whole
         # point of `next` is that it is read alone.
         "next": None if nxt is None else
-                {**nxt, "caveat": _next_caveat(nxt, ordering, len(open_views))},
+                {**nxt, "caveat": _next_caveat(nxt, trust, len(open_views))},
         # Always present, `trusted: true` and all — a flag that appears only when
-        # things are wrong is one a client never learns to look for.
-        "ordering": ordering,
+        # things are wrong is one a client never learns to look for. Named for the
+        # question it answers rather than `ordering`, because `GET /plan/order`
+        # answers a different one and two adjacent reads called the same thing is
+        # how a word stops meaning anything.
+        "order_trust": trust,
         "counts": {
             "open": len(open_views),
             "claimed": sum(1 for v in open_views if v["claim"]),
@@ -2192,6 +2203,11 @@ def _order_entry(placement: dict, view: dict, evidence: dict) -> dict:
         "title": view["title"],
         "ref": view["ref"],
         "rank": view["rank"],
+        # WHO chose that rank (#183). A move is a different proposition depending
+        # on whether the position it replaces was decided by a human or was merely
+        # where `plan_add` put the row — and this endpoint's whole argument is
+        # that a reader must be able to tell derived from judged.
+        "rank_source": view["rank_source"],
         # Evidence, never a rule. A claim expires passively, so ordering on it
         # would make the sequence flap on a TTL — and `next` already skips a
         # claimed item, which is the behaviour that question actually wants.

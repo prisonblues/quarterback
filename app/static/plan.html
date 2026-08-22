@@ -86,7 +86,7 @@ const showDone = document.getElementById("showDone");
 // counts and the `next` the SERVER computed over the whole scope. They travel as one
 // because they have to agree — the header, the list and the next panel used to be
 // worked out separately here, over a subset, and so disagreed on the same page load.
-let plan = {items:[], counts:{}, next:null, ordering:{}};
+let plan = {items:[], counts:{}, next:null, order_trust:{}};
 let repos = new Set(); // every repo scope seen, so the filter can be built from data
 let gen = 0;           // read generation — a reply from a superseded read is discarded
 let busy = false;      // a write is in flight — the 20s tick must not read back over it
@@ -219,7 +219,7 @@ function render(){
   // `next` walks rank order, so it is exactly as good as the ranks are. The page
   // says so in the same panel rather than somewhere a reader has to go looking:
   // this is the surface where the answer is fixed, one drag at a time.
-  const ord = plan.ordering || {};
+  const ord = plan.order_trust || {};
   const caveat = (next && next.caveat) ? next.caveat
     : (!next && ord.trusted === false && ord.hint) ? ord.hint : null;
   nextEl.innerHTML = next
@@ -260,7 +260,7 @@ async function load(){
   // filter change or over a list that has just been reordered.
   if(my !== gen) return;
   plan = {items: d.items || [], counts: d.counts || {}, next: d.next || null,
-          ordering: d.ordering || {}};
+          order_trust: d.order_trust || {}};
   const seen = new Set(plan.items.map(it => it.repo || "(fleet)"));
   // Only the unscoped (all) read sees every repo, so only it may REPLACE the option
   // list; a repo read returns that repo plus the fleet band, and the fleet read returns

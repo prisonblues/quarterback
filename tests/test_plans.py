@@ -131,8 +131,8 @@ async def test_a_submitted_plan_says_the_submitter_chose_its_order(client):
     assert [i["rank_source"] for i in out["items"]] == ["appended", "submitted"]
 
     plan = await read(client, repo, exact=True)
-    assert plan["ordering"]["by_source"] == {"appended": 1, "submitted": 1}
-    assert plan["ordering"]["from_rank"] == 1
+    assert plan["order_trust"]["by_source"] == {"appended": 1, "submitted": 1}
+    assert plan["order_trust"]["from_rank"] == 1
 
 
 async def test_each_submission_leaves_exactly_one_position_nobody_chose(client):
@@ -145,9 +145,9 @@ async def test_each_submission_leaves_exactly_one_position_nobody_chose(client):
     await submitted(client, repo, "second block", [item(97), item(98)])
 
     plan = await read(client, repo, exact=True)
-    assert plan["ordering"]["by_source"] == {"appended": 2, "submitted": 2}
-    assert plan["ordering"]["trusted"] is False
-    assert plan["ordering"]["unchosen"] == 2
+    assert plan["order_trust"]["by_source"] == {"appended": 2, "submitted": 2}
+    assert plan["order_trust"]["trusted"] is False
+    assert plan["order_trust"]["unchosen"] == 2
 
 
 async def test_a_circular_batch_edge_is_refused_before_anything_is_written(client):

@@ -837,7 +837,7 @@ def plan_read(ctx: Context, repo: str | None = None, plan: str | None = None,
     **Check `next.caveat` before you act on `next`.** The answer is worked out
     from ranks, so it is exactly as good as the ranks are — and an item that was
     appended sits last because that was all `plan_add` could do, not because
-    anybody decided it was least important. `ordering` says how much of the
+    anybody decided it was least important. `order_trust` says how much of the
     sequence was actually chosen and from which rank it stops meaning anything;
     `caveat` is that fact carried to whoever reads only the headline. When it is
     set, read the notes rather than trusting the number.
