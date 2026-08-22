@@ -17,6 +17,29 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.80 — Every decision owed to a human now leaves the fleet by one door, and it is the board
+
+The harness stops and says *a human has to answer this* in four places. Each one reported somewhere different, and none of them reported to the board — the one surface a human actually watches, and the one already carrying exactly this traffic from every other project in the fleet. `epic.py` printed its not-agent-doable ruling to stdout, so an unattended epic run's entire human-decision output lived in a systemd journal. `preland` returned an exit code. A panel seat had no way to say it at all. A fixer's escalation reached a PR comment thread and a new issue.
+
+The measurement #274 was filed on: `GET /review/stats?days=30` returned `by_outcome: {fixed: 24, refuted: 1, deferred: 0, …}` — over thirty days, across sixty-five rounds, **not one escalation was recorded as one**, while two issues sat open as literal deferred-finding backlogs. The escalation path documented at length in three skill files had never once been exercised through its own API.
+
+### One function, not four call sites
+
+`harness/loops/needs_human.py` is the door. Every producer calls `announce()` and nothing else decides where an escalation goes. That is deliberate and it is the whole design: #328 proposes a `blockers` row as the durable store for the same judgement, and the two are not alternatives — the row is where a blocker lives, the post is how a person finds out one was raised. When that row lands there is one function to repoint and four producers that do not change. A destination spread across four modules is how "two stores for one fact" gets built by accident.
+
+### The four doors, wired
+
+- **`epic.py`'s ruling.** A blocked sub-issue announces, with the class the triage judge now names — the prompt asks for one, so "needs a licence" and "somebody has to look at this on a phone" stop being the same row. An untriaged issue announces as `environment` rather than `decision`: nobody decided anything, the judge never ran, and every branch that produces one of those diagnoses is about the box. A dry run announces nothing; a plan preview naming what a run *would* be stuck on is how a queue fills with questions nobody is blocked by.
+- **`preland`'s HOLD.** Only the reasons a person has to clear. `Check.hold_for_human` records the class beside the sentence at the seven sites where the remedy named is a human's — a merge conflict, a repo with no CI at all, a board this box cannot read, a reconciler that declined. A checkout at the wrong commit and a PR missing from the landing queue stay silent, because a gate that posted every HOLD would be a CI log with an addressee. The payload gains `needs_human`, so a caller can tell the two kinds apart without pattern-matching prose.
+- **The panel's seats.** A finding carries `needs_human`, `needs_human_class` and `needs_human_reason` from the seat's own reply through the merge to `POST /review`, per reporter as well as per finding — because a flag is a way *out* of work, and the rate at which each seat reaches for one is only enforceable on the row it is scored by. A bare flag is refused before the board has to refuse it, and two reporters disagreeing about the class keep both.
+- **`panel.py --escalated-from-board`.** The escalation list read off the board's own `needs_human_keys` instead of typed by hand. This is the half that makes the flag get used: a key a fixer has to transcribe out of its own prose is a key nobody transcribes, and thirty days of rounds prove it. A board too old to publish the field is reported as a capability answer, never as an empty list.
+
+### A flag costs a reason, at this boundary too
+
+An announcement with no non-blank reason is refused and says so. An unrecognised class is announced under `other` with the spelling named, never dropped — the same rule `needs_human_unknown` follows at ingest, because dropping what you do not understand without a word is the failure being repaired. The same question is announced once every twelve hours rather than once per tick, so a gate that runs on every landing attempt and an epic on a timer do not turn the board into the notification bus #253 measured the cost of.
+
+The vocabulary is `app/needs_human.py`'s and is imported from it, by file path, whenever a checkout is in reach. An installed harness has no `app/` beside it, so there is a pinned copy for that case and `tests/test_needs_human_drift.py` fails if the two ever disagree.
+
 ## v2.79 — the loop gets a ceiling in both directions, and a person holds the key
 
 An autonomous loop had no limit on what it could take on or how much it could
