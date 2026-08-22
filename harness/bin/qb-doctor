@@ -586,14 +586,34 @@ def check_harness(host: Host) -> Check:
                      f"identical to {src} ({len(list(src.iterdir()))} files)", "ok")
     parts = []
     if missing:
-        parts.append(f"{len(missing)} absent ({', '.join(sorted(missing)[:4])})")
+        parts.append(f"{len(missing)} absent ({_named(missing)})")
     if differ:
-        parts.append(f"{len(differ)} differ ({', '.join(sorted(differ)[:4])})")
+        parts.append(f"{len(differ)} differ ({_named(differ)})")
     return Check("harness", str(host.harness_bin),
                  "behind this checkout: " + ", ".join(parts), "fail",
                  manual="bump the quarterback-harness flake input on this host and rebuild "
                         "(#267 — nothing bumps it for you)",
                  extra={"differ": sorted(differ), "missing": sorted(missing)})
+
+
+#: How many names a drift list spells out before it elides the rest. The row is
+#: one line and `harness/bin` is around 30 files, so a cap has to exist; what may
+#: not happen is applying one silently.
+NAME_CAP = 4
+
+
+def _named(names: set[str]) -> str:
+    """The names, capped, with any elision SAID rather than left to be noticed (#358).
+
+    The count beside this list is the full length, so a list that quietly stops at
+    the cap contradicts the number in front of it — and because the count is the
+    honest half, a reader who counts the names concludes the count is broken and
+    stops trusting the row. `+N more` is the shape `qb-dash` already uses when it
+    trims a table.
+    """
+    shown = sorted(names)[:NAME_CAP]
+    rest = len(names) - len(shown)
+    return ", ".join(shown) + (f", +{rest} more" if rest else "")
 
 
 def _harness_drift(src: Path, installed: Path) -> tuple[set[str], set[str]]:

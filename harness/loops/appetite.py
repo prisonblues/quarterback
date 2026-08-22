@@ -405,6 +405,20 @@ def author_allowed(rules: dict, author: str) -> tuple[bool, str]:
                    f"issue_pickup.allowed_authors")
 
 
+def author_verdict(cfg: dict, author: str) -> Verdict:
+    """May this author's text drive anything in this repo?
+
+    :func:`author_allowed` against the repo's config rather than against a rules
+    block a caller had to dig out itself. Public because the allowlist bounds
+    more than picking work up: #63's watcher writes a comment saying what
+    decision an issue is waiting on, and whose issue it will write on is the same
+    question with the same answer. A consumer reading `allowed_authors` for
+    itself is a second reading of the one setting that must not have two.
+    """
+    ok, why = author_allowed(_rules(cfg, "issue_pickup"), author)
+    return Verdict(ok, why, "issue_pickup.allowed_authors")
+
+
 def pickup_verdict(cfg: dict, issue: dict, *,
                    events: list[dict] | None = None) -> Verdict:
     """May a loop pick this issue up of its own accord?
@@ -425,9 +439,9 @@ def pickup_verdict(cfg: dict, issue: dict, *,
         return Verdict(False, f"issue pickup is off for this repo (#{num})",
                        "issue_pickup.enabled")
 
-    ok, why = author_allowed(rules, str(issue.get("author") or ""))
-    if not ok:
-        return Verdict(False, f"#{num}: {why}", "issue_pickup.allowed_authors")
+    who = author_verdict(cfg, str(issue.get("author") or ""))
+    if not who.allowed:
+        return Verdict(False, f"#{num}: {who.reason}", "issue_pickup.allowed_authors")
 
     # Before the allowlist, not after: a `p0` issue that a person has also marked
     # `needs-human/decision` is refused for the reason that actually matters, and
@@ -464,6 +478,34 @@ def pickup_verdict(cfg: dict, issue: dict, *,
                        "issue_pickup.require_human_triage", {"matched": matched})
     return Verdict(True, f"#{num} human-triaged: {why}",
                    "issue_pickup.require_human_triage", {"matched": matched})
+
+
+def events_needed(cfg: dict) -> bool:
+    """Can `pickup_verdict`'s answer turn on the label event log for this repo?
+
+    `label_events` is a paginated API call per issue and a watcher sweeping a
+    backlog makes one per candidate, so callers skip it where it cannot change
+    the verdict. Answered here rather than at each call site because "which
+    settings make the log matter" is a fact about this gate: a third setting
+    that consulted the log would otherwise have to be remembered in three places,
+    and the failure of forgetting is a gate that silently stops reading who
+    applied the label.
+    """
+    rules = _rules(cfg, "issue_pickup")
+    return (_flag(rules, "issue_pickup", "enabled")
+            and _flag(rules, "issue_pickup", "require_human_triage"))
+
+
+def unattended_writes_allowed(cfg: dict) -> bool:
+    """May an unattended run write to this repo's tracker?
+
+    `issue_filing.unattended` restates #40's standing decision as config, and a
+    comment posted by a loop nobody is watching is the same decision as an issue
+    filed by one. Exposed rather than left to each consumer's own reading of the
+    block: #63's watcher wants the answer and a second switch meaning the same
+    thing is how the two come to disagree.
+    """
+    return _flag(_rules(cfg, "issue_filing"), "issue_filing", "unattended")
 
 
 # ------------------------------------------------------------------- filing
@@ -671,12 +713,9 @@ def cmd_pickup(args) -> int:
                      "--json", "number,labels,author"], cfg["github"])
     labels = label_names(issue.get("labels"))
     author = (issue.get("author") or {}).get("login", "")
-    rules = _rules(cfg, "issue_pickup")
     # Only fetched when it can change the answer — the event log is a paginated
     # call per issue, and a watcher sweeping a backlog makes one per candidate.
-    events = (label_events(cfg["github"], args.number)
-              if _flag(rules, "issue_pickup", "enabled")
-              and _flag(rules, "issue_pickup", "require_human_triage") else [])
+    events = label_events(cfg["github"], args.number) if events_needed(cfg) else []
     return _emit(pickup_verdict(cfg, {"number": args.number, "labels": labels,
                                       "author": author}, events=events),
                  args.as_json)

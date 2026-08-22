@@ -1466,6 +1466,9 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.88** — the migration-heads guard now runs where the fleet actually merges.
 - **v2.89** — a dial and a worktree are the same repository however the remote is spelt.
 - **v2.90** — a session can be started by something other than a hand, and it ships off.
+- **v2.91** — qb-doctor's harness row stops counting five files and naming four.
+- **v2.92** — the pre-push hook stops telling you to renumber a graph it never counted.
+- **v2.93** — an issue watcher that reads the tracker and mostly declines.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
