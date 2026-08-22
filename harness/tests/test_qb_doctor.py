@@ -23,6 +23,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -779,6 +780,98 @@ def test_an_install_that_matches_through_both_artefacts_is_ok_and_still_sees_abs
     assert check.verdict == "fail"
     assert check.extra == {"differ": [], "missing": ["qb-new"]}
     assert "1 absent (qb-new)" in check.detail
+
+
+# --------------------------------------------------------------------------- #
+# harness — a list that is capped has to SAY it was capped (#358)
+# --------------------------------------------------------------------------- #
+
+#: `N absent (…)` / `N differ (…)`: the count the row states, and the names it offers
+#: as that count. The regression is entirely the gap between the two.
+COUNTED_LIST = re.compile(r"(\d+) (absent|differ) \(([^)]*)\)")
+
+#: The elision marker, matched whole rather than by suffix — a file called `one-more`
+#: is a name the row listed, not a claim about names it did not.
+ELIDED = re.compile(r"^\+(\d+) more$")
+
+
+def _drifted(repo: Path, tmp_path: Path, *, differ: int, absent: int) -> qd.Check:
+    """An install behind the checkout by exactly this much GENUINE drift.
+
+    Differing files differ in their body, not their shebang, so nothing here is a
+    packaging artefact and #353's exclusions have nothing to take out.
+    """
+    src = repo / "harness" / "bin"
+    src.mkdir(parents=True)
+    installed = tmp_path / "store" / "bin"
+    installed.mkdir(parents=True)
+    for i in range(differ):
+        (src / f"qb-differ-{i}").write_text(f"#!/bin/sh\nexec qb {i} new\n")
+        (installed / f"qb-differ-{i}").write_text(f"#!/bin/sh\nexec qb {i} old\n")
+    for i in range(absent):
+        (src / f"qb-absent-{i}").write_text(f"#!/bin/sh\nexec qb {i}\n")
+    return qd.check_harness(host_for(repo, harness_bin=installed,
+                                     source_harness=installed.parent))
+
+
+def _accounted(detail: str) -> list[tuple[str, int, int]]:
+    """Each counted list in the row as `(label, the count it states, names it accounts
+    for)` — where a trailing `+N more` accounts for N of them."""
+    out = []
+    for count, label, listed in COUNTED_LIST.findall(detail):
+        names = [n.strip() for n in listed.split(",") if n.strip()]
+        elided = 0
+        tail = ELIDED.match(names[-1]) if names else None
+        if tail:
+            elided = int(tail.group(1))
+            names.pop()
+        out.append((label, int(count), len(names) + elided))
+    return out
+
+
+def test_a_capped_differ_list_says_the_cap_was_applied(repo, tmp_path):
+    """The row that filed #358 read `5 differ (four names)` and dropped the fifth in
+    silence. The count was the honest half, which is the confusing way round: a reader
+    who counts the names concludes the COUNT is broken and stops trusting the row."""
+    check = _drifted(repo, tmp_path, differ=6, absent=0)
+    assert check.verdict == "fail"
+    assert ("6 differ (qb-differ-0, qb-differ-1, qb-differ-2, qb-differ-3, +2 more)"
+            in check.detail)
+    assert len(check.extra["differ"]) == 6, "--json still carries every name"
+
+
+def test_the_absent_list_is_capped_the_same_way_and_says_so(repo, tmp_path):
+    """Both halves of the row had the same cap written the same way, so both halves
+    get the same fix — a person reading one learns nothing about the other."""
+    check = _drifted(repo, tmp_path, differ=0, absent=5)
+    assert ("5 absent (qb-absent-0, qb-absent-1, qb-absent-2, qb-absent-3, +1 more)"
+            in check.detail)
+    assert len(check.extra["missing"]) == 5
+
+
+def test_a_list_at_the_cap_names_everything_and_claims_no_elision(repo, tmp_path):
+    """The boundary: exactly `NAME_CAP` names is a complete list, and appending
+    `+0 more` to it would be a second way of lying about the same thing."""
+    check = _drifted(repo, tmp_path, differ=qd.NAME_CAP, absent=1)
+    assert "more" not in check.detail, check.detail
+    assert f"{qd.NAME_CAP} differ (" in check.detail
+
+
+@pytest.mark.parametrize("differ, absent", [(0, 9), (9, 0), (5, 5), (4, 4), (1, 30)])
+def test_every_counted_list_in_the_harness_row_accounts_for_every_name_it_counts(
+        repo, tmp_path, differ, absent):
+    """The guard, and the reason it parses the row instead of asserting one string:
+    the defect is not "the cap is 4", it is "a cap was applied and not mentioned". So
+    this reads whatever the row prints and holds it to its own arithmetic — any list
+    that starts eliding without saying so fails here, whatever the cap becomes and
+    whichever of the two lists grows a third."""
+    check = _drifted(repo, tmp_path, differ=differ, absent=absent)
+    parsed = _accounted(check.detail)
+    assert parsed, f"no counted list found in: {check.detail}"
+    assert len(parsed) == bool(differ) + bool(absent)
+    for label, count, accounted in parsed:
+        assert accounted == count, (
+            f"{label}: the row counts {count} and accounts for {accounted} — {check.detail}")
 
 
 def test_the_content_comparison_says_in_the_code_that_it_is_a_proxy(tmp_path):
