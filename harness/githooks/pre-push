@@ -8,7 +8,9 @@
 #      head. `alembic upgrade head` refuses to run against a two-headed graph, and the
 #      deployed database is then stuck wherever the last deploy left it. Delegated to the
 #      repo's own `migration_reconcile.py heads --ref`, which already answers this from
-#      files at a ref.
+#      files at a ref. Two refusals, not one, because the reconciler has two answers here
+#      and only the first wants a renumber: it counted the heads and the count was not one,
+#      or it DECLINED TO ANSWER and there is no head count to report (#357).
 #   2. A branch that stamped a release number somebody else has since taken. Fork-relative:
 #      the question is whether THIS branch claimed the number, which needs the merge base as
 #      a third reference point. Delegated to the repo's own `release_stamp.py collision`.
@@ -338,17 +340,69 @@ check_migration_heads() {
         err=""
     fi
 
-    # 2 is the reconciler's documented "stop": the graph at this ref is not one it will
-    # accept — not single-headed, a cycle, or a duplicate revision id. Anything else is the
-    # tool failing to answer, and the two must not be reported as the same thing: a refusal
-    # that asserts a two-headed graph over what was really a Python traceback sends the
-    # reader to renumber a graph that is fine. lexray's hook hedges this in one sentence
-    # ("or the check failed"); saying which is cheap here because the exit code says it.
-    if (( rc == 2 )); then
+    # 2 is the reconciler's documented "stop", and it arrives for two materially different
+    # outcomes that must not be reported as one thing (#357).
+    #
+    #   * It COUNTED the heads and the count was not one. A graph defect: the ids are on
+    #     stdout, `# N head(s)` on stderr, and renumbering or a merge revision is the answer.
+    #     A cycle is this case too, counted as zero.
+    #   * It DECLINED TO ANSWER — a duplicate revision id, a migration it cannot parse, git
+    #     failing underneath it. No head count was ever produced, and the graph may be
+    #     perfectly single-headed. Telling that reader "not exactly one head" sends them off
+    #     to renumber something that was fine, which is worse than the refusal was
+    #     protecting against.
+    #
+    # The signal is the reconciler's own `STOP: ` line, which `main()` prints on stderr for
+    # every `ReconcileError` and which nothing else it emits begins with — the same
+    # predicate on the same marker as the `migration-heads` job in
+    # `.github/workflows/tests.yml` (#351 / PR #355), which is the reference implementation
+    # for this split. `tests/test_migration_reconcile.py` pins that contract at the tool, so
+    # the two callers read one documented marker rather than each inferring one.
+    #
+    # The EXIT CODE is deliberately not what carries this, and that decision is #357's other
+    # half. A third code would be the cleaner contract in a repo where tool and caller ship
+    # as one unit, and this is not one: the hook ships with the harness into repos whose
+    # `migration_reconcile.py` is that repo's own copy and can be older than the hook. Every
+    # version of the tool has printed `STOP: `; only versions from #357 onwards would emit a
+    # new code. A hook keying the decline branch off a code the reconciler in front of it
+    # does not emit would print the renumber message for a decline — this bug, reintroduced
+    # in exactly the deployment the harness exists to serve. The string is the signal that
+    # is true of every version.
+    #
+    # Anchored at line start, and read across BOTH captures: when `mktemp` is unavailable
+    # the two streams are merged into `$out`, and a head id never begins a line with `STOP:`.
+    #
+    # A here-string and NOT `printf … | grep -q`, which is the same SIGPIPE-under-pipefail
+    # trap `chain_delegate` documents at the top of this file. `grep -q` exits the moment it
+    # matches; if the diagnostic is larger than the pipe buffer, `printf` is still writing,
+    # dies of SIGPIPE, and `pipefail` hands the pipeline 141 — so the pipeline reports
+    # FAILURE on exactly the input that matched, and a decline is then reported as a head
+    # count. That is this bug wearing a size threshold, invisible on every short message.
+    local declined=0
+    grep -q '^STOP: ' <<<"$out"$'\n'"$err" && declined=1
+
+    if (( rc == 2 && declined == 1 )); then
+        refuse \
+            "REFUSE: the migration reconciler will not accept the graph at ${sha:0:12}, so" \
+            "        pushing $branch would leave the base in a state 'alembic upgrade head'" \
+            "        cannot be trusted to run. It never counted the heads, so this is not a" \
+            "        report that the graph has more than one — the cause is usually a" \
+            "        duplicate revision id, sometimes a migration it cannot read. It says" \
+            "        which:" \
+            "" \
+            "$(printf '%s\n%s\n' "$out" "$err" | sed '/^$/d; s/^/          /')" \
+            "" \
+            "        Reconcile before pushing — the tool chooses the resolution:" \
+            "            $py $reconciler preflight${BASE_REF:+ --onto $BASE_REF}" \
+            "            $py $reconciler apply${BASE_REF:+ --onto $BASE_REF}" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    elif (( rc == 2 )); then
         refuse \
             "REFUSE: pushing $branch would leave the migration graph in a state" \
-            "        'alembic upgrade head' cannot run. The reconciler refuses the graph at" \
-            "        ${sha:0:12} — not exactly one head, a cycle, or a duplicate revision id:" \
+            "        'alembic upgrade head' cannot run. The reconciler counted the heads at" \
+            "        ${sha:0:12} and the count was not exactly one:" \
             "" \
             "$(printf '%s\n%s\n' "$out" "$err" | sed '/^$/d; s/^/          /')" \
             "" \

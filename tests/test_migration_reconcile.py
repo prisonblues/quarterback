@@ -1063,6 +1063,49 @@ def test_heads_exits_zero_on_a_single_head_and_two_on_a_split(collided_repo: Pat
     assert mr.main(["heads", "--repo", str(collided_repo), "--ref", "HEAD"]) == 2
 
 
+def test_a_counted_two_and_a_declined_two_are_told_apart_by_stop(collided_repo: Path, capsys):
+    """The contract behind exit 2, pinned here rather than inferred at each caller.
+
+    `heads` exits 2 for two answers that want opposite remedies: it counted the heads and
+    the count was not one, or it declined to build the graph at all and there is no count.
+    Both `harness/githooks/pre-push` and the `migration-heads` job in
+    `.github/workflows/tests.yml` split them on the `STOP: ` line, and neither has any other
+    way to — so the day that prefix is reworded, both silently report every decline as a
+    head count and send readers off to renumber graphs that are fine (#357, #351/PR #355).
+
+    Asserted as a pair, in one test, because the property is the DIFFERENCE: a marker
+    present on both sides distinguishes nothing, and two separate tests would each pass
+    while the pair was useless.
+    """
+    _git(collided_repo, "checkout", "-q", "-b", "split")
+    _write(collided_repo, "0018_third.py", "0018b", "0017", "third")
+    _commit(collided_repo, "a second head, and no duplicate")
+
+    assert mr.main(["heads", "--repo", str(collided_repo), "--ref", "HEAD"]) == 2
+    counted = capsys.readouterr()
+    assert "STOP: " not in counted.err, (
+        "a counted two-head graph must not carry the decline marker, or every caller reads "
+        f"a graph defect as a refusal:\n{counted.err}"
+    )
+    assert "0018" in counted.out and "0018b" in counted.out, counted.out
+    assert "# 2 head(s)" in counted.err, counted.err
+
+    _git(collided_repo, "checkout", "-q", "feature")
+    _git(collided_repo, "merge", "-q", "--no-edit", "main")
+
+    assert mr.main(["heads", "--repo", str(collided_repo), "--ref", "HEAD"]) == 2
+    declined = capsys.readouterr()
+    assert declined.err.startswith("STOP: "), (
+        f"a declined graph must announce itself as one:\n{declined.err}"
+    )
+    assert declined.out == "", (
+        f"a decline must not put a head list on stdout it never computed:\n{declined.out}"
+    )
+    assert "head(s)" not in declined.err, (
+        f"and it must not print a count either:\n{declined.err}"
+    )
+
+
 def test_an_integration_ref_with_no_migrations_is_not_a_stop():
     """`cmd_heads` calls a migration-free ref fine, so the planner must agree — landing
     the very first migration into a fresh repo was blocked with "integration ref has 0
