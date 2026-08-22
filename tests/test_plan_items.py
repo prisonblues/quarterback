@@ -1145,6 +1145,35 @@ async def test_placing_does_not_renumber_history(client):
     assert still == was
 
 
+async def test_placing_is_exact_even_where_two_open_items_share_a_rank(client):
+    """Ranks are not guaranteed distinct: a dropped item keeps the rank it had
+    while a reorder renumbers what is still open, so putting it back can leave two
+    open rows at one rank. "Immediately after that item" is then a promise
+    `rank + 1` cannot keep — anchored to the first of the pair it lands after
+    BOTH."""
+    repo = "acme/placedupe"
+    a = await issue(client, repo, 855)
+    b = await issue(client, repo, 856)
+    c = await issue(client, repo, 857)
+    await client.post("/plan/item/update",
+                      json={"item_id": b["item_id"], "state": "dropped"}, headers=HUMAN)
+    await client.post("/plan/reorder",
+                      json={"repo": repo, "order": [a["item_id"], c["item_id"]]},
+                      headers=HUMAN)
+    await client.post("/plan/item/update",
+                      json={"item_id": b["item_id"], "state": "open"}, headers=HUMAN)
+    live = await read(client, repo, exact="true")
+    assert [i["rank"] for i in live["items"]] == [1, 2, 2], "the duplicate this is about"
+
+    placed = await add(client, repo, "immediately after b", after=b["item_id"])
+    after = await read(client, repo, exact="true")
+    assert [i["item_id"] for i in after["items"]] == [
+        a["item_id"], b["item_id"], placed["item_id"], c["item_id"]]
+    # And the duplicate is gone: a placement writes the order it read back as
+    # 1..n, which changes no pair's relative order and repairs the degenerate rank.
+    assert [i["rank"] for i in after["items"]] == [1, 2, 3, 4]
+
+
 async def test_placing_does_not_reset_the_staleness_clock_of_what_it_moves(client):
     """`updated_at` is "has anybody paid this item attention", and being
     renumbered is not attention. One placement must not make a fortnight-old

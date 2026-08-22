@@ -914,23 +914,42 @@ async def _place_rank(session: AsyncSession, repo: str | None, anchor: PlanItem,
     read-then-write over the same ranks, and two placements computing room from
     one snapshot is the same lost update.
 
+    **It renumbers the scope's open items rather than adding one to every rank
+    past a number**, and that is the difference between keeping the promise and
+    nearly keeping it. Ranks are not guaranteed distinct: a dropped item keeps the
+    rank it had while a reorder renumbers everything still open around it, so a
+    human putting it back can leave two open items sharing a rank — a state the
+    list survives (the read breaks ties on ``created_at``, so it stays total) and
+    that arithmetic on rank alone cannot place into. Anchored to the first of two
+    items sharing rank 3, ``rank + 1`` puts the new row after BOTH of them, which
+    is not what "immediately after that item" says. Reading the order and writing
+    it back 1..n puts the row exactly where the caller asked, and repairs the
+    duplicate on the way past without asserting anything — every existing pair
+    keeps the relative order it was read in, which is the whole rule placement
+    lives under.
+
     **OPEN items only, exactly as a reorder renumbers only open ones.** History
     keeps the rank it had — a done row is a record of finished work, not a
-    position — so a shift that renumbered it would rewrite the record every time
-    somebody placed an item above it.
+    position — so renumbering it would rewrite the record every time somebody
+    placed an item above it.
 
-    ``updated_at`` is deliberately NOT touched on the rows that shift. Staleness
-    is "has anybody paid this item any attention", and being renumbered is not
+    ``updated_at`` is deliberately NOT touched on the rows that move. Staleness is
+    "has anybody paid this item any attention", and being renumbered is not
     attention: bumping it would let one placement make a fortnight-old plan read
     as fresh, which is precisely the plan that is believed and wrong.
     """
-    rank = anchor.rank if before else anchor.rank + 1
-    await session.execute(
-        update(PlanItem)
-        .where(PlanItem.state == "open", PlanItem.rank >= rank,
-               PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo)
-        .values(rank=PlanItem.rank + 1))
-    return rank
+    items = await _scope_items(session, repo, exact=True, include_done=False)
+    at = next((n for n, item in enumerate(items) if item.id == anchor.id), None)
+    if at is None:  # pragma: no cover — `_resolve_anchor` just read it in this scope
+        raise _place_refused("after", str(anchor.id), "no longer in this scope",
+                             "read the plan again: it moved while this was in flight")
+    # How many existing items end up ABOVE the new one.
+    above = at if before else at + 1
+    for n, item in enumerate(items):
+        want = n + 1 if n < above else n + 2
+        if item.rank != want:
+            item.rank = want
+    return above + 1
 
 
 async def _counts_by_state(session: AsyncSession, repo: str | None,
