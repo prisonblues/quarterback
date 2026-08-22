@@ -203,6 +203,14 @@
           # reads, and a guard inert in the sandbox it protects is no guard, which is the
           # point Codex made on #264's earlier cut and it holds identically for this one.
           install -Dm644 ${./flake.nix} flake.nix
+          # `.harness-rules.sample` for the same reason and at the same level (#337).
+          # This repo has no live `.harness-rules`, so the sample IS the policy that
+          # governs it unattended — and the two assertions that read it are the ones
+          # saying the in-flight ceiling still ships at `null`. That is a claim about
+          # THIS repo's behaviour on upgrade, so it has to be checked wherever the
+          # suite runs; without this line both would ERROR on a missing file rather
+          # than be evaluated, which is #163's mechanism exactly.
+          install -Dm644 ${./.harness-rules.sample} .harness-rules.sample
           chmod -R u+w harness
           # test_release_numbers.py is not a harness test and cannot run in this
           # sandbox: it reads CHANGELOG.md, README.md, pyproject.toml, app/main.py
