@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Does this checkout's `.env` name a database another checkout is also using?
+
+`create-worktree` gives a worktree its own database copy and rewrites the
+worktree's `.env` to name it. Three routes end with a worktree whose `.env` still
+names the MAIN checkout's database, and none of them announces itself:
+
+* `--shared-db` was passed, deliberately, by someone who did not expect to run a
+  suite that truncates;
+* the worktree predates per-worktree databases entirely, and was **reused** —
+  `create-worktree` refuses an existing directory, so nothing re-provisions it
+  and nothing re-checks it;
+* no PostgreSQL container was running when the worktree was made, so the copy was
+  skipped with a yellow note and the `.env` left pointing at the main database.
+
+The first two are #340. What they have in common is that the decision was made
+somewhere upstream and the *resolved* `.env` was never asked. So this asks it,
+from outside, about whatever checkout it is pointed at — provisioned, reused or
+inherited, it is the same question and the same answer.
+
+    check-db-isolation [CHECKOUT]
+
+Exit 0 when this checkout may safely rebuild its target, 1 when it must not, 2
+for a usage error. A refusal names the database, the variable, and the checkout
+that owns it.
+
+**It asks the `.env`, not the environment.** An exported `DATABASE_URL` overrides the
+file for anything that resolves the way `dbtarget` does, and this does not read it —
+deliberately: `PGDATABASE` and `POSTGRES_DB` are variables people export in a shell
+profile, and a check that refused every worktree on the box because of one would be
+switched off within a day. The environment is the suite guard's to catch, at the point
+where the environment that matters is the one the run is actually in.
+
+**It is not the test suite's guard and does not replace it.** `tests/dbtarget.py`
+refuses at pytest start, which is the backstop that has to hold; this runs
+*before* the work, where the answer is still cheap to act on — the difference
+between "re-provision the worktree now" and "the suite refused after an hour".
+The two agree because they are the same code: everything below the shared-guard
+marker in `templates/dbtarget.py` is byte-identical to the copy this repo's suite
+imports, held there by `tests/test_dbtarget.py`.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+
+from pathlib import Path
+
+#: The variables a checkout can name its database in. `create-worktree` rewrites
+#: exactly this set (see its `db_name_vars`), so a value it missed is a value one
+#: of these still holds — which is the residual case this has to catch.
+CONVENTIONAL_VARS = ("DATABASE_URL", "DB_NAME", "DATABASE_NAME", "POSTGRES_DB", "PGDATABASE")
+
+
+def load_dbtarget():
+    """The shared guard, imported from wherever this script is installed.
+
+    Two layouts, because the harness has two: a source checkout, where
+    `templates/` is a sibling of `bin/`, and the nix store, where `bin/` is a
+    sibling of `share/quarterback-harness/`. `$QB_DBTARGET` overrides both, which
+    is what the tests use — they run the real file rather than a stub, since a
+    stub would verify this against parsing nobody ships.
+
+    Registered in `sys.modules` before it executes: the module defines a frozen
+    dataclass, and `@dataclass` looks its own module up by name while the class
+    body runs. Without the assignment that lookup returns None and the import
+    dies inside dataclasses.py, several frames from anything a reader would
+    connect to a missing line here.
+    """
+    here = Path(__file__).resolve().parent
+    candidates = [
+        Path(os.environ["QB_DBTARGET"]) if os.environ.get("QB_DBTARGET") else None,
+        here.parent / "templates" / "dbtarget.py",
+        here.parent / "share" / "quarterback-harness" / "templates" / "dbtarget.py",
+    ]
+    for path in candidates:
+        if path is not None and path.is_file():
+            spec = importlib.util.spec_from_file_location("qb_dbtarget", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules["qb_dbtarget"] = module
+            spec.loader.exec_module(module)
+            return module
+    tried = ", ".join(str(p) for p in candidates if p is not None)
+    sys.exit(f"check-db-isolation: cannot find dbtarget.py (tried: {tried})")
+
+
+def configured_vars(checkout: Path, main: Path | None) -> tuple[str, ...]:
+    """`CONVENTIONAL_VARS` plus whatever `.worktree.json` declares.
+
+    A repo that keeps its database name in a variable of its own — the same
+    `database.url_env` / `name_env` keys `create-worktree` reads — is a repo this
+    would otherwise wave through while the provisioner was rewriting the very
+    variable it declared. The conventional set is never dropped: the declared var
+    says where the name is *meant* to live, not where a stale copy of it is.
+    """
+    extra: list[str] = []
+    for root in (checkout, main):
+        if root is None:
+            continue
+        try:
+            config = json.loads((root / ".worktree.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        database = config.get("database")
+        if isinstance(database, dict):
+            extra += [str(database.get(key)) for key in ("url_env", "name_env")
+                      if isinstance(database.get(key), str) and database.get(key)]
+    return tuple(dict.fromkeys([*CONVENTIONAL_VARS, *extra]))
+
+
+def targets(dbtarget, checkout: Path, variables: tuple[str, ...]) -> list[tuple[str, str]]:
+    """Every (variable, value) in `checkout/.env` that names a database.
+
+    Empty values are dropped rather than compared. `same_database` fails closed —
+    it reads an unparseable target as "assume it collides" — so an empty
+    `PGDATABASE=` left in a `.env` would otherwise collide with every checkout on
+    the box and make the answer useless.
+    """
+    found = []
+    for var in variables:
+        value = dbtarget.env_file_value(var, checkout / ".env")
+        if value and dbtarget.database_name(value):
+            found.append((var, value))
+    return found
+
+
+def collides(dbtarget, mine: str, theirs: str) -> bool:
+    """Could these two values name the same database?
+
+    Two connection URLs go to `same_database`, which is the comparison the test suite's
+    guard makes: host aliases collapse, an omitted port is filled in with libpq's default,
+    and anything it cannot parse is read as a collision.
+
+    A **bare name** — `PGDATABASE=myapp`, the residual case create-worktree warns about —
+    carries no host and no port, so it cannot go through that comparison: `endpoint` fills
+    in 5432 for it, and the main checkout's URL naming port 5435 then reads as a different
+    server. That is the exact shape of the bug this exists to catch, waved through on a
+    port neither side stated. So a bare name is compared by name alone.
+
+    Fail-closed, and knowingly: two checkouts on genuinely different servers that spell the
+    database name the same way are refused. The alternative is inferring a host for a value
+    that has none, and the cost of the two errors is not symmetric — a wrong refusal costs
+    a `DB_HOST` read and an override; a wrong pass costs another checkout's data.
+    """
+    if "://" in mine and "://" in theirs:
+        return dbtarget.same_database(mine, theirs)
+    return dbtarget.database_name(mine) == dbtarget.database_name(theirs)
+
+
+def branch_of(checkout: Path) -> str:
+    """The branch `checkout` has out, for the `remove-worktree` hint.
+
+    `remove-worktree` takes a BRANCH and derives the directory itself, so pasting the
+    directory basename — the first thing to hand, and what the first draft of this
+    message printed — fails with a confusing "no such worktree". `create-worktree`'s
+    half-built warning got this wrong once and `test_create_worktree_db_name.py` pins it
+    there; the lesson is not specific to that script.
+
+    A detached HEAD or a git that will not answer leaves a placeholder rather than a
+    wrong name: this line is meant to be pasted.
+    """
+    try:
+        done = subprocess.run(["git", "-C", str(checkout), "symbolic-ref", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=15, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "<branch>"
+    return done.stdout.strip() if done.returncode == 0 and done.stdout.strip() else "<branch>"
+
+
+def refusal(dbtarget, checkout: Path, var: str, value: str,
+            owner: Path, owner_var: str, is_main: bool) -> str:
+    whose = "the MAIN checkout" if is_main else "a sibling worktree"
+    branch = branch_of(checkout)
+    return "\n".join([
+        f"REFUSING: {checkout}/.env names the database "
+        f"'{dbtarget.database_name(value)}', which belongs to {whose} ({owner}).",
+        f"  here:  {var}={dbtarget.redact(value)}",
+        f"  there: {owner_var} in {owner}/.env",
+        "  Anything that truncates or rebuilds the schema here — the test suite's",
+        "  teardown, a migration — destroys that checkout's data instead of this",
+        "  one's. Do not run it.",
+        "  Fix the .env to name this worktree's own database, or re-provision:",
+        f"    remove-worktree {branch}   # keeps the branch and its commits",
+        f"    create-worktree --from <base> {branch}",
+    ])
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 1:
+        print(f"usage: {Path(argv[0]).name} [CHECKOUT]", file=sys.stderr)
+        return 2
+    checkout = Path(argv[0] if argv else ".").resolve()
+    if not checkout.is_dir():
+        print(f"check-db-isolation: not a directory: {checkout}", file=sys.stderr)
+        return 2
+
+    dbtarget = load_dbtarget()
+    layout = dbtarget.repo_layout(checkout)
+    if layout.linked is False:
+        print(f"check-db-isolation: {checkout} is the main checkout — it owns its database.")
+        return 0
+    if layout.linked is None:
+        # Fail closed, and for the reason dbtarget's own `_unknown_owner_refusal`
+        # gives: this has a .git pointer file, so it IS a linked worktree, and
+        # "which checkout owns the target" going unanswered is not a no.
+        print(f"REFUSING: cannot tell which repository {checkout} belongs to, so whether "
+              f"its database belongs to another checkout is unknown — and unknown is not a "
+              f"yes.\n  Check `git -C {checkout} rev-parse --git-common-dir`.", file=sys.stderr)
+        return 1
+
+    variables = configured_vars(checkout, layout.main)
+    mine = targets(dbtarget, checkout, variables)
+    elsewhere = [(other, found) for other in layout.others
+                 if (found := targets(dbtarget, other, variables))]
+
+    if not mine:
+        # "Names nothing" is not the same as "targets nothing". An application whose
+        # `.env` is silent falls back to a compiled-in default, and that default is the
+        # DEV database by construction — `dbtarget.DEV_FALLBACK_URL` is exactly that, and
+        # its own comment says a worktree reaching it is the bug. So a worktree naming no
+        # database while another checkout names one is refused: what it will actually
+        # connect to is unknown, and unknown is not a yes.
+        #
+        # A repo where NO checkout names a database is the quiet case and stays quiet —
+        # there is no database to protect and nothing to be wrong about.
+        if not elsewhere:
+            print(f"check-db-isolation: {checkout}/.env names no database, and neither does "
+                  f"any other checkout of this repository — nothing to check.")
+            return 0
+        owner, found = elsewhere[0]
+        print(f"REFUSING: {checkout}/.env names no database at all, while {owner}/.env names "
+              f"'{dbtarget.database_name(found[0][1])}'.\n"
+              f"  With nothing configured here, the application falls back to whatever "
+              f"default is compiled into it — which is the shared dev database in every "
+              f"layout this has been seen in, and is not this worktree's own.\n"
+              f"  Write this worktree's database into its .env, or re-provision it:\n"
+              f"    remove-worktree {branch_of(checkout)}   # keeps the branch and its commits\n"
+              f"    create-worktree --from <base> {branch_of(checkout)}", file=sys.stderr)
+        return 1
+
+    for other, found in elsewhere:
+        for owner_var, owner_value in found:
+            for var, value in mine:
+                if collides(dbtarget, value, owner_value):
+                    print(refusal(dbtarget, checkout, var, value, other, owner_var,
+                                  other == layout.main), file=sys.stderr)
+                    return 1
+
+    names = sorted({dbtarget.database_name(value) for _, value in mine})
+    print(f"check-db-isolation: isolated — {checkout}/.env names {', '.join(names)}, "
+          f"which no other checkout of this repository uses.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

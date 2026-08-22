@@ -1,7 +1,7 @@
 # Fix GitHub Issue
 
-@description Plan, implement, test, and PR for a GitHub issue in an isolated worktree (auto-decides whether it needs a DB copy).
-@arguments $ARGS: <issue-number> [--base <branch>] [--shared-db | --isolated-db]
+@description Plan, implement, test, and PR for a GitHub issue in a worktree with its own database copy.
+@arguments $ARGS: <issue-number> [--base <branch>]
 
 Parse `$ARGS`: the first integer is the **issue number** (`$ISSUE_NUMBER`
 below). An optional `--base <branch>` names the branch this issue's work
@@ -57,20 +57,25 @@ Write an implementation plan. List:
 - Related code that needs to change for consistency
 - Risks and how you'll mitigate them
 
-**Decide the DB mode now** (drives worktree provisioning in step 3). From the
-issue and your plan, classify the change:
-- **Touches the DB model** — schema/migrations, ORM model classes, anything that
-  ALTERs tables or writes migrations → needs an **isolated DB copy** so your
-  schema churn never touches the main database.
-- **Writes data but not schema** → also prefer an **isolated copy** (a single
-  agent, but seeded/mutated data still pollutes the shared DB).
-- **Read-only / no DB** → **shared DB** is fine and faster (no copy).
+**There is no DB mode to decide, and that is deliberate** (#340). This step used
+to ask you to classify the change — schema churn gets an isolated database copy,
+read-only work shares the main one and skips the copy — and step 3 offered
+`--shared-db` to act on the answer.
 
-Record the decision as `DB_MODE = isolated | shared`. An explicit `--shared-db`
-or `--isolated-db` arg overrides this classification. When genuinely unsure
-between the two, choose **isolated** — it's the safe default.
+The classification asked the wrong question. What decides whether the shared
+database is safe is not whether *your change* writes to it; it is whether
+*anything you run* truncates it. Step 7 runs the full suite on every invocation,
+without exception, and this suite's teardown truncates. So the answer was already
+"unsafe" before you had finished reading the issue, and a correct classification
+led to a worktree the suite's own guard then refused to run in — which is how
+that guard came to stop two runs in one day.
 
-## 3. Provision an isolated worktree (or reuse one you're already in)
+So: the worktree always gets its own database copy, this skill passes no DB flag,
+and there is nothing here for you to weigh. (`--shared-db` still exists on
+`create-worktree`, where it is meaningful for a caller that genuinely never runs
+a suite. This is not one of them.)
+
+## 3. Get an isolated worktree — provision, reuse or inherit — then verify it
 
 This skill works in a **dedicated worktree** so your main checkout never moves
 and its DB is never touched. Pick the branch prefix from the change type:
@@ -90,18 +95,39 @@ docs. The branch is `{prefix}issue-$ISSUE_NUMBER`.
   and throw away the correct fork point). Set `WT_DIR` to the current worktree
   (`WT_DIR=$(git rev-parse --show-toplevel)`), write the session marker for it
   (same `printf … | tee "$HOME/.cache/claude-code/session-cwd/$CLAUDE_CODE_SESSION_ID"`
-  as below), then skip to step 4. The DB was provisioned by the epic setup;
-  don't touch it.
+  as below), then go to **Isolation check** at the end of this step. Don't
+  provision a database — the epic setup did that — but do check it: "it was
+  provisioned" is the assumption the check exists to test, not a reason to skip.
+
+- **Does the worktree already exist? Reuse is allowed; re-verifying is not
+  optional.** `create-worktree` **refuses** an existing directory
+  (`Worktree directory already exists: …`) rather than reusing it, so this is a
+  decision you make after it has declined to do anything: work in the directory
+  that is there, or `remove-worktree {prefix}issue-$ISSUE_NUMBER` and create it
+  fresh. Salvaging a branch abandoned weeks ago is often the right call — the
+  prior work is sometimes exactly what the issue needs — and nothing here
+  forbids it.
+
+  What it forbids is inheriting that worktree's configuration unexamined.
+  **Nothing provisioned it this time, so nothing gave it its own database**, and
+  a worktree created before per-worktree databases existed still names the
+  **main** one. That is the second route into #340 and the one nobody chose:
+  `feat/issue-85` reached the shared database with no `--shared-db` anywhere,
+  because a reused worktree carried a `.env` older than the isolation that was
+  supposed to protect it.
+
+  Resolve `WT_DIR` for the existing worktree with the same `git worktree list`
+  command below, then go to **Isolation check**.
 
 - **Otherwise create the worktree** with `create-worktree` (it makes the dir,
   symlinks `.venv`/`.claude`/`CLAUDE.md`, copies configured data, provisions the
   DB, and wires Docker/nginx if the repo uses them):
   ```bash
-  create-worktree --from <base> [--shared-db] {prefix}issue-$ISSUE_NUMBER
+  create-worktree --from <base> {prefix}issue-$ISSUE_NUMBER
   ```
-  Pass `--shared-db` **only when `DB_MODE = shared`** (step 2). For
-  `DB_MODE = isolated`, pass nothing — an isolated DB copy is create-worktree's
-  default. Then resolve the new worktree directory:
+  No DB flag: an isolated copy is `create-worktree`'s default and step 2 says why
+  this skill never asks for anything else. Then resolve the new worktree
+  directory:
   ```bash
   WT_DIR=$(git worktree list --porcelain \
     | awk -v b="refs/heads/{prefix}issue-$ISSUE_NUMBER" \
@@ -132,22 +158,43 @@ Verify the worktree branch: `git -C "$WT_DIR" branch --show-current` must be the
 issue branch. Store the branch name and `WT_DIR` — you'll verify the branch
 again before committing, and report `WT_DIR` at the end.
 
-**Isolation check (isolated mode).** After `create-worktree` runs, scan its
-output. If it prints a red warning that any `.env` entry still equals the main
-DB name (its residual-var safety net), **STOP** — the worktree may still point at
-the **main** database, and a migration would corrupt shared data. Do not run
-migrations or DB-touching tests until it's resolved (fix the offending `.env` var
-by hand, or report it). This is the backstop for the bug class where the app
-reads a DB-name var (`DB_NAME`, `PGDATABASE`, …) that the provisioner didn't
-rewrite — verify the isolated DB is actually in use before touching it.
+### Isolation check — every route ends here, and none of them may skip it
 
-**DB confirm-guard (fallback).** If you provisioned with `--shared-db` and then
-discover during implementation that the change actually needs to ALTER the model
-or run a migration, **stop** and confirm with the user before proceeding — that
-would mutate the shared database. Offer to re-provision the worktree with an
-isolated DB copy (`remove-worktree {prefix}issue-$ISSUE_NUMBER` then
-`create-worktree --from <base> {prefix}issue-$ISSUE_NUMBER`) rather than running
-schema changes against the shared DB.
+Ask the **resolved `.env`** which database this worktree names. Not
+`create-worktree`'s output, not the flag you passed, not which route you took:
+the file the application will actually read.
+
+```bash
+check-db-isolation "$WT_DIR"
+```
+
+Exit 0 and you may proceed to step 4. **Non-zero: STOP.** The refusal names the
+database, the variable holding it and the checkout that owns it. Do not run the
+suite, a migration, or anything else that touches the database — this worktree
+would rebuild another checkout's data, and the suite's teardown truncates. Fix
+the offending `.env` variable, or `remove-worktree` and provision again, then
+re-run the check. If you cannot resolve it, say so and stop; do not carry on with
+DB work flagged as "probably fine".
+
+**Why it is a command and not a paragraph.** The check this replaces read
+`create-worktree`'s output for its residual-`.env` warning, so it only ran when
+`create-worktree` ran — and a **reused** worktree, the one route where nothing
+provisioned a database and the `.env` is therefore least trustworthy, skipped the
+check entirely. That is how `feat/issue-85` came to point at the shared database
+with every decision above it made correctly. A check conditional on the safe path
+having been taken is not a check.
+
+`check-db-isolation` ships with this harness, so it is on `PATH` wherever this
+brief is. If it is not, do not read that as permission: run
+`harness/bin/check-db-isolation` from the harness checkout, or compare
+`$WT_DIR/.env`'s database name against the main checkout's by hand and stop if
+they match.
+
+It is the same comparison the test suite's own guard makes at pytest start
+(`tests/dbtarget.py`, and `harness/templates/dbtarget.py` for other repos —
+`check-db-isolation` imports that module rather than re-implementing it). That
+guard is the backstop and it holds; this one runs *before* the work, where the
+answer still costs a re-provision rather than an afternoon.
 
 ## 4. Implement
 
