@@ -1046,6 +1046,21 @@ full — including what was broken before it, which is the part no diff recovers
   regression test, built from #188's own numbers, was confirmed red first (#298).
 - **v2.68** — the fix pass stopped being most of the PR.
 - **v2.69** — the review loop becomes usable.
+- **v2.70** — the v2.23 datum, read back: which other PRs does landing this one disturb?
+  `GET /review/collisions` was written twice and pulled twice, because a four-seat panel found
+  the same defect in both of its rounds and round 2's instance was introduced by round 1's fix —
+  a filter composed in front of the newest-run selection, resurrecting a stale run behind a
+  confident answer (#101). So the third attempt has nowhere to put one: **select first, classify
+  second.** One unconditional `DISTINCT ON (pr)` gives each rival's newest run, full stop, and
+  every other question is asked afterwards by a pure ladder in `app/collisions.py` that takes an
+  already-selected run and returns exactly one of `collides` / `partial` / `unanswerable` /
+  `excluded` / `disjoint`. `counts` reports all five against `considered`, so absence is not
+  representable — which retires the third bug too, a rival that claimed 2,500 files, stored none,
+  and appeared in no list at all. `disjoint` is the one verdict that is a safety claim and the
+  only one with a completeness test in front of it; the subject's own `files_complete` is the
+  same guard one level out. The population is *PRs this board has panelled* and that is said in
+  the response, not only here — an empty `collides` means "none of the PRs I have seen", never
+  "none exist".
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
