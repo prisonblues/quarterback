@@ -41,8 +41,8 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    overrode it. `headless_permission_mode` is what the sub-agents run under.
 
    **Then check the repo argument is one you can actually honour.** `/fix-issue` has **no repo
-   parameter** — its `@arguments` is `<issue-number> [--base <branch>] [--shared-db | --isolated-db]`
-   and it operates on the canonical remote of whatever checkout it runs in. So a repo argument
+   parameter** — its `@arguments` is `<issue-number> [--base <branch>]` and it operates on the
+   canonical remote of whatever checkout it runs in. So a repo argument
    naming anything other than the cwd's repo cannot be carried into step 2: it would resolve
    *that* repo's rules and then implement the issue *here*, silently. If `<repo>` was given and
    does not match the cwd's repo (`gh repo view --json nameWithOwner`), **stop and say so** — the

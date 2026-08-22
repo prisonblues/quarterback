@@ -375,18 +375,21 @@ list and the exit-code contract.
 
 ### `/fix-issue <number>` — the driver
 
-End-to-end resolution of a GitHub issue in a dedicated worktree. Reads the issue, plans,
-**decides whether the change needs an isolated database copy**, provisions a worktree,
-implements, writes tests, updates docs, runs the project's real CI checks, self-reviews the
-diff (optionally with `codex` as a second opinion), commits, pushes, opens a PR, and
-comments on the issue.
+End-to-end resolution of a GitHub issue in a dedicated worktree with its own database copy.
+Reads the issue, plans, provisions a worktree, implements, writes tests, updates docs, runs
+the project's real CI checks, self-reviews the diff (optionally with `codex` as a second
+opinion), commits, pushes, opens a PR, and comments on the issue.
 
-Two decisions in it are worth lifting out, because they are the ones that bite:
+Two things in it are worth lifting out, because they are the ones that bite:
 
-- **DB mode.** Schema changes and data writes get an isolated copy; read-only work shares
-  the main database because copying is slow. If it can't tell, it picks isolated. There is
-  a guard for the case where it chose `shared` and *then* discovered it needs a migration —
-  it stops and asks rather than mutating the shared database.
+- **There is no DB mode to choose** (#340). It used to ask whether the change touched the
+  database and pass `--shared-db` when it did not. That question does not decide the
+  outcome: what makes the shared database unsafe is not whether the *change* writes to it
+  but whether anything the run *executes* truncates it — and step 7 runs the full suite
+  every time. The classification was answered correctly and still produced a worktree the
+  suite's own guard refused to run in. So the copy is unconditional, and step 3 ends in an
+  **isolation check on the resolved `.env`** that every route passes through — created,
+  reused or inherited from the epic driver. See `check-db-isolation` below.
 - **The worktree is left in place** when the PR opens, so review findings can be addressed
   on the same branch and the same database. Teardown is a separate, deliberate act.
 
@@ -413,6 +416,36 @@ it is the only one that is dry-run by default.
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
+
+### `check-db-isolation` — which database is this checkout actually pointed at?
+
+```
+check-db-isolation [CHECKOUT]     # default: cwd
+#   exit 0  safe    — the main checkout, a worktree with its own database, or no database at all
+#   exit 1  REFUSE  — this worktree's .env names a database another checkout is using
+#   exit 2  used wrongly
+```
+
+Three routes end with a worktree whose `.env` names the **main** database, and the reason
+this is a script rather than a paragraph in a brief is that only the first of them announces
+itself:
+
+| Route | What happened |
+| --- | --- |
+| `--shared-db` | Someone chose it, and then ran a suite whose teardown truncates |
+| **A reused worktree** | `create-worktree` refuses an existing directory, so nothing re-provisioned it and nothing re-checked it. A worktree predating per-worktree databases still names the main one — this is how `feat/issue-85` got there with nobody choosing anything (#340) |
+| No database container | The copy was skipped with a yellow note and the `.env` left pointing at the main database |
+
+`/fix-issue` used to check isolation by reading `create-worktree`'s residual-`.env` warning
+out of its output, which meant the check ran only when `create-worktree` ran — never on the
+route where nothing had provisioned a database at all. It now runs this, on `$WT_DIR`,
+whatever produced it.
+
+It **imports** `templates/dbtarget.py` rather than re-implementing the comparison, so it and
+the pytest guard that refuses at collection time cannot disagree about what "the same
+database" means: host aliases collapse, an omitted port is filled in, and anything
+unparseable is read as a collision. What it adds over that guard is *when* — before the work
+rather than at the start of the run that was going to destroy something.
 
 **`create-worktree` also turns on `git rerere` for the repo, once, if nobody has set
 it either way.** This is the setting whose value scales with the number of worktrees:

@@ -39,7 +39,10 @@ stdenvNoCC.mkDerivation {
   # CLI entry points — the worktree
   # scripts, which must land in one directory together because each finds
   # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH;
-  # `qb-stage`, which the slash commands call by name and so needs PATH;
+  # `qb-stage` and `check-db-isolation`, which the slash commands call by name and
+  # so need PATH — the second of those is a refusal a brief is told to obey, and a
+  # `command not found` that a brief reads as "fine, carry on" is the failure it
+  # was written to stop (#340);
   # `qb-seat`, which a multiplexer layout names as the command for each pane —
   # a layout is data on another machine, so it can only refer to it by name;
   # `qb-board`, which is a thing a human types on a headless box, which is

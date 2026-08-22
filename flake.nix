@@ -159,6 +159,24 @@
           # against them, so without this line every assertion about either guard errors
           # on a missing file rather than being evaluated (#163).
           cp -r ${./harness/githooks} harness/githooks
+          # harness/templates for `check-db-isolation`, which IMPORTS `templates/dbtarget.py`
+          # rather than re-implementing the comparison it makes — so without this line the
+          # script exits on "cannot find dbtarget.py" before checking anything, and every
+          # assertion in test_check_db_isolation.py fails for a reason that has nothing to do
+          # with the code under test. A tree rather than the one file: the templates are what
+          # the harness ships to other repos, and a second consumer should not need a line
+          # here. `pytest … tests` below collects only `tests`, so
+          # `templates/test_migrations_self_contained.py` — a template, not a suite — is not
+          # picked up by being present.
+          cp -r ${./harness/templates} harness/templates
+          # And the brief that has to run it. test_check_db_isolation.py is in two halves on
+          # purpose (its docstring says why): the mechanism, driven against real git
+          # worktrees with the git above, and the shipped text of `/fix-issue` that calls it.
+          # The prose half rides along here for the same reason test_qb_doctor's README
+          # assertions do — splitting the file by which tool each half needs would leave the
+          # coupling between them, a command nobody runs or a brief calling a command that
+          # does not exist, asserted in neither check (#340).
+          install -Dm644 ${./harness/commands/fix-issue.md} harness/commands/fix-issue.md
           # The two tools the pre-push guard hands its questions to. Its whole contract is
           # that it DELEGATES — the graph to `migration_reconcile.py heads --ref`, the release
           # number to `release_stamp.py collision` — so test_pre_push_hook.py copies the real
