@@ -122,7 +122,7 @@ with human privileges, generating #183's confidently-wrong `next` continuously r
 once.
 
 `POST /plan/order-proposal` records a proposal with its evidence in `plan_order_proposals`
-(schema 0025) — **and the caller supplies no order**. The board computes what it stores, so a
+(schema 0028) — **and the caller supplies no order**. The board computes what it stores, so a
 row always says what the *rules* produced rather than what an agent asserted and labelled
 deterministic. An agent's ordering opinion belongs on the board addressed to whoever is
 deciding, which needs no endpoint.

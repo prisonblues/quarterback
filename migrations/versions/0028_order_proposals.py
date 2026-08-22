@@ -48,16 +48,16 @@ it (`rules_version`) or what they read (`inputs_digest`) is a row no later
 analysis can interpret. `repo` is nullable because NULL is the fleet-wide scope,
 exactly as in `plan_items`.
 
-Revision ID: 0026
-Revises: 0025
+Revision ID: 0028
+Revises: 0027
 """
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0026"
-down_revision: str | None = "0025"
+revision: str = "0028"
+down_revision: str | None = "0027"
 branch_labels = None
 depends_on = None
 

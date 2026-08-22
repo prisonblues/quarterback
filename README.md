@@ -1141,7 +1141,7 @@ full — including what was broken before it, which is the part no diff recovers
   `displaced` at both ends. `unknown` names what it could not read, changed-file
   overlap included: its collision query is #101 and open, and overlap is a refinement that
   only ever breaks a tie, so its absence widens the ambiguous set and changes nothing else.
-  `POST /plan/order-proposal` writes the proposal and its evidence to a ledger (schema 0026)
+  `POST /plan/order-proposal` writes the proposal and its evidence to a ledger (schema 0028)
   and takes no order from the caller, because #232's planner cannot be told what its last
   orders cost until something has been recording them while they were still predictions — and
   the outcome half is absent rather than stubbed, since a null `outcome` column invites the
