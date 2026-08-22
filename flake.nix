@@ -460,6 +460,11 @@
           cp -r ${./harness/loops} repo/harness/loops
           install -Dm644 ${./harness/hm-module.nix}                          repo/harness/hm-module.nix
           install -Dm644 ${./harness/README.md}                              repo/harness/README.md
+          # The workflow, because `test_commands_wired.py` reads it to check that the guards
+          # `fix-and-land.md`'s hazards section points at are still jobs in it, under the ids and
+          # display names the page quotes (#367). Without this line that read errors on a missing
+          # file rather than being asserted — #163's mechanism, in the check built to catch it.
+          install -Dm644 ${./.github/workflows/tests.yml}                    repo/.github/workflows/tests.yml
           install -Dm644 ${./app/api/reviews.py}                             repo/app/api/reviews.py
           install -Dm644 ${./app/models/review.py}                           repo/app/models/review.py
           install -Dm644 ${./flake.nix}                                      repo/flake.nix
