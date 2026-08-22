@@ -174,7 +174,8 @@ do_status() {
     # has been switched off cannot look like one where it is quietly passing. That is the
     # whole difference between an escape hatch and a hole.
     local knob off
-    for knob in qb.prePush.migrationHeads qb.prePush.releaseNumber qb.prePush.releaseBodies; do
+    for knob in qb.prePush.migrationHeads qb.prePush.releaseNumber \
+               qb.prePush.releaseBodies qb.prePush.reserveRelease; do
         off=$(git -C "$repo" config --bool --get "$knob" 2>/dev/null) || off=""
         if [[ "$off" == "false" ]]; then
             echo -e "           ${YELLOW}$knob is off${NC} for this repo"

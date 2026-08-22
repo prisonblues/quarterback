@@ -33,7 +33,13 @@ placeholder convention is quietly opted out of on the one release that most need
 
 ## When two branches stamp the same number
 
-They can, and the recovery is deliberately manual and deliberately one edit long. Once
+They can — the stamp itself is still a file read — and `scripts/release_tag.py` is what
+stops the second one landing: a tag is created for the number at push time, atomically, so
+the second branch is refused before its merge rather than reported after it. What follows
+is what happens when the tag was never taken (a `--no-verify` push, a checkout with no
+hooks) and the two branches meet anyway.
+
+The recovery is deliberately manual and deliberately one edit long. Once
 `apply` has run, the placeholder is GONE — the branch says `## v2.34`, and re-running
 `apply` has nothing left to rewrite. There is no automatic re-stamp and this file does not
 pretend otherwise; what it does instead is make the collision impossible to miss:
@@ -52,19 +58,33 @@ was ever written in terms of the number — that is what "cheap to redo" actuall
 it is worth more than an unstamp command that would have to guess which of two identical
 headings belongs to you.
 
-**This is not an allocator, and since #172 there is no other one.** #46/#99's
-`POST /release/claim` recorded that a caller INTENDED to take a number: an announcement,
-not a reservation, which this tool never read and never honoured. A branch holding a
-claim for v2.34 got no protection here — the next `apply` on any branch stamped v2.34
-too, because a stamped number is only ever "the next one free at the ref I merged into",
-which is a question a git ref answers on its own.
+**This file is not the allocator. `scripts/release_tag.py` is (#296).** What it hands out
+is a READING of a shared file — `max(headings at --onto) + 1` — and a read is not a lock,
+which is what the first paragraph of this docstring says and what two landers seconds
+apart keep proving. The lock is `git push origin <sha>:refs/tags/v2.96`: creating a ref on
+a remote is atomic and succeeds for exactly one caller, forever.
 
-So the allocator is deleted: `POST /release/claim`, `POST /release/reclaim`,
-`GET /releases`, their MCP tools and the `kind='release'` claim underneath them are all
-gone, and this file is the whole mechanism. A namespace nobody claims in does not need
-an allocator, and the rows it did have — one going stale for every PR still open — were
-a second answer to a question that has one. There is nothing to announce and nothing to
-opt into: write the placeholder, and `apply` at land.
+So the counter has a second input now, and only one:
+
+  * `tag_releases()` reads `refs/tags/vX[.Y]` and `next_release` folds it into the same
+    `max`. Headings say what LANDED; tags say what was ISSUED, and between a sibling's
+    reservation and its merge those disagree by exactly the number two branches keep both
+    taking.
+  * `_collision` refuses a number this branch added that a tag holds on a commit this
+    branch does not contain — a sibling that stamped and pushed first.
+
+Neither needs a service. `harness/githooks/pre-push` calls `release_tag.py reserve` for the
+branch it is pushing, so the number is taken at the moment the release commit leaves the
+machine and the second lander is refused rather than merged.
+
+**Which is NOT what #46/#99's `POST /release/claim` was, and the difference is why that one
+was deleted and this one is not.** That allocator recorded an INTENTION to take a number:
+an announcement this tool never read and never honoured, so a branch holding a claim for
+v2.34 got no protection at all — the next `apply` on any branch stamped v2.34 too. It is
+gone (#172), with `POST /release/reclaim`, `GET /releases`, their MCP tools and the
+`kind='release'` claim underneath them, and it stays gone. A tag is not an announcement:
+after `reserve` succeeds, v2.96 cannot be issued again by anybody, whether or not they
+remember to look — which is the property the board claim never had and could not have.
 
 ## What counts as a placeholder
 
@@ -183,6 +203,7 @@ import subprocess
 import sys
 import tomllib
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -362,6 +383,12 @@ class Plan:
     served_from: str = ""
     served_to: str = ""
     onto_newest: Release | None = None
+    #: The highest number any release TAG holds in this checkout, or None where there are
+    #: none. Reported beside `onto_newest` rather than folded into it, because the two say
+    #: different things — what has landed at the base, and what has been issued to anybody —
+    #: and the day they disagree is the day a sibling is mid-land with the number this
+    #: branch would otherwise have taken.
+    reserved_newest: Release | None = None
     major: bool = False
     #: Things a caller should know that are not this branch's to fix, and must not
     #: stop it. A broken base is the one that matters (#168): it is a refusal for a
@@ -379,6 +406,7 @@ class Plan:
             "version": fmt(self.version) if self.version else None,
             "major": self.major,
             "onto_newest": fmt(self.onto_newest) if self.onto_newest else None,
+            "reserved_newest": fmt(self.reserved_newest) if self.reserved_newest else None,
             "sites": [{"path": s.path, "line": s.line, "text": s.text} for s in self.sites],
             "loose": [{"path": s.path, "line": s.line, "text": s.text} for s in self.loose],
             "untracked": [
@@ -455,6 +483,50 @@ def _git_ok(repo: Path, *args: str) -> bool:
     return subprocess.run(
         ["git", "-C", str(repo), *args], capture_output=True, text=True, check=False
     ).returncode == 0
+
+
+#: A release TAG, spelled exactly the way `fmt` spells a release and anchored at both ends.
+#: Public because `scripts/release_tag.py` reads it: "which tags are release tags" has to
+#: have one answer, and a second copy of this pattern agrees with it until the day it does
+#: not — at which point a tag exists for a number no document explains.
+#: `v2.96-rc1`, `v2.96.1` and `salvage/issue-85` are somebody else's refs: this file has no
+#: opinion about tags it did not issue, and a repo is allowed to have others.
+TAG_NAME = re.compile(r"^v(\d+)(?:\.(\d+))?$")
+
+
+def tag_releases(repo: Path) -> dict[Release, str]:
+    """Release numbers held by a git tag, as {release: the commit sha it names}.
+
+    The counter this file hands numbers out of has always been read from ONE place — the
+    CHANGELOG headings at `--onto` — and that reading is the defect its own header names:
+    two landers seconds apart read the same file and get the same answer, because a file
+    read is not a lock. A tag is. Creating `refs/tags/v2.96` on a remote succeeds for
+    exactly one caller (`scripts/release_tag.py reserve`), so a number a tag holds is one
+    somebody has already been given, whether or not their branch has landed yet.
+
+    Read from refs and from nothing else, which keeps this file's promise that every answer
+    is computed from git objects rather than from a service. The corollary is that it is
+    only as fresh as the checkout: a reservation lives on a commit that is not reachable
+    from `main`, and `git fetch <remote>` follows tags only into history it fetched, so
+    `git fetch origin --tags` is what makes a sibling's reservation visible here. When it
+    has not been run this simply falls back to what it always did, and the atomic create in
+    `release_tag.py reserve` is what still refuses the second lander.
+
+    Peeled with `%(*objectname)` so an ANNOTATED tag reports the commit rather than the tag
+    object: `backfill` writes annotated tags, and comparing a tag object's sha with a commit
+    sha reports every one of them as pointing somewhere unrelated.
+    """
+    out = _git(repo, "for-each-ref",
+               "--format=%(refname:strip=2) %(objectname) %(*objectname)", "refs/tags/")
+    found: dict[Release, str] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        m = TAG_NAME.match(parts[0])
+        if m:
+            found[release(m.group(1), m.group(2))] = parts[2] if len(parts) > 2 else parts[1]
+    return found
 
 
 #: Case-insensitive, because `git ls-files -- '*.md'` is not: on Linux a `README.MD` or a
@@ -704,8 +776,9 @@ def duplicates_by_file(repo: Path) -> dict[str, list[Release]]:
     return out
 
 
-def next_release(text: str, major_bump: bool = False, where: str = "") -> Release:
-    """One past the highest heading in `text`.
+def next_release(text: str, major_bump: bool = False, where: str = "",
+                 also: Iterable[Release] = ()) -> Release:
+    """One past the highest heading in `text`, or in `also`, whichever is higher.
 
     Highest, not first. The file is newest-first and a test enforces that, but a tool that
     hands out numbers must not be the one thing that trusts the ordering it is about to
@@ -718,12 +791,24 @@ def next_release(text: str, major_bump: bool = False, where: str = "") -> Releas
     inference — but it has to exist, because this repo's own README lists `v3` as what is
     next and a tool that could not produce it would be quietly opted out of at that moment,
     by hand, which is the whole failure mode the placeholder is here to remove.
+
+    `also` is every number a TAG already holds (`tag_releases`). Headings say what has
+    LANDED; tags say what has been ISSUED, and between a sibling's `reserve` and its merge
+    those two disagree by exactly the number this file was written because two branches kept
+    taking. It folds into the same `max` rather than being checked separately, because "the
+    next free number" has one answer and a second code path computing it is how the two
+    drift apart. Empty `also` — no tags, or a checkout that has not fetched them — leaves
+    the behaviour precisely as it was.
+
+    An unparseable CHANGELOG is still the refusal even when tags are present. A repo whose
+    release headings this tool cannot read is not one it should be handing numbers out for,
+    and tags alone would let it do that silently.
     """
     found = releases_in(text, where)
     if not found:
         raise StampError("no `## vX.Y` headings at the base ref — CHANGELOG.md is not the "
                          "file this tool thinks it is, or the ref is wrong")
-    major, minor = max(found)
+    major, minor = max([*found, *also])
     return (major + 1, 0) if major_bump else (major, minor + 1)
 
 
@@ -1322,6 +1407,40 @@ def _collision(
             f"landed first took {fmt(rel)}. {repair}"
         )
 
+    # The fourth shape, and the only one that can be seen BEFORE either branch merges: the
+    # number is held by a TAG on a commit this branch does not contain. That is a sibling
+    # that stamped and pushed first — `release_tag.py reserve` created the tag atomically, so
+    # there is exactly one holder and it is not this branch. The three shapes above all need
+    # the number to be visible at `onto`, which it is not until the sibling MERGES; this is
+    # what closes the window between the two stamps rather than reporting it afterwards.
+    #
+    # Both conditions are required and neither is enough. "This branch added it" (the merge
+    # base again) keeps a branch that merely inherited a released heading out of it. "Not
+    # contained in this branch" is what distinguishes a sibling's live reservation from this
+    # branch's own, and from a backfilled tag for a release that is already in this history.
+    # A backfilled tag on `main` is an ancestor of every branch off `main`, so this is silent
+    # for all of them — which is the property that lets it run on every push.
+    #
+    # Quiet when the tags cannot be read at all. That is `inherited is None`'s reasoning one
+    # ref along: a checkout with no tags is the state this repo was in for ninety-five
+    # releases, and refusing there would refuse every branch in it.
+    try:
+        tagged = tag_releases(repo)
+    except StampError:
+        return
+    for rel, line in release_headings(branch_text, "CHANGELOG.md"):
+        sha = tagged.get(rel)
+        if rel in inherited or sha is None:
+            continue
+        if _git_ok(repo, "merge-base", "--is-ancestor", sha, branch):
+            continue
+        raise StampError(
+            f"this branch's CHANGELOG adds `{line}`, and {fmt(rel)} is already tagged at "
+            f"{sha[:12]} — a commit this branch does not contain. Another branch stamped "
+            f"{fmt(rel)} and reserved it first, and `refs/tags/{fmt(rel)}` can only be "
+            f"created once. {repair}"
+        )
+
 
 def _releases_at_fork(repo: Path, onto: str, branch: str = "HEAD") -> set[Release] | None:
     """Release numbers already in CHANGELOG.md at the commit this branch forked from.
@@ -1527,9 +1646,35 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     # Both bumps come out of one pair of calls and `next_version` is chosen from them, rather
     # than a third parse asking a question these two have already answered between them: the
     # flag picks one of two answers, it does not produce a third.
+    #
+    # TAGS COME IN HERE AND NOWHERE ELSE. A number a tag holds has been ISSUED — the tag was
+    # created on the remote and that create is atomic — while a heading at `onto` only says
+    # it has LANDED. Between a sibling's `reserve` and its merge those two disagree by
+    # exactly one number, and that one number is the collision this whole file is a reaction
+    # to. Folded into the counter, not checked beside it: the next free number has one
+    # answer.
+    #
+    # `onto_newest` is deliberately NOT moved by tags. It is the input to the "did this
+    # branch write a number nobody has issued" refusal below, which is a question about what
+    # has landed at the ref; letting a reservation raise it would make a hand-written number
+    # matching that reservation pass. So the floor rises and the landmark does not.
+    #
+    # Unreadable tags are a warning and never a stop: ninety-five releases shipped here
+    # before any tag existed, and a checkout that cannot list refs must still be able to
+    # stamp.
     try:
-        minor_next = next_release(onto_text, False, f"{onto}:CHANGELOG.md")
-        major_next = next_release(onto_text, True, f"{onto}:CHANGELOG.md")
+        tagged = tag_releases(repo)
+    except StampError as e:
+        tagged = {}
+        plan.warnings.append(
+            f"could not read this checkout's release tags ({e}), so the number was computed "
+            "from CHANGELOG headings alone — a number a sibling has reserved and not yet "
+            "merged would not be visible here"
+        )
+    plan.reserved_newest = max(tagged) if tagged else None
+    try:
+        minor_next = next_release(onto_text, False, f"{onto}:CHANGELOG.md", tagged)
+        major_next = next_release(onto_text, True, f"{onto}:CHANGELOG.md", tagged)
         onto_newest = max(releases_in(onto_text, f"{onto}:CHANGELOG.md"))
     except StampError as e:
         if plan.sites:
@@ -1789,18 +1934,23 @@ def _show(repo: Path, ref: str, path: str, named: str | None = None) -> str:
 # ---------------------------------------------------------------------- the commands
 
 
-def next_free(onto_text: str, branch_text: str, onto: str, branch: str) -> Release | None:
-    """`max(base, head) + 1` — the number a colliding branch should have taken.
+def next_free(onto_text: str, branch_text: str, onto: str, branch: str,
+              also: Iterable[Release] = ()) -> Release | None:
+    """`max(base, head, tags) + 1` — the number a colliding branch should have taken.
 
     Both sides, not just the base: a branch that stamped ABOVE the base and collided with a
     sibling anyway would otherwise be told to take a number it already has. None when neither
     ref declares a release at all, which is a repo where there is no counter to advance.
+
+    `also` is `tag_releases`, for the same reason `next_release` takes it: a number a
+    sibling has reserved and not yet merged is at neither ref, and advising a colliding
+    branch to take it is advising the next collision.
     """
     found = releases_in(onto_text, f"{onto}:CHANGELOG.md")
     found += releases_in(branch_text, f"{branch}:CHANGELOG.md")
     if not found:
         return None
-    major, minor = max(found)
+    major, minor = max([*found, *also])
     return major, minor + 1
 
 
@@ -1824,7 +1974,11 @@ def cmd_collision(args: argparse.Namespace) -> int:
     onto_text = _show(repo, onto_sha, "CHANGELOG.md", args.onto)
     branch_text = _show(repo, branch_sha, "CHANGELOG.md", args.branch)
 
-    free = next_free(onto_text, branch_text, args.onto, args.branch)
+    try:
+        tagged = tag_releases(repo)
+    except StampError:
+        tagged = {}
+    free = next_free(onto_text, branch_text, args.onto, args.branch, tagged)
     payload = {
         "onto": args.onto,
         "onto_sha": onto_sha,
@@ -2281,7 +2435,10 @@ def _report(plan: Plan, onto: str, *, applied: bool) -> None:
         return
     verb = "stamped" if applied else "would stamp"
     how = " (--major)" if plan.major else ""
-    print(f"{verb} {fmt(plan.version)}{how}  (newest at {onto}: {fmt(plan.onto_newest)})")
+    held = (f", newest tag: {fmt(plan.reserved_newest)}" if plan.reserved_newest else
+            ", no release tags in this checkout")
+    print(f"{verb} {fmt(plan.version)}{how}  (newest at {onto}: {fmt(plan.onto_newest)}"
+          f"{held})")
     for s in plan.sites:
         print(f"  {s.path}:{s.line}  {s.text}")
     if plan.serves:
@@ -2289,6 +2446,16 @@ def _report(plan: Plan, onto: str, *, applied: bool) -> None:
     else:
         print("\nserved version unchanged")
     print(f"  {plan.serves_reason}")
+    # Printed by `apply` as well as `preflight`, and printed even where a hook will do it
+    # anyway. Stamping is a READING of a shared file until the number is taken on the
+    # remote, and that is the whole of #296: this line is the only thing between the two
+    # that mentions the step which is actually a lock.
+    if applied:
+        print(f"\nCommit this, then take {fmt(plan.version)} on the remote before anybody "
+              "else does:")
+        print("  scripts/release_tag.py reserve")
+        print("  (harness/githooks/pre-push does it for you on `git push`; this is the "
+              "spelling for a checkout without the hook.)")
 
 
 def main(argv: list[str] | None = None) -> int:
