@@ -121,6 +121,35 @@ async def test_a_plan_carries_its_own_dependency_graph(client):
     assert plan["counts"]["blocked"] == 2
 
 
+async def test_a_submitted_plan_says_the_submitter_chose_its_order(client):
+    """A submission is a list somebody wrote in an order, so its items are not
+    `appended` — and not `ordered` either, because a submitted plan is a proposal
+    (#183). The exception is its FIRST item: where the block itself lands is
+    `_next_rank`'s decision and nobody else's."""
+    repo = "acme/submitorder"
+    out = await submitted(client, repo, "sequenced", [item(90), item(91)])
+    assert [i["rank_source"] for i in out["items"]] == ["appended", "submitted"]
+
+    plan = await read(client, repo, exact=True)
+    assert plan["order_trust"]["by_source"] == {"appended": 1, "submitted": 1}
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 1
+
+
+async def test_each_submission_leaves_exactly_one_position_nobody_chose(client):
+    """Two plans submitted into one scope: the second sits behind the first for
+    no reason anybody stated, and that seam is the whole of what is unchosen.
+    Calling every submitted row `submitted` reported the scope as fully trusted —
+    a smaller version of the "17 chosen, 11 by arrival" this issue is about."""
+    repo = "acme/submitseam"
+    await submitted(client, repo, "first block", [item(95), item(96)])
+    await submitted(client, repo, "second block", [item(97), item(98)])
+
+    plan = await read(client, repo, exact=True)
+    assert plan["order_trust"]["by_source"] == {"appended": 2, "submitted": 2}
+    assert plan["order_trust"]["trusted"] is False
+    assert plan["order_trust"]["unchosen"] == 2
+
+
 async def test_a_circular_batch_edge_is_refused_before_anything_is_written(client):
     repo = "acme/submitcycle"
     r = await submit(client, repo, "ring",

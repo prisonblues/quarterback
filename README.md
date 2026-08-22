@@ -232,9 +232,13 @@ GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unatt
 
 # the plan: what is next, in what order, and who has it (v2.39; plans are rows in #172)
 GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
-                          -> {items:[…], plans:[…], next, counts, truncated}
+                          -> {items:[…], plans:[…], next, order_trust, counts, truncated}
                           `next` = the first item that is open, unclaimed, unblocked and
-                          not `covered_by` somebody else's plan claim; `counts` describe
+                          not `covered_by` somebody else's plan claim — carrying a
+                          `caveat` whenever part of the order is merely the order things
+                          were added (#183); `order_trust` says how much of the sequence
+                          anybody actually chose, by `rank_source`, and names the first
+                          item whose position nobody did; `counts` describe
                           the whole scope — neither is ever the page, however small
                           `limit` is (max 1000, `truncated` says so); ?repo= also returns
                           the fleet-wide (repo-less) items, ranked after that repo's own;
@@ -260,9 +264,17 @@ POST  /plan/claim        { plan_id, ttl=3600, session?, note? }
 POST  /plan/release      { plan_id, session? }         (idempotent)
 POST  /plan/done         { plan_id, session?, note?, force? }
                           refused while items are still open, naming them
-POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, depends_on? }
+POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, depends_on?,
+                           after?|before?, placed_for? }
                           one OPEN item per ref — a duplicate is refused, naming the item.
-                          `plan` is a label or an id; an unknown label creates the plan
+                          `plan` is a label or an id; an unknown label creates the plan.
+                          `after`/`before` take an item id or an issue ref ("#84") in the
+                          SAME scope and say where the new item enters — agent-permitted,
+                          because PLACING changes the relative order of nothing already
+                          in the plan, while REORDERING permutes what is there and stays
+                          human-only (#183). Absent, it appends and says so. `placed_for`
+                          records whose priority a placement transcribes and is refused
+                          without one
 POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
                           the same claim POST /claim writes. Owned by the SESSION: two
                           agents on one box are two workers. Blocked items need force,
@@ -316,6 +328,35 @@ agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a 
 that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
 [DEPLOY.md](DEPLOY.md) §0.
 
+### Placing a new item is not reordering the plan (#183)
+
+`POST /plan/item` was safe for agents on a premise it did not keep: *adding is not
+reordering*. True of adding, false of what the code did — there was no way to add an item
+without also deciding where it went, and "last" was hard-coded. That is not the absence of an
+ordering judgement but one specific judgement, *"this is the lowest-priority open item"*,
+made on the caller's behalf every time and wrong whenever the new item is not in fact the
+least important thing outstanding. The plan's own seed shows what it costs: told mid-seed
+that #85 was near-top priority, the agent could append it at rank 20 and then write the
+priority into free text — a `phase` reading `TOP PRIORITY — Rich, 2026-08-17 23:00` and a
+`note` opening `RANK IS WRONG AND A HUMAN MUST FIX IT`.
+
+So the two operations are separated. **Reordering** permutes items already in the plan: two
+agents can overwrite each other's decision, it is contested, and it stays human-only.
+**Placing** chooses where a new item enters, and alters the relative order of nothing already
+there — insert between ranks 2 and 3 and every existing pair keeps the relationship it had,
+so there is no prior decision to overwrite and nothing to thrash. `after` / `before` take an
+item id or an issue ref in the same scope (ranks are per scope, so an anchor from another
+list is refused), and `placed_for` records whose priority the placement transcribes. A
+position is for writing down an order you were **given**; an item you merely think matters
+still appends, with the reasoning in `note`.
+
+And the plan now says how much of its order anybody chose. `plan_items.rank_source` is
+`appended` (nobody — it went last because that was all there was), `submitted` (every row of
+a `POST /plan/submit` batch but the first, since where the block lands is an append like any
+other), `placed`, or `ordered` (a human). `GET /plan` reports `order_trust`, and `next`
+carries a `caveat` for the agent that reads only the headline instead of answering rank 1
+with confidence while the stated top priority sits at rank 20.
+
 ### A suggested order, and the ledger it writes to (#232)
 
 "Only a human reorders it" is a rule about who may **write** the sequence. It left the fleet
@@ -324,7 +365,11 @@ imply?* — which is mechanical for most of a plan, and was being worked out by 
 agent, from a `gh` sweep nobody kept.
 
 `GET /plan/order` runs the deterministic rules and publishes `suggested_order` beside
-`active_order`. It writes nothing. `suggested_order` is shaped exactly like
+`active_order`. It writes nothing. It is the counterpart of `order_trust` above and not a
+second version of it: this one says what order the rules would imply, that one says who chose
+the order already in force — a proposal and a provenance. Each entry carries `rank_source`
+for that reason, because a move is a different proposition depending on whether the position
+it replaces was somebody's decision or merely where the row landed. `suggested_order` is shaped exactly like
 `POST /plan/reorder`'s `order`, so applying it is one human call — and that call is the only
 way it ever takes effect.
 
@@ -479,7 +524,9 @@ worth one call, since v2.12 the board names you and you cannot work it out local
 push) / `sync_status` (am I stale?); coordination — `active` (who's live in a dir) /
 `peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
 `plan_read` (what is next, with `next` already worked out — `next` and `counts`
-describe the plan, never the page) / `plan_add` / `plan_claim`
+describe the plan, never the page, and `next.caveat` says when the order it walked
+is not one anybody chose) / `plan_add` (with `after`/`before`, because placing a new
+item reorders nothing) / `plan_claim`
 (before you start, not after) / `plan_release` / `plan_done` / `plan_depends`; whole
 plans (#172) — `plans` (who is surveying what) / `plan_submit` (a plan in one call,
 claimed on the way out) / `plan_hold` / `plan_unhold` / `plan_finish`; and claims —
@@ -488,7 +535,9 @@ anything here — the check to make before substantive work). **No claim tool ta
 string and none composes a key**: they take a `repo_path` and the board derives both, which
 is #148's rule and #172's. There is
 no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
-it could only ever return a 403. Panel stats are
+it could only ever return a 403. Placing a new item is the other half of that distinction
+and is `plan_add(after=…/before=…)`: it alters no existing pair's relative order, so it
+cannot thrash and needs no gate. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
@@ -1195,6 +1244,7 @@ full — including what was broken before it, which is the part no diff recovers
   the outcome half is absent rather than stubbed, since a null `outcome` column invites the
   question to be answered by whoever is looking.
 - **v2.72** — "a human has to look at this" stops being a sentence nobody can count.
+- **v2.73** — an agent can say where a new plan item goes, and `next` admits when nobody decided.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

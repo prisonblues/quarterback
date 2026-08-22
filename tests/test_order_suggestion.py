@@ -668,6 +668,26 @@ async def test_the_suggested_order_is_applied_by_a_human_and_by_nobody_else(clie
     assert a["item_id"] in body["suggested_order"]
 
 
+async def test_an_entry_says_whether_anybody_chose_the_rank_it_would_move(client):
+    """A suggested move against a position a human decided is a different
+    proposition from one against a position `plan_add` merely appended to — and
+    this endpoint's own argument is that a reader must be able to tell derived
+    from judged (#183)."""
+    repo = "acme/ord-ranksource"
+    first = await add(client, repo, "appended, nobody chose it")
+    placed = await add(client, repo, "placed", before=first["item_id"])
+    body = await order(client, repo)
+    assert entry(body, placed["item_id"])["rank_source"] == "placed"
+    assert entry(body, first["item_id"])["rank_source"] == "appended"
+
+    await client.post("/plan/reorder",
+                      json={"repo": repo, "order": [first["item_id"], placed["item_id"]]},
+                      headers=HUMAN)
+    after = await order(client, repo)
+    assert {entry(after, i["item_id"])["rank_source"]
+            for i in (first, placed)} == {"ordered"}
+
+
 async def test_one_pr_is_answered_for_by_its_newest_run_and_no_other(client):
     """#101's finding, applied here: any predicate placed in front of the
     newest-run selection resurrects a stale run. The older run says the PR is red;

@@ -20,8 +20,12 @@ coordination primitive rather than a to-do list in a table:
   by everyone remembering: one open item per ref.
 * **"Not yet" is a fact.** A dependency blocks, a dropped one does not block
   forever, and a circular one is refused.
-* **Only a human reorders.** Agents add, claim, record what they observe and
-  complete; the sequence stays the human's, which is what stops it thrashing.
+* **Only a human reorders — and placing a new item is not reordering (#183).**
+  Permuting existing items is contested, so the sequence stays the human's, which
+  is what stops it thrashing. Saying where a NEW item enters alters no existing
+  pair's relative order, so an agent may do it — and `next` says out loud how much
+  of the order anybody actually chose, instead of answering rank 1 with confidence
+  while the human's stated top priority sits at rank 20.
 * **It never decides an item is done** — `done` records that the issue closed.
 """
 
@@ -996,6 +1000,332 @@ async def test_a_reorder_will_not_renumber_history(client):
     assert [i["item_id"] for i in ok.json()["items"]] == [live["item_id"]]
 
 
+# ------------------------------------- placing is not reordering (#183)
+
+
+async def test_an_agent_may_say_where_a_new_item_enters(client):
+    """The premise the endpoint was documented on, made true. "Adding is not
+    reordering" was right about adding and false about what the code did: there
+    was no way to add without also deciding where it went, and "last" was
+    hard-coded — an ordering judgement asserted on the caller's behalf."""
+    repo = "acme/place"
+    first = await issue(client, repo, 800)
+    second = await issue(client, repo, 801)
+    urgent = await add(client, repo, "told this is near-top", before=second["item_id"])
+
+    assert urgent["rank"] == 2 and urgent["rank_source"] == "placed"
+    assert [i["ref"]["value"] if i["ref"] else i["title"]
+            for i in (await read(client, repo))["items"]] == ["800", "told this is near-top", "801"]
+    assert first["item_id"] and (await read(client, repo))["items"][0]["rank"] == 1
+
+
+async def test_placing_changes_the_relative_order_of_nothing_already_there(client):
+    """The whole reason this is agent-permitted. Reordering is contested because
+    two agents can overwrite each other's decision; a placement overwrites none,
+    because every existing pair keeps the relationship it had."""
+    repo = "acme/placepairs"
+    before_ids = [(await issue(client, repo, n))["item_id"] for n in (810, 811, 812)]
+    await add(client, repo, "wedged in", after="#810")
+
+    after = [i["item_id"] for i in (await read(client, repo))["items"]]
+    assert [i for i in after if i in before_ids] == before_ids, \
+        "an existing pair changed order — that is a reorder, and agents may not"
+
+
+async def test_a_position_may_name_the_issue_rather_than_the_item(client):
+    """An agent transcribing a spoken priority has an issue number, not a uuid —
+    which is why `depends_on` takes both spellings too."""
+    repo = "acme/placeref"
+    anchor = await issue(client, repo, 820)
+    await issue(client, repo, 821)
+    placed = await add(client, repo, "beneath 820", after="#820")
+
+    assert placed["rank"] == anchor["rank"] + 1
+    assert [i["title"] for i in (await read(client, repo, exact="true"))["items"]] == [
+        "#820", "beneath 820", "#821"]
+
+
+async def test_a_position_is_one_neighbour_and_not_two(client):
+    repo = "acme/placeboth"
+    a = await issue(client, repo, 830)
+    b = await issue(client, repo, 831)
+    r = await client.post("/plan/item",
+                          json={"repo": repo, "title": "confused",
+                                "after": a["item_id"], "before": b["item_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 422
+    assert "not both" in r.json()["detail"]["error"]
+
+
+async def test_an_empty_position_is_no_position_rather_than_two(client):
+    """`after=""` names nothing, so a request carrying it alongside a real
+    `before` names one position — refusing it as "two" would refuse a request
+    that is not ambiguous."""
+    repo = "acme/placeblank"
+    anchor = await issue(client, repo, 835)
+    r = await client.post("/plan/item",
+                          json={"repo": repo, "title": "above it",
+                                "after": "", "before": anchor["item_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    assert r.json()["rank"] == 1 and r.json()["rank_source"] == "placed"
+
+
+async def test_a_position_in_another_scope_is_refused(client):
+    """Ranks are allocated per scope: a repo's list is 1..n and the fleet's is
+    its own 1..n, so "after the fleet item ranked 3" names a position in a
+    sequence this item is not in."""
+    fleet = await add(client, None, "fleet-wide thing")
+    r = await client.post("/plan/item",
+                          json={"repo": "acme/placescope", "title": "mine",
+                                "after": fleet["item_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 422
+    assert r.json()["detail"]["field"] == "after"
+    assert "fleet" in r.json()["detail"]["error"]
+    # And the other way round, because the widened READ is what makes this
+    # tempting: a repo read carries the fleet band along, so a fleet item can see
+    # a repo item in the list it was handed and still not share its sequence.
+    mine = await issue(client, "acme/placescope", 833)
+    back = await client.post("/plan/item",
+                             json={"title": "fleet, placed at a repo item",
+                                   "before": mine["item_id"]},
+                             headers=LAPTOP)
+    assert back.status_code == 422 and back.json()["detail"]["field"] == "before"
+    # Finished on the way out, as the fleet tests above do: an open fleet item is
+    # a row in EVERY later test's scope.
+    await client.post("/plan/item/done", json={"item_id": fleet["item_id"]},
+                      headers=LAPTOP)
+
+
+async def test_a_position_beside_finished_work_is_refused(client):
+    """Only open items carry an order — the same rule a reorder enforces, said
+    the same way, because a done row is a record and not a place."""
+    repo = "acme/placedone"
+    done = await issue(client, repo, 840)
+    await client.post("/plan/item/done", json={"item_id": done["item_id"]}, headers=LAPTOP)
+
+    r = await client.post("/plan/item",
+                          json={"repo": repo, "title": "next to history",
+                                "after": done["item_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 422
+    assert "done" in r.json()["detail"]["error"]
+
+
+async def test_a_position_beside_nothing_is_refused_by_either_spelling(client):
+    repo = "acme/placemissing"
+    await issue(client, repo, 845)
+    by_id = await client.post("/plan/item",
+                              json={"repo": repo, "title": "x",
+                                    "after": str(uuid.uuid4())}, headers=LAPTOP)
+    assert by_id.status_code == 422 and "no such plan item" in by_id.json()["detail"]["error"]
+
+    by_ref = await client.post("/plan/item",
+                               json={"repo": repo, "title": "x", "before": "#999"},
+                               headers=LAPTOP)
+    assert by_ref.status_code == 422
+    assert "references that issue" in by_ref.json()["detail"]["error"]
+
+
+async def test_placing_does_not_renumber_history(client):
+    """A finished item keeps the rank it had, exactly as a reorder leaves it
+    alone: shifting it would rewrite the completion record of work that is over
+    every time somebody placed an item above it."""
+    repo = "acme/placehistory"
+    done = await issue(client, repo, 850)
+    live = await issue(client, repo, 851)
+    await client.post("/plan/item/done", json={"item_id": done["item_id"]}, headers=LAPTOP)
+    was = next(i for i in (await read(client, repo, include_done=True))["items"]
+               if i["item_id"] == done["item_id"])["rank"]
+
+    await add(client, repo, "above the live one", before=live["item_id"])
+    still = next(i for i in (await read(client, repo, include_done=True))["items"]
+                 if i["item_id"] == done["item_id"])["rank"]
+    assert still == was
+
+
+async def test_placing_is_exact_even_where_two_open_items_share_a_rank(client):
+    """Ranks are not guaranteed distinct: a dropped item keeps the rank it had
+    while a reorder renumbers what is still open, so putting it back can leave two
+    open rows at one rank. "Immediately after that item" is then a promise
+    `rank + 1` cannot keep — anchored to the first of the pair it lands after
+    BOTH."""
+    repo = "acme/placedupe"
+    a = await issue(client, repo, 855)
+    b = await issue(client, repo, 856)
+    c = await issue(client, repo, 857)
+    await client.post("/plan/item/update",
+                      json={"item_id": b["item_id"], "state": "dropped"}, headers=HUMAN)
+    await client.post("/plan/reorder",
+                      json={"repo": repo, "order": [a["item_id"], c["item_id"]]},
+                      headers=HUMAN)
+    await client.post("/plan/item/update",
+                      json={"item_id": b["item_id"], "state": "open"}, headers=HUMAN)
+    live = await read(client, repo, exact="true")
+    assert [i["rank"] for i in live["items"]] == [1, 2, 2], "the duplicate this is about"
+
+    placed = await add(client, repo, "immediately after b", after=b["item_id"])
+    after = await read(client, repo, exact="true")
+    assert [i["item_id"] for i in after["items"]] == [
+        a["item_id"], b["item_id"], placed["item_id"], c["item_id"]]
+    # And the duplicate is gone: a placement writes the order it read back as
+    # 1..n, which changes no pair's relative order and repairs the degenerate rank.
+    assert [i["rank"] for i in after["items"]] == [1, 2, 3, 4]
+
+
+async def test_placing_does_not_reset_the_staleness_clock_of_what_it_moves(client):
+    """`updated_at` is "has anybody paid this item attention", and being
+    renumbered is not attention. One placement must not make a fortnight-old
+    plan read as fresh — that is precisely the plan that is believed and wrong."""
+    repo = "acme/placestale"
+    old = await issue(client, repo, 860)
+    before = (await read(client, repo))["items"][0]["updated"]
+
+    await add(client, repo, "in front of it", before=old["item_id"])
+    moved = next(i for i in (await read(client, repo))["items"]
+                 if i["item_id"] == old["item_id"])
+    assert moved["rank"] == 2 and moved["updated"] == before
+
+
+async def test_two_placements_in_one_scope_do_not_land_on_one_rank(client):
+    """`_place_rank` reads a rank and shifts from it — the same read-then-write
+    `_next_rank` is, and the same lost update if two of them interleave."""
+    repo = "acme/placerace"
+    anchor = await issue(client, repo, 870)
+    both = await asyncio.gather(
+        add(client, repo, "one", before=anchor["item_id"]),
+        add(client, repo, "two", before=anchor["item_id"], headers=DESKTOP))
+    assert [r["rank_source"] for r in both] == ["placed", "placed"]
+    ranks = sorted(i["rank"] for i in (await read(client, repo, exact="true"))["items"])
+    assert ranks == [1, 2, 3], f"one rank each, got {ranks}"
+
+
+async def test_a_placement_records_whose_priority_it_transcribes(client):
+    """The field the workaround had to invent. Told mid-seed that #85 was
+    near-top, the agent wrote "TOP PRIORITY — Rich, 23:00" into `phase` and
+    "RANK IS WRONG AND A HUMAN MUST FIX IT" into `note`, because those were the
+    only writable strings."""
+    repo = "acme/placedfor"
+    anchor = await issue(client, repo, 880)
+    placed = await add(client, repo, "the appetite gate", before=anchor["item_id"],
+                       placed_for="Rich, 2026-08-17 23:00")
+    assert placed["placed_for"] == "Rich, 2026-08-17 23:00"
+    assert placed["rank_source"] == "placed"
+
+
+async def test_provenance_without_a_position_is_refused(client):
+    """On its own it would be one more free-text priority channel, which is the
+    workaround rather than the fix."""
+    r = await client.post("/plan/item",
+                          json={"repo": "acme/placedfor2", "title": "urgent, honest",
+                                "placed_for": "Rich, 23:00"},
+                          headers=LAPTOP)
+    assert r.status_code == 422
+    assert "needs `after` or `before`" in r.json()["detail"]["error"]
+
+
+async def test_an_appended_item_still_appends_and_says_nobody_chose_it(client):
+    """Nothing that worked before changes — a position is optional, and its
+    absence is now recorded rather than silently meaning "least important"."""
+    repo = "acme/placedefault"
+    await issue(client, repo, 890)
+    plain = await add(client, repo, "no position given")
+    assert plain["rank"] == 2 and plain["rank_source"] == "appended"
+    assert plain["placed_for"] is None
+
+
+# ------------------------------- `next` says how good an answer it is (#183)
+
+
+async def test_next_admits_when_the_order_is_one_nobody_chose(client):
+    """The sharpest complaint in the issue: `plan_read` returned `next` = rank 1
+    confidently while the human's stated top priority sat at rank 20 under a note
+    shouting that the rank was a lie. Every signal was in free text."""
+    repo = "acme/untrusted"
+    await issue(client, repo, 900)
+    await issue(client, repo, 901)
+
+    plan = await read(client, repo, exact="true")
+    assert plan["order_trust"]["trusted"] is False
+    assert plan["order_trust"]["unchosen"] == 2
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 1
+    assert plan["order_trust"]["first_unchosen"]["repo"] == repo
+    assert plan["order_trust"]["by_source"] == {"appended": 2}
+    assert "nobody chose" in plan["next"]["caveat"]
+
+
+async def test_a_human_ordering_the_list_is_what_makes_next_confident(client):
+    """`trusted` is not decoration: it flips when somebody actually decides, and
+    the caveat goes with it."""
+    repo = "acme/trusted"
+    first = await issue(client, repo, 910)
+    second = await issue(client, repo, 911)
+    r = await client.post("/plan/reorder",
+                          json={"repo": repo, "order": [second["item_id"], first["item_id"]]},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    plan = await read(client, repo, exact="true")
+    assert plan["order_trust"] == {"trusted": True, "by_source": {"ordered": 2},
+                                "unchosen": 0, "first_unchosen": None, "hint": None}
+    assert plan["next"]["caveat"] is None
+    assert plan["next"]["rank_source"] == "ordered"
+
+
+async def test_a_reorder_claims_no_decision_about_an_item_the_page_never_saw(client):
+    """A stale page carries an unseen item along rather than losing it — and
+    carrying it is not deciding where it goes. Marking it `ordered` would make
+    the plan claim a human chose a position they were never shown."""
+    repo = "acme/orderedrest"
+    first = await issue(client, repo, 920)
+    second = await issue(client, repo, 921)
+    unseen = await issue(client, repo, 922)
+
+    r = await client.post("/plan/reorder",
+                          json={"repo": repo, "order": [second["item_id"], first["item_id"]]},
+                          headers=HUMAN)
+    assert r.json()["appended"] == [unseen["item_id"]]
+    plan = await read(client, repo, exact="true")
+    assert plan["order_trust"]["by_source"] == {"ordered": 2, "appended": 1}
+    assert plan["order_trust"]["trusted"] is False
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 3
+    assert plan["next"]["caveat"] is not None
+    assert " this one among them," not in plan["next"]["caveat"], \
+        "next itself was ordered by a human — the caveat is about the rest"
+
+
+async def test_a_placed_item_is_a_chosen_position(client):
+    """Placement is what an agent can do about an untrustworthy order without
+    reordering anything: a plan every item of which was placed is trusted."""
+    repo = "acme/placedtrust"
+    anchor = await issue(client, repo, 930)
+    await client.post("/plan/reorder", json={"repo": repo, "order": [anchor["item_id"]]},
+                      headers=HUMAN)
+    await add(client, repo, "placed above it", before=anchor["item_id"])
+
+    plan = await read(client, repo, exact="true")
+    assert plan["order_trust"]["by_source"] == {"placed": 1, "ordered": 1}
+    assert plan["order_trust"]["trusted"] is True and plan["next"]["caveat"] is None
+
+
+async def test_the_caveat_names_the_answers_own_position_when_that_is_the_problem(client):
+    """"Read the notes" is different advice depending on whether the item you
+    are being handed is itself sitting where nobody put it."""
+    repo = "acme/caveatself"
+    await issue(client, repo, 940)
+    plan = await read(client, repo, exact="true")
+    assert " this one among them," in plan["next"]["caveat"]
+
+
+async def test_an_empty_scope_is_trusted_rather_than_suspicious(client):
+    """Nothing unchosen is nothing unchosen. A flag that fires on an empty plan
+    is one every reader learns to ignore."""
+    plan = await read(client, "acme/emptyorder", exact="true")
+    assert plan["order_trust"]["trusted"] is True and plan["next"] is None
+    assert plan["order_trust"]["by_source"] == {}
+
+
 # --------------------------------------------------- spelling and edge cases
 
 async def test_one_issue_is_one_item_however_the_repo_is_spelled(client):
@@ -1134,6 +1464,23 @@ def test_every_plan_verb_the_mcp_tools_use_is_a_route_the_board_serves():
     for verb in ("claim", "release", "done", "depends"):
         assert f"/plan/item/{verb}" in paths
     assert {"/plan", "/plan/item", "/plan/reorder", "/plan/view"} <= paths
+
+
+def test_the_mcp_plan_tools_teach_placing_and_the_caveat():
+    """Agents learn this API from the tool docstring and nowhere else, and
+    `plan_add`'s said "Adding is not reordering, so you may" — the premise #183
+    is about, stated by the one surface every agent reads. A position an agent
+    cannot pass is a position agents will keep faking in free text."""
+    source = (Path(__file__).resolve().parent.parent
+              / "mcp" / "mcp_server" / "server.py").read_text(encoding="utf-8")
+    add_tool = source[source.index("def plan_add("):source.index("def plan_claim(")]
+    assert "after: str | None = None" in add_tool
+    assert "before: str | None = None" in add_tool
+    assert "placed_for: str | None = None" in add_tool
+    assert '"after": after, "before": before, "placed_for": placed_for' in add_tool
+    assert "Placing is not reordering" in add_tool
+    read_tool = source[source.index("def plan_read("):source.index("def plan_add(")]
+    assert "caveat" in read_tool
 
 
 def test_the_mcp_plan_tools_restate_neither_the_ttl_nor_the_limit():
