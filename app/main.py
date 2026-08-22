@@ -13,6 +13,7 @@ from app.api.leases import router as leases_router
 from app.api.merge_queue import router as merge_queue_router
 from app.api.plan import router as plan_router
 from app.api.posts import router as posts_router
+from app.api.review_queue import router as review_queue_router
 from app.api.reviews import router as reviews_router
 from app.api.stream import router as stream_router
 from app.api.subagents import router as subagents_router
@@ -36,6 +37,7 @@ app.include_router(blobs_router)
 app.include_router(leases_router)
 app.include_router(subagents_router)
 app.include_router(reviews_router)
+app.include_router(review_queue_router)
 app.include_router(worktrees_router)
 app.include_router(sync_router)
 app.include_router(claims_router)

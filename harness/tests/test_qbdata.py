@@ -1319,3 +1319,259 @@ def test_an_estimate_with_no_history_is_no_number_rather_than_a_guess():
     est = qd.pace_estimate(qd.pace(([_cap(percent=62)], None)), None, seats=4)
     assert est["tokens"] is None and est["per_run"] is None
     assert est["headroom_pct"] == 38, "the half that IS known is still reported"
+
+
+# ---- the review queue (#273) -------------------------------------------------
+#
+# The dashboard is where "six of eight open PRs have never been panelled" was
+# supposed to be visible and was not. These pin the two halves that make it so:
+# the PR rows go to the board unchanged (so nothing translates on the way), and a
+# board that cannot be reached reports as unreachable rather than as an empty
+# queue.
+
+@pytest.mark.parametrize("secs,expected", [
+    (0, "0m"),
+    (90, "1m"),
+    (3600, "1h00m"),
+    (22_200, "6h10m"),
+    (216_000, "2d12h"),
+    (1_000_000, "11d13h"),
+    (None, ""),
+    ("nonsense", ""),
+])
+def test_a_wait_is_reported_in_days_once_it_is_days(secs, expected):
+    """`ago` stops at hours, and this queue's whole complaint is measured in days:
+    "60h13m" is a number a reader has to convert before it means anything."""
+    assert qd.waited(secs) == expected
+
+
+def test_the_pr_rows_reach_the_board_in_githubs_own_words(monkeypatch):
+    client, sent = _client(monkeypatch, json.dumps({
+        "counts": {"open": 1, "drainable": 1},
+        "oldest": {"pr": 9, "age_seconds": 216_000},
+        "entries": [{"pr": 9, "state": "unreviewed", "drainable": True,
+                     "age_seconds": 216_000}],
+        "idle_reason": None,
+    }).encode())
+    prs = [{"number": 9, "title": "a pr", "headRefOid": "f" * 40,
+            "mergeable": "MERGEABLE", "createdAt": "2026-08-17T00:00:00Z",
+            "isDraft": False, "statusCheckRollup": [{"noise": "x"} for _ in range(50)],
+            "repo": "acme/one"}]
+
+    queue = qd.fetch_review_queue(client, prs, repos=["acme/one"])
+    body = json.loads(sent[0].data.decode())
+    assert body["repo"] == "acme/one"
+    # GitHub's own field names, so nothing has to translate on the way in...
+    assert body["prs"] == [{"number": 9, "title": "a pr", "headRefOid": "f" * 40,
+                            "mergeable": "MERGEABLE", "createdAt": "2026-08-17T00:00:00Z",
+                            "isDraft": False}]
+    # ...and the check rollup, which is most of the row and none of the question,
+    # does not travel.
+    assert "statusCheckRollup" not in body["prs"][0]
+    assert queue["depth"] == 1 and queue["open"] == 1
+    assert queue["entries"][0]["repo"] == "acme/one"
+    assert queue["oldest"]["age_seconds"] == 216_000
+
+
+def test_a_repo_with_no_open_prs_is_still_asked(monkeypatch):
+    """Otherwise a repo whose queue drained and a repo nobody asked about are the
+    same blank, which is #244's confusion in the one panel built to end it."""
+    client, sent = _client(monkeypatch, json.dumps({
+        "counts": {"open": 0, "drainable": 0}, "entries": [], "oldest": None,
+        "idle_reason": "no open pull requests were supplied for this repo"}).encode())
+    queue = qd.fetch_review_queue(client, [], repos=["acme/quiet"])
+    assert len(sent) == 1
+    assert queue["open"] == 0 and queue["depth"] == 0
+    assert "no open pull requests" in queue["idle"]
+
+
+def test_a_board_that_cannot_be_reached_is_a_state_not_an_exception(monkeypatch):
+    def boom(*a, **k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", boom)
+    client = qd.BoardClient(qd.BoardConfig("https://board.example", "t", "host"))
+    queue = qd.fetch_review_queue(client, [], repos=["acme/one"])
+    assert queue["error"] and "acme" not in queue["error"].split(":")[0]
+    assert queue["entries"] == []
+    # And it must NOT read as a drained queue on the header line.
+    assert qd.queue_cell(queue)[1] == "?"
+
+
+def test_one_failing_repo_does_not_cost_the_others_their_queue(monkeypatch):
+    answers = {
+        "acme/good": {"counts": {"open": 2, "drainable": 2},
+                      "entries": [{"pr": 1, "drainable": True, "age_seconds": 10},
+                                  {"pr": 2, "drainable": True, "age_seconds": 20}],
+                      "oldest": {"pr": 2, "age_seconds": 20}, "idle_reason": None},
+    }
+
+    def urlopen(req, *a, **k):
+        repo = json.loads(req.data.decode())["repo"]
+        if repo not in answers:
+            raise OSError("no")
+        return _Response(json.dumps(answers[repo]).encode())
+
+    monkeypatch.setattr(qd.urllib.request, "urlopen", urlopen)
+    client = qd.BoardClient(qd.BoardConfig("https://board.example", "t", "host"))
+    queue = qd.fetch_review_queue(client, [], repos=["acme/good", "acme/bad"])
+    assert queue["depth"] == 2
+    assert "bad" in queue["error"]
+    # Oldest first, and the drainable ones ahead of the held ones.
+    assert [e["pr"] for e in queue["entries"]] == [2, 1]
+
+
+def test_a_queue_where_everything_is_stuck_still_reports_its_age():
+    """Reporting only the drainable wait renders a repo whose every PR has been
+    blocked for five days as a queue with no age at all — the reading this panel
+    exists to surface, hidden by the panel built to surface it."""
+    stuck = {"open": 4, "depth": 0, "oldest": None, "error": None,
+             "oldest_held": {"pr": 270, "age_seconds": 432_000}}
+    assert qd.queue_oldest(stuck) == ("5d00h", True)
+    assert qd.queue_cell(stuck) == ("REVIEW", "0 waiting", "held 5d00h", "green")
+    live = {"open": 4, "depth": 2, "oldest": {"age_seconds": 3600},
+            "oldest_held": {"age_seconds": 432_000}, "error": None}
+    assert qd.queue_oldest(live) == ("1h00m", False)
+
+
+def test_the_header_cell_tells_an_empty_queue_from_an_unasked_one():
+    empty = qd.queue_cell({"open": 3, "depth": 0, "oldest": None, "error": None})
+    assert empty == ("REVIEW", "0 waiting", "", "green")
+    deep = qd.queue_cell({"open": 9, "depth": 6,
+                          "oldest": {"age_seconds": 216_000}, "error": None})
+    assert deep[1] == "6 waiting" and deep[2] == "oldest 2d12h" and deep[3] == "red"
+
+
+def test_the_entries_are_sorted_for_reading_and_the_held_ones_keep_their_place():
+    """A panel that hid its blocked entries would report a depth of zero for a
+    repo where everything is stuck — which is the reading this exists to end."""
+    answer = {"counts": {"open": 3, "drainable": 1},
+              "entries": [{"pr": 1, "drainable": False, "age_seconds": 900_000},
+                          {"pr": 2, "drainable": True, "age_seconds": 100},
+                          {"pr": 3, "drainable": False, "age_seconds": 50}],
+              "oldest": {"pr": 2, "age_seconds": 100}, "idle_reason": None}
+
+    class C:
+        def post(self, path, body):
+            return answer
+
+    queue = qd.fetch_review_queue(C(), [], repos=["acme/one"])
+    assert [e["pr"] for e in queue["entries"]] == [2, 1, 3]
+    assert queue["depth"] == 1 and queue["open"] == 3
+    assert queue["idle"] is None, "a queue with depth is not idle"
+
+
+def test_a_pr_list_that_failed_is_not_an_empty_pr_list(monkeypatch):
+    """`gh` failing gives `([], err)`, and sending that empty list would have the
+    board honestly answer "no open pull requests" for a repo with eight waiting."""
+    asked: list = []
+
+    class C:
+        def post(self, path, body):
+            asked.append(body)
+            return {"counts": {"open": 0, "drainable": 0}, "entries": [],
+                    "oldest": None, "idle_reason": "no open pull requests"}
+
+    queue = qd.fetch_review_queue(C(), [], repos=["acme/one"], pr_err="one: gh exit 1")
+    assert asked == [], "nothing may be derived from a listing nobody could read"
+    assert "pr list unavailable" in queue["error"]
+    assert qd.queue_cell(queue)[1] == "?"
+
+
+def test_an_empty_board_response_is_an_error_and_not_an_empty_queue():
+    """`BoardClient.post` reads an empty body as `{}` because a WRITE's 200 may
+    carry none. This is a read through that method, so the tolerance is undone."""
+    class C:
+        def post(self, path, body):
+            return {}
+
+    queue = qd.fetch_review_queue(C(), [], repos=["acme/one"])
+    assert "empty answer" in queue["error"]
+    assert queue["open"] == 0 and queue["entries"] == []
+    assert qd.queue_cell(queue)[1] == "?"
+
+
+def test_one_repos_failed_listing_does_not_cost_the_others_their_queue(monkeypatch):
+    """The conservative fix for "an empty list is not an empty repo" was to refuse
+    every repo, which throws away two good queues because a third's token expired."""
+    asked: list = []
+
+    class C:
+        def post(self, path, body):
+            asked.append(body["repo"])
+            return {"counts": {"open": 1, "drainable": 1},
+                    "entries": [{"pr": 5, "drainable": True, "age_seconds": 60}],
+                    "oldest": {"pr": 5, "age_seconds": 60}, "idle_reason": None}
+
+    queue = qd.fetch_review_queue(
+        C(), [{"number": 5, "repo": "acme/good"}],
+        repos=["acme/good", "acme/bad"], pr_err="bad: HTTP 401")
+    assert asked == ["acme/good"]
+    assert queue["depth"] == 1
+    assert "bad: pr list unavailable" in queue["error"]
+
+
+def test_an_unattributable_listing_error_makes_every_repo_suspect():
+    class C:
+        def post(self, path, body):     # pragma: no cover - must not be reached
+            raise AssertionError("nothing may be derived")
+
+    queue = qd.fetch_review_queue(C(), [], repos=["acme/one"], pr_err="something broke")
+    assert "something broke" in queue["error"]
+    assert qd.queue_cell(queue)[1] == "?"
+
+
+def test_the_error_format_and_the_parse_of_it_agree(monkeypatch):
+    """`gh_error_repos` reads the string `_gh_list` writes. Pinned together,
+    because a drift between them silently restores the bug above."""
+    class Done:
+        returncode = 1
+        stdout = ""
+        stderr = "HTTP 401: Bad credentials"
+
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+    rows, err = qd.fetch_prs(["acme/alpha", "acme/beta"])
+    assert rows == []
+    assert qd.gh_error_repos(err) == {"alpha", "beta"}
+
+
+def test_a_repo_at_the_fetch_limit_reports_its_depth_as_a_floor():
+    """"60 open PRs" and "at least 60" are different facts, and only one is a depth."""
+    class C:
+        def post(self, path, body):
+            return {"counts": {"open": qd.PR_LIMIT, "drainable": qd.PR_LIMIT},
+                    "entries": [], "oldest": None, "idle_reason": None}
+
+    prs = [{"number": n, "repo": "acme/busy"} for n in range(qd.PR_LIMIT)]
+    queue = qd.fetch_review_queue(C(), prs, repos=["acme/busy"])
+    assert queue["depth"] == qd.PR_LIMIT
+    assert "depth is a floor" in queue["error"]
+
+
+def test_two_watched_repos_with_one_short_name_are_both_withheld(monkeypatch):
+    """`org1/api` and `org2/api` produce the same error prefix, so while a listing
+    error is outstanding neither can be shown to have succeeded. A third repo with
+    a name of its own is unaffected."""
+    asked: list = []
+
+    class C:
+        def post(self, path, body):
+            asked.append(body["repo"])
+            return {"counts": {"open": 0, "drainable": 0}, "entries": [],
+                    "oldest": None, "idle_reason": None}
+
+    queue = qd.fetch_review_queue(
+        C(), [], repos=["org1/api", "org2/api", "org3/web"], pr_err="api: HTTP 401")
+    assert asked == ["org3/web"]
+    assert "org1/api: which `api` failed is ambiguous" in queue["error"]
+    assert "org2/api" in queue["error"]
+
+
+def test_a_shared_short_name_costs_nothing_when_no_listing_failed():
+    class C:
+        def post(self, path, body):
+            return {"counts": {"open": 0, "drainable": 0}, "entries": [],
+                    "oldest": None, "idle_reason": None}
+
+    queue = qd.fetch_review_queue(C(), [], repos=["org1/api", "org2/api"])
+    assert queue["error"] is None

@@ -928,8 +928,25 @@ along the bottom (the **tape**) is the event stream. Who is alive and on what, w
 which claim and for how long, what the fleet agreed to do next, every open PR with its CI
 verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
 the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
+where it is, a PR or an issue opens on GitHub. `qb-dash` is the same views rendered
 without interaction, for a terminal that will not forward mouse events.
+
+`qb-dash` also carries a **REVIEW QUEUE** panel the clickable renderer does not have yet
+(#273). OPEN PRs above it says a PR exists and CI is green; it never said whether anybody
+had reviewed it, and on 2026-08-20 six of eight open PRs had never been panelled while the
+newest round on the board was two and a half days old — neither number readable anywhere.
+The panel is `POST /review-queue`: every open PR joined to every panel run, plan item, work
+claim and landing-queue entry the board holds, so each row carries the state it is in, the
+verb that state implies (`panel`, `re-panel`, `fix`, `rebase`, `land`) and how long it has
+waited. Rows nothing may act on keep their place and show the reason instead of the verb,
+because a panel that hid them would report an empty queue for a repo where everything is
+stuck. The depth and the oldest wait also sit on the caps line at the top, beside the budget
+they would be spent out of.
+
+An age prefixed `~` is the longest the wait could have been rather than the length it was:
+nothing records when a head moved or when a branch started conflicting, so those are
+measured from the round or from the PR's opening. Nothing here starts a review — the panel
+is a reader, and the thing that would act on it is #53.
 
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
