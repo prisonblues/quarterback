@@ -17,6 +17,68 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.1 — the review loop starts measuring whether its fixes are getting anywhere
+
+A fix that patches a wrong assumption produces the next round's findings. A fix that removes the
+assumption does not. The loop could not tell those two rounds apart: it stopped on a round count,
+which fires at the same point whether the rounds are converging or circling — and that is the point
+in a cycle where the spend is highest and a human is least likely to be asked.
+
+Every round past the first now records, per finding, where that finding stands relative to the fix
+pass before it, and what the judge says when asked directly whether that fix's premise still holds.
+**Nothing stops on either.** #67 asks for the instrument before the gate, and the first calibration
+below is the reason that is right rather than merely cautious.
+
+### What is recorded
+
+`recurrence` places a finding against the last fix pass. `revisited` is the conjunction of three
+things — the previous round raised a finding in this file, that round's fixer wrote lines in it, and
+this finding sits within about twenty lines of them; `fix-site` is the fixer having worked here on
+something nobody complained about; then `elsewhere`, and `unknown` for a finding with no line, no
+file, or a path that could name two changed files. `recurs_of` names the earlier finding, so a label
+can be traced back to the record it came from. NULL is *not recorded* throughout, and never "does
+not recur": a round 1, a run outside a cycle and a repeat all leave it unset, which is a different
+statement from `unknown`.
+
+`premise_verdict` is the judge's own answer — `invalidates`, `separate`, `unclear` — asked as one
+extra key on a verdict it is already writing, so the sharper question costs no second model call.
+The brief carrying it is spliced into the judge prompt at a slot swapped for the empty string
+whenever there is no earlier round, so a round-1 prompt is byte-identical to the one it has always
+been given. It spends most of its length pushing *away* from `invalidates`: a second bug in a file
+somebody just edited is a second bug.
+
+Both tallies ride the run (`recurrence_counts`, `premise_counts`), both reach the board, and
+`GET /review/stats` splits both across a window.
+
+### The first calibration says the mechanical half does not discriminate
+
+Replayed over 36 rounds from 26 pull requests — every multi-round cycle the board holds — against
+the three cycles #67 identifies as circling (#61, #29, #88) with every other cycle as the control:
+
+| narrowing | #61 / #29 / #88 | every other PR |
+|---|---|---|
+| same file + within 20 lines | 83% | 69% |
+| same file + within 5 lines | 79% | 64% |
+| same file + exactly on a written line | 65% | 52% |
+| …and the earlier finding within 20 lines | 29% | 27% |
+
+There is no radius at which it separates them, and tightening lowers both columns together. The
+reason is legible in the runs: since #41 a later round *reviews the fix commit*, so a new finding at
+the fix's site is the ordinary case rather than the exceptional one.
+
+So the bucket is named for a position (`revisited`) rather than for a verdict (`circling`), the
+report prints the count with no recommendation attached, and the judge is asked the question the
+position cannot answer. The rate is kept because a measurement that saturates is itself a fact about
+the loop, and it is the baseline any later rule has to beat. This is also what #67's own note on
+PR #88 predicted: the grouping key needed is "not 'same file' but 'same way of being wrong'".
+
+### Two premises, and they are not the same premise
+
+#84's premise register is a **fixer's declaration** of what it is about to fix on, and it brakes a
+repeat. This is an **adjudication of a finding**, and it brakes nothing. #67's record of PR #88 is
+the argument for keeping the two apart: the agent that wrote round 1's fix wrote round 2's
+regression of the same shape, in the same commit as a docstring stating the invariant it broke.
+
 ## v3 — the release number gets an allocator, and it is a git tag
 
 The number was handed out by reading a file. `release_stamp.py apply` computes
