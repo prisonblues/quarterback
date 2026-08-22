@@ -5,6 +5,7 @@ let
   share = "${cfg.package}/share/quarterback-harness";
 
   board = cfg.board;
+  consumer = cfg.consumer;
   wantConfig = board.url != null;
 
   # The site config file, sourced (never executed) by qb-env — see harness/bin/qb-env for
@@ -37,6 +38,10 @@ let
     QUARTERBACK_AGENT='${board.agent}'
   '' + lib.optionalString (board.repo != null) ''
     QUARTERBACK_REPO="${board.repo}"
+  '' + lib.optionalString (consumer.flake != null) ''
+    QUARTERBACK_CONSUMER_FLAKE="${consumer.flake}"
+  '' + lib.optionalString (consumer.attr != null) ''
+    QUARTERBACK_CONSUMER_ATTR='${consumer.attr}'
   '';
 
   # What `qb-start` compiles in (its SPAWNABLE table). Restated here so a bad
@@ -354,6 +359,48 @@ in
         '';
       };
     };
+
+    # ---- which flake CONSUMES this harness, so a bump can be prepared --------
+    #
+    # quarterback ships the harness; something else pins it. That something else is
+    # a third thing — not this repo and not the store path — and `qb-doctor` records
+    # that it cannot find it, which is why its staleness check compares CONTENT
+    # rather than the pin. These two options are the door a consumer declares itself
+    # through: set them and `qb-bump` knows, on this host, exactly which flake to
+    # prepare a bump in and which system output to build. Leave them and it scans
+    # (`~/source`, `~`) for a lock that pins this repo, which is what runs on a fleet
+    # that has declared nothing — and refuses rather than guessing if it finds two.
+    consumer = {
+      flake = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "$HOME/source/nix-fleet";
+        description = ''
+          The flake that pins this harness — the checkout `nixos-rebuild --flake` is
+          pointed at on this machine. Emitted as `QUARTERBACK_CONSUMER_FLAKE`.
+
+          Point it at the CHECKOUT, not at a worktree of it: a machine is rebuilt from
+          the former, and a bump prepared into the latter lands in somebody's in-flight
+          branch. `$HOME` expands (the value is emitted double-quoted), which is what
+          lets one fleet-wide line serve every host.
+        '';
+      };
+
+      attr = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "desktop";
+        description = ''
+          The `nixosConfigurations` attribute that IS this machine, when it is not
+          simply the hostname. Emitted as `QUARTERBACK_CONSUMER_ATTR`.
+
+          Worth setting wherever the two differ — this fleet's `zeus` is
+          `nixosConfigurations.desktop` — because the fallback is to evaluate each
+          configuration in turn asking what hostname it declares, which is correct,
+          slow, and can be defeated by a host that does not evaluate here at all.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -367,6 +414,31 @@ in
         (noSingleQuote "board.tokenRefreshCommand" board.tokenRefreshCommand)
         (noSingleQuote "board.url" board.url)
         (noSingleQuote "board.agent" board.agent)
+        (noSingleQuote "consumer.attr" consumer.attr)
+        {
+          # The consumer keys ride in the file `board.url` decides to render, so
+          # declaring one without the other is a value that silently reaches nothing —
+          # and the symptom is `qb-bump` scanning, finding two candidates and refusing,
+          # on a host that thought it had said which. Named at eval time instead.
+          assertion = (consumer.flake == null && consumer.attr == null) || wantConfig;
+          message = ''
+            programs.quarterback-harness.consumer is set but board.url is null, so this
+            module renders no ~/.config/quarterback/config and the value would reach
+            nothing. Set board.url, or write QUARTERBACK_CONSUMER_FLAKE into the config
+            file you manage yourself.
+          '';
+        }
+        {
+          # Emitted double-quoted so that $HOME in it expands — the same trade board.repo
+          # makes, and the same two characters it therefore cannot carry.
+          assertion = consumer.flake == null
+            || !(lib.hasInfix "\"" consumer.flake || lib.hasInfix "`" consumer.flake);
+          message = ''
+            programs.quarterback-harness.consumer.flake must not contain a double quote or
+            a backtick — it is emitted double-quoted (so that $HOME in it expands) into
+            ~/.config/quarterback/config, which every board client sources.
+          '';
+        }
         {
           # Refused at EVAL time, where the message can name the option, rather than
           # at spawn time on a box nobody is watching. `qb-start` refuses an unknown

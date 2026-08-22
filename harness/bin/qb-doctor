@@ -550,11 +550,15 @@ def checkout_harness_bin(host: Host) -> Path | None:
 def check_harness(host: Host) -> Check:
     """Is the harness on PATH built from this checkout?
 
-    The nix flake pin is what versions it, nothing bumps that pin automatically
-    (#267), and no harness script can tell you it is stale because each one only
-    knows its own store path. So this compares CONTENT: every file the package
+    The nix flake pin is what versions it, no harness script can tell you it is
+    stale because each one only knows its own store path, and until #267 nothing
+    acted on the answer either. So this compares CONTENT: every file the package
     installs from `bin/`, against the checkout's. That answers the question the
     version number would have, without needing one to exist.
+
+    `qb-bump` is what acts on it now, and it reads this row rather than measuring
+    anything itself — so this stays the one comparison, and the remedy below names
+    a command instead of a chore.
 
     CONTENT IS A PROXY, and the next reader should know it is one. The question
     actually being asked is "was the harness on PATH built from a commit at or
@@ -591,8 +595,9 @@ def check_harness(host: Host) -> Check:
         parts.append(f"{len(differ)} differ ({_named(differ)})")
     return Check("harness", str(host.harness_bin),
                  "behind this checkout: " + ", ".join(parts), "fail",
-                 manual="bump the quarterback-harness flake input on this host and rebuild "
-                        "(#267 — nothing bumps it for you)",
+                 manual="run `qb-bump`: it prepares that flake input's bump, builds this "
+                        "machine's system with it, and hands you the one command that "
+                        "needs your password (#267)",
                  extra={"differ": sorted(differ), "missing": sorted(missing)})
 
 

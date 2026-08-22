@@ -2031,6 +2031,115 @@ check that cannot answer until after the problem is solved.
   says nothing about which source tree answered (#203), and the documented repair for that
   installs a different half of the package (#200).
 
+### `qb-bump` — the thing that acts on a stale harness (#267)
+
+`qb-doctor` says the harness on PATH is behind this checkout. Nothing used to do anything
+about it. On 2026-08-22 sixteen releases landed and the harness half of every one of them
+reached this fleet's desktop only when a person remembered to run `nix flake update` by
+hand: the pin was 162 commits behind at 09:00 (eleven binaries simply absent from PATH,
+including the `qb-reconcile` whose systemd units had therefore never been installable), was
+bumped at 10:19, and was stale again by 14:00.
+
+```bash
+qb-bump                     # stale? prepare the bump, BUILD it, propose it
+qb-bump --json              # the same answer as a document
+qb-bump --apply             # what a PERSON runs: install the prepared lock and switch
+qb-bump --apply --dry-run   # print that command rather than running it
+
+#   exit 0  nothing to carry — the harness on PATH is this checkout's
+#   exit 1  cannot tell — no qb-doctor, no nix, no consuming flake, or more than one
+#   exit 2  a bump is prepared and BUILT; one command by a person finishes it
+#   exit 4  the bump does not build — refused to propose it
+```
+
+**It does not detect anything.** The drift verdict is `qb-doctor --json --only harness`,
+read and not re-derived. A second comparison here would be a second opinion about a fact
+that already has one, and the two would disagree the day one of them learned something —
+`_same_after_packaging`'s handling of `patchShebangs` and `wrapProgram` is exactly the kind
+of thing only one of two copies ever gets right. The suite asserts this behaviourally: a
+stub doctor reporting `ok` is believed, whatever any other measurement of those directories
+would say.
+
+**The ceiling is `sudo`, and it is designed around rather than fought.** A
+`nixos-rebuild switch` needs root. An agent has no root and should not go looking for it, so
+this stops one step short of it — prepare, build, prove, and hand a person one command. That
+is the ten minutes; the `sudo` is the ten seconds. `--apply` refuses without a terminal, so
+a timer, a CI job or an agent that invokes it changes nothing and prints the command instead.
+
+**A proposal that has not been built is a proposal to break somebody's machine.** The first
+bump on 2026-08-22 failed: quarterback's module had started installing
+`~/.claude/quarterback-workflow.md` while the consuming flake still declared its own copy,
+and two definitions of one `home.file` path is an eval error, not a merge. So the build is
+not a nicety — a bump that does not build is **refused** and announced as a refusal, with
+the error, rather than proposed.
+
+**It never commits in the consumer, and never reads its uncommitted work.** Preparation runs
+on `git archive HEAD` unpacked into a temporary directory, so a consumer's dirty working
+tree — a half-edited secrets module — can neither be built here nor swept into anything. The
+only file this ever writes into a consumer's checkout is `flake.lock`, only under `--apply`,
+and only when a person typed the command. It is left *modified*, never committed: what that
+lock means for a fleet's history is the consumer's business.
+
+#### Finding the flake that consumes this harness
+
+That flake is a third thing — not this repo, not the store path — which is why `qb-doctor`
+compares content rather than pins: it cannot find it. `qb-bump` asks four questions in order
+and refuses rather than guessing:
+
+1. `--flake DIR`.
+2. `$QUARTERBACK_CONSUMER_FLAKE`.
+3. `QUARTERBACK_CONSUMER_FLAKE` in `~/.config/quarterback/config` — which
+   `programs.quarterback-harness.consumer.flake` writes, and is how a fleet says this once.
+4. A scan of `~/source` and `~`, one level deep, for a `flake.lock` that pins this repo.
+   Override the roots with `QUARTERBACK_CONSUMER_ROOTS` (colon-separated) — that is also how
+   a host with its flake at `/etc/nixos` says so.
+
+A hit is collapsed onto its **main checkout** before being counted. Eight directories under
+`~/source` pinned this repo on the machine this was written for, and they were eight
+worktrees of one flake; they are not eight consumers, because a machine is rebuilt from the
+checkout and a bump prepared into a feature branch's worktree lands in somebody's in-flight
+work. Two genuinely different flakes still refuse, by name: picking the first would prepare
+a bump against a directory nobody rebuilds from, which looks exactly like a good proposal
+and does nothing at all.
+
+**The system attribute is not the hostname.** This fleet's `zeus` is
+`nixosConfigurations.desktop`. So the hostname is a first guess checked against the flake's
+own attribute names, and the fallback is to ask each configuration what `networking.hostName`
+it declares — correct, slow, and defeated by a host that does not evaluate here at all, which
+is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
+
+#### What a person is told, and where
+
+Through #274's door and in #279's vocabulary: `needs_human.announce`, class `environment` —
+nothing here needs taste or a design decision, it needs root on a particular machine. Not a
+board post written by this script, because a second spelling of "a human must do this" is two
+places to watch and a person watching neither. The board post carries the drift, the two
+revisions, the store path that was built and the one command; the same thing is printed
+locally whether or not the board took it, because an escalation that cannot be announced is
+still an escalation.
+
+```
+stale: behind this checkout: 5 absent (check-db-isolation, qb-admit, qb-release, qb-start,
+       +1 more), 5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)
+
+consumer   /home/rich/source/nix-fleet (found by scanning /home/rich/source)
+input      quarterback
+pin        b35de2a5e638 -> eac457b385ff
+built      desktop: /nix/store/…-nixos-system-zeus-26.05.20260707.0ad6f47
+
+10 scripts arrive on PATH when a person runs:
+  /home/rich/source/quarterback/harness/bin/qb-bump --apply
+
+That writes the prepared flake.lock into the consumer and runs `nixos-rebuild switch`, which
+needs a password; nothing above it did.
+```
+
+That path rather than the bare name is deliberate and is the normal case: the harness
+carrying `qb-bump` is by definition the one **not** installed on the host it is diagnosing,
+so on the first run `qb-bump --apply` would be a `command not found`. When the name resolves
+to the file that just ran, the name is what gets printed.
+
+
 ## How it works
 
 - **Layout.** A worktree is a *sibling* of the main checkout: `../<project>-<branch>`, with
