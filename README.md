@@ -1458,6 +1458,8 @@ full — including what was broken before it, which is the part no diff recovers
   it leaves the machine.
 - **v2.84** — a repository spelt with capitals is the same repository.
 - **v2.85** — a shipped release's notes cannot be quietly replaced by a merge resolution.
+- **v2.86** — a claim is handed back when the work ends, and a repo may bound how much work is in
+  flight.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
