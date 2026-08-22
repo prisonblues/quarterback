@@ -870,6 +870,148 @@ The line `qb-seat` draws — *"the board coordinates work, it does not operate t
 is about **dispatch**, and none of this moves it. What an agent works on is still its own
 choice, self-selected and claimed atomically.
 
+### `qb-start` — the verb that begins a session, and it ships off
+
+The other half of #277. There were three ways to start a session on this fleet and every one
+of them ended at a human hand: `qb-seat` in a pane somebody typed into, the dashboard's ⚒ on
+a mouse click, and `run_agent`'s headless `claude -p` inside a loop a person launched. So a
+plan could say what was next, the board could show who was on what, and nothing could act on
+either.
+
+```bash
+qb-start /fix-issue 277               # a session working issue 277
+qb-start /panel-review-pr 352         # …reviewing PR 352
+qb-start --dry-run /fix-issue 277     # every refusal, nothing started
+#   exit 0  started  — a real, attachable session exists
+#   exit 2  used wrongly
+#   exit 3  NOT ENABLED on this machine — the default, and the whole of it
+#   exit 4  that command is not on this machine's allowlist
+#   exit 5  this machine is already running as many spawns as it may
+#   exit 6  the shared subscription's window is spent (qb-pace)
+#   exit 7  this repo's in-flight window is full (qb-admit)
+#   exit 8  somebody already holds that work (qb-claim)
+#   exit 9  could not start it — the claim is handed back
+```
+
+**Off by default, and the default costs nothing — not even a file.** With no
+`~/.config/quarterback/spawn.json` this exits 3 before it has looked for a board, a token, a
+network, tmux or the agent. There is deliberately **no environment override** for that path —
+one existed while this was being written, and a bypass a repository could set falsifies the
+only claim the gate makes. A machine opts in in the home-manager module; a repository cannot,
+and neither can an agent:
+
+```nix
+programs.quarterback-harness.spawn = {
+  enable      = true;
+  commands    = [ "/fix-issue" ];   # empty by default: the second lock
+  maxSessions = 1;                  # 0 is a freeze
+};
+```
+
+**A malformed policy fails CLOSED, which is the opposite of `qb-admit` and is the same
+principle.** `in_flight.max` is a restriction, so failing open on a typo admits one agent too
+many while failing closed throttles every checkout on the fleet. `spawn.json` is a
+*permission*, so failing open on a typo starts sessions nobody authorised on a box holding
+`~/.claude`, `~/.config/gh` and the board token. Unreadable, unparseable, or `enabled`
+anything other than the literal `true` — one answer, and it is no.
+
+**The brief is a named command with a number, never free text.** The set lives in `qb-start`
+itself and a policy file can only ever *narrow* it, so a policy naming `/anything-i-like` is
+refused exactly as one naming nothing is. That matters because this repo is public: under a
+board-sourced trigger an issue body becomes the instructions for an agent with a full shell,
+and the only mitigation that works is an allowlist — a filter is a list of the phrasings
+somebody already thought of (#63). Each entry carries the resource its session claims, which
+is what makes a spawn countable:
+
+| command | claims |
+|---|---|
+| `/fix-issue`, `/fix-and-review`, `/fix-and-land` | `issue <n>` |
+| `/review-pr`, `/panel-review-pr` | `pr <n>` |
+
+**Everything it starts is counted, claimed, attachable and endable.** In that order, and the
+order is the feature — a refusal costs nothing to unwind only while nothing has been taken:
+
+0. This machine's own cap, counted off the tmux server: spawned panes whose agent has not
+   exited. A `list-panes` that fails is *cannot tell*, not zero — a cap that switches itself
+   off when its input goes unreadable is not one.
+1. `qb-pace --gate`, and unlike a seat it *obeys* rather than warns. A seat warns a human who
+   can then decide; a spawned pane has nobody to tell.
+2. `qb-admit`, so #337's bound is not decorative — anything that starts a session has to go
+   through the thing that counts them.
+3. `qb-claim`, through the ordinary path, on the resource the command names, **before the
+   process exists**.
+4. A board post, before it is a process. Refusals are posted too, so a fleet's spawning is
+   readable rather than something you find out about by noticing a pane.
+5. A detached tmux window — a real session a human can attach to, read and interrupt. There
+   are no hidden sessions here. Its three pane options are what make it findable, so a window
+   that cannot be stamped with them is **closed again** rather than left running where nothing
+   could count or end it.
+
+**Every gate has to return a definite go, and that is the opposite of what `create-worktree`
+does with the same answers.** An outage, a malformed ceiling, a `qb-pace` that could not read
+the caps, a tool missing from a partial install: each of those is the gate not running, not the
+gate passing. A checkout failing open is a human who has already decided to work being told the
+board is unreachable; a spawn failing open is an unattended session nobody decided on, against
+a ceiling nobody could read — #244's rule applied to the risky direction. It costs a human one
+retry, and only where something is already broken.
+
+The claim records **no session**, for `create-worktree`'s reason: the agent that will do the
+work does not exist yet, and a claim stamped with a session that is not the worker's makes
+`may_mutate` refuse the worker its own renewal. It is a machine-held claim that the spawned
+session's own `create-worktree` renews and that the land step, the teardown and the sweep hand
+back.
+
+**It is endable before it exists.** The session id is minted by `qb-start` and handed to the
+agent with `--session-id`, so the pane wears `@qb_session` from the moment it is created rather
+than from whenever the agent's SessionStart hook gets round to it — `qb-end <id>` works
+immediately, the seat bar's ✕ can reach it, and the ordinary SessionEnd hook ends it with a
+reason like any other session.
+
+**It is not a dispatcher, and that line is not being moved.** `qb-seat`'s *"the board
+coordinates work, it does not operate the machine"* is about **dispatch**: nothing here reads
+the plan, picks an item, or tells an agent what to work on. It is told a command and a number
+by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
+agent takes stays the agent's own choice, self-selected and claimed atomically.
+
+**What still pulls it is a human.** A cron floor, a lifecycle hook or a dashboard button
+is the trigger, and there is not one yet — this is the primitive, deliberately landed before
+anything automatic can pull it.
+
+### `qb-status` — the pane's answer, the agent's answer, and the gap
+
+The middle step of #277, and the reason a fleet view could not previously tell a session that
+was thinking hard from one whose context had been reset out from under it from one that no
+longer existed. tmux knows whether a **process** is there; the board knows what the **agent**
+last said about itself. The disagreement between them is the diagnosis.
+
+```bash
+qb-status                      # this session ($CLAUDE_CODE_SESSION_ID)
+qb-status "$sid" --json        # both sources side by side
+#   exit 0  alive     — something is running it
+#   exit 1  finished  — it ended, and something said so
+#   exit 2  gone      — nothing is running it and nobody reported an ending
+#   exit 3  unknown   — cannot tell: no board, no token, an outage
+```
+
+| pane | agent | what it is |
+|---|---|---|
+| running | fresh lease | working, and nothing to say |
+| running | **stale** state | a long turn (#252) — the beacon moves at turn boundaries only, so an old `working` describes a busy pane rather than a stuck one |
+| running | **ended** | #263's shape: a `/clear` or a supersede, where the pane lives on and this conversation does not |
+| running | no lease at all | an agent the board has never heard of — no token, no hooks, or a board that was down at its start |
+| gone | live lease **here** | a crashed or killed seat that never got to report itself; it will read as working until the TTL runs out |
+| gone | live lease on **another machine** | not a verdict: this box's tmux server is not where that session runs, so the pane half of the evidence is missing rather than negative |
+| gone | ended | finished, and everything agrees |
+
+**"Gone" is never guessed from an absence of tmux.** Run outside a multiplexer, the pane
+source answers *cannot tell* and says so — reporting a session gone because this process could
+not see a pane would be an inability dressed as a fact, which is exactly what the ending
+vocabulary exists to stop.
+
+**It observes and nothing else.** No process is signalled, no pane is closed, no lease is
+touched, and it never ends a session it finds ended. `qb-end` is the verb; this is the question
+you ask before you use it.
+
 ### `worktree-holder` — is somebody else in there?
 
 The fourth script answers one question: **which live agent is working in this
@@ -2059,6 +2201,8 @@ Five files, one pin:
 | `bin/qb-end` | the stop verb: hand back a session's claims and its lease, saying why (#277). Called by the hook and by the seat bar's ✕; usable by hand |
 | `bin/qb-release` | the release verb for ONE claim, named as a resource: what the land step and the worktree teardown hand back (#337) |
 | `bin/qb-admit` | is there room in this repo for another unit of work? Reads `in_flight.max` and the board's count; ships unbounded (#337) |
+| `bin/qb-start` | the start verb: begin one session on an allowlisted command, counted, claimed and attachable. Off unless a machine's `spawn.json` says otherwise (#277) |
+| `bin/qb-status` | is that session alive, finished or gone? The pane's answer and the agent's, and the disagreement between them (#277) |
 
 ### Which qb-hook am I running?
 

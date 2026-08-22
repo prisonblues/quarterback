@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+"""qb-start — start one agent session on a named command. The verb that was missing (#277).
+
+  qb-start /fix-issue 277               start a session working issue 277
+  qb-start /panel-review-pr 352         …reviewing PR 352
+  qb-start --dry-run /fix-issue 277     every refusal, nothing started
+  qb-start --repo-path ../other /review-pr 12
+
+  0  started    — a real, attachable session exists (or: a clean dry run)
+  2  used wrongly
+  3  NOT ENABLED on this machine — the default, and the whole of it
+  4  refused    — that command is not on this machine's allowlist
+  5  refused    — this machine is already running as many spawns as it may
+  6  refused    — the shared subscription's window is spent (`qb-pace`)
+  7  refused    — this repo's in-flight window is full (`qb-admit`)
+  8  refused    — somebody already holds that work (`qb-claim`)
+  9  could not start it — tmux refused, or there is no tmux. The claim is handed back
+
+**THE HALF OF #277 THAT WAS NEVER BUILT.** There were three ways to start a
+session here and every one of them ended at a human hand: `qb-seat` in a pane
+somebody typed into, `qb-dash-tui`'s ⚒ on a mouse click, and `run_agent`'s
+headless `claude -p` inside a loop a person launched. v2.77 gave the fleet the
+`end` verb. This is `start`, and it is deliberately the smallest thing that can
+be one: a session that is **countable, claimable, endable, and off by default**.
+
+**IT IS NOT A DISPATCHER, and that line is not being moved.** `qb-seat:44` says
+the board coordinates work and does not operate the machine; what that sentence
+is about is *dispatch*, and nothing here reads the plan, picks an item, or tells
+an agent what to work on. It is told a command and a number by whatever pulled
+it, exactly as the dash's ⚒ is told one by a click. Which work an agent takes
+stays the agent's own choice, self-selected and claimed atomically — a spawner
+that read the plan and handed seat 1 the first item would be hub-and-spoke with a
+hub that runs once, and self-selection is the whole design.
+
+**THE BRIEF IS A NAMED COMMAND, NEVER FREE TEXT.** :data:`SPAWNABLE` is the whole
+of what may be started and it is compiled in, so the spawn surface is an
+allowlist rather than a prompt; a machine's policy file can only ever NARROW it.
+That matters because this repo is public and anyone can open an issue: under a
+board-sourced trigger, issue text becomes the instructions for an agent holding a
+full shell, and the only mitigation that works is an allowlist — a filter is a
+list of the phrasings somebody already thought of, and the attack is the one
+nobody thought of (#63, and `issue_pickup._allowed_authors` says it first).
+
+**OFF BY DEFAULT, AND THE DEFAULT COSTS NOTHING.** With no policy file this
+refuses at exit 3 before it has looked for a board, a token, a network, tmux or
+the agent binary — asserted in `harness/tests/test_qb_start.py` by handing it a
+`qbdata` that raises on IMPORT, which is the bar #337 set for its own default.
+A machine opts in by having `programs.quarterback-harness.spawn.enable` render
+:data:`POLICY_NAME`; a repository cannot, and neither can an agent, because the
+file lives in the user's config directory and the module writes it read-only.
+
+**A MALFORMED POLICY FAILS CLOSED, WHICH IS THE OPPOSITE OF `qb-admit`.** That is
+not an inconsistency, it is the same principle applied to a switch that points
+the other way. `in_flight.max` is a *restriction*: failing open on a typo admits
+one agent too many, and failing closed would throttle every checkout on the fleet
+over a config file — the worse morning, and the harder one to diagnose from a
+phone. `spawn.json` is a *permission*: failing open on a typo starts sessions
+nobody authorised, on a box holding `~/.claude`, `~/.config/gh` and the board
+token. Unreadable, unparseable, or `enabled` anything other than `true` — all one
+answer, and the answer is no.
+
+**WHAT IT STARTS IS A REAL SESSION IN A REAL PANE.** A detached tmux window, the
+same shape `qb-dash-tui.run_in_window` already uses, so a human can attach to it,
+read it, interrupt it and take it over. There are no hidden sessions here: a
+spawn that could not be watched could not be stopped either, and #263 and #252
+are both records of the board losing track of a session nobody could see.
+
+**AND IT IS ENDABLE BEFORE IT EXISTS.** The session id is minted HERE and handed
+to the agent with `--session-id`, so the pane carries `@qb_session` from the
+moment it is created rather than from whenever the agent's SessionStart hook gets
+round to it. `qb-end <that id>` works immediately, the seat bar's ✕ can reach it,
+and the ordinary SessionEnd hook ends it with a reason like any other session.
+
+**THE CLAIM IS THE COUNT.** Taken before the process exists, through the ordinary
+`qb-claim` path, on the resource the command names — so `qb-admit`'s window,
+`GET /claim/held`, the plan and `qb-reconcile` all see a spawn as one unit of
+work, and two spawns cannot both take one issue. It records **no session**, for
+the reason `create-worktree`'s claim stanza gives at length: the agent that will
+do the work does not exist yet, and a claim stamped with a session that is not
+the worker's makes `may_mutate` refuse the worker its own renewal. So it is a
+machine-held claim that the spawned session's own `create-worktree` renews, and
+that the land step, the teardown and the sweep hand back (#337).
+
+**ADVISORY, LIKE EVERYTHING ELSE IN THIS TABLE.** The cap and the window are
+counted and then the claim is taken, so two `qb-start`s in the same second can
+both see room. Same non-atomicity `qb-admit` documents, same reason it is not
+fixed here: making it exact means moving admission into the board.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+#: The exits. 1 is deliberately unused: every other `qb-` tool spends it on "the
+#: board decided against this", and here there are six distinct refusals whose
+#: remedies differ — a caller that could not tell "not enabled on this machine"
+#: from "somebody else has that issue" would retry the first forever and give up
+#: on the second.
+STARTED, MISUSE = 0, 2
+NOT_ENABLED, NOT_ALLOWED, AT_CAP = 3, 4, 5
+PACED, FULL, HELD = 6, 7, 8
+COULD_NOT_START = 9
+
+#: Every command that may EVER be spawned, and the resource each one claims.
+#: Compiled in rather than configured, because a machine may narrow this and must
+#: not be able to widen it: a policy file that could name any string would be the
+#: free-text brief this exists to refuse, one indirection further away.
+#:
+#: The claim kind is here and not in the policy for the same reason. It is what
+#: makes a spawn countable, and a command whose unit of work nobody has worked
+#: out is a command that cannot be started — not one that is started uncounted.
+SPAWNABLE = {
+    "/fix-issue": "issue",
+    "/fix-and-review": "issue",
+    "/fix-and-land": "issue",
+    "/review-pr": "pr",
+    "/panel-review-pr": "pr",
+}
+
+#: Where a machine says yes, and there is NO environment override for it.
+#:
+#: There was one while this was being written — a `$QUARTERBACK_SPAWN` naming a
+#: file, for the tests and for a human trying it out — and the codex review was
+#: right that it falsified the sentence above it: an agent that can set an
+#: environment variable could point the gate at a policy file inside the
+#: repository it is working in, which is precisely the party the gate exists to
+#: exclude. Removed rather than narrowed, because a permission with a convenient
+#: bypass is not one. `XDG_CONFIG_HOME` still moves it, and that is not the same
+#: hole: it is the standard resolution `qb-env`, `qb-seat` and `qbdata` already
+#: use, so anyone who controls it already controls the board token this would be
+#: spent on. The tests point it at a temporary directory, which exercises the
+#: real resolution rather than an override that only exists for them.
+POLICY_NAME = "quarterback/spawn.json"
+
+#: How many spawns may be live on this box at once when the policy names no
+#: number. One, not none and not many: a policy file that has been written
+#: deliberately means to spawn something, and the number that cannot surprise
+#: anybody is the smallest one that works.
+DEFAULT_MAX_SESSIONS = 1
+
+#: The pane options a spawn wears. `@qb_spawn` says a pane is one of ours;
+#: `@qb_spawn_ended` is written BY THE PANE ITSELF when the agent exits, which is
+#: what keeps the cap honest — the window outlives the agent on purpose (its
+#: output is the only record of what happened), so counting windows would fill
+#: the cap with corpses and counting `pane_current_command` would be guesswork
+#: about which process a shell is.
+OPT_SPAWN = "@qb_spawn"
+OPT_ENDED = "@qb_spawn_ended"
+OPT_SESSION = "@qb_session"
+OPT_LABEL = "@qb_label"
+
+
+# ---- the machine's policy ----------------------------------------------------
+
+class Policy:
+    """What this machine will start, or why it will start nothing.
+
+    Never raises, and every failure to read one is the same answer: no. See the
+    module docstring on why this fails closed where `qb-admit` fails open.
+    """
+
+    def __init__(self, enabled: bool, commands: frozenset[str], max_sessions: int,
+                 skip_permissions: bool, where: str, refusal: str) -> None:
+        self.enabled = enabled
+        self.commands = commands
+        self.max_sessions = max_sessions
+        self.skip_permissions = skip_permissions
+        self.where = where
+        self.refusal = refusal
+
+
+def policy_path() -> Path:
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.environ.get("HOME", ""), ".config")
+    return Path(base) / POLICY_NAME
+
+
+def read_policy() -> Policy:
+    path = policy_path()
+
+    def no(why: str) -> Policy:
+        return Policy(False, frozenset(), 0, False, str(path), why)
+
+    if not path.is_file():
+        return no(f"spawning is not enabled on this machine — there is no {path}. "
+                  f"A machine opts in by setting "
+                  f"`programs.quarterback-harness.spawn.enable = true` and "
+                  f"naming the commands it will start; nothing a repository or an "
+                  f"agent can write turns this on")
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as e:                                        # noqa: BLE001
+        return no(f"{path} would not parse ({e}) — refusing. A permission that "
+                  f"cannot be read is not a permission")
+    if not isinstance(raw, dict):
+        return no(f"{path} is a {type(raw).__name__}, not an object — refusing")
+    if raw.get("enabled") is not True:
+        return no(f"{path} does not say `\"enabled\": true` — refusing. The key is "
+                  f"compared to the literal true, so a string, a 1 and an absence "
+                  f"are all no")
+
+    commands = raw.get("commands")
+    if commands is None:
+        commands = []
+    if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
+        return no(f"`commands` in {path} is not a list of strings — refusing, "
+                  f"because a spawn allowlist that cannot be read is not one")
+
+    ceiling = raw.get("max_sessions", DEFAULT_MAX_SESSIONS)
+    if ceiling is None:
+        ceiling = DEFAULT_MAX_SESSIONS
+    # `bool` is an `int` in python and `true` is a plausible thing to type into a
+    # key next to `enabled`; refused rather than counted as 1, the rule `qb-admit`
+    # applies to its own ceiling.
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+        return no(f"`max_sessions` in {path} is {ceiling!r} — it takes a "
+                  f"non-negative integer (0 is a freeze). Refusing")
+
+    skip = raw.get("skip_permissions", True)
+    if not isinstance(skip, bool):
+        return no(f"`skip_permissions` in {path} is {skip!r}, not a boolean — refusing")
+
+    return Policy(True, frozenset(commands), ceiling, skip, str(path), "")
+
+
+# ---- the pane ---------------------------------------------------------------
+
+def tmux(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
+    """One tmux call, never raising. A box with no tmux is a state, not a crash."""
+    try:
+        return subprocess.run(["tmux", *args], capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception as e:                                        # noqa: BLE001
+        return subprocess.CompletedProcess(args, 127, "", f"{type(e).__name__}: {e}")
+
+
+def live_spawns() -> list[dict] | None:
+    """Spawned panes on this tmux server whose agent has not exited, or None.
+
+    `list-panes -a` is the whole server rather than one screen, which is what the
+    cap is about: the limit is on the MACHINE, so a second screen must not get a
+    second allowance.
+
+    **None is "cannot tell", and it is not []** — the distinction the codex review
+    found missing. A `list-panes` that fails read as zero live spawns, which is a
+    cap that switches itself off exactly when the thing it counts has become
+    unreadable. The caller refuses on it.
+
+    No tmux at all IS zero, and honestly so: a spawn is a tmux window, so a box
+    with no multiplexer is running none. It refuses a few steps later for having
+    nowhere to put one.
+    """
+    if not os.environ.get("TMUX"):
+        return []
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("pane_id", OPT_SPAWN, OPT_ENDED, OPT_SESSION, "pane_dead"))
+    got = tmux("list-panes", "-a", "-F", fmt, timeout=5)
+    if got.returncode != 0:
+        return None
+    live = []
+    for line in got.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5 or not parts[1]:
+            continue
+        if parts[2] or parts[4] == "1":
+            continue
+        live.append({"pane": parts[0], "command": parts[1], "session": parts[3]})
+    return live
+
+
+# ---- the neighbours ----------------------------------------------------------
+
+def sibling(name: str) -> str:
+    """`name` on PATH, or beside this script. The resolution `qb-seat.pace_cmd`
+    makes, for the reason it gives: a home-manager install has both, a checkout
+    has only the second, and a partial install has only the first."""
+    from shutil import which
+    return which(name) or str(Path(__file__).resolve().parent / name)
+
+
+def run_gate(name: str, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    """A neighbouring qb- tool, its stderr passed straight through.
+
+    NOT captured: `qb-claim` naming the holder and `qb-admit` listing the slots
+    are the whole use of a refusal, and a spawner that swallowed them would refuse
+    with less to say than the tools it called.
+    """
+    try:
+        return subprocess.run([sibling(name), *args], text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL)
+    except Exception as e:                                        # noqa: BLE001
+        # Said out loud, not only returned. The caller turns any non-zero into a
+        # refusal naming the exit code, and "127" on its own sends an operator
+        # looking for a gate that answered rather than one that never ran — the
+        # difference between a missing install and a 30-second timeout is the
+        # whole of what they need.
+        print(f"qb-start: {name} did not run — {e.__class__.__name__}: {e}",
+              file=sys.stderr)
+        return subprocess.CompletedProcess((name,), 127, None, f"{e}")
+
+
+def board_post(kind: str, summary: str, detail: str, refs: list[dict]) -> None:
+    """Tell the board, best-effort and in silence.
+
+    Every spawn is a post before it is a process, and a refusal is posted too —
+    that is what makes a fleet's spawning readable rather than something you find
+    out about by noticing a pane. It is best-effort for the reason `qb-stage` and
+    the seat's name registration are: a session that refused to start because a
+    record of it could not be written would cost more than the record is worth,
+    and the pane is the durable evidence either way.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qbdata import board_client
+        client, _cfg = board_client()
+        client.post("/post", {"type": kind, "summary": summary[:400],
+                              "detail": detail, "refs": refs})
+    except Exception:                                             # noqa: BLE001
+        pass
+
+
+# ---- the command -------------------------------------------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-start", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?",
+                    help="the slash command to start — one of: "
+                         + ", ".join(sorted(SPAWNABLE)))
+    ap.add_argument("number", nargs="?",
+                    help="the issue or PR number it takes")
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout the session runs in (default: here)")
+    ap.add_argument("--model", default=None,
+                    help="passed to the agent as --model; omitted when unset")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="make every refusal, print what would run, start nothing "
+                         "— and take no claim and post nothing")
+    ap.add_argument("--json", action="store_true",
+                    help="print the whole answer on stdout")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    def out(**fields) -> None:
+        if args.json and not args.quiet:
+            print(json.dumps(fields, indent=2))
+
+    # ---- 1. the machine. FIRST, and before anything is imported, looked for or
+    # asked. This is the default path and it has to cost nothing at all.
+    policy = read_policy()
+    if not policy.enabled:
+        say(f"not enabled: {policy.refusal}")
+        out(started=False, enabled=False, policy=policy.where, reason=policy.refusal)
+        # Not posted. On a machine that has not opted in there is nothing to
+        # report — nobody asked the board for this — and a refusal that phoned
+        # home would break the property that the default touches nothing.
+        return NOT_ENABLED
+
+    if not args.command:
+        say("qb-start: name a command and its number, e.g. `qb-start /fix-issue 277`")
+        say(f"  this machine allows: {', '.join(sorted(policy.commands)) or '(none)'}")
+        return MISUSE
+
+    command = args.command if args.command.startswith("/") else "/" + args.command
+    repo_path = os.path.abspath(args.repo_path)
+
+    def refuse(code: int, summary: str, detail: str = "") -> int:
+        say(f"refused: {summary}")
+        if detail:
+            say(f"  {detail}")
+        out(started=False, enabled=True, policy=policy.where, command=command,
+            reason=summary)
+        if not args.dry_run:
+            board_post("note", f"spawn refused: {summary}",
+                       detail or None, board_refs(repo_path, command, args.number))
+        return code
+
+    # ---- 2. the allowlist, both halves. The table is what CAN be spawned; the
+    # policy is what this machine WILL spawn, and it can only take things away.
+    if command not in SPAWNABLE:
+        return refuse(NOT_ALLOWED,
+                      f"{command} is not a spawnable command",
+                      "the set is compiled in so that a policy file cannot widen "
+                      "it: " + ", ".join(sorted(SPAWNABLE)))
+    if command not in policy.commands:
+        allowed = ", ".join(sorted(policy.commands)) or (
+            "nothing — `commands` is empty, which is the second lock: turning "
+            "spawning on is one decision and saying what may come through it is "
+            "another")
+        return refuse(NOT_ALLOWED,
+                      f"{command} is not on this machine's allowlist",
+                      f"{policy.where} allows: {allowed}")
+
+    # ---- 3. the argument. One positive integer, because that is the whole of
+    # what these commands take and anything else is the free text being refused.
+    #
+    # ASCII, and matched rather than tested with `isdigit`. `"٧".isdigit()` is
+    # True and `int("٧")` is 7, so a naive check hands `/fix-issue` an issue
+    # number nobody typed and nothing downstream would recognise; `"½".isdigit()`
+    # is False but `isnumeric` says otherwise, which is the same trap one method
+    # along. The set of characters an issue number may contain is ten of them.
+    if not re.fullmatch(r"[0-9]+", args.number or "") or int(args.number) <= 0:
+        say(f"qb-start: {command} takes an issue or PR number — got "
+            f"{args.number!r}. The brief is a named command with arguments, not "
+            f"free text, so nothing else is passed through")
+        return MISUSE
+    number = str(int(args.number))
+    kind = SPAWNABLE[command]
+
+    # ---- 4. the checkout.
+    if not os.path.isdir(repo_path):
+        say(f"qb-start: {repo_path} is not a directory")
+        return MISUSE
+    inside = subprocess.run(["git", "-C", repo_path, "rev-parse", "--show-toplevel"],
+                            capture_output=True, text=True)
+    if inside.returncode != 0:
+        say(f"qb-start: {repo_path} is not a git worktree — a session starts in one, "
+            f"and the claim is keyed on its origin remote")
+        return MISUSE
+
+    # ---- 5. this machine's own ceiling.
+    running = live_spawns()
+    if running is None:
+        return refuse(AT_CAP, "this machine's spawned panes could not be counted",
+                      "tmux is here and would not list its panes, so the ceiling "
+                      "cannot be applied — and a cap that switches itself off when "
+                      "its input goes unreadable is not one")
+    if len(running) >= policy.max_sessions:
+        return refuse(AT_CAP,
+                      f"{len(running)} of {policy.max_sessions} spawned session(s) "
+                      f"are already running on this machine",
+                      "close one, or raise `max_sessions` in " + policy.where
+                      + (" (0 is a freeze)" if policy.max_sessions == 0 else ""))
+
+    # ---- 6 and 7. THE GATES, AND ONE RULE OVER BOTH: a spawn proceeds only on a
+    # definite go. Not "anything that is not a refusal" — an outage, a malformed
+    # ceiling, a `qb-pace` that could not read the caps and a tool missing from a
+    # partial install all reach this as some other number, and every one of them
+    # means the gate did not run rather than that it passed.
+    #
+    # That is the OPPOSITE of what `create-worktree` does with the same two
+    # answers, and the asymmetry is the whole point rather than an oversight. A
+    # checkout failing open is a human who has already decided to work being told
+    # the board is unreachable; a spawn failing open is an unattended session
+    # nobody decided on, against a ceiling nobody could read. #244's rule applied
+    # to the risky direction: a governor that cannot read its input must not
+    # report clear.
+    #
+    # It costs a human one retry, and only in the cases where something is
+    # already broken. `qb-pace` and `qb-admit` ship in the same package as this
+    # file and `sibling()` falls back to the directory beside it, so "not
+    # installed" is not a state a real install reaches.
+    pace = run_gate("qb-pace", "--gate", timeout=30)
+    if pace.returncode == 3:
+        return refuse(PACED, "the shared subscription's window is spent",
+                      "it comes back — qb-pace's line above says when")
+    if pace.returncode != 0:
+        return refuse(PACED, "how the shared subscription stands could not be read",
+                      f"qb-pace exited {pace.returncode} (4 is 'the caps could not "
+                      f"be obtained at all'). An API-key install with no caps to "
+                      f"report answers `go`, so this is not that")
+
+    admit = run_gate("qb-admit", "--repo-path", repo_path, timeout=30)
+    if admit.returncode == 1:
+        return refuse(FULL, f"{os.path.basename(repo_path)}'s in-flight window is full")
+    if admit.returncode != 0:
+        return refuse(FULL, "how much of this repo is in flight could not be read",
+                      f"qb-admit exited {admit.returncode} — a board it could not "
+                      f"reach, or a ceiling it would not act on. An unbounded repo "
+                      f"answers `room` without asking anything, so this is not that")
+
+    if args.dry_run:
+        session = "<a fresh uuid4>"
+        say(f"policy:   {policy.where}")
+        say(f"cwd:      {repo_path}")
+        say(f"claim:    {kind} {number} (no session, machine-held, as create-worktree's is)")
+        say(f"session:  {session}")
+        argv = agent_argv(command, number, policy, args.model, session)
+        say(f"command:  {' '.join(shlex.quote(a) for a in argv)}")
+        out(started=False, dry_run=True, enabled=True, policy=policy.where,
+            command=command, number=number, claim={"kind": kind, "value": number},
+            repo_path=repo_path, running=len(running), max_sessions=policy.max_sessions)
+        return STARTED
+
+    # ---- 8. the claim, through the ordinary path, before the process exists.
+    session = str(uuid.uuid4())
+    claim = run_gate(
+        "qb-claim", kind, number, "--repo-path", repo_path, "--session", "",
+        "--note", f"spawned {command} {number} by qb-start (session {session[:8]})",
+        "--quiet", timeout=60)
+    if claim.returncode == 1:
+        return refuse(HELD, f"{kind} {number} is already claimed",
+                      "two agents on one unit of work is what the claim prevents — "
+                      "run `qb-claimed` to see who has it")
+    if claim.returncode != 0:
+        # An outage is NOT proceeded through here, and that is the one place this
+        # differs from `create-worktree`, deliberately. A checkout that cannot
+        # reach the board is a human who has already decided to work; a spawn that
+        # cannot reach the board is an unattended session nobody would know about,
+        # taken out of a count nobody can see. The board being down is a reason
+        # not to start something, and never a reason not to stop.
+        return refuse(HELD, f"the claim on {kind} {number} could not be taken",
+                      "qb-claim's own reason is above. A spawn is not started "
+                      "uncounted: an unattended session that nothing can count is "
+                      "worse than one nobody started")
+
+    refs = board_refs(repo_path, command, number)
+    board_post("status", f"spawning {command} {number}",
+               f"qb-start on this machine: session {session}, cwd {repo_path}, "
+               f"claim {kind}/{number}. Attachable in tmux; end it with "
+               f"`qb-end {session}`.", refs)
+
+    # ---- 9. the pane.
+    started, why = spawn(command, number, policy, args.model, session, repo_path)
+    if not started:
+        # The claim goes back. It was taken for a session that now does not exist,
+        # and leaving it would hold the slot the whole point of taking it was to
+        # account for — for eight hours, over a window that never opened.
+        run_gate("qb-release", kind, number, "--repo-path", repo_path,
+                 "--session", "", "--quiet", timeout=30)
+        say(f"could not start: {why}")
+        say(f"  the claim on {kind} {number} was handed back")
+        out(started=False, enabled=True, reason=why, session=session)
+        board_post("note", f"spawn failed: {command} {number} — {why}",
+                   "the claim was handed back", refs)
+        return COULD_NOT_START
+
+    say(f"started: {command} {number} in {os.path.basename(repo_path)}")
+    say(f"  session {session} — attach in tmux, or end it with `qb-end {session}`")
+    out(started=True, enabled=True, policy=policy.where, command=command,
+        number=number, session=session, repo_path=repo_path, pane=why,
+        claim={"kind": kind, "value": number})
+    return STARTED
+
+
+def board_refs(repo_path: str, command: str, number: str | None) -> list[dict]:
+    """What the board should render this post against. Best-effort throughout:
+    a post with no refs is still a post."""
+    refs: list[dict] = []
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qbdata import repo_slug
+        repo = repo_slug(repo_path)
+    except Exception:                                             # noqa: BLE001
+        repo = None
+    if repo:
+        refs.append({"kind": "repo", "value": repo})
+    if number and re.fullmatch(r"[0-9]+", str(number)) and command in SPAWNABLE:
+        refs.append({"kind": SPAWNABLE[command], "value": str(number),
+                     **({"repo": repo} if repo else {})})
+    return refs
+
+
+def agent_argv(command: str, number: str, policy: Policy, model: str | None,
+               session: str) -> list[str]:
+    """What the pane runs.
+
+    The brief goes after `--`, the way `qb-seat` passes one and for its reason: it
+    is read as a prompt whatever it starts with, and every brief here starts with
+    a slash.
+
+    `--session-id` is what makes the session endable before it has said anything.
+    Without it the id is whatever the agent minted, known only once its
+    SessionStart hook has told the board — a window in which the one thing nobody
+    can do to a session started by a machine is stop it.
+
+    Permissions are skipped by default and the argument is `qb-seat:650`'s,
+    verbatim: a spawned window is a pane nobody is watching, so the first tool
+    call wanting a permission the agent does not hold stops it dead in the one way
+    this design cannot recover from — the pane looks busy, the board shows a live
+    agent holding a claim, and nothing is moving. It is a real trade and it is
+    made inside a file a human wrote on purpose; `"skip_permissions": false` in
+    that file takes it back.
+    """
+    argv = [os.environ.get("QB_START_AGENT", "claude"), "--session-id", session]
+    if policy.skip_permissions:
+        argv.append("--dangerously-skip-permissions")
+    if model:
+        argv += ["--model", model]
+    return [*argv, "--", f"{command} {number}"]
+
+
+def spawn(command: str, number: str, policy: Policy, model: str | None,
+          session: str, repo_path: str) -> tuple[bool, str]:
+    """A detached tmux window, stamped so everything else can find it.
+
+    Detached, and dropping to a shell afterwards, because `qb-dash-tui` already
+    settled both: a window that stole the screen would interrupt whoever started
+    it, and one that vanished on exit would take the only record of what happened
+    with it.
+
+    The pane writes `@qb_spawn_ended` on itself when the agent exits. That is the
+    cap's honesty: the window deliberately outlives the agent, so the option is
+    the only thing that can tell a session still running from its own transcript.
+    """
+    if not os.environ.get("TMUX"):
+        return False, ("there is no tmux here — a spawn is a real pane somebody "
+                       "can attach to, and this has nowhere to put one")
+    shell = os.environ.get("SHELL", "/bin/bash")
+    agent = " ".join(shlex.quote(a) for a in
+                     agent_argv(command, number, policy, model, session))
+    # `-t "$TMUX_PANE"`, and it is NOT belt and braces. `tmux set-option -p` with
+    # no target does not mean "the pane I am running in": a command run from
+    # inside a pane reaches the server as a client with no session of its own, so
+    # the default target is the most recently used pane — somebody's seat, mid
+    # turn, which would then be counted as a spawn that had ended. Measured while
+    # writing this: the option landed on `%0` of another window every time.
+    # `$TMUX_PANE` is exported into the pane and is the only handle it has on
+    # itself.
+    full = (f'{agent}; tmux set-option -p -t "$TMUX_PANE" {OPT_ENDED} 1 '
+            f">/dev/null 2>&1; exec {shlex.quote(shell)} -i")
+    name = f"{command.lstrip('/')}-{number}"
+    made = tmux("new-window", "-d", "-P", "-F", "#{pane_id}",
+                "-n", name, "-c", repo_path, full)
+    if made.returncode != 0 or not made.stdout.strip():
+        return False, f"tmux refused: {(made.stderr or '').strip()[:160] or 'no reason given'}"
+    pane = made.stdout.strip()
+    # Stamped after the fact, which leaves a sliver in which a concurrent
+    # `qb-start` counts one spawn too few. Same non-atomicity `qb-admit`
+    # documents about its own count-then-claim, and the same remedy is not
+    # available: tmux has no way to create a window with options already on it.
+    #
+    # **AND THE WRITES ARE CHECKED**, which the codex review found they were not.
+    # These three options are the whole of what makes a spawn findable: without
+    # `@qb_session` the ✕ cannot end it and `qb-status` cannot see its pane, and
+    # without `@qb_spawn` it is outside the cap for as long as it runs. A window
+    # that got none of them is an agent nothing on the box can account for, so it
+    # is closed rather than reported as started — the same judgement as refusing
+    # a spawn whose claim could not be taken, one step later.
+    for option, value in ((OPT_SPAWN, command), (OPT_SESSION, session),
+                          (OPT_LABEL, name)):
+        wrote = tmux("set-option", "-p", "-t", pane, option, value, timeout=5)
+        if wrote.returncode != 0:
+            why = (wrote.stderr or "").strip()[:120] or "no reason given"
+            tmux("kill-pane", "-t", pane, timeout=5)
+            return False, (f"tmux made the window and would not stamp {option} on "
+                           f"it ({why}) — closed again rather than left running "
+                           f"where nothing could count or end it")
+    return True, pane
+
+
+if __name__ == "__main__":
+    sys.exit(main())
