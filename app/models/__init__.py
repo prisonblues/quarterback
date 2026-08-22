@@ -4,6 +4,7 @@ from app.models.blob import Blob
 from app.models.dial import DialSetting
 from app.models.lease import Lease
 from app.models.merge_queue import MergeQueueEntry
+from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
 from app.models.post import Post
@@ -27,6 +28,7 @@ __all__ = [
     "DialSetting",
     "Lease",
     "MergeQueueEntry",
+    "OrderProposal",
     "Plan",
     "PlanItem",
     "Post",

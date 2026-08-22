@@ -17,6 +17,140 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.71 — an order the rules derive, and a record of what they claimed
+
+The plan has had an order since v2.39 and one writer for it: a human. That is the right
+rule — "if any agent may reorder it, the plan thrashes and stops being the shared intent it
+exists to be" — and it left nowhere to put the other thing. *What order do the facts imply?*
+is mechanical for most of a plan, and it was being worked out by hand, once per agent, from a
+`gh` sweep nobody kept and a plan page nobody could diff against it.
+
+#232 asks for one agent that owns the order and is **told what its last few orders actually
+cost**, "so it is the one autonomous agent here that can be wrong in a way anybody notices".
+This release ships the half of that which needs no agent, and it ships that half **first on
+purpose**: build the agent first and there is nothing to tell it. Every ordering opinion this
+fleet has ever formed was spoken in a session and lost with it. #227 asked a proposal to
+record its *"expected rework avoided"* — a prediction — and observed that nothing ever checks
+it, because nothing was ever written down to be checked.
+
+### The rules, and why they are labelled
+
+`app/ordering.py` is a pure function: candidates in, an order out, no session, no clock, no
+claim, no I/O. `GET /plan/order` gathers the plan and the newest panel run per referenced PR,
+runs it, and publishes `suggested_order` beside `active_order`.
+
+1. **dependency** — an item follows what it waits on (*constraint*: per #183 topological
+   repair asserts nothing, it removes a contradiction, and it is enforced structurally so no
+   preference can outrank it);
+2. **bucket** — workable, then waiting on an open blocker (*constraint*: the plan's own
+   `next` already skips those), then finished, meaning its PR was merged or closed as of its
+   last panel run (*preference*: a snapshot). Waiting sits above finished because blocked work
+   becomes workable and finished work never does;
+3. **open work** — red CI or confirmed findings nobody has answered rises (*preference*);
+4. **staleness** — an item untouched past the plan's own `STALE_DAYS` rises (*preference*);
+5. **overlap** — of two items the rules could not separate that touch the same files, the one
+   closer to landing first (*preference*).
+
+The labels are the feature, not decoration. #232: *"an order whose derived and judged parts
+are indistinguishable cannot be trusted differently in the two places, so it gets trusted
+uniformly — usually too much."* So every entry carries a `basis` — `constraint`, `preference`,
+`ambiguous`, `unopposed`, `unresolved` — and the interchangeable groups are a field. Two
+counts, not one: a placement can be pinned below a blocked item (*derived*) and still be
+swappable with its neighbour, so `derived` and `interchangeable` are both reported and neither
+implies the other.
+
+**No placement is chosen by a coin.** A tie breaks on the order already in force, so if no
+rule fires anywhere the suggestion is the sequence you already have.
+
+The first draft of that sentence said "nothing moves on ambiguity alone", which is false and
+was caught on review. Inverting a pair the rules *do* separate drags whatever sits between
+them: with `slow, bystander, fast` and a rule putting `fast` first, some pair no rule compares
+has to invert — there is no sequence that changes the one relation and no other. Both minimal
+repairs disturb exactly one such pair, so the walk takes one and **labels it**: a `displaced`
+reason names every item that crossed this one without a rule ordering the two, at both ends of
+the inversion. The test is per PAIR and not per item, which was itself a correction — the first
+version suppressed the note whenever the item had any separating reason of its own, so an item
+pinned by a dependency edge and then crossed by an unrelated overlap promotion reported the
+dependency and said nothing about the crossing. Two different claims, one of them missing. What
+changed overall is that the move is no longer silent, which in a proposal whose whole selling
+point is stated reasons was the one entry a reader could not check.
+
+### The overlap rule is pairwise, and it took two rounds to say so
+
+Rule 5 was written down as a claim about a pair and implemented twice as a question
+about a set, which is #101's disease in a new organ. The first implementation asked whether
+the tied group contained *any* colliding pair and then readiness-sorted the whole group — so an
+item sharing no file with anybody could be moved, and its placement came back labelled
+`overlap`, a reason that was not true of it. The fix narrowed that to the group's colliding
+members and was wrong the same way one level in: with two disconnected pairs in one group, the
+readiest member of pair B jumped the head of pair A, and those two share nothing either. Both
+instances were found by an independent reviewer on this branch, the second in the fix for the
+first.
+
+So the rule now only ever compares one item with the items *it* collides with, and every
+promotion it makes rests on a collision between exactly those two — stated in
+`app/ordering._peers` rather than narrowed a third time, per #67. Collision is treated as
+symmetric by construction too: a query reporting the relation one way round would otherwise
+make the order depend on which of the pair happened to be asked about. And a placement the rule
+*confirms* is reported as derived rather than ambiguous, because "a rule decided this and the
+incumbent order was right" does not belong in the remainder a model is asked about.
+
+### Absent evidence is named, not assumed benign
+
+`unknown` lists every input the gather could not read: an item referencing an issue rather
+than a PR (most of a plan), a PR the board has never panelled, evidence more than a week old,
+an unresolvable ref, and changed-file overlap — whose collision query is #101 and still open.
+Overlap is a **refinement**: with it absent, rule 5 never fires, the ambiguous set is larger,
+and nothing else about the order changes. That is why this did not have to wait for #101.
+
+`_pr_evidence` follows #101's own conclusion rather than re-deriving it. That endpoint had the
+same defect found twice, the second instance introduced by the fix for the first — *"any
+predicate placed before the selection resurrects a stale run"* — so the query here carries two
+predicates, both about identity (which repo, which PRs) and neither about a run's state, and
+every reading is taken afterwards in code. Repository names are folded to lower case on both
+sides too: the plan lower-cases its copy because GitHub repos are case-insensitive,
+`review_runs.repo` is stored as the panel sent it, and comparing them as text would leave a
+PR looking like one the board had never seen — #101's silent absence wearing a different hat.
+
+### It cannot rewrite anything
+
+`suggested_order` is shaped exactly like `POST /plan/reorder`'s `order`, the response's
+`apply` block names that endpoint and says `human_only: true`, and nothing in the board reads
+`suggested_order` back. That is #232's non-privileged-writer rule, and it is what lets this
+ship while #183 is unsettled: an agent that may silently rewrite the live sequence is an agent
+with human privileges, generating #183's confidently-wrong `next` continuously rather than
+once.
+
+`POST /plan/order-proposal` records a proposal with its evidence in `plan_order_proposals`
+(schema 0028) — **and the caller supplies no order**. The board computes what it stores, so a
+row always says what the *rules* produced rather than what an agent asserted and labelled
+deterministic. An agent's ordering opinion belongs on the board addressed to whoever is
+deciding, which needs no endpoint.
+
+Proposals are deduplicated on a digest, and the rule for what that digest covers is stated
+once so it can be checked: **every input the rules read and where it came from, excluding only
+the clock.** So #232's cron floor — which runs dirty or not — cannot bury the moment the answer
+changed under a thousand copies of it, while a run that arrived or an outcome somebody recorded
+*does* write a row even when the order is unchanged, because "the evidence moved and the answer
+did not" is one of the things this table exists to be able to say. Every placement also carries
+the run its readings came from (`evidence`: run id, when, at what commit), because #227 asks a
+proposal to name the exact inputs used and a stored "CI was green" that cannot be traced to the
+run that said so cannot be checked later.
+
+### The outcome half is absent, not stubbed
+
+The record #232 wants is a triple: **order proposed → what happened → the delta**. This
+release stores the first term and nothing else. A nullable `outcome` column would invite "was
+this right?" to be answered by whoever happened to be looking, which is the self-grading loop
+#40 and #77 both refuse, and the honest answer needs a merge order, a rebase count and a
+staleness reading nothing here gathers. An absent column is a visible gap; a null one reads
+like a question nobody bothered to answer.
+
+Nothing derived is stored either — no `moves`, no `changed`, no counts. All three regenerate
+from the two order columns on read, because a stored copy is free to disagree with the source
+it came from, which is the failure #232 names when it says a planner must never regenerate
+from its own prior output.
+
 ## v2.70 — the same defect twice, so the third attempt has nowhere to put it
 
 v2.23 recorded which FILES a PR touched and shipped no query over them. That was deliberate and
