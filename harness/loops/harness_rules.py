@@ -2021,6 +2021,14 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
                             f"— ignored")
             continue
         name = str(row.get("dial") or "")
+        if _expired(row, now):
+            # SILENT, and FIRST — before the name and the value are judged. An
+            # expired dial is simply ABSENT: a resolution that never had one and a
+            # resolution whose one lapsed have to be indistinguishable, or the
+            # expiry is a flag somebody still has to clear. Judged after the name,
+            # a lapsed dial with a typo in it would go on being complained about
+            # for ever, which is the one thing an expiry is supposed to end.
+            continue
         dial = BOARD_DIALS.get(name)
         if dial is None:
             problems.append(
@@ -2028,11 +2036,6 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
                 f"settles that list, not the board (see BOARD_DIALS); a dial the "
                 f"board reports as in force and nothing applies is worse than no "
                 f"dial at all. Settable: {', '.join(sorted(BOARD_DIALS))}")
-            continue
-        if _expired(row, now):
-            # SILENT. An expired dial is simply ABSENT: a resolution that never had
-            # one and a resolution whose one lapsed have to be indistinguishable,
-            # or the expiry is a flag somebody still has to clear.
             continue
         value = row.get("value")
         problem = _dial_problem(name, dial, value)

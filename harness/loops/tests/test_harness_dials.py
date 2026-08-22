@@ -434,3 +434,17 @@ def test_a_floor_is_read_case_insensitively_from_the_board_too(repo, monkeypatch
     assert cfg["review_panel"]["fix_severity_floor"] == "P3"
     assert cfg["review_panel"]["reviewer_scope"] == "increment"
     assert cfg["_dials"][FLOOR]["value"] == "P3"
+
+
+def test_an_expired_dial_is_absent_even_when_it_is_also_wrong(repo, monkeypatch,
+                                                              capsys):
+    """Expiry is judged FIRST, before the name and the value. Judged after, a lapsed
+    dial with a typo in it would go on being complained about for ever — which is
+    the one thing an expiry is supposed to end."""
+    hr._reported.clear()
+    board(monkeypatch,
+          dial("review_panel.invented", 1, expires_at="2020-01-01T00:00:00+00:00"),
+          dial(FLOOR, "nonsense", expires_at="2020-01-01T00:00:00+00:00"))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["review_panel"]["fix_severity_floor"] == "P2"
+    assert capsys.readouterr().err == ""
