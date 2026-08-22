@@ -182,7 +182,7 @@ def test_the_judge_can_answer_the_question_on_a_verdict_it_already_writes():
         [{"id": "F01", "members": [0], "real": True, "severity": "P2",
           "file": "a.py", "line": 9, "synthesis": "merged", "reason": "why",
           "premise": "invalidates"}],
-        [said], 34)
+        [said], 34, asked=True)
     assert c.premise_verdict == "invalidates"
     assert c.as_dict()["premise_verdict"] == "invalidates"
 
@@ -244,10 +244,24 @@ def test_the_round_one_judge_prompt_is_byte_identical_to_the_one_before_this():
     filled = panel_core.JUDGE_PROMPT.format(findings="F", coverage="C", ci="", diff="D")
     round_one = (filled.replace(panel_core.JUDGE_CODE_SLOT, "")
                        .replace(panel_core.JUDGE_RECURRENCE_SLOT, ""))
-    before = (filled.replace(panel_core.JUDGE_CODE_SLOT, "")
-                    .replace(panel_core.JUDGE_RECURRENCE_SLOT + "\n", ""))
-    assert round_one.replace("\n\n", "\n") == before.replace("\n\n", "\n")
+    # The prompt as it stood before the slot existed: the slot text removed
+    # entirely, taking nothing else with it. Compared BYTE FOR BYTE — the first
+    # spelling of this test normalised `\n\n` to `\n` on both sides before
+    # comparing, which is precisely the difference the slot had introduced, so it
+    # asserted byte-identity while hiding the one way it was false. (Found by a
+    # second reviewer reading the template, not by this test.)
+    before = filled.replace(panel_core.JUDGE_RECURRENCE_SLOT, "").replace(
+        panel_core.JUDGE_CODE_SLOT, "")
+    assert round_one == before
     assert "RECURRENCE" not in round_one and "#67" not in round_one
+    # …and the same with the code brief IN, since that is the other fill and the
+    # two slots are adjacent: a newline miscounted between them shows up here.
+    with_code = (filled.replace(panel_core.JUDGE_CODE_SLOT,
+                                panel_core.CODE_ACCESS_BRIEF)
+                       .replace(panel_core.JUDGE_RECURRENCE_SLOT, ""))
+    assert with_code == filled.replace(
+        panel_core.JUDGE_RECURRENCE_SLOT, "").replace(
+        panel_core.JUDGE_CODE_SLOT, panel_core.CODE_ACCESS_BRIEF)
 
 
 def test_the_slot_never_reaches_a_model_as_literal_text():
@@ -270,6 +284,25 @@ def test_the_brief_tells_the_judge_the_common_answer_is_separate():
     got = panel_rounds.recurrence_brief([("k" * 16, "P2", "a.py", 4, "t")], 2)
     assert "THIS IS THE DEFAULT AND THE COMMON CASE" in got
     assert "Nothing is decided by your answer" in got
+    # It ends with its own newline, because the slot it fills carries none: that
+    # is what lets the empty fill leave the round-1 prompt byte-identical.
+    assert got.endswith("\n")
+
+
+def test_a_judge_that_was_never_asked_cannot_answer(monkeypatch):
+    """A `premise` key on a reply to a prompt that never put the question is not
+    an answer to it. The model volunteered a word about a fix pass it was shown
+    nothing of, and storing it would put a fabricated verdict in the one column
+    whose whole value is that `unclear` and "not asked" stay apart."""
+    said = panel_rounds.Finding(reviewer="codex", severity="P2", file="a.py",
+                                line=9, title="a defect", detail="")
+    verdicts = [{"id": "F01", "members": [0], "real": True, "severity": "P2",
+                 "file": "a.py", "line": 9, "synthesis": "merged", "reason": "why",
+                 "premise": "invalidates"}]
+    [unasked] = panel_rounds._parse_verdicts(verdicts, [said], 34)
+    [asked] = panel_rounds._parse_verdicts(verdicts, [said], 34, asked=True)
+    assert unasked.premise_verdict == ""
+    assert asked.premise_verdict == "invalidates"
 
 
 # --------------------------------------------------------------------------

@@ -542,6 +542,12 @@ JUDGE_CODE_SLOT = "<<<CODE_ACCESS_BRIEF>>>"
 #: 1 judge prompt stays BYTE-IDENTICAL to the one it has always been. That is the
 #: same discipline `PR_SCOPE_HEADER` keeps for whole-PR scope, and it exists so a
 #: comparison between rounds is not also a comparison between two prompts.
+#:
+#: It sits IMMEDIATELY before ``{diff}`` with no newline of its own, and the
+#: brief supplies its own trailing one. Given a line to itself the empty fill
+#: still left a blank line behind it, so the round-1 prompt differed from the
+#: pre-#67 one by a single ``\n`` — byte-identity claimed in a docstring and not
+#: actually held, which the test asserting it was (wrongly) normalising away.
 JUDGE_RECURRENCE_SLOT = "<<<RECURRENCE_BRIEF>>>"
 
 #: What the judge may answer #67's question with, per finding. NULL — the field
@@ -711,8 +717,7 @@ Coverage declared by the reviewers:
 {coverage}
 {ci}
 <<<CODE_ACCESS_BRIEF>>>
-<<<RECURRENCE_BRIEF>>>
-{diff}
+<<<RECURRENCE_BRIEF>>>{diff}
 """
 
 ASK_PROMPT = """You are answering ONE question about a system, as a point of order. This is NOT a

@@ -2582,24 +2582,30 @@ async def record_review(
     # producer misspelling a recurrence bucket and one misspelling a provenance
     # bucket have different bugs, and a reader told only that *a* bucket was
     # refused has to guess which field to go and look at.
-    for name, sent, tally_unknown, tally_unusable in (
-            ("recurrence",
+    # Both key names are written out rather than derived from one stem. They do not
+    # share one: the FIELD is `premise_verdict` and the TALLY is `premise_counts`,
+    # so `f"{name}_counts_unusable"` invented `premise_verdict_counts_unusable` —
+    # a response key naming a field this API does not have, which a consumer
+    # watching for the documented one would never see. The same derivation is
+    # exactly what `PROVENANCE_COUNTER` refuses to do and says why.
+    for unknown_key, unusable_key, sent, tally_unknown, tally_unusable in (
+            ("recurrence_unknown", "recurrence_counts_unusable",
              [p.f.recurrence_sent for p in findings
               if p.f.recurrence is None and p.f.recurrence_sent is not None],
              body.recurrence_counts_unknown, body.recurrence_counts_unusable),
-            ("premise_verdict",
+            ("premise_verdict_unknown", "premise_counts_unusable",
              [p.f.premise_verdict_sent for p in findings
               if p.f.premise_verdict is None and p.f.premise_verdict_sent is not None],
              body.premise_counts_unknown, body.premise_counts_unusable)):
         names = sorted(set(sent) | set(tally_unknown))
         if names:
-            dropped[f"{name}_unknown"] = names[:MAX_UNKNOWN_BUCKETS]
+            dropped[unknown_key] = names[:MAX_UNKNOWN_BUCKETS]
             if len(names) > MAX_UNKNOWN_BUCKETS:
-                dropped[f"{name}_unknown_total"] = len(names)
+                dropped[f"{unknown_key}_total"] = len(names)
         if tally_unusable:
-            dropped[f"{name}_counts_unusable"] = tally_unusable[:MAX_UNKNOWN_BUCKETS]
+            dropped[unusable_key] = tally_unusable[:MAX_UNKNOWN_BUCKETS]
             if len(tally_unusable) > MAX_UNKNOWN_BUCKETS:
-                dropped[f"{name}_counts_unusable_total"] = len(tally_unusable)
+                dropped[f"{unusable_key}_total"] = len(tally_unusable)
     # Every needs_human class this board did not recognise, from the findings and
     # from their reporters' own declarations. Named rather than swallowed, for the
     # reason `provenance_unknown` beside it is: a misspelt class would otherwise

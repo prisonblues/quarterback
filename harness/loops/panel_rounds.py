@@ -482,7 +482,8 @@ def _judge_listing(clusters: list[list[Finding]],
     return "\n".join(lines), flat
 
 
-def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonical]:
+def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
+                    asked: bool = False) -> list[Canonical]:
     """Turn the judge's reply into canonical findings.
 
     Defensive in one direction only: a malformed reply must never SUPPRESS a
@@ -497,6 +498,13 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
     answers with `"members": ["F01"]` — its own issue labels where report numbers
     belong — loses every merge it made, and without a word about it the run reads
     exactly like one where the judge found no duplicates.
+
+    ``asked`` is whether #67's recurrence brief was in the prompt. A `premise` key
+    on a reply to a prompt that never put the question is not an answer to it: the
+    model volunteered a word, about a fix pass it was shown nothing of, and
+    recording it would put a fabricated verdict in the one column whose value is
+    that `unclear` and "not asked" stay apart. Default False, so a caller that has
+    not thought about it records nothing rather than something.
     """
     out: list[Canonical] = []
     claimed: set[int] = set()
@@ -540,7 +548,7 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
             # #67, and only ever present when the recurrence brief was in the
             # prompt — a judge that was never asked cannot answer, and a stray key
             # on a round-1 reply normalises to "" like any other unreadable value.
-            premise_verdict=_premise_verdict(v.get("premise")),
+            premise_verdict=_premise_verdict(v.get("premise")) if asked else "",
         )
         out.append(c)
         rel = v.get("related")
@@ -788,7 +796,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         if not flat and answered:
             return [], None, note
         return unruled("judge: no JSON verdict in output (unparseable)", note)
-    return _parse_verdicts(parsed, flat, pr), None, note
+    return _parse_verdicts(parsed, flat, pr, asked=bool(recurrence)), None, note
 
 
 # ----------------------------------------------------------------------------- rounds

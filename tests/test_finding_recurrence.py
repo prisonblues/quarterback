@@ -82,8 +82,10 @@ async def record(client, pr: int, **over) -> dict:
 #: this issue's fields sent. Named rather than tested for the presence of a
 #: `dropped` object, because the response is FLAT — `{**recorded, **dropped}` —
 #: so `"dropped" not in got` is vacuously true on every run and asserts nothing.
-DRIFT_KEYS = ("recurrence_unknown", "recurrence_counts_unusable",
-              "premise_verdict_unknown", "premise_counts_unusable",
+DRIFT_KEYS = ("recurrence_unknown", "recurrence_unknown_total",
+              "recurrence_counts_unusable", "recurrence_counts_unusable_total",
+              "premise_verdict_unknown", "premise_verdict_unknown_total",
+              "premise_counts_unusable", "premise_counts_unusable_total",
               "unreadable_fields")
 
 
@@ -261,10 +263,23 @@ async def test_an_unbelievable_count_drops_with_its_key(client):
     got = await record(client, 6711, round=2, cycle="c67i",
                        recurrence_counts={"revisited": -1, "elsewhere": "two",
                                           "unknown": 3})
-    assert set(got["recurrence_counts_unusable"]) == {"revisited",
-                                                                 "elsewhere"}
+    assert set(got["recurrence_counts_unusable"]) == {"revisited", "elsewhere"}
     run = await detail(client, got["id"])
     assert run["recurrence_counts"] == {"unknown": 3}
+
+
+async def test_the_premise_tally_names_its_drop_under_the_documented_key(client):
+    """The FIELD is `premise_verdict` and the TALLY is `premise_counts`, so the
+    two drop keys do not share a stem. Derived from one they came out as
+    `premise_verdict_counts_unusable` — a response key naming a field this API
+    does not have, which a consumer watching for the documented one would never
+    see, and which nothing failed on because no test asked for it."""
+    got = await record(client, 6722, round=2, cycle="c67t",
+                       premise_counts={"invalidates": "many", "separate": 2})
+    assert got["premise_counts_unusable"] == ["invalidates"]
+    assert not any(k.startswith("premise_verdict_counts") for k in got)
+    run = await detail(client, got["id"])
+    assert run["premise_counts"] == {"separate": 2}
 
 
 async def test_a_tally_that_loses_every_key_is_null_and_not_the_empty_object(client):
