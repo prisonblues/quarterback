@@ -134,7 +134,24 @@ SPAWNABLE = {
 #: environment variable could point the gate at a policy file inside the
 #: repository it is working in, which is precisely the party the gate exists to
 #: exclude. Removed rather than narrowed, because a permission with a convenient
-#: bypass is not one. `XDG_CONFIG_HOME` still moves it, and that is not the same
+#: bypass is not one.
+#:
+#: `XDG_CONFIG_HOME` still moves it, codex raised that too, and it is ANSWERED
+#: rather than fixed — because it is not the same kind of hole. `$QUARTERBACK_SPAWN`
+#: existed only for this gate: setting it was a pure escalation implying no other
+#: capability. `XDG_CONFIG_HOME` is where `qbdata.resolve_config` finds
+#: `quarterback/config`, whose `QUARTERBACK_TOKEN_CMD` is a shell command this
+#: fleet runs on every board call — so anyone who can set it for a harness process
+#: already has arbitrary execution as the user, and could equally shadow `claude`
+#: on `$PATH` or simply run it. A permission gate is not an environment sandbox
+#: and cannot be made into one from inside a script the environment starts. What
+#: it does stop is the thing it is for: REPOSITORY CONTENT — an issue body, a
+#: CLAUDE.md, a committed file — being what grants the permission, because nothing
+#: here reads a file the repository controls. `policy_path` returning None rather
+#: than a relative path is the same property, held against the case where a
+#: variable is missing instead of set.
+#:
+#: The rest of the resolution: `XDG_CONFIG_HOME` still moves it, and that is not the same
 #: hole: it is the standard resolution `qb-env`, `qb-seat` and `qbdata` already
 #: use, so anyone who controls it already controls the board token this would be
 #: spent on. The tests point it at a temporary directory, which exercises the
@@ -560,13 +577,24 @@ def main() -> int:
         # The claim goes back. It was taken for a session that now does not exist,
         # and leaving it would hold the slot the whole point of taking it was to
         # account for — for eight hours, over a window that never opened.
-        run_gate("qb-release", kind, number, "--repo-path", repo_path,
-                 "--session", "", "--quiet", timeout=30)
+        #
+        # And what the release ANSWERED is reported, rather than assumed. Saying
+        # "handed back" over a release that failed is the worse half of two
+        # failures: the slot is held AND the only record says it is free, so
+        # nobody goes looking. The TTL is still underneath it, and eight hours is
+        # exactly the wait this line exists to save somebody.
+        gave_back = run_gate("qb-release", kind, number, "--repo-path", repo_path,
+                             "--session", "", "--quiet", timeout=30)
+        handed = gave_back.returncode == 0
+        note = (f"the claim on {kind} {number} was handed back" if handed else
+                f"the claim on {kind} {number} could NOT be handed back "
+                f"(qb-release exited {gave_back.returncode}) — it holds a slot "
+                f"until its TTL runs out, or until `qb-release {kind} {number}`")
         say(f"could not start: {why}")
-        say(f"  the claim on {kind} {number} was handed back")
-        out(started=False, enabled=True, reason=why, session=session)
-        board_post("note", f"spawn failed: {command} {number} — {why}",
-                   "the claim was handed back", refs)
+        say(f"  {note}")
+        out(started=False, enabled=True, reason=why, session=session,
+            claim_released=handed)
+        board_post("note", f"spawn failed: {command} {number} — {why}", note, refs)
         return COULD_NOT_START
 
     say(f"started: {command} {number} in {os.path.basename(repo_path)}")
@@ -676,10 +704,20 @@ def spawn(command: str, number: str, policy: Policy, model: str | None,
         wrote = tmux("set-option", "-p", "-t", pane, option, value, timeout=5)
         if wrote.returncode != 0:
             why = (wrote.stderr or "").strip()[:120] or "no reason given"
-            tmux("kill-pane", "-t", pane, timeout=5)
+            # And whether the close WORKED is reported. A `kill-pane` that failed
+            # leaves an unstamped agent running against a claim about to be
+            # handed back — the one state this whole file is arranged to prevent
+            # — and saying "closed again" over it would hide precisely the thing
+            # somebody has to go and do by hand.
+            killed = tmux("kill-pane", "-t", pane, timeout=5)
+            closed = ("closed again rather than left running where nothing could "
+                      "count or end it" if killed.returncode == 0 else
+                      f"AND COULD NOT BE CLOSED (kill-pane: "
+                      f"{(killed.stderr or '').strip()[:80] or 'no reason given'}) "
+                      f"— an unstamped agent is running in pane {pane} and only a "
+                      f"human can stop it: `tmux kill-pane -t {pane}`")
             return False, (f"tmux made the window and would not stamp {option} on "
-                           f"it ({why}) — closed again rather than left running "
-                           f"where nothing could count or end it")
+                           f"it ({why}) — {closed}")
     return True, pane
 
 

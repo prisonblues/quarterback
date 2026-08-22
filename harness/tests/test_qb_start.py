@@ -81,7 +81,8 @@ def stub_tool(path: Path, exit_code: int = 0, log: Path | None = None) -> None:
 def sandbox(tmp_path: Path, *, policy: object = "absent", explode: bool = True,
             pace: int = 0, admit: int = 0, claim: int = 0, release: int = 0,
             tmux_exit: int | None = 0, new_window_exit: int | None = None,
-            set_option_exit: int | None = None) -> dict:
+            set_option_exit: int | None = None,
+            kill_pane_exit: int | None = None) -> dict:
     """A copy of `qb-start` with every neighbour it could reach replaced.
 
     `explode` makes the stub board client unimportable, which is how the
@@ -139,6 +140,9 @@ def board_client():
             "fi\n"
             'if [ "$1" = "set-option" ]; then\n'
             f'  exit {tmux_exit if set_option_exit is None else set_option_exit}\n'
+            "fi\n"
+            'if [ "$1" = "kill-pane" ]; then\n'
+            f'  exit {tmux_exit if kill_pane_exit is None else kill_pane_exit}\n'
             "fi\n"
             f"exit {tmux_exit}\n")
         (tools / "tmux").chmod(0o755)
@@ -696,6 +700,31 @@ def test_a_window_that_cannot_be_stamped_is_closed_again(tmp_path):
     assert got.returncode == COULD_NOT_START, got.stderr
     assert any(ln.startswith("tmux kill-pane") for ln in got.ran), got.ran
     assert any(ln.startswith("qb-release issue 277") for ln in got.ran), got.ran
+
+
+def test_a_release_that_failed_is_not_reported_as_a_claim_handed_back(tmp_path):
+    """The worse half of two failures: the slot is held AND the only record says it
+    is free, so nobody goes looking. The TTL is still underneath it, and eight hours
+    is exactly the wait this line exists to save somebody."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False, new_window_exit=1,
+                  release=2)
+    got = run(box, "/fix-issue", "277", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START
+    assert "could NOT be handed back" in got.stderr
+    assert json.loads(got.stdout)["claim_released"] is False
+    assert "could NOT be handed back" in got.posts[-1]["body"]["detail"]
+
+
+def test_a_window_that_could_not_be_closed_says_so_and_names_the_pane(tmp_path):
+    """An unstamped agent running against a claim about to be handed back is the one
+    state this whole file is arranged to prevent. Saying "closed again" over it
+    would hide precisely the thing somebody has to go and do by hand."""
+    box = sandbox(tmp_path, policy=ENABLED, explode=False, set_option_exit=1,
+                  kill_pane_exit=1)
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START
+    assert "COULD NOT BE CLOSED" in got.stderr
+    assert "tmux kill-pane -t %9" in got.stderr
 
 
 def test_the_failure_is_posted_as_well_as_the_start(tmp_path):

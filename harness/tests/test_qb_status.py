@@ -368,6 +368,28 @@ def test_it_never_writes_to_the_board(tmp_path):
     assert "post" not in STATUS.read_text().split('"""', 2)[2]
 
 
+def test_a_running_pane_wins_over_a_finished_one_with_the_same_session(tmp_path):
+    """One session id can be on two panes at once: `qb-start` leaves its window open
+    after the agent exits, so resuming that session in a new pane leaves the corpse
+    behind wearing the same stamp. Taking the first match let `list-panes` order
+    decide the verdict."""
+    corpse = pane(**{"@qb_spawn": "/fix-issue", "@qb_spawn_ended": "1",
+                     "pane_id": "%1"})
+    alive = pane(pane_id="%2")
+    got = run(sandbox(tmp_path, panes=[corpse, alive], lease=LIVE))
+    assert got.returncode == ALIVE, got.stderr
+    assert "%2" in got.stderr
+
+
+def test_a_dead_pane_beside_a_dead_pane_is_still_exited(tmp_path):
+    """The preference is for a RUNNING pane, not for the last one listed: with
+    nothing running, the first match is still the answer."""
+    got = run(sandbox(tmp_path, panes=[pane(**{"@qb_spawn_ended": "1"}),
+                                       pane(pane_dead="1", pane_id="%4")],
+                      ended=ENDING))
+    assert got.returncode == FINISHED
+
+
 # --------------------------------------- a pane this box cannot see is not gone
 
 def test_a_lease_on_another_machine_is_not_a_crashed_seat(tmp_path):

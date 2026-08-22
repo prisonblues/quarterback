@@ -110,7 +110,15 @@ def pane_answer(session: str) -> dict:
     if not mine:
         return {"verdict": "absent", "why": "no pane on this tmux server carries "
                                             "that session id", "pane": None}
-    pane = mine[0]
+    # A RUNNING pane wins over a finished one, and taking the first match does not
+    # do that. One session id can be on two panes at once: `qb-start` leaves its
+    # window open after the agent exits (its output is the only record of what
+    # happened), so resuming that session in a new pane leaves the corpse behind
+    # wearing the same stamp — and whichever `list-panes` happened to name first
+    # would then decide the verdict. If anything is running that session, that is
+    # the answer; the leftovers are not evidence against it.
+    pane = next((p for p in mine
+                 if p["pane_dead"] != "1" and not p["@qb_spawn_ended"]), mine[0])
     if pane["pane_dead"] == "1":
         return {"verdict": "exited", "why": "the pane's process has exited",
                 "pane": pane["pane_id"], "spawn": pane["@qb_spawn"] or None}
