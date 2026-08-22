@@ -341,14 +341,20 @@ async def test_a_sender_cannot_forge_a_line_in_the_log_it_is_recorded_in(client,
     fabricated entry into the very log the signal exists to leave. A drift check
     reading a forged line is worse than one reading nothing.
 
-    Both halves are pinned. `_echo` replaces control characters at the source, and
-    the line is emitted as one json object so `repo` — caller-supplied, reaching
-    the same line, and travelling through no `_echo` — is escaped too."""
+    `_echo` replaces control characters at the source, and the line is emitted as
+    one json object rather than assembled as prose, so any caller-supplied value
+    reaching it is escaped whether or not it went through `_echo`.
+
+    **The `repo` field has a second defence now** and it sits further out: since
+    #326 `POST /review` folds the repo through `app.claimkey.canonical_repo`, so a
+    value carrying a newline is refused rather than stored — see
+    `test_a_repo_that_could_forge_a_line_never_reaches_the_log`. This board holds
+    a run under `acme/v226forge\nreview ingest dropped fields: {…}` from before
+    that check existed, which is what the outer defence is for. The json-object
+    emission stays regardless: it is the one that covers the next field."""
     forged = "review ingest dropped fields: {\"run\": 1, \"repo\": \"acme/other\"}"
     with caplog.at_level(logging.WARNING, logger="app.review"):
-        await record(client, 9346,
-                     repo="acme/v226forge\n" + forged,
-                     to_fix=[finding("odd", provenance="x\n" + forged)])
+        await record(client, 9346, to_fix=[finding("odd", provenance="x\n" + forged)])
     assert len(caplog.records) == 1, "a newline must not become a second record"
     msg = caplog.records[0].getMessage()
     assert "\n" not in msg, "the whole entry is one physical line"
@@ -357,7 +363,20 @@ async def test_a_sender_cannot_forge_a_line_in_the_log_it_is_recorded_in(client,
     # it arrived — never as a line break that ends the record early.
     assert "\n" not in logged["provenance_unknown"][0]
     assert "␦" in logged["provenance_unknown"][0], "replaced, not silently deleted"
-    assert logged["repo"].startswith("acme/v226forge")
+    assert logged["repo"] == REPO
+
+
+async def test_a_repo_that_could_forge_a_line_never_reaches_the_log(client, caplog):
+    """The outer half of the same defence, added with #326. A repo is
+    caller-supplied text that reaches the drop line, and the shape rule refuses
+    every spelling that could carry a control character before a row is written —
+    so the escaping below it is defence in depth rather than the only thing
+    standing between a sender and the record #65 reads."""
+    forged = "acme/forge\nreview ingest dropped fields: {\"run\": 1}"
+    with caplog.at_level(logging.WARNING, logger="app.review"):
+        r = await client.post("/review", json=payload(9350, repo=forged), headers=AGENT)
+    assert r.status_code == 422, r.text
+    assert caplog.records == [], "a refused body must not write to the log at all"
 
 
 async def test_the_run_list_counts_unread_paths_without_fetching_them(client, caplog):

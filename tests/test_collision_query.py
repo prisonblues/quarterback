@@ -643,3 +643,85 @@ async def test_collisions_are_scoped_to_one_repo(client, repo):
 async def test_reading_a_collision_answer_needs_auth(client, repo):
     r = await client.get("/review/collisions", params={"repo": repo, "pr": 10320})
     assert r.status_code == 401
+
+
+# ---- #326: one repository, one spelling --------------------------------------
+#
+# The endpoint compared `review_runs.repo` with `==` against a caller-supplied
+# string, over a column stored exactly as the panel sent it. GitHub folds owner
+# and repository names, so one repository could sit on the board under two
+# spellings — and a query in either one answered about half the board. The 404 is
+# the loud half. `counts.considered: 0` is the quiet one, and it reads as "landing
+# this disturbs nothing", which is the reading this endpoint exists to make
+# unavailable.
+#
+# Both halves fold through `app.claimkey.canonical_repo` now — the write, so there
+# is one stored spelling, and the caller's `repo`, so it meets it.
+
+
+def spelt(repo: str) -> str:
+    """The same repository, spelt the way a `gh` remote in another checkout does.
+
+    Title-cased rather than upper: `ACME/X` and `acme/x` differ in every letter,
+    which would pass a fold that only compared first characters. This differs in
+    two.
+    """
+    owner, _, name = repo.partition("/")
+    return f"{owner.title()}/{name.title()}"
+
+
+async def test_a_repo_spelt_with_capitals_returns_the_same_collisions(client, repo):
+    """#326's acceptance, stated as the issue states it: a query for
+    `PrisonBlues/Quarterback` returns what `prisonblues/quarterback` returns."""
+    await record(client, repo, 10400, changed_files=files("app/api/reviews.py"),
+                 changed_files_total=1)
+    await record(client, repo, 10401, changed_files=files("app/api/reviews.py"),
+                 changed_files_total=1)
+
+    lower = await collisions(client, repo, 10400)
+    capitals = await collisions(client, spelt(repo), 10400)
+
+    assert [h["pr"] for h in lower[COLLIDES]] == [10401]
+    assert capitals["counts"] == lower["counts"]
+    assert [h["pr"] for h in capitals[COLLIDES]] == [h["pr"] for h in lower[COLLIDES]]
+
+
+async def test_a_considered_of_zero_cannot_be_a_spelling_that_missed(client, repo):
+    """The dangerous direction, and the one worth a test of its own.
+
+    The subject is recorded under one spelling and its rival under another, which
+    is what two agents on two checkouts produce. Before the fold the subject was
+    found — so no 404 said anything was wrong — and the rival selection matched
+    nothing, so the answer was a confident `considered: 0` with an empty
+    `collides`: an all-clear made of not having matched anything.
+    """
+    await record(client, repo, 10410, changed_files=files("app/collisions.py"),
+                 changed_files_total=1)
+    await record(client, spelt(repo), 10411, changed_files=files("app/collisions.py"),
+                 changed_files_total=1)
+
+    for asked in (repo, spelt(repo)):
+        c = await collisions(client, asked, 10410)
+        assert c["counts"]["considered"] == 1, f"{asked!r} lost the rival"
+        assert [h["pr"] for h in c[COLLIDES]] == [10411]
+
+
+async def test_the_answer_names_the_repo_it_was_answered_about(client, repo):
+    """`repo` comes back in its STORED spelling, not the caller's. A caller that
+    sent capitals can see which repository it was answered about — the one thing
+    it cannot otherwise tell apart from having been answered about nothing."""
+    await record(client, repo, 10420, changed_files=files("a.py"), changed_files_total=1)
+    c = await collisions(client, spelt(repo), 10420)
+    assert c["repo"] == repo
+
+
+async def test_a_spelling_that_is_not_a_repo_is_refused_not_answered_empty(client):
+    """A clone URL or a bare name used to 404 with "nothing to compare", which
+    says the PR was never panelled. It is a 422 naming the shape now — the same
+    refusal `POST /claim` makes, for the same reason: an empty answer to a
+    question the board could not understand is the failure this issue is about."""
+    r = await client.get("/review/collisions",
+                         params={"repo": "git@github.com:acme/x.git", "pr": 1},
+                         headers=AGENT)
+    assert r.status_code == 422, r.text
+    assert "owner/name" in r.text

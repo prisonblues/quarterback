@@ -2188,12 +2188,19 @@ async def _pr_evidence(session: AsyncSession,
     function, ``LISTEN``/``NOTIFY`` *is* the SSE leg, and the README lists
     Postgres under *Architecture (decided)*).
 
-    Repository names are folded to lower case on both sides. GitHub repos are
-    case-insensitive, ``_norm_scope`` lower-cases the plan's copy for exactly that
-    reason, and ``review_runs.repo`` is stored as the panel sent it — so a run
-    recorded as ``PrisonBlues/quarterback`` would otherwise leave its PR looking
-    like one the board had never seen, which is the silent-absence failure #101
-    is filed about wearing a different hat.
+    Repository names meet in one spelling on both sides. GitHub repos are
+    case-insensitive, so a run recorded as ``PrisonBlues/quarterback`` would
+    otherwise leave its PR looking like one the board had never seen — the
+    silent-absence failure #101 is filed about wearing a different hat. This used
+    to be a ``func.lower()`` over ``review_runs.repo``, which was stored as the
+    panel sent it; since #326 the *write* folds, migration ``0033``'s CHECK
+    constraint holds it there, and the column can be compared directly — which is
+    also what lets ``ix_review_runs_repo_pr`` answer this query.
+
+    The plan's own side keeps its ``.lower()``. ``_norm_scope`` canonicalises
+    every scope written since #148, but rows predating it are still on the board
+    (``app.api.claims`` re-folds them for the same reason), so folding here costs
+    nothing and reaches them.
 
     Returns the evidence keyed by ``(repo, pr)``, and the items whose ref could
     not be resolved to one — reported, never dropped.
@@ -2215,12 +2222,11 @@ async def _pr_evidence(session: AsyncSession,
     if not wanted:
         return {}, problems
 
-    repo_key = func.lower(ReviewRun.repo)
     runs = list(await session.scalars(
         select(ReviewRun)
-        .where(tuple_(repo_key, ReviewRun.pr).in_(list(wanted)))
-        .distinct(repo_key, ReviewRun.pr)
-        .order_by(repo_key, ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .where(tuple_(ReviewRun.repo, ReviewRun.pr).in_(list(wanted)))
+        .distinct(ReviewRun.repo, ReviewRun.pr)
+        .order_by(ReviewRun.repo, ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
     ))
     # Confirmed findings on those runs, and which of them somebody has recorded an
     # outcome for. All four outcomes count as answered, `deferred` included: it
@@ -2241,7 +2247,7 @@ async def _pr_evidence(session: AsyncSession,
         for repo, pr, key in await session.execute(
             select(ReviewFindingOutcome.repo, ReviewFindingOutcome.pr,
                    ReviewFindingOutcome.finding_key)
-            .where(tuple_(func.lower(ReviewFindingOutcome.repo),
+            .where(tuple_(ReviewFindingOutcome.repo,
                           ReviewFindingOutcome.pr).in_(list(wanted)))
         ):
             answered.add((repo.lower(), pr, key))
