@@ -16,6 +16,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -333,6 +334,20 @@ class ReviewReviewer(Base):
     rereview_flagged: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )
+    #: Findings this member declared no fix round can settle — ``needs_human``
+    #: (#279). The ``rereview_flagged`` treatment, and it exists for a sharper
+    #: reason than symmetry: a flag is a way OUT of work, so #67's "do not
+    #: escalate to end a cycle you find tedious" is only enforceable if the rate
+    #: at which each seat reaches for it is on the row. A seat that flags `taste`
+    #: on everything is then measurable, and so is one that never flags `ui` on a
+    #: TUI change.
+    #:
+    #: Tallied over CONFIRMED findings, like every sibling counter here and for
+    #: the same reason ``rereview_flagged`` is: a declaration attached to a
+    #: finding the judge dismissed is not a claim worth scoring.
+    human_flagged: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     #: Wall-clock for this reviewer's whole turn, every CLI attempt included.
     #: The cost axis that is comparable *across* vendors — unlike the token
     #: counts below, a second is a second whoever spent it.
@@ -429,6 +444,8 @@ class ReviewReviewer(Base):
         Index("ix_review_reviewers_name_model", "name", "model"),
         CheckConstraint("rereview_flagged >= 0",
                         name="ck_review_reviewers_rereview_flagged_non_negative"),
+        CheckConstraint("human_flagged >= 0",
+                        name="ck_review_reviewers_human_flagged_non_negative"),
     )
 
 
@@ -483,6 +500,33 @@ class ReviewFinding(Base):
     needs_rereview: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    #: No fix round can settle this: it needs a person (#279). NOT
+    #: ``could_not_assess`` one table over, and the difference is load-bearing —
+    #: that field means "I lacked context", a gap a tool or a wider scope closes,
+    #: and this means "no context would close this". Collapsing them would put a
+    #: grep-able question and a design decision in one bucket.
+    #:
+    #: Stored on the finding as well as per reporter
+    #: (:class:`ReviewFindingReport`) for the reason ``needs_rereview`` is: the
+    #: finding is the grain a fix round is briefed against — a flagged finding is
+    #: never re-briefed to a fixer and never counts against convergence — while
+    #: the per-reporter row is the grain the DECLARATION is judged at. A group
+    #: flag credited to everyone who happened to raise the finding makes the
+    #: member that called it and the member that didn't indistinguishable.
+    needs_human: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    #: WHICH judgement is owed — one of :data:`app.needs_human.NEEDS_HUMAN_CLASSES`.
+    #: The class is the point rather than decoration: a bare "needs a human" says
+    #: stop without saying who or what for, and the class is what routes it. A
+    #: ``ui`` flag means somebody has to look at a terminal; an ``auth`` flag
+    #: means somebody has to try the credential path on a real box.
+    needs_human_class: Mapped[str | None] = mapped_column(Text)
+    #: Why, in a line. Required whenever the flag is set — at the database, not
+    #: only in the API — because a bare flag is a confident assertion with
+    #: nothing behind it, and this one ENDS a cycle. #67: do not escalate to end
+    #: a cycle you find tedious.
+    needs_human_reason: Mapped[str | None] = mapped_column(Text)
     #: This observation was not raised by any earlier round of the same PR — the
     #: dry-round counter, per finding. NULL where the panel didn't say.
     new_this_round: Mapped[bool | None] = mapped_column(Boolean)
@@ -511,6 +555,39 @@ class ReviewFinding(Base):
         Index("ix_review_findings_run", "run_id"),
         Index("ix_review_findings_verdict", "verdict"),
         Index("ix_review_findings_key", "finding_key"),
+        # What is waiting on a human, by class — the read `GET /review/needs-human`
+        # exists to answer. Partial, because a flagged finding is meant to be a
+        # small minority of the table and an index over every row would be paid
+        # for on every ingest to serve a query that only ever wants the few.
+        Index("ix_review_findings_needs_human", "needs_human_class",
+              postgresql_where=text("needs_human")),
+        CheckConstraint(
+            "needs_human_class IS NULL OR needs_human_class IN "
+            "('decision', 'taste', 'ui', 'environment', 'auth', 'other')",
+            name="ck_review_findings_needs_human_class",
+        ),
+        # The evidence rule, both ways round, at the boundary rather than only in
+        # the API — for a backfill, an admin script, or the next write path.
+        #
+        # Forward: a flag with no class and no reason is the bare confident
+        # assertion this whole feature exists to measure, arriving one level up.
+        # Backward: a class or a reason with no flag is evidence for a judgement
+        # nobody made, which would sit in the table looking exactly like one that
+        # was later withdrawn.
+        #
+        # `btrim` with an explicit character set, and vertical tab spelled `\013`
+        # rather than `\v` — Postgres' escape strings do not define `\v`, so
+        # `E'\v'` is the LETTER v and the set would quietly refuse a reason of
+        # "v" as empty. Both traps are documented at length on
+        # `ck_review_finding_outcomes_refuted_note`; this is the same rule.
+        CheckConstraint(
+            r"(needs_human AND needs_human_class IS NOT NULL "
+            r"AND needs_human_reason IS NOT NULL "
+            r"AND btrim(needs_human_reason, E' \t\n\r\f\013') <> '') "
+            r"OR (NOT needs_human AND needs_human_class IS NULL "
+            r"AND needs_human_reason IS NULL)",
+            name="ck_review_findings_needs_human_evidence",
+        ),
     )
 
 
@@ -552,11 +629,43 @@ class ReviewFindingReport(Base):
     needs_rereview: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false"
     )
+    #: THIS reviewer said no fix round can settle this finding (#279). Per
+    #: reporter, not per finding, for the reason ``needs_rereview`` above is: the
+    #: declaration's accuracy is per reviewer, and this one is a way out of work
+    #: — so who reached for it, and how often, is the measurement. A group flag
+    #: makes the member that called it and the member that didn't identical.
+    needs_human: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    #: This reviewer's own class and reason, which may differ from the finding's
+    #: synthesis — two members can agree a human is needed and disagree about
+    #: what for, and that disagreement is data rather than a merge conflict.
+    needs_human_class: Mapped[str | None] = mapped_column(Text)
+    needs_human_reason: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("finding_id", "reviewer", name="uq_review_report_finding_reviewer"),
         Index("ix_review_finding_reports_finding", "finding_id"),
         Index("ix_review_finding_reports_reviewer", "reviewer"),
+        # The same two rules the finding carries, on the row that attributes the
+        # declaration. Not redundant with them: this table is written from a
+        # different branch of the ingest (a reporter's own flag, which may be set
+        # where the finding's is not yet resolved), and `/review/stats` scores
+        # THESE rows — so a bare flag arriving here lands directly in a published
+        # per-reviewer figure.
+        CheckConstraint(
+            "needs_human_class IS NULL OR needs_human_class IN "
+            "('decision', 'taste', 'ui', 'environment', 'auth', 'other')",
+            name="ck_review_finding_reports_needs_human_class",
+        ),
+        CheckConstraint(
+            r"(needs_human AND needs_human_class IS NOT NULL "
+            r"AND needs_human_reason IS NOT NULL "
+            r"AND btrim(needs_human_reason, E' \t\n\r\f\013') <> '') "
+            r"OR (NOT needs_human AND needs_human_class IS NULL "
+            r"AND needs_human_reason IS NULL)",
+            name="ck_review_finding_reports_needs_human_evidence",
+        ),
     )
 
 
