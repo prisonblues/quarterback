@@ -1671,6 +1671,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.99** — something acts on a stale harness, and stops one step short of your password.
 - **v3** — the release number gets an allocator, and it is a git tag.
 - **v3.1** — the review loop starts measuring whether its fixes are getting anywhere.
+- **v3.2** — a release gets its tag on a machine that has never been told who it is.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

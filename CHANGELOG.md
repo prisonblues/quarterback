@@ -17,6 +17,24 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.2 — a release gets its tag on a machine that has never been told who it is
+
+The job that records a tag for every release on `main` failed the first time it ran, and
+`v2.99` and `v3` landed with no tag at all. `release_tag.py backfill` writes **annotated**
+tags, an annotated tag is an object, and an object has a tagger — so git refuses to write one
+where it cannot name anybody. A CI runner is the one place that is always true: no
+`user.name`, and no GECOS field to guess a name from. Every other place the command runs — a
+developer's machine, this suite's fixtures — has an identity already, which is why nothing
+caught it before it was live.
+
+`backfill` now supplies a tagger itself when the environment cannot name one, so the command
+works wherever it is run rather than only where its caller remembered to run `git config`
+first. Whatever git can already work out still wins: the gate is `git var
+GIT_COMMITTER_IDENT`, the same question git asks itself before writing an object, and where it
+answers, the tag carries the caller's own name exactly as before. Where it refuses, a
+configured half is still preferred over the fallback — a set `user.name` with no resolvable
+email is a real shape, and only the missing half is invented.
+
 ## v3.1 — the review loop starts measuring whether its fixes are getting anywhere
 
 A fix that patches a wrong assumption produces the next round's findings. A fix that removes the
