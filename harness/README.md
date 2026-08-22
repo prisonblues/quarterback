@@ -740,6 +740,91 @@ alone rather than destroyed by somebody else's failed checkout. That second one 
 checkout claims with `--json` — the flag exists so a caller can read `renewed` without
 grepping the prose on stderr.
 
+### `qb-release` — handing the claim back when the work ends
+
+The verb the checkout claim did not have (#337). `create-worktree` takes it; nothing gave
+it back. #277's `stop` half releases a *session's* claims and this one has no session — it
+was taken by a script, on behalf of a worktree, before the agent that would use it existed
+— so the only thing that ever freed one was the 8h TTL. Measured on 2026-08-22: four plan
+items still carried live claims after their PRs had merged, one of them shipped as v2.78
+hours earlier, and the four slots would have stayed held until the evening.
+
+```bash
+qb-release                          # the issue this checkout's branch names
+qb-release issue 337                # 0 released / 1 not ours / 2 unknown
+qb-release --branch feat/issue-337  # what remove-worktree runs
+```
+
+**Nothing to release is exit 0.** Three callers release one claim by design — the land step,
+the worktree teardown, and `prune-worktrees` — so the second and third find the work already
+done and must not report that as failure. The board is idempotent under it too: `released_at`
+is set once and the row stays as history.
+
+It names the resource and lets the board derive the key, exactly as `qb-claim` does. `1`
+means somebody else holds it (another machine, or another session on this box) and is a
+different answer from `2`, which is a board that could not be reached — collapsing them is
+how "this is not yours" gets reported as "try again later" forever.
+
+**Three places now hand it back**, and the TTL stays underneath all three as the backstop it
+was meant to be:
+
+| where | what it releases |
+| --- | --- |
+| the land step | `/review-pr`, `/panel-review-pr` and `/fix-and-land` run `qb-release issue <n>` after `gh pr merge` — the common case and the cheapest |
+| `remove-worktree` | step 8, releasing what the create-name names (so `/drop-worktree` covers it too). `--keep-claim` opts out, for a teardown that is not the end of the work |
+| `prune-worktrees --prune` | claims whose note names a worktree that is no longer live — the debris case, matched on the note `create-worktree` writes and nothing else does |
+
+### `qb-admit` — is there room to start? (#337)
+
+The admission half of the in-flight bound, and **off unless a repo asks for it**.
+
+```bash
+qb-admit          # 0 room (or no bound configured) / 1 full / 2 unknown
+qb-admit --json
+```
+
+Rich, after eight agents fanned out and back in over one morning: *"I want rolling process
+not batch."* The costs were all of the predicted kind — two branches minted migration `0029`
+independently, a third was renumbered twice mid-flight, the largest open diff went DIRTY the
+moment the first landed. Nothing counted, because nothing ever had: `git worktree list`
+returned 48 on that box.
+
+**The count is claims**, asked of the board (`GET /claims/in-flight`): live `work` claims
+naming an issue or a PR in this repo, fleet-wide, whoever holds them. Not worktrees — 48,
+mostly debris from finished work — and not open PRs, by which time the branch exists.
+Quarterback bounds what it has authority over; work that never registered is outside it, and
+`create-worktree --no-claim` is the visible way to stay there. A human starting a ninth thing
+by hand is absorbed rather than exempt, with no special case at all: they run
+`create-worktree` and take the same claim an agent does.
+
+The ceiling lives in the repo's rules file beside #85's gates, and **ships null**:
+
+```json
+"in_flight": { "max": null, "min": null }
+```
+
+`max` is enforced by `create-worktree`, which asks before it takes the claim — the same
+refusal `--require-claim` already makes when the issue is taken, at the same moment, for a
+second reason. A full window refuses (definite, like a 409); a count that cannot be read
+warns and proceeds (a board outage must not stop every checkout on the fleet), unless
+`--require-claim`. `--no-bound` waives the refusal for one checkout and **still takes the
+claim**, so the window keeps reporting the truth about itself.
+
+`min` is the floor and nothing reads it yet: it is where the planner's discretion (#232) will
+be configured, and that needs the changed-file overlap (#101/#287) and a planner that does not
+exist. Recorded, reported, inert — the shape `review_panel.require_failing_test` already has.
+
+A malformed ceiling fails **open**, loudly (exit 2, and the reason names the file). Refusing
+every checkout on the fleet over a typo in a config file is the worse of the two failures and
+the harder one to diagnose from a phone.
+
+**The ceiling is advisory and can be exceeded.** The count is taken and then the claim is, so
+two checkouts starting in the same second both see room — a simultaneous fan-out can put the
+window over by however many raced. That is the standing the claim table already gives itself
+("advisory: it cannot stop a merge, only warn you"), and closing it means moving admission
+into the board so the count and the insert are one transaction. The rolling behaviour survives
+it: past the first burst, checkouts arrive one at a time against a count that is truthful.
+
 ### `qb-end` — the verb that stops a session
 
 There were three ways to start a session on this fleet and, until #277, none to end one.
@@ -1972,6 +2057,8 @@ Five files, one pin:
 | `bin/qb-claude-setup` | the wiring: merges the hook fragment into `~/.claude/settings.json`, registers the MCP server in `~/.claude.json`, @imports the workflow doc |
 | `bin/qb` | what a human types — `qb sessions`, `qb resume <id>` |
 | `bin/qb-end` | the stop verb: hand back a session's claims and its lease, saying why (#277). Called by the hook and by the seat bar's ✕; usable by hand |
+| `bin/qb-release` | the release verb for ONE claim, named as a resource: what the land step and the worktree teardown hand back (#337) |
+| `bin/qb-admit` | is there room in this repo for another unit of work? Reads `in_flight.max` and the board's count; ships unbounded (#337) |
 
 ### Which qb-hook am I running?
 

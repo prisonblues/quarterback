@@ -32,6 +32,9 @@ WORKTREE_SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pw
 #   --require-claim      Refuse the checkout if the claim cannot be TAKEN, not
 #                        only when somebody else holds it
 #   --claim-ttl <secs>   How long the checkout claim holds (default 28800 = 8h)
+#   --no-bound           Skip the in-flight window check (#337). The checkout
+#                        still takes its claim and still counts; it is only the
+#                        refusal that is waived
 
 # ============================================
 # COLORS
@@ -418,6 +421,85 @@ holder_note() {
     return 0
 }
 
+# >>> bound (extracted verbatim by harness/tests/test_create_worktree_bound.py)
+# Is there room for another unit of work in this repo? (#337)
+#
+# The fleet fans out and fans in. Eight agents were run against one `main` on
+# 2026-08-22 and every predicted cost arrived: two branches minted migration
+# `0029` independently, a third was renumbered twice mid-flight, the largest open
+# diff went DIRTY the moment the first landed. Nothing counted, because nothing
+# ever had: `git worktree list` on that box returned 48 and this script had no
+# notion that a number existed.
+#
+# **It is the same refusal, at the same moment, gaining a second reason.** Today
+# a checkout is refused because *this issue* is taken; with a ceiling configured
+# it is also refused because *there is no room*. So this runs where the claim
+# runs — before `git worktree add`, where a refusal costs nothing to unwind —
+# and reads the same three-answer shape:
+#
+#   * room, or no bound configured  -> proceed
+#   * FULL -> refuse, always. The board is saying something definite, exactly as
+#     a 409 on the claim is, and a bound enforced only when convenient is advice.
+#   * cannot tell (no board, board down, a malformed ceiling) -> warn and
+#     proceed, unless --require-claim. Failing closed here would make the board a
+#     single point of failure for every checkout on the fleet, which is the worse
+#     of the two failures and the harder one to diagnose from a phone.
+#
+# **DEFAULT OFF.** `qb-admit` returns 0 without contacting anything when the repo
+# names no `in_flight.max`, so on a repo that has not opted in this stanza costs
+# one process and changes nothing — no request, no output, no new way to fail.
+#
+# **Advisory, and it can be exceeded.** The count is taken and then the claim is:
+# two checkouts starting in the same second both see room and both proceed, so a
+# simultaneous fan-out can put the window over its ceiling by however many raced.
+# That is the same standing the claim table gives itself, and closing it means
+# moving admission into the board so the count and the insert are one transaction
+# — not a thing to land in the change that ships the bound off. The rolling
+# behaviour survives it: past the first burst, checkouts arrive one at a time and
+# the count they read is truthful.
+#
+# **--no-claim skips it, and that is consistent rather than a hole.** The count is
+# claims; a checkout that takes none is outside the count either way, so refusing
+# it would be bounding something this is not counting. It is loud about it (see
+# `claim_the_branch`'s unclaimed warning), which is the point: working outside the
+# window is a fine thing to do deliberately and a bad thing to do silently.
+admit_the_branch() {
+    local qa rc
+    [[ "$BOUND" = true && "$CLAIM" = true ]] || return 0
+
+    qa=$(command -v qb-admit 2>/dev/null || true)
+    if [[ -z "$qa" && "$0" == */* ]]; then qa="${0%/*}/qb-admit"; fi
+    if [[ -z "$qa" || ! -x "$qa" ]]; then
+        # Silent unless somebody asked for strictness. An absent sibling script
+        # is the ordinary state of a host that has not installed this harness,
+        # and a warning on every checkout there is a warning nobody reads.
+        [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: qb-admit not found"
+        return 0
+    fi
+
+    set +e
+    "$qa" --repo-path "$MAIN_REPO"
+    rc=$?
+    set -e
+    case "$rc" in
+        0) ;;
+        1) die "the in-flight window for this repo is full (see above). This is
+  admission, not a queue: leave the issue on the plan, unclaimed, and start it
+  when a slot opens — one is freed by every land, every worktree teardown, and
+  every claim that lapses. Raise in_flight.max in the repo's rules if the window
+  is genuinely too small, or pass --no-bound to take a slot over the ceiling
+  deliberately." ;;
+        *) echo -e "  ${YELLOW}unbounded:${NC} could not tell how much of this repo is in" >&2
+           echo -e "  flight — qb-admit's own reason is above. Proceeding, because a board" >&2
+           echo -e "  outage must not stop a checkout; --require-claim if you would rather" >&2
+           echo -e "  it did." >&2
+           [[ "$REQUIRE_CLAIM" = true ]] && die "--require-claim: the in-flight count could not be read"
+           ;;
+    esac
+    return 0
+}
+# <<< bound
+
 # >>> claim (extracted verbatim by harness/tests/test_create_worktree_claim.py)
 # The issue number a branch names, or nothing. `feat/issue-172`,
 # `fix/issue-114`, `feat/issue-135-qb-next` — the shapes the fix-issue and epic
@@ -626,6 +708,7 @@ CLAIM=true                # take the issue claim this branch names (#172)
 REQUIRE_CLAIM=false       # ...and refuse the checkout if it cannot be taken
 CLAIM_TTL=28800           # 8h: a worktree outlives an hour, and a lapsed claim
                           # reads as "free" to the next agent
+BOUND=true                # ask whether there is room in flight first (#337)
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -661,6 +744,8 @@ while [[ $# -gt 0 ]]; do
             CLAIM=false; shift ;;
         --require-claim)
             REQUIRE_CLAIM=true; shift ;;
+        --no-bound)
+            BOUND=false; shift ;;
         --claim-ttl)
             [[ -z "${2:-}" ]] && die "--claim-ttl requires a number of seconds"
             [[ "$2" =~ ^[0-9]+$ ]] || die "--claim-ttl takes seconds, got '$2'"
@@ -1113,7 +1198,10 @@ if [[ -x "$WORKTREE_SCRIPT_DIR/qb-hooks" ]]; then
 fi
 # <<< stash-guard
 
-# Before the tree, so a refusal costs nothing to unwind.
+# Before the tree, so a refusal costs nothing to unwind. The window first: being
+# refused for lack of room must not leave a claim taken, and a claim taken and
+# then rolled back is a slot that flickered.
+admit_the_branch
 claim_the_branch "$BRANCH_NAME"
 
 step "Creating git worktree and branch..."

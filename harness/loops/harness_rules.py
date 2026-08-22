@@ -860,6 +860,31 @@ DEFAULTS: dict = {
         # migrations exist and it stops no-opping.
         "migrations_dir": "migrations/versions",
     },
+    # How much work may be IN FLIGHT in this repo at once (#337). Both null,
+    # which is NO BOUND AT ALL — landing this changed nobody's behaviour, and a
+    # repo opts in by naming a ceiling.
+    #
+    # The count is CLAIMS, fleet-wide: `GET /claims/in-flight` counts the live
+    # `work` claims naming an issue or a PR in this repo, whoever holds them.
+    # Not worktrees (48 on zeus, mostly debris from finished work), not open PRs
+    # (by then the branch exists and the cost is already paid). Quarterback
+    # bounds what it has authority over; work that never registered is outside
+    # it, and `create-worktree --no-claim` is the visible way to stay there.
+    #
+    # `max` is enforced at the checkout — `qb-admit`, called by `create-worktree`
+    # before it takes the claim, so a refusal costs nothing and there is no
+    # half-built tree to clean up. Admission, not queueing: the item stays on the
+    # plan, unclaimed and visibly waiting, which `next` already understands.
+    #
+    # `min` is the floor, and NOTHING READS IT YET. It exists so the planner's
+    # discretion (#232) has somewhere to be configured when it is built: the
+    # floor is what stops a ceiling starving throughput when everything queued is
+    # genuinely disjoint, and "disjoint" is a judgement that needs the overlap
+    # data (#101/#287) and a planner that does not exist. Written down here for
+    # the reason `review_panel.require_failing_test` is: the key exists so the
+    # work has a home, and a repo that sets it gets it recorded and reported and
+    # inert rather than silently ignored.
+    "in_flight": {"max": None, "min": None},
     "preland": {
         # The pre-land verdict's only knob: check names preland.py must NOT run.
         # Empty is the safe end — every guardrail it can detect, it runs.
@@ -886,7 +911,7 @@ DEFAULTS: dict = {
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
 _DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "issue_pickup",
-                "issue_filing", "epic", "preland")
+                "issue_filing", "epic", "preland", "in_flight")
 
 # The documentation convention every rules file in the fleet leans on: a key
 # whose name starts with "_" is prose for whoever reads the file next, not a

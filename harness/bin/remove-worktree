@@ -9,6 +9,8 @@ set +e  # Don't exit on errors — try all cleanup steps
 #   --keep-branch        Don't delete the git branch
 #   --keep-db            Don't drop the isolated database
 #   --force              Tear down even if another live agent holds the worktree
+#   --keep-claim         Don't hand back the board claim on the issue this
+#                        worktree's branch names (#337)
 
 # ============================================
 # COLORS & HELPERS
@@ -132,6 +134,67 @@ holder_check() {
     return 0
 }
 
+# >>> release (extracted verbatim by harness/tests/test_remove_worktree_claim.py)
+# Hand back what `create-worktree` took (#337).
+#
+# The claim on the issue a branch names is taken BY THE CHECKOUT, held by the
+# machine with no session, for 8h. Nothing gave it back. #277's `stop` half
+# releases a SESSION's claims and these have none — they were taken by a script,
+# on behalf of a worktree, before the agent that would use it existed — so the
+# only thing that ever freed one was the TTL. Measured on 2026-08-22: four plan
+# items still carried live claims after their PRs had merged, one of them shipped
+# as v2.78 hours earlier. Symmetry with the thing that acquired it, and it
+# catches abandoned work as well as landed work.
+#
+# **The create-name, not the worktree's resolved branch.** They diverge when
+# somebody checks out something else inside the tree, and it is the create-name
+# that `create-worktree` derived its claim from. Releasing what `RESOLVED_BRANCH`
+# names would hand back a claim this worktree never took — which, on a box where
+# another agent holds it, is the one outcome worse than leaving it held.
+#
+# Best-effort throughout, and it never changes the outcome of the teardown: the
+# board is a coordination tool, and one that cannot be reached must not leave a
+# worktree half-removed. A failure is recorded as a cleanup warning, because a
+# claim silently left held for eight hours is exactly the state this exists to
+# stop, and "cleanup complete" over it is how it stayed unnoticed for a day.
+release_the_claim() {
+    local branch="$1" dir="$2" qr rc
+    if [[ "$KEEP_CLAIM" = true ]]; then
+        echo -e "${YELLOW}Keeping the claim (--keep-claim)${NC}"
+        return 0
+    fi
+    # **The tree is still there, so the checkout the claim belongs to is still
+    # there.** STEP 4 prints "Done" whether or not the directory actually went:
+    # the recursive delete is `2>/dev/null` and fails silently against root-owned
+    # files a container wrote, which is the case `prune-worktrees --remove-dirs`
+    # carries its own sudo hint for. Handing the claim back over a directory
+    # somebody can still `cd` into reports a slot free that is occupied — the
+    # exact wrong answer for a window that counts claims. So it stays held, is
+    # said out loud, and is recorded: the TTL is under it, and
+    # `prune-worktrees --prune` sweeps it once the tree really is gone.
+    if [[ -n "$dir" && -d "$dir" ]]; then
+        warn_cleanup "worktree directory still present — claim on '$branch' left held"
+        return 0
+    fi
+    qr=$(command -v qb-release 2>/dev/null || true)
+    # The `*/*` guard matters: invoked by bare name with no qb-release on PATH,
+    # `${0%/*}` leaves $0 untouched and would build a nonsense path.
+    if [[ -z "$qr" && "$0" == */* ]]; then qr="${0%/*}/qb-release"; fi
+    if [[ -z "$qr" || ! -x "$qr" ]]; then
+        echo -e "${YELLOW}qb-release not found — claim (if any) left held${NC}"
+        return 0
+    fi
+    "$qr" --branch "$branch" --repo-path "$MAIN_REPO"
+    rc=$?
+    case "$rc" in
+        0) echo -e "${GREEN}Done${NC}" ;;
+        1) echo -e "${YELLOW}Not ours to hand back (see above) — left alone${NC}" ;;
+        *) warn_cleanup "the claim on '$branch' was NOT handed back (see above) and stays held until it lapses" ;;
+    esac
+    return 0
+}
+# <<< release
+
 detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
@@ -159,6 +222,7 @@ CONFIG_FILE=""
 CONFIG_JSON=""
 KEEP_BRANCH=false
 KEEP_DB=false
+KEEP_CLAIM=false
 FORCE=false
 
 while [[ $# -gt 0 ]]; do
@@ -170,6 +234,8 @@ while [[ $# -gt 0 ]]; do
             KEEP_BRANCH=true; shift ;;
         --keep-db)
             KEEP_DB=true; shift ;;
+        --keep-claim)
+            KEEP_CLAIM=true; shift ;;
         --force)
             FORCE=true; shift ;;
         --*)
@@ -287,7 +353,7 @@ echo -e "  Main repo: $MAIN_REPO"
 echo -e "  Worktree:  $WORKTREE_DIR"
 echo ""
 
-TOTAL_STEPS=7
+TOTAL_STEPS=8
 CURRENT=0
 step() { CURRENT=$((CURRENT + 1)); echo -e "${YELLOW}[$CURRENT/$TOTAL_STEPS] $1${NC}"; }
 
@@ -591,6 +657,14 @@ if [[ -f "$PORT_FILE" ]]; then
 else
     echo -e "${YELLOW}No port file${NC}"
 fi
+
+# ============================================
+# STEP 8: Hand the issue claim back
+# ============================================
+# Last, and after the tree is actually gone: a claim handed back while the
+# checkout still exists is a slot reported free that somebody is standing in.
+step "Handing back the board claim..."
+release_the_claim "$BRANCH_NAME" "$WORKTREE_DIR"
 
 # ============================================
 # SUMMARY

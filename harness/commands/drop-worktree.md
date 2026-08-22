@@ -58,8 +58,12 @@ remove-worktree --keep-branch "$CREATE_NAME"
 ```
 Show the command before running it. `--keep-branch` preserves the branch; the
 script removes the container(s), strips the nginx block and restarts nginx, drops
-the isolated DB, prunes the `.worktree-ports` entry, and deletes the directory.
-(If the user also wants the DB kept, add `--keep-db`.)
+the isolated DB, prunes the `.worktree-ports` entry, deletes the directory, and
+**hands back the board claim on the issue the create-name names** (#337) — the
+one `create-worktree` took at checkout, which nothing else releases when the work
+lands. (If the user also wants the DB kept, add `--keep-db`; if they are dropping
+the tree but still working the issue — re-creating it, or continuing in the main
+checkout — add `--keep-claim` so the issue stays claimed by this machine.)
 
 ## 4. Clear the session marker
 
@@ -82,6 +86,7 @@ Confirm to the user:
 - the worktree directory is gone and its trappings (containers, nginx block, DB,
   port) were cleaned,
 - the **branch `<name>` survives** (with its commits / PR intact),
+- the issue claim was handed back (or, with `--keep-claim`, deliberately was not),
 - the statusline markers (worktree + PR + stage) are cleared, so the bar
   reflects the main checkout again.
 

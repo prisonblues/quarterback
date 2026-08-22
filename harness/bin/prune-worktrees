@@ -27,6 +27,8 @@ set -uo pipefail
 #                      stack, whose project has no worktree suffix).
 #   --remove-nginx     Strip orphan `# WORKTREE-START/END:<branch>` blocks from
 #                      the nginx config and restart nginx.
+#                      --prune also hands back board claims taken by checkouts
+#                      that no longer exist (#337).
 #                      Each --remove-* flag is independent of --prune; combine
 #                      any of them to do several at once.
 #   --config <path>    Config file (default: .worktree.json in repo root)
@@ -458,6 +460,60 @@ if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]]; then
 fi
 
 # ============================================
+# 6. ORPHAN CLAIMS
+# ============================================
+# >>> claim-sweep (extracted verbatim by harness/tests/test_prune_worktrees_claims.py)
+# A claim `create-worktree` took for a worktree that is no longer here (#337).
+#
+# The checkout claim is held by the MACHINE with no session and an 8h TTL, and
+# until #337 nothing handed it back: #277's `stop` half releases a SESSION's
+# claims and these have none. So a tree removed with a bare `git worktree remove`
+# — the same debris every other sweep here exists for — left an issue claimed by
+# nobody for the rest of the working day. Symmetry with the acquire, in the tool
+# that already sweeps what a missed teardown left behind.
+#
+# **Only what this script can prove `create-worktree` took.** The discriminator
+# is the NOTE, which that script writes as `worktree <branch> on <host>` and
+# nothing else writes. An agent working an issue in place — no worktree, so
+# `fix-issue-here`, or a claim taken through the `claim` MCP tool — carries a
+# different note and is not touched. Without that, a sweep keyed on "no worktree
+# for this issue" would free the claim of every agent that never made one, which
+# is live work reported as debris.
+#
+# Machine-scoped by construction: `qb-claimed` asks `/claim/held`, which answers
+# about the asking machine. A claim held by another box is neither listed here
+# nor releasable from here, and both are correct — that worktree is on that box.
+ORPHAN_CLAIMS=()
+ORPHAN_CLAIM_BRANCHES=()
+CLAIM_BIN=""
+RELEASE_BIN=""
+if command -v jq >/dev/null 2>&1; then
+    CLAIM_BIN=$(command -v qb-claimed 2>/dev/null || true)
+    if [[ -z "$CLAIM_BIN" && "$0" == */* ]]; then CLAIM_BIN="${0%/*}/qb-claimed"; fi
+    [[ -n "$CLAIM_BIN" && -x "$CLAIM_BIN" ]] || CLAIM_BIN=""
+    RELEASE_BIN=$(command -v qb-release 2>/dev/null || true)
+    if [[ -z "$RELEASE_BIN" && "$0" == */* ]]; then RELEASE_BIN="${0%/*}/qb-release"; fi
+    [[ -n "$RELEASE_BIN" && -x "$RELEASE_BIN" ]] || RELEASE_BIN=""
+fi
+if [[ -n "$CLAIM_BIN" && -n "$RELEASE_BIN" ]]; then
+    # `--session ''` on purpose: the checkout claim names no session, and the
+    # default would narrow to this process's own. Stderr is dropped — an
+    # unconfigured or unreachable board is a normal state for this tool and its
+    # own commentary would be one warning per run about a feature nobody enabled.
+    CLAIMS_JSON=$("$CLAIM_BIN" --repo-path "$MAIN_REPO" --session '' --json 2>/dev/null || true)
+    while IFS=$'\t' read -r note key; do
+        [[ -z "$note" ]] && continue
+        [[ "$note" =~ ^worktree[[:space:]](.+)[[:space:]]on[[:space:]] ]] || continue
+        br="${BASH_REMATCH[1]}"
+        is_live_suffix "$br" && continue
+        ORPHAN_CLAIMS+=("$key  (worktree $br)")
+        ORPHAN_CLAIM_BRANCHES+=("$br")
+    done < <(printf '%s' "$CLAIMS_JSON" \
+                | jq -r '.claims[]? | [(.note // ""), (.key // "")] | @tsv' 2>/dev/null)
+fi
+# <<< claim-sweep
+
+# ============================================
 # REPORT
 # ============================================
 # Print a labelled section. Args after the count are the items (may be zero).
@@ -476,6 +532,7 @@ report "Stale port entries"   "${#STALE_PORTS[@]}"       "${STALE_PORTS[@]:-}"
 report "Leftover directories" "${#LEFTOVER_DIRS[@]}"     "${LEFTOVER_DIRS[@]:-}"
 report "Orphan containers"    "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
 report "Orphan nginx blocks"  "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
+report "Orphan board claims"  "${#ORPHAN_CLAIMS[@]}"     "${ORPHAN_CLAIMS[@]:-}"
 if [[ ${#SKIPPED_DIRS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}  (ignored ${#SKIPPED_DIRS[@]} ${PROJECT}-* dir(s) with no worktree markers — not touched)${NC}"
 fi
@@ -487,7 +544,7 @@ fi
 echo ""
 
 TOTAL=$(( ${#ORPHAN_DBS[@]} + ${#STALE_PORTS[@]} + ${#LEFTOVER_DIRS[@]} \
-        + ${#ORPHAN_CONTAINERS[@]} + ${#ORPHAN_NGINX[@]} ))
+        + ${#ORPHAN_CONTAINERS[@]} + ${#ORPHAN_NGINX[@]} + ${#ORPHAN_CLAIMS[@]} ))
 if [[ "$TOTAL" -eq 0 ]]; then
     echo -e "${GREEN}Nothing to prune. Clean.${NC}"
     exit 0
@@ -500,8 +557,8 @@ fi
 # handles leftover directories. With neither, it's a dry run.
 if [[ "$ANY_APPLY" != true ]]; then
     echo -e "${YELLOW}Dry run — nothing changed.${NC}"
-    [[ $(( ${#ORPHAN_DBS[@]} + ${#STALE_PORTS[@]} )) -gt 0 ]] && \
-        echo -e "  Re-run with ${CYAN}--prune${NC} to drop orphan DBs and prune port entries."
+    [[ $(( ${#ORPHAN_DBS[@]} + ${#STALE_PORTS[@]} + ${#ORPHAN_CLAIMS[@]} )) -gt 0 ]] && \
+        echo -e "  Re-run with ${CYAN}--prune${NC} to drop orphan DBs, prune port entries and hand back claims."
     [[ ${#LEFTOVER_DIRS[@]} -gt 0 ]] && \
         echo -e "  Re-run with ${CYAN}--remove-dirs${NC} to delete the leftover directories."
     [[ ${#ORPHAN_CONTAINERS[@]} -gt 0 ]] && \
@@ -531,6 +588,18 @@ if [[ "$APPLY" = true ]]; then
         fi
         echo -e "  ${GREEN}pruned ${#STALE_PORTS[@]} stale port entr$([[ ${#STALE_PORTS[@]} -eq 1 ]] && echo y || echo ies)${NC}"
     fi
+    # Handed back one at a time, by BRANCH: `qb-release` re-derives the key from
+    # the branch through the board, so this never composes a key of its own —
+    # the rule #172 exists for, and the reason the sweep above collected branch
+    # names rather than the keys it printed.
+    for br in "${ORPHAN_CLAIM_BRANCHES[@]:-}"; do
+        [[ -z "$br" ]] && continue
+        if "$RELEASE_BIN" --branch "$br" --repo-path "$MAIN_REPO" --quiet; then
+            echo -e "  ${GREEN}released claim: $br${NC}"
+        else
+            echo -e "  ${YELLOW}could not release claim: $br (still held)${NC}"
+        fi
+    done
 fi
 
 # Remove leftover directories (--remove-dirs)
