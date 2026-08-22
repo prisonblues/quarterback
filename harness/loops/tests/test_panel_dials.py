@@ -1483,3 +1483,85 @@ def test_only_a_copy_counts_as_supplying_a_file():
              "          cp -r ${./harness/commands} repo/harness/commands\n"
              "          install -Dm644 ${./.harness-rules.sample} repo/.harness-rules.sample\n")
     assert set(_FLAKE_COPY.findall(block)) == {"harness/commands", ".harness-rules.sample"}
+
+
+# ------------------------------------- which LAYER supplied the dials — #305
+
+
+#: A cfg as `resolve_repo` now returns one: the dials, and beside each of them the
+#: layer that answered. `_dials` is the whole of #305's reporting half, and the
+#: panel's job is to carry it onto the round rather than to compute it.
+def _layered(**board):
+    dials = {
+        "review_panel.fix_severity_floor": {
+            "value": "P3", "layer": "sample",
+            "source": "origin/main:.harness-rules.sample"},
+        "review_panel.max_rounds": {"value": 2, "layer": "defaults",
+                                    "source": "harness_rules.DEFAULTS"},
+        "reviewers.claude.enabled": {"value": True, "layer": "sample",
+                                     "source": "origin/main:.harness-rules.sample"},
+        # Deliberately outside the two review blocks: `resolve_repo` reports every
+        # dial in the config, and a round's artifact wants the ones that governed
+        # the round.
+        "loops.issue_executor": {"value": False, "layer": "defaults",
+                                 "source": "harness_rules.DEFAULTS"},
+    }
+    dials.update(board)
+    return {**PANEL_CFG, "_rules_from": "origin/main:.harness-rules.sample",
+            "_dials": dials, "_dials_from": "https://qb.example/dials",
+            "_dials_unreadable": False,
+            "review_panel": {"fix_severity_floor": "P3"}}
+
+
+def test_the_round_records_which_layer_supplied_each_dial(monkeypatch, capsys, tmp_path):
+    """`review_panel` said WHAT ran and never WHERE IT CAME FROM, and that is the
+    half the #299 incident turned on: the sample stated both floors at P2 while five
+    rounds put P4s in `to_fix`, and no artifact could settle which described the run.
+    """
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                        config=_layered())
+    said = payload["rules"]["dials"]
+    assert said["review_panel.fix_severity_floor"]["layer"] == "sample"
+    assert said["review_panel.max_rounds"]["layer"] == "defaults"
+    # Scoped to what governs a REVIEW. The loop schedule is a dial and did not.
+    assert "loops.issue_executor" not in said
+    assert payload["rules"]["baseline"] == ".harness-rules.sample"
+
+
+def test_a_round_that_ran_under_a_board_dial_says_so_in_the_public_notes(
+        monkeypatch, capsys, tmp_path):
+    """#52's "never silent" applied to the one layer that can move a floor without a
+    pull request. `config_notes` is where it goes because `--post` puts that list in
+    a public PR comment, so the reader of the review sees the floor it was run
+    against, who moved it and why."""
+    cfg = _layered(**{"review_panel.fix_severity_floor": {
+        "value": "P3", "layer": "board", "source": "https://qb.example/dials",
+        "scope": "repo", "reason": "trying P3 for a fortnight", "set_by": "rich",
+        "expires_at": "2999-01-01T00:00:00+00:00"}})
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], config=cfg)
+    said = [n for n in payload["config_notes"] if "from the BOARD" in n]
+    assert len(said) == 1
+    assert "review_panel.fix_severity_floor" in said[0]
+    assert "trying P3 for a fortnight" in said[0] and "rich" in said[0]
+    assert "2999-01-01" in said[0]
+    assert payload["rules"]["dials"][
+        "review_panel.fix_severity_floor"]["layer"] == "board"
+
+
+def test_a_round_whose_board_would_not_answer_says_that_too(monkeypatch, capsys,
+                                                            tmp_path):
+    """A configured board that did not answer is NOT the same fact as no dial being
+    set, and a round that quietly ran on the repo's own rules while a dial was in
+    force on the board is the disagreement this whole feature exists to end."""
+    cfg = {**_layered(), "_dials_unreadable": True}
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], config=cfg)
+    assert any("would not answer" in n for n in payload["config_notes"])
+    assert payload["rules"]["dials_unreadable"] is True
+
+
+def test_a_repo_with_no_board_dial_adds_no_note_at_all(monkeypatch, capsys, tmp_path):
+    """The quiet case has to stay quiet: a round on a repo nobody has set a dial for
+    reads exactly as it did before this landed."""
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                        config=_layered())
+    assert not [n for n in payload["config_notes"] if "BOARD" in n]

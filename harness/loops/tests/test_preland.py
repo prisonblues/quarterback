@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import preland  # noqa: E402
 
 HEAD = "a" * 40
@@ -863,6 +864,11 @@ def test_the_payload_gathers_every_reason_across_checks():
 
 
 # ------------------------------------------------------------- the site config
+#
+# The reader and `board_config` MOVED to `harness_rules` when #305's dial layer
+# became their second reader, which is where preland's own comment always said
+# they belonged. The behaviour these pin is unchanged; only the module holding it
+# is, and `preland.board_config` is still the same function by import.
 
 
 def test_the_config_reader_takes_assignments_and_ignores_the_rest(tmp_path):
@@ -874,7 +880,7 @@ def test_the_config_reader_takes_assignments_and_ignores_the_rest(tmp_path):
                  "QUARTERBACK_TOKEN_CMD='cat /run/tok'\n"
                  'if [ -n "$x" ]; then\n'
                  'QUARTERBACK_AGENT=zeus\n')
-    assert preland._config_file(f) == {
+    assert harness_rules._config_file(f) == {
         "QUARTERBACK_BASE_URL": "https://qb.example",
         "QUARTERBACK_TOKEN_CMD": "cat /run/tok",
         "QUARTERBACK_AGENT": "zeus",
@@ -882,13 +888,13 @@ def test_the_config_reader_takes_assignments_and_ignores_the_rest(tmp_path):
 
 
 def test_a_missing_config_file_is_empty_not_an_error(tmp_path):
-    assert preland._config_file(tmp_path / "nope") == {}
+    assert harness_rules._config_file(tmp_path / "nope") == {}
 
 
 def test_the_environment_beats_the_config_file(monkeypatch, tmp_path):
     f = tmp_path / "config"
     f.write_text("QUARTERBACK_BASE_URL=https://from-file\n")
-    monkeypatch.setattr(preland, "QB_CONFIG", f)
+    monkeypatch.setattr(harness_rules, "QB_CONFIG", f)
     monkeypatch.setenv("QUARTERBACK_BASE_URL", "https://from-env/")
     monkeypatch.setenv("QUARTERBACK_TOKEN", "t")
     assert preland.board_config() == ("https://from-env", "t", "")
@@ -897,15 +903,15 @@ def test_the_environment_beats_the_config_file(monkeypatch, tmp_path):
 def test_an_unset_board_url_is_an_error_and_never_a_guess(monkeypatch, tmp_path):
     """The fleet has more than one board and they are deliberately disjoint, so a
     default would point this agent at another island's."""
-    monkeypatch.setattr(preland, "QB_CONFIG", tmp_path / "nope")
+    monkeypatch.setattr(harness_rules, "QB_CONFIG", tmp_path / "nope")
     monkeypatch.delenv("QUARTERBACK_BASE_URL", raising=False)
     url, token, why = preland.board_config()
     assert (url, token) == ("", "") and "no default" in why
 
 
 def test_a_board_with_no_resolvable_token_says_so(monkeypatch, tmp_path):
-    monkeypatch.setattr(preland, "QB_CONFIG", tmp_path / "nope")
-    monkeypatch.setattr(preland, "QB_TOKEN_FILE", tmp_path / "nope-either")
+    monkeypatch.setattr(harness_rules, "QB_CONFIG", tmp_path / "nope")
+    monkeypatch.setattr(harness_rules, "QB_TOKEN_FILE", tmp_path / "nope-either")
     monkeypatch.setenv("QUARTERBACK_BASE_URL", "https://qb.example")
     monkeypatch.delenv("QUARTERBACK_TOKEN", raising=False)
     assert "no board token" in preland.board_config()[2]

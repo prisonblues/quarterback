@@ -99,6 +99,106 @@ Two things to know, because this path removes a file that used to be tracked:
   `git rm --cached .harness-rules`, which untracks the file while keeping it on disk,
   where it is now the overlay.
 
+### The third layer: dials the board states and the repo only defaults (#305)
+
+`review_panel.fix_severity_floor` decides which findings a fix pass may touch;
+`round_trigger_floor` decides which ones buy another round. Between them they decide
+what a review costs and what it is worth — and changing either was **a commit on a
+pull request, reviewed by the panel those dials configure.**
+
+That is the wrong shape for a policy knob, and here is what it cost: this repo's
+`.harness-rules.sample` stated both floors at P2 while every round of the five run on
+PR #299 put P4 findings in `to_fix` with `below_fix_floor` empty, which cannot happen
+under a P2 fix floor. The file that stated the policy and the rounds that applied it
+disagreed for five rounds, four agents and a landed release, because there was no way
+to **ask** what the floor was.
+
+So there is a third layer, applied last:
+
+```
+DEFAULTS  ->  .harness-rules.sample  ->  per-box overlay  ->  the board
+   (a default)      (this repo's default)    (capability)      (the value IN FORCE)
+```
+
+**The repo states a DEFAULT; the board states the value IN FORCE; and the reported
+answer names which layer produced it.** That last clause is what stops this becoming
+a second place a dial is written down (#56's rule) — nothing on the board is
+authoritative on its own, because every resolution reports the layer behind every
+dial.
+
+```bash
+harness_rules.py --dial review_panel.fix_severity_floor
+# review_panel.fix_severity_floor  "P3"  [board] repo — 'trying P3 for a fortnight'
+#                                                  by rich, 2026-09-05T00:00:00+00:00
+
+harness_rules.py --dials      # every dial, its value, and the layer that answered
+harness_rules.py --json       # the same table, as `_dials`
+```
+
+Every reviewed round records it too, in the payload's `rules.dials`, and a round that
+ran under a board dial says so in `config_notes` — which `--post` puts in the public
+PR comment.
+
+**Setting one takes no pull request:**
+
+```bash
+curl -X POST "$QUARTERBACK_BASE_URL/dials" -H "$edge_headers" -d '{
+  "repo": "prisonblues/quarterback",
+  "dial": "review_panel.fix_severity_floor",
+  "value": "P3",
+  "reason": "trying the P3 floor for a fortnight against the deferred backlog",
+  "expires_at": "2026-09-05T00:00:00Z"}'
+```
+
+Four properties, each closing a failure the two file layers have:
+
+- **It expires by itself.** `expires_at` is optional — omit it for a floor you mean
+  to keep — and an expired dial is simply *absent*: a resolution whose dial lapsed and
+  one that never had a dial are indistinguishable, so nothing has to be remembered and
+  cleared.
+- **Reads happen on BOTH paths**, unlike the overlay. The overlay is excluded
+  unattended because it is a file in an untrusted working tree; the board is not in
+  the working tree. Unattended is also the path a budget governor exists to govern
+  (#276).
+- **Writes are human-only.** Reads take any agent's bearer token; `POST /dials` takes
+  the same edge-authenticated human gate the plan's order takes. Anything running while
+  a branch under review is checked out — a test suite, a build step, a git hook — holds
+  this box's machine token, so a machine-writable dial would be the two-ref rule's own
+  hole reopened from the board side.
+- **A repo with no dial behaves exactly as before.** An empty table and an unenrolled
+  host are the same silent answer. A board that is *configured here and will not
+  answer* is a different fact, and is reported rather than swallowed.
+
+**Which dials, and the one boundary case.** The settable set is
+`harness_rules.BOARD_DIALS`, and it is the dials whose value is a judgement about
+**cost** rather than about capability: both floors, `low_severity_fix_lines`,
+`max_fix_growth`, `max_rounds`, `reviewer_scope`, `max_diff_chars`,
+`judge_max_diff_chars`, `judge_model`, `distant_merge_lines` and
+`escalate_on.premise_repeated`. Everything that decides what may be **merged** —
+`auto_merge`, the `epic` and `preland` blocks, title patterns, the loop schedule —
+stays in the sample, for the reason the overlay refuses the same set.
+
+`reviewers.<seat>.enabled` is settable and is the one dial with a direction rule: the
+board **may turn a seat off and may not turn one on.** It is both capability and
+policy, and the board's claim is the policy half only — whether a seat is worth its
+tokens. Nothing on the board knows which CLIs a machine carries, and `panel.py` counts
+a seat that never ran as coverage it did not get, so a board that could enable a seat
+could veto every round's confidence on a box that never had it. Every other dial may
+move **either way**, because raising `fix_severity_floor` from P3 to P2 makes rounds
+cheaper and coverage thinner while lowering it does the reverse: neither direction is
+the safe one, which is exactly why #276's narrow-only throttle rule cannot govern a
+floor.
+
+**The board does not know what a dial IS.** It stores an opaque name and opaque JSON.
+The harness ships the dial table and the server image carries no `harness/` directory,
+so a copy there would be the second-source-of-truth failure arriving from the other
+end. A dial the harness does not recognise, or holds at a value it may not take, is
+**refused and named on stderr at every resolution** — never dropped quietly.
+
+`QUARTERBACK_DIALS` set at all — the empty string included — is the offline switch:
+the variable becomes the whole layer and the board is not consulted. That is what the
+suites use, and what an operator uses when the board is down.
+
 Two conventions the resolver enforces so a rules file can be read like prose:
 
 - **A key starting with `_` is a comment**, at any depth (`"_": "why this seat is

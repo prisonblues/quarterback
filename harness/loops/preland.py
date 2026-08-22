@@ -95,7 +95,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shlex
 import subprocess
 import sys
@@ -107,8 +106,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+# `board_config` and the site-config reader beneath it were WRITTEN here and now
+# live one layer down, because this module's own comment said where they belonged
+# the moment anything else needed them: *"the moment a second reader needs this it
+# belongs in harness_rules.py beside the other shared plumbing."* #305's dial layer
+# is that second reader, and two copies of "which board is this box on, and what
+# bearer does it use" is how two readers come to disagree about which island they
+# are talking to. `board_request` stays here: its contract is this script's — it
+# never raises, and it returns the HTTP status because one check has to tell an
+# older board from a broken one.
 from harness_rules import (  # noqa: E402
-    RepoNotFound, check_status, describe, resolve_repo,
+    BOARD_TIMEOUT, RepoNotFound, board_config, check_status, describe, resolve_repo,
 )
 # #278's reading lives in `panel_scope` because that is where the review target is
 # decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
@@ -143,19 +151,6 @@ SKIPPED = ("skipped-absent", "skipped-disabled", "skipped-flag")
 #: and are deliberately NOT listed — see :func:`verdict_of` for why the list runs
 #: this way round.
 NOT_AN_OBJECTION = ("passed", "reconcile", *SKIPPED)
-
-#: Where the site config lives, in qb-env's words: the per-host file that says
-#: which board this machine belongs to. Environment beats it, and an unset URL is
-#: an ERROR rather than a guess — the fleet has more than one board and they are
-#: deliberately disjoint, so a default would point an agent at another island's.
-QB_CONFIG = Path(os.environ.get("QUARTERBACK_CONFIG") or (
-    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    / "quarterback" / "config"))
-
-#: The pre-config fleet layout, kept for a host that has not been rebuilt yet.
-QB_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
-
-BOARD_TIMEOUT = 15
 
 #: The board endpoint the landing queue lives behind (#227/#317). Named here
 #: because :func:`check_queue` says it back in two messages, and a path spelled
@@ -292,78 +287,6 @@ def verdict_of(checks: list[Check]) -> str:
 
 
 # ---------------------------------------------------------------- the board read
-
-
-def _config_file(path: Path) -> dict[str, str]:
-    """The site config's `KEY=value` lines, as a mapping.
-
-    A deliberately small reader for a file bash SOURCES. It takes plain
-    assignments and strips one layer of quotes; it does not evaluate anything,
-    because a config read must not be able to run what a config write put there.
-    A line it cannot parse is skipped rather than guessed at.
-
-    The cost of not evaluating: a value containing `$VAR` is taken literally.
-    That is the honest failure — the board is then "unreachable at $VAR/…", which
-    names the problem — rather than the dishonest one, which would be expanding
-    it here and getting a different answer than `qb` does.
-    """
-    out: dict[str, str] = {}
-    try:
-        text = path.read_text()
-    except OSError:
-        return out
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line[len("export "):].strip() if line.startswith("export ") else line
-        name, sep, value = line.partition("=")
-        if not sep or not name.replace("_", "").isalnum():
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        out[name.strip()] = value
-    return out
-
-
-def board_config() -> tuple[str, str, str]:
-    """(base_url, token, why-it-is-unusable) for this host's board.
-
-    Same contract and same precedence as `qb-env`, which is the fleet's rule
-    rather than this script's preference: environment beats the config file, an
-    unset URL is an error and never a guess, and the token may come from a
-    command because its source is per-site (a cached file here, an ssh fetch
-    there). Re-derived in Python only because `qb` has no read subcommand for
-    reviews and lives in another repo; the moment a second reader needs this it
-    belongs in harness_rules.py beside the other shared plumbing.
-    """
-    cfg = _config_file(QB_CONFIG)
-    url = (os.environ.get("QUARTERBACK_BASE_URL")
-           or cfg.get("QUARTERBACK_BASE_URL", "")).rstrip("/")
-    if not url:
-        return "", "", (
-            f"no board configured on this host — QUARTERBACK_BASE_URL is unset "
-            f"and there is deliberately no default (see {QB_CONFIG})")
-    token = os.environ.get("QUARTERBACK_TOKEN", "") or _token_from(cfg)
-    if not token:
-        return url, "", ("no board token — set QUARTERBACK_TOKEN, or "
-                         f"QUARTERBACK_TOKEN_CMD in {QB_CONFIG}")
-    return url, token, ""
-
-
-def _token_from(cfg: dict[str, str]) -> str:
-    """The bearer, via the config's own command or the pre-config token file."""
-    cmd = cfg.get("QUARTERBACK_TOKEN_CMD", "")
-    if cmd:
-        proc = run(["bash", "-c", cmd])
-        first = (proc.stdout or "").strip().splitlines()
-        if not proc.returncode and first:
-            return first[0]
-    try:
-        return QB_TOKEN_FILE.read_text().strip()
-    except OSError:
-        return ""
 
 
 def board_get(path: str, params: dict) -> tuple[object, str]:

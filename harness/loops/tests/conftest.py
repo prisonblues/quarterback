@@ -66,6 +66,7 @@ above, one seam over: a double that does not know the whole contract fails green
 
 import io
 import json
+import os
 import sys
 import tarfile
 from pathlib import Path
@@ -79,6 +80,18 @@ import pytest
 # because some other module's insert had already run, so selecting a single node
 # (`pytest tests/test_x.py::test_y`) in a module that does not insert could raise
 # ModuleNotFoundError out of a fixture that has nothing to do with the panel.
+# THE SUITE DOES NOT TALK TO A BOARD. `resolve_repo` reads the dial layer (#305)
+# from `GET /dials`, and `QUARTERBACK_DIALS` set AT ALL — the empty string
+# included — is the offline switch: the variable becomes the whole layer, so this
+# is "there are no dials" rather than "ask, and hope". Without it a checkout whose
+# host is enrolled on a board would make a live HTTP call per resolution and the
+# same test would mean different things on two machines, which is the leak
+# `tests/conftest.py` pins every other setting to close.
+#
+# `setdefault`, so a caller that exported its own body still gets it, and
+# monkeypatch still wins inside a test.
+os.environ.setdefault("QUARTERBACK_DIALS", "")
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — the `gh` seam every stub here replaces
