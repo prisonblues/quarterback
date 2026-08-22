@@ -755,7 +755,8 @@ def fetch_board(client) -> dict:
     return out
 
 
-def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]:
+def _gh_list(kind: str, repo: str, fields: str,
+             limit: int = 30) -> tuple[list[dict], str | None]:
     """One `gh <kind> list` against one repo, every row tagged with that repo.
 
     The tag is what lets the panels say where a row came from, and it is applied
@@ -765,7 +766,7 @@ def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]
     try:
         raw = subprocess.run(
             ["gh", kind, "list", "--repo", repo, "--state", "open",
-             "--limit", "30", "--json", fields],
+             "--limit", str(limit), "--json", fields],
             capture_output=True, text=True, timeout=45,
         )
         if raw.returncode != 0:
@@ -784,22 +785,43 @@ def _gh_list(kind: str, repo: str, fields: str) -> tuple[list[dict], str | None]
         return [], f"{short_repo(repo)}: {type(exc).__name__}"
 
 
-def _gh_list_many(kind: str, fields: str, repos: list[str] | None = None):
+def _gh_list_many(kind: str, fields: str, repos: list[str] | None = None,
+                  limit: int = 30):
     """Every repo this dashboard watches. One failing repo is reported, not fatal:
     a token that cannot see one of three is still worth three panels."""
     out: list[dict] = []
     errs: list[str] = []
     for repo in (repos if repos is not None else resolve_repos()):
-        rows, err = _gh_list(kind, repo, fields)
+        rows, err = _gh_list(kind, repo, fields, limit)
         out.extend(rows)
         if err:
             errs.append(err)
     return out, ("; ".join(errs) if errs else None)
 
 
+#: How many open PRs one `gh` call may return. Higher than the issue list's 30
+#: because the review queue's DEPTH is computed off this list, and a depth
+#: silently capped at the fetch limit is the number this whole feature exists to
+#: make trustworthy. :func:`fetch_review_queue` still says so when a repo comes
+#: back holding exactly this many, because "60 open PRs" and "at least 60" are
+#: different facts and only one of them is a depth.
+PR_LIMIT = 60
+
+#: Rows the printed OPEN PRs panel draws before it stops and counts the rest. A
+#: printed panel cannot scroll, and `PR_LIMIT` rows of it would push everything
+#: below off the screen.
+PR_ROWS = 12
+
+
 def fetch_prs(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
     return _gh_list_many(
-        "pr", "number,title,isDraft,updatedAt,statusCheckRollup,headRefName", repos)
+        "pr",
+        # headRefOid / mergeable / createdAt are the review queue's inputs (#273).
+        # Fetched here rather than in a second `gh` call because both panels read
+        # one list, and two lists a minute apart would disagree about a PR that
+        # moved between them.
+        "number,title,isDraft,updatedAt,statusCheckRollup,headRefName,"
+        "headRefOid,mergeable,createdAt", repos, PR_LIMIT)
 
 
 def fetch_issues(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
@@ -826,6 +848,231 @@ def issue_claims(claims: list[dict], repo: str = REPO) -> dict[int, dict]:
         if prefix == repo and number.isdigit():
             held.setdefault(int(number), c)
     return held
+
+
+# ---- the review queue: what review is waiting on, and for how long (#273) ----
+#
+# `qb-dash` already pays for one `gh pr list` per refresh and the board already
+# holds every panel run, every plan item and every claim. Neither half alone can
+# answer "what is review waiting on" — which is why, on 2026-08-20, six of eight
+# open PRs had never been panelled and nobody could see it. `POST /review-queue`
+# is the join; this is the client for it, and it reuses the PR rows the OPEN PRs
+# panel already fetched rather than asking `gh` a second time.
+
+#: The verb each `next_action` gets in a narrow pane. The board publishes the
+#: long form on every entry; this is only the column width.
+QUEUE_VERB = {
+    "integrate": "rebase",
+    "review": "panel",
+    "re-review": "re-panel",
+    "fix": "fix",
+    "land": "land",
+    "answer": "answer",
+    "none": "—",
+}
+
+#: State → colour. Red is "a round spent here is wasted", magenta is "findings
+#: are sitting unfixed", yellow is "review is owed", green has left the queue.
+QUEUE_COLOUR = {
+    "escalated": "bold red",
+    "blocked": "red",
+    "unresolved": "magenta",
+    "stale": "yellow",
+    "unreviewed": "yellow",
+    "unconverged": "cyan",
+    "ready": "green",
+    "exempt": "grey50",
+}
+
+#: The only hold code too long for the verb column. Abbreviated here rather than
+#: clipped, because `mergeable…` and `mergeable-unknown` read as the same word
+#: and the `?` is the whole of what it says.
+QUEUE_HOLD = {"mergeable-unknown": "mergeable?"}
+
+#: The `gh pr list` fields `POST /review-queue` reads, under GitHub's own names —
+#: the endpoint takes them as aliases so nothing has to translate on the way.
+QUEUE_PR_FIELDS = ("number", "title", "headRefOid", "mergeable", "createdAt", "isDraft")
+
+
+def waited(seconds) -> str:
+    """'40m', '6h12m', '2d12h' — how long an entry has been waiting.
+
+    Days, which :func:`ago` does not do: this queue's whole complaint is measured
+    in them, and "60h13m" is a number a reader has to convert before it means
+    anything.
+    """
+    try:
+        secs = int(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if secs < 0:
+        return ""
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h{(secs % 3600) // 60:02d}m"
+    days, rest = divmod(secs, 86400)
+    return f"{days}d{rest // 3600:02d}h"
+
+
+def gh_error_repos(err: str | None) -> set[str]:
+    """The SHORT repo names named in a :func:`_gh_list_many` error string.
+
+    Reads the format :func:`_gh_list` writes — ``"<short repo>: <why>"``, joined
+    by ``"; "`` — and the two live in this file together for exactly that reason.
+    The alternative was worse in both directions: a queue that cannot tell WHICH
+    repo's listing failed must either refuse every repo (throwing away good data
+    for two repos because a third's token expired) or trust a list nobody could
+    read (rendering a repo with eight PRs waiting as a drained queue).
+
+    A malformed or unattributable error yields the empty set, and the caller
+    treats that as "every repo is suspect" — the conservative direction, since it
+    can only withhold an answer, never invent one.
+
+    It answers in SHORT names because that is what the string carries, and short
+    names are not unique: `org1/api` and `org2/api` produce the same prefix, and
+    a panel showing both has always rendered their errors identically. The caller
+    resolves that rather than this function guessing — see
+    :func:`fetch_review_queue`, which refuses to derive for either of a colliding
+    pair while a listing error is outstanding.
+    """
+    return {part.split(":", 1)[0].strip()
+            for part in (err or "").split("; ") if ":" in part}
+
+
+def _queue_pr(row: dict) -> dict:
+    """One `gh` PR row, trimmed to what the endpoint reads.
+
+    Trimmed rather than sent whole because `statusCheckRollup` is a list of every
+    check on the PR, and it would be the bulk of a request that is otherwise a
+    few hundred bytes per PR.
+    """
+    return {k: row.get(k) for k in QUEUE_PR_FIELDS if row.get(k) is not None}
+
+
+def fetch_review_queue(client, prs: list[dict], repos: list[str] | None = None,
+                       pr_err: str | None = None) -> dict:
+    """The derived review queue for the watched repos. Never raises.
+
+    A dead board is a state, not an exception — the same contract
+    :func:`fetch_board` keeps, and for the same reason: a dashboard that dies on
+    a 502 tells its reader less than one that says the board is unreachable.
+
+    **A PR list that failed is not an empty PR list**, which is why `pr_err` is an
+    argument. `fetch_prs` returns `([], err)` when `gh` fails, and sending that
+    empty list as the repo's open PRs would have the board honestly answer "no
+    open pull requests" — rendering a repo with eight PRs waiting as a queue that
+    has drained. So a failed listing refuses to derive at all and reports the
+    failure, because the whole value of this panel is a depth somebody can act
+    on and a depth built on a list nobody could read is not one.
+
+    Entries come back flattened across repos and tagged with the repo they came
+    from, sorted oldest-drainable first. That sort is a READING order and not a
+    work order: the board deliberately refuses to rank the queue (#232 owns the
+    order), so this is the dashboard deciding what to put at the top of a panel
+    that cannot scroll, which is a different decision from deciding what to do.
+    """
+    out: dict = {"entries": [], "open": 0, "depth": 0, "oldest": None,
+                 "oldest_held": None, "idle": None, "error": None}
+    watched = list(repos if repos is not None else resolve_repos())
+    failed = gh_error_repos(pr_err) if pr_err else set()
+    if pr_err and not failed:
+        # An error nothing could attribute makes every listing suspect.
+        out["error"] = f"pr list: {pr_err}"
+        return out
+    # How many watched repos each short name stands for. A listing error names a
+    # short name, so while one is outstanding a name shared by two watched repos
+    # cannot say which of them failed — and both a false "drained" and a false
+    # "unavailable" would be a fact stated about a repo nobody measured.
+    shared: dict[str, int] = {}
+    for r in watched:
+        shared[short_repo(r)] = shared.get(short_repo(r), 0) + 1
+    by_repo: dict[str, list[dict]] = {}
+    for row in prs:
+        by_repo.setdefault(row.get("repo") or "", []).append(row)
+
+    errs: list[str] = []
+    idles: list[str] = []
+    for repo in watched:
+        rows = by_repo.get(repo, [])
+        if pr_err and shared[short_repo(repo)] > 1:
+            errs.append(f"{repo}: which `{short_repo(repo)}` failed is ambiguous")
+            continue
+        if short_repo(repo) in failed:
+            # This repo's listing failed, so its empty row list is not an empty
+            # repo. The others' lists are still good and still worth a queue.
+            errs.append(f"{short_repo(repo)}: pr list unavailable")
+            continue
+        if len(rows) >= PR_LIMIT:
+            errs.append(f"{short_repo(repo)}: {PR_LIMIT}+ open PRs, depth is a floor")
+        body = {"repo": repo, "prs": [_queue_pr(r) for r in rows]}
+        try:
+            answer = client.post("/review-queue", body)
+        except Exception as exc:                  # noqa: BLE001 — display it, don't die
+            errs.append(f"{short_repo(repo)}: {type(exc).__name__}")
+            continue
+        # `post` tolerates an empty body because a WRITE's 200 legitimately
+        # carries none. This is a read through that method, so the tolerance has
+        # to be undone here: a truncated response, a proxy's contentless 502 or a
+        # board mid-deploy would otherwise arrive as `{}` and render as a queue
+        # that is empty rather than one that could not be read (#244).
+        if not isinstance(answer, dict) or "counts" not in answer:
+            errs.append(f"{short_repo(repo)}: empty answer")
+            continue
+        counts = answer.get("counts") or {}
+        out["open"] += counts.get("open") or 0
+        out["depth"] += counts.get("drainable") or 0
+        for entry in answer.get("entries") or []:
+            out["entries"].append({**entry, "repo": repo})
+        for field in ("oldest", "oldest_held"):
+            oldest = answer.get(field)
+            if oldest and (out[field] is None
+                           or (oldest.get("age_seconds") or 0)
+                           > (out[field].get("age_seconds") or 0)):
+                out[field] = {**oldest, "repo": repo}
+        if answer.get("idle_reason"):
+            idles.append(f"{short_repo(repo)}: {answer['idle_reason']}")
+
+    out["entries"].sort(key=lambda e: (not e.get("drainable"),
+                                       -(e.get("age_seconds") or 0)))
+    out["error"] = "; ".join(errs) if errs else None
+    # Only when NOTHING is drainable anywhere. A queue with depth is not idle,
+    # however many of its repos happen to be.
+    out["idle"] = "; ".join(idles) if idles and not out["depth"] else None
+    return out
+
+
+def queue_oldest(queue: dict) -> tuple[str, bool]:
+    """`("2d12h", held)` — the longest wait in the queue, and whether it is held.
+
+    Falls back to the oldest HELD entry when nothing is drainable, because a repo
+    where every PR has been stuck for five days is the reading this panel exists
+    to surface and reporting only the drainable ones would render it as a queue
+    with no age at all. The flag is what stops the fallback reading as a wait
+    somebody could go and end.
+    """
+    oldest = queue.get("oldest")
+    if oldest:
+        return waited(oldest.get("age_seconds")), False
+    return waited((queue.get("oldest_held") or {}).get("age_seconds")), True
+
+
+def queue_cell(queue: dict) -> tuple[str, str, str, str]:
+    """`REVIEW  3 waiting  oldest 2d12h` — the header's own summary of the queue.
+
+    Beside the caps because it is the same kind of number: the caps say what the
+    seats may spend, and this says what is waiting to be spent on. A depth of
+    zero is not the same as a board that could not be asked, so an error reports
+    as `?` rather than as an empty queue (#244).
+    """
+    if queue.get("error") and not queue.get("open"):
+        return ("REVIEW", "?", clip(queue["error"], 40), "red")
+    depth = queue.get("depth") or 0
+    age, held = queue_oldest(queue)
+    colour = "green" if not depth else ("yellow" if depth < 5 else "red")
+    if not age:
+        return ("REVIEW", f"{depth} waiting", "", colour)
+    return ("REVIEW", f"{depth} waiting", f"{'held' if held else 'oldest'} {age}", colour)
 
 
 def repo_ref(row: dict) -> str:

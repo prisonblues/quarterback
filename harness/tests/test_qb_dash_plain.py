@@ -105,6 +105,26 @@ PRS = [{"number": 265, "title": "a pr", "isDraft": False, "updatedAt": None,
         "statusCheckRollup": [], "repo": qd.REPO}]
 ISSUES = [{"number": 261, "title": "an issue", "updatedAt": None, "repo": qd.REPO}]
 
+#: One of each shape the REVIEW QUEUE panel has to draw: something to do,
+#: something nothing may be done to, and an age nobody can pin down.
+QUEUE = {
+    "open": 3, "depth": 1, "error": None, "idle": None,
+    "oldest": {"pr": 270, "age_seconds": 216_000},
+    "entries": [
+        {"pr": 264, "title": "a first round is owed", "state": "unreviewed",
+         "next_action": "review", "drainable": True, "holds": [],
+         "age_seconds": 216_000, "age_is_upper_bound": False, "repo": qd.REPO},
+        {"pr": 270, "title": "conflicting, so no round", "state": "blocked",
+         "next_action": "integrate", "drainable": False,
+         "holds": [{"code": "conflicting", "detail": "…"}],
+         "age_seconds": 90_000, "age_is_upper_bound": True, "repo": qd.REPO},
+        {"pr": 190, "title": "somebody else has it", "state": "unresolved",
+         "next_action": "fix", "drainable": False,
+         "holds": [{"code": "claimed", "detail": "zeus/otter holds it"}],
+         "age_seconds": 3_600, "age_is_upper_bound": False, "repo": "other/repo"},
+    ],
+}
+
 
 def _table(panel):
     return panel.renderable
@@ -157,6 +177,53 @@ def test_the_pr_panel_and_its_filler_rows_agree(dash, scope, expected):
     assert len(_table(dash.panel_prs(PRS, None, 78, scope)).columns) == expected
     assert len(_table(dash.panel_prs([], None, 78, scope)).columns) == expected
     assert len(_table(dash.panel_prs([], "gh is down", 78, scope)).columns) == expected
+
+
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
+def test_the_review_queue_panel_and_its_filler_rows_agree(dash, scope, expected):
+    assert len(_table(dash.panel_review_queue(QUEUE, 78, scope)).columns) == expected
+    assert len(_table(dash.panel_review_queue({}, 78, scope)).columns) == expected
+    assert len(_table(dash.panel_review_queue(
+        {"error": "board is down"}, 78, scope)).columns) == expected
+    many = dict(QUEUE, entries=[dict(QUEUE["entries"][0], pr=n) for n in range(30)])
+    assert len(_table(dash.panel_review_queue(many, 78, scope)).columns) == expected
+
+
+def test_the_review_queue_shows_what_is_held_rather_than_hiding_it(dash):
+    """A panel that dropped its blocked rows would report an empty queue for a
+    repo where everything is stuck — the reading #273 exists to end."""
+    panel = dash.panel_review_queue(QUEUE, 78, WIDE)
+    rows = _cells(panel)
+    assert [r[2] for r in rows] == ["#264", "#270", "#190"]
+    # A drainable row shows the VERB; a held one shows why it is not offered.
+    assert [r[3] for r in rows] == ["panel", "conflicting", "claimed"]
+    # An age nothing recorded the start of wears a `~`.
+    assert [r[4] for r in rows] == ["2d12h", "~1d01h", "1h00m"]
+    title = _titles(panel)
+    assert "1 waiting" in title and "2 held" in title and "oldest 2d12h" in title
+
+
+def test_an_unasked_review_queue_does_not_render_as_a_drained_one(dash):
+    """#244, on the one panel built to end it: the empty state has to say which
+    empty it is."""
+    drained = dash.panel_review_queue(
+        {"open": 0, "depth": 0, "entries": [], "error": None,
+         "idle": "quarterback: no open pull requests were supplied for this repo"},
+        78, NARROW)
+    assert "no open pull requests" in " ".join(c for row in _cells(drained) for c in row)
+
+    broken = dash.panel_review_queue({"error": "board: TimeoutError"}, 78, NARROW)
+    assert "TimeoutError" in " ".join(c for row in _cells(broken) for c in row)
+
+
+def test_the_queue_rides_the_header_line_beside_the_caps(dash):
+    line = dash.queue_line(QUEUE)
+    assert "REVIEW" in line.plain and "1 waiting" in line.plain
+    assert "oldest 2d12h" in line.plain
+    # Never fetched is never rendered; a depth of zero still is.
+    assert dash.queue_line({}).plain == ""
+    assert "0 waiting" in dash.queue_line(
+        {"open": 2, "depth": 0, "error": None}).plain
 
 
 @pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
@@ -308,8 +375,8 @@ def test_the_printed_renderer_maps_scope_and_pins_repos_too(dash, watched, monke
     seen: dict = {}
     monkeypatch.setattr(dash, "board_client", lambda: (None, object()))
     monkeypatch.setattr(dash, "fetch_state", lambda client: {"plan": [], "plan_err": None})
-    monkeypatch.setattr(dash, "fetch_gh", lambda: {"prs": [], "pr_err": None,
-                                                   "issues": [], "issue_err": None})
+    monkeypatch.setattr(dash, "fetch_gh", lambda client=None: {
+        "prs": [], "pr_err": None, "issues": [], "issue_err": None, "queue": {}})
     monkeypatch.setattr(dash, "refresh_limits", lambda caps: caps)
     monkeypatch.setattr(dash, "frame", lambda cfg, data, gh, width, caps=None, scope=None:
                         seen.setdefault("scope", scope) or "")

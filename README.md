@@ -205,6 +205,41 @@ GET   /review/findings   ?repo=&pr=&limit=                       (one PR's findi
                           summary of it, not a second copy
 GET   /panel             (browser view — the leaderboard)
 
+# the review queue: what review has not finished with (#273)
+POST  /review-queue      { repo, prs:[{number, headRefOid?, mergeable?,     -> {counts, oldest,
+                           createdAt?, title?, isDraft?, escalated?}],          oldest_held,
+                           max_rounds? }                                        idle_reason,
+                                                                                entries, vocabulary}
+                          every OPEN pull request, joined to every panel run, plan item, work
+                          claim and landing-queue entry the board holds — so each one comes back
+                          with the `state` it is in, the `next_action` that state implies, an
+                          `age` and the `since_basis` it was measured from, and every `hold`
+                          between it and that action. `counts.drainable` is the depth,
+                          `oldest` is the wait
+                          `escalated` is DERIVED from #279's `needs_human`, not taken on
+                          trust: a defect a person is owed an answer about holds its PR out
+                          of the queue until somebody answers or an outcome is recorded. The
+                          entry carries the count and the age of the QUESTION and points at
+                          `GET /review/needs-human?repo=&pr=` for which judgement each one
+                          wants; `escalated` in the request is additive only, for a
+                          judgement formed somewhere the board has not been told about
+                          DERIVED, never accumulated: nothing is enqueued and no event is
+                          observed, so a backlog opened long before this endpoint existed comes
+                          back in full on the first call. That is the distinction from #54
+                          A POST because the board holds no GitHub credential and cannot
+                          enumerate open PRs. It takes testimony and owns the join, exactly as
+                          `merge_queue_entries` does — and `review_runs.pr_state` is as of the
+                          last panel, so a `GET` over what the board already knows would answer
+                          with PRs that merged days ago
+                          Writes NOTHING, and decides no order: entries come back in PR order.
+                          The plan owns the order (#232) and the landing queue the landing
+                          order (#227); `app/ordering.py` is what ranks this queue when
+                          something wants it ranked
+                          A PR leaves the queue when it MERGES, CLOSES, or an open plan item
+                          whose note carries `review: exempt` says so. "Panelled once" is not
+                          terminal, and silence is not exemption — a PR with no plan item is
+                          drainable, and an exemption comes back named, attributed and ageing
+
 # claims: what you are working on, said before you start (v2.31, derived in #172)
 POST  /claim             { ref:{kind, repo?, value}, ttl=3600, session?, note? }
                           ref.kind = issue|pr|branch|plan|item, and the BOARD derives
@@ -1300,6 +1335,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.72** — "a human has to look at this" stops being a sentence nobody can count.
 - **v2.73** — an agent can say where a new plan item goes, and `next` admits when nobody decided.
 - **v2.74** — the board can reach a person, and a person can answer it.
+- **v2.75** — the review queue only drained when a human typed, and nobody could see it.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

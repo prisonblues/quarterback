@@ -14,9 +14,15 @@ waiting to land. State, not events.
 By default it shows ONE project's rows — the repos of the checkout it was started
 in — and drops the repo column, because a screen built for one project spends
 eleven columns of a narrow pane restating its name (#261). `--scope all` widens the
-three panels that come off the BOARD (FLEET, CLAIMED, PLANS); OPEN PRs and ISSUES
-cannot widen, because `gh` is only ever asked about the repos this dashboard
-watches. The clickable renderer toggles with `s`, which this one has no keyboard for.
+three panels that come off the BOARD (FLEET, CLAIMED, PLANS); OPEN PRs, REVIEW
+QUEUE and ISSUES cannot widen, because `gh` is only ever asked about the repos
+this dashboard watches. The clickable renderer toggles with `s`, which this one
+has no keyboard for.
+
+REVIEW QUEUE is the one panel that is neither board state nor `gh` state but a
+join of the two (#273): every open PR that review is not finished with, what it
+is waiting for, and how long it has waited. Its depth and oldest age also sit on
+the caps line, beside the budget they would be spent out of.
 
 Board data comes from the same client the MCP server uses; PRs and issues come
 from `gh`, on a slower clock because that is a network call per refresh and
@@ -42,16 +48,18 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    LIMITS_EVERY, Scope, agent_state, ago, board_client, ci_state, claim_label, claim_repo, clip,
-    elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue,
-    in_scope, issue_key, limit_cells, plan_counts, plan_ref, plan_state, plan_who, repo_arg,
-    repo_colour, resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until,
+    LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_state,
+    claim_label, claim_repo, clip, elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan,
+    fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells, plan_counts,
+    plan_ref, plan_state, plan_who, queue_cell, queue_oldest, repo_arg, repo_colour,
+    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until, waited,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
 GH_EVERY = 90.0         # gh is a network round trip, and PRs/issues are not live data
 ISSUE_ROWS = 12         # a printed panel cannot scroll; the rest is a count
 PLAN_ROWS = 10          # the same, for the plan: running items first, then a count
+QUEUE_ROWS = 8          # the same again, for the review queue: oldest first
 
 # Repo → colour, so the same project is the same colour everywhere on the panel.
 # ---- panels ------------------------------------------------------------------
@@ -223,10 +231,13 @@ def panel_prs(prs: list[dict], err: str | None, width: int,
     t.add_column(width=5, justify="right", no_wrap=True)   # age
 
     filler = [""] * (3 if show_repo else 2)
-    red = 0
-    for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
+    ordered = sorted(prs, key=lambda p: -p.get("number", 0))
+    # Over EVERY open PR, not only the drawn ones: the title's count is what a
+    # reader acts on, and one counted off the visible rows would say "2 red" for
+    # a repo with five, which is worse than not counting at all.
+    red = sum(1 for p in ordered if ci_state(p)[1] == "red")
+    for pr in ordered[:PR_ROWS]:
         glyph, colour = ci_state(pr)
-        red += colour == "red"
         title = pr.get("title") or ""
         repo = short_repo(pr.get("repo") or "")
         cells = [Text(glyph, style=colour)]
@@ -247,6 +258,82 @@ def panel_prs(prs: list[dict], err: str | None, width: int,
     head = f"[bold]OPEN PRs[/] [grey50]{len(prs)}"
     if red:
         head += f" · [red]{red} red[/]"
+    if len(ordered) > PR_ROWS:
+        head += f" · +{len(ordered) - PR_ROWS} more"
+    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
+                 padding=(0, 1))
+
+
+def panel_review_queue(queue: dict, width: int, scope: Scope | None = None) -> Panel:
+    """What review is waiting on, and how long it has waited — #273.
+
+    The panel this dashboard was missing. OPEN PRs above says a PR exists and CI
+    is green; nothing said whether anybody had ever reviewed it, and on
+    2026-08-20 six of eight open PRs had never been panelled while the newest
+    round on the board was two and a half days old. Neither number was readable
+    anywhere.
+
+    Rows are oldest-drainable first, which is a READING order for a panel that
+    cannot scroll and not a work order — the board refuses to rank the queue, and
+    so does this. An entry nothing may act on keeps its place in the list and
+    goes grey with the reason in its verb column, because a queue that hid its
+    blocked entries would report a depth of zero for a repo where everything is
+    stuck (#244).
+    """
+    show_repo = scope is None or scope.column
+    entries = queue.get("entries") or []
+    err = queue.get("error")
+    t = Table.grid(padding=(0, 1), expand=True)
+    t.add_column(width=1, no_wrap=True)                     # state
+    if show_repo:
+        t.add_column(width=11, no_wrap=True)                # repo
+    t.add_column(width=4, justify="right", no_wrap=True)    # number
+    t.add_column(width=11, no_wrap=True)                    # verb, or why not
+    t.add_column(width=6, justify="right", no_wrap=True)    # age
+    t.add_column(ratio=1, no_wrap=True)                     # title
+
+    filler = [""] * (4 if show_repo else 3)
+    for e in entries[:QUEUE_ROWS]:
+        state = e.get("state") or ""
+        colour = QUEUE_COLOUR.get(state, "grey50")
+        drains = bool(e.get("drainable"))
+        holds = e.get("holds") or []
+        hold = holds[0].get("code") if holds else state
+        verb = (QUEUE_VERB.get(e.get("next_action"), e.get("next_action") or "")
+                if drains else QUEUE_HOLD.get(hold, hold))
+        repo = short_repo(e.get("repo") or "")
+        cells = [Text("\u25cf", style=colour)]
+        if show_repo:
+            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        cells += [
+            Text(f"#{e.get('pr')}", style="bold grey70"),
+            Text(clip(verb, 11), style=colour if drains else "grey50"),
+            # An age that is the longest the wait COULD have been wears a `~`,
+            # because nothing records when a head moved or when a branch started
+            # conflicting, and a number nobody can rely on should say so.
+            Text(("~" if e.get("age_is_upper_bound") else "")
+                 + waited(e.get("age_seconds")), style="grey50"),
+            Text(clip(e.get("title") or "", max(12, width - (43 if show_repo else 31))),
+                 style="white" if drains else "grey50"),
+        ]
+        t.add_row(*cells)
+    if err:
+        t.add_row(Text("!", style="red"), *filler[1:],
+                  Text(clip(err, width - 12), style="red"), "")
+    if not entries and not err:
+        t.add_row(*filler, Text(queue.get("idle") or "nothing waiting on review",
+                                style="grey50"), "")
+
+    depth = queue.get("depth") or 0
+    held = max(0, (queue.get("open") or 0) - depth)
+    head = f"[bold]REVIEW QUEUE[/] [grey50]{depth} waiting"
+    if held:
+        head += f" \u00b7 {held} held"
+    age, oldest_held = queue_oldest(queue)
+    if age:
+        head += f" \u00b7 {'held' if oldest_held else 'oldest'} {age}"
+    if len(entries) > QUEUE_ROWS:
+        head += f" \u00b7 +{len(entries) - QUEUE_ROWS} more"
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
                  padding=(0, 1))
 
@@ -330,8 +417,28 @@ def limits_line(limits: list[dict], width: int, stale: bool = False) -> Text:
     return out
 
 
+def queue_line(queue: dict) -> Text:
+    """`REVIEW 3 waiting oldest 2d12h` — the queue's depth and age, in one cell.
+
+    Empty only when the queue was never fetched. A depth of zero still renders,
+    because "nothing is waiting" is the answer this whole issue is trying to make
+    reachable, and a line that vanished when it was true would leave a reader
+    unable to tell it from a dashboard that never asked.
+    """
+    out = Text()
+    if not queue:
+        return out
+    label, depth, age, colour = queue_cell(queue)
+    out.append(label, style="bold grey70")
+    out.append(f" {depth}", style=f"bold {colour}")
+    if age:
+        out.append(f" {age}", style="grey50")
+    return out
+
+
 def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
-           stale: bool = False, scope: Scope | None = None) -> Panel:
+           stale: bool = False, scope: Scope | None = None,
+           queue: dict | None = None) -> Panel:
     host = (cfg.agent or "?").split("/", 1)[0]
     now = datetime.now().strftime("%H:%M:%S")
     state = Text("● board up", style="green")
@@ -347,7 +454,15 @@ def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
     where = f"   {scope.label()}" if scope is not None else ""
     sub = Text(f"{cfg.base_url}   {now}{where}", style="grey50")
     parts = [line, Align.left(sub)]
-    caps = limits_line(limits or [], width - 4, stale)
+    # The queue cell shares the caps line because it is the same kind of number:
+    # the caps say what the seats may spend, this says what is waiting to be
+    # spent on. Measured first so the bars are sized for the room that is left.
+    review = queue_line(queue or {})
+    room = width - 4 - (len(review.plain) + 3 if review.plain else 0)
+    caps = limits_line(limits or [], room, stale)
+    if caps.plain and review.plain:
+        caps.append("   ")
+    caps.append_text(review)
     if caps.plain:
         parts.insert(0, Align.left(caps))
     return Panel(Group(*parts), border_style="grey35", padding=(0, 1))
@@ -382,11 +497,21 @@ def refresh_limits(caps: dict) -> dict:
     return caps
 
 
-def fetch_gh() -> dict:
-    """The two `gh` calls, together: they share a clock and a failure mode."""
+def fetch_gh(client=None) -> dict:
+    """The `gh` calls, together: they share a clock and a failure mode.
+
+    The review queue rides this clock rather than the board one even though it is
+    a board call, because it is a join over the PR list fetched right here — on
+    the fast clock it would answer about PRs ninety seconds newer than the ones
+    the panel above it is drawing, and the two would disagree about a PR that
+    moved in between.
+    """
     prs, pr_err = fetch_prs()
     issues, issue_err = fetch_issues()
-    return {"prs": prs, "pr_err": pr_err, "issues": issues, "issue_err": issue_err}
+    queue = (fetch_review_queue(client, prs, pr_err=pr_err)
+             if client is not None else {})
+    return {"prs": prs, "pr_err": pr_err, "issues": issues, "issue_err": issue_err,
+            "queue": queue}
 
 
 def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
@@ -396,11 +521,14 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
     # agent working out of another repo's checkout, is still held. Narrowing this
     # would show that issue as free and send the next seat straight into it.
     held = claims_by_issue(data.get("claims", []))
-    parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error")), scope),
+    queue = gh.get("queue") or {}
+    parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error")), scope,
+                    queue),
              panel_agents(data, width, scope),
              panel_claims(data, width, scope),
              panel_plan(data.get("plan") or [], data.get("plan_err"), width, scope),
              panel_prs(gh["prs"], gh["pr_err"], width, scope),
+             panel_review_queue(queue, width, scope),
              panel_issues(gh["issues"], held, gh["issue_err"], width, scope)]
     if data.get("error"):
         parts.append(Panel(Text(clip(data["error"], width * 2), style="red"),
@@ -454,7 +582,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     data = fetch_state(client)
-    gh = fetch_gh()
+    gh = fetch_gh(client)
     caps = refresh_limits({"limits": [], "error": None})
 
     if args.once:
@@ -468,7 +596,7 @@ def main(argv: list[str] | None = None) -> int:
             time.sleep(args.interval)
             data = fetch_state(client)
             if time.monotonic() - last_gh >= GH_EVERY:
-                gh = fetch_gh()
+                gh = fetch_gh(client)
                 last_gh = time.monotonic()
             if time.monotonic() - last_caps >= LIMITS_EVERY:
                 refresh_limits(caps)
