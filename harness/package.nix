@@ -31,17 +31,31 @@ stdenvNoCC.mkDerivation {
 
   src = lib.cleanSource ./.;
 
-  # `loops` and `commands` go to share/ rather than bin/ because neither is
-  # something you invoke by name: the loops are driven by the slash commands
-  # (which reference them by path), and the commands are read by Claude Code out
-  # of ~/.claude. Only `bin/` holds genuine CLI entry points — the worktree
+  # `loops`, `commands` and `claude` go to share/ rather than bin/ because none of them
+  # is something you invoke by name: the loops are driven by the slash commands
+  # (which reference them by path), the commands are read by Claude Code out
+  # of ~/.claude, and `claude/` is data — the settings fragment the wiring merges
+  # and the workflow doc the module links into ~/.claude. Only `bin/` holds genuine
+  # CLI entry points — the worktree
   # scripts, which must land in one directory together because each finds
   # `worktree-holder` as a sibling of $0 when it is not otherwise on PATH;
   # `qb-stage`, which the slash commands call by name and so needs PATH;
   # `qb-seat`, which a multiplexer layout names as the command for each pane —
   # a layout is data on another machine, so it can only refer to it by name;
-  # and `qb-board`, which is a thing a human types on a headless box, which is
-  # the whole point of it existing.
+  # `qb-board`, which is a thing a human types on a headless box, which is
+  # the whole point of it existing; `qb-reconcile`, which a systemd timer names
+  # as its ExecStart, for the same reason as the layout; and the board client's
+  # own four (#230) — `qb-hook`, which ~/.claude/settings.json names by absolute
+  # path, `qb-mcp`, which ~/.claude.json does, `qb-claude-setup`, which writes
+  # both of those from the home-manager activation, and `qb` for a human.
+  #
+  # Two files land in bin/ that are not entry points at all, for the same reason
+  # as each other. `qbdata.py` is the library the dashboards and `qb-reconcile`
+  # import as a SIBLING OF $0; `qb-env` is the library the board client's four
+  # SOURCE, each finding it as a sibling of $0 too. Neither relationship survives
+  # anywhere else — home-manager links each file in as its own flat store path,
+  # so "beside the script" is the only one there is. Same rule keeps
+  # `worktree-holder` here.
   installPhase = ''
     runHook preInstall
 
@@ -50,7 +64,10 @@ stdenvNoCC.mkDerivation {
     # templates/ ships alongside them: create-worktree does nothing for a repo
     # until that repo has a .worktree.json, so an installed harness that omits
     # the starting points makes the user go back to the source tree for them.
-    cp -r loops commands templates $out/share/quarterback-harness/
+    # githooks/ is data too: `qb-hooks` copies reference-transaction and
+    # qb-hook-forward out of it into a repo's common git dir. Omit it and an
+    # installed harness creates worktrees with no stash guard at all.
+    cp -r loops commands templates claude githooks $out/share/quarterback-harness/
     install -m 0644 worktree.example.json README.md $out/share/quarterback-harness/
 
     runHook postInstall
@@ -65,7 +82,8 @@ stdenvNoCC.mkDerivation {
   # Rewrites `#!/usr/bin/env bash|python3` to store paths, so an installed
   # harness does not depend on what happens to be on the user's PATH.
   postFixup = ''
-    patchShebangs $out/bin $out/share/quarterback-harness/loops
+    patchShebangs $out/bin $out/share/quarterback-harness/loops \
+                  $out/share/quarterback-harness/githooks
   '';
 
   nativeBuildInputs = [ makeWrapper ];

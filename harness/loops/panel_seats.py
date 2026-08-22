@@ -1069,7 +1069,35 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     return None, last
 
 
-def record_run(payload: dict) -> None:
+#: How much of `qb`'s own output is quoted back into the one-line note. Long
+#: enough for a curl error or an HTTP status, short enough that a board returning
+#: an HTML error page cannot push a page of markup into a PR comment.
+QB_SAID_MAX = 200
+
+
+def _unrecorded(why: str) -> str:
+    """The one line a round that did not reach the board says about itself.
+
+    Printed on stderr AND returned, because those are two different readers and
+    #284 is what happens when only the first exists: the stderr line lives in a
+    subprocess nobody reads afterwards, while the returned line goes into
+    `config_notes` — the payload, the report, and the PR comment.
+
+    It names the recovery because the payload survives the failure: `--json-file`
+    writes exactly the bytes this function pipes to `qb`, so the run can be put on
+    the board later from any host that has one. That is the whole of #284's
+    backfill answer for runs from here on — no queue, no retry daemon, no state
+    to go stale; the artefact already exists and the note says what to do with it.
+    """
+    line = (f"this round was NOT recorded on the board — {why}. The review itself "
+            "is complete and unaffected; re-record it later from any host with a "
+            "`qb`: `qb record-review < PAYLOAD.json`, where PAYLOAD.json is the "
+            "file `--json-file` wrote")
+    print(f"panel: {line}", file=sys.stderr)
+    return line
+
+
+def record_run(payload: dict) -> str:
     """Record this run on the quarterback board, best-effort.
 
     A panel run is a controlled comparison — one diff, several models, one judge
@@ -1095,21 +1123,50 @@ def record_run(payload: dict) -> None:
 
     Never raises and never blocks the review: telemetry that can fail a run that
     already succeeded is worse than no telemetry.
+
+    **Returns "" when the board has it, and one line saying so when it does not**
+    — for the caller to put in `config_notes`, which is the whole of #284. Not
+    failing the run was always right; being SILENT about it was not, and the two
+    had been fused into a bare `return`. `qb` lives in the fleet's own repo (#28),
+    so its absence is an ordinary property of a host rather than an anomaly, and
+    a round recorded nowhere was indistinguishable from one recorded everywhere:
+    67 rounds across 30 PRs went missing that way, leaving the board holding 39%
+    of this repo's review history and every measurement taken from it — the
+    /panel leaderboard, #165's dial calibration, #232's orderer — computed off a
+    three-day tail nobody knew was a tail.
+
+    Three ways to miss, one sentence each:
+
+    * no `qb` on this host — the early return that caused #284;
+    * `qb` refused (exit non-zero): no board URL, no token, no such subcommand;
+    * `qb` ran and the board did not answer. This is the quiet one. `qb
+      record-review` exits **0** whether or not the POST landed, deliberately —
+      a down board must never fail a review — and distinguishes the two on its
+      streams: the success branch prints the recorded id on STDOUT, the failure
+      branch prints "review not recorded (…)" on stderr and leaves stdout empty.
+      So an empty stdout under exit 0 is the tell, and what `qb` said is quoted
+      either way so a misread corrects itself in front of the reader rather than
+      becoming a confident wrong sentence about a program in another repo.
     """
     if not shutil.which("qb"):
-        return
+        return _unrecorded("there is no `qb` on this host (it lives in the fleet's "
+                          "own repo, not this one — #28)")
     try:
         proc = subprocess.run(["qb", "record-review"], input=json.dumps(payload),
                               capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:
-        print(f"panel: run not recorded ({e.__class__.__name__})", file=sys.stderr)
-        return
-    # qb exits 0 whether or not the board answered, and says which on stderr; the
-    # note is worth surfacing (a board that has been down for a week is invisible
-    # otherwise) but is never an error here.
-    note = (proc.stdout or proc.stderr or "").strip().splitlines()
-    if note:
-        print(f"panel: {note[-1]}", file=sys.stderr)
+        return _unrecorded(f"`qb record-review` failed ({e.__class__.__name__})")
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
+    quoted = f" — `qb` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    if proc.returncode:
+        return _unrecorded(f"`qb record-review` exited {proc.returncode}{quoted}")
+    if not (proc.stdout or "").strip():
+        return _unrecorded(f"`qb` ran but the board did not answer{quoted}")
+    # Recorded. The id (and the board's "already recorded" for a replayed
+    # payload) is still worth a stderr line — it is how a human watching a run
+    # sees the record land.
+    print(f"panel: {proc.stdout.strip().splitlines()[-1]}", file=sys.stderr)
+    return ""
 
 
 #: `qb`'s exit code for a subcommand it does not have — and for several other
@@ -1242,10 +1299,10 @@ def resolve_round_scope(asked: str, panel: dict, notes: list[str]) -> str:
     return DEFAULT_ROUND_SCOPE if want == "auto" else want
 
 
-# --------------------------------------------------------------- #165's dials
+# --------------------------------------------------- #165's dials, and #297's eighth
 #
-# Seven `review_panel.*` settings that trade thoroughness against convergence, read
-# in one place so a round's applied policy is one object rather than seven lookups
+# Eight `review_panel.*` settings that trade thoroughness against convergence, read
+# in one place so a round's applied policy is one object rather than eight lookups
 # scattered through `run()`. Each key's number and the measurement behind it are
 # documented beside it in `harness_rules.DEFAULTS`; what lives here is how a WRITTEN
 # value is turned into an applied one.
@@ -1366,6 +1423,133 @@ def reviewer_scope(panel: dict, notes: list[str]) -> str:
     return want.strip().lower()
 
 
+def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
+    """`low_severity_fix_lines` — whole lines >= 0, or ``None`` for "no budget".
+
+    The combined churn a round may spend on the findings `fix_severity_floor` admits
+    and `round_trigger_floor` does not (#297). Three readings, all of them meant:
+
+    * a **number** is the budget, spent cheapest-first until it is gone;
+    * **0** is a budget that buys nothing, so none of that band is fixed — which is
+      `fix_severity_floor` raised to the cut, without the repo having to say the same
+      thing in two keys and keep them in step;
+    * an explicit **null** is no budget at all: every finding at or above the fix
+      floor is unconditional work, which is the pre-#297 behaviour.
+
+    So an ABSENT key inherits the default and a written `null` does not, the
+    distinction :func:`fix_growth_limit` draws and for a sharper version of its
+    reason. There, `0` is not a threshold anything can be under, so `null` was the
+    only spelling left for "off". Here `0` is a perfectly good budget and means
+    something *different* from off — nothing gets fixed, versus everything does — so
+    collapsing the two would leave one of the two readings unwritable. Which one it
+    ate would depend on which way the code happened to be written, and a repo
+    spelling "fix none of them" and getting "fix all of them" is the widest possible
+    miss.
+
+    A bool is rejected before the integer read for `resolve_max_rounds`'s reason:
+    ``isinstance(True, int)`` is True, so `low_severity_fix_lines: false` — the other
+    way a hand writes "off" — would otherwise become a 1-line budget, which is not
+    off and is not anything else either. An integral float (``40.0`` out of a
+    generator) counts; ``40.5`` does not, because half a line is not a quantity `git
+    diff --numstat` can report and rounding it silently would spend a budget the file
+    did not write. Negative is refused rather than clamped: a repo that wrote one
+    meant something, and nothing here can tell which."""
+    raw = panel.get("low_severity_fix_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_LOW_SEVERITY_FIX_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("low_severity_fix_lines", raw,
+                      f"{what} — a whole number of churned lines the round may spend "
+                      "on findings below the trigger floor, 0 to spend none, or null "
+                      "for no budget at all")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n < 0:
+        return refuse("zero or more")
+    return n
+
+
+def distant_merge_lines(panel: dict, notes: list[str]) -> int | None:
+    """`distant_merge_lines` — whole lines >= 0, or ``None`` for "never distant".
+
+    How much an integration merge may put into a PR's OWN files before the round that
+    ran before it stops being a review of this PR's change (#278). Three readings,
+    all of them meant:
+
+    * a **number** is the allowance: at or under it the merge is DISTANT and the
+      earlier round stands, past it the merge is INVOLVED and its resolution is
+      unreviewed work;
+    * **0** keeps the reading and admits only a resolution that is empty over this
+      PR's own files — the mechanically distant case, and the strictest setting that
+      still saves a round;
+    * an explicit **null** switches the reading off: every head move is a review of
+      earlier code, which is the behaviour before this key existed.
+
+    So an ABSENT key inherits the default and a written `null` does not, exactly as
+    :func:`low_severity_budget` and :func:`fix_growth_limit` have it, and for
+    :func:`low_severity_budget`'s sharper reason: `0` here is a perfectly good
+    allowance and means something DIFFERENT from off — only an empty resolution is
+    distant, versus none ever is — so collapsing the two would leave one of the two
+    readings unwritable.
+
+    A bool is rejected before the integer read for :func:`resolve_max_rounds`'s
+    reason: ``isinstance(True, int)`` is True, so `distant_merge_lines: false` — the
+    obvious way a hand writes "off" — would otherwise become a one-line allowance,
+    which is not off and is not anything else either. An integral float counts and a
+    fractional one does not: half a changed line is not a quantity any diff reports.
+    Negative is refused rather than clamped — a repo that wrote one meant something,
+    and nothing here can tell which — and clamping it to 0 would silently pick the
+    STRICTEST reading for a file that may have meant the loosest."""
+    raw = panel.get("distant_merge_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_DISTANT_MERGE_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("distant_merge_lines", raw,
+                      f"{what} — a whole number of changed lines an integration may "
+                      "put into this PR's own files and still leave the earlier round "
+                      "standing, 0 to require an empty resolution, or null to read "
+                      "every head move as a review of earlier code")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n < 0:
+        return refuse("zero or more")
+    return n
+
+
 def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
     """`max_fix_growth` — a positive multiple, or ``None`` for "do not check".
 
@@ -1482,7 +1666,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str]) -> int:
 
 @dataclass(frozen=True)
 class Dials:
-    """The seven #165 settings as this round applied them.
+    """The eight #165/#297 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1493,6 +1677,7 @@ class Dials:
     fixer_may_defer: bool = DEFAULT_FIXER_MAY_DEFER
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
+    low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
@@ -1504,10 +1689,72 @@ class Dials:
         return {"fixer_may_defer": self.fixer_may_defer,
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
+                "low_severity_fix_lines": self.low_severity_fix_lines,
                 "max_fix_growth": self.max_fix_growth,
                 "reviewer_scope": self.reviewer_scope,
                 "require_failing_test": self.require_failing_test,
                 "max_rounds": self.max_rounds}
+
+    @property
+    def budgeted_band(self) -> bool:
+        """Is there a band of findings this round pays for out of a budget?
+
+        True when a budget is written AND the fix floor reaches below the trigger
+        floor, which is the only shape that HAS a band. At `fix_severity_floor: P2`
+        with the default trigger floor the two meet, nothing sits between them, and
+        the budget is inert rather than mis-applied — so every reader below asks this
+        first rather than each deriving it, and a repo that closed the gap sees a
+        round that behaves exactly as it did before the key existed."""
+        return (self.low_severity_fix_lines is not None
+                and not severity_at_least(self.fix_severity_floor,
+                                          self.round_trigger_floor))
+
+    @property
+    def fix_floor(self) -> str:
+        """The floor a finding must reach to be **fixable at all** this round.
+
+        `fix_severity_floor` itself, except at a budget of `0`, where the band it
+        admits below the trigger floor can buy nothing: a finding in it is then not
+        this round's work in any sense, and reporting it as one — in the fixer's list,
+        under a header naming a floor it is above — would be the report contradicting
+        the policy the round ran under. So the applied floor rises to the cut, which
+        is what a budget of zero MEANS, and the report says so where it names it.
+
+        A positive budget does not move it: the band is in the fixer's list, marked,
+        with the budget beside it."""
+        return (self.round_trigger_floor
+                if self.budgeted_band and self.low_severity_fix_lines == 0
+                else self.fix_severity_floor)
+
+    @property
+    def cleared_floor(self) -> str:
+        """The floor the round was **required to clear**, which `round_stop` bounds
+        its repeat rules by.
+
+        Not the same question as :attr:`fix_floor`, and the difference is the whole
+        of a positive budget. A budgeted finding may be left unfixed because the
+        budget ran out before it, and the panel cannot tell which ones those were —
+        it sees a fix commit, not a ledger. `round_stop`'s rule 3 justifies itself on
+        "the fixer was told about them and they are still there", which is exactly as
+        false of an unpaid budgeted finding as it is of a below-floor one, and left
+        unbounded it would run every budgeted cycle to the cap on findings the round
+        was never obliged to clear — the jam the fix floor was bounded to avoid.
+
+        So while a budget is in force the required floor is the cut. What that costs
+        is honest and small: a budgeted finding the fixer DID pay for and got wrong
+        no longer buys another round by repeating. That is the same trade
+        `round_trigger_floor` already makes on the same tier, one round earlier."""
+        return (self.round_trigger_floor if self.budgeted_band
+                else self.fix_severity_floor)
+
+    def budgeted(self, severity: str) -> bool:
+        """Is a finding at this severity one the budget pays for — in the band, and
+        with something to spend? False at a budget of `0`: there the band is below
+        :attr:`fix_floor` and renders as the below-floor findings do, so a caller
+        asking this to decide whether to MARK a finding must not also get True."""
+        return bool(self.budgeted_band and self.low_severity_fix_lines
+                    and severity_at_least(severity, self.fix_severity_floor)
+                    and not severity_at_least(severity, self.round_trigger_floor))
 
     def gist(self) -> str:
         """The one report line. Printed on EVERY round, at the default or not: the
@@ -1517,8 +1764,17 @@ class Dials:
         Rounds block already prints the cap it actually used."""
         growth = ("off" if self.max_fix_growth is None
                   else f"{self.max_fix_growth:g}x")
-        return (f"fix at/above {self.fix_severity_floor} · another round at/above "
-                f"{self.round_trigger_floor} · reviewer scope {self.reviewer_scope} · "
+        # Spelled as what it BOUNDS, not as its key: "below-P2 fix budget" says which
+        # findings are on it without the reader holding `round_trigger_floor` in their
+        # head, and it is printed even where the band is empty (`fix_severity_floor`
+        # at the cut) because a dial that vanishes from the line at some settings is
+        # one a reader cannot tell from a dial that was never applied.
+        budget = ("off" if self.low_severity_fix_lines is None
+                  else f"{self.low_severity_fix_lines} lines")
+        return (f"fix at/above {self.fix_severity_floor} · below-"
+                f"{self.round_trigger_floor} fix budget {budget} · another round "
+                f"at/above {self.round_trigger_floor} · "
+                f"reviewer scope {self.reviewer_scope} · "
                 f"fix growth cap {growth} · fixer may defer "
                 f"{'yes' if self.fixer_may_defer else 'no'} · failing test required "
                 f"{'yes' if self.require_failing_test else 'no'}")
@@ -1526,7 +1782,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str]) -> Dials:
-    """Read, validate and report all seven at once.
+    """Read, validate and report all eight at once.
 
     `require_failing_test` gets a note of its own when it is ON, and that note is the
     whole of its behaviour: the contract it describes needs a reviewer-emitted test
@@ -1542,6 +1798,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
+        low_severity_fix_lines=low_severity_budget(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
@@ -2886,7 +3143,9 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "reviewer_scope", "fix_growth_limit", "panel_flag",
+    "severity_floor", "reviewer_scope", "low_severity_budget",
+    "distant_merge_lines", "fix_growth_limit",
+    "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
     "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",

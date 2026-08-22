@@ -1,7 +1,9 @@
 from app.models.agent_name import AgentName
 from app.models.base import Base
 from app.models.blob import Blob
+from app.models.dial import DialSetting
 from app.models.lease import Lease
+from app.models.merge_queue import MergeQueueEntry
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
@@ -23,7 +25,9 @@ __all__ = [
     "AgentName",
     "Base",
     "Blob",
+    "DialSetting",
     "Lease",
+    "MergeQueueEntry",
     "OrderProposal",
     "Plan",
     "PlanItem",

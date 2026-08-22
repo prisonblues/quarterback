@@ -128,6 +128,19 @@ import panel_rounds              # noqa: F401
 from panel_preflight import *     # noqa: F401,F403
 import panel_preflight            # noqa: F401
 
+# Where the round's wall clock went (#192). Its own module, and deliberately NOT
+# star-imported: nothing here calls it as a bare global, so an explicit import
+# keeps `panel_timing.` on every call site and makes the instrumentation greppable
+# as one thing — this file is edited by several changes at once and a timing call
+# that reads like a panel helper is the kind of line a merge loses.
+import panel_timing               # noqa: F401
+
+# The mergeability sentence, from the merge gate that already owns it (#271). One
+# import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
+# branch at merge time, this refuses a round on the same branch hours earlier, and
+# the two saying it differently is how the three checks in #96 came to disagree.
+from preland import mergeability   # noqa: E402
+
 # ----------------------------------------------------------------------------- run
 
 def _changed_files(meta: dict) -> tuple[list[dict], int | None, int]:
@@ -212,6 +225,12 @@ def _payload_defaults() -> dict:
     literal of nine keys against this one's two dozen, so the skipped PR — the
     case that payload exists FOR — was the one that raised KeyError."""
     return {
+        # Where this round's wall clock went (#192). None means the run never got
+        # far enough to say — the same distinction every other key here draws, and
+        # it matters more than most: a fix phase is measured from the PREVIOUS
+        # round's `timing.finished_at`, so a payload that carries a zero rather
+        # than a null hands the next round a left-hand end that never happened.
+        "timing": None,
         "changed_lines": 0,
         # The PR's file list, not this round's. Under #41 a later round reviews
         # only the increment, so the round's files narrow while the PR's
@@ -305,6 +324,11 @@ def _payload_defaults() -> dict:
         "coverage_note": None,
         "diff_truncated": False,
         "diff_chars": 0,
+        # The PR's own size, which a skipped round never measured (#298). 0 rather
+        # than null for the same reason `diff_chars` beside it is 0: `reviewed` is
+        # what tells a reader this round measured nothing, and the growth ceiling
+        # already refuses a baseline whose `reviewed` is false.
+        "pr_chars": 0,
         "diff_budgets": {},
         "config_notes": [],
         # Present on every payload, empty by default: a consumer that reads it —
@@ -335,6 +359,12 @@ def _payload_defaults() -> dict:
         # in the rules file is still reported on those paths — it lands in
         # `config_notes`, which the skip payloads carry.
         "review_panel": None,
+        # WHICH LAYER supplied each of them (#305) — and unlike `review_panel`
+        # above, present on every payload including the ones that reviewed nothing.
+        # A round that refused still resolved a policy, and "what rules did this
+        # repo have when it refused" is exactly the question a refusal raises. Null
+        # only as the shape a caller building a payload by hand would leave.
+        "rules": None,
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -447,7 +477,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         max_rounds: int | None = None, scope: str = "auto",
         since: str = "", force: bool = False,
         no_code_access: bool = False,
-        escalated: list[str] | None = None) -> int:
+        escalated: list[str] | None = None,
+        premise_file: str = "") -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -467,6 +498,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
     # loop is data, not a duplicate.
     run_key = uuid.uuid4().hex
+    # The round's stopwatch, started HERE rather than beside the seats (#192).
+    # Half of a cycle's wall clock was unattributable, and the reason a
+    # measurement that starts where the interesting code starts cannot close that
+    # gap is that it can only ever report the part somebody already suspected.
+    # Everything from the config read down is inside a phase.
+    clock = panel_timing.RoundClock()
     cfg = load_repo_cfg(repo_name)
     # The name RESOLVED from the checkout, never the argument. `--repo` is
     # optional — `panel.py --pr N` in a repo is the documented single-PR form —
@@ -484,12 +521,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # fetched: a rules file with a bad `fix_severity_floor` has to say so whether or
     # not the PR read succeeds, and the round cap the verdict is computed against
     # comes out of the same resolution. Everything downstream still just appends.
-    notes: list[str] = []
-    # The seven `review_panel` settings that trade thoroughness against convergence,
+    # A round that ran under a board-set dial SAYS SO, in the list `--post` puts in
+    # a public PR comment — #52's "never silent" applied to the layer that can move
+    # a floor without a pull request. First, before the dial resolution below it,
+    # because it is about where the dials came FROM and reads oddly after a
+    # complaint about one of their values.
+    notes: list[str] = board_dial_notes(cfg)
+    # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
     dials = resolve_dials(panel, max_rounds, notes)
     cap = dials.max_rounds
+    # #84's futility brake, from the round's side. Resolved beside the dials and for
+    # the same reason: a rules file with a bad `escalate_on` has to say so whether or
+    # not the PR read succeeds, and the brake is part of the policy the round's stop
+    # is computed under.
+    #
+    # The register is READ here and never written — `panel.py --premise` is the only
+    # writer, because the count is of fix passes PROPOSED and a round proposes none.
+    # Two writers would be two answers to "how many times was this premise declared",
+    # which is the one question the brake exists to answer.
+    premise_limit = premise_repeat_limit(panel, notes)
+    premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
+    notes.extend(premise_problems)
 
     # A repo that configured no review does not get one. Before `gh pr view`, and
     # before the --reviewers check below it, because this refusal is about the repo
@@ -518,6 +572,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "round": round_no,
             "skip_reason": refusal,
             "config_notes": [refusal],
+            "rules": rules_record(cfg),
+            # No baseline was read on this path, so there is no earlier end and no
+            # fix phase — but the payload still says when it started and stopped,
+            # because `_payload_defaults`' rule is that a consumer reading a key
+            # should not have to know which exit produced the payload.
+            "timing": panel_timing.timing_block(clock,
+                                                panel_timing.fix_phase(clock.started_at),
+                                                measured_to="unconfigured"),
             "run_key": run_key,
         }
         # No `load_baseline` and no cycle bookkeeping, unlike the title skip. That
@@ -553,7 +615,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         meta = json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
                               "--json", "title,additions,deletions,baseRefName,"
                                         "baseRefOid,headRefName,headRefOid,files,"
-                                        "changedFiles,state,isDraft"]))
+                                        "changedFiles,state,isDraft,mergeable"]))
     except subprocess.CalledProcessError as e:
         tail = (e.stderr or "").strip().splitlines()
         # `gh pr view --json` rejects the WHOLE command on a field it does not
@@ -572,12 +634,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # is carried into the payload now because the next round needs it to tell a
     # defect its own fix pass created from one this round simply missed.
     head_sha = meta["headRefOid"]
-    # The base end of the same range (#98). `baseRefOid` is the MERGE BASE — the
-    # commit `gh pr diff`'s three-dot diff is built from — and not the base
-    # branch's tip, which is why the tip is fetched separately below rather than
-    # read off this call. `.get`, not `[...]`: every other key here is required
-    # because the run cannot proceed without it, and a base commit is not that.
-    merge_base = meta.get("baseRefOid") or None
+    # The base end of the same range (#98), as GITHUB STORES IT — which is not the
+    # merge base and must not be recorded as one (#241). It is what `gh pr diff`
+    # builds its three-dot diff from, so it is the honest answer to "what was this
+    # round's target measured against"; the true fork point is computed below, past
+    # the skip branch, and the two are reconciled there. `.get`, not `[...]`: every
+    # other key here is required because the run cannot proceed without it, and a
+    # base commit is not that.
+    stored_base = meta.get("baseRefOid") or None
+    # What the SKIP path records. The skip branch returns before the merge-base
+    # computation below, on purpose: that path exists to cost nothing, never
+    # fetches a diff and never reaches the board, so it keeps the value that is
+    # free off the metadata already in hand rather than buying an API call for a
+    # round that reviewed nothing.
+    merge_base = stored_base
+    # Must the branch be able to MERGE for a round to be worth running (#271)? The
+    # DIAL is read here, before anything is fetched, because `panel_flag` exits on
+    # a value that is neither true nor false and a rules file this harness cannot
+    # obey has to fail at the door. The question itself is asked past the skip
+    # branch below, where it may cost an API call.
+    require_mergeable = panel_flag(panel, "require_mergeable", True, notes)
     changed = meta["additions"] + meta["deletions"]
     # Same call that already produced `changed`, three fields wider — so the board
     # gets the paths behind the number, and the PR's state, without a second
@@ -716,6 +792,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # read is a fact about the cycle, not about the review it skipped,
                 # so it travels rather than being dropped on the floor.
                 "config_notes": notes + skip_prior.problems,
+                "rules": rules_record(cfg),
                 # A skipped round carries the cycle's open escalations forward
                 # and adds nothing to them. It is the baseline the NEXT round
                 # inherits, and a register that emptied whenever a title matched
@@ -730,6 +807,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "prior_rounds": len(skip_prior.rounds),
                 "prior_findings": len(skip_prior.keys),
                 "skip_reason": f"title matches skip pattern /{pat}/",
+                # A finish, for the same reason `head_sha` is here (#192): this
+                # payload is the next round's `--baseline`, and its fix phase runs
+                # from where THIS round stopped. Left null, that round measures
+                # from whichever earlier round last recorded a finish and reports a
+                # span containing a whole skipped round as a fix phase.
+                "timing": panel_timing.timing_block(
+                    clock,
+                    panel_timing.fix_phase(clock.started_at,
+                                           prior_finished_at=skip_prior.finished_at,
+                                           prior_round=(skip_prior.finished_round
+                                                        or skip_prior.head_round),
+                                           prior_head_sha=skip_prior.head_sha,
+                                           head_sha=head_sha,
+                                           repo_path=cfg.get("path") or ""),
+                    measured_to="skip"),
                 "run_key": run_key,
             }
             # --json-file is honoured here too, and its failure fails the run the
@@ -743,6 +835,111 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             return finish(failed)
     print(f"\n[{repo_name}#{pr_number}] {title[:60]}", file=chatter)
     print(f"  base={base}  changed={changed} lines\n", file=chatter)
+
+    # ---- CAN THIS BRANCH MERGE AT ALL (#271)? The cheapest refusal in the system,
+    # and until now the LAST one made: `preland.check_pr_state` refuses a
+    # CONFLICTING branch at the merge gate, which is after a full multi-vendor
+    # round and a judge have been spent on a diff that must be rebased before it
+    # can land. Measured on PR #270 — 28 files, 5,572 lines, a branch four commits
+    # behind its base — while the issue was being written.
+    #
+    # Past the title-skip branch, which returns above: a round skipped for its
+    # title reviewed nothing for a reason that has nothing to do with merging, and
+    # a note claiming a precondition refusal would be a second answer to "why is
+    # this payload empty" — on the one path that must also stay free of API calls.
+    #
+    # **Asked TWICE when the first answer is UNKNOWN, and that is what makes this
+    # gate work at all.** GitHub computes mergeability lazily: the first query
+    # schedules the merge test and answers UNKNOWN while it runs. Measured on this
+    # repo, three consecutive reads of an open PR gave UNKNOWN, CONFLICTING,
+    # CONFLICTING — so a gate that asks once refuses only the PRs somebody happened
+    # to have looked at recently, which is a gate that appears to work and mostly
+    # does not. The re-read is one cheap call, and only on the cold answer.
+    #
+    # The answer then travels two ways. `gate` reaches the pre-flight verdict and
+    # refuses the round through the machinery that already exists for that
+    # (`skip_reason`, `preflight.verdict`, the per-seat `ran: false` rows,
+    # `--force`); the NOTE is what a round that ran against a non-mergeable head
+    # anyway says in its payload, rather than leaving a reader to infer it.
+    # `config_notes: []` under a wrong target is the whole of #241's complaint, and
+    # this is its sibling defect.
+    mergeable, mergeable_said = mergeability(meta)
+    if mergeable == "UNKNOWN":
+        again = _mergeable_now(gh_repo, pr_number)
+        if again:
+            mergeable, mergeable_said = mergeability({"mergeable": again})
+    gate = mergeable_said if mergeable == "CONFLICTING" and require_mergeable else ""
+    if mergeable == "CONFLICTING" and not gate:
+        notes.append(f"{mergeable_said}. Reviewed anyway because "
+                     "`review_panel.require_mergeable` is off for this repo: the "
+                     "merged state these findings reason about does not exist yet, "
+                     "and the rebase will change the diff they are about")
+    elif mergeable == "CONFLICTING" and force:
+        # `gate` is still set, and still recorded — `--force` turns the verdict
+        # into `run` and leaves `preflight.would_have: refuse` behind it, which is
+        # this repo's standing rule that "the tool chose to run" and "a caller
+        # overrode the tool" must never look alike. This is the half a human reads.
+        notes.append(f"{mergeable_said}. Reviewed anyway on --force: the merged "
+                     "state these findings reason about does not exist yet, and "
+                     "the rebase will change the diff they are about")
+    elif mergeable == "CONFLICTING":
+        notes.append(f"{mergeable_said}. This round is REFUSED before any seat is "
+                     "dispatched — rebase and re-run, or set "
+                     "`review_panel.require_mergeable: false`")
+    elif mergeable_said:
+        # Still not computed after two reads, or a `gh` too old to know the field.
+        # The merge gate warns rather than refusing on it and so does this: a
+        # refusal on "we could not tell" would stop a round on GitHub's own
+        # scheduling. The fact is recorded either way — an unread precondition is
+        # not a satisfied one — and it says the question was put twice, so a reader
+        # does not take it for the cold first answer it usually is.
+        notes.append(f"{mergeable_said}. It was asked for twice")
+
+    # ---- WHERE THIS BRANCH ACTUALLY FORKED (#241). Past the skip branch, which
+    # returns above and must stay free of API calls, and before the diff so that
+    # everything downstream — the payload, the mid-round re-read, the next round's
+    # anchor — agrees about which commit it means.
+    #
+    # `baseRefOid` is not this. GitHub maintains it for its own purposes and it has
+    # been measured wrong in both directions on this repo: OLDER than the fork
+    # point on PR #187, where a commit shared with another PR landed on `main` and
+    # nothing recomputed the stored base, so `gh pr diff` returned already-landed
+    # code and a full round confirmed 15 findings about it; and NEWER on PR #270,
+    # where the stored base was the tip of `main` and named a commit the branch had
+    # never contained. Recording the stored value as `merge_base` is what let both
+    # rounds report a range nobody had reviewed.
+    #
+    # The diff is still `gh pr diff`, and that is deliberate rather than
+    # unfinished: silently re-deriving the target from a locally-computed range
+    # would swap one unannounced scope for another, and the load-bearing part of
+    # #241 is that a mis-scoped round must not be SILENT. So the fork point is
+    # recorded, the stored base is compared against it, and any disagreement is
+    # said out loud in `config_notes` — where a reader can discount findings that
+    # fall outside the true range.
+    forked_at = _merge_base_now(gh_repo, base, head_sha)
+    if forked_at is None and stored_base:
+        notes.append(
+            "the merge base could not be computed for this round, so `merge_base` "
+            f"records GitHub's stored base for the PR ({stored_base[:8]}) instead "
+            "— that field is not a merge base, so treat the recorded range as "
+            "approximate")
+    elif forked_at is None:
+        notes.append(
+            "the merge base could not be computed and GitHub stores no base commit "
+            "for this PR, so this round records neither end of its base — a later "
+            "staleness check has nothing to anchor against")
+    else:
+        merge_base = forked_at
+        if stored_base and stored_base != forked_at:
+            notes.append(
+                f"the target may be MIS-SCOPED: this round's diff came from `gh pr "
+                f"diff`, which GitHub builds against its stored base for the PR "
+                f"({stored_base[:8]}), and that is not where the branch forked from "
+                f"({forked_at[:8]} — `{base}...{head_sha[:8]}`). Findings may fall "
+                f"outside the range this PR actually contributes; check any finding "
+                f"against `git diff {forked_at[:8]}...{head_sha[:8]}` before acting "
+                "on it. `merge_base` below records the fork point, not the stored "
+                "base")
 
     # The head is read BEFORE the diff, and the order is load-bearing. The two are
     # separate requests, so a push that lands between them makes them disagree —
@@ -775,9 +972,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         notes.append(f"--since {since!r} is not a commit or a ref — it was ignored")
         since = ""
     anchor = since or prior.head_sha or ""
+    # #278's dial, resolved here beside the scope it qualifies rather than inside
+    # `decide`: a malformed value is a hard exit through `_refuse_value`, and the one
+    # place a rules file may take a run down is where the run reads the rules file.
     review, scope_notes = ReviewScope.decide(
         want_scope, round_no, diff, (anchor, head_sha), gh_repo, base,
-        None if since else prior.head_round)
+        None if since else prior.head_round, distant_merge_lines(panel, notes))
     notes.extend(scope_notes)
 
     # Diff budgets: panel-wide value, then each model's own override. Every
@@ -805,13 +1005,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "which of the two produced it cannot be told from here; the later commit "
                      "is recorded, and provenance against this round is that much less certain")
         head_sha = moved_to
-        # `merge_base` came off the metadata read before the round started, and
-        # GitHub recomputes `baseRefOid` on every push to the head branch. Leaving
-        # it would pair a re-stamped right end with a left end computed for the
-        # commit it replaced — and the pair being replayable is this release's
-        # whole claim. Worse, the common reason a head moves here is a merge of
-        # the base branch INTO the PR (~1.8 integration merges per PR landed on
-        # this repo, #80), which is exactly the case that moves the merge base:
+        # `merge_base` was computed against the head this round started with, and a
+        # fork point is a fact about a PAIR of commits — move one end and the answer
+        # can move with it. Leaving it would pair a re-stamped right end with a left
+        # end computed for the commit it replaced, and the pair being replayable is
+        # this release's whole claim. Worse, the common reason a head moves here is
+        # a merge of the base branch INTO the PR (~1.8 integration merges per PR
+        # landed on this repo, #80), which is exactly the case that moves it:
         # the stored range would then start before an integration merge its right
         # end contains, and it is a range no round ever reviewed.
         #
@@ -819,7 +1019,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # already gone irregular. If it fails, the pair is not silently mismatched
         # — the note says which end is stale, because "unknown" and "stale" want
         # different treatment from whatever reads this later.
-        moved_meta = _merge_base_now(gh_repo, pr_number)
+        moved_meta = _merge_base_now(gh_repo, base, head_sha)
         if moved_meta and moved_meta != merge_base:
             notes.append(f"the merge base moved with it, from {merge_base[:8] if merge_base else '?'} "
                          f"to {moved_meta[:8]} — both ends are re-read, so the recorded range is "
@@ -959,7 +1159,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # different facts, and only the second one changed. Captured here rather than
     # after the refusal branch so that branch can record it too.
     target_scope = review.scope
-    pre = preflight(review.target, budgets, panel, notes, forced=force)
+    # `gate` is the mergeability precondition decided at the top of this function
+    # (#271), and it is handed to the verdict rather than acted on where it was
+    # computed so that a precondition refusal and a size refusal are ONE path: the
+    # payload, `skip_reason`, the per-seat `ran: false` rows, the board record and
+    # `--force` all already exist below, and a second refusal branch beside them is
+    # how the checks in #96 came to disagree with each other.
+    # `installed` is HANDED to the verdict rather than left to be re-derived, and
+    # it is the round's own snapshot from a few dozen lines up. `seat_ceilings`
+    # resolves the predicate in its body when it is given none, so the verdict was
+    # taking a SECOND, independently-timed PATH reading — the exact thing the
+    # snapshot's own comment above says it exists to prevent ("two independently
+    # timed PATH reads can disagree; a snapshot is what makes the consumers below
+    # describe one host"). The verdict was the one consumer still outside it.
+    #
+    # `.__contains__` and not the set, because the parameter is a PREDICATE that
+    # `seat_ceilings` calls per seat. Being a bound method it is also always truthy,
+    # which matters for the `installed or seat_installed` fallback there: an empty
+    # set is falsy and would hand a host carrying no seat at all straight back to
+    # the PATH read. That case cannot arise today — the predicate is only ever asked
+    # about names in `budgets`, which is a subset of this set, so an empty snapshot
+    # means an empty `budgets` and nothing to ask about — which is why there is no
+    # test for it. It is spelled the safe way because the cost is a dunder.
+    pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
+                    installed=installed.__contains__)
     if pre.refused:
         # The CI gate, read on a round that dispatches nobody. It is one API call,
         # is not defeated by diff size, and costs no seat's budget — and a refusal
@@ -996,11 +1219,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # limit, which is in bytes, and a per-seat skip reason that states a
         # character count against a byte ceiling disagrees with `skip_reason` in the
         # same payload. See `panel_preflight.Ceiling`.
-        refused_by = (f"not dispatched — the panel refused this round "
+        #
+        # A GATE refusal names no ceiling: nothing was measured against one, and
+        # `pre.cap` can legitimately be None there, so the size formatting would
+        # raise from inside the payload build. The seat's row says which question
+        # refused it, which is what "why is this row empty" wants.
+        refused_by = ("not dispatched — the panel refused this round before any "
+                      "seat, on a precondition the diff's size has nothing to do "
+                      "with" if pre.gate else
+                      f"not dispatched — the panel refused this round "
                       f"({pre.measured:,} {pre.cap_unit} against {pre.cap:,})")
-        print(report, file=chatter)
+        # The refusal's one phase, closed HERE rather than above the CI read. A
+        # refusal is the cheap path by design, and this is what checks that claim —
+        # so it has to contain the gh call the refusal still makes and the report
+        # it still builds. Closed before either, `round_ms` would sum to a phase
+        # that excluded the only two things this path does. It closes before the
+        # payload is assembled, since the payload carries the timing; the print and
+        # the board record now happen after that (#284), and are the cheap end.
+        clock.mark("setup")
         refuse_payload = {
             **_payload_defaults(),
+            "rules": rules_record(cfg),
             "repo": repo_name, "github": gh_repo, "pr": pr_number,
             "title": title, "base": base,
             # Same three ends the skip path records, and for the same reasons: a
@@ -1061,17 +1300,42 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # claim about coverage.
             "skip_reason": pre.reason,
             "preflight": pre.as_dict(),
+            # Timed like any other exit (#192). A refusal is the cheap path by
+            # design, and "cheap" is a claim this is the only thing that checks —
+            # but the load-bearing half is `finished_at`: this payload is fed to
+            # round r+1 as a `--baseline`, and without a finish here that round
+            # measures its fix phase from whichever earlier round last recorded
+            # one, silently spanning this one as well.
+            "timing": panel_timing.timing_block(
+                clock,
+                panel_timing.fix_phase(clock.started_at,
+                                       prior_finished_at=prior.finished_at,
+                                       prior_round=prior.finished_round or prior.head_round,
+                                       prior_head_sha=prior.head_sha,
+                                       head_sha=head_sha,
+                                       repo_path=cfg.get("path") or ""),
+                measured_to="refusal"),
             "run_key": run_key,
         }
-        failed = write_payload(json_file, refuse_payload)
         # RECORDED, unlike the title-pattern skip, and that is the difference
         # between the two paths rather than an inconsistency. A title skip says
         # "this PR was never worth a panel"; a refusal says "a panel was wanted
         # and this diff defeated it", which is exactly the observation the board
         # exists to accumulate — and the issue's own requirement, so that "no
         # review" can never be read later as "clean".
+        #
+        # Ahead of the write and ahead of the print, because a refusal the board
+        # never saw has to say so in all three artefacts and not just in the one
+        # nobody keeps (#284). `refusal_report` takes no notes list — it is not
+        # the panel's report — so the line is appended to the notice in the same
+        # `⚠️ config:` shape the reviewed report renders `config_notes` in.
         if record:
-            record_run(refuse_payload)
+            missed = record_run(refuse_payload)
+            if missed:
+                refuse_payload["config_notes"].append(missed)
+                report += f"\n  - ⚠️ config: {missed}"
+        print(report, file=chatter)
+        failed = write_payload(json_file, refuse_payload)
         if json_out:
             print(json.dumps(refuse_payload, indent=2))
         elif post:
@@ -1309,6 +1573,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"reviewers' checkout: {', '.join(stripped[:8])}"
                      + (f" and {len(stripped) - 8} more" if len(stripped) > 8 else ""))
 
+    # Everything above — the PR read, the diff fetch, the scope decision, the
+    # pre-flight verdict, the CI read and the code-tree download — closes here as
+    # one phase. It is the part of a round that costs no vendor call and was
+    # therefore assumed to cost no time; `setup` is what says whether that is true
+    # on this repo.
+    clock.mark("setup")
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
         # Every selected LLM reviewer runs — no de-minimis gate. If we asked for
@@ -1342,6 +1612,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 {"number": pr_number, "base": base,
                  "head": meta["headRefName"], "head_sha": meta["headRefOid"]},
                 changed_lines, cfg["path"])
+
+        # Observe the seats landing before collecting them in submission order
+        # (#192). Sonar is watched with the rest: it is dispatched into the same
+        # executor and its finish is part of the same join, so leaving it out
+        # would attribute a round Sonar held to whichever LLM seat was slowest.
+        # `watch` never reads a result, so the loop below still raises, skips and
+        # records exactly as it did — see its docstring.
+        panel_timing.watch(clock,
+                           {**tasks, **({"sonarqube": sonar_future} if sonar_future
+                                        else {})},
+                           echo=chatter)
 
         llm_findings: list[Finding] = []
         ran_llm: list[str] = []
@@ -1471,6 +1752,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: pointing at nothing, so a later reader of it would be asking a question the
     #: variable can no longer answer honestly.
     code_tree_used = code_tree is not None
+    # The seat phase: dispatch to join. Every seat's own finish offset was recorded
+    # inside it, so `seats` minus the second-slowest of those is the span the round
+    # spent on one process with every other seat finished — `gated_ms`, the number
+    # #192's "parallel but gated on its slowest seat" claim was missing.
+    clock.mark("seats")
 
     # Pre-cluster as a hint, then let the master MERGE the duplicates and rule on
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
@@ -1526,6 +1812,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # holds and the report and board write-up still have to run.
     if code_dir is not None:
         shutil.rmtree(code_dir, ignore_errors=True)
+    # The judge's own phase, and it is charged with the clustering and the material
+    # composition ahead of it because those exist only to feed it. Its size against
+    # `seats` is the argument for or against every proposal to overlap the two:
+    # the judge cannot start until the slowest seat lands, so it pays `gated_ms`
+    # before it begins and that cost is invisible in this number.
+    clock.mark("judge")
     judged = judge_skip is None and bool(findings)
     to_fix = sorted((c for c in findings if c.verdict != "dismissed"),
                     key=lambda c: c.severity)
@@ -1540,8 +1832,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `Canonical` compares by value, so two genuinely distinct findings with the same
     # severity, file, line and synthesis are equal to each other, and one of them
     # would be marked on the strength of the other's membership.
+    # `dials.fix_floor`, not `dials.fix_severity_floor`: the two differ only at
+    # `low_severity_fix_lines: 0`, where the band the fix floor admits below the
+    # trigger floor can buy nothing and so is not this round's work at all (#297).
+    # The property carries the argument; what matters here is that ONE floor answers
+    # "may this be fixed" for the report, the payload and the mark.
     def below_floor(c: Canonical) -> bool:
-        return not severity_at_least(c.severity, dials.fix_severity_floor)
+        return not severity_at_least(c.severity, dials.fix_floor)
+
+    # The other half of #297: findings the fix floor admits but the trigger floor does
+    # not, which the round pays for out of a shared line budget rather than
+    # unconditionally. They stay in the fixer's LIST — a genuinely cheap fix is worth
+    # taking while the pass is open, which is the argument `fix_severity_floor` is set
+    # a tier low for — and are marked so the budget travels with them into any brief
+    # built by pasting that list.
+    def budgeted(c: Canonical) -> bool:
+        return dials.budgeted(c.severity)
 
     for_fix = [c for c in to_fix if not below_floor(c)]
     under_floor = [c for c in to_fix if below_floor(c)]
@@ -1737,7 +2043,47 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # construction and would otherwise run the cycle to the cap on
                       # its own. `round_stop`'s docstring has the whole argument.
                       trigger_floor=dials.round_trigger_floor,
-                      fix_floor=dials.fix_severity_floor)
+                      # The floor the round was REQUIRED to clear, which is the fix
+                      # floor until a budget is in force and the cut afterwards
+                      # (#297) — an unpaid budgeted finding is outstanding for the
+                      # same reason a below-floor one is, and rule 3 would otherwise
+                      # run every budgeted cycle to the cap on it.
+                      # `Dials.cleared_floor` has the argument.
+                      fix_floor=dials.cleared_floor,
+                      # #84's register, read-only here. The BRAKE runs before a fix
+                      # pass (`panel.py --premise`); this is the round's half — it
+                      # ends a cycle whose premise was declared twice and reached a
+                      # round anyway, and it reports the fix passes that declared
+                      # nothing and so could not have been braked at all.
+                      premises=premise_state(premises, round_no, premise_limit))
+    # Said in `config_notes` as well as in `round_stop`, because these two are read
+    # by different people at different moments: the payload's `round_stop` is what
+    # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
+    # is what a human reads off the PR comment afterwards. An unescalatable cycle has
+    # to be legible in the second place too, or the gap is only ever found by
+    # somebody already looking for it.
+    #
+    # Gated on `--premise-file`, so it fires for a cycle that WIRED the brake and
+    # skipped a declaration and stays quiet for one that never wired it at all. Those
+    # are different facts and only the first is actionable by the caller reading this
+    # report; a note on every round of every unwired cycle is the "loud and wrong" a
+    # reader learns to skip, and it would arrive on the same line as the ones that
+    # mean something. The unwired case is still IN the payload
+    # (`round_stop.premises.undeclared_rounds`), where an auditor asking "could this
+    # cycle have been braked at all?" is looking.
+    undeclared = stop["premises"]["undeclared_rounds"]
+    if undeclared and premise_file and premise_limit is not None:
+        notes.append(
+            f"the fix pass after round(s) {', '.join(str(r) for r in undeclared)} "
+            "declared no premise (`panel.py --premise`), so #84's futility brake could "
+            "not be evaluated on it — those passes are UNESCALATABLE, which is a gap "
+            "in this cycle's record rather than a clean one")
+    for repeated in stop["premises"]["repeated"]:
+        notes.append(
+            f"premise {repeated['key']} was declared in rounds "
+            f"{', '.join(str(r) for r in repeated['rounds'])} — "
+            f"{repeated['text']!r}. A fix pass was written against it more than once, "
+            "so the cycle ends here and a human answers the premise (#67, #84)")
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
@@ -1765,17 +2111,37 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
     # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
     # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
-    # introduced an unbounded FIFO read. So a round whose material is more than
-    # `max_fix_growth` times what the cycle's FIRST round reviewed stops and says the
-    # change wants splitting, rather than buying another panel over a bigger change.
+    # introduced an unbounded FIFO read. So a round whose PR is more than
+    # `max_fix_growth` times the size the cycle's FIRST round found it at stops and
+    # says the change wants splitting, rather than buying another panel over a bigger
+    # change.
     #
-    # Computable with no new plumbing: the size is `len(review.target)`, the same
-    # number `diff_chars` records, and `Baseline.first_reviewed` reads the earliest
-    # baseline's own `diff_chars` off the payloads round 2+ already receives via
-    # `--baseline`. Both are scope-dependent, which is why the scope of each end
-    # travels with it and is printed — under the default `increment` scope this is
-    # "the fix commit is Nx the change round 1 read", under `pr` scope it is "the PR
-    # has grown Nx", and they are different sentences about the same ceiling.
+    # **BOTH ENDS ARE THE WHOLE PR, WHATEVER THIS ROUND REVIEWED (#298).**
+    # `round_scope` decides what the reviewers are asked to LOOK AT; this ceiling
+    # asks how big the change has BECOME. They are different questions, and the
+    # second must not silently change its meaning because the first was configured.
+    # Measured on `review.target` — as it was until #298 — the default `increment`
+    # scope put one round's fix commit over the cycle's whole-PR starting size, which
+    # is a real quantity and not the one that runs away: PR #188 went 185 -> 593 ->
+    # 721 churned lines, 3.90x under this 3.0x ceiling, while its round-2 increment
+    # was 128 lines and never came near it. The backstop against the 63.7% bad-fix
+    # injection this repo measures was pointed at the wrong number and never fired.
+    #
+    # Still no new plumbing on this end: `review.diff` is the PR as `gh pr diff`
+    # returned it under either scope, and `Baseline.first_reviewed` reads the
+    # earliest baseline's whole-PR size off the payloads round 2+ already receive via
+    # `--baseline` (`pr_chars`, recorded below).
+    #
+    # `review.diff` under a manifest round is the MANIFEST, exactly as
+    # `review.target` was: what that round put in front of the panel is a description
+    # of a move, and the target's pre-substitution size lives in `preflight.shape`.
+    # Named rather than left to be discovered, because it is the one case where this
+    # ratio is not two diff sizes.
+    #
+    # The measurement of each end still travels with it and is still printed, because
+    # two readings of a size exist in this payload and whatever reports a ratio has to
+    # be able to say which one it computed. `review_scope` rides alongside so a reader
+    # can see what the round reviewed without mistaking it for what was measured.
     #
     # **NOT dressed up as convergence.** It takes a veto line naming itself and
     # `confident` is forced false, the same discipline the round cap and a held
@@ -1785,21 +2151,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     growth = None
     if dials.max_fix_growth is not None and prior.first_reviewed:
         first_round, first_chars, first_scope = prior.first_reviewed
-        ratio = len(review.target) / first_chars
+        pr_chars = len(review.diff)
+        ratio = pr_chars / first_chars
         over = ratio > dials.max_fix_growth
         growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
-                  "over": over, "chars": len(review.target), "scope": review.scope,
+                  "over": over, "chars": pr_chars, "scope": "pr",
+                  "review_scope": review.scope,
                   "first_round": first_round, "first_chars": first_chars,
                   "first_scope": first_scope}
         if over:
             stop["stop"] = True
             stop["reason"] = (
-                f"the change this round reviewed is {ratio:.1f}x what round "
-                f"{first_round} reviewed, past the {dials.max_fix_growth:g}x "
+                f"this PR is {ratio:.1f}x the size round {first_round} reviewed it at, "
+                f"past the {dials.max_fix_growth:g}x "
                 f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
                 "splitting, not another round")
             stop["veto"] = [*stop["veto"],
-                            f"this round's {len(review.target):,} chars ({review.scope}) "
+                            f"the PR's {pr_chars:,} chars (whole PR) "
                             f"against round {first_round}'s {first_chars:,} "
                             f"({first_scope}) is {ratio:.1f}x, past the "
                             f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
@@ -1927,10 +2295,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # at different accounts of the same review — and one finding record per
     # defect, carrying every reviewer's own report, so a consumer reads the merge
     # instead of re-deriving it from an over-counted list.
+    # Everything between the judge returning and this line: provenance, the stop
+    # rule, the growth ceiling, the escalation register. Closed here so the four
+    # phases partition the round exactly rather than leaving a remainder nobody
+    # can name — `measured_to` says what is outside them.
+    clock.mark("wrapup")
+    # The fix phase that ran INTO this round (#192). Its earlier end comes from the
+    # previous round's own recorded finish where there is one, and is derived from
+    # the two rounds' head commit times where there is not — `fix_phase` records
+    # which, because the derivation is a lower bound and breaks in the two places
+    # it would matter most. `cfg["path"]` is the checkout the derivation reads; on
+    # a host that has no clone of this repo it simply reports that it could not.
+    timing = panel_timing.timing_block(
+        clock,
+        panel_timing.fix_phase(clock.started_at,
+                               prior_finished_at=prior.finished_at,
+                               prior_round=prior.finished_round or prior.head_round,
+                               prior_head_sha=prior.head_sha,
+                               head_sha=head_sha,
+                               repo_path=cfg.get("path") or ""))
     payload = {
         **_payload_defaults(),
         "repo": repo_name, "github": gh_repo, "pr": pr_number,
         "title": title, "base": base, "changed_lines": changed,
+        # Where the wall clock went, and what the round spent waiting on one thing
+        # (#192). Board ingest is `extra="ignore"`, so this key is dropped there
+        # until a column exists for it — it travels in `--json`/`--json-file`,
+        # which is what a cycle chains its rounds through, and `finished_at` is
+        # read straight back out of it by the NEXT round's `load_baseline` as the
+        # left-hand end of that round's fix phase.
+        "timing": timing,
         # The commit reviewed: the NEXT round anchors its increment on it, and
         # provenance measures its fix range to it. One key, because two would be
         # one fact with two chances to disagree.
@@ -1990,6 +2384,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # answer, and a seat that got the whole target and only part of the
         # context is named in `config_notes`.
         "diff_chars": len(review.target),
+        # The WHOLE PR's size, whatever this round reviewed — the growth ceiling's
+        # own measurement (#298) and the one number in this group that means the same
+        # thing on every round of a cycle. `diff_chars` above is scope-dependent by
+        # design, so a later round reading it as "how big is this PR now" is handed a
+        # fix commit; plotted across a cycle, this is the line that does not cliff at
+        # round 2. Equal to `diff_chars` under "pr" scope, and under a manifest round
+        # both measure the manifest, which is what was sent.
+        "pr_chars": len(review.diff),
         # Everything prepared ALONGSIDE the target: 0 under "pr" scope, where
         # there is no such thing. This plus `diff_chars` is what a round put in
         # front of an uncapped reviewer, and the pair is the measurement issue #41
@@ -2086,37 +2488,61 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # master ruled it not real, so "below the fix floor" would describe work that
         # does not exist. `review_panel` below records the floor it was computed
         # against.
+        # `budgeted_fix` is the third of that family and the one #297 adds: not "NOT
+        # this round's work" but "this round's work only while the line budget lasts",
+        # which is a third answer and cannot be spelled by the other two. Always
+        # False on a SONAR issue, where the other two flags are computed: neither
+        # floor applies to a hard-gate issue at any rule, so a budget that could
+        # decline to fix one would say the panel may leave a red quality gate red.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
                     "escalated": c.key in held,
-                    "below_fix_floor": below_floor(c)} for c in to_fix],
+                    "below_fix_floor": below_floor(c),
+                    "budgeted_fix": budgeted(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c),
                             "escalated": c.key in held,
-                            "below_fix_floor": below_floor(c)} for c in sonar],
+                            "below_fix_floor": below_floor(c),
+                            "budgeted_fix": False} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c),
                        "escalated": False,
-                       "below_fix_floor": False} for c in dismissed],
-        # The seven #165 dials AS APPLIED, not as written: a repo whose
+                       "below_fix_floor": False,
+                       "budgeted_fix": False} for c in dismissed],
+        # The eight #165/#297 dials AS APPLIED, not as written: a repo whose
         # `fix_severity_floor` was rejected reads the floor that actually ran here
         # and the reason it was rejected in `config_notes`. Every key present on
         # every reviewed round, so a consumer never has to tell "the default applied"
         # from "a payload written before the field".
         "review_panel": dials.as_dict(),
+        # …and which layer supplied each of them (#305). `review_panel` says what
+        # ran; this says which of the four layers said so, so a round that ran under
+        # a moved floor names the mover instead of leaving a reader to infer it from
+        # three files and a resolution order.
+        "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
         "skipped": result.skipped,
         "run_key": run_key,
     }
+
+    # Recorded BEFORE the file is written, which is the ordering the fix needs
+    # rather than a preference: `record_run` now answers whether the board took
+    # the run, and `notes` IS `payload["config_notes"]` — so appending here puts
+    # "this round was NOT recorded" into the payload on disk, into `--json`, and
+    # into the report and PR comment below, instead of into a stderr line in a
+    # subprocess nobody reads (#284). The board is sent the payload as it stood,
+    # which is right both ways round: if it answered, it has the run and the note
+    # is false; if it did not, there is nothing to have received the note.
+    if record:
+        missed = record_run(payload)
+        if missed:
+            notes.append(missed)
 
     # So a caller can have BOTH the PR comment and the machine-readable run.
     # Without --json-file, --json suppresses the report and the only way to get
     # both was to review the PR twice — several CLI invocations, for a copy. A
     # requested file that could not be written FAILS the run (see `finish`).
     write_failed = write_payload(json_file, payload)
-
-    if record:
-        record_run(payload)
 
     # ---- machine-readable mode: the whole run as JSON, no report/post. Same
     # shape as the skip-pattern exit's payload, so a consumer can read any key of
@@ -2294,7 +2720,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "itself was not read by anybody** — treat its correctness as "
                      "carried over from when it landed on the base branch, not as "
                      "reviewed here.")
-    if pre.forced:
+    if pre.forced and pre.gate:
+        # A forced PRECONDITION refusal, and the size sentence below would be a
+        # non-sequitur about it — there is no ceiling in this verdict, `pre.cap` may
+        # be None, and the reader's problem is not that the seats were spread thin
+        # but that the code they read is going to change before it lands.
+        lines.append("  - ⚠️ **`--force` overrode a pre-flight `refuse` verdict** — "
+                     f"{pre.reason.removeprefix('--force: ')}. The panel refused "
+                     "this round and was overruled: what follows is a review of a "
+                     "branch whose merged form does not exist yet, so read every "
+                     "finding as provisional on the rebase.")
+    elif pre.forced:
         lines.append(f"  - ⚠️ **`--force` overrode a pre-flight `{pre.would_have}` "
                      f"verdict** — the panel judged this round "
                      f"{'not worth running' if pre.would_have == 'refuse' else 'unreadable as content'}"
@@ -2339,6 +2775,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     else:
         judge_txt = f"⚠️ {judge_skip} — all findings KEPT unjudged (re-run to get a verdict)"
     lines.append(f"**Master judge:** {judge_txt}")
+    # Where the round's wall clock went, on the PR comment and not only in the
+    # payload (#192). It sits directly under the reviewer list and the judge
+    # because it is a fact about exactly those two, and the operator deciding
+    # whether to spend another round is the reader it is for — the payload is not
+    # where they are looking. It reports the fix phase BEFORE this round, which is
+    # the half of a cycle's cost that had no number anywhere.
+    lines.append(panel_timing.timing_line(timing))
     # Which seats could read the code, stated on the PR comment (#113). It belongs
     # next to the reviewer list because it is a property OF that list, and it has to
     # be visible: a reader weighing "codex could not assess the caller" against
@@ -2391,8 +2834,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
     lines.append(f"\n### To fix ({len(for_fix)}) — master-confirmed, any reviewer count"
-                 + (f", {dials.fix_severity_floor} and above"
+                 + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
+    # #297's budget, stated where the list it bounds is, not only on the dials line.
+    # A mark inside **To fix** rather than a section of its own, which is the opposite
+    # of the choice the below-floor findings get below — and for the same reason read
+    # the other way. These ARE the fixer's work; what is bounded is how much of them
+    # gets done. An orchestrator that pastes the To fix list into a brief has to
+    # sweep these up, so the budget has to come with them, which means the header.
+    on_budget = [c for c in for_fix if budgeted(c)]
+    if on_budget:
+        lines.append(
+            f"_💸 marks the {len(on_budget)} finding(s) below the "
+            f"`{dials.round_trigger_floor}` cut. They share a "
+            f"{dials.low_severity_fix_lines}-line budget for the WHOLE round: measure "
+            "each fix's churned lines (`git diff --numstat`) rather than estimating "
+            "them, spend cheapest first, and stop when the budget is spent. "
+            "Count, do not estimate, "
+            "and do not ask yourself whether a fix risks ballooning — the budget is "
+            "the answer to that question and it has already been given. What the "
+            "budget does not reach is reported and recorded exactly like a below-floor "
+            "finding: not dropped, and not this round's work (#297). Everything "
+            "unmarked is unconditional._")
     if for_fix:
         for c in for_fix:
             tail = f" — {c.rationale}" if c.rationale and c.rationale != "unjudged" else ""
@@ -2407,7 +2870,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
-            lines.append(f"- **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — {c.synthesis}"
+            paid = "💸 " if budgeted(c) else ""
+            lines.append(f"- {paid}**{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+                         f"{c.synthesis}"
                          f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}")
             lines += accounts(c)
     else:
@@ -2420,11 +2885,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # brief must not be able to sweep these up with it. Absent entirely at the
     # pre-#165 floor, where nothing is below it.
     if under_floor:
+        # The APPLIED floor in both lines, which is the written one except at a
+        # budget of 0 — where it is the cut, and saying `fix_severity_floor` would
+        # name a floor these findings are above while listing them as not this
+        # round's work. The `because` clause names whichever key actually decided it,
+        # so an operator reading the report knows which one to edit.
+        because = (f"`review_panel.fix_severity_floor` is "
+                   f"`{dials.fix_severity_floor}`"
+                   if dials.fix_floor == dials.fix_severity_floor else
+                   f"`review_panel.low_severity_fix_lines` is 0, so the round's "
+                   f"applied floor is the `{dials.round_trigger_floor}` cut rather "
+                   f"than the `{dials.fix_severity_floor}` fix floor")
         lines.append(f"\n### Reported, not this round's work ({len(under_floor)}) — "
-                     f"below the `{dials.fix_severity_floor}` fix floor")
+                     f"below the `{dials.fix_floor}` fix floor")
         lines.append("_Master-confirmed, recorded, and deliberately NOT for the fixer: "
-                     f"`review_panel.fix_severity_floor` is "
-                     f"`{dials.fix_severity_floor}`. Do not build a fix brief from "
+                     f"{because}. Do not build a fix brief from "
                      "this list — a fix pass that takes them on is the growth this "
                      "floor exists to stop (#165). They stay in the payload "
                      "(`below_fix_floor`) and on the board._")
@@ -2610,6 +3085,26 @@ def main() -> int:
                          "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
                          "to mean anything, and is inherited by later rounds through "
                          "--baseline")
+    ap.add_argument("--premise", metavar="TEXT",
+                    help="#84's futility brake, run BEFORE a fix pass rather than "
+                         "after it: declare in one sentence the premise the fix you "
+                         "are about to write rests on. Records it in the cycle's "
+                         "register (--premise-file) and exits non-zero when this is "
+                         "the Nth time that premise has been declared, where N is "
+                         "review_panel.escalate_on.premise_repeated — the fix is not "
+                         "to be written, the finding is escalated instead. No seats, "
+                         "no diff, no judge, no cost")
+    ap.add_argument("--premise-file", metavar="PATH", default="", dest="premise_file",
+                    help="the cycle's premise register: written by --premise, and read "
+                         "by a round so the payload can say which premises repeated "
+                         "and which fix passes declared none. One path per PR, beside "
+                         "the --json-file payloads")
+    ap.add_argument("--premise-for", action="append", default=[], metavar="KEY",
+                    dest="premise_for",
+                    help="a finding key this fix pass would have cleared. Repeatable. "
+                         "When the brake fires these are the keys to pass to the next "
+                         "round's --escalated, which is how a braked premise reaches "
+                         "the stop rule. --premise only")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -2650,6 +3145,17 @@ def main() -> int:
                                    ("--baseline", bool(args.baseline)),
                                    ("--force", args.force),
                                    ("--escalated", bool(args.escalated)),
+                                   # Refused rather than ordered, because the two are
+                                   # different questions about one premise and the
+                                   # answer to "which ran?" must not be a reading of
+                                   # this file's branch order. `--ask` puts the premise
+                                   # to the SEATS (#79, and it costs a vendor call per
+                                   # seat); `--premise` counts how many times a fix has
+                                   # been written against it (#84, and it costs
+                                   # nothing). Run them as two commands.
+                                   ("--premise", args.premise is not None),
+                                   ("--premise-file", bool(args.premise_file)),
+                                   ("--premise-for", bool(args.premise_for)),
                                    ("--max-rounds", args.max_rounds is not None)) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
@@ -2668,6 +3174,53 @@ def main() -> int:
                    # agent whose CLI this file cannot recognise, and only the
                    # second is worth a note in the report.
                    asker if args.asker is not None else None)
+    # Settled next, and on the same principle as the ask: a declaration is not a
+    # round either. It reviews nothing, so it takes none of the round flags except
+    # the two that say WHICH cycle and WHICH round's findings it is answering.
+    if args.premise is not None:
+        if not args.premise.strip():
+            raise SystemExit("--premise: the premise is empty — say in one sentence "
+                             "what the fix you are about to write assumes")
+        if not args.premise_file:
+            raise SystemExit(
+                "--premise needs --premise-file: the brake counts OCCURRENCES across a "
+                "cycle, and a declaration with nowhere to be counted is not a check. "
+                "Use one path per PR, beside the --json-file payloads")
+        wrong = [f for f, used in (("--post", args.post),
+                                   ("--baseline", bool(args.baseline)),
+                                   ("--force", args.force),
+                                   ("--escalated", bool(args.escalated))) if used]
+        if wrong:
+            raise SystemExit(
+                f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
+                "check made BEFORE a fix pass, not a round — there is no diff to post "
+                "about, no pre-flight verdict to override, and nothing to compare a "
+                "baseline against. --escalated is what the NEXT round is given when "
+                "this check refuses the fix")
+        # The round flags' own check runs below, on the review path this branch
+        # returns before reaching. A round of 0 or less would date the declaration to
+        # a round that cannot exist and make `undeclared_passes` count from it.
+        if args.round_no is not None and args.round_no < 1:
+            raise SystemExit("--round: rounds are numbered from 1")
+        bad = [k for k in args.premise_for if not panel_rounds._is_key(k)]
+        if bad:
+            raise SystemExit(
+                f"--premise-for takes finding KEYS (8-64 hex characters), not "
+                f"{panel_rounds._key_gist(bad[0])!r} — these are the keys the next "
+                "round's --escalated would need, so an ID or a title here would name "
+                "no finding at all")
+        return declare(args.repo, args.premise.strip(), args.premise_file,
+                       1 if args.round_no is None else args.round_no,
+                       args.premise_for, args.pr, args.json_out)
+    # `--premise-file` is NOT refused here: a round READS the register, so the
+    # payload can say which premises repeated and which fix passes declared none.
+    # `--premise-for` has no reading outside a declaration and is refused, on the
+    # rule `--context` and `--asker` are refused by: a flag accepted and ignored is
+    # a caller believing it asked for something this run does not do.
+    if args.premise_for:
+        raise SystemExit("--premise-for belongs to --premise — it names the findings a "
+                         "refused fix pass would have cleared, and a review round has "
+                         "no fix pass to refuse. The round's equivalent is --escalated")
     if args.pr is None:
         raise SystemExit("--pr is required — or pass --ask to challenge one premise "
                          "instead of reviewing a PR")
@@ -2718,7 +3271,7 @@ def main() -> int:
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
-               args.no_code_access, args.escalated)
+               args.no_code_access, args.escalated, args.premise_file)
 
 
 if __name__ == "__main__":

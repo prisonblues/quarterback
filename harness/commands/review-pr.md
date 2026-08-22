@@ -64,12 +64,17 @@ standard is not "good enough" — it's "nothing left to improve".
 
 **What that scope IS is a repo setting, not your judgement.** The orchestrator
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
-report prints them on its **Panel dials** line). Three of them define this pass:
+report prints them on its **Panel dials** line). Four of them define this pass:
 
 - **`fix_severity_floor`** (default `P3`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
   by this pass. A panel report puts those under their own heading, *Reported, not
   this round's work*, marked 🔽; do not lift them into your list.
+- **`low_severity_fix_lines`** (default `40`) — the churned lines the WHOLE pass may
+  spend on findings below `round_trigger_floor` (`P2` by default, so this is the P3
+  band). A panel report marks those 💸. Step 3 has how to spend it; what matters here
+  is that it is a budget for the round and not a cap per fix, because the failure it
+  answers was 408 lines of individually reasonable small fixes on a 185-line PR.
 - **`reviewer_scope`** (default `diff`) — whether the change under review is the
   target or the starting point. Under `diff`, findings are about the change and the
   seams where it meets what was already there.
@@ -188,7 +193,8 @@ errors, skip silently.
 
 Rank findings P1 (blocks merge) · P2 (important) · P3 (should fix) · P4 (polish).
 The rank is not decoration and not just a column: **`review_panel.fix_severity_floor`
-decides which of them this pass fixes.** At or above the floor they get fixed. Below
+decides which of them this pass fixes, and `low_severity_fix_lines` decides how much
+of the low tier it can afford.** At or above the floor they get fixed. Below
 it they are reported in step 6 with `Deferred` against them and left alone — that
 is the setting's judgement, already made, and re-making it by fixing them anyway is
 the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
@@ -202,14 +208,53 @@ note them. Update the stale docs. Propagate renames/patterns to
 sibling code. After fixing, re-read the full diff of your fixes and fix any new
 issues they introduce.
 
+**The low-severity band is on a budget, and you spend it by COUNTING.** Findings
+below `round_trigger_floor` — the ones a panel report marks 💸 — share
+`low_severity_fix_lines` churned lines for the whole round (40 by default). Findings
+at or above the cut are not on the budget and none of this touches them.
+
+Spend it like this, and do not improvise around it:
+
+1. Do the unbudgeted findings first and commit them. The budget pays for the budgeted
+   fixes alone, so they need a clean tree to be measured against.
+2. **Measure before you spend.** You cannot know what a fix costs until you have made
+   it, so find out rather than guessing: make each budgeted fix on its own, run `git
+   diff --numstat` for it, write down insertions + deletions, and put it back
+   (`qb-stash push` it, or `git restore` the file — and mind the warning just below
+   about discarding your own uncommitted work). You now have a counted cost for each one.
+3. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
+   order of that cost, subtracting each from the budget as you go. Stop at the first
+   one that does not fit — in ascending order, nothing after it fits either. If the
+   whole list fits, the whole list gets fixed and the budget never binds.
+4. Everything the budget did not reach goes into step 6 exactly as a below-floor
+   finding does: reported, recorded `deferred` against the issue you open for the
+   batch, and **not** fixed. It is not dropped and it is not yours to sneak in.
+
+**Count, never estimate, and never ask yourself whether a fix "risks ballooning".**
+That question is a judgement, and it is the judgement the measurement indicts:
+across seven PRs 63.7% of new findings were created by the fix pass immediately
+before them, and on PR #268's round 2 it was 85%. The budget is the answer to that
+question and it has already been given. Your job here is arithmetic — a numstat and
+a running total — not a forecast about your own work.
+
 **Commit before you break something on purpose.** Proving a new test bites — by
 mutating the code it guards and watching it go red — is worth doing and is the
 only way to know a guard is not vacuous. But the revert is `git checkout --
 <file>`, which discards **your own uncommitted work** in that file with no
 warning and nothing to undo it from. Two fixers hit this on PR #212 within an
 hour, both while checking guards they had just written; both were lucky enough to
-notice. Commit (or `git stash`) first, and mutate a file you have not edited
-where you have the choice.
+notice. Commit first, and mutate a file you have not edited where you have the
+choice.
+
+**Not `git stash` — `qb-stash push`.** Every worktree of a repo shares one
+`refs/stash`, so a stash you push here is listed and poppable from every sibling
+worktree, and `stash@{0}` there resolves to whatever the last pusher meant. Two
+working trees have already gone that way. `create-worktree` now installs a hook
+that refuses the shared stash outright, so a plain `git stash` in a harness
+worktree stops with a `REFUSED:` message rather than racing; `qb-stash` is the
+same push/pop/list/apply/drop stored per-worktree. It takes no pathspec and does
+not save untracked files (`git stash create` supports neither), which is why the
+red/green step below uses a patch file instead.
 
 **Once the list is triaged, decide *how* to fix it.** Serially yourself is the
 default; for a big, clean list, fan the fixes out to `general-purpose` sub-agents
@@ -296,6 +341,50 @@ touched, or when several findings on this list produce **the same failure** in
 different files, stop and ask whether one premise explains them all. Cluster by
 the failure produced, not by the file: on #88 seven P1/P2s across two files were
 one premise, and grouped by file they read as seven unrelated defects.
+
+**Record the premise before you write the patch — that is where the brake is.**
+If the brief gave you a **premise register** path, declare the premise there
+*before* deciding whether to patch or escalate. It costs nothing — no seats, no
+diff, no judge, no vendor call — and it is the only thing that can tell you the
+same premise was already patched once:
+
+```bash
+premise=$(cat <<'PREMISE'
+<the premise, in one sentence>
+PREMISE
+)
+python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
+    --premise-file <the register path from the brief> \
+    --premise-for <each finding key the premise explains>
+```
+
+Read the exit code, not the prose. **0** means this premise has not been patched
+before in this cycle: carry on and decide patch-or-escalate on the three tests
+above. **4** means it has, and `review_panel.escalate_on.premise_repeated` says
+stop — **do not write the patch**. It is an escalation now whether or not it
+passes the three tests, because a premise a fix pass has already been written
+against once is #67's circling by definition, and the second patch is what
+produces the third round. Report it under `Escalated` with the command's output,
+including the `--escalated` keys it prints, and fix everything else in the pass
+as usual.
+
+The heredoc is not optional and the reason is the same one the `--ask` block
+below gives: a premise about code carries backticks and `$(…)`, and inside a
+double-quoted argument bash *executes* them. `--premise-for` takes finding
+**keys** (8-64 hex characters, as sent with each finding), not IDs and not
+titles — they are what the orchestrator hands the next round as `--escalated`,
+and an ID there names no finding at all.
+
+**State the premise, never the proxy.** The brake compares declarations, not code:
+"the panel exiting 0 means it reviewed" and "the payload existing means it
+reviewed" are one premise wearing two proxies, they share almost no words, and
+declared that way they count as two. Declare what the fix *assumes about the
+world* — "a local check can prove a review happened" — and the second one is
+caught.
+
+If the brief gave you no register path, say so in your write-up rather than
+inventing one: an undeclared fix pass is **unescalatable** — nothing can brake it
+— and #84's rule is to report that rather than pretend the count covered it.
 
 **Put the premise to the seats before you escalate.** Best-effort, about a
 minute, and the reason it is here is that this signal cannot be self-reported by

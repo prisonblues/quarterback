@@ -1,0 +1,736 @@
+#!/usr/bin/env bash
+# quarterback lifecycle hook — the automatic reflexes for the coordination board.
+#
+# Invoked by Claude Code hooks (settings.json) with the event name as $1 and the
+# hook JSON payload on stdin. This is layer 3: presence/lease/handoff must NOT
+# depend on the model remembering to do them, so they live here and the harness
+# fires them. It is deliberately fail-open — any error is swallowed and the hook
+# exits 0, so a board outage can never block or slow a coding session.
+#
+# Token: QUARTERBACK_TOKEN if set, else this agent's entry extracted from the
+# op-resolved combined token list (/run/op-secrets/quarterback-tokens, one
+# `name:token` per machine). Agent name = QUARTERBACK_AGENT or the hostname.
+#
+# Identity (quarterback v2.9): the token proves the MACHINE, and every session on
+# it shares that token — so without more, all of them post as "zeus" and none can
+# be addressed individually. The X-Agent-Instance header names this session; the
+# board records the author as machine/instance. The instance is a prefix of the
+# Claude Code session id because qb-mcp derives the same value from
+# CLAUDE_CODE_SESSION_ID — that's what keeps a session's tool calls and its
+# presence/leases under ONE identity instead of two.
+
+set -uo pipefail   # NOT -e: never abort a session on a curl/jq hiccup
+
+EVENT="${1:-}"
+
+# Site config decides the board and the token source (see qb-env). This hook is
+# fail-open by contract, so an unconfigured host no-ops rather than erroring — but
+# it must no-op *without* falling back to a board, which is why there is no default
+# URL here any more: on the work island the old fallback pointed at the personal
+# board, and that board is reachable from there over public DNS.
+#
+# Two failures are NOT the same and must not be handled the same way. "The board
+# is unreachable" — or "this host has no board" — is expected, and gets the silent
+# exit 0 below. "I could not load my own library" is a bug in this install, and
+# swallowing that silently is how a broken source line ran ~20 hours unnoticed. It
+# still exits 0 — a hook must never block a session — but it leaves a breadcrumb
+# first, so the next person to wonder why the board went quiet has one file to
+# look at rather than a mystery.
+qb_broken() {
+  local msg="$1" marker="${TMPDIR:-/tmp}/qb-hook-broken"
+  echo "qb-hook: $msg (hook disabled; exiting 0)" >&2
+  # Overwrite, never append: this fires on every hook event, and an unbounded log
+  # in /tmp is its own bug. mtime is the "when", the line is the "what".
+  printf '%s qb-hook[%s]: %s\n  argv0=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${EVENT:-?}" "$msg" "$0" >"$marker" 2>/dev/null
+  printf 'broken\n' >"${XDG_RUNTIME_DIR:-/tmp}/qb-health" 2>/dev/null
+  exit 0
+}
+
+# Find qb-env beside this script. NOT `readlink -f`: home-manager installs each
+# file as its own flat /nix/store/…-hm_qbhook path, so full resolution walks past
+# the bin/ directory and dirname yields /nix/store. Walk the chain one link at a
+# time instead and take the first directory that actually holds a qb-env.
+qb_env_path() {
+  local p="$1" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -r "$d/qb-env" ] && { printf '%s\n' "$d/qb-env"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+# ---- which qb-hook is this? -------------------------------------------------
+# #204 names three independently versioned things that must agree and misses a fourth:
+# this file. While it lived in a consumer's personal config it was pinned by whatever
+# repo that was, on a different revision from the harness and the board — and a hook
+# calling a route the pinned board does not serve is skew that no check could even see,
+# because the file was not in the tree being checked. It ships with the harness now
+# (#230), so the question "which one am I running" finally has an answer, and this is
+# where a doctor asks it.
+#
+# What is printed is the RESOLVED PATH of both halves, not a version string, and that is
+# deliberate: on a nix install the store hash IS the pin, uniquely and unforgeably,
+# whereas the `version` in a derivation name is a field somebody has to remember to bump.
+# The two lines are what matter together — a qb-hook and a qb-env from different store
+# paths is precisely the half-migrated install this issue is about, and it is invisible
+# from either line alone.
+#
+# `readlink -f` HERE, unlike everywhere else in this file: the other walks are looking for
+# a SIBLING and must stop at the bin/ directory, while this one is answering "what am I",
+# for which full resolution is the whole point. The fallback covers a platform without
+# GNU readlink -f.
+if [ "$EVENT" = "--version" ] || [ "$EVENT" = "version" ]; then
+  printf 'qb-hook %s\n' "$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+  if _qbe="$(qb_env_path "$0")"; then
+    printf 'qb-env  %s\n' "$(readlink -f -- "$_qbe" 2>/dev/null || printf '%s' "$_qbe")"
+    exit 0
+  fi
+  printf 'qb-env  (not found beside this script — this install cannot post to a board)\n'
+  exit 1
+fi
+
+QB_ENV="$(qb_env_path "$0")" || qb_broken "no qb-env found next to this script"
+# shellcheck source=./qb-env
+. "$QB_ENV" || qb_broken "qb-env at $QB_ENV would not load"
+# Sourcing can "succeed" on a truncated or half-written file, so check for the
+# thing we are about to call rather than trusting the exit status.
+command -v qb_load_config >/dev/null 2>&1 \
+  || qb_broken "qb-env at $QB_ENV loaded but defines no qb_load_config"
+qb_load_config
+[ -n "${QUARTERBACK_BASE_URL:-}" ] || exit 0   # unconfigured → no-op, never a guess
+qb_resolve_token || exit 0                     # no token → no-op
+
+BASE="$QUARTERBACK_BASE_URL"
+AGENT="$QUARTERBACK_AGENT"
+TOK="$QUARTERBACK_TOKEN"
+
+command -v jq  >/dev/null 2>&1 || exit 0
+command -v curl >/dev/null 2>&1 || exit 0
+
+IN=$(cat 2>/dev/null || true)
+
+_throttle() {   # _throttle <key> <seconds>: true at most once per <seconds>, else false
+  local mark="${XDG_RUNTIME_DIR:-/tmp}/qb-$1"
+  if [ -f "$mark" ] && [ $(( $(date +%s) - $(stat -c %Y "$mark" 2>/dev/null || echo 0) )) -lt "$2" ]; then
+    return 1
+  fi
+  : > "$mark"; return 0
+}
+_once() {   # _once <key>: true the first time only (no expiry) — dedupe by identity
+  local mark="${XDG_RUNTIME_DIR:-/tmp}/qb-once-$1"
+  [ -f "$mark" ] && return 1
+  : > "$mark"; return 0
+}
+
+# ---- the state beacon -------------------------------------------------------
+# What this session is DOING, for a human looking at a row of panes: working,
+# waiting (on you), input (a prompt is up), or gone. One word, one file, rewritten
+# on every lifecycle event; the status line stats it.
+#
+# It has to be a hook rather than anything the status line could work out for
+# itself, because "the agent finished its turn" is not visible in the payload
+# Claude Code hands a status line — no field says it, and the render that follows
+# a Stop looks exactly like the render that follows a tool call.
+#
+# THE MTIME IS HALF THE SIGNAL. `working` written twelve minutes ago does not mean
+# working; it means a pane that looks busy and has not moved, which is the failure
+# quarterback's own v2.46 notes describe — "a prompt no one answers is an outage
+# that looks like progress, and N of them is a row of stuck panes that reads as a
+# working fleet". Removing the permission prompt did not remove that shape, it
+# only removed the version of it a human could see. So every tool call rewrites
+# this file even when the content does not change, and the reader treats a stale
+# `working` as stalled rather than as fine — the same bargain as qb-health.
+#
+# Not written on a host with no board: this hook exits above before it gets here,
+# and a machine with no fleet has no row of panes to scan.
+#
+# Three consumers, one write. The FILE is for this pane's own footer (a stat, on
+# every render). STATE_NOW rides the next lease to the board, so a dashboard on
+# another machine can see it. The tmux PANE OPTION colours the seat cell on the
+# screen's own bar, which is the only one of the three that a human reads without
+# looking at a pane at all.
+#
+# The tmux write is behind a change check for one reason: this runs on every tool
+# call, and a subprocess there is not free where a `cat` is. Comparing first turns
+# the common case (still working, said so a second ago) back into two file reads.
+STATE_NOW=""
+_state() {   # _state <working|waiting|input>
+  local f="${XDG_RUNTIME_DIR:-/tmp}/qb-state-$sid" prev
+  prev=$(cat "$f" 2>/dev/null)
+  printf '%s\n' "$1" > "$f" 2>/dev/null
+  STATE_NOW="$1"
+  [ "$prev" = "$1" ] && return 0
+  # Backgrounded: the bar is cosmetic and tmux is a socket round trip. $TMUX_PANE
+  # is the pane the agent was STARTED in, inherited through the environment —
+  # which is exactly right for a seat, and absent (so this no-ops) for a session
+  # that is not in tmux at all.
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    ( tmux set-option -p -t "$TMUX_PANE" @qb_state "$1" ) >/dev/null 2>&1 &
+  fi
+  return 0
+}
+
+# PostToolUse now matches EVERY tool (settings.json `*`), not just Task and Bash,
+# because the ask courier below has to reach an agent BETWEEN prompts (#107). So
+# this is the hook's hottest path by a wide margin and it must not grow: one jq
+# reads everything the decision needs, and an ordinary tool call with no mail due
+# costs that jq plus one stat — no curl, no git, no transcript.
+#
+# Three jobs hang off this event and they want different things:
+#   task  → close the sub-agent record   (no git)
+#   push  → announce the commit          (git)
+#   other → nothing at all, UNLESS the ask poll is due
+#
+# `agent_id` is present ONLY when the hook fires inside a sub-agent, and it is the
+# only thing that says so — `session_id` is the PARENT's, shared verbatim. That
+# matters here because the ask cursor is keyed on the session: a sub-agent that
+# polled would consume its parent's mail, advance the cursor past it, and inject
+# the note into a context that is about to be discarded. The parent would never
+# see the ask and nothing would report it missing. That is the machine-wide bug
+# recorded at the cursor below, one level down, and much worse at 45s cadence
+# than at one poll per prompt — so the poll is refused outright in a sub-agent.
+# (Verified on Claude Code 2.1.232: agent_id/agent_type absent on the main thread.)
+pt_kind=""; pt_sub=""; turn_id=""
+if [ "$EVENT" = "PostToolUse" ]; then
+  { read -r pt_kind; read -r pt_sub; read -r sid; read -r turn_id; } < <(
+    printf '%s' "$IN" | jq -r '
+      (if .tool_name == "Task" then "task"
+       elif (.tool_name == "Bash" and ((.tool_input.command // "") | test("\\bgit\\b.*\\bpush\\b"))) then "push"
+       else "other" end),
+      (.agent_id // ""),
+      (.session_id // ""),
+      (.prompt_id // "")' 2>/dev/null)
+  [ -n "$sid" ] || exit 0
+  # Heartbeat. Above the early exit, because the exit is the common case and a
+  # beacon that only ticked on the rare ones would call a busy session stalled.
+  # A sub-agent's tool calls count: the parent is working precisely because its
+  # Task is. One printf — this is the hook's hottest path and the reason the
+  # state lives in a file instead of on the board.
+  _state working
+  # Poll due? Decided once, for every kind, so a session that only ever pushes
+  # still gets its mail. The throttle is a stat and a date compare, never a curl.
+  [ -z "$pt_sub" ] && _throttle "askpoll-$sid" 45 && ASK_POLL_DUE=1
+  # Nothing to do and nothing to say: leave before the git subprocesses below.
+  [ "$pt_kind" = "other" ] && [ -z "${ASK_POLL_DUE:-}" ] && exit 0
+fi
+
+sid=$(printf '%s' "$IN" | jq -r '.session_id // empty' 2>/dev/null)
+cwd=$(printf '%s' "$IN" | jq -r '.cwd // empty' 2>/dev/null)
+tp=$(printf '%s'  "$IN" | jq -r '.transcript_path // empty' 2>/dev/null)
+[ -n "$sid" ] || exit 0
+
+repo=""; branch=""
+if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
+  # Repo identity is the origin remote's name, not the directory's: a checkout
+  # cloned to a different local name is still the same repo to everyone else, and
+  # /sync has to agree with what the MCP tools (which read origin) call it. Falls
+  # back to the directory basename when there's no origin.
+  _origin=$(git -C "$cwd" config --get remote.origin.url 2>/dev/null)
+  repo=$(printf '%s' "${_origin:-$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)}" \
+         | sed -E 's#/+$##; s#\.git$##; s#.*[:/]##')
+  branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
+fi
+
+# Session title + recap from Claude Code's own metadata (its first-class ai-title
+# and, when the session has compacted, the isCompactSummary). Falls back to the
+# last prompt from history.jsonl. All best-effort.
+# Transcript metadata (title/recap/model) is only used by the session-lifecycle
+# events' lease/record payloads — skip the jq passes for the frequent Task-tool
+# PreToolUse/PostToolUse events, which carry no transcript context.
+title=""; recap=""; model=""
+case "$EVENT" in SessionStart|Stop|SessionEnd)
+  if [ -n "$tp" ] && [ -r "$tp" ]; then
+    title=$(jq -rR 'fromjson? | select(.type=="ai-title") | .aiTitle' "$tp" 2>/dev/null | tail -1)
+    recap=$(jq -rR 'fromjson? | select(.isCompactSummary==true)
+                    | (.message.content // .content // "")
+                    | if type=="array" then (map(.text? // "")|join(" ")) else . end' \
+              "$tp" 2>/dev/null | tail -1 | tr '\n' ' ' | cut -c1-500)
+  fi
+  if [ -z "$recap" ] && [ -r "$HOME/.claude/history.jsonl" ]; then
+    recap=$(jq -rc --arg s "$sid" 'select(.sessionId==$s) | .display' \
+              "$HOME/.claude/history.jsonl" 2>/dev/null | tail -1 | tr '\n' ' ' | cut -c1-300)
+  fi
+  # Subject beacon. The title is already computed here for the lease, and it is
+  # the only human sentence anything local holds about what this session is FOR
+  # ("Pull latest changes and rebuild"). Claude Code does not put it in the
+  # status-line payload — `session_name` is absent from a real capture — so a bar
+  # that wanted it would have to scan the transcript on every render for a string
+  # that changes about twice a session. Written here instead, read there for a
+  # stat. Empty titles do not overwrite a good one: an untitled turn is not news.
+  [ -n "$title" ] && printf '%s\n' "$title" \
+    > "${XDG_RUNTIME_DIR:-/tmp}/qb-title-$sid" 2>/dev/null
+  if [ -n "$tp" ] && [ -r "$tp" ]; then
+    model=$(jq -rR 'fromjson? | select((.type // .role)=="assistant") | (.message.model // .model // empty)' \
+              "$tp" 2>/dev/null | tail -1)
+  fi
+;; esac
+
+# Instance = this session among the machine's several. QUARTERBACK_INSTANCE wins
+# (a human label like "deploy"); otherwise the session-id prefix, byte-identical
+# to what qb-mcp computes. IDENT is what the board will call us — used to read our
+# own inbox, and assumes (as this hook always has) that the token's name is the
+# hostname. Sanitized to the charset the board accepts, so a hand-set label can
+# never turn every request into a 400 this fail-open hook would swallow silently.
+INSTANCE=$(printf '%s' "${QUARTERBACK_INSTANCE:-${sid:0:8}}" \
+           | tr -c 'A-Za-z0-9._~-' '-' | sed -E 's/^[._~-]+//' | cut -c1-40)
+IDENT="$AGENT${INSTANCE:+/$INSTANCE}"
+
+_auth=(-H "Authorization: Bearer $TOK")
+[ -n "$INSTANCE" ] && _auth+=(-H "X-Agent-Instance: $INSTANCE")
+_json=(-H 'Content-Type: application/json')
+
+_refs() {   # emit the refs array for a post (repo + branch when known)
+  jq -nc --arg r "$repo" --arg b "$branch" \
+    '([ if $r!="" then {kind:"repo",value:$r} else empty end ]
+      + [ if $b!="" then {kind:"branch",value:$b} else empty end ])'
+}
+# Health beacon for the status line. This hook is the only thing that talks to
+# the board on every turn, so it is the only honest source of "is quarterback
+# actually working" — a status line that probed the board itself would put a
+# network call on every render. One file, overwritten: the content is the
+# verdict, the mtime is how fresh that verdict is, and a reader that finds it
+# stale should say "unknown" rather than "fine". Written from the two calls that
+# fire every turn (_lease on UserPromptSubmit/Stop, _post on status/presence);
+# the blob/record calls are deliberately left out, since a 45s upload timing out
+# on a huge transcript is not the same as the board being down.
+_health() { printf '%s\n' "$1" >"${XDG_RUNTIME_DIR:-/tmp}/qb-health" 2>/dev/null; }
+
+# Name beacon for the status line, same bargain as the health one. Since
+# quarterback v2.12 the board DESIGNATES the name half of an identity: what we
+# send in X-Agent-Instance is an opaque key, and `zeus/glacier-amber` is the
+# spelling peers see and reply to. So "what am I called" is a question only the
+# board can answer, and a status line cannot derive it — it could only ask, which
+# would be an HTTP call per render. /lease already answers it: the response
+# carries `holder`, the canonical identity, and it fires every turn. Cache the
+# name half per session and the status line reads it for free.
+_namefile="${XDG_RUNTIME_DIR:-/tmp}/qb-name-$sid"
+_remember_name() {  # _remember_name <lease response body>
+  local holder name
+  holder=$(printf '%s' "$1" | jq -r '.holder // empty' 2>/dev/null)
+  name="${holder#*/}"
+  # Write only on a holder that has a name half. A body we don't recognise (a
+  # 409 conflict, say — curl -sS exits 0 on those) must leave a good cached name
+  # alone rather than blank the footer on one bad turn.
+  if [ -n "$name" ] && [ "$name" != "$holder" ]; then
+    printf '%s' "$name" >"$_namefile" 2>/dev/null
+  fi
+}
+
+# The HTTP status, not curl's exit code. `curl -sS` exits 0 on a 401 as readily as on a
+# 200, so a token the board has stopped accepting used to write `ok` into the health
+# beacon on every turn: the status line said quarterback was fine while every post it
+# made was being dropped. That is the exact failure qb-mcp's own self-heal exists for,
+# and the one thing a health beacon must not get wrong. `-f` is deliberately not used —
+# it would also throw away the body, which _lease needs.
+_http_ok() {   # _http_ok <status> — is this a status the board answered normally with?
+  case "$1" in 2*) return 0 ;; *) return 1 ;; esac
+}
+
+_post() {   # _post <type> <summary>
+  local code
+  code=$(curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/post" \
+       -d "$(jq -nc --arg t "$1" --arg s "$2" --arg sid "$sid" --argjson refs "$(_refs)" \
+             '{type:$t, summary:$s, session:$sid, refs:$refs}')" \
+       -o /dev/null -w '%{http_code}' 2>/dev/null) || code=""
+  if _http_ok "$code"; then _health ok; else _health down; fi
+}
+_opt() {  # jq expr: merge cwd/title/recap/model when set (shared by lease + record)
+  # shellcheck disable=SC2016  # a jq program, not a shell string: $c/$t/$r/$m are jq's
+  printf '%s' '(if $c!="" then {cwd:$c} else {} end) + (if $t!="" then {title:$t} else {} end) + (if $r!="" then {recap:$r} else {} end) + (if $m!="" then {model:$m} else {} end)'
+}
+_lease() {  # claim OR renew (same device re-claim == renew, per the API), carrying context
+  # repo/branch ride along so /active + /overlap can match live agents by the
+  # git repo they're in (topic self-discovery), not just an identical cwd.
+  # State rides the lease rather than getting a call of its own: the hook already
+  # posts one on every event that changes a state, and a second endpoint for a
+  # field this small would double the traffic to say the same thing. The board
+  # only overwrites when a state is actually sent (see LeaseIn.state), so the
+  # heartbeat leases that know nothing leave the last report — and its age —
+  # alone, which is what makes the age worth reading.
+  #
+  # `-w '\n%{http_code}'` appends the status on its own last line, so the body and the
+  # verdict both survive one call. A 409 is counted as the board answering — a lease
+  # conflict says somebody else holds it, which is news about the lease and not about
+  # quarterback being reachable — while a 401 or a 500 is not, and used to read `ok`.
+  local out code body
+  out=$(curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/lease" \
+       -d "$(jq -nc --arg s "$sid" --arg d "$AGENT" --arg c "$cwd" --arg repo "$repo" --arg br "$branch" \
+                 --arg t "$title" --arg r "$recap" --arg m "$model" --arg st "$STATE_NOW" \
+             "{session:\$s, device:\$d, ttl:1800} + $(_opt) + (if \$repo!=\"\" then {repo:\$repo} else {} end) + (if \$br!=\"\" then {branch:\$br} else {} end) + (if \$st!=\"\" then {state:\$st} else {} end)")" \
+       -w '\n%{http_code}' 2>/dev/null) || out=""
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+  if _http_ok "$code" || [ "$code" = 409 ]; then _health ok; else _health down; fi
+  _http_ok "$code" && _remember_name "$body"
+  return 0
+}
+_put_blob() {   # PUT the transcript blob; echo its sha (empty on any failure)
+  [ -n "$tp" ] && [ -r "$tp" ] && command -v sha256sum >/dev/null 2>&1 || return 0
+  local sha; sha=$(sha256sum "$tp" | cut -d' ' -f1) || return 0
+  curl -sS --max-time 45 "${_auth[@]}" -X PUT "$BASE/blob/$sha" --data-binary "@$tp" \
+    >/dev/null 2>&1 && printf '%s' "$sha"
+}
+_record() {     # _record <endpoint> <sha> — snapshot (keep lease) or handoff (release)
+  curl -sS --max-time 8 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/$1" \
+    -d "$(jq -nc --arg s "$sid" --arg b "$2" --arg c "$cwd" --arg t "$title" --arg r "$recap" --arg m "$model" \
+          "{session:\$s, blob:\$b} + $(_opt)")" \
+    >/dev/null 2>&1 || true
+}
+# ---- the ask courier (v2.13, #107) ------------------------------------------
+# A directed ask used to reach an agent only at its next prompt. For a headless
+# /epic, /lander or /fix-and-land run that meant one poll at the start and then
+# never — and those are exactly the runs where a peer's correction is worth most,
+# because they are long, unattended, and building on a premise nobody has checked
+# since it was formed. The only channel to one was kill(1).
+#
+# Same poll, same cursor, same formatter as before; what changed is that it is a
+# function, so PostToolUse can call it too and the message lands seconds after
+# the tool call rather than at the next human keystroke.
+
+# How many times one TURN may be interrupted. The 45s poll throttle bounds the
+# network, not the interruptions, and the cursor stops the same ask being
+# re-delivered but not a genuine exchange — so two agents asking each other would
+# ping-pong without this. Everything pending coalesces into ONE note (the
+# formatter always did), so the cap counts conversations, not messages.
+ASK_MAX_PER_TURN=2
+
+_ask_budget_ok() {   # true while this turn still has interrupts left
+  local f="${XDG_RUNTIME_DIR:-/tmp}/qb-askturn-$sid" prev n
+  # No prompt_id (Claude Code <2.1.196) means no turn to key on. Fall back to a
+  # quiet period rather than to no limit — and to a limit that expires, rather
+  # than to a per-session counter, which would silently kill the channel for the
+  # rest of a long run after two messages.
+  [ -n "$turn_id" ] || { _throttle "askquiet-$sid" 300; return; }
+  read -r prev n < <(cat "$f" 2>/dev/null || echo "- 0")
+  [ "$prev" = "$turn_id" ] || n=0
+  [ "${n:-0}" -lt "$ASK_MAX_PER_TURN" ] || return 1
+  printf '%s %s\n' "$turn_id" "$(( ${n:-0} + 1 ))" > "$f" 2>/dev/null
+  return 0
+}
+
+_ask_note() {   # _ask_note [midturn] — echo the note for undelivered asks, or nothing
+  local mark cur inbox newcur tail_line
+  # Cursor and throttle are per SESSION, not per machine: with several agents on
+  # one box a machine-wide throttle meant whichever agent polled first swallowed
+  # the window, and a shared cursor meant it also consumed everyone's asks. The
+  # `to=` filter is hierarchical server-side, so this inbox is what was sent to
+  # this agent by name PLUS what was broadcast to the whole machine. Only asks
+  # get here at all (type=ask), so a broadcast status/finding/published can never
+  # interrupt a turn — which is the rule that keeps this a channel and not a
+  # firehose pointed at an agent's attention.
+  mark="${XDG_RUNTIME_DIR:-/tmp}/qb-asks-$AGENT-$INSTANCE"
+  cur=$(cat "$mark" 2>/dev/null || echo 0)
+  inbox=$(curl -sS --max-time 3 "${_auth[@]}" -G "$BASE/board" \
+    --data-urlencode "to=$IDENT" --data-urlencode "since=$cur" --data-urlencode "type=ask" 2>/dev/null)
+  [ -n "$inbox" ] || return 0
+  newcur=$(printf '%s' "$inbox" | jq -r 'if length>0 then (max_by(.id).id) else empty end' 2>/dev/null)
+  # Empty inbox: return WITHOUT spending a budget slot. An interrupt allowance is
+  # for messages that exist, and polls mostly find nothing.
+  [ -n "$newcur" ] || return 0
+  # Budget is checked here, after we know there IS mail and before the cursor
+  # moves. Refusing later would advance the cursor past an ask nobody was shown
+  # and lose it silently; refusing here just leaves it for the next window.
+  if [ "${1:-}" = "midturn" ]; then
+    _ask_budget_ok || return 0
+    tail_line="Answer directly if it concerns your work. This arrived mid-turn — finish what you are doing first; nothing here needs you to abandon an edit."
+  else
+    tail_line="Answer directly if it concerns your work."
+  fi
+  printf '%s' "$newcur" > "$mark" 2>/dev/null
+  printf '%s' "$inbox" | jq -rc --arg tail "$tail_line" '
+    (. // []) as $a
+    | if ($a|length)==0 then ""
+      else "📨 quarterback: "+($a|length|tostring)+" message(s) addressed to you:\n"
+           + ($a | map("  • " + (.from // "?") + ": " + .summary
+                        + "  [reply board_post(type=\"ack\", to=\""+(.from // "")+"\", re="+(.id|tostring)+")]")
+              | join("\n"))
+           + "\n" + $tail
+      end' 2>/dev/null
+}
+
+# ---- sync advisories (v2.8) -------------------------------------------------
+# The classic devops failure: work lands on one machine, another keeps building
+# from a checkout days behind, and nothing tells it. Both halves live here rather
+# than in the model's head — publishing is a reflex on push, and the staleness
+# note arrives before the turn instead of after the wasted build.
+
+_sync_note() {   # echo the board's advice for THIS checkout, or nothing
+  [ -n "$repo" ] && [ -n "$cwd" ] || return 0
+  local top have state dirty ahead behind
+  top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  # "what I have": recent SHAs, newest first. Sending our own history means the
+  # answer is about us whether or not this machine ever ran report_git.
+  #
+  # The window has to outlive the board's PUBLISHED list, not just the last few
+  # commits. The server walks that list newest-first and stops at the first entry
+  # we hold (app/sync.py: missing_published) — so one entry inside the window
+  # vouches for every older one, but if they've ALL scrolled out it reports the
+  # lot as missing. At -n25 that fired on nix-fleet: the newest publish was 32
+  # commits back and a checkout that held all six was told to pull all six.
+  # Abbreviated SHAs buy most of the depth back — the server prefix-matches
+  # anything of MIN_SHA (7) or longer, so ten times the history costs about
+  # 3.7kB of query string against the old 1kB, well inside any URL limit, and
+  # 12 hex digits is far past collision range for a repo this size.
+  have=$(git -C "$top" log -n250 --abbrev=12 --format=%h 2>/dev/null | paste -sd, -)
+  [ -n "$have" ] || return 0
+  dirty=$([ -n "$(git -C "$top" status --porcelain --untracked-files=no 2>/dev/null)" ] \
+          && echo true || echo false)
+  state=$(git -C "$top" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)
+  behind=$(printf '%s' "$state" | cut -f1); ahead=$(printf '%s' "$state" | cut -f2)
+
+  # branch is omitted when detached rather than sent empty — an empty value is a
+  # branch named "" server-side, which matches nothing.
+  curl -sS --max-time 4 "${_auth[@]}" -G "$BASE/sync" \
+    --data-urlencode "repo=$repo" ${branch:+--data-urlencode "branch=$branch"} \
+    --data-urlencode "path=$top" --data-urlencode "have=$have" \
+    --data-urlencode "dirty=$dirty" \
+    ${behind:+--data-urlencode "behind=$behind"} ${ahead:+--data-urlencode "ahead=$ahead"} \
+    2>/dev/null \
+  | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null
+}
+
+_publish_push() {   # announce HEAD if a push just put it on the tracking branch
+  [ -n "$cwd" ] || return 0
+  local top sha up subject
+  top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  up=$(git -C "$top" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || return 0
+  [ -n "$up" ] || return 0
+  # Ask git whether the push landed rather than parsing the tool's output: the
+  # remote-tracking ref only advances on a successful push, so HEAD being an
+  # ancestor of it IS the success condition. A rejected push leaves it behind.
+  git -C "$top" merge-base --is-ancestor HEAD "$up" 2>/dev/null || return 0
+  sha=$(git -C "$top" rev-parse HEAD 2>/dev/null) || return 0
+  # Dedupe by SHA: a re-push, or a push of some other branch, must not re-announce.
+  _once "pub-$sha" || return 0
+  # Summary is the commit subject alone: the SHA, branch and remote are already
+  # in the refs, and a reader's advisory line re-states them around this text.
+  subject=$(git -C "$top" log -1 --format=%s 2>/dev/null | cut -c1-120)
+  [ -n "$subject" ] || subject="pushed ${sha:0:7} to $up"
+
+  curl -sS --max-time 6 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/post" \
+    -d "$(jq -nc --arg s "$subject" --arg sid "$sid" \
+              --arg r "$repo" --arg b "$branch" --arg c "$sha" \
+          '{type:"published", summary:$s, session:$sid,
+            refs: ([{kind:"commit", value:$c}]
+                   + [ if $r!="" then {kind:"repo",value:$r} else empty end ]
+                   + [ if $b!="" then {kind:"branch",value:$b} else empty end ])}')" \
+    >/dev/null 2>&1 || true
+}
+
+case "$EVENT" in
+  SessionStart)
+    # `waiting`, not `working`: the session exists and nothing has been asked of
+    # it yet. A seat started by qb-seats submits its brief within the second and
+    # flips to working on its own, so the honest value here costs nothing.
+    _state waiting
+    _lease
+    _post presence "started${repo:+ on $repo}${branch:+ @ $branch}"
+    # Stale-checkout note (v2.8), first: it's surfaced before any work starts,
+    # which is the only moment it saves a wasted build. Merged with the occupancy
+    # note below into one injection.
+    SEP=$'\n\n'; start_notes="$(_sync_note)"
+
+    # Presence/collision (v2.7): our lease (with repo) is registered; ask who ELSE
+    # is live in this repo — or, for a non-git dir, this exact cwd — self-quieted so
+    # our own fan-out never reads as a peer. This is a light "who's around" note; the
+    # precise same-problem match happens per prompt (UserPromptSubmit), where the
+    # task text is the strongest overlap signal. Fail-open.
+    scope=""; where=""
+    if [ -n "$repo" ]; then scope="repo=$repo"; where="repo $repo"
+    elif [ -n "$cwd" ]; then scope="cwd=$cwd"; where="$cwd"; fi
+    if [ -n "$scope" ]; then
+      lines=$(curl -sS --max-time 6 "${_auth[@]}" -G "$BASE/active" \
+        --data-urlencode "$scope" --data-urlencode "mine=$sid" --data-urlencode "peers_only=true" \
+        2>/dev/null \
+        | jq -rc '[.agents[] | "  • " + .holder + (if .device then " ("+.device+")" else "" end)
+                    + (if .title then " — \""+.title+"\"" else "" end)] | unique | join("\n")' 2>/dev/null)
+      if [ -n "$lines" ]; then
+        occupancy=$(jq -nr --arg w "$where" --arg l "$lines" \
+          '"quarterback: also live in " + $w + ":\n" + $l
+            + "\nWorking the same area is fine — that is what the board is for. If any of them is on the same thing, say hi with the `peers` tool or a board post and compare notes; no need to hold off."')
+        start_notes="${start_notes:+$start_notes$SEP}$occupancy"
+      fi
+    fi
+    if [ -n "$start_notes" ]; then
+      jq -nc --arg c "$start_notes" \
+        '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
+    fi
+    ;;
+  UserPromptSubmit)
+    _state working
+    # Per-turn coordination reflexes (v2.7), each independently throttled and
+    # short-timeout so a turn never stalls; combined into one context injection.
+    SEP=$'\n\n'; notes=""
+    prompt=$(printf '%s' "$IN" | jq -r '.prompt // empty' 2>/dev/null)
+
+    # (0) CLAIM THE WORK BEFORE DOING IT.
+    #
+    # Until now the first thing that reached the board about a piece of work was
+    # the `published` post at the END of it — exactly when a peer can no longer
+    # avoid having duplicated it. On 2026-08-09 three agents each independently
+    # diagnosed and fixed the same red CI job (#1544, #1545, and a third folding
+    # one into the other); the third had *checked for peers first* and been told
+    # the coast was clear. It was not: /overlap ranks peers by their LEASE's
+    # subject, and a lease only learned its subject at SessionStart or the
+    # previous Stop, so two findings already sitting on the board were invisible
+    # to it. An announcement that arrives after the work is the one moment it
+    # cannot prevent anything.
+    #
+    # So refresh the subject from this prompt, and do it BEFORE the discovery
+    # query below reads everyone else's. Two agents starting together now both
+    # see each other rather than neither. Untitled/unrecapped fields stay as they
+    # are — the server only overwrites what we actually send.
+    if [ -n "$prompt" ]; then
+      recap=$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-300)
+      _lease
+      # ...and say it in the stream too, not just the lease table, so a human and
+      # a plain board_read can both see who took what. Throttled per session, and
+      # skipped for short follow-ups ("yes", "carry on") that claim nothing new.
+      if [ "${#prompt}" -gt 25 ] && _throttle "claim-$sid" 600; then
+        _post status "working on: $(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-140)"
+      fi
+    fi
+
+    # (a) Directed asks addressed to THIS agent we have not surfaced yet — a peer's
+    # question lands in the incumbent's next turn, not a manual board read. The
+    # poll itself now lives in _ask_note so PostToolUse can call it too (#107);
+    # this is the prompt-boundary delivery and takes no per-turn budget, because a
+    # prompt boundary is not an interruption.
+    if _throttle "askpoll-$sid" 45; then
+      a=$(_ask_note)
+      [ -n "$a" ] && notes="$a"
+    fi
+
+    # (b) Same-problem discovery on the current task: match the PROMPT (the
+    # strongest subject signal) against live peers in this repo and seed a DIRECT
+    # ask, so a silent overlap becomes a conversation. Throttled per session.
+    if [ -n "$repo" ] && [ -n "$prompt" ] && _throttle "discover-$sid" 600; then
+      peers=$(curl -sS --max-time 3 "${_auth[@]}" -G "$BASE/overlap" \
+        --data-urlencode "mine=$sid" --data-urlencode "repo=$repo" \
+        --data-urlencode "subject=$prompt" 2>/dev/null)
+      p=$(printf '%s' "$peers" | jq -rc '
+        (.peers // []) as $p
+        | if ($p|length)==0 then ""
+          else
+            ($p | map("  • " + .holder + (if .device then " ("+.device+")" else "" end)
+                      + " — \"" + (.title // .recap // "?") + "\""
+                      + (if .last_post_id then "  [re #"+(.last_post_id|tostring)+"]" else "" end))
+               | join("\n")) as $lines
+            | $p[0] as $top
+            | "quarterback: another agent is also on this, from a different angle:\n" + $lines
+              + "\nOverlap is fine — reach out to compare notes when it helps: board_post(type=\"ask\", to=\"" + $top.holder + "\""
+              + (if $top.last_post_id then ", re=" + ($top.last_post_id|tostring) else "" end)
+              + ", summary=\"...\")."
+          end' 2>/dev/null)
+      [ -n "$p" ] && notes="${notes:+$notes$SEP}$p"
+    fi
+
+    # (c) Stale checkout (v2.8): a peer published commits this checkout doesn't
+    # have. Throttled per session — the SessionStart note covers the start, this
+    # catches a peer landing work mid-session, before we build on stale code.
+    if [ -n "$repo" ] && _throttle "sync-$sid" 300; then
+      s=$(_sync_note)
+      [ -n "$s" ] && notes="${notes:+$notes$SEP}$s"
+    fi
+
+    if [ -n "$notes" ]; then
+      jq -nc --arg c "$notes" \
+        '{hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:$c}}'
+    fi
+    ;;
+  Stop)
+    # The turn ended, so the pane is waiting on a human. This is the state the
+    # whole beacon exists for: with ten seats open it is the only thing that says
+    # which one wants you, and it is invisible from the outside — a finished pane
+    # and a thinking pane render identically.
+    _state waiting
+    _lease   # heartbeat: keep this live session's lease from lapsing
+    # freshness: snapshot the transcript (keeps the lease) so a peer can resume
+    # mid-session — throttled to bound uploads on long sessions.
+    if _throttle "snap-$sid" 120; then sha=$(_put_blob); [ -n "$sha" ] && _record snapshot "$sha"; fi
+    ;;
+  SessionEnd)
+    # The beacons go with the session. A `waiting` left behind by a closed pane
+    # would be indistinguishable from one that is still open and wants you, and
+    # the session id is never reused.
+    rm -f "${XDG_RUNTIME_DIR:-/tmp}/qb-state-$sid" \
+          "${XDG_RUNTIME_DIR:-/tmp}/qb-title-$sid" 2>/dev/null
+    # push the transcript so another device can pull + resume, then hand off (release)
+    sha=$(_put_blob); [ -n "$sha" ] && _record handoff "$sha"
+    _post presence "ended${repo:+ on $repo}"
+    # Handoff releases the lease, which retires the name — it may be another
+    # agent's within the minute, so stop claiming it here.
+    rm -f "$_namefile" 2>/dev/null
+    ;;
+  Notification)
+    # Claude Code fires this when it wants something from the human: a permission
+    # prompt it cannot answer itself, or a session idle at the prompt for 60s.
+    # Both mean the same thing to somebody scanning a wall of panes — this one is
+    # asking — and neither is visible anywhere else, which is why the event is
+    # wired at all (see home/claude/settings.json; it was the one lifecycle event
+    # this hook did not receive).
+    #
+    # Nothing is posted to the board: a permission prompt is between an agent and
+    # its operator, and at N panes a post per prompt would be the noisiest thing
+    # on the tape. The beacon is enough — it is read by the pane's own footer.
+    _state input
+    # ...and tell the board, so the dashboard sees it and not just this pane's
+    # own footer. Throttled: Claude Code also fires this on a 60s idle, and an
+    # idle session must not turn into a lease every minute for the rest of the
+    # afternoon.
+    _throttle "notify-$sid" 60 && _lease
+    ;;
+  PreToolUse)
+    _state working
+    # Sub-agent visibility (v2.6): register a Task/Agent spawn as current-state
+    # (never a post). Scoped to Task by the settings.json matcher; the tool_name
+    # guard is belt-and-braces. agent_id is a stable hash of the invocation so
+    # the matching PostToolUse ends exactly this one. Backgrounded so board
+    # latency never delays spawning the sub-agent.
+    [ "$(printf '%s' "$IN" | jq -r '.tool_name // empty' 2>/dev/null)" = "Task" ] || exit 0
+    # agent_id must be byte-identical between Pre and Post for the same Task call,
+    # so canonicalize: recursively sort object keys before serializing (jq's
+    # tostring/tojson do NOT honor --sort-keys, and payload key order is not a
+    # protocol guarantee). Otherwise Post can't end the subagent it opened.
+    aid=$(printf '%s' "$IN" | jq -j '.session_id, (.tool_input | walk(if type=="object" then to_entries|sort_by(.key)|from_entries else . end) | tojson)' 2>/dev/null | sha256sum | cut -c1-16)
+    label=$(printf '%s' "$IN" | jq -r '.tool_input | ((.subagent_type // "agent") + ": " + (.description // ""))' 2>/dev/null | cut -c1-80)
+    curl -sS --max-time 5 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/subagent" \
+      -d "$(jq -nc --arg s "$sid" --arg a "$aid" --arg l "$label" --arg c "$cwd" --arg d "$AGENT" \
+            '{parent_session:$s, agent_id:$a, label:$l, cwd:$c, device:$d, ttl:1800}')" \
+      >/dev/null 2>&1 &
+    ;;
+  PostToolUse)
+    # (a) The courier (#107). First, and outside the kind switch, because it is
+    # the only thing here that writes to stdout and it must run whatever the tool
+    # was. $pt_kind / $ASK_POLL_DUE were decided by the hot-path guard at the top,
+    # which has already refused this in a sub-agent.
+    if [ -n "${ASK_POLL_DUE:-}" ]; then
+      a=$(_ask_note midturn)
+      [ -n "$a" ] && jq -nc --arg c "$a" \
+        '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$c}}'
+    fi
+    case "$pt_kind" in
+      push)
+        # Publish reflex (v2.8): a push is the moment every other checkout in the
+        # fleet goes stale, so announcing it must not depend on anyone remembering
+        # to. The command matched loosely in the guard (`git -C x push`, `… && git
+        # push -u origin main`); _publish_push asks git whether the push landed.
+        # stdout is closed explicitly rather than merely unused: this branch can
+        # now run AFTER the courier has written its JSON, and a backgrounded child
+        # holding the hook's stdout open would keep the reader waiting on EOF.
+        _publish_push >/dev/null 2>&1 &
+        ;;
+      task)
+        # Same canonical hash as PreToolUse (see there) so we end the exact agent_id we opened.
+        aid=$(printf '%s' "$IN" | jq -j '.session_id, (.tool_input | walk(if type=="object" then to_entries|sort_by(.key)|from_entries else . end) | tojson)' 2>/dev/null | sha256sum | cut -c1-16)
+        curl -sS --max-time 5 "${_auth[@]}" "${_json[@]}" -X POST "$BASE/subagent/end" \
+          -d "$(jq -nc --arg s "$sid" --arg a "$aid" '{parent_session:$s, agent_id:$a}')" \
+          >/dev/null 2>&1 &
+        ;;
+    esac
+    ;;
+esac
+exit 0

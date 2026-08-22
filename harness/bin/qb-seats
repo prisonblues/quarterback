@@ -283,7 +283,7 @@ dash_cmd() {
 # two would make this print two ids, `resize-pane -t` rejects a two-id target, and
 # the reassert below would then quietly do nothing at all.
 dash_pane() {
-  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_label}' \
+  tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id} #{@qb_label}' \
     | awk '$2 == "dash" { print $1; exit }'
 }
 
@@ -483,7 +483,7 @@ dash_hooks() {
   for self in "${tried[@]}"; do
     understands_dash_fit "$self" || continue
     cmd="$(sh_quote "$self") --dash-fit -s $(sh_quote "$SESSION")"
-    tmux set-hook -w -t "$SESSION:seats" window-resized \
+    tmux set-hook -w -t "$SESSION_ID:seats" window-resized \
       "run-shell -b \"$(tmux_quote "$cmd")\""
     return 0
   done
@@ -558,17 +558,20 @@ seat_bar() {
 #     the ✕ is three columns from the cell that merely jumps to the pane.
 install_bar() {
   local click=$1 run stash confirm inner
-  # `-t "=$SESSION:"`, with the colon, throughout. set-option rejects the bare
-  # `=name` exact-match form that every other command here takes — it reports
-  # "no such session" for a session that plainly exists. The colon makes it a
-  # window target of that session, which resolves, and keeps `=` doing its job:
-  # dropping it would let a session named `seats-quarterback-old` be matched by
-  # a prefix and configured instead of this one.
-  tmux set-option -t "=$SESSION:" mouse on
-  tmux set-option -t "=$SESSION:" status 2
-  tmux set-option -t "=$SESSION:" status-position top
-  tmux set-option -t "=$SESSION:" 'status-format[1]' "$(seat_bar)"
-  tmux set-option -t "=$SESSION:" @qb_bar 1
+  # `-t "$SESSION_ID:"` — the id, then the colon that says "that session's current
+  # window". These lines used to read `-t "=$SESSION:"`, and both halves of that
+  # spelling were about the NAME: set-option would not take the bare `=name`
+  # exact-match form at all ("no such session" for a session that plainly exists),
+  # and the `=` was there to stop `seats-quarterback-old` being matched by prefix.
+  # An id needs neither — it is exact by construction and set-option takes it with
+  # or without the colon (measured on 3.6a and 3.7b alike). The colon stays because
+  # every other session target in this script carries it and one spelling is easier
+  # to hold than two, not because anything here still depends on it.
+  tmux set-option -t "$SESSION_ID:" mouse on
+  tmux set-option -t "$SESSION_ID:" status 2
+  tmux set-option -t "$SESSION_ID:" status-position top
+  tmux set-option -t "$SESSION_ID:" 'status-format[1]' "$(seat_bar)"
+  tmux set-option -t "$SESSION_ID:" @qb_bar 1
 
   # Assembled in pieces and passed as ONE LINE. A newline inside a tmux command
   # string ends the command, so the readable indented version of this — nested
@@ -601,17 +604,63 @@ default_repo() {
 }
 
 # ---- tmux helpers -----------------------------------------------------------
-have_session() { tmux has-session -t "=$SESSION" 2>/dev/null; }
+# THE ID, NEVER THE NAME, IS WHAT A `-t` GETS. `.` and `:` are a target's own
+# separators, and a session name is whatever `-s` was handed. tmux used to rewrite
+# those characters out of a name it would not take — which is what this script
+# leaned on, and what the warning by new-session is about — and tmux 3.7b stopped:
+# `my.screen` is now kept verbatim, so `-t "=my.screen"` parses as pane `screen` of
+# session `my` and comes back "can't find pane: screen". Every seat command then
+# failed against a screen that plainly existed, `list` showed nothing, and `resume`
+# could not reach it (#259, which read this as stale tests; the tests were right and
+# the script was leaning on a tmux behaviour that went away).
+#
+# `#{session_id}` is `$0`, `$3` — no separators, unique for the life of the server,
+# and tmux's own answer to "which session". Names are for humans and stay in the
+# messages; ids do the addressing.
+SESSION_ID=""
+
+# The id of a session by exact name, read off `list-sessions` rather than looked up
+# with `-t`: a lookup BY name is the very thing that cannot be trusted here. The
+# name is the last field for the reason `screens()` gives — it may contain spaces,
+# and everything before it is one fixed field.
+session_id() {
+  local line
+  # SPLIT BY HAND, not with `IFS=' ' read -r id nm`: read strips trailing IFS
+  # whitespace from the last field, so a session called `mine ` (tmux takes one)
+  # would come back as `mine` and never compare equal to what the caller asked
+  # for. `IFS=` keeps the line whole and the two expansions cut it at the first
+  # space, which is where the id ends.
+  tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
+    | while IFS= read -r line; do
+        [ "${line#* }" = "$1" ] && printf '%s\n' "${line%% *}"
+      done
+}
+
+# Sets SESSION_ID as a side effect, so a caller that goes on to address the session
+# does not have to remember to. Absent session, empty id, false — one answer.
+have_session() {
+  SESSION_ID=$(session_id "$SESSION")
+  [ -n "$SESSION_ID" ]
+}
 
 attach() {
   if [ -n "${TMUX:-}" ]; then
-    tmux switch-client -t "=$SESSION"
+    tmux switch-client -t "$SESSION_ID"
   elif [ -t 0 ]; then
-    tmux attach-session -t "=$SESSION"
+    tmux attach-session -t "$SESSION_ID"
   else
     # No terminal to attach to (a script, a unit, a CI check). The screen is up
     # regardless — say how to reach it rather than failing.
-    printf '%s: %s is up — tmux attach -t %s\n' "$PROG" "$SESSION" "$SESSION"
+    #
+    # `$PROG resume` and not `tmux attach -t $SESSION`, which is what this said
+    # and which does not work for the names this script now supports: a target
+    # session is parsed for `.` and `:` like any other, so `tmux attach -t
+    # my.screen` comes back "can't find pane: screen" on 3.7b (measured). Handing
+    # a human a command that fails against exactly the screens the id conversion
+    # exists for is worse than saying nothing. `resume` takes the name because it
+    # resolves it the way session_id does, and it is the spelling `list` already
+    # advertises.
+    printf '%s: %s is up — %s resume %s\n' "$PROG" "$SESSION" "$PROG" "$SESSION"
   fi
 }
 
@@ -635,26 +684,33 @@ attach() {
 # THE LAST FIELD of each record: everything before it is a fixed count of fields,
 # so a reader can take the rest of the line as the name and be right.
 screens() {
-  local s n att path all
+  local s sid n att path all line
   # READ THE SESSION LIST FIRST, and tolerate it failing. A server with no
   # sessions at all — which is `list` and `resume` on a box where nothing is up,
   # the commonest reason to run either — makes `tmux list-sessions` exit 1, and
   # under `pipefail` that status is the whole pipeline's however the `while`
   # ends. `set -e` then took the script down before it could say so: measured as
   # `qb-seats list` printing "no screens are up" and exiting 1 anyway.
-  all=$(tmux list-sessions -F '#{session_name}' 2>/dev/null) || return 0
+  all=$(tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null) || return 0
   [ -n "$all" ] || return 0
-  printf '%s\n' "$all" | sort | while IFS= read -r s; do
-    n=$(tmux list-panes -s -t "=$s" -F '#{@qb_seat}' 2>/dev/null \
+  # Sorted on the NAME, which is field 2 onwards — the id sorts `$10` before `$2`
+  # and is not what a reader is scanning. Each line is `<id> <name>`, and the id
+  # is what the two lookups below address: a session called `my.screen` is real
+  # and unreachable by its own name (see session_id).
+  printf '%s\n' "$all" | sort -k2 | while IFS= read -r line; do
+    sid=${line%% *}; s=${line#* }
+    n=$(tmux list-panes -s -t "$sid" -F '#{@qb_seat}' 2>/dev/null \
           | awk 'NF { n++ } END { print n + 0 }')
     [ "$n" -gt 0 ] || continue
-    # `=$s:` WITH THE COLON, exactly as the set-option calls further down use it
-    # and for the same reason: display-message takes a target-PANE, and a bare
-    # session name is not one. It does not fail loudly either — it prints an
-    # empty line, which is how the first cut of this listed every screen with no
-    # path and every one of them "(attached)".
-    att=$(tmux display-message -p -t "=$s:" '#{session_attached}' 2>/dev/null) || att=
-    path=$(tmux display-message -p -t "=$s:" '#{session_path}' 2>/dev/null) || path=
+    # `$sid:` WITH THE COLON, exactly as the set-option calls further down use it.
+    # These read `=$s:` before the id conversion, and the colon was load-bearing
+    # then: display-message takes a target-PANE and a bare session NAME is not
+    # one, and it does not fail loudly either — it prints an empty line, which is
+    # how the first cut of this listed every screen with no path and every one of
+    # them "(attached)". See install_bar for why the colon is kept now that the
+    # target is an id and no longer needs it.
+    att=$(tmux display-message -p -t "$sid:" '#{session_attached}' 2>/dev/null) || att=
+    path=$(tmux display-message -p -t "$sid:" '#{session_path}' 2>/dev/null) || path=
     # NO FIELD MAY BE EMPTY. A tab is IFS whitespace, so a reader splitting on one
     # collapses a run of them: `3\t\t\tname` reads back as two fields, not four,
     # and the name lands in the second variable. The defaults are therefore not
@@ -749,7 +805,7 @@ EOF
 # Seats are identified by a pane option, not by index or title: the index shifts
 # when a pane is added, and the agent in the pane rewrites the title.
 seat_panes() {
-  tmux list-panes -t "$SESSION:seats" -F '#{pane_id} #{@qb_seat}' \
+  tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id} #{@qb_seat}' \
     | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
 }
 
@@ -832,6 +888,51 @@ beside_me() {
   printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "$name"
 }
 
+# ---- what a screen of N seats is about to spend ------------------------------
+#
+# N agents on ONE subscription is the largest single spending decision this fleet
+# makes, and it is made here, by a human, at a prompt. Until #275 the five-hour
+# and weekly caps were drawn on the dash and read by nothing, so the brake on the
+# fleet's only hard ceiling was somebody noticing a bar go red — and this command
+# is the moment that matters most and the moment nobody is looking at the dash.
+#
+# IT WARNS AND PROCEEDS, ALWAYS. A human bringing up a screen has already decided
+# to spend; what helps is a prediction rather than a refusal — what these N seats
+# cost, against what is left and when it comes back. The refusal lives one layer
+# down in qb-seat, off by default, for the panes with nobody in front of them
+# (QB_SEAT_PACE=obey).
+#
+# Printed here rather than left to the seats, because a pane execs its agent
+# moments later and the agent's own screen paints over anything printed before
+# it. This is the terminal that stays.
+#
+# QB_SEATS_PACE=off silences it — and is how a test avoids reading the developer's
+# real subscription.
+pace_note() {
+  local bin line
+  [ "${QB_SEATS_PACE:-on}" = off ] && return 0
+  bin=$(beside_me qb-pace)
+  # An older or partial install has no qb-pace. That is not a reason to refuse to
+  # build a screen; it is a screen built without the estimate, as before.
+  [ -x "$bin" ] || return 0
+  # `|| true` because this runs under `set -e` and the answer is advisory: a
+  # timeout, a broken interpreter or a board that will not answer must cost the
+  # note, never the screen. `|| true` rather than `|| line=`, so a command that
+  # said something useful AND exited non-zero is still relayed — the assignment
+  # has already happened by then, and throwing the line away would silence the
+  # one case where a caller most wants to hear it.
+  if command -v timeout >/dev/null 2>&1; then
+    line=$(timeout 20 "$bin" --estimate "$SEATS" 2>/dev/null) || true
+  else
+    line=$("$bin" --estimate "$SEATS" 2>/dev/null) || true
+  fi
+  [ -n "$line" ] || return 0
+  printf '%s\n' "$line" | while IFS= read -r l; do
+    printf '%s: %s\n' "$PROG" "$l" >&2
+  done
+  return 0
+}
+
 # ---- the knobs qb-seat reads ------------------------------------------------
 # qb-seat's own knobs have to be forwarded explicitly. A pane's environment comes
 # from the tmux SERVER, and the server is usually one that was already running
@@ -892,7 +993,7 @@ seat_env_fill() {
   local v
   seat_env=()
   [ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
-  for v in QB_SEAT_AGENT QB_SEAT_FORCE QB_SEAT_YOLO; do
+  for v in QB_SEAT_AGENT QB_SEAT_FORCE QB_SEAT_PACE QB_SEAT_YOLO; do
     [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
   done
   [ -n "${QB_SEAT_BRIEF+set}" ] && seat_env+=(-e "QB_SEAT_BRIEF=$QB_SEAT_BRIEF")
@@ -973,6 +1074,9 @@ if [ "$ACTION" = list ]; then
 fi
 
 if [ "$ACTION" = resume ]; then
+  # resolve_screen answers with a NAME, because that is what a user typed and what
+  # the list printed. `attach` addresses the id, so it is looked up here — via
+  # have_session, which is the one place that mapping lives.
   if ! SESSION=$(resolve_screen "$TARGET"); then
     if [ -z "$(screen_names)" ]; then
       die "no screens are up — start one with \`$PROG\` in the repo you want it in"
@@ -985,6 +1089,7 @@ if [ "$ACTION" = resume ]; then
     list_screens >&2
     exit 1
   fi
+  have_session || die "'$SESSION' went away between the listing and the attach"
   attach
   exit 0
 fi
@@ -995,7 +1100,7 @@ REPO=$(cd -P "$REPO" 2>/dev/null && pwd) || die "no such directory: $REPO"
 
 if [ "$ACTION" = kill ]; then
   have_session || die "no session $SESSION"
-  tmux kill-session -t "=$SESSION"
+  tmux kill-session -t "$SESSION_ID"
   exit 0
 fi
 
@@ -1055,6 +1160,7 @@ if have_session; then
 fi
 
 require_qb_seat
+pace_note
 
 # QB_SEATS_DASH_SIZE reaches `split-window -l` and `resize-pane -x` verbatim, so it
 # is checked here, where nothing exists yet. `QB_SEATS_DASH_SIZE=78px` makes
@@ -1116,9 +1222,26 @@ seat_env_fill
 # and refuses on tmux's own "duplicate session: my_screen" — which at least names
 # the screen it is talking about. The warning below is where a user learns it.
 SESSION_ASKED=$SESSION
-SESSION=$(tmux new-session -d -P -F '#{session_name}' -s "$SESSION" -n seats -c "$REPO" \
-  -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
+# BOTH halves, in one call: the id to address it by and the name to call it by.
+# Asking for the id here rather than looking it up afterwards is the point — a
+# lookup by name is exactly what a name carrying `.` or `:` defeats (see
+# session_id). The id is the first field and the name is the rest, so a name with
+# a space in it still arrives whole.
+_created=$(tmux new-session -d -P -F '#{session_id} #{session_name}' -s "$SESSION" \
+  -n seats -c "$REPO" -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
   -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"})
+# CHECKED ON THE SHAPE, not by comparing the two halves. `${_created%% *}` and
+# `${_created#* }` both return the whole string when there is no space in it, so
+# "they came back different" reads as "there were two fields" — except for a
+# session actually named `$3`, where the two fields are genuinely equal and a
+# perfectly good screen would die here as a tmux malfunction. `$` and digits is
+# what a session id is, and a name has to be there after the space.
+case "$_created" in
+  '$'[0-9]*' '?*) ;;
+  *) die "tmux did not report the new session's id and name ('$_created')" ;;
+esac
+SESSION_ID=${_created%% *}
+SESSION=${_created#* }
 [ "$SESSION" = "$SESSION_ASKED" ] \
   || warn "tmux would not take '$SESSION_ASKED' as a session name and called this
        screen '$SESSION' instead — that is the name to reattach to, and the name
@@ -1126,16 +1249,16 @@ SESSION=$(tmux new-session -d -P -F '#{session_name}' -s "$SESSION" -n seats -c 
 
 # Never a shared instance: strip any inherited value from the session
 # environment, so nothing a seat spawns can pick one up. qb-seat sets its own.
-tmux set-environment -t "=$SESSION" -r QUARTERBACK_INSTANCE
+tmux set-environment -t "$SESSION_ID" -r QUARTERBACK_INSTANCE
 
 # Label the panes. Two seats are indistinguishable once both are printing, and
 # being able to address ONE of them is the whole point.
-tmux set-option -w -t "$SESSION:seats" pane-border-status top
+tmux set-option -w -t "$SESSION_ID:seats" pane-border-status top
 # @qb_label is how a pane that is NOT a seat says what it is: the option this script
 # labels the dash and the tape with, and the one the dashboard marks a review pane
 # with when it splits one into this row. Without the middle case every such pane is
 # labelled "board", which is the one thing on this screen they are definitely not.
-tmux set-option -w -t "$SESSION:seats" pane-border-format \
+tmux set-option -w -t "$SESSION_ID:seats" pane-border-format \
   ' #{?@qb_seat,seat #{@qb_seat},#{?@qb_label,#{@qb_label},board}} #{?pane_active,*,} '
 
 # What the screen is, recorded on the screen. The bar's ＋ has to run this same
@@ -1143,7 +1266,7 @@ tmux set-option -w -t "$SESSION:seats" pane-border-format \
 # in a run-shell is the tmux server's, and the seat panes' cwd is only the repo
 # until somebody cds.
 SELF=$(beside_me qb-seats)
-tmux set-option -t "=$SESSION:" @qb_repo "$REPO"
+tmux set-option -t "$SESSION_ID:" @qb_repo "$REPO"
 
 # THE SCOPE IS RECORDED AS WELL AS FORWARDED, and the two are for different
 # readers. The variable tells the seat what to call itself; this tells whatever
@@ -1159,8 +1282,8 @@ tmux set-option -t "=$SESSION:" @qb_repo "$REPO"
 # scope asks for machine-wide numbering, in which no second screen can hold the
 # same seat number for a reader to confuse it with.
 [ -z "${QB_SEAT_SCOPE+set}" ] \
-  || tmux set-option -t "=$SESSION:" @qb_scope "$QB_SEAT_SCOPE"
-tmux set-option -t "=$SESSION:" @qb_seats_bin "$SELF"
+  || tmux set-option -t "$SESSION_ID:" @qb_scope "$QB_SEAT_SCOPE"
+tmux set-option -t "$SESSION_ID:" @qb_seats_bin "$SELF"
 
 # The bar is opt-out because turning it on is not free: it takes over the status
 # line, turns the mouse on (which costs shift-less text selection), and binds a
@@ -1179,7 +1302,7 @@ row_of() {                      # how many seats go in the top row
 }
 TOP=$(row_of)
 
-first=$(tmux list-panes -t "$SESSION:seats" -F '#{pane_id}')
+first=$(tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id}')
 tmux set-option -p -t "$first" @qb_seat 1
 
 # Split off the pane just made, not off $first: a split lands to the RIGHT of
@@ -1209,7 +1332,7 @@ if [ "$SEATS" -gt "$TOP" ]; then
   done
   tmux select-layout -t "$second" -E 2>/dev/null || true
 fi
-[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION:seats" even-horizontal
+[ "$SEATS" -le 5 ] && tmux select-layout -t "$SESSION_ID:seats" even-horizontal
 
 # The dash, down the right. AFTER the select-layout calls above and BEFORE the
 # tape below, and both halves of that matter:
@@ -1238,7 +1361,7 @@ if [ -n "$DASH_CMD" ]; then
   # line saying why beats dying half-built, on a tmux error, with a session name
   # that then makes the obvious rerun fail too.
   if ! dash=$(tmux split-window -h -f -l "$DASH_SIZE" -P -F '#{pane_id}' \
-                -t "$SESSION:seats" -c "$REPO"); then
+                -t "$SESSION_ID:seats" -c "$REPO"); then
     warn "no dash: the pane could not be split off at $DASH_SIZE columns"
     DASH_CMD=""
     dash=""

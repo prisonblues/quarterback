@@ -31,8 +31,9 @@ of them mean "do not merge", so a caller that conflates them fails safe.
 
 READ-ONLY, AND IT TAKES NO CLAIM
     This reports commands; it never runs them. It reads ``kind=merge`` claims and
-    HOLDs when another agent holds the branch, but it does not TAKE that claim —
-    that is #100's, where the merge actually happens. The distinction is between
+    the merge queue, and HOLDs when another agent holds the base this PR lands
+    onto or sits ahead of it in the line — but it TAKES neither. That is #100's,
+    where the merge actually happens. The distinction is between
     the verdict (a pure function of the world) and the actor (the thing that
     merges), and conflating them costs three things at once: a verdict that
     mutates cannot run as a CI check, cannot be re-run to verify itself, and
@@ -68,10 +69,12 @@ WHAT IT MUST NOT BECOME
     the round's own statements: ``stopped``, ``confirmed``, ``head_sha``,
     ``sonar_gate``. #62 spent three rounds discovering that merge gates trust
     proxies, replacing the exit code with the push and the push with the payload
-    artefact. And ``stop_confident: false`` is a WARN, not a HOLD: two
+    artefact. And ``stop_confident: false`` is a WARN by default, not a HOLD: two
     permanently-absent reviewer seats on a headless box would otherwise make a
     green verdict unreachable, which is the noise-for-signal trade
-    ``.harness-rules`` already argues against for ``coverage_veto``.
+    ``.harness-rules`` already argues against for ``coverage_veto``. A caller
+    that ran the round itself and is about to offer to land on the strength of it
+    asks for the strict reading with ``--require-earned-stop`` (#100).
 
 ITS LIMIT, STATED PLAINLY
     This is advisory. The board cannot gate github.com and neither can a script
@@ -85,13 +88,13 @@ Usage:
     preland.py --pr 131                     # human-readable, in the cwd's repo
     preland.py --pr 131 --json              # the payload a loop reads
     preland.py --pr 131 --skip ci           # for a CI job (see above)
+    preland.py --pr 131 --require-earned-stop   # for the loop that ran the round
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import shlex
 import subprocess
 import sys
@@ -103,9 +106,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+# `board_config` and the site-config reader beneath it were WRITTEN here and now
+# live one layer down, because this module's own comment said where they belonged
+# the moment anything else needed them: *"the moment a second reader needs this it
+# belongs in harness_rules.py beside the other shared plumbing."* #305's dial layer
+# is that second reader, and two copies of "which board is this box on, and what
+# bearer does it use" is how two readers come to disagree about which island they
+# are talking to. `board_request` stays here: its contract is this script's — it
+# never raises, and it returns the HTTP status because one check has to tell an
+# older board from a broken one.
 from harness_rules import (  # noqa: E402
-    RepoNotFound, check_status, describe, resolve_repo,
+    BOARD_TIMEOUT, RepoNotFound, board_config, check_status, describe, resolve_repo,
 )
+# #278's reading lives in `panel_scope` because that is where the review target is
+# decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
+# on have to answer "how involved was that merge" the same way, or a payload and a
+# verdict can disagree about the same commit with nothing saying which is right.
+# Only the measurement differs by caller — the panel reads GitHub's compare API and
+# checks nothing out, this runs in a checkout and has real `git`.
+from panel_scope import (  # noqa: E402
+    DEFAULT_DISTANT_MERGE_LINES, Integration, merge_involvement,
+)
+from panel_seats import distant_merge_lines  # noqa: E402
 
 READY, RECONCILE, HOLD = "READY", "RECONCILE", "HOLD"
 
@@ -116,7 +138,7 @@ EXIT = {READY: 0, RECONCILE: 3, HOLD: 2}
 #: collected from the functions so that `--skip nonsense` and a typo in
 #: `.harness-rules` are both hard errors: a gate silently running one check short
 #: is the failure mode the whole file exists to prevent.
-CHECKS = ("pr_state", "checkout", "ci", "review", "merge_claim",
+CHECKS = ("pr_state", "checkout", "ci", "review", "merge_claim", "queue",
           "migrations", "sw_version")
 
 #: The three distinct reasons a check did not run. Kept apart because "this repo
@@ -130,18 +152,10 @@ SKIPPED = ("skipped-absent", "skipped-disabled", "skipped-flag")
 #: this way round.
 NOT_AN_OBJECTION = ("passed", "reconcile", *SKIPPED)
 
-#: Where the site config lives, in qb-env's words: the per-host file that says
-#: which board this machine belongs to. Environment beats it, and an unset URL is
-#: an ERROR rather than a guess — the fleet has more than one board and they are
-#: deliberately disjoint, so a default would point an agent at another island's.
-QB_CONFIG = Path(os.environ.get("QUARTERBACK_CONFIG") or (
-    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    / "quarterback" / "config"))
-
-#: The pre-config fleet layout, kept for a host that has not been rebuilt yet.
-QB_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
-
-BOARD_TIMEOUT = 15
+#: The board endpoint the landing queue lives behind (#227/#317). Named here
+#: because :func:`check_queue` says it back in two messages, and a path spelled
+#: three times is a path that ends up spelled two ways.
+QUEUE_PATH = "merge-queue"
 
 
 # --------------------------------------------------------------- the two shells
@@ -275,108 +289,82 @@ def verdict_of(checks: list[Check]) -> str:
 # ---------------------------------------------------------------- the board read
 
 
-def _config_file(path: Path) -> dict[str, str]:
-    """The site config's `KEY=value` lines, as a mapping.
-
-    A deliberately small reader for a file bash SOURCES. It takes plain
-    assignments and strips one layer of quotes; it does not evaluate anything,
-    because a config read must not be able to run what a config write put there.
-    A line it cannot parse is skipped rather than guessed at.
-
-    The cost of not evaluating: a value containing `$VAR` is taken literally.
-    That is the honest failure — the board is then "unreachable at $VAR/…", which
-    names the problem — rather than the dishonest one, which would be expanding
-    it here and getting a different answer than `qb` does.
-    """
-    out: dict[str, str] = {}
-    try:
-        text = path.read_text()
-    except OSError:
-        return out
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        line = line[len("export "):].strip() if line.startswith("export ") else line
-        name, sep, value = line.partition("=")
-        if not sep or not name.replace("_", "").isalnum():
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
-            value = value[1:-1]
-        out[name.strip()] = value
-    return out
-
-
-def board_config() -> tuple[str, str, str]:
-    """(base_url, token, why-it-is-unusable) for this host's board.
-
-    Same contract and same precedence as `qb-env`, which is the fleet's rule
-    rather than this script's preference: environment beats the config file, an
-    unset URL is an error and never a guess, and the token may come from a
-    command because its source is per-site (a cached file here, an ssh fetch
-    there). Re-derived in Python only because `qb` has no read subcommand for
-    reviews and lives in another repo; the moment a second reader needs this it
-    belongs in harness_rules.py beside the other shared plumbing.
-    """
-    cfg = _config_file(QB_CONFIG)
-    url = (os.environ.get("QUARTERBACK_BASE_URL")
-           or cfg.get("QUARTERBACK_BASE_URL", "")).rstrip("/")
-    if not url:
-        return "", "", (
-            f"no board configured on this host — QUARTERBACK_BASE_URL is unset "
-            f"and there is deliberately no default (see {QB_CONFIG})")
-    token = os.environ.get("QUARTERBACK_TOKEN", "") or _token_from(cfg)
-    if not token:
-        return url, "", ("no board token — set QUARTERBACK_TOKEN, or "
-                         f"QUARTERBACK_TOKEN_CMD in {QB_CONFIG}")
-    return url, token, ""
-
-
-def _token_from(cfg: dict[str, str]) -> str:
-    """The bearer, via the config's own command or the pre-config token file."""
-    cmd = cfg.get("QUARTERBACK_TOKEN_CMD", "")
-    if cmd:
-        proc = run(["bash", "-c", cmd])
-        first = (proc.stdout or "").strip().splitlines()
-        if not proc.returncode and first:
-            return first[0]
-    try:
-        return QB_TOKEN_FILE.read_text().strip()
-    except OSError:
-        return ""
-
-
 def board_get(path: str, params: dict) -> tuple[object, str]:
-    """(parsed JSON, error) from the board. Never raises: an unreachable board is
-    a fact this script REPORTS, and reporting it is what makes it a HOLD rather
-    than an exception nobody mapped to a verdict."""
+    """(parsed JSON, error) from the board, for the checks with no use for a
+    status code. :func:`board_request` without its third element."""
+    body, err, _ = board_request(path, params)
+    return body, err
+
+
+def board_request(path: str, params: dict) -> tuple[object, str, int | None]:
+    """(parsed JSON, error, HTTP status) from the board. Never raises: an
+    unreachable board is a fact this script REPORTS, and reporting it is what
+    makes it a HOLD rather than an exception nobody mapped to a verdict.
+
+    The status is returned because ONE caller needs to tell two failures apart
+    that the error sentence cannot: :func:`check_queue` reads an endpoint that
+    older boards do not implement, and a 404 there means "this board has no
+    landing queue" — a capability answer — while a 500 means it has one and it
+    broke. The module docstring's capability rule for repo-local scripts is the
+    same rule; the board is simply the other place a guardrail can be absent.
+    It is `None` for everything that never reached HTTP at all.
+    """
     url, token, why = board_config()
     if why:
-        return None, why
+        return None, why, None
     full = f"{url}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
         with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT) as r:
-            return json.loads(r.read().decode()), ""
+            return json.loads(r.read().decode()), "", r.status
     except urllib.error.HTTPError as e:
         # Before URLError: it is a subclass, and an HTTP status says far more
         # than "unreachable" — 401 in particular is a token problem, not a board
         # that is down, and the two want different remedies.
         hint = " — the token this host resolved was refused" if e.code == 401 else ""
-        return None, f"board answered HTTP {e.code} for /{path.lstrip('/')}{hint}"
+        return None, f"board answered HTTP {e.code} for /{path.lstrip('/')}{hint}", e.code
     except OSError as e:
         # OSError, not URLError: it covers URLError and TimeoutError both, plus a
         # connection reset partway through the read, which is an OSError that
         # urllib does not wrap. This function's contract is that it never raises,
         # and a narrow tuple is how that contract quietly stops being true.
-        return None, f"board unreachable at {url} ({e.__class__.__name__})"
+        return None, f"board unreachable at {url} ({e.__class__.__name__})", None
     except ValueError:
-        # JSONDecodeError, and a body that is not valid UTF-8.
-        return None, f"board answered /{path.lstrip('/')} with something that is not JSON"
+        # JSONDecodeError, and a body that is not valid UTF-8. The status is
+        # dropped rather than reported: the request DID reach the board, so a
+        # caller reading capability off the status would draw a conclusion from a
+        # body nothing managed to parse.
+        return (None, f"board answered /{path.lstrip('/')} with something that is "
+                "not JSON", None)
 
 
 # ------------------------------------------------------------------- the checks
+
+
+def mergeability(pr: dict) -> tuple[str, str]:
+    """``(the normalised mergeable state, the sentence to say about it)``.
+
+    The mergeability clause of :func:`check_pr_state`, lifted out because it has a
+    SECOND caller: `panel.py` refuses a review round on a branch that cannot merge
+    (#271), and the merged state a review reasons about does not exist while the
+    branch is CONFLICTING. Lifted rather than copied — the three pre-land checks in
+    #96 drifted precisely because the same question was asked in two places in two
+    wordings, and a reviewer refusing a round with one sentence while the merge gate
+    refuses the merge with another is that failure arriving one loop earlier.
+
+    The sentence is ``""`` only for ``MERGEABLE``. Every other value has something
+    to say, and the caller decides whether its own answer is a refusal or a
+    warning: at the merge gate CONFLICTING blocks and UNKNOWN warns, and the panel
+    makes the same split for its own reasons.
+    """
+    state = (pr.get("mergeable") or "UNKNOWN").upper()
+    if state == "CONFLICTING":
+        return state, ("GitHub reports the branch as CONFLICTING — resolve the "
+                       "conflicts by hand; guessing a resolution is not mechanical")
+    if state != "MERGEABLE":
+        return state, (f"GitHub has not computed mergeability yet ({state}); "
+                       "a conflict would fail the merge loudly rather than land")
+    return state, ""
 
 
 def check_pr_state(pr: dict) -> Check:
@@ -393,13 +381,11 @@ def check_pr_state(pr: dict) -> Check:
         c.reasons.append(f"the PR is {pr['state']}, not OPEN — there is nothing to land")
     if pr.get("isDraft"):
         c.reasons.append("the PR is a draft; mark it ready for review first")
-    mergeable = (pr.get("mergeable") or "UNKNOWN").upper()
+    mergeable, said = mergeability(pr)
     if mergeable == "CONFLICTING":
-        c.reasons.append("GitHub reports the branch as CONFLICTING — resolve the "
-                         "conflicts by hand; guessing a resolution is not mechanical")
-    elif mergeable != "MERGEABLE":
-        c.warnings.append(f"GitHub has not computed mergeability yet ({mergeable}); "
-                          "a conflict would fail the merge loudly rather than land")
+        c.reasons.append(said)
+    elif said:
+        c.warnings.append(said)
     c.detail = {"state": pr["state"], "draft": bool(pr.get("isDraft")),
                 "mergeable": mergeable, "head_sha": pr["headRefOid"]}
     c.status = "failed" if c.reasons else "passed"
@@ -476,13 +462,161 @@ def check_ci(pr: dict) -> Check:
     return c
 
 
-def check_review(repo: str, pr: dict) -> Check:
+@dataclass(frozen=True)
+class MergeGate:
+    """Where the #278 reading is measured and the dial it is measured against.
+
+    Two fields rather than two more arguments threaded through three functions:
+    the pair travels together, is read in one place, and a caller that has neither
+    (a test, or a call site that predates #278) gets the honest answer — an
+    unmeasurable head move, which HOLDs exactly as it did before. Frozen, so the
+    empty one is safe as a default argument: it is built once at definition time
+    and there is nothing in it a call could mutate for the next caller.
+    """
+
+    root: str = ""
+    limit: int | None = DEFAULT_DISTANT_MERGE_LINES
+
+
+def _paths(out: str | None) -> list[str] | None:
+    """The paths in a NUL-separated `git` listing, or None if it could not be read.
+
+    `-z` rather than the default: git QUOTES a path with a space or a non-ASCII
+    byte in it (`"src/a b.py"`), and a quoted name matches nothing in the file set
+    it is being intersected with — so a merge into a file whose name needed quoting
+    would count as zero changed lines and read DISTANT. `_git` strips whitespace and
+    NUL is not whitespace, so the trailing separator survives as an empty field and
+    is dropped here.
+    """
+    if out is None:
+        return None
+    return [f for f in out.split("\0") if f]
+
+
+def _integration_since(root: str, recorded: str, pr: dict) -> Integration:
+    """What landed on this PR between the commit a round read and the head it has
+    now, measured with real `git` in the checkout this gate is already standing in.
+
+    The measurement #278 names, taken literally: `git diff` between the pre-merge
+    head and the merge result, RESTRICTED to the files this PR itself touches. The
+    restriction is what makes it a statement about this PR rather than about
+    `main` — a base merge drags in every file main gained, which is not this PR's
+    change and is not what the earlier round's findings were about.
+
+    `--numstat` rather than a diff body: the count is all that is wanted, and a
+    range that merged a busy `main` can be megabytes of text that would be read into
+    memory only to be discarded. A binary file the PR also touches REFUSES the
+    reading rather than counting zero — numstat reports `-` for it, and a merge that
+    replaced an asset this PR also edits is real material that cannot be measured in
+    lines, so it must not be allowed to look like an empty resolution.
+
+    **"The files this PR touches" is a UNION of two moments, and it has to be.** Taken
+    from the head alone it is what the PR contributes AFTER the merge, and a
+    resolution that reverted one of the PR's files all the way back to base drops that
+    file out of the set — so the change the earlier round reviewed would have been
+    silently discarded by the merge and the measurement would score it zero and call
+    the merge distant. That is #80's `stderr_gist` incident exactly (a landed fix lost
+    because a branch that had MOVED a function met a `main` that already had it), and
+    it is the one defect this whole reading exists to catch. So the files the PR
+    touched AS THE ROUND READ IT — measured from its own fork point, before the
+    integration — are in the set too.
+
+    **A rewritten branch has no range and says so.** `git diff A B` will happily
+    compare two commits with no ancestry between them, and after a force-push or a
+    rebase the answer is not a delta from `A` at all: anything dropped in the rewrite
+    is in neither side, and a small diff plus any merge commit in the replacement
+    history would preserve a review of code that no longer exists. `_fix_range_diff`
+    refuses GitHub's `diverged` status for the same reason; this is the local half.
+
+    Every failure returns a stated `problem` and never raises. An unreadable range is
+    an unread precondition, and :func:`merge_involvement` turns that into the
+    expensive answer — the behaviour before #278, which is the safe direction.
+    """
+    head = pr["headRefOid"]
+    if not root:
+        return Integration(problem="no checkout was available to measure it in")
+    for sha in (recorded, head):
+        if _git(root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}") is None:
+            return Integration(problem=f"{sha[:12]} is not in this checkout, so the "
+                                       "range cannot be read here — fetch it, or the "
+                                       "branch was rewritten and there is no range")
+    if _git(root, "merge-base", "--is-ancestor", recorded, head) is None:
+        return Integration(problem=f"{recorded[:12]} is not an ancestor of the head, so "
+                                   "there is no range between them — the branch was "
+                                   "rewritten since the round read it")
+    base = f"origin/{pr['baseRefName']}"
+    fork, was = _git(root, "merge-base", base, head), _git(root, "merge-base", base,
+                                                           recorded)
+    if not (fork and was):
+        return Integration(problem=f"this PR's fork point from {base} could not be "
+                                   "computed, so which files are the PR's own is "
+                                   "unknown")
+    own = _paths(_git(root, "diff", "--name-only", "-z", fork, head))
+    had = _paths(_git(root, "diff", "--name-only", "-z", was, recorded))
+    rows = _paths(_git(root, "diff", "--numstat", "-z", "--no-renames", recorded, head))
+    merges = _git(root, "rev-list", "--count", "--merges", f"{recorded}..{head}")
+    if own is None or had is None or rows is None or merges is None:
+        return Integration(problem="`git` could not read the range in this checkout")
+    mine, churn = set(own) | set(had), {}
+    for row in rows:
+        parts = row.split("\t", 2)
+        if len(parts) != 3 or parts[2] not in mine:
+            continue
+        if parts[0] == "-" or parts[1] == "-":
+            return Integration(problem=f"{parts[2]} is binary and this PR also touches "
+                                       "it, so what the range put there cannot be "
+                                       "counted in lines")
+        try:
+            churn[parts[2]] = int(parts[0]) + int(parts[1])
+        except ValueError:
+            return Integration(problem=f"`git diff --numstat` gave {row!r}, which is "
+                                       "not a line count")
+    try:
+        n_merges = int(merges)
+    except ValueError:
+        return Integration(problem=f"`git rev-list --count --merges` gave {merges!r}")
+    return Integration(churn=churn, merges=n_merges)
+
+
+def _head_moved(c: Check, recorded: str, pr: dict, gate: MergeGate) -> None:
+    """#278: a head that moved is not by itself a review of earlier code.
+
+    This clause used to be flat — recorded head != current head, therefore HOLD —
+    and under the decision that is right for an INVOLVED merge and too strong for a
+    DISTANT one. Too strong is not free: any integration moves the head, so the flat
+    reading made a base merge cost a whole panel cycle across every seat, and #80
+    measures integration cost as quadratic in the number of open PRs. Five
+    concurrent PRs is about ten integration merges, at a measured 283,795 tokens per
+    `claude` seat per round.
+
+    Distant is a WARNING and not silence. The head did move, a reader of the payload
+    has to be able to see that it moved and see why it was let through, and
+    `merge_reading` in the detail carries the numbers the sentence is built from.
+    """
+    reading = merge_involvement(_integration_since(gate.root, recorded, pr),
+                                gate.limit, (recorded, pr["headRefOid"]))
+    c.detail["merge_reading"] = {"verdict": reading.verdict, "lines": reading.lines,
+                                 "files": list(reading.files), "limit": reading.limit}
+    moved = (f"the round read {recorded[:12]}, the PR's head is now "
+             f"{pr['headRefOid'][:12]}")
+    if reading.distant:
+        c.warnings.append(f"{moved} — {reading.why}")
+    else:
+        c.reasons.append(f"{moved} — it is a review of earlier code: {reading.why}")
+
+
+def check_review(repo: str, pr: dict, earned_stop: bool = False,
+                 gate: MergeGate = MergeGate()) -> Check:
     """The panel's own statements about the round that read THIS commit.
 
     Every clause here is a field the round wrote about itself. None of them is a
     proxy, and none of them is re-derived: the panel already decided whether it
     stopped and why, and this reads that decision rather than forming a second
     opinion about the same diff.
+
+    ``earned_stop`` is ``--require-earned-stop``: see :func:`_round_stop_earned`.
+    ``gate`` is where the #278 head-moved reading is measured: see
+    :func:`_head_moved`.
     """
     c = Check("review", "passed")
     rows, err = board_get("reviews", {"repo": repo, "pr": pr["number"], "limit": 20})
@@ -513,14 +647,19 @@ def check_review(repo: str, pr: dict) -> Check:
     # findings a fix already cleared, or worse, blesses a stale head — and that is
     # too much to rest on another service's clause remaining what it is today.
     newest = max(rows, key=lambda r: (str(r.get("ts") or ""), r.get("id") or 0))
-    return _judge_round(c, newest, pr)
+    return _judge_round(c, newest, pr, earned_stop, gate)
 
 
-def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
+def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False,
+                 gate: MergeGate = MergeGate()) -> Check:
     """The clause list, against the newest round the board holds for this PR."""
     c.detail = {k: latest.get(k) for k in
                 ("id", "ts", "round", "cycle", "head_sha", "stopped", "stop_reason",
                  "stop_confident", "confirmed", "unjudged", "sonar_gate", "judge_skip")}
+    # Which mode ran, in the audit trail. A payload that reads READY has to say
+    # whether the strict clause was even asked, or a caller cannot tell a stop
+    # that was earned from one nobody put the question to.
+    c.detail["require_earned_stop"] = earned_stop
     c.summary = (f"round {latest.get('round')} of cycle "
                  f"{(latest.get('cycle') or '?')[:8]} at "
                  f"{(latest.get('ts') or '?')[:19]}")
@@ -529,8 +668,7 @@ def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
         c.reasons.append("the round recorded no head_sha, so there is no way to tell "
                          "which commit it read — re-run the panel on this head")
     elif recorded != pr["headRefOid"]:
-        c.reasons.append(f"the round read {recorded[:12]}, the PR's head is now "
-                         f"{pr['headRefOid'][:12]} — it is a review of earlier code")
+        _head_moved(c, recorded, pr, gate)
     if latest.get("stopped") is not True:
         c.reasons.append("the round did not stop: " +
                          (latest.get("stop_reason") or "it recorded no stopping verdict"))
@@ -549,36 +687,83 @@ def _judge_round(c: Check, latest: dict, pr: dict) -> Check:
     elif gate not in ("", "OK", "SKIPPED", "NO-ANALYSIS", "NO-PR-ANALYSIS", "NONE"):
         c.warnings.append(f"the SonarCloud gate reads {latest['sonar_gate']!r}, which "
                           "is not a status this check knows how to rule on")
+    _round_stop_earned(c, latest, earned_stop)
     _round_warnings(c, latest)
     c.status = "failed" if c.reasons else "passed"
     return c
 
 
-def _round_warnings(c: Check, latest: dict) -> None:
-    """What the round said that is worth reading but must not block.
+def _round_stop_earned(c: Check, latest: dict, earned_stop: bool) -> None:
+    """`stop_confident: false` — a warning by default, a HOLD when asked for.
 
-    `stop_confident: false` is the deliberate one. It means the stop was not
-    earned — a reviewer was truncated, or absent, or the judge was skipped — and
+    The default is deliberate and unchanged. An unearned stop means a reviewer
+    was truncated, or absent, or the judge was skipped, or the cap ran out — and
     holding on it would make a green verdict unreachable on exactly the headless
-    boxes that run unattended, where two seats are permanently missing. So the
-    vetoes are printed and the merge is not blocked.
+    boxes that run unattended, where two seats are permanently missing.
+
+    `--require-earned-stop` is for the caller that just RAN the round and is
+    about to offer to land on the strength of it (`/panel-review-pr` §7, #100).
+    There, an unearned stop is not background noise about somebody else's box: it
+    is this cycle reporting that nobody read the whole diff, and an offer to merge
+    resting on it is an offer resting on nothing. Which of the two a run is doing
+    is the caller's fact, not this file's, so it is a flag rather than a rule —
+    and either way the vetoes are reported, so the strict mode changes what the
+    verdict IS and never what the reader gets told.
     """
-    if latest.get("stop_confident") is False:
-        for v in latest.get("stop_veto") or ["(the round recorded no veto reasons)"]:
-            c.warnings.append(f"the stop was not earned: {v}")
+    if latest.get("stop_confident") is not False:
+        return
+    where = c.reasons if earned_stop else c.warnings
+    for v in latest.get("stop_veto") or ["(the round recorded no veto reasons)"]:
+        where.append(f"the stop was not earned: {v}")
+
+
+def _round_warnings(c: Check, latest: dict) -> None:
+    """What the round said that is worth reading but must not block."""
     if latest.get("unjudged"):
         c.warnings.append(f"{latest['unjudged']} finding(s) were never adjudicated" +
                           (f" ({latest['judge_skip']})" if latest.get("judge_skip") else ""))
 
 
 def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
-    """Is another agent already landing this branch?
+    """Is another agent already landing onto this PR's base?
 
     `kind=merge, key=<repo>:<branch>` shipped in #131 and nothing has ever read
     it — on the same day two agents merged at once. This is the read half. It
     does not TAKE the claim (see the module docstring), so `mine` is how a caller
     that already holds one says so: without it, the lander's own claim would hold
     its own merge.
+
+    **The branch is the BASE, and #318 is why.** This read the HEAD branch until
+    that issue asked which one the claim is supposed to be, and under a head key
+    the incident in the paragraph above is *not* prevented: two agents landing two
+    different PRs into `main` hold `<repo>:feat/a` and `<repo>:feat/b`, never see
+    each other, and both merge. The head key catches only the narrower case of two
+    agents landing the same PR, which is the rarer of the two and already unlikely
+    once :func:`check_queue` exists. What a simultaneous merge collides on is the
+    base — it is what every other open PR goes stale against afterwards, and #80
+    measures that collision as quadratic in the open PRs.
+
+    The audit #318 asked for is what made the change safe rather than merely
+    right. `derive("branch", …)` is the only maker of merge keys and **every**
+    branch claim in this fleet is a landing claim: `create-worktree` claims the
+    ISSUE its branch names (the function called `claim_the_branch` resolves to an
+    issue number), the plan's `ref_kind` is restricted to issue and pr, and
+    `qb-hook`'s `kind: "branch"` post ref is an annotation on a board post that
+    takes no claim at all. So the branch claim served no non-landing purpose whose
+    meaning this could change out from under.
+
+    It also removes a disagreement rather than creating one: the queue keys on
+    `repo + base` through `app.claimkey`, and `GET /merge-queue` reports the claim
+    it finds at that key. With this reading of the same land, a queue head that is
+    told "take `kind=merge` on this base before you merge" takes the claim this
+    check then reads. Under the old one the two named one land two ways, which is
+    the #172 defect `merge_key`'s own docstring says it exists to prevent.
+
+    Composed here rather than through `app.claimkey`, because this script runs out
+    of `~/.claude/loops` on hosts with no checkout of this repo on the path. The
+    shape is `derive`'s and the separator is `:`; the repo is already canonical
+    (`resolve_repo` reads it off the remote) and the branch half is deliberately
+    not case-folded there either.
 
     #142 inverted the authorisation this used to be hedged about: every kind in
     the claims table is session-owned now, so a co-tenant POSTing the same claim
@@ -593,7 +778,7 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     thirteen agents worked three shared checkouts. So "unclaimed" is reported as
     what it is: an answer this check cannot draw a conclusion from.
     """
-    key = f"{repo}:{pr['headRefName']}"
+    key = f"{repo}:{pr['baseRefName']}"
     body, err = board_get("claims", {"kind": "merge", "key": key})
     if err:
         c = Check("merge_claim", "error", "claims unreadable")
@@ -615,7 +800,8 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
         c.reasons.append(
             f"{other.get('holder')} holds the merge claim on {key!r} since "
             f"{other.get('acquired') or '?'} ({other.get('note') or 'no note'}) "
-            "— it is landing this branch")
+            f"— it is landing onto {pr['baseRefName']} right now, and two merges "
+            "into one base at once is what this claim exists to prevent")
     if claims and not others:
         c.summary = "held by you"
     if not claims:
@@ -673,7 +859,7 @@ def _unclaimed_repo_warning(repo: str) -> list[str]:
         + (f" (the board holds {live} claim(s), all in other repos)" if live else
            " — and the board holds no claims at all, fleet-wide")
         + ". So `unclaimed` here is the absence of a record, not evidence that "
-        "nobody else is landing this branch. Agents in a repo that claims nothing "
+        "nobody else is landing onto this base. Agents in a repo that claims nothing "
         "collide in silence: enrol it (create-worktree takes the claim, "
         "`qb-claim issue <n>` by hand) or read this check as uninformative."
     ]
@@ -720,6 +906,159 @@ def _plan_claims_here(repo: str) -> int:
         # the list before there is anything exact in it to hold.
         held += sum(1 for p in plans if isinstance(p, dict) and p.get("claim"))
     return held
+
+
+def check_queue(repo: str, pr: dict) -> Check:
+    """Is this PR at the head of the line to land on its base? — #227.
+
+    The queue (#317) keys on ``repo`` + the **base** branch, because the base is
+    the resource two landings collide on. It answers what `merge_claim`
+    structurally cannot: that claim is one slot and says *somebody is landing
+    right now*, never who is next — so every review-clean PR behaved as though it
+    were. Merge the base, push, wait for CI, re-run this, discover somebody else
+    landed, repeat: #80's quadratic integration cost, with each loser's push
+    invalidating the winner's green checks on the way past.
+
+    #317 built the board side and stopped there, saying so in as many words:
+    *"nothing yet forces the stop"*. **This is the stop.** A PR behind another in
+    the line is not READY, and the reason names its position and the entry it
+    waits on, so the loop stands down before it spends the CI run rather than
+    after.
+
+    **It rules on POSITION and nothing else.** The board also reports whether an
+    entry carries a ``ready`` verdict at this commit, and this must not gate on
+    that: preland's own verdict is what produces that assertion, so holding for
+    want of it would be this file refusing to run until it had already run. A
+    head whose entry is behind the branch gets a WARNING carrying the board's own
+    sentence, because re-enqueueing at this head is the caller's next step and it
+    needs saying.
+
+    **A queue nobody is in imposes nothing**, which is the other half of the
+    contract. A lone PR on a base with an empty line passes without a word of
+    friction: there is nobody to wait for, and a gate that made the ordinary case
+    harder is a gate people turn off. What does NOT pass is a PR that never
+    enqueued while others are queued — otherwise the way past this check is to
+    skip the mechanism, which is #169's defect wearing the queue's clothes.
+
+    **A board with no queue is a capability answer, not a failure.** The endpoint
+    landed in #317 and a board deployed before it answers 404. That is the same
+    fact as a repo with no ``scripts/migration_reconcile.py`` — the invariant does
+    not exist there — and it reports ``skipped-absent`` for the same reason. Every
+    other board failure is an ERROR: a line this gate cannot see is a line it
+    cannot rule on, and the module docstring's rule about the ``review`` check
+    applies here word for word, off-switch included.
+    """
+    base = pr["baseRefName"]
+    body, err, status = board_request(
+        QUEUE_PATH, {"repo": repo, "base": base, "pr": pr["number"],
+                     "head": pr["headRefOid"]})
+    if status == 404:
+        return _queue_absent(base)
+    if err:
+        c = Check("queue", "error", "the queue is unreadable")
+        c.reasons.append(
+            f"{err}. Cannot tell whether another PR is ahead of this one in the "
+            f"line to land on {base!r}, and absent must not read as clean. Turn "
+            'this check off deliberately with `"preland": {"disabled_checks": '
+            '["queue"]}` in .harness-rules if this board has no queue')
+        return c
+    you = body.get("you") if isinstance(body, dict) else None
+    if not isinstance(you, dict):
+        c = Check("queue", "error", "the queue is unreadable")
+        c.reasons.append(
+            f"the board answered /{QUEUE_PATH} with no `you` verdict in it, so "
+            f"this PR's position in the line for {base!r} is unknown")
+        return c
+    order = body.get("active_order")
+    order = order if isinstance(order, list) else []
+    c = Check("queue", "passed",
+              detail={"base": base, "active_order": order, "you": you})
+    return _judge_place(c, you, order, pr, base)
+
+
+def _queue_absent(base: str) -> Check:
+    """A 404 on ``/merge-queue``: ruled on rather than believed.
+
+    404 is the board saying "no such route", and for THIS route that is usually a
+    capability answer — the endpoint landed in #317, and a board deployed before it
+    has no line to read. But 404 is also what a base URL pointed at the wrong host
+    returns, and what a proxy with no upstream returns, and reading either of those
+    as "this board has no queue" would fail the gate open on exactly the
+    misconfiguration it has no other way of noticing. A capability answer that
+    cannot be told apart from an outage is not a capability answer.
+
+    So the absence is corroborated, the way :func:`_detected` corroborates a
+    missing guardrail script against the base rather than taking the branch's word
+    for it: ask for a route that predates the queue by a long way. A board that
+    answers ``/claims`` is a real board that simply does not have the queue yet;
+    one that cannot answer that either is not a board this gate is talking to.
+    """
+    _, err, _status = board_request("claims", {"limit": "1"})
+    if not err:
+        return Check("queue", "skipped-absent",
+                     f"this board has no landing queue (no /{QUEUE_PATH})")
+    c = Check("queue", "error", "the queue is unreadable")
+    c.reasons.append(
+        f"the board answered 404 for /{QUEUE_PATH}, and /claims — which has existed "
+        f"far longer — came back with: {err}. So this is not a board that merely "
+        "predates the queue, and nothing here can tell whether another PR is ahead "
+        f"of this one in the line to land on {base!r}")
+    return c
+
+
+def _judge_place(c: Check, you: dict, order: list, pr: dict, base: str) -> Check:
+    """The verdict clause of :func:`check_queue`, over the board's own answer.
+
+    The board wrote the sentence and this does not rewrite it: ``reason`` is
+    quoted rather than paraphrased, so an agent reading this payload and an agent
+    reading ``merge_queue`` are told the same thing in the same words. What is
+    added is who holds the place ahead — "wait for #123" is something to act on
+    only once you know which agent to go and ask.
+    """
+    if you.get("queued") and you.get("is_head"):
+        c.summary = f"head of the line for {base} ({len(order)} queued)"
+        if not you.get("may_merge"):
+            c.warnings.append(
+                f"{you.get('reason')} — this run is that re-check, so re-enqueue "
+                "at this head once it comes back READY. Until you do, the line "
+                "advertises a readiness about a commit nobody checked")
+        return c
+    if you.get("queued"):
+        c.status = "failed"
+        c.summary = f"position {you.get('position')} of {len(order)}"
+        c.reasons.append(_waiting_sentence(you))
+        return c
+    if not order:
+        # The lone PR, and the reason this check adds no friction to it. Said in
+        # the summary rather than passed silently: a `passed` a reader cannot
+        # distinguish from "the queue was never asked" is #172's shape again.
+        c.summary = f"nobody is queued to land on {base}"
+        return c
+    c.status = "failed"
+    c.summary = f"not in the line ({len(order)} queued)"
+    c.reasons.append(
+        f"#{pr['number']} is not in the queue for {base!r} and "
+        f"{', '.join('#' + str(n) for n in order)} " +
+        ("is" if len(order) == 1 else "are") + " — the line exists so that only "
+        f"its head spends CI on integrating, and landing past #{order[0]} would "
+        "invalidate its checks. Enqueue (`merge_queue_enqueue`), then run this "
+        "again: joining the line is what makes your turn visible to everyone else")
+    return c
+
+
+def _waiting_sentence(you: dict) -> str:
+    """The board's refusal, plus who holds the place ahead — and the one thing a
+    caller must NOT do about it.
+
+    Standing down keeps the entry. Leaving and re-joining is a trip to the back of
+    the line, so a loop that read "stop" as "leave" would starve its own PR every
+    time it was overtaken, which is worse than the racing it replaced.
+    """
+    on = you.get("waiting_on") if isinstance(you.get("waiting_on"), dict) else {}
+    who = on.get("holder") or "an agent the board could not name"
+    return (f"{you.get('reason')} — #{on.get('pr')} is held by {who} "
+            f"({on.get('note') or 'no note'}). Stay queued: your place is kept "
+            "while your entry is renewed, and leaving would re-join at the back")
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:
@@ -991,7 +1330,7 @@ def disabled_checks(cfg: dict, skip: list[str]) -> dict[str, str]:
 
 
 def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
-           mine: str = "") -> list[Check]:
+           mine: str = "", earned_stop: bool = False) -> list[Check]:
     """Every check, in report order, with the disabled ones still present.
 
     A check that did not run is REPORTED as not having run. Dropping it would
@@ -1000,12 +1339,18 @@ def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
     """
     repo, root = cfg["github"], cfg["path"]
     versions = (cfg.get("epic") or {}).get("migrations_dir") or ""
+    gate = MergeGate(root, distant_merge_lines(cfg.get("review_panel") or {}, []))
     how = {
         "pr_state": lambda: check_pr_state(pr),
         "checkout": lambda: check_checkout(root, pr),
         "ci": lambda: check_ci(pr),
-        "review": lambda: check_review(repo, pr),
+        # Resolved OUTSIDE the lambda: a malformed `distant_merge_lines` is a hard
+        # exit through `_refuse_value`, and it belongs where `disabled_checks`
+        # already puts a bad rules value — before any check runs, not inside one
+        # check's guard where it would read as that check failing.
+        "review": lambda: check_review(repo, pr, earned_stop, gate),
         "merge_claim": lambda: check_merge_claim(repo, pr, mine),
+        "queue": lambda: check_queue(repo, pr),
         "migrations": lambda: check_migrations(root, base, versions),
         "sw_version": lambda: check_sw_version(root, base),
     }
@@ -1098,6 +1443,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="do not refresh the base branch's remote-tracking ref first")
     ap.add_argument("--claim-holder", default="", metavar="AGENT",
                     help="a merge claim held by this identity is yours, not a conflict")
+    ap.add_argument("--require-earned-stop", action="store_true", dest="earned_stop",
+                    help="HOLD when the round's stop was not earned (stop_confident: "
+                         "false) instead of warning about it. For a caller that ran "
+                         "the round itself and is about to offer to land on it")
     args = ap.parse_args(argv)
     if args.pr is not None and args.pr < 1:
         ap.error("--pr: pull requests are numbered from 1")
@@ -1110,7 +1459,7 @@ def main(argv: list[str] | None = None) -> int:
     pr = read_pr(cfg["github"], args.pr, cfg["path"])
     base = refresh_base(cfg["path"], pr["baseRefName"], fetch=not args.no_fetch)
 
-    checks = gather(cfg, pr, base, off, args.claim_holder)
+    checks = gather(cfg, pr, base, off, args.claim_holder, args.earned_stop)
     out = payload(cfg, pr, checks, base)
     if args.as_json:
         print(json.dumps(out, indent=2))

@@ -16,9 +16,17 @@ board reconnects them.**
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-seat`, which turns one pane of a
-  multiplexer into a fleet seat with its own board identity, and `qb-board`, which
+  multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README)
+  on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
+  that asks whether the board's plan still describes the present, `qb-pace`, which
+  says how the shared subscription's five-hour and weekly windows stand and what a
+  job of N seats would cost against them — **and the board
+  client proper**: `qb-hook` (the lifecycle reflexes Claude Code fires), `qb-mcp`
+  (the per-session stdio MCP shim), `qb-claude-setup` (the wiring), `qb` (the human
+  CLI), and `qb-env`, the site-config library the four of them source
+- `claude/` — the Claude Code configuration the harness owns: the hook `settings-fragment.json`
+  and `quarterback-workflow.md`. See [claude/README.md](claude/README.md)
 - `worktree.example.json` — per-repo config, annotated with quarterback's own values
 
 Neither half needs the other. The loops run with no board configured (recording is
@@ -143,7 +151,7 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
 PR and the 67.3% tail beside it is not.
 
-So `.harness-rules.sample` now carries seven `review_panel` dials (#165), and what they
+So `.harness-rules.sample` now carries eight `review_panel` dials (#165, #297), and what they
 bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
 is asked to clear, and below it a finding is reported, marked and recorded rather than
 fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
@@ -152,6 +160,12 @@ the rule that mattered most, because from round 2 the thing under review IS the 
 round's fix and a termination test fed by its own output can only end on the cap — the
 two floors differ on purpose, since fixing a P3 in a pass that is already open costs one
 edit while letting a P3 buy another round costs a whole panel plus another fix pass;
+`low_severity_fix_lines` (**40**) is the churned lines the whole round may spend on the band
+between the two floors, counted rather than estimated and spent cheapest-first — added after a
+second measurement on 2026-08-21, where PR #188's 185-line feature came out of two fix passes
+at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
+below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
+individually reasonable small fixes;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
@@ -168,8 +182,8 @@ answer — warned about and dropped, so a rules file shared across a fleet that 
 different times is not a version pin. What the round actually applied is in the
 artifact, on a **Panel dials** line and in the payload's `review_panel`, because the
 orchestrator that briefs the fixer builds that brief out of the report. #165 proposes about
-fifteen dials; these are the seven whose enforcement point already exists, and the rest stay
-in the issue.
+fifteen dials; these are the seven whose enforcement point already exists, plus #297's budget,
+and the rest stay in the issue.
 
 The fixer has one more permitted outcome than "fixed" and "false positive", and it exists
 because of what the other two cost. A fix that patches a wrong assumption produces the next
@@ -258,8 +272,10 @@ agent in a sibling worktree popped the red/green stash into its own checkout and
 back. Two earlier drafts tried to make stash safe (a label check, then an entry count);
 the count caught the loss, but nothing local can stop another worktree popping the entry.
 So: `git add -N` the fix's paths, `git diff HEAD` them to a patch, check `test -s`, remove
-them, run red, `git apply` the patch back. See #210 for giving the harness a per-worktree
-stash of its own.
+them, run red, `git apply` the patch back. The harness now has a per-worktree stash of its
+own as well — `qb-stash`, below — and `create-worktree` installs a hook that refuses the
+shared one outright; the patch file stays the right tool *here* because it is the one that
+takes a pathspec.
 
 Three details in that sequence exist because the obvious spelling is wrong. **`test -s` is
 the check that matters**: an empty capture — mistyped paths, or a fix already committed —
@@ -432,6 +448,100 @@ whether or not `autoUpdate` is off. So on the loop-driven path, an answer given 
 hand in one branch can be committed unread in another. That is not closed here: it wants
 either explicit staging in those two loops or rerere scoped away from loop-driven
 worktrees, and it is filed rather than guessed at.
+
+### `git stash` is unsafe here, and `create-worktree` now says so out loud
+
+`refs/stash` lives in the **common** git dir, not the per-worktree one. Every worktree of
+a repo therefore shares one stash stack: `git stash push` in `quarterback-fix-issue-114`
+is listed by `git stash list` in `quarterback-fix-issue-113`, and `stash@{0}` there
+resolves to whatever the last pusher meant. This harness runs many concurrent worktrees
+off one `.git` **by design** — that is what `create-worktree` is for — so the shared stack
+is not a corner case here, it is the normal configuration.
+
+It has already taken two working trees. Once an agent's red/green stash was popped into a
+sibling and pushed back by hand; the second time the recovery note was parked in the same
+shared stash that had eaten it, where the next racing push could take it out the same way.
+Both were noticed by luck. Nothing in git warns either party, and a stash entry carries no
+author, no worktree and no session, so there is nothing to warn *with*: the owner of the
+second one was identified from a board claim, not from git.
+
+So `create-worktree` installs a **`reference-transaction` hook** that refuses to put
+anything on `refs/stash` while the repo has linked worktrees:
+
+```
+REFUSED: refs/stash is shared across every worktree of this repo.
+  ...
+  Use 'qb-stash' instead — push/pop/list/apply/drop with the same shape, stored
+  per-worktree under refs/worktree/, invisible to every sibling.
+```
+
+Four things about that are worth knowing before it surprises you.
+
+**It catches a hand-typed `git stash`, which is the only reason it is a hook.** `stash` is
+a C built-in, so `alias.stash` is ignored and a `git-stash` on `PATH` is never consulted,
+and there is no `pre-stash` hook. A wrapper script would have covered the harness's own
+commands and nobody else, and a human clearing a dirty tree before a pull is exactly the
+case that produced the near-miss.
+
+**It guards the main checkout too**, not just the linked worktrees, because that near-miss
+was an orchestrator running `git stash push -u` in `main` while sub-agents worked in
+siblings. A repo with no linked worktrees stashes exactly as it always did — the hazard is
+the shared stack, and a single checkout does not have one.
+
+**It stops the push, not the pop, and that is a real limit rather than an oversight.**
+Measured on git 2.54.0: `git stash pop` removes its entry through the **reflog**, which
+raises no ref transaction at all while another entry remains underneath, so no hook can
+see a pop. The protection works by keeping the shared stack empty — with nothing on it,
+there is nothing for a sibling to take. Deletions of `refs/stash` are deliberately let
+through so entries that predate the guard stay droppable.
+
+**`QB_ALLOW_SHARED_STASH=1` is the escape hatch**, for somebody doing this on purpose. One
+env var, per command, so the guard does not become the thing people turn off wholesale.
+
+`core.hooksPath` **replaces** the hooks directory rather than stacking with it, and on this
+fleet its global value is a read-only nix store path whose one entry is a gitleaks
+`pre-commit`. `qb-hooks install` therefore re-exports every hook that dir provides as a
+symlink to a forwarder that resolves the delegate **at run time** — the store path changes
+on every home-manager rebuild, so an install-time snapshot would rot. Without that, turning
+on a stash guard would turn off secret scanning, which is the class of failure this repo is
+organised against; `harness/tests/test_stash_guard.py` pins it.
+
+Run `qb-hooks status` to see what is installed, `qb-hooks install` to add it to a repo by
+hand, `qb-hooks uninstall` to take it off.
+
+### `qb-stash` — a stash that belongs to one worktree
+
+The other half, because refusing a stash is only half an answer to somebody who needs one.
+`refs/worktree/*` is the one ref namespace git keeps per worktree, and `git stash create`
+mints a stash commit without touching the shared stack. `qb-stash` is those two facts
+joined up:
+
+```bash
+qb-stash push [-m msg]    # snapshot tracked changes, then revert the tree
+qb-stash list             # this worktree's entries, newest first
+qb-stash show [n]
+qb-stash apply [n] [--index]
+qb-stash pop   [n] [--index]
+qb-stash drop  [n] | qb-stash clear
+```
+
+`--index` restores the staged/unstaged split as well as the content. That asymmetry is
+what made the hand-recovery of the lost trees lossy: a staged addition came back unstaged,
+which is easy to miss and easy to commit wrong.
+
+**Two limits, measured rather than assumed, and named rather than half-implemented.**
+`git stash create` takes **no pathspec**, so `push` snapshots tracked changes across the
+whole worktree; it also has **no `-u`** and ignores untracked files, so `push` leaves them
+in the tree and says which ones. Both are refused with an error rather than silently
+widened — a pathspec quietly applied to the whole tree would revert work the caller never
+mentioned. For path-scoped work (removing a fix to prove a regression test goes red), use a
+patch file: it is per-worktree by construction too, and it *does* take a pathspec. That is
+the mechanism the red/green briefs already use.
+
+Entries die with the worktree, since `git worktree remove` takes `refs/worktree/*` with it
+and `git status` cannot see them. `remove-worktree` copies any it finds into
+`refs/qb-stash-rescued/<branch>/` before it tears anything down, and tells you where they
+went.
 
 ### `qb-claim` and `qb-claimed` — what you are working on, before you start
 
@@ -704,6 +814,7 @@ per-branch database), assign work, or drive the agent past starting it.
 | `QB_SEAT_AGENT` | `claude` | The agent to start |
 | `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
 | `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
+| `QB_SEAT_PACE` | `warn` | What to do about the shared subscription's window before starting. `warn` says it and starts anyway; `obey` refuses to start at `hold` and names when the window comes back (exit 4); `off` does not consult at all. See `qb-pace` below |
 | `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
 | `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
 | `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
@@ -741,10 +852,18 @@ the directory it was built in. `resume` takes the number from the list or the sc
 and with exactly one screen up it takes no argument at all.
 
 A screen is recognised by a pane carrying `@qb_seat`, never by its name — `-s` takes
-anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and tmux
-silently renames what it will not take verbatim. So the list is read back from tmux and can
-only print names that really exist, which also makes it the way to reattach to a screen tmux
-renamed under you.
+anything, the fleet's own screen is `qbseats` rather than `seats-nix-fleet`, and **what
+tmux does with a name it will not take verbatim depends on which tmux you have**: up to
+3.6a it silently renamed one (`my.screen` → `my_screen`), and 3.7b keeps it as typed. So
+the list is read back from tmux and can only print names that really exist, which is also
+the way to reattach to a screen an older tmux renamed under you.
+
+**Inside the script a session is addressed by `#{session_id}`, never by its name**, and
+that is not tidiness: `.` and `:` are a tmux target's own separators, so on 3.7b
+`-t "=my.screen"` parses as pane `screen` of session `my` and every seat command failed
+against a screen that plainly existed. `qb-seat-click` — the bar's ✕ and ＋ — does the same.
+Names are for the messages a human reads; ids do the addressing, and
+`test_every_session_target_is_an_id_and_not_a_name` reads both scripts to keep it that way.
 
 A screen also records **what its seats are called**: `@qb_repo` is the repository it was
 built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set
@@ -812,6 +931,61 @@ the tmux cursor to that seat's pane, a claim shows its note, a plan item explain
 where it is, a PR or an issue opens on GitHub. `qb-dash` is the same five views rendered
 without interaction, for a terminal that will not forward mouse events.
 
+**It opens on ONE project, and that is the interesting default.** Every panel here is
+fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
+PLANS every repo's list — while a screen is built for one repository. So most rows were
+somebody else's, and the repo cell was then the same word, eleven columns wide, on every
+line of a 78-column pane (#261). The scope narrows the three board-derived panels to the
+repos this screen watches and drops the column outright; the eleven columns go back to
+`what` an agent is doing and to a plan item's title, and `quarterback#209` in CLAIMED
+becomes `#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
+`--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
+origin of `QB_DASH_REPO`, else of the directory it was started in.
+
+`--repo` reads `owner/name` as a **repository** and anything else as a **checkout**: a
+leading `./` or `/`, a third segment, or a single name that is a directory here. So a
+two-segment relative path needs its `./` — `--repo src/nix-fleet` is the repository
+`src/nix-fleet`, which is probably not what was meant, and `--repo ./src/nix-fleet` is the
+directory. Deciding on the shape is what stops the answer depending on which directory the
+pane happened to open in.
+
+**`--repo <checkout>` moves where work runs, `--repo <owner/name>` does not**, and the
+difference is the point rather than an inconsistency. `/fix-issue` and `/panel-review-pr`
+take a bare number and resolve the repository from the checkout their pane opens in, so a
+slug — which names a repo this machine may have no checkout of — can only filter rows; a
+checkout also becomes the cwd the ⚒ and the ⚖ launch into. Where a row's repo is not the
+one this dashboard runs in, both icons are dimmed and a click on one says why rather than
+starting it. **A guard that cannot tell refuses**: a checkout whose remote is `upstream`
+rather than `origin` — or a missing `git` — leaves the dashboard unable to name its own
+repo, and since `gh` and `git push` resolve a default remote without consulting `origin`,
+treating that as "nothing to check" would have let the review go out anyway. The ⚖ had no such guard
+before the scope existed: a review off another repo's PR row would have commented on, and
+pushed a fix commit to, whatever pull request wore that number here.
+
+Two repos keep the column — there it still tells rows apart, and two owners of one name
+(a fork and its upstream) are two repos, compared as whole slugs rather than folded to the
+bare name they share — and so does the wide view, which is the whole reason to widen. `s`
+toggles between them in the TUI, redrawing from what the client already has rather than
+re-fetching; the plain renderer has no keyboard, so it takes `--scope all` or
+`QB_DASH_SCOPE=all`. **A narrowed panel always says what it
+hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads like the whole fleet
+is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
+claimed" and "nothing claimed *here*" are different claims about the world.
+
+Four things stay fleet-wide on purpose. A row whose repo the board cannot name — an agent
+outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process has not
+resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
+live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
+the only thing that ever said so and the narrow view is exactly the view that drops it.
+The SEATS panel's `state` column reads every agent the board reports rather than the scoped
+ones: `tmux_seats()` lists every seat pane on the whole tmux server, so another screen's
+seat is on that panel either way, and narrowing would leave the cell that says which seat
+is waiting on you reading `—`. The held-issue
+markers come from *every* claim, so an issue held by an agent working out of another repo's
+checkout is still shown as held rather than offered to the next seat. And OPEN PRs and
+ISSUES cannot narrow at all: `gh` was only ever asked about the watched repos, so there is
+no other repo's row there to hide — only their column answers to the scope.
+
 **The top line is the ceiling every pane below it works towards.** The seats spend one
 Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
 that none of the tables can show — and six seats working a plan in parallel is exactly the
@@ -832,13 +1006,20 @@ are minutes old and still roughly true; past ten minutes the line appends a dim 
 than pretending. A 429 backs off for ten minutes, because the failing call is itself the
 thing being rate limited.
 
+**And the same figures are readable as a verdict, not only as a bar.** Drawing the ceiling
+left it enforced by a human noticing a bar go red, which is a poor arrangement for a fleet
+of panes nobody is watching; `qbdata.pace()` turns the cached figures into `go` / `slow` /
+`hold` / `unknown`, and `qb-pace` — its own section below — is what a script asks. It is the
+same cache and the same three-minute floor, so a verdict never costs a call and the word and
+the bar cannot come to disagree.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming runs
 `/panel-review-pr <n>` or `/fix-issue <n>` in a detached tmux window of its own — the same
 way `qb-seat` starts an agent, so what it starts is a real session you can attach to, read
 and interrupt. Clicking anywhere else on the row still opens the thing on GitHub. The keys
-are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `r` refresh, `?`
-the list, `q` quit.
+are `o` open, `p` panel-review, `f` fix the selected issue or plan item, `s` this project's
+rows or the whole fleet's, `r` refresh, `?` the list, `q` quit.
 
 **The plans panel is the one that says what the work is FOR.** FLEET says who is here and
 CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
@@ -877,8 +1058,8 @@ to warn about, not to forbid.
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
 pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a
 78-column pane should not be able to start either. `QB_DASH_CONFIRM=0` for anyone who wants
-the single click and means it. `QB_DASH_REPO` says where launched work runs, defaulting to
-the dashboard's own cwd.
+the single click and means it. `QB_DASH_REPO` says where launched work runs, behind
+`--repo <checkout>` and ahead of the dashboard's own cwd.
 
 Adding another verb is three things: an entry in `BINDINGS`, an `action_*` method, and — if
 it wants an icon — a column, since a click carries the column it landed in and that is how
@@ -922,6 +1103,17 @@ clamp bites. This is also the first release where **a screen loses columns by de
 existing callers get seats a third narrower than before, and `QB_SEATS_DASH=` is how to
 have the old screen back.
 
+**A new screen says what its seats are about to spend.** N agents on one shared
+subscription is the largest single spending decision this fleet makes, and it is made here,
+at a prompt, by a human who is not looking at the dash the caps are drawn on — so
+`qb-seats` asks `qb-pace`
+for an estimate of *this* screen's seat count and prints it before the first pane exists.
+It warns and proceeds, always: the refusal lives one layer down in `qb-seat`, off by
+default, for panes with nobody in front of them. Printed here rather than in the panes
+because a seat execs its agent moments later and the agent paints over anything printed
+before it. `QB_SEATS_PACE=off` silences it, and a `qb-pace` that is missing, broken or slow
+costs the note and never the screen.
+
 The width is per-screen state, read from the environment once when the screen is built and
 recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
 screen* asked for — including one set by dragging the border, which a reflow will not
@@ -956,6 +1148,214 @@ both streams, on every resize, saying nothing. So the copy is asked before the h
 PATH's if it answers the flag, otherwise the one that is running, and otherwise no hook at
 all plus a line on stderr naming what it tried. A screen that does not re-fit is honest; a
 hook that fails invisibly is not.
+
+### `qb-pace` — the shared ceiling, read by something other than a bar
+
+Every seat, every panel and every `/fix-issue` on the fleet bills to **one** Claude
+subscription, across every machine and every project. That subscription's five-hour and
+weekly windows are the only hard ceiling any of this has, and until #275 the dashboard drew
+them and nothing read them: the brake was a human watching a progress bar, on a fleet whose
+own documentation says a seat is *a pane nobody is watching*.
+
+```
+qb-pace                 the verdict, one line
+qb-pace --json          the same, for a caller that has to branch on it
+qb-pace --estimate 4    …plus what a four-seat job costs and what is left
+qb-pace --gate          say it AND carry it in the exit status
+```
+
+Four answers, and the fourth is the one that matters most:
+
+- **go** — room, or nothing to pace against. An install authenticating with an API key has
+  no subscription caps at all, so it gets `go` and says why — the same rule that makes the
+  dash's answer to that state one line fewer rather than an error.
+- **slow** / **hold** — the bar's own yellow and red, at 70% and 90%, or sooner when the
+  endpoint's `severity` says so. The thresholds are not restated here; the verdict is
+  derived from `limit_colour`, because a display and a decision disagreeing about what 88%
+  means is exactly the failure nobody can see. **`hold` is a wait, not a stop**: it carries
+  `resets_in_s`, and a caller that treats it as terminal has thrown away the only fact that
+  makes it survivable.
+- **unknown** — the figures could not be obtained at all. Deliberately not `go`, which would
+  be a governor reporting clear on an input it never read; and deliberately not `hold`,
+  which would let a dropped network park the fleet.
+
+Figures that are merely **old** are a third case and they are not discarded — caps move over
+hours, so minutes-old ones are still the right ones to act on. What staleness costs is the
+right to say `go`. It does not promote a `slow` into a `hold`: staleness is uncertainty
+about the number, and parking work over it would be a claim about the window made on the
+strength of the weather.
+
+**Where the number lives: nowhere new.** `pace()` keeps no store. The cap is the usage
+endpoint's fact, `fetch_limits()` already holds the only copy there is — one machine-wide
+cache behind a three-minute floor, shared by every dash pane — and the verdict reads that.
+No second file, no board row, no figure of its own to drift behind the endpoint's back. It
+is fleet-scoped because its **source** is, not because something here aggregates it.
+
+`--gate` inverts both halves for a caller that has decided to obey: the verdict goes in the
+exit status (**3** hold, **4** unknown, **0** go or slow) and nothing is printed at `go`, so
+a caller can relay whatever came out without parsing it. Plain `qb-pace` always exits 0 and
+always prints — being told is the whole of the gap this closes, and a command that started
+failing in scripts because a window was warm would be a bigger claim than the one being
+made. 3 and 4 are separate codes on purpose: a caller may reasonably decide to run on an
+unreadable ceiling and may not reasonably decide to run on a spent one.
+
+**`--estimate` states two measured halves and refuses to multiply them.** It prices the job
+from the board's own record — `GET /review/stats`, counting only the seats that bill to
+*this* subscription, since `codex`, `antigravity` and `pi` bill to OpenAI, a Google account
+and OpenRouter — and it prints what the window has left beside it. The third line says
+`fit unknown`, because nothing anywhere records how much of a five-hour window a seat-run
+actually spends: the board knows tokens, the endpoint knows percent, and no row pairs them.
+Sampling the caps either side of a run is what would close that, and it belongs to whatever
+drives the run. A fit predicted from a rate nobody measured would arrive in the same
+sentence as two real numbers and be believed.
+
+**Who reads it.** `qb-seats` prints the estimate when it builds a screen — N agents on one
+subscription is the largest single spending decision the fleet makes, and it is made at a
+prompt by a human who is not looking at the dash. It warns and proceeds, always. `qb-seat`
+carries the refusal, and it is **off by default**: `QB_SEAT_PACE=obey` is for panes with
+nobody in front of them, and at `hold` such a seat does not start, says when the window
+comes back, and exits 4. `unknown` never stops a seat under either mode — refusing every
+seat on the fleet because a laptop dropped its network is a far larger claim than this is
+making — but it is always said.
+
+**What it deliberately does not do.** It does not throttle, park, resume, or choose work.
+Turning a `slow` into thinner rounds needs dials that can be moved at runtime, which is
+#276; a ceiling this repo sets for *itself* is #55; what to run next is #232/#227. This
+answers "how does the fleet stand", and the value of having it as a function rather than a
+colour is that the answer stops needing somebody to be looking.
+
+### `qb-reconcile` — does the plan still describe the present?
+
+`plan_read` computes one answer, `next`, and every agent that starts cold acts on it.
+Nothing checked it against reality. On 2026-08-20 ranks 2 and 4 of this repo's plan pointed
+at PRs #182 and #211 — **both merged ninety minutes earlier** — and `next` returned rank 2:
+finished work, offered as the thing to do. Beside it sat `idle_days: 0.0, stale: false`,
+because staleness measures time-since-touched and not agreement-with-reality. **An item can
+be wrong and fresh at the same time**, and nothing on the board could tell.
+
+Every input needed to catch that was already there. Plan items carry
+`ref: {kind: pr, value: "182"}`; `GET /reviews` carries `pr_state`, `head_sha`, `ci_status`
+and `stop_reason` across every recorded run. Nothing joined them. So:
+
+```bash
+qb-reconcile                     # every repo the board's plan names
+qb-reconcile --repo owner/name   # just that one
+qb-reconcile --json              # the whole report, unknowns beside the findings
+qb-reconcile --post              # put the report on the board — when it CHANGED, or aged out
+qb-reconcile --include-drafts    # count draft PRs as untracked work too
+qb-reconcile --quiet             # say nothing when there is nothing to say
+```
+
+**`--post` posts what is new, or what has gone unheard.** It hashes what the report
+*says* — the conditions, subjects and sentences, not `idle_days` or GitHub's
+`updatedAt`, which move on their own — and keeps that digest, with the time it was
+posted, under `$XDG_STATE_HOME/qb-reconcile`. On a 15-minute timer with no such check,
+one unchanged disagreement is ~96 identical `finding` posts a day, each carrying the
+whole rendered report in `detail`; `finding` is not in the board's `MUTED_TYPES`, so
+every one of them lands in every agent's orient read — the volume problem that list
+exists to solve.
+
+**But "changed" alone is not the test, because "posted once, ever" is not the same as
+"not spam".** `GET /board` orients over a 30-minute window by default, so half an hour
+after that single post the disagreement is invisible to every subsequent cold orient —
+which is exactly the reader `--post` exists for. So an unchanged report is re-posted
+once it is older than `REPOST_AFTER` (4 hours): 6 posts a day for a disagreement that
+never changes, and a bound on how long a live one can go unseen rather than the
+possibility removed. An unreadable digest, or one written before the timestamp existed,
+posts rather than staying quiet — silencing a disagreement because a cache could not be
+read is the wrong way round.
+
+Because those sentences are what is hashed, **a `summary` or a `reason` must not carry a
+value that moves on its own**: interpolating a claim's `expires` into one defeats the
+digest through the field it trusts, since `/plan` re-issues that timestamp every time
+the claim is renewed.
+
+**Bot PRs and drafts are not untracked work.** The harness ships a whole loop for
+dependabot's PRs (`loops/lander.py`), and those are deliberately never on the plan —
+so counting them would make every repo with dependabot enabled a page of findings
+that are already owned. Drafts are opt-in for the same reason: a draft is not yet
+work the plan owes an item. Neither is dropped silently: the report says how many it
+did not compare and why, because "no untracked PRs" and "no untracked PRs among the
+ones I looked at" are different sentences — and a tick whose *only* content is skipped
+PRs still prints under `--quiet` and still posts under `--post`, or that promise would
+not hold in the one configuration the shipped timer unit runs.
+
+**What accounts for a PR is an item's ref or its title, never its note.** A ref and a
+title say what an item IS; a note is prose about the work, and prose mentions a PR
+without owning it all the time — "follows PR #999", "blocked until PR #247 lands".
+Reading those as ownership marks a PR tracked forever and `untracked_pr` then goes
+permanently silent about work nothing on the plan is doing, which is a false negative
+on the one condition whose whole job is finding unaccounted-for work. A PR genuinely
+owned by an issue-backed item is reached through the issue leg instead. And **every row
+the plan has can account for a PR, not only its open ones**: the repo scope is drawn
+from the whole plan so a repo whose work is all finished still gets its open PRs read,
+and if only open rows could account for them, every PR in such a repo would be a
+standing finding.
+
+It walks the plan's refs against GitHub and the board's own review record and reports five
+disagreements:
+
+| condition | what it means |
+|---|---|
+| `done_candidate` | item open, its work merged or closed-as-completed |
+| `dropped_candidate` | item open, its work closed unmerged or not-planned |
+| `stale_claim` | item claimed, but the claim does not describe the present |
+| `note_contradicted` | the item's note asserts a readiness `/review/findings` denies |
+| `untracked_pr` | an open PR no open plan item accounts for |
+
+**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. It never
+edits the plan: "this item looks done" is a candidate for a human or a `plan_done` call, not
+a state transition to make behind their back — and `dropped` in particular is a *decision*,
+which is why the plan's model keeps it apart from `done`. The only write it can make is one
+board post, and only when asked.
+
+**Ref kind is not one of the conditions.** The first two are "the item outlived its work"
+and "the work was abandoned"; whether that work is spelled as a PR or an issue is only how
+it is looked up. Nine of the fourteen items on this plan carry `issue` refs, so a pass that
+read PR refs alone would be silent on two thirds of it while reporting that it had checked
+the plan.
+
+**A claim is checked by its session, not by its holder.** Passive expiry covers a holder
+that *died* — it stops renewing and the row lapses with nobody reaping it. It does not cover
+the holder still being there while the conversation that took the claim is gone: a `/new`
+resets the conversation, the seat identity and its claims are pinned to the pane, and the
+lifecycle hook renews the lease on every prompt whatever the new conversation is about. The
+claim then looks maximally fresh *because* the agent is busy — with something else — and it
+cannot lapse while the pane lives. A claim naming no session (one taken by hand) can only be
+checked by holder name, and names are recycled when an agent finishes, so that case is
+reported as **unchecked** rather than as healthy.
+
+**And an absent lease is not evidence that a claim is dead, because the two TTLs are not the
+same length.** A plan claim runs an hour; a lease runs 30 minutes on this board (300s by API
+default) and is renewed by the lifecycle hook per *prompt*, and `/active` lists only leases
+that have not expired. So an agent in a single long autonomous turn — the normal shape of the
+loops this harness drives — drops out of `/active` for up to half an hour with its claim
+perfectly live, and nothing in the payload tells "quiet" from "gone". Only one case is a
+finding: the holder is demonstrably live and the session that took the claim is not, which is
+the case passive expiry can never reach. When *nothing* the claim names is in `/active`, the
+claim's own `expires` is what can still be read, and while it holds this is reported as
+**unchecked** — the board's own passive expiry settles it at the claim's TTL, and a finding
+accusing a working agent of holding a dead claim every fifteen minutes settles nothing.
+
+**An unmade check never reads as a clean one**, which is the half of #255 that shapes the
+whole file. Every condition has a third answer, `unknowns` is never folded into `findings`,
+and `complete: false` says so in the JSON. This is not hypothetical: the deployed board is
+v2.48 and its `/review/findings` returns no `cycles` field, so its `stopped` cannot be
+attributed to one cycle — and the pass says exactly that instead of reading the field
+anyway. The exit code carries the same distinction:
+
+```
+0   ran, every check completed (a disagreement is the report, not an error)
+1   ran, but at least one check could not be made
+2   could not run at all: no board, no `gh`, or bad arguments
+```
+
+Run it on a timer with
+[`loops/systemd/qb-reconcile.{service,timer}`](loops/systemd/) — reference units, like the
+lander's. There is no `--execute` to graduate to, because there is nothing for it to do.
+
+`--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
+the present, which is why this is the deterministic half of that issue in its cheapest form.
 
 ## How it works
 
@@ -1158,6 +1558,104 @@ Adopt the second when you can no longer tell what the others are doing.
 
 ---
 
+## The board client
+
+Everything above is the workflow half. This is the half that makes a machine *appear* on a
+board, and until #230 none of it was here: the hook script, the MCP registration and the
+seven `settings.json` entries all lived in whatever personal config a consumer happened to
+keep. So a host that imported the flake got the slash commands and the loops and **no
+board** — no lease, no presence, no ask courier, no overlap detection, no sync advice — while
+the flake's own description said otherwise. Worse, the hook was pinned by a different repo
+than the board it posts to, which is version skew that `qb-doctor` could not even look at,
+because the file was not in the tree it checks.
+
+Five files, one pin:
+
+| file | what it is |
+|---|---|
+| `bin/qb-hook` | the lifecycle reflexes — presence, lease, handoff, publish-on-push, the ask courier, sync advice, sub-agent records. Fired by Claude Code, never by the model: these must not depend on anybody remembering them. Fail-open by contract |
+| `bin/qb-env` | the site-config contract — which board, which token. Sourced, not run |
+| `bin/qb-mcp` | one stdio MCP server per session, so each agent carries its own identity |
+| `bin/qb-claude-setup` | the wiring: merges the hook fragment into `~/.claude/settings.json`, registers the MCP server in `~/.claude.json`, @imports the workflow doc |
+| `bin/qb` | what a human types — `qb sessions`, `qb resume <id>` |
+
+### Which qb-hook am I running?
+
+```bash
+qb-hook --version
+# qb-hook /nix/store/…-quarterback-harness-0.1.0/bin/qb-hook
+# qb-env  /nix/store/…-quarterback-harness-0.1.0/bin/qb-env
+```
+
+Paths, not a version string: on a nix install the store hash **is** the pin, uniquely, while a
+`version` field is something somebody has to remember to bump. The two lines matter together —
+a `qb-hook` and a `qb-env` from different store paths is a half-migrated install, and it is
+invisible from either line alone. This is the fourth layer #204 counts three of.
+
+### Is it actually wired?
+
+```bash
+qb-claude-setup --check
+# ok       PreToolUse        /nix/store/…/bin/qb-hook PreToolUse
+# MISSING  PostToolUse       no qb-hook entry — this host is deaf on that event
+# SKEW     Stop              /home/you/.local/bin/qb-hook Stop
+```
+
+Per event, because that is the resolution the failure has: the bug this replaced wired three
+of seven, which any single yes/no would have reported as "wired". Exit codes are a contract —
+**0** all wired here, **1** something missing, **2** all wired but to a different `qb-hook`
+than this install's. `2` is not a lesser `1`: it is the state a host is in for the whole of a
+migration, and it is the skew this section exists to end.
+
+It reads `~/.claude/settings.json` and nothing else. The MCP registration and the CLAUDE.md
+@import are wired by the same run and are deliberately **not** in those exit codes: folding
+three answers into one number would leave a doctor unable to tell a deaf host from one
+missing a doc. Check those two by looking — `jq .mcpServers.quarterback ~/.claude.json` and
+`grep quarterback-workflow ~/.claude/CLAUDE.md`.
+
+### Wiring `~/.claude/settings.json` when you already write to it
+
+That file has several writers — you edit it, Claude Code writes to it, and nix wants to
+declare parts of it — so `home.file` cannot own it: a store symlink is read-only and breaks
+the app. The wiring is therefore an activation script doing a surgical, idempotent merge, and
+it is **additive by identity**: quarterback's own entries are replaced, everybody else's in
+the same event are kept. Your `PreToolUse` Bash guard survives having a board installed.
+
+The half a jq expression cannot fix is ordering. The usual spelling of "declare part of
+settings.json from nix" is `jq -s '.[0] * .[1]'`, and `*` replaces **arrays** — so a canonical
+file of yours that declares `hooks.PreToolUse` will drop quarterback's entry from that one
+array if it lands last. Name your entry and the ordering is explicit:
+
+```nix
+programs.quarterback-harness.claude.activationAfter = [ "claudeBaseSettings" ];
+```
+
+Relying on the DAG's tie-breaking between two entries that merely both come after
+`writeBoundary` is not a fix; it is the same bug with a coincidence holding it up. If you
+would rather own the file outright, take the fragment instead:
+
+```bash
+qb-claude-setup --print-fragment      # the exact JSON the activation would have merged
+```
+
+with `claude.enable = false`. One expression produces both, so the manual route cannot drift
+from the wired one.
+
+### Migrating off a hand-rolled copy
+
+If you already carry your own `qb-hook`/`qb-claude-setup` (this is where they came from), the
+transition is safe in either direction and needs no flag day: the merge matches on the command
+*naming* `qb-hook` rather than on an exact path, so your old `~/.local/bin/qb-hook` entries are
+**replaced** rather than doubled. A doubled `PostToolUse` entry would run the hot path twice
+per tool call and poll the ask courier twice per window, which is the reason that is matched
+loosely on purpose. When you drop your copies, drop the `settings.json` hook entries with them
+and let the module write them; `qb-claude-setup --check` tells you which pin you are on
+meanwhile. One thing to check by hand: an activation attribute called `quarterbackClaude` in
+your own config does **not** collide with this module's (`quarterbackClaudeWiring`), but two
+definitions of one name would be an eval failure rather than a merge, so keep the names apart.
+
+---
+
 ## Installing
 
 Nothing here has a build step — it is bash and standard-library Python. There are two ways
@@ -1173,15 +1671,35 @@ The repo root is a flake. As a home-manager consumer:
 
   # …then in your home-manager configuration:
   imports = [ inputs.quarterback.homeManagerModules.default ];
-  programs.quarterback-harness.enable = true;
+
+  programs.quarterback-harness = {
+    enable = true;
+    board.url = "https://qb.example.org";
+    board.tokenCommand = "cat /run/secrets/quarterback-token";
+  };
 }
 ```
 
-That links `loops/` to `~/.claude/loops`, every slash command to `~/.claude/commands/`, and
-puts the worktree scripts on `PATH`. Narrow `programs.quarterback-harness.commands` if your
-host already defines a command of the same name — home-manager will collide rather than pick
-a winner silently, which is the behaviour you want. Set `installScripts = false` to take the
-loops and commands without the worktree tooling.
+That links `loops/` to `~/.claude/loops`, every slash command to `~/.claude/commands/`, puts
+the scripts on `PATH`, and — because a board was named — renders
+`~/.config/quarterback/config` and wires the seven lifecycle hooks and the MCP server at
+activation. Presence, leases, the courier and sync advice work from the next session, with no
+quarterback-specific lines anywhere else in your config.
+
+| option | default | what it decides |
+|---|---|---|
+| `commands` | all of them | which slash commands land in `~/.claude/commands`. Narrow it if your host already defines one of the names — home-manager collides rather than picking a winner silently, which is the behaviour you want |
+| `installScripts` | `true` | the package on `PATH`. Off takes the loops and commands without the worktree tooling. The board wiring does not depend on it: hooks are wired by store path, so a host can have a working client with nothing on `PATH` |
+| `seats.enable` | `false` | adds `tmux`, the one runtime dependency the harness cannot assume. Off because you enable this module on every host and want a seat screen on one |
+| `board.url` | `null` | the board this host talks to. **Null means "I render that config myself"**, not "use a default" — there is deliberately no fallback URL, because a self-hosted board has none and a guess points an agent at somebody else's |
+| `board.tokenCommand` | `null` | a command printing this machine's bearer. A command, not a path: the token source is what varies per site. Runs on every board call, so keep it cheap |
+| `board.tokenRefreshCommand` | `tokenCommand` | used *instead* after a confirmed 401, for the common case where `tokenCommand` reads a cache and re-running it returns the same stale bearer |
+| `board.agent` | short hostname | this machine's name on the board — the machine half of a `machine/name` identity |
+| `board.repo` | `$HOME/source/quarterback` | a checkout, which `qb-mcp` needs for the MCP server's venv |
+| `claude.enable` | `true` | do the wiring at all. Off gives you the fragment to merge yourself |
+| `claude.activationAfter` | `[ ]` | activation entries the wiring must run after. Name yours if you also merge into `settings.json` |
+| `claude.workflowDoc` | `true` | install `~/.claude/quarterback-workflow.md` and @import it from `~/.claude/CLAUDE.md`, creating that file if you have none. The import is conditional on the doc, so turning this off leaves no dangling @import |
+| `claude.registerMcp` | `"auto"` | register `qb-mcp` in `~/.claude.json`. `auto` registers it only when the interpreter it execs exists, because a server that cannot start means every session opens on a failed connection; it self-heals on the next switch. `always` for a host that builds the venv afterwards |
 
 Outside home-manager, `nix build github:prisonblues/quarterback#harness` puts the scripts in
 `result/bin` and the rest in `result/share/quarterback-harness`.
@@ -1198,8 +1716,11 @@ cp harness/commands/*.md ~/.claude/commands/
 
 `git`, `jq`, `bash`, and Python 3 (standard library only — the loops import nothing
 third-party). `gh` for anything that talks to GitHub, which is most of it. `curl` for
-`worktree-holder` (without it the check reports "could not tell" and the scripts carry
-on). `docker` and a database client only if your repo uses them.
+`worktree-holder` and for the board client (without it `worktree-holder` reports "could not
+tell" and `qb-hook` no-ops, both silently and on purpose — a coordination board must never be
+in the critical path of a tool call). `jq` and `curl` are hard requirements for `qb-hook`
+specifically, which checks for both and exits 0 without them. `docker` and a database client
+only if your repo uses them.
 
 `qb-board` is the one exception to the stdlib-only rule, and it is an exception in
 where the code lives rather than in this directory: the launcher here is bash, and what
@@ -1217,16 +1738,23 @@ reported as skipped, not fatal.
 ### Connecting it to a board (optional)
 
 The panel looks for a `qb` CLI to record runs. With none on `PATH`, it no-ops silently and
-everything else works unchanged. Point `qb` at your board to light up `GET /review/stats`
-and the board's `/panel` page.
+everything else works unchanged — that stays true even though `qb` now ships here (#230),
+because `installScripts = false` is a supported way to take the loops alone. Point it at
+your board to light up `GET /review/stats` and the board's `/panel` page.
 
-`worktree-holder` and `qb-board` read the same per-host site config —
-`QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` from
-`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, either overridable from the
-environment — but read it directly rather than through `qb`, so the occupancy check and
-the board client work whether or not that CLI is installed. There is deliberately **no
-default board URL**: unset means this machine has not been told which board it belongs to,
-and guessing would point the query at somebody else's.
+One site config, read by everything: `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` (plus
+the optional `QUARTERBACK_TOKEN_REFRESH_CMD`, `QUARTERBACK_AGENT` and `QUARTERBACK_REPO`) from
+`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, each overridable from the environment.
+`bin/qb-env` is the contract and the loader; `qb`, `qb-hook` and `qb-mcp` source it, while
+`worktree-holder` and `qb-board` read the same two variables directly, so the occupancy check
+and the board client work whether or not the CLI is installed. Under home-manager,
+`board.url` renders that file for you; set it to `null` (the default) to keep rendering it
+yourself. There is deliberately **no default board URL**: unset means this machine has not
+been told which board it belongs to, and guessing would point the query at somebody else's.
+
+`qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
+reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy
+information", it exits **2** and says which read it could not make.
 
 ## Caveats
 

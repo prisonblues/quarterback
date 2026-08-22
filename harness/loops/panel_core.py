@@ -199,8 +199,8 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 # ----------------------------------------------------------------- #165's dials
 #
 # The built-in half of `review_panel.{fixer_may_defer, fix_severity_floor,
-# round_trigger_floor, max_fix_growth, reviewer_scope, require_failing_test,
-# max_rounds}`. WHY each number is this number lives beside the key in
+# round_trigger_floor, low_severity_fix_lines, max_fix_growth, reviewer_scope,
+# require_failing_test, max_rounds}`. WHY each number is this number lives beside the key in
 # `harness_rules.DEFAULTS`, which is the file an operator reads; these are what
 # the resolvers in `panel_seats` fall back to when a rules file (or a test's
 # hand-written `panel` literal) does not carry the key. The two are asserted equal
@@ -217,6 +217,13 @@ DEFAULT_FIX_SEVERITY_FLOOR = "P3"
 #: the fix floor is P3, deliberately: fixing a P3 inside a pass that is already open
 #: costs one edit; letting one buy a whole new round costs a panel plus a fix pass.
 DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
+#: Churned lines the whole round may spend fixing findings BELOW the trigger floor —
+#: the tier the fix floor admits and the measurement does not. 40 because the failure
+#: is accumulation, not one balloon: PR #188's round-1 fix pass was 408 lines of
+#: individually reasonable small fixes on a 185-line feature. `None` is no budget at
+#: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
+#: measurement.
+DEFAULT_LOW_SEVERITY_FIX_LINES = 40
 #: The floor value that means "no floor" — the least severe severity there is, so
 #: everything is at or above it. Both floors default to this INSIDE `round_stop`,
 #: which is what keeps every caller that has not heard of them on the old
@@ -233,6 +240,16 @@ REVIEWER_SCOPES = ("diff", "repo")
 DEFAULT_FIXER_MAY_DEFER = True
 #: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
 DEFAULT_REQUIRE_FAILING_TEST = False
+#: Lines an integration merge may put into a PR's OWN files and still leave the
+#: round that ran before it standing as a review of this PR's change (#278). The
+#: measurement is `diff(the commit the round read, the merge result)` restricted to
+#: the files the PR itself touches; at or under this many changed lines the merge is
+#: DISTANT and the earlier round stands, past it the merge is INVOLVED and its
+#: resolution is unreviewed work. `None` switches the reading off, which is the
+#: pre-#278 behaviour where any head move is a review of earlier code; `0` admits
+#: only a resolution that is empty over this PR's files. `harness_rules` carries the
+#: argument for the number.
+DEFAULT_DISTANT_MERGE_LINES = 20
 
 # The judge's prompt holds the one component that grows with the review itself —
 # one line per reviewer account, each up to RAW_DETAIL_CHARS — so the listing
@@ -754,6 +771,69 @@ def load_repo_cfg(name: str) -> dict:
         return resolve_repo(name)
     except RepoNotFound as e:
         sys.exit(str(e))
+
+
+#: The dials a REVIEW runs under. `resolve_repo` reports the layer that answered
+#: for every dial in the config, including the loop schedule and the epic's model
+#: ceiling; a round's artifact only wants the ones that governed the round.
+_REVIEW_BLOCKS = ("review_panel.", "reviewers.")
+
+
+def rules_record(cfg: dict) -> dict:
+    """WHICH LAYER SUPPLIED EACH DIAL THIS ROUND RAN UNDER — #305.
+
+    The payload already carried `review_panel`, the dials AS APPLIED. What it could
+    not say is where each of them came from, and that is the half the incident
+    turned on: `.harness-rules.sample` stated both floors at P2 while five rounds on
+    #299 put P4 findings in `to_fix`, and nothing in any round's artifact could
+    settle which of the two was describing the run. A value with no provenance is
+    a value a reader has to go and guess the source of, from three files and a
+    resolution order.
+
+    So every reviewed round now records the layer beside the value — `defaults`,
+    `sample`, `overlay` or `board` — plus, for a board dial, the reason somebody
+    gave for moving it and when it lapses. On EVERY payload including the ones that
+    reviewed nothing, unlike `review_panel` itself: a refusal or a skip did not
+    apply a review policy, but it certainly resolved one, and "which rules did this
+    repo have when it refused" is exactly the question a refusal raises.
+    """
+    return {
+        "from": cfg.get("_rules_from", ""),
+        "baseline": cfg.get("_rules_baseline", ""),
+        "unreadable": bool(cfg.get("_rules_unreadable")),
+        "dials_from": cfg.get("_dials_from", ""),
+        # The board is configured on this box and did not answer, so the layers
+        # below are this repo's own and not necessarily the ones in force. A
+        # separate fact from `unreadable`, which is about the default branch.
+        "dials_unreadable": bool(cfg.get("_dials_unreadable")),
+        "dials": {path: said for path, said in (cfg.get("_dials") or {}).items()
+                  if path.startswith(_REVIEW_BLOCKS)},
+    }
+
+
+def board_dial_notes(cfg: dict) -> list[str]:
+    """`config_notes` lines for a round that ran under a board dial, or none.
+
+    #52's rule — a round that ran under a changed dial SAYS SO — and the reason it
+    is `config_notes` rather than the report alone is that `--post` puts these in a
+    public PR comment, so the person reading the review sees the floor it was run
+    against and who moved it.
+    """
+    said = [(path, d) for path, d in (cfg.get("_dials") or {}).items()
+            if d.get("layer") == "board" and path.startswith(_REVIEW_BLOCKS)]
+    notes = []
+    if cfg.get("_dials_unreadable"):
+        notes.append(
+            f"the board at {cfg.get('_dials_from')} would not answer, so this round "
+            f"ran on this repo's own rules — which is not the same thing as no dial "
+            f"being set on the board")
+    for path, d in sorted(said):
+        lapses = f", until {d['expires_at']}" if d.get("expires_at") else ""
+        notes.append(f"{path} is {json.dumps(d['value'])} from the BOARD "
+                     f"({d['scope']} scope), not from {SAMPLE_FILENAME}: "
+                     f"{d['reason'] or 'no reason given'} — set by "
+                     f"{d['set_by'] or 'nobody named'}{lapses}")
+    return notes
 
 
 def review_refusal(cfg: dict) -> str:
@@ -2039,8 +2119,10 @@ __all__ = [
     "RAW_DETAIL_CHARS", "CLUSTER_WINDOW", "ACCOUNT_CHARS", "DEFAULT_MAX_ROUNDS",
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
+    "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
+    "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
@@ -2050,7 +2132,8 @@ __all__ = [
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
-    "PanelResult", "sh", "load_repo_cfg", "review_refusal",
+    "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
+    "board_dial_notes",
     "RULES_FILENAME", "SAMPLE_FILENAME", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",
     "_TOKEN", "_TOKEN_MARK", "_tokenise", "_schema",

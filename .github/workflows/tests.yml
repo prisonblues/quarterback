@@ -94,6 +94,23 @@ jobs:
       # test job that quietly runs nothing and reports green. That is the exact
       # failure this repo is organised against; a suite that disappears has to
       # be as loud as a suite that fails.
+      #
+      # `-n auto`, one worker per core. This step ran on a single core for 68s of
+      # every push while the runner's other three sat idle, and what dominates it
+      # is not CPU: `test_nginx_block_regressions` alone is 20s of shelling out to
+      # a 220-line bash suite that builds throwaway git repos, and four qb-seat
+      # tests wait on a real tmux server (#233). Those are subprocess waits, so
+      # they overlap across workers almost perfectly, and not one test is
+      # shortened to get it — the tmux tests still drive tmux and the nginx test
+      # still drives real git repositories, which is the whole of what they check.
+      # Not in `addopts`: the flake's check sandboxes hold pytest and nothing
+      # else, so a project-wide `-n` would fail every check in flake.nix with
+      # "unrecognized arguments". The flag stays where xdist is installed.
+      #
+      # `-n` does not weaken the report. xdist prefixes a failure with the worker
+      # that saw it ([gw2]) and prints the whole traceback in the summary, and the
+      # per-suite loop below is still one pytest run per suite, so a red step still
+      # names a suite, a module and a test.
       - name: Run every harness suite
         run: |
           set -euo pipefail
@@ -105,7 +122,7 @@ jobs:
           printf 'running %d harness suite(s): %s\n' "${#suites[@]}" "${suites[*]}"
           for suite in "${suites[@]}"; do
             echo "--- $suite"
-            uv run --extra dev pytest "$suite" -q
+            uv run --extra dev pytest "$suite" -q -n auto
           done
 
       # TWICE, with different extras, for the reason the mcp job below runs
@@ -119,27 +136,40 @@ jobs:
       # only in mcp/pyproject.toml — so those tests had never once run in CI.
       # Seven of them, green by never executing, on the file with the most
       # clicking-the-wrong-row ways to be wrong.
-      - name: Run every harness suite with the dashboard's dependencies
+      #
+      # THE DASHBOARD MODULES ONLY, and that narrowing is the other half of #233.
+      # This step used to re-run every suite under harness/ before the check below,
+      # which cost a further 74s per push to learn nothing: the tui extra changes
+      # what these two modules do and changes nothing anywhere else, so the nginx
+      # bash suite and the tmux seat tests were being paid for twice over. What
+      # makes that safe to assume is that it is not assumed — tests/test_harness_job.py
+      # scans every harness test module for a real textual/rich dependency and fails
+      # if one of them is missing from the list below. Add a module that needs the
+      # extra, forget this line, and that test is red rather than the module being
+      # silently green by never running.
+      - name: Run the dashboard suites with the dashboard's dependencies
         run: |
           set -euo pipefail
-          mapfile -t suites < <(find harness -type d -name tests -not -path '*/node_modules/*' | sort)
-          for suite in "${suites[@]}"; do
-            echo "--- $suite"
-            uv run --extra dev --extra tui pytest "$suite" -q
-          done
-
           # And loudly if the thing this step exists for skipped anyway. A module
           # that skips every test exits 0, so a green step is not evidence on its
           # own — that is exactly how the gap above went unnoticed. The tests that
           # want a live board and a `gh` still skip here and are meant to; these
           # are the ones whose data is a literal in the file.
-          echo "--- did the dashboard tests actually run?"
-          out=$(uv run --extra dev --extra tui pytest harness/tests/test_qb_dash.py -q -rs 2>&1)
-          echo "$out"
-          grep -qE '[0-9]+ passed' <<<"$out" || {
-            echo "::error::The dashboard suite executed nothing. It is skipping under CI again — check _why_no_tui in test_qb_dash.py and the tui extra in pyproject.toml."
-            exit 1
-          }
+          # BOTH dashboard suites, named one at a time. Each is skip-guarded on its
+          # own dependency — test_qb_dash.py on textual, test_qb_dash_plain.py on
+          # rich — so a single run over both would report `N passed` while one of
+          # them contributed nothing, which is the reading this step exists to deny.
+          # Serial, and not `-n auto` like the step above: this reads pytest's own
+          # summary line back out, and it is forty-odd tests to begin with.
+          for suite in harness/tests/test_qb_dash.py harness/tests/test_qb_dash_plain.py; do
+            echo "--- did $suite actually run?"
+            out=$(uv run --extra dev --extra tui pytest "$suite" -q -rs 2>&1)
+            echo "$out"
+            grep -qE '[0-9]+ passed' <<<"$out" || {
+              echo "::error::$suite executed nothing. It is skipping under CI again — check its skip guard (_why_no_tui / importorskip) and the tui extra in pyproject.toml."
+              exit 1
+            }
+          done
 
   mcp:
     name: mcp + board client
@@ -191,6 +221,154 @@ jobs:
           set -euo pipefail
           cd mcp
           uv run --extra dev --extra tui --extra server pytest -q
+
+  flake:
+    name: flake checks
+    runs-on: ubuntu-latest
+    # Least privilege, and this job is the one in this file that most needs it: it
+    # evaluates and BUILDS nix code that arrives with the pull request, through a
+    # third-party action that runs before any code of ours. The SHA pin below covers
+    # the action being repointed; it says nothing about what the token that action
+    # holds can do. A repository whose default `GITHUB_TOKEN` is still read/write —
+    # the common default — hands that write scope to a `flake.nix` written by whoever
+    # opened the PR. Checkout is all this job needs.
+    permissions:
+      contents: read
+    # The jobs above and this one do NOT run the same thing, and that is the
+    # point rather than duplication (#179). They run `uv run pytest` against a
+    # normal checkout; the flake runs the same suites inside a sandbox holding
+    # only what `flake.nix` puts there. Each is blind where the other sees:
+    # `test_release_numbers.py` passes above and errored on missing files in the
+    # sandbox for a day (#163), and the qb-seats suite skips above because the
+    # runner has no tmux, while the sandbox installs tmux precisely so that those
+    # tests cannot skip. Until this job existed the flake's checks ran only when
+    # a human typed `nix build`, which is how a red `main` went a day without
+    # anyone noticing.
+    #
+    # For anyone wiring up branch protection: unlike `stamped` below, this job
+    # runs on pull_request as well as push, so it is safe to require.
+    #
+    # Same fifteen minutes as the jobs above. No measurement is written down
+    # here on purpose. Cold runs have come in around a minute end to end, but the
+    # runner image, the nixpkgs pin and the check set all move independently, so
+    # a number in a comment goes stale in silence and then misleads the next
+    # reader about how much headroom actually remains. Fifteen minutes is an
+    # order of magnitude clear of anything observed, which is what a timeout is
+    # for: it catches a wedged run, not a slow one.
+    #
+    # No nix store cache, deliberately. `magic-nix-cache-action` was sunset,
+    # `cachix-action` wants a token this repo does not have, and `actions/cache`
+    # over /nix/store restores more slowly than cache.nixos.org serves a closure
+    # this size. If the check set ever grows enough to flip that trade, the
+    # timeout above is the thing that says so.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to the commit behind v31.11.1, not the mutable `v31` tag. This is
+      # third-party and runs before any code of ours, so a repointed tag would
+      # execute here holding the job's token. `actions/checkout` above has the
+      # same tag shape but is first-party, which is why the pin starts here.
+      # Bump the SHA and the trailing comment together.
+      - name: Install nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          # Asserted by tests/test_flake_workflow.py: without these two features
+          # every `nix` invocation below fails on a runner whose nix.conf has
+          # neither, and the job's failure names the config rather than the flake.
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+          # Flake inputs are `github:` refs, and the installer fetches its own
+          # release metadata the same way. Unauthenticated, both share the runner
+          # IP's 60 requests/hour with every other job on that host, and the cost
+          # lands squarely here: the deliberate absence of a nix store cache
+          # (reasoned about above) means this job re-fetches on every single run.
+          # The symptom is an intermittent `HTTP 403: rate limit exceeded` that has
+          # nothing to do with the diff — and a required check that fails for
+          # reasons the PR did not cause is one reviewers learn to re-run without
+          # reading, which is worse than not having it.
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # DISCOVERED and not listed, and it FAILS when it finds nothing — the same
+      # rule as the harness job above, for a sharper reason: `nix flake check` on
+      # a flake whose checks have been removed exits 0. A job that only ran that
+      # would go green the day the checks disappear, which is precisely the
+      # failure this job exists to end. Naming them also puts the set in the log,
+      # so a reviewer can see a new check is actually being run rather than
+      # assume it: #163's `release-metadata-tests` was added because the old
+      # arrangement ran eight assertions that had never once been evaluated.
+      #
+      # Be clear about the floor this guard sets: it is name-level. It catches
+      # the checks being emptied or the whole output being deleted. It cannot
+      # catch a check that keeps its name and loses its body — swap one for
+      # `pkgs.emptyFile` and the count is unchanged and the log still reads
+      # reassuringly. The guard against THAT is not here but in
+      # tests/test_flake_workflow.py, which pins the expected set of names
+      # against flake.nix so that adding, renaming or dropping a check is a
+      # deliberate, reviewer-visible diff rather than a silent one.
+      #
+      # The system is derived, not written down. A hardcoded x86_64-linux is
+      # wrong the day this moves to an arm runner, and the same lesson landed
+      # twice in this repo already (#148, #176).
+      - name: Name the checks
+        run: |
+          set -euo pipefail
+          system=$(nix eval --impure --raw --expr 'builtins.currentSystem')
+          # Caught rather than left to `set -e`. If `checks` — or `checks.$system`
+          # — has been deleted from flake.nix outright instead of emptied, the
+          # eval itself is what fails, and an uncaught failure would end this job
+          # on a raw nix error before the annotation below could fire. That
+          # annotation is the entire purpose of the step, so this reads the same
+          # to a human whether the checks were emptied or removed.
+          #
+          # stderr to a file rather than folded in with `2>&1`: nix writes to it
+          # on the SUCCESS path too — "warning: Git tree is dirty" is the common
+          # one — and merging that into the capture hands jq a JSON document with
+          # a line of English glued to the front of it.
+          eval_err=$(mktemp)
+          if ! names=$(nix eval ".#checks.$system" --apply 'cs: builtins.attrNames cs' --json 2>"$eval_err"); then
+            echo "::error::flake.nix declares no checks for $system — \`checks.$system\` could not be evaluated at all, so it was removed or renamed rather than emptied. nix said: $(tr '\n' ' ' <"$eval_err")"
+            exit 1
+          fi
+          # Caught, for the same reason the eval above is. `set -e` would end the
+          # step here on a bare jq message — no jq on the runner, or a `names` that
+          # is not a well-formed JSON array — and the annotation is the entire
+          # purpose of this step, so every way the names can fail to arrive has to
+          # produce one. A step that dies silently reports the same as a check set
+          # that vanished, which is the confusion this job exists to remove.
+          if ! count=$(jq 'length' <<<"$names" 2>/dev/null); then
+            echo "::error::the flake's check names could not be counted — \`nix eval\` returned something that is not a JSON array, or jq is missing from this runner. nix returned: $(tr -d '\r' <<<"$names" | tr '\n' ' ' | head -c 300)"
+            exit 1
+          fi
+          if [[ "$count" -eq 0 ]]; then
+            echo "::error::flake.nix declares no checks for $system — they were removed, or this job is now a no-op reporting green."
+            exit 1
+          fi
+          # Assigned on its own line rather than substituted into the printf. A
+          # jq that fails inside `$(...)` in printf's argument list still leaves
+          # printf exiting 0, so `set -e` never sees it and the job carries on
+          # reporting an empty set of names as though it had found none.
+          #
+          # `map(@json)` and not a bare `join`, because these names are attribute
+          # names out of the pull request's own flake.nix and this line goes into a
+          # log that Actions PARSES: a line beginning `::` is a workflow command, so
+          # a check named with an embedded newline and `::error::` forges an
+          # annotation — or `::add-mask::`, or an `::error::` claiming the opposite
+          # of what happened. @json renders each name as a JSON string literal, so a
+          # newline arrives as the two characters `\n` and no name can ever start a
+          # line. The quotes are a readability gain as well: an empty or
+          # space-padded name is visible instead of invisible.
+          if ! joined=$(jq -r 'map(@json) | join(", ")' <<<"$names" 2>/dev/null); then
+            echo "::error::the flake's check names could not be rendered for the log, though $count of them were counted — jq failed on a document it had just parsed."
+            exit 1
+          fi
+          printf 'running %d flake check(s) on %s: %s\n' "$count" "$system" "$joined"
+
+      # -L so the pytest output of a failing suite is in this log. Without it a
+      # red check reports `builder for '...drv' failed` and the assertion that
+      # actually broke is behind a `nix log` on a machine nobody has.
+      - name: nix flake check
+        run: nix flake check -L
 
   stamped:
     name: no unstamped release on main

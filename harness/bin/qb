@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# qb — quarterback CLI. See Claude Code sessions across the fleet and revive one.
+#   qb sessions          list live + resumable sessions (id, who, repo, age, size)
+#   qb resume <session>  pull the latest transcript blob + `claude --resume`
+#   qb focus <session>   focus the niri window whose process tree holds that session
+#   qb record-review     record a panel run (POST /review); JSON payload on stdin
+#   qb record-outcome    record what HAPPENED to a panel's findings
+#                        (POST /review/outcomes); JSON payload on stdin
+#
+# Board and token both come from the per-host site config; see qb-env for the
+# contract and for why there is no default board URL.
+set -uo pipefail
+
+# Find qb-env beside this script. NOT `readlink -f`: home-manager installs each
+# file as its own flat /nix/store/…-hm_qb path, so full resolution walks straight
+# past the bin/ directory and dirname yields /nix/store. Walk the chain one link
+# at a time instead and take the first directory that actually holds a qb-env.
+qb_env_path() {
+  local p="$1" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -r "$d/qb-env" ] && { printf '%s\n' "$d/qb-env"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+QB_ENV="$(qb_env_path "$0")" \
+  || { echo "qb: no qb-env next to $0 — broken install" >&2; exit 1; }
+# shellcheck source=./qb-env
+. "$QB_ENV"
+qb_load_config
+qb_require_base_url || exit 1
+qb_resolve_token || { echo "qb: no token (set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in $QB_CONFIG)" >&2; exit 1; }
+
+BASE="$QUARTERBACK_BASE_URL"
+TOK="$QUARTERBACK_TOKEN"
+auth=(-H "Authorization: Bearer $TOK")
+
+# cwd -> ~/.claude/projects dir name (Claude replaces / and . with -)
+_encode() { printf '%s' "$1" | sed 's#[/.]#-#g'; }
+
+_ancestor_of() {   # is pid $1 an ancestor of pid $2? (walk ppid chain)
+  local anc="$1" p="$2" i=0
+  while [ "${p:-0}" -gt 1 ] && [ "$i" -lt 40 ]; do
+    [ "$p" = "$anc" ] && return 0
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); [ -n "$p" ] || return 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+case "${1:-sessions}" in
+  sessions|ls)
+    curl -fsS "${auth[@]}" "$BASE/sessions" 2>/dev/null | jq -r '
+      .[] | [ (if .live then "●live" else "○" end),
+              ((.title // ((.cwd // "?")|split("/")|last))[0:30]),
+              (.holder // "?") + (if .device then "@"+.device else "" end),
+              (.updated_at // "")[11:19],
+              ((.size // 0)|tostring)+"B",
+              (if .resumable then "qb resume "+.session else "—" end) ]
+      | @tsv' | column -t -s"$(printf '\t')"
+    ;;
+  resume)
+    id="${2:-}"; [ -n "$id" ] || { echo "usage: qb resume <session>" >&2; exit 2; }
+    st=$(curl -fsS "${auth[@]}" "$BASE/session/$id" 2>/dev/null) \
+      || { echo "qb: unknown session $id" >&2; exit 1; }
+    blob=$(printf '%s' "$st" | jq -r '.latest_blob // empty')
+    cwd=$(printf '%s'  "$st" | jq -r '.cwd // empty')
+    [ -n "$blob" ] || { echo "qb: session has no transcript yet to resume" >&2; exit 1; }
+    [ -n "$cwd" ]  || { echo "qb: no recorded cwd; cd to the repo and run: claude --resume $id" >&2; exit 1; }
+    dir="$HOME/.claude/projects/$(_encode "$cwd")"
+    mkdir -p "$dir"
+    curl -fsS "${auth[@]}" "$BASE/blob/$blob" -o "$dir/$id.jsonl" 2>/dev/null \
+      || { echo "qb: failed to fetch transcript blob" >&2; exit 1; }
+    echo "pulled transcript -> $dir/$id.jsonl"
+    [ -d "$cwd" ] || { echo "qb: $cwd not on this machine — clone it, then: claude --resume $id" >&2; exit 1; }
+    cd "$cwd" && exec claude --resume "$id"
+    ;;
+  focus)
+    id="${2:-}"; [ -n "$id" ] || { echo "usage: qb focus <session>" >&2; exit 2; }
+    command -v niri >/dev/null 2>&1 || { echo "qb: niri IPC not available here" >&2; exit 1; }
+    # CC process pid for this session, from the local sessions metadata
+    pid=$(grep -l "\"sessionId\":\"$id\"" "$HOME"/.claude/sessions/*.json 2>/dev/null \
+          | head -1 | xargs -r jq -r '.pid // empty' 2>/dev/null)
+    [ -n "$pid" ] || { echo "qb: session $id has no live process on this machine" >&2; exit 1; }
+    # the niri window whose process subtree contains that pid (Ghostty is the ancestor)
+    wid=""
+    while IFS=$'\t' read -r w wpid; do
+      _ancestor_of "$wpid" "$pid" && { wid="$w"; break; }
+    done < <(niri msg --json windows 2>/dev/null | jq -r '.[] | "\(.id)\t\(.pid)"')
+    [ -n "$wid" ] || { echo "qb: couldn't map session pid $pid to a window" >&2; exit 1; }
+    niri msg action focus-window --id "$wid" && echo "focused window $wid ($id)"
+    ;;
+  record-review)
+    # Record one reviewer-panel run on the board (POST /review). panel.py pipes
+    # its --json payload in here rather than POSTing itself, so the recorder
+    # inherits this file's site config: which board this island talks to, how its
+    # token is resolved, and the rule that an unset URL is an error and never a
+    # guess. A panel that posted directly would have to re-derive all three, and
+    # the failure mode of getting it wrong is review data landing on another
+    # island's board.
+    #
+    # Exit 0 whether or not the board answered: recording is telemetry, and a
+    # down board must never fail a review that already ran.
+    payload=$(cat)
+    [ -n "$payload" ] || { echo "qb: record-review reads a JSON payload on stdin" >&2; exit 2; }
+    # Same instance rule as qb-mcp/qb-hook: an explicit label wins, else the
+    # session-id prefix — so a run recorded here is attributed to the same agent
+    # its posts and leases are. Written out rather than nested because `set -u`
+    # makes ${A:-${B:0:8}} an error when B is unset, which is the common case.
+    inst="${QUARTERBACK_INSTANCE:-}"
+    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
+    [ -n "$inst" ] && inst="${inst:0:8}"
+    hdr=()
+    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
+            -H 'Content-Type: application/json' --data-binary @- \
+            --max-time 15 "$BASE/review" 2>&1) \
+      || { echo "qb: review not recorded (${out:-board unreachable})" >&2; exit 0; }
+    printf '%s\n' "$out" | jq -r '"recorded review run \(.id)" + (if .recorded then "" else " (already recorded)" end)' 2>/dev/null \
+      || echo "recorded review run"
+    ;;
+  record-outcome|record-outcomes)
+    # Record what HAPPENED to a panel's findings (POST /review/outcomes) — the
+    # half the judge cannot know. It rules once, at review time, with no more
+    # access to the answer than the reviewer it rules on, so without this a
+    # confident wrong finding scores exactly like a real one: three of six
+    # judge-confirmed P2s on quarterback PR #64 were plainly wrong and are still
+    # in the board as confirmed. Piped in here rather than POSTed by the fixer
+    # for the same reason `record-review` is — which board this island talks to
+    # and how its token is resolved are site config, and re-deriving them is how
+    # data lands on another island's board.
+    #
+    # **Exit 1 when the board did not answer, where `record-review` exits 0.**
+    # That is not an inconsistency. A panel run is telemetry riding on a review
+    # that already succeeded, and failing it would be worse than losing the
+    # datum; an outcome is a report somebody sat down to make, and it exists
+    # nowhere else — so the caller has to learn it did not land, and can retry.
+    payload=$(cat)
+    [ -n "$payload" ] || { echo "qb: record-outcome reads a JSON payload on stdin" >&2; exit 2; }
+    # The same instance rule as `record-review` above, deliberately duplicated
+    # rather than factored out: that arm is a working path in the one command
+    # every panel run goes through, and four lines is a cheaper price than
+    # touching it.
+    inst="${QUARTERBACK_INSTANCE:-}"
+    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
+    [ -n "$inst" ] && inst="${inst:0:8}"
+    hdr=()
+    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
+            -H 'Content-Type: application/json' --data-binary @- \
+            --max-time 15 "$BASE/review/outcomes" 2>&1) \
+      || { echo "qb: outcomes NOT recorded (${out:-board unreachable})" >&2; exit 1; }
+    # The board itemises what it refused and which refutations nobody signed off,
+    # and both are printed rather than counted. A silent rejection here would
+    # undo the whole point of naming it back: the caller believes an outcome
+    # landed, and the coverage marker on /panel says it never did.
+    printf '%s\n' "$out" | jq -r '
+        "recorded \(.recorded|length), changed \(.changed|length), unchanged \(.unchanged|length)"
+        + (if ((.rejected // []) | length) > 0
+           then "\n" + ((.rejected | map("  REJECTED \(.key): \(.reason)")) | join("\n"))
+           else "" end)
+        + (if ((.unattested_refutations // []) | length) > 0
+           then "\n  unattested refutation(s): "
+                + ((.unattested_refutations) | join(", "))
+                + " — nobody has signed these off; /panel shows them as unattested"
+           else "" end)' 2>/dev/null \
+      || echo "recorded outcomes"
+    ;;
+  *)
+    echo "usage: qb {sessions|resume <session>|focus <session>|record-review|record-outcome}" >&2
+    exit 2 ;;
+esac

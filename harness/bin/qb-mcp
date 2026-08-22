@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# quarterback stdio MCP shim — run the board's MCP server AS THIS MACHINE, so its
+# token (and therefore the machine half of its board identity) is this machine's.
+# Registered globally in ~/.claude.json by qb-claude-setup. A shared HTTP MCP is
+# deliberately NOT used: one process per session is what lets each agent carry its
+# own identity — a shared one would hand every caller the same instance.
+#
+# Token: QUARTERBACK_TOKEN, else this agent's entry from the op-resolved list.
+# Instance (v2.9): the server reads CLAUDE_CODE_SESSION_ID from the environment
+# Claude Code spawns us with (or QUARTERBACK_INSTANCE for a human label) and sends
+# it as X-Agent-Instance, so this session posts as e.g. zeus/f5ca7491 rather than
+# as an indistinguishable "zeus". Both are inherited through the exec below —
+# nothing to set here.
+set -uo pipefail
+
+# Find qb-env beside this script. NOT `readlink -f`: home-manager installs each
+# file as its own flat /nix/store/…-hm_qbmcp path, so full resolution walks past
+# the bin/ directory and dirname yields /nix/store. Walk the chain one link at a
+# time instead and take the first directory that actually holds a qb-env.
+qb_env_path() {
+  local p="$1" d
+  for _ in 1 2 3 4 5 6 7 8; do
+    d="$(cd -P "$(dirname "$p")" 2>/dev/null && pwd)" || return 1
+    [ -r "$d/qb-env" ] && { printf '%s\n' "$d/qb-env"; return 0; }
+    [ -L "$p" ] || return 1
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  return 1
+}
+
+QB_ENV="$(qb_env_path "$0")" \
+  || { echo "qb-mcp: no qb-env next to $0 — broken install" >&2; exit 1; }
+# shellcheck source=./qb-env
+. "$QB_ENV"
+qb_load_config
+qb_require_base_url || exit 1
+export QUARTERBACK_BASE_URL
+
+REPO="${QUARTERBACK_REPO:-$HOME/source/quarterback}"
+
+qb_resolve_token || {
+  echo "qb-mcp: no token (set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in $QB_CONFIG)" >&2
+  exit 1
+}
+
+# Self-heal a stale token at startup (selfhost #135). The interactive path caches this
+# host's bearer in a RAM tmpfs file ($XDG_RUNTIME_DIR/quarterback.token) once per login
+# and then serves it forever; after a token rotation every session keeps sending the OLD
+# bearer and gets a silent 401 while the board itself is healthy (/health=200). So probe
+# once here and, on a rejected token, re-mint and rewrite the cache — the current MCP
+# session picks up the fresh token below, and the next login/session (its hooks included)
+# reads the healed cache. No manual `rm` + Claude restart needed.
+#
+# Re-minting is qb_refresh_token, i.e. whatever QUARTERBACK_TOKEN_CMD this site sets. It
+# used to be an inline `op read`, which is why WORK-ISLAND-HANDOVER.md §6 had to warn
+# that the self-heal must not run on work hosts — 1Password is exactly the thing they may
+# not touch. With the command coming from site config there is nothing to suppress: the
+# work island re-fetches over SSH, the personal fleet still uses op, same code path.
+#
+# Fail-open: a missing curl, an unset TOKEN_CMD, or any probe error leaves the token
+# exactly as-is. Re-minting happens ONLY on a confirmed 401, never on the happy path.
+qb_selfheal_token() {
+  command -v curl >/dev/null 2>&1 || return 0
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+    -H "Authorization: Bearer ${QUARTERBACK_TOKEN}" \
+    "${QUARTERBACK_BASE_URL}/board?type=presence&limit=1" 2>/dev/null) || return 0
+  [ "$code" = "401" ] || return 0   # 200 = valid; network hiccup = leave it, don't churn
+  qb_refresh_token || return 0
+  local fresh="$QUARTERBACK_TOKEN"
+  # Persist to the tmpfs cache so the next login/session (bashrc + hooks) is fresh too.
+  # Report honestly: if the write fails (e.g. XDG_RUNTIME_DIR not writable) this session is
+  # healed but future ones may still read the stale token — say so, don't claim success.
+  local cache="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/quarterback.token"
+  if ( umask 077; printf '%s' "$fresh" > "$cache.tmp" ) 2>/dev/null \
+       && mv -f "$cache.tmp" "$cache" 2>/dev/null; then
+    echo "qb-mcp: bearer was rejected (401); re-minted and rewrote $cache" >&2
+  else
+    rm -f "$cache.tmp" 2>/dev/null
+    echo "qb-mcp: bearer was rejected (401); re-minted for this session, but" \
+         "could NOT rewrite $cache — next login may still use the stale token" >&2
+  fi
+}
+qb_selfheal_token
+
+PY="$REPO/mcp/.venv/bin/python"
+[ -x "$PY" ] || {
+  echo "qb-mcp: MCP venv missing at $PY" >&2
+  echo "       run: cd $REPO/mcp && uv venv --python 3.12 .venv && uv pip install -e ." >&2
+  exit 1
+}
+exec "$PY" -m mcp_server "$@"

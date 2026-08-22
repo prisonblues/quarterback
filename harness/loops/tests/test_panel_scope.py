@@ -532,8 +532,12 @@ def test_a_merge_in_the_range_is_reported_because_no_filter_can_remove_it(monkey
     files it DOES touch cannot be, and a reviewer reads them as the fixer's work.
     The code already knew that and said nothing — this is the saying."""
     _, notes = decide(monkeypatch, facts={"merges": 2})
-    assert "2 merge commit(s)" in notes[0]
-    assert "cannot be told apart from the fixer's" in notes[0]
+    # Not `notes[0]`: a range carrying a merge also carries #278's distant/involved
+    # reading, which is emitted first because it is a fact about the merge rather
+    # than a caveat about the target.
+    merged = [n for n in notes if "2 merge commit(s)" in n]
+    assert len(merged) == 1
+    assert "cannot be told apart from the fixer's" in merged[0]
 
 
 def test_a_non_ancestor_range_is_reported_rather_than_reviewed_as_a_delta(monkeypatch):
@@ -601,7 +605,14 @@ def test_no_caveat_about_the_increment_survives_a_fallback(monkeypatch):
     big = chunk("fix.py", "+x" * len(PR)) + chunk("gone.py", "-was here")
     got, notes = decide(monkeypatch, increment=big, facts={"merges": 2, "files": 2})
     assert got.scope == "pr"
-    assert len(notes) == 1 and "reviewed the whole PR" in notes[0]
+    assert sum("reviewed the whole PR" in n for n in notes) == 1
+    # No caveat about the discarded target survives. #278's reading does, and is
+    # deliberately not a caveat: it describes the MERGE, which is true whichever
+    # scope the round ended up with, and a reader must never have to infer whether
+    # a round stood on a distant merge or re-read a hand resolution.
+    assert not any("left out of the review target" in n for n in notes)
+    assert not any("2 merge commit(s)" in n for n in notes)
+    assert sum("follows an integration and takes the" in n for n in notes) == 1
     # Nothing was lost when the increment IS used: the same range, under the size
     # guard's ceiling, still carries both caveats.
     small = chunk("fix.py", "+the fix") + chunk("gone.py", "-was here")
@@ -1077,7 +1088,12 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
         if args[:3] == ["gh", "pr", "view"]:
             return json.dumps({"title": title, "additions": 3, "deletions": 1,
                                "baseRefName": "main", "baseRefOid": MERGE_BASE,
-                               "headRefName": "feat/x", "headRefOid": HEAD})
+                               "headRefName": "feat/x", "headRefOid": HEAD,
+                               # A branch that can merge. Unanswered it reads
+                               # UNKNOWN, which is a `config_notes` line (#271) —
+                               # and these tests read `config_notes` as a scope
+                               # note that never happened.
+                               "mergeable": "MERGEABLE"})
         # The base branch's tip, which v2.29 reads to stamp what this round would
         # be merged INTO. Answered here for the same reason the compare call
         # below is: unanswered it degrades to a `config_notes` entry, and these
@@ -1090,6 +1106,11 @@ def _stub_run(monkeypatch, seen, *, cfg=None, findings=(), increment=INCREMENT,
         # left — and left unanswered it degrades to a `config_notes` entry, which
         # these tests read as a scope note that never happened.
         if args[:2] == ["gh", "api"] and "/compare/" in args[2]:
+            # The fork-point read (#241) is the same endpoint with a different
+            # `--jq`, and it wants a bare sha rather than a body. Unanswered it
+            # comes back unparseable, which is another `config_notes` line.
+            if panel._MERGE_BASE_JQ in args:
+                return f"{MERGE_BASE}\n"
             return json.dumps({"status": "ahead", "files": [
                 {"filename": "fix.py", "patch": "@@ -1,1 +1,2 @@\n+the fix commit"}]})
         return PR

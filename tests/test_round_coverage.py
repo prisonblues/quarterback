@@ -1094,8 +1094,29 @@ PANEL_CFG = {
     # to review, and this test's whole subject (the payload the board reads back)
     # is never produced.
     "_rules_baseline": ".harness-rules.sample",
+    # codex's cap is the subject of the round below: it has to CUT the 268-char
+    # diff (that is what `reviewers.codex.truncated` asserts) without putting the
+    # round past the pre-flight refusal threshold, which is 3x the tightest seat
+    # ceiling (#138). 120 is 2.2x — truncated, comfortably short of a refusal.
+    #
+    # It was 40 — 6.7x — and that is #239's whole mechanism rather than a typo.
+    # `seat_ceilings` used to resolve "is this seat here" for ITSELF instead of
+    # taking the round's snapshot, so the verdict read the real PATH while
+    # `_every_seat_installed` above pinned the budgets to a box carrying
+    # everything. On a machine with no `codex` binary the two disagreed in the
+    # direction that hid the problem: the budgets gave codex a 40-char cap and the
+    # verdict, seeing no codex on PATH, weighed the diff against no ceiling at all
+    # and let the round run. With a codex installed the verdict saw the cap and
+    # refused, and this test failed — passing or failing on whether a vendor binary
+    # was installed, which is exactly what #239 is titled for.
+    #
+    # The panel now hands the verdict the round's own snapshot, so there is ONE
+    # answer to which seats exist and this test's outcome no longer depends on the
+    # host. That answer is the pinned one — codex is here, with its configured cap
+    # — and at 40 it refuses the round on every box rather than on some of them. So
+    # the cap moves to a value that means what this fixture always intended.
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
-                  "codex": {"enabled": True, "model": "gpt-5.6", "max_diff_chars": 40}},
+                  "codex": {"enabled": True, "model": "gpt-5.6", "max_diff_chars": 120}},
     "review_panel": {},
 }
 DIFF = "diff --git a/app/sync.py b/app/sync.py\n@@ -1,1 +1,2 @@\n+mirror = {}\n" + "x" * 200
@@ -1164,6 +1185,14 @@ async def test_a_real_panel_payload_records_and_reads_back(client, monkeypatch, 
     silently into a NULL column — the run records, nothing errors, and the column
     the whole release exists for is empty."""
     r1_path, r1 = _panel_round(monkeypatch, tmp_path, 1, "half-stale node")
+    # A round HAPPENED, asserted before anything about its contents. A pre-flight
+    # refusal (#138) produces a payload too, with `reviewed: false` and every
+    # finding-shaped key empty — so every assertion below would fail one by one,
+    # naming the field it read rather than the reason there was nothing in it. That
+    # is how this test spent a release reporting "new_findings 0" while the actual
+    # answer was "the panel refused the round and said so at length" (#239).
+    assert r1["reviewed"] is True, r1["skip_reason"]
+    assert r1["preflight"]["verdict"] == "run", r1["preflight"]["reason"]
     assert r1["round"] == 1 and r1["new_findings"] == 1
     assert r1["round_stop"]["stop"] is False
     # codex's budget (40 chars) cut a longer diff: measured, not declared.

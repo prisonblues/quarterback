@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Generic delegating git hook. Installed as a SYMLINK named after each hook the
+# machine's managed hooks dir provides, so pointing `core.hooksPath` at the
+# harness dir does not silently disable them.
+#
+# WHY THIS IS NOT OPTIONAL. `core.hooksPath` REPLACES the hooks directory, it
+# does not stack. On this fleet the global value is a read-only nix store path
+# whose only entry is a `pre-commit` running gitleaks. Repointing a repo at a
+# harness dir without re-exporting that hook would turn secret scanning off for
+# the repo as a side effect of a stash-safety feature — a guard that makes a
+# different guard stop executing, which is exactly the failure mode this repo is
+# organised against. `harness/tests/test_stash_guard.py` pins it.
+#
+# The delegate is resolved AT RUN TIME from the global/system config rather than
+# recorded at install time, because the nix store path changes on every rebuild
+# and a recorded one would rot into a broken or garbage-collected path.
+set -uo pipefail
+
+name=$(basename "$0")
+# `reference-transaction.delegate` is how the guard marks "there is one of these
+# to chain to" without paying for a config lookup on every ref update.
+name="${name%.delegate}"
+
+delegate=$(git config --global --type=path --get core.hooksPath 2>/dev/null) || delegate=""
+if [[ -z "$delegate" ]]; then
+    delegate=$(git config --system --type=path --get core.hooksPath 2>/dev/null) || delegate=""
+fi
+if [[ -z "$delegate" ]]; then
+    common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+    delegate="$common/hooks"
+fi
+
+target="$delegate/$name"
+[[ -x "$target" ]] || exit 0
+exec "$target" "$@"

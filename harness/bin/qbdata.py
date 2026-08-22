@@ -76,6 +76,96 @@ def short_repo(repo: str) -> str:
     return repo.split("/", 1)[-1]
 
 
+def set_repos(repos: list[str]) -> None:
+    """Pin which repositories this process watches, overriding the environment.
+
+    The dashboards take ``--repo`` now, and half of what reads the answer reaches
+    :func:`resolve_repos` for itself — ``plan_repo``, ``sort_plan``, ``fetch_prs``
+    — rather than taking a list as an argument. Priming the cache is what makes
+    one flag reach all of them; threading it through every call site would leave
+    whichever one was missed silently watching the cwd, which is the shape of
+    #176 all over again.
+    """
+    global _repos
+    cleaned = [r.strip() for r in repos if r and r.strip()]
+    _repos = cleaned or None
+
+
+#: An owner or a repository name, as GitHub spells one. Anything else in an
+#: ``owner/name`` argument — a space, a quote, a shell metacharacter — is a
+#: malformed slug rather than a repository, and it would reach `gh` as one.
+#: At least one character that is not a dot, so ``owner/..`` is not a repository
+#: name that merely looks odd: it is a path, and `gh` would be asked about it.
+_SLUG_PART = re.compile(r"(?=[^.])[A-Za-z0-9._-]+")
+
+
+def repo_target(value: str) -> tuple[str, str | None]:
+    """A ``--repo`` argument as ``(slug, the checkout it names or None)``.
+
+    A directory is asked for its origin, which is how "the project this screen is
+    set up for" is spelled when you are standing in it — and the directory comes
+    back beside the slug because the clickable renderer LAUNCHES work in it, so
+    ``--repo ~/src/nix-fleet`` has to move the cwd of what the ⚒ starts and not
+    only the rows the panels draw. A slug names a repository this process may have
+    no checkout of, which is why the second half of the answer can be None.
+
+    SHAPE FIRST, the filesystem second, and the whole rule in three lines:
+    ``owner/name`` is a **slug**; anything with another separator, a leading ``.``
+    or ``/``, or a single segment naming a directory is a **checkout**; anything
+    else is refused. Deciding on the shape is what stops the answer depending on
+    the cwd — ``--repo prisonblues/quarterback`` run from a ``~/src/<owner>/<repo>``
+    tree used to match ``os.path.isdir`` and die as "not a git checkout" — and the
+    cost is one keystroke: a two-segment relative path needs its ``./``, because
+    ``owner/name`` means a repository everywhere else in the fleet.
+
+    A bare name is REFUSED rather than completed: `gh` needs an owner, the fleet
+    works in repos whose owner is not this one's, and inventing one aims the PR
+    panel — and the ⚒ that starts work off it — at somebody else's repository of
+    the same name. Unless it names a directory, which is not a guess about an
+    owner: ``--repo nix-fleet`` beside a checkout of that name is unambiguous, and
+    that spelling worked before the shape rule arrived.
+
+    THE PATH COMES BACK ABSOLUTE. It is handed to tmux as a ``-c`` start directory
+    for the pane the ⚒ and ⚖ open, and tmux resolves a relative ``-c`` against the
+    tmux SERVER's cwd — where the server was first started, months ago — not this
+    process's. `self.repo` used to be `os.getcwd()` and so absolute by
+    construction; ``--repo ./nix-fleet`` would have quietly launched work in
+    whatever that name means to the server, while the guard beside it resolved the
+    same relative path correctly in-process and reported the right repo, hiding it.
+    """
+    raw = (value or "").strip() or "."
+    # `~` is expanded here because the help text and the README advertise
+    # `--repo ~/src/nix-fleet`, and only an interactive shell expands it: quoted,
+    # built into a QB_SEATS_DASH command string or sent through `tmux send-keys`,
+    # the tilde arrives intact and used to be reported as a bad slug.
+    path = os.path.expanduser(raw).rstrip("/") or "/"
+    parts = [part.strip() for part in path.split("/")]
+    if len(parts) == 2 and not path.startswith(".") and all(
+            _SLUG_PART.fullmatch(part) for part in parts):
+        return "/".join(parts), None
+    # A single segment is a checkout only if it IS one — and a value with a `/`
+    # that reached here is not slug-shaped, so it is a path or it is nothing. Said
+    # from the shape rather than by asking git: `git -C 'owner/na@me'` costs a
+    # subprocess and answers "not a git checkout with an origin remote", which
+    # misdiagnoses a bad slug as a missing remote.
+    if path.startswith((".", "/")) or os.path.isdir(path):
+        slug = repo_slug(path)
+        if not slug:
+            raise ValueError(f"{path}: not a git checkout with an origin remote")
+        return slug, os.path.abspath(path)
+    if "/" in path:
+        raise ValueError(f"{raw!r}: not an owner/name slug — a repository name may "
+                         "hold only letters, digits, dots, hyphens and underscores; "
+                         "write ./" + raw.lstrip("/") + " if you meant the directory")
+    raise ValueError(f"{raw!r}: neither a checkout nor an owner/name slug — a bare "
+                     "name needs its owner, or a directory of that name here")
+
+
+def repo_arg(value: str) -> str:
+    """Just the slug of a ``--repo`` argument, for a renderer that launches nothing."""
+    return repo_target(value)[0]
+
+
 _REPO_COLOURS = ["cyan", "magenta", "green", "yellow", "blue", "red"]
 _repo_colour: dict[str, str] = {}
 
@@ -90,6 +180,213 @@ def repo_colour(name: str) -> str:
     if key not in _repo_colour:
         _repo_colour[key] = _REPO_COLOURS[len(_repo_colour) % len(_REPO_COLOURS)]
     return _repo_colour[key]
+
+
+# ---- scope: which project's rows this dashboard is about ---------------------
+#
+# Every board-derived panel is fleet-wide by construction — FLEET is every live
+# agent, CLAIMED every claim, PLANS every repo's list — and a screen is built for
+# ONE project. So most rows are somebody else's, and the repo cell is then the
+# same word, eleven columns wide, on every line: a 78-column pane spending its
+# scarcest thing on a fact the header can state once (#261).
+#
+# One object holds both halves of the decision because they have to agree. What is
+# kept, and whether the column is worth keeping, are the same question asked twice:
+# a column dropped from a table whose rows were NOT narrowed shows nothing anywhere,
+# and rows narrowed with the column left in place is the waste this exists to end.
+
+#: Opens the dashboard wide instead of on the screen's own repos. Any other value
+#: — including nothing — is the narrow default, which is what a seat screen wants
+#: every time but the one time it is looking for a peer somewhere else.
+SCOPE_ENV = "QB_DASH_SCOPE"
+SCOPE_WIDE = ("all", "fleet", "wide")
+
+
+def repo_name(value: str | None) -> str | None:
+    """A repo in the one form these panels can be compared in, or None.
+
+    THREE spellings reach this dashboard for one repository. A lease reports a
+    bare ``quarterback``, because what it saw was the checkout's directory; the
+    plan and `gh` both report ``prisonblues/quarterback``; and a hand-written plan
+    item reports whichever the human typed. Folded to the bare name, lowercased,
+    so what gets compared is repositories rather than spellings — comparing the
+    slugs would put a seat's own FLEET row out of its own scope.
+    """
+    return short_repo((value or "").strip()).lower() or None
+
+
+def claim_repo(key: str | None, plan: list[dict] | None = None) -> str | None:
+    """Which repo a claim is against, or None when its key cannot say.
+
+    Three key shapes are in use and only two of them carry a repo: ``owner/repo#12``
+    (an issue), ``owner/repo:2.40`` (a release number), and ``plan:<uuid>`` — which
+    names an item and not a repo, so the plan is consulted when the caller has it
+    and the claim is left unattributed when it does not.
+
+    None means "cannot say", and every caller treats that as in scope. A claim
+    whose repo is unknown is not evidence that it belongs to another project, and
+    hiding it drops the one row that says somebody already holds the work you were
+    about to pick up.
+    """
+    key = (key or "").strip()
+    if not key:
+        return None
+    if key.startswith("plan:"):
+        wanted = key.split(":", 1)[1]
+        for item in plan or []:
+            if item.get("item_id") == wanted:
+                return item.get("repo") or None
+        return None
+    head = key.split("#", 1)[0].split(":", 1)[0]
+    # A head with no owner is not a repo we can name. `gh` and the plan both spell
+    # a claim key with its owner, so a bare word here is some other namespace's
+    # key, and reading it as a repo would scope rows against a word that is not one.
+    return head if "/" in head else None
+
+
+class Scope:
+    """Which rows a dashboard is about, and whether to spend a column saying so."""
+
+    def __init__(self, repos: list[str], on: bool = True) -> None:
+        self.repos = list(repos)
+        self.on = bool(on)
+        #: The bare names, for the header and for comparing against a board row
+        #: that reports no owner (a lease reports the checkout's directory).
+        self.names = {n for n in (repo_name(r) for r in self.repos) if n}
+        #: The full slugs of the watched repos that name an owner, and the bare
+        #: names of the ones that do not.
+        self.slugs = {r.strip().lower() for r in self.repos if "/" in r.strip()}
+        #: ...and the bare names of the ones that do not, MINUS any that a slug
+        #: already accounts for. `QB_DASH_REPOS=quarterback,prisonblues/quarterback`
+        #: is one repository named twice — which `keeps` has always treated as one —
+        #: and counting both spellings put the eleven-column cell back on a
+        #: single-project pane, which is the waste this whole thing removes.
+        named = {short_repo(slug) for slug in self.slugs}
+        self.bare = {n for n in (repo_name(r) for r in self.repos
+                                 if "/" not in r.strip()) if n and n not in named}
+        #: ONE ENTRY PER REPOSITORY, in the strongest form each was named in. The
+        #: bare names alone folded a fork and its upstream into one — `column` then
+        #: dropped the only cell that told them apart and `keeps` accepted both
+        #: repos' rows — because `len(names) == 1` had stopped meaning "exactly one
+        #: repository", which is what both of them rely on it meaning.
+        self.keys = self.slugs | self.bare
+
+    @property
+    def column(self) -> bool:
+        """Is the repo cell worth its eleven columns?
+
+        Not when the rows have been narrowed to ONE repository: every cell then
+        carries the same word, and the header says it once for the whole pane. Yes
+        for the wide view — telling repos apart is the entire reason to widen — and
+        yes for a screen watching two, where the cell still distinguishes rows.
+        """
+        return not self.on or len(self.keys) != 1
+
+    def keeps(self, repo: str | None) -> bool:
+        """Does a row in ``repo`` belong on this pane?
+
+        A row whose repo nothing could name STAYS. No repo is not evidence of
+        another repo, and dropping it hides a live agent working outside a checkout
+        — or a claim whose plan item this process has not fetched — on the strength
+        of a missing field. The narrow view is a way to read the fleet, not a claim
+        to have accounted for all of it.
+
+        Compared on the WHOLE slug when both sides name an owner: ``myuser/quarterback``
+        and ``prisonblues/quarterback`` are two repositories, and a fork whose rows
+        were kept as the upstream's is the one narrowing that reads as a fact. A row
+        that gives only a bare name can only be compared as one — and, per the rule
+        above, a bare name that matches is kept rather than guessed at.
+        """
+        if not self.on or not self.names:
+            return True
+        name = repo_name(repo)
+        if name is None:
+            return True
+        full = (repo or "").strip().lower()
+        if "/" in full:
+            return full in self.slugs or name in self.bare
+        return name in self.names
+
+    def label(self) -> str:
+        """What the header says this pane is showing, in one phrase."""
+        if not (self.on and self.names):
+            return "all repos"
+        # The bare names, which is all a header needs — unless two of them are the
+        # same word, when the owner is the only thing that says which pane this is.
+        return ", ".join(sorted(self.names if len(self.names) == len(self.keys)
+                                else self.keys))
+
+    def toggled(self) -> Scope:
+        """The same watch list, the other way round — what the `s` key switches to.
+
+        Named for what it does. It was `widened()`, which promised one direction and
+        delivered two: called on a wide scope it narrows, so the one line in
+        `action_toggle_scope` was also the line that took the pane back.
+        """
+        return Scope(self.repos, not self.on)
+
+
+def resolve_scope(repos: list[str] | None = None, on: bool | None = None) -> Scope:
+    """The scope a dashboard starts in: narrow, unless told otherwise.
+
+    Narrow by default because that is what a screen is for. ``QB_DASH_SCOPE=all``
+    opens wide for a session that is watching the fleet rather than working in it;
+    the repos are the ones :func:`resolve_repos` already worked out, so one
+    ``--repo`` or ``QB_DASH_REPOS`` aims the filter and the `gh` calls together.
+    """
+    if on is None:
+        on = os.environ.get(SCOPE_ENV, "").strip().lower() not in SCOPE_WIDE
+    return Scope(resolve_repos() if repos is None else repos, on)
+
+
+def in_scope(rows: list[dict], scope: Scope | None,
+             repo_of=None) -> tuple[list[dict], int]:
+    """The rows a scope keeps, and HOW MANY IT HID.
+
+    The count comes back rather than being dropped because a filtered panel that
+    does not say it filtered is a panel quietly lying about the fleet — the same
+    defect as a hardcoded repo (#176) one level up. Every caller puts it in the
+    panel title, so "nobody else is working" and "nobody else is working *here*"
+    can never read the same.
+    """
+    if scope is None:
+        return list(rows), 0
+    getter = repo_of or (lambda row: row.get("repo"))
+    kept = [row for row in rows if scope.keeps(getter(row))]
+    return kept, len(rows) - len(kept)
+
+
+def elsewhere(hidden: int) -> str:
+    """What a narrowed panel adds to its own title, or nothing.
+
+    Every panel that filters says so, because a panel that filtered silently is a
+    panel lying about the fleet: "nothing claimed" and "nothing claimed HERE" are
+    different facts, and the second is the one the reader is being shown.
+
+    Here rather than in a renderer because both of them format it and they have to
+    agree — the two copies this replaces had already drifted by a word.
+    """
+    return f" · {hidden} elsewhere" if hidden else ""
+
+
+def scope_mark(scope: Scope | None, repo: str | None) -> str:
+    """The prefix a row the scope could not attribute wears, or nothing.
+
+    :meth:`Scope.keeps` deliberately keeps a row whose repo nothing could name —
+    an agent outside any checkout, a fleet-wide plan item, a claim whose item this
+    process has not fetched. The repo cell was the only thing that ever SAID so
+    (``—``, ``fleet``), and the narrow view is exactly the view that drops it: with
+    the cell gone and no mark, an agent working nowhere reads as one working here,
+    which is the panel-that-filtered-silently one level down.
+
+    A prefix rather than a cell of its own because a table's columns are fixed for
+    every row: what needs marking is one row in ten, and the pane cannot spend a
+    column on it. Only where the cell is gone — the wide view has the repo itself,
+    which says more than a mark can.
+    """
+    if scope is None or scope.column or repo_name(repo) is not None:
+        return ""
+    return "? "
 
 
 def ago(stamp: str | None) -> str:
@@ -373,11 +670,29 @@ class BoardClient:
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def _request(self, req: urllib.request.Request) -> dict:
+    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False) -> dict:
+        """One authenticated request. ``allow_empty`` belongs to the WRITE path only.
+
+        An empty body is not ``{}``. A proxy's contentless 502, a 204 from a board
+        mid-deploy, a truncated response — read as an empty object, every one of
+        those arrives at a caller as "the board says there is nothing there", which
+        is the absence-vs-inability collapse this client's consumers exist to
+        report on rather than commit. Two of them are one line away from it:
+        `qb-reconcile` turns `GET /plan` into `plan.get("items") or []` and would
+        print "the plan agrees with GitHub and the board on everything checked"
+        over a plan it never received, and :func:`fetch_board` sets ``error`` from
+        an exception it would no longer get, rendering an empty fleet as a healthy
+        one. So ``get`` lets `json` raise, exactly as it did before ``post``
+        existed; only ``post``, whose 200 legitimately carries no body, tolerates
+        an empty one.
+        """
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
         with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
-            return json.loads(resp.read().decode())
+            body = resp.read().decode()
+        if allow_empty and not body.strip():
+            return {}
+        return json.loads(body)
 
     def get(self, path: str, params: dict | None = None) -> dict:
         query = urllib.parse.urlencode(
@@ -391,7 +706,7 @@ class BoardClient:
             data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"},
             method="POST")
-        return self._request(req)
+        return self._request(req, allow_empty=True)
 
     def active(self) -> dict:
         return self.get("/active")
@@ -751,7 +1066,8 @@ def plan_who(item: dict) -> tuple[str, str]:
     return ago(item.get("updated")), "grey50"
 
 
-def claim_label(key: str, plan: list[dict] | None = None) -> str:
+def claim_label(key: str, plan: list[dict] | None = None,
+                scope: Scope | None = None) -> str:
     """What a claim is ON, in words a human can read off a pane.
 
     A claim on a board object is keyed by uuid — ``item:<id>`` for one line of the
@@ -765,13 +1081,25 @@ def claim_label(key: str, plan: list[dict] | None = None) -> str:
     whole-plan claim that release added — so the old test matched a plan id
     against item ids, which cannot ever be equal, and the CLAIMED pane showed a
     bare uuid for every claim the new plan takes.
+
+    The scope trims the repo off the front for the same reason the panels drop
+    their repo column (#261): on a pane showing one project, ``quarterback#209``
+    spends twelve columns to say ``#209``. Only when the scope is that one project
+    — the wide view keeps the repo, because there it is what tells two claims apart.
+
+    And the OWNER survives where two watched repos share a name. CLAIMED has no
+    repo column for the scope to restore — its three are who/key/left — so if the
+    owner goes too, a fork's claim and its upstream's both read ``quarterback#3``,
+    which is the ambiguity the slug comparison exists to remove, reintroduced one
+    panel further on.
     """
     key = key or "?"
     prefix, _, wanted = key.partition(":")
     if not wanted or prefix not in ("item", "plan"):
         # `acme/widget:feat/x` is a branch and `acme/widget#5` an issue: both are
-        # already readable, and neither is a uuid to look up.
-        return short_key(key)
+        # already readable, and neither is a uuid to look up — but both wear the
+        # repo the pane may already be scoped to, so they go through the trim.
+        return _scoped_key(key, scope)
     for item in (plan or []):
         if prefix == "item" and item.get("item_id") == wanted:
             head = " ".join(x for x in ("plan", plan_ref(item)) if x)
@@ -782,7 +1110,37 @@ def claim_label(key: str, plan: list[dict] | None = None) -> str:
             # plan rather than as one of its items: it is not the first row's
             # work, it is all of it.
             return f"plan {row['label']}"
-    return short_key(key)
+    return _scoped_key(key, scope)
+
+
+def _scoped_key(key: str, scope: Scope | None) -> str:
+    """A claim key shortened as far as the scope allows, and no further.
+
+    Two watched repos sharing a bare name is the one case where even the owner is
+    load-bearing, so the key comes back whole: ``short_key`` would drop it and put
+    a fork's claim and its upstream's both at ``quarterback#3``.
+    """
+    if scope is not None and len(scope.names) != len(scope.keys):
+        return key
+    return _unprefixed(short_key(key), scope)
+
+
+def _unprefixed(label: str, scope: Scope | None) -> str:
+    """``quarterback#209`` → ``#209``, and ``quarterback:2.40`` → ``2.40``.
+
+    Only against the repo the pane is scoped to, and only when that is a single
+    repo: trimming a name the header does not state would leave a bare ``#209``
+    with nothing anywhere saying whose #209 it is.
+    """
+    if scope is None or scope.column or len(scope.names) != 1:
+        return label
+    name = next(iter(scope.names))
+    lowered = label.lower()
+    if lowered.startswith(f"{name}#"):
+        return label[len(name):]                  # the '#' stays: it reads as an issue
+    if lowered.startswith(f"{name}:"):
+        return label[len(name) + 1:]              # the ':' does not: it read as a namespace
+    return label
 
 
 def plan_detail(item: dict) -> str:
@@ -1051,6 +1409,24 @@ def parse_limits(data: dict) -> list[dict]:
     return out
 
 
+def resets_in_s(stamp: str | None) -> int | None:
+    """Seconds until a cap comes back, or None when there is no readable stamp.
+
+    Split out of `limit_reset` so the pacing verdict and the bar's countdown read
+    one clock: a `hold` carries a resumption time, and a resumption time that
+    disagreed with the number drawn two inches above it would be two answers to
+    one question. Never negative — a window whose reset is in the past has come
+    back, which is 0 seconds away and not a negative wait.
+    """
+    if not stamp:
+        return None
+    try:
+        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return max(0, int((then - datetime.now(timezone.utc)).total_seconds()))
+
+
 def limit_reset(stamp: str | None) -> str:
     """'44m', '3h58m', '5d' — when a cap comes back, in five columns.
 
@@ -1058,13 +1434,17 @@ def limit_reset(stamp: str | None) -> str:
     window reads '128h48m', which is both too wide for the line and not how
     anybody thinks about next Monday.
     """
-    if not stamp:
-        return ""
-    try:
-        then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    secs = int((then - datetime.now(timezone.utc)).total_seconds())
+    secs = resets_in_s(stamp)
+    return "" if secs is None else limit_reset_secs(secs)
+
+
+def limit_reset_secs(secs: int) -> str:
+    """The same countdown from seconds rather than from a stamp.
+
+    The pacing verdict carries `resets_in_s` because a caller wants to compare
+    it, not print it; this is how it gets printed, and it is the same function
+    the bar uses so the two cannot come to spell 47 minutes differently.
+    """
     if secs <= 0:
         return "now"
     if secs < 3600:
@@ -1118,3 +1498,215 @@ def limit_cells(limits: list[dict], width: int) -> list[tuple[str, str, str, str
     return [(l["label"], limit_bar(l["percent"], bar) if bar else "",
              f"{l['percent']}%", limit_reset(l["resets"]),
              limit_colour(l["percent"], l["severity"])) for l in limits]
+
+
+# ---- pacing: the ceiling, read by something other than a bar -----------------
+#
+# The caps above are drawn and nothing consults them (#275). The whole gap is
+# that the fleet's one hard ceiling — one subscription, every machine, every
+# project — is enforced by a human noticing a bar go red, and a seat is a pane
+# nobody is watching.
+#
+# WHERE THE NUMBER LIVES, WHICH IS NOWHERE NEW. `pace()` adds no store. The cap
+# is the usage endpoint's fact; `fetch_limits()` already holds the only copy
+# there is, in a machine-wide cache that exists to keep three dash panes from
+# rate-limiting each other, and this reads THAT. No second file, no board row,
+# no figure of its own to go stale behind the endpoint's back. A verdict that
+# kept its own number would be a second source of truth about a ceiling nobody
+# here sets, which is the one thing a governor must not be.
+#
+# WHAT THIS IS NOT. It does not throttle, park, resume, or pick work. It says
+# what the window says, in words a caller can act on. #276 owns the actuator
+# (the dials, board-side, expiring), #55 owns the ceiling this repo CHOOSES, and
+# #232/#227 own what to run next. The decision here is only "how does the fleet
+# stand", and the value of having it as a function is that the answer stops
+# being a colour on a screen somebody has to be looking at.
+
+#: The bar's colours, read as decisions. Derived from `limit_colour` rather than
+#: restated with thresholds of its own: the display and the verdict disagreeing
+#: about what 88% means is exactly the failure a human debugging this at 2am
+#: cannot see, and the endpoint's `severity` — the one input that knows about
+#: caps this fleet has not modelled — only reaches the verdict because that
+#: function already honours it.
+PACE_OF_COLOUR = {"green": "go", "yellow": "slow", "red": "hold"}
+#: Worst cap wins. Never averaged: a 7d window at 12% does not buy back a 5h
+#: window at 94%, and the thing about to stop is the one that binds.
+PACE_RANK = {"go": 0, "slow": 1, "hold": 2}
+
+
+def _pace(verdict: str, source: str, reason: str, cap: dict | None = None) -> dict:
+    """One shape for every answer, so a caller never has to ask which kind it got."""
+    return {
+        "verdict": verdict,
+        "source": source,
+        "reason": reason,
+        "cap": (cap or {}).get("label"),
+        "percent": (cap or {}).get("percent"),
+        "severity": (cap or {}).get("severity"),
+        "resets_in_s": resets_in_s((cap or {}).get("resets")),
+    }
+
+
+def pace(caps: tuple[list[dict], str | None] | None = None) -> dict:
+    """How the shared subscription stands, as a verdict a caller can act on.
+
+    {verdict: go|slow|hold|unknown, source, cap, percent, severity,
+     resets_in_s, reason}
+
+    `caps` is a `fetch_limits()` answer, for a caller that already has one (the
+    dashboards do). Left out, this fetches — which costs nothing extra, because
+    `fetch_limits` is floored at one call every three minutes across every
+    process on the machine and hands back the cache in between.
+
+    The four answers, and why the fourth exists:
+
+    * **go** — room, or nothing to pace against. An API-key install has no
+      subscription caps at all, so it gets `go` and says so; that is the same
+      rule as the dash's, where no token means one line fewer rather than an
+      error.
+    * **slow** / **hold** — the bar's yellow and red, which is to say 70% and
+      90%, or sooner when the endpoint's own severity says so. `hold` carries
+      `resets_in_s` and is therefore a WAIT, not a stop: a five-hour window at
+      95% comes back, and the caller that treats it as terminal has thrown away
+      the only fact that makes it survivable.
+    * **unknown** — the figures could not be obtained at all. NOT `go`, which
+      would be a governor reporting clear on an input it never read (#244), and
+      not `hold`, which would let a dropped network park the fleet. Unknown is
+      the honest word and it leaves the decision with the caller.
+
+    Figures that are merely OLD are a third case and they are not thrown away:
+    a failed call keeps the last answer, and caps move over hours, so minutes-old
+    ones are still the right ones to act on. What staleness costs is the right to
+    say `go` — a `go` on figures nobody could refresh is the one verdict that
+    could be confidently wrong about a window that emptied while the network was
+    down. It does NOT escalate a `slow` to a `hold`: staleness is uncertainty
+    about the number, and parking work over it would be a claim about the window
+    made on the strength of a hiccup.
+    """
+    limits, err = caps if caps is not None else fetch_limits()
+    if not limits:
+        if err:
+            return _pace("unknown", "unreadable",
+                         f"the usage endpoint could not be read ({err}) and no "
+                         f"cached figures survive — the ceiling is unknown, not clear")
+        return _pace("go", "absent",
+                     "no subscription caps to read: this install has no OAuth "
+                     "token, so there is no shared window to pace against")
+
+    stale = err is not None
+    graded = [(PACE_RANK[PACE_OF_COLOUR[limit_colour(l["percent"], l["severity"])]], l)
+              for l in limits]
+    # Percent breaks a tie so the reported cap is the one nearest its ceiling,
+    # not whichever the endpoint happened to list first.
+    cap = max(graded, key=lambda g: (g[0], g[1]["percent"]))[1]
+    verdict = PACE_OF_COLOUR[limit_colour(cap["percent"], cap["severity"])]
+    reason = f"{cap['label']} at {cap['percent']}%"
+    if cap["severity"] not in ("", "normal"):
+        reason += f" ({cap['severity']})"
+    if not stale:
+        return _pace(verdict, "live", reason, cap)
+    reason += f", on figures that could not be refreshed ({err})"
+    if verdict == "go":
+        return _pace("slow", "stale", reason + " — too old to say go on", cap)
+    return _pace(verdict, "stale", reason, cap)
+
+
+def pace_line(verdict: dict) -> str:
+    """The verdict on one line, in one place.
+
+    Shared rather than formatted at each call site for the same reason
+    `limit_cells` is: `qb-pace` prints this, `qb-seat` prints this before it
+    starts an agent, and two spellings of one judgement is how a fleet ends up
+    arguing with itself about whether it is allowed to spend.
+    """
+    out = f"pace: {verdict['verdict'].upper()} — {verdict['reason']}"
+    secs = verdict.get("resets_in_s")
+    if secs is not None and verdict["verdict"] != "go":
+        out += f"; resets in {limit_reset_secs(secs)}"
+    return out
+
+
+# THE ESTIMATE IS IN TOKENS AND IT STOPS THERE, ON PURPOSE.
+#
+# "Does this job fit in what is left" is the question worth answering, and it
+# needs a rate — how much of a five-hour window one seat-run actually spends.
+# Nothing records that. The board knows what a run cost in TOKENS; the endpoint
+# knows what the window has spent in PERCENT; no row anywhere pairs them, which
+# is #275's own first sequencing step (sample the caps either side of a run) and
+# it belongs to whatever drives the run rather than here.
+#
+# So this reports the two halves and refuses to multiply them. A fit prediction
+# derived from a made-up rate would be the exact failure #275 names — a governor
+# that guesses rather than saying it cannot read its input — and it would be
+# believed, because it would arrive in the same sentence as two real numbers.
+
+def subscription_cost(client=None, reviewer: str = "claude",
+                      days: int = 30) -> tuple[dict | None, str | None]:
+    """What one seat-run of `reviewer` costs, from the board's own record.
+
+    ({tokens_per_run, runs, models}, None) or (None, why-not).
+
+    Only the seats billing to THIS subscription count, which is why there is a
+    reviewer argument with `claude` as its default: the five-hour and weekly caps
+    are the Anthropic subscription's, and `codex`, `antigravity` and `pi` bill to
+    OpenAI, a Google account and OpenRouter. A four-seat panel is not four seats
+    of pressure on this window (#276 makes the same distinction for its shed).
+    """
+    # The client is BUILT in here rather than taken as read, because resolving a
+    # board config is itself one of the ways this question goes unanswered — a box
+    # with no config is the ordinary case, not an error, and a caller that had to
+    # guard the constructor separately would report it in a different voice from
+    # the board being down.
+    try:
+        # `judged_only=false`, unlike every other reader of this endpoint. The
+        # rest of the page is about a reviewer's precision, which only an
+        # adjudicated run can measure; this is about what a run COST, and an
+        # unjudged round spent its tokens exactly the same.
+        data = (client or board_client()[0]).get(
+            "/review/stats", {"days": days, "judged_only": "false"})
+    except Exception as exc:                      # noqa: BLE001 — no board is not a failure
+        return None, f"the board did not answer ({type(exc).__name__})"
+    # `reviewer`, which is what the RESPONSE calls the column the query labels
+    # `name`. Read off a live answer rather than off the SELECT, because the two
+    # differ and the difference is silent: a filter on the wrong key matches
+    # nothing and reports "no measured history", which is indistinguishable from
+    # a board that genuinely has none.
+    rows = [r for r in (data.get("by_model") or [])
+            if (r.get("reviewer") or "") == reviewer and r.get("total_tokens")
+            and r.get("billable_runs")]
+    if not rows:
+        return None, (f"the board has no measured token history for the "
+                      f"'{reviewer}' seat in the last {days} days")
+    tokens = sum(int(r["total_tokens"]) for r in rows)
+    runs = sum(int(r["billable_runs"]) for r in rows)
+    # Summed and divided once rather than averaging the rows' own averages: the
+    # groups are (reviewer, model, effort) and they have wildly different run
+    # counts, so a mean of means weights a single opus run like forty sonnet ones.
+    return {"tokens_per_run": round(tokens / runs), "runs": runs,
+            "models": sorted({r.get("model") or "?" for r in rows})}, None
+
+
+def pace_estimate(verdict: dict, cost: dict | None, seats: int,
+                  rounds: int = 1) -> dict:
+    """What a job of `seats` × `rounds` costs, beside what the window has left.
+
+    {tokens, per_run, runs, headroom_pct, resets_in_s, fits, why} — where `fits`
+    is **always None today** and `why` says why. See the note above: the
+    tokens-to-window rate is not recorded anywhere yet, so the honest answer to
+    "will this finish" is that it cannot be predicted, not a number.
+    """
+    per_run = (cost or {}).get("tokens_per_run")
+    percent = verdict.get("percent")
+    return {
+        "seats": seats,
+        "rounds": rounds,
+        "per_run": per_run,
+        "runs": (cost or {}).get("runs"),
+        "tokens": per_run * seats * rounds if per_run else None,
+        "headroom_pct": None if percent is None else max(0, 100 - percent),
+        "resets_in_s": verdict.get("resets_in_s"),
+        "fits": None,
+        "why": ("no recorded rate from tokens to window percent — nothing samples "
+                "the caps either side of a run yet (#275 step 1), so whether this "
+                "job fits cannot be answered without guessing"),
+    }

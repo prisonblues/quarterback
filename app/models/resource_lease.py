@@ -25,7 +25,10 @@ class ResourceLease(Base):
       :mod:`app.claimkey`, and #172 is what happens without it: two spellings of
       one collision are two resources by construction, because ``(kind, key)`` is
       the unique index.
-    * ``kind="merge"``, ``key="<repo>:<branch>"`` — held across a land.
+    * ``kind="merge"``, ``key="<repo>:<base>"`` — held across a land. The branch
+      is the one being landed ONTO, because that is what two simultaneous merges
+      collide on; #318 settled it and :data:`app.claimkey.MERGE` carries the
+      argument. It is also the key the merge queue (#227) reports beside its line.
 
     **There is no release kind here any more (#172).** ``kind="release"``,
     ``key="<repo>:<version>"`` used to be listed above as a thing this table
@@ -72,7 +75,7 @@ class ResourceLease(Base):
     #: type cannot fold two spellings of one resource onto one row.
     kind: Mapped[str] = mapped_column(Text, nullable=False)
     #: The resource itself: ``<repo>#172``, ``<repo>!207``, ``plan:<uuid>``,
-    #: ``<repo>:<branch>``. Derived from what is being claimed rather than
+    #: ``<repo>:<base>``. Derived from what is being claimed rather than
     #: composed by whoever is claiming it (:mod:`app.claimkey`) — a key a caller
     #: types is a key the next caller types differently. A shape this board does
     #: not recognise is left exactly as sent: the namespace is open on purpose.

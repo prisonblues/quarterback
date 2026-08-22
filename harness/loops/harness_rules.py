@@ -91,8 +91,12 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, NamedTuple, TextIO
 
 RULES_FILENAME = ".harness-rules"
 
@@ -405,6 +409,75 @@ DEFAULTS: dict = {
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
         "reviewer_code_access": True,
+        # Must the branch be able to MERGE before a round is worth running? **On.**
+        # The merged state a review is implicitly reasoning about does not exist
+        # while GitHub reports the branch CONFLICTING, and the rebase that resolves
+        # it changes the diff every finding is about — so the round is refused
+        # before any seat is dispatched, which is the cheapest refusal in the
+        # system and used to be made LAST, by `preland.check_pr_state` at the merge
+        # gate, after a full multi-vendor round and a judge had been spent (#271).
+        # It is nearly free: mergeability rides on the PR metadata the panel
+        # already fetches, and costs one further read only when that comes back
+        # UNKNOWN — which GitHub answers while it computes the merge test, so
+        # asking once would refuse only the PRs somebody had looked at recently.
+        #
+        # A dial rather than a rule because there are real cases for reviewing a
+        # conflicted branch — an architectural read where the conflict is
+        # incidental, or a PR whose conflict IS the thing being discussed. `false`
+        # reviews them and says so in `config_notes`; `panel.py --force` is the
+        # per-run override for one PR. An UNKNOWN that survives both reads is never
+        # a refusal, only a note: refusing on "we could not tell" would stop a
+        # round on GitHub's scheduling.
+        "require_mergeable": True,
+        # How much of an integration merge is genuinely NEW material to this PR
+        # before the round that ran before it stops being a review of this PR's
+        # change (#278). The measurement is `git diff` between the commit the round
+        # read and the merge result, RESTRICTED to the files this PR itself touches,
+        # counted in changed lines. At or under this many the merge is DISTANT — it
+        # moved nothing this PR is about, so the earlier round stands and nothing is
+        # claimed as reviewed that was not. Past it the merge is INVOLVED — that
+        # resolution is unreviewed work, and it gets reviewed, only it and not the
+        # whole PR again.
+        #
+        # This is the number that decides whether an integration costs a whole panel
+        # cycle. #80 measures integration cost as quadratic in open PRs — five
+        # concurrent PRs is about ten integration merges — and at a measured 283,795
+        # tokens per `claude` seat per round, throwing a round away per integration is
+        # the ceiling on running more than one thing at a time.
+        #
+        # LINES, not file overlap and not hunk overlap, and the choice is deliberate.
+        # File overlap is a hair-trigger: `main` touching one docstring in a file this
+        # PR also edits would force a full re-review, and the shipped answer would be
+        # "re-review everything", which is what this replaces. Hunk overlap is the
+        # sharpest predictor of a genuine conflict and is the one measurement that
+        # cannot be had from the compare API cheaply or read the same way from a local
+        # `git diff`, so the two ends of this feature would answer differently. Lines
+        # of resolution is continuous — which is what makes a DIAL mean something
+        # rather than rename a boolean — it is the same number computed locally and
+        # over the API, and 0 is exactly the mechanical distant case the decision
+        # names ("a merge whose resolution is empty over this PR's files").
+        #
+        # 20, and at the LOW end on purpose. The two ways of being wrong cost wildly
+        # different amounts: reading INVOLVED when the merge was distant buys one
+        # scoped round over a small range, while reading DISTANT when it was involved
+        # ships a hand-resolved merge nobody read — and #80's `stderr_gist` incident is
+        # what that costs, a landed fix silently reverted because a function that had
+        # MOVED on one side met a `main` that already had it, git conflicting on
+        # neither and the second definition winning. So the threshold sits at the low
+        # end of what could honestly be called trivial: an import block, one side of a
+        # signature change, a version string. Past that it is code, and code gets read.
+        #
+        # `null` switches the reading off: every head move is then a review of earlier
+        # code, which is the behaviour before this key existed and the safe end of the
+        # switch for a repo that would rather pay. `0` keeps the reading and admits
+        # only a resolution that is empty over this PR's own files. A range carrying
+        # no merge commit at all is never distant whatever its size — that is a push,
+        # not an integration, and unreviewed work of this PR's own kind holds at any
+        # size. Which reading a round took is written into `config_notes`, and
+        # `preland`'s review check reports it as the reason it did or did not HOLD:
+        # a round that stood on a distant merge and one that re-reviewed a resolution
+        # are different claims about coverage, and neither may have to be inferred.
+        "distant_merge_lines": 20,
         # Dollars one code-reading seat may spend per CLI invocation, via
         # `claude --max-budget-usd`. `null` — the default — means no cap, and that
         # default is chosen for the reason `max_diff_chars` gives for its own: a
@@ -540,6 +613,40 @@ DEFAULTS: dict = {
         # is already running and refuses to let one buy a fourth. `"P4"` restores
         # today's behaviour.
         "round_trigger_floor": "P2",
+        # How many CHURNED LINES the whole round may spend on findings the fix floor
+        # admits and `round_trigger_floor` does not — the band between the two, which
+        # at the shipped defaults is exactly the P3s.
+        #
+        # The measurement this answers (#297, 2026-08-21). PR #188's feature was 185
+        # churned lines; two fix passes turned it into 721, so **74% of that PR was
+        # review-response code**, and round 2's "to fix" list was 89% below P2. On
+        # #268, 17 of the 20 round-2 findings were created by the round-1 fix pass —
+        # 85%, against this repo's own measured 63.7% and a ~7% industry baseline for
+        # bad-fix injection. The line a fix leaves is next round's review surface at
+        # that rate, so a fix pass that accumulates lines is buying the next round's
+        # findings.
+        #
+        # **A budget, not a per-fix cap, and not a higher floor.** #188's round 1 was
+        # not one balloon; it was 408 lines of individually reasonable small fixes,
+        # each of which any per-fix cap would have waved through. And the floor stays
+        # at P3 on purpose (`fix_severity_floor` carries that argument): a genuinely
+        # cheap correctness-adjacent fix is worth taking while the pass is open. What
+        # a budget stops is the ACCUMULATION, which is the thing that was measured.
+        #
+        # **Mechanical, not discretionary.** The spend is COUNTED — `git diff
+        # --numstat` after each fix, cheapest first, stop when the budget is gone —
+        # and never estimated, and the fixer is never asked "does this risk
+        # ballooning?". That question is a judgement by the actor whose judgement the
+        # 85% impugns. `max_fix_growth` verifies the total afterwards.
+        #
+        # 40 lines: enough for a handful of the genuinely cheap ones (a missing
+        # timeout, a guard, a stale docstring) and nowhere near 408. Unpaid findings
+        # are not dropped — they are reported and recorded exactly like a below-floor
+        # finding and are what the next round or an issue picks up. `null` is no
+        # budget at all, the pre-#297 behaviour where every finding at or above the
+        # fix floor is unconditional work; `0` fixes none of the band, which is
+        # `fix_severity_floor` raised to the cut without saying so twice.
+        "low_severity_fix_lines": 40,
         # A fix pass that MULTIPLIES the diff has written a second change, not a
         # fix. If what a round reviews has grown by more than this multiple of what
         # the FIRST round of the cycle reviewed, the cycle stops and says the change
@@ -612,6 +719,53 @@ DEFAULTS: dict = {
         # have the fix commit read at all, and remember what that buys — round 2 is
         # the only pass that ever reads the fixer's own work (#24).
         "max_rounds": 2,
+        # #78's reserved matters — the decisions the process must not take on its
+        # own — of which exactly one is implemented: `premise_repeated` (#84).
+        #
+        # **What it counts, and why it is not the cap.** The cap bounds COST: N
+        # rounds and stop, whatever is happening. This bounds FUTILITY — stop when
+        # the rounds have stopped being about different things. The number is
+        # OCCURRENCES of one declared premise, not rounds, and `2` means "the second
+        # time": the second time a fix is written against a premise the previous
+        # round invalidated, stop. Not the third.
+        #
+        # **The measurement (PR #299, 2026-08-21).** Five rounds. Rounds 1, 2 and 3
+        # each found the previous round's fix reopening the same hole, patched three
+        # different ways — merge parents, then same-named refs, then a purely local
+        # branch — and the premise underneath all three, that a local repository can
+        # say where a release number LANDED, was named at round 3 by the human and
+        # answered by deleting the machinery. 39 of the 53 findings after round 1
+        # were introduced by the previous fix pass; round 2 was 17 out of 17. The
+        # cap did not stop it; nothing did.
+        #
+        # **Evaluated when a fix is PROPOSED**, not when a round completes —
+        # `panel.py --premise`, before the fix pass runs. End-of-round is one whole
+        # fix pass and one whole panel too late, which is #84's own finding and PR
+        # #62's measurement. `round_stop` reads the same register and ends the cycle
+        # on a repeat that reached a round anyway, which is the late half.
+        #
+        # **On by default, unlike the switches in #78's table**, and the asymmetry is
+        # deliberate. Those default to today's behaviour because they can refuse a
+        # run or discard a finding on a rule nobody has exercised. This one can only
+        # fire after a fixer has DECLARED the same premise twice, which cannot happen
+        # by accident, and its output is "stop and ask a human" — #67's own required
+        # output and the cheap failure. A false positive costs one printed question;
+        # a false negative is the five-round cycle above.
+        #
+        # `null` switches the brake off and is how a repo asks for the pre-#84
+        # behaviour. `1` is REFUSED: it would escalate the first time any premise was
+        # declared, which is not a repeat, and the fastest way to teach a fixer never
+        # to declare one. The block is merged one level deep like the rest of
+        # `review_panel`, so a repo writing `escalate_on` replaces this object — but
+        # each key falls back to the default it does not mention, or
+        # `{"quorum_failed": true}` would silently switch the brake off.
+        #
+        # `quorum_failed` and `judge_absent` are #78's other two. They are ACCEPTED
+        # and not enforced, and a repo that sets one is told so in `config_notes`
+        # (`require_failing_test`'s precedent): a governance switch believed to be on
+        # and quietly off is the loudest possible way to make a process look
+        # governed.
+        "escalate_on": {"premise_repeated": 2},
     },
     "loops": {
         "dependabot_lander": False,
@@ -1251,6 +1405,14 @@ _EXTRA_REVIEWER_FIELDS: dict[str, set[str]] = {
 }
 
 
+# #78's other two reserved matters, named in `review_panel.escalate_on` but absent
+# from DEFAULTS because nothing implements them: listing them here is what tells a
+# repo that wrote one apart from a repo that mistyped `premise_repeated`. The value
+# is accepted and reported as unenforced (`panel_rounds.ESCALATE_ON_UNBUILT`), which
+# is the answer a reserved name deserves and a typo does not.
+_EXTRA_ESCALATE_ON = {"quorum_failed", "judge_absent"}
+
+
 def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
     """Every mapping in a rules file whose key set is fully known, as
     (label, what the file said, the names that mapping may contain).
@@ -1264,6 +1426,16 @@ def _validated(rules: dict) -> list[tuple[str, dict, set[str]]]:
         if not isinstance(over, dict) or not isinstance(base, dict):
             continue
         out.append((block, over, set(base)))
+        # `review_panel.escalate_on` is the one non-reviewer setting that is itself
+        # a mapping of names (#84), so it needs the same descent for the same
+        # reason: `escalate_on: {"premise_repeatd": 2}` would otherwise leave the
+        # futility brake at its default with nothing on stderr, on the block that
+        # decides when a cycle stops asking a fixer to patch the same assumption.
+        if block == "review_panel":
+            sub, sub_base = over.get("escalate_on"), base.get("escalate_on")
+            if isinstance(sub, dict) and isinstance(sub_base, dict):
+                out.append((f"{block}.escalate_on", sub, set(sub_base)
+                            | set(_EXTRA_ESCALATE_ON)))
         if block != "reviewers":
             continue
         # Reviewer FIELDS are one level deeper again, and the failure there is
@@ -1414,6 +1586,614 @@ def _report(where: str, problems: list[str], repo: str = "") -> None:
         print(f"{where}: {problem}", file=sys.stderr)
 
 
+# --------------------------------------------------- THE THIRD LAYER: THE BOARD
+#
+# THE PROBLEM THIS LAYER EXISTS FOR, stated as the incident rather than as a
+# principle. `.harness-rules.sample` said this repo answered `fix_severity_floor`
+# at P2. Every round of the five run on PR #299 put P4 findings in `to_fix` with
+# `below_fix_floor` empty, which cannot happen under a P2 fix floor. So the file
+# that stated the policy and the rounds that applied it disagreed, and the
+# disagreement survived five rounds, four agents and a landed release without
+# anybody noticing — because there was no way to ASK what the floor was. You could
+# read a file and hope it was the one that ran.
+#
+# The two layers above are each right for what they are, and neither is a settings
+# channel:
+#
+#   the tracked sample   POLICY, on the protected branch, read from
+#                        `origin/<default>` unattended so that a poisoned PR
+#                        cannot rewrite the rules governing its own review. It
+#                        cannot be changed for one run, cannot expire, and cannot
+#                        be changed at all by anyone who is not landing a PR.
+#   the per-box overlay  CAPABILITY — what will THIS MACHINE's provider serve.
+#                        Deliberately three keys, deliberately local, and
+#                        deliberately not read unattended at all.
+#
+# So this layer is the third: **the repo supplies a DEFAULT, the board states the
+# value IN FORCE, and the resolved answer names which layer produced it.** That
+# last clause is the whole of the constraint (#56's rule): a board dial must not
+# become a SECOND PLACE a dial is written down. It is not one, because nothing
+# here is authoritative on its own — `_dial_layers` reports, for every dial in the
+# resolved config, which of the four layers answered, and `--dials` prints that
+# table in one call.
+#
+# READ ON BOTH PATHS, unlike the overlay, and for the reason the overlay is not:
+# the overlay's exclusion is about the WORKING TREE, and the board is not in the
+# working tree. Unattended is also the path a governor exists to govern (#276), so
+# a layer the timers could not see would be a layer that could not do its job.
+#
+# WHAT IT COSTS, named rather than argued away. Reading the board is a network
+# call on a path that runs on a timer, and a board that is configured on this host
+# but does not answer leaves the run on the repo's own default — which is the
+# right floor, but is NOT the same fact as there being no dial, so it is reported
+# as `_dials_unreadable` and said in the rules line rather than swallowed. A host
+# with no board configured at all is the ordinary case and says nothing.
+
+#: Where the site config lives, in qb-env's words: the per-host file that says
+#: which board this machine belongs to. Environment beats it, and an unset URL is
+#: an ERROR rather than a guess — the fleet has more than one board and they are
+#: deliberately disjoint, so a default would point an agent at another island's.
+#:
+#: HERE rather than in `preland.py`, where it was written, because that module's
+#: own comment said where it belonged the moment anything else needed it: *"the
+#: moment a second reader needs this it belongs in harness_rules.py beside the
+#: other shared plumbing."* The dial layer is that second reader, and a second
+#: copy of "which board is this box on, and what bearer does it use" is how two
+#: readers come to disagree about which island they are talking to.
+QB_CONFIG = Path(os.environ.get("QUARTERBACK_CONFIG") or (
+    Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    / "quarterback" / "config"))
+
+#: The pre-config fleet layout, kept for a host that has not been rebuilt yet.
+QB_TOKEN_FILE = Path("/run/op-secrets/quarterback-token")
+
+#: How long `preland`'s checks wait on the board. Its verdict is the whole point
+#: of that run, so it can afford to wait.
+BOARD_TIMEOUT = 15
+
+#: How long the DIAL read waits, and much shorter on purpose. This runs inside
+#: `resolve_repo`, which every loop tick and every `panel.py` invocation calls, so
+#: a board that is down must cost a moment rather than a quarter of a minute per
+#: repo per tick. The answer when it lapses is the repo's own default plus a
+#: reported failure, which is a usable answer; fifteen seconds of nothing is not.
+DIALS_TIMEOUT = 5
+
+#: The board path the dial layer reads.
+DIALS_PATH = "dials"
+
+#: The offline switch, and the test seam. SET AT ALL — even to the empty string —
+#: means the board is not consulted and this variable is the whole layer; unset
+#: means ask the board. Empty is therefore "this run has no dials", which is what
+#: a test suite wants and what an operator wants when the board is down and the
+#: noise is not helping.
+#:
+#: It holds the JSON body `GET /dials` returns, so the shape a test exercises is
+#: the shape production parses. An ENVIRONMENT VARIABLE is a legitimate channel on
+#: the unattended path where an untracked file is not, and the difference is the
+#: one the module docstring turns on: the working tree is written by whatever runs
+#: while a branch under review is checked out, and the environment of the harness
+#: process is set by whoever launched it.
+DIALS_ENV = "QUARTERBACK_DIALS"
+
+
+class Dial(NamedTuple):
+    """One board-settable dial: what shape its value takes, and which way it may
+    move.
+
+    `kind` is checked against the value because an unreviewed channel that can
+    write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
+    the sample's values are checked by whoever consumes them rather than here.
+    `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
+    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated` and
+    `max_diff_chars`, and means "inherit the default" for everything else — so a
+    dial that took `null` generally would have one written value with two meanings.
+
+    `rule` is the direction, and it is the one place this layer and #276's throttle
+    genuinely differ:
+
+      `either`  the dial may move both ways. This is the case a THROTTLE's rule
+                cannot govern and the reason #305 is not #276: raising
+                `fix_severity_floor` from P3 to P2 makes rounds cheaper and
+                coverage thinner, and lowering it does the reverse, so neither
+                direction is the safe one and "may only move the cheaper way"
+                would be a rule with no meaning here.
+      `narrow`  the dial may only be turned DOWN — which for `enabled` means off,
+                never on. See `_NARROW_ONLY_ENABLED` for the argument.
+    """
+
+    kind: str
+    nullable: bool
+    rule: str
+
+
+#: `reviewers.<seat>.enabled` is the interesting boundary and it gets the narrow
+#: rule, so state which half won and why.
+#:
+#: It is BOTH: partly capability (is the CLI on this box) and partly policy (is the
+#: seat worth its tokens). The capability half already has a channel — the per-box
+#: overlay, which may take a seat OFF and may not put one ON, for the reason its
+#: own comment gives: *"Off is a fact about this machine; on is a choice about this
+#: repo."* The board's claim on the dial is the policy half only, so it inherits
+#: the same asymmetry from the other side: the board may decide a seat is not worth
+#: its tokens, and it may NOT decide that a box which said it cannot run `agy`
+#: actually can. Nothing on the board knows which CLIs a machine carries, and
+#: `panel.py` counts a seat that never ran as coverage it did not get — so a board
+#: that could enable a seat could veto every round's confidence on a box that never
+#: had it, from a table nobody would think to look in.
+#:
+#: This is also exactly the dial #276's throttle needs for its provider shed, and
+#: it needs it in exactly this direction, so the throttle inherits the rule rather
+#: than adding one.
+_NARROW_ONLY_ENABLED = "narrow"
+
+#: The dials the board may set. **The dials whose value is a judgement about COST
+#: rather than about capability** — which is the line #305 draws and the reason
+#: `auto_merge`, the epic and preland blocks, `skip_title_patterns` and the loop
+#: schedule are absent: those decide what may be MERGED, and a merge gate is policy
+#: that belongs where a human reviewing a branch can see it. The overlay's own
+#: comment refuses the same set for the same reason.
+#:
+#: NOT a second statement of what these dials mean or what they default to —
+#: `DEFAULTS` is still the only place either is written down. This is a list of
+#: names, a value shape and a direction, and `_dial_default` reads the default back
+#: out of `DEFAULTS` rather than restating it.
+BOARD_DIALS: dict[str, Dial] = {
+    # The two floors #305 is named for: which findings a fix pass may touch, and
+    # which ones buy another round.
+    "review_panel.fix_severity_floor": Dial("severity", False, "either"),
+    "review_panel.round_trigger_floor": Dial("severity", False, "either"),
+    # #297's budget for the band between them, and #298's growth ceiling.
+    "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
+    "review_panel.max_fix_growth": Dial("number", True, "either"),
+    # What a cycle costs: how many rounds, how much of the change each seat reads,
+    # how much diff it is handed, and whether a second model adjudicates.
+    "review_panel.max_rounds": Dial("number", False, "either"),
+    "review_panel.reviewer_scope": Dial("scope", False, "either"),
+    "review_panel.max_diff_chars": Dial("number", True, "either"),
+    "review_panel.judge_max_diff_chars": Dial("number", True, "either"),
+    "review_panel.judge_model": Dial("text", False, "either"),
+    # #278's dial, and #84's futility brake.
+    "review_panel.distant_merge_lines": Dial("number", True, "either"),
+    "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
+    # The boundary case, narrow-only. Filled in below from DEFAULTS' seat list so
+    # that a seat added there is settable without a second edit here — a seat named
+    # in two places is a seat the two places can disagree about.
+    **{f"{_LOCAL_BLOCK}.{seat}.enabled": Dial("flag", False, _NARROW_ONLY_ENABLED)
+       for seat in DEFAULTS[_LOCAL_BLOCK]},
+}
+
+#: The severity bands a floor may name. `P0` is deliberately absent: the panel's
+#: bands run P1..P4 and a floor at P0 would admit nothing at all, which is a way of
+#: switching the panel off without saying so.
+#:
+#: CASE-INSENSITIVE, and normalised on the way in, for the reason `severity_floor`
+#: is: every severity entering the panel is stripped and upper-cased, so a layer
+#: that refused `"p2"` while the sample beside it accepted it would make one written
+#: value mean two things depending on which layer carried it.
+_SEVERITY_RE = re.compile(r"^[Pp][1-4]$")
+
+#: What `reviewer_scope` accepts. Two words, and a third would silently review the
+#: whole PR every round.
+_SCOPES = ("diff", "increment")
+
+
+def _config_file(path: Path) -> dict[str, str]:
+    """The site config's `KEY=value` lines, as a mapping.
+
+    A deliberately small reader for a file bash SOURCES. It takes plain
+    assignments and strips one layer of quotes; it does not evaluate anything,
+    because a config read must not be able to run what a config write put there.
+    A line it cannot parse is skipped rather than guessed at.
+
+    The cost of not evaluating: a value containing `$VAR` is taken literally.
+    That is the honest failure — the board is then "unreachable at $VAR/…", which
+    names the problem — rather than the dishonest one, which would be expanding
+    it here and getting a different answer than `qb` does.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text()
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line[len("export "):].strip() if line.startswith("export ") else line
+        name, sep, value = line.partition("=")
+        if not sep or not name.replace("_", "").isalnum():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[name.strip()] = value
+    return out
+
+
+def _token_from(cfg: dict[str, str]) -> str:
+    """The bearer, via the config's own command or the pre-config token file."""
+    cmd = cfg.get("QUARTERBACK_TOKEN_CMD", "")
+    if cmd:
+        try:
+            proc = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                                  text=True, timeout=BOARD_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        first = (proc.stdout or "").strip().splitlines()
+        if not proc.returncode and first:
+            return first[0]
+    try:
+        return QB_TOKEN_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+def board_config() -> tuple[str, str, str]:
+    """(base_url, token, why-it-is-unusable) for this host's board.
+
+    Same contract and same precedence as `qb-env`, which is the fleet's rule
+    rather than any one script's preference: environment beats the config file, an
+    unset URL is an error and never a guess, and the token may come from a
+    command because its source is per-site (a cached file here, an ssh fetch
+    there).
+    """
+    cfg = _config_file(QB_CONFIG)
+    url = (os.environ.get("QUARTERBACK_BASE_URL")
+           or cfg.get("QUARTERBACK_BASE_URL", "")).rstrip("/")
+    if not url:
+        return "", "", (
+            f"no board configured on this host — QUARTERBACK_BASE_URL is unset "
+            f"and there is deliberately no default (see {QB_CONFIG})")
+    token = os.environ.get("QUARTERBACK_TOKEN", "") or _token_from(cfg)
+    if not token:
+        return url, "", ("no board token — set QUARTERBACK_TOKEN, or "
+                         f"QUARTERBACK_TOKEN_CMD in {QB_CONFIG}")
+    return url, token, ""
+
+
+def _dial_body(github: str) -> tuple[dict, str, str]:
+    """`(the board's answer, where it came from, why there is no answer)`.
+
+    Three outcomes and they are three different facts, which is why the reason is
+    a string and not a bool:
+
+      no board on this host   an empty body and an EMPTY reason. The ordinary case for
+                              a box that is not on a board at all, and it must be
+                              silent — a diagnostic printed on every resolution of
+                              every repo is one nobody reads.
+      the board did not answer  a reason, which is reported and recorded, because
+                              "there is no dial" and "we could not find out" have
+                              different remedies and only one of them is fine.
+      an answer               the parsed body.
+    """
+    raw = os.environ.get(DIALS_ENV)
+    if raw is not None:
+        where = f"${DIALS_ENV}"
+        if not raw.strip():
+            return {}, where, ""
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError as e:
+            # Named but unreadable is a mistake and a loud one, exactly as
+            # `BOX_RULES_ENV` treats a path that does not exist: somebody set this
+            # to say something, and a run that cannot tell what must not quietly
+            # decide it said nothing.
+            raise SystemExit(f"{DIALS_ENV} is not valid JSON: {e}")
+        if not isinstance(body, dict):
+            raise SystemExit(f"{DIALS_ENV} must hold a JSON object, not "
+                             f"{type(body).__name__}")
+        return body, where, ""
+
+    url, token, why = board_config()
+    if why:
+        # TWO different facts, and `board_config` tells them apart by whether it
+        # managed to resolve a URL. No URL is "this box is on no board", the
+        # ordinary case, and it is silent. A URL with no usable TOKEN is a
+        # MISCONFIGURED box that IS enrolled — it may well have dials in force that
+        # this run cannot see — and reporting that as "no dials" would be exactly
+        # the silent-policy failure this module exists to prevent.
+        return ({}, "", "") if not url else ({}, f"{url}/{DIALS_PATH}", why)
+    where = f"{url}/{DIALS_PATH}"
+    full = f"{where}?{urllib.parse.urlencode({'repo': github})}"
+    req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=DIALS_TIMEOUT) as r:
+            body = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # Before URLError, which it subclasses: a 404 means this board is older
+        # than the dial layer and has none, which is a CAPABILITY answer and not a
+        # failure, while a 500 means it has one and it broke. `preland` tells the
+        # same two apart on the same evidence for the same reason.
+        if e.code == 404:
+            return {}, where, ""
+        hint = " — the token this host resolved was refused" if e.code == 401 else ""
+        return {}, where, f"the board answered HTTP {e.code}{hint}"
+    except OSError as e:
+        # OSError, not URLError: it covers URLError and TimeoutError both, plus a
+        # connection reset partway through the read, which urllib does not wrap.
+        return {}, where, f"the board was unreachable ({e.__class__.__name__})"
+    except ValueError:
+        return {}, where, "the board answered with something that is not JSON"
+    if not isinstance(body, dict):
+        return {}, where, f"the board answered a {type(body).__name__}, not an object"
+    return body, where, ""
+
+
+def _expired(entry: dict, now: float) -> bool:
+    """Has this dial's `expires_at` passed?
+
+    The board filters expired rows out already, so this is the SECOND check and it
+    is not redundant: `$QUARTERBACK_DIALS` is a hand-written body with no server in
+    front of it, and an expiry that only one of the two sources honoured would be
+    an expiry that works everywhere except where it is being tested.
+
+    A malformed timestamp is treated as EXPIRED rather than as absent-and-eternal.
+    A dial nobody can date is a dial that cannot end, which is the exact failure
+    `expires_at` exists to close.
+    """
+    at = entry.get("expires_at")
+    if not at:
+        return False
+    try:
+        stamp = datetime.fromisoformat(str(at))
+    except ValueError:
+        return True
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=UTC)
+    return stamp.timestamp() <= now
+
+
+def _dial_default(path: str) -> tuple[Any, bool]:
+    """`(the built-in default for this dotted path, was there one)`.
+
+    Read back out of `DEFAULTS` rather than restated in `BOARD_DIALS`, which is the
+    whole of the no-second-source rule applied to this module's own tables.
+    """
+    node: Any = DEFAULTS
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None, False
+        node = node[part]
+    return node, True
+
+
+def _dial_problem(path: str, dial: Dial, value: Any) -> str:
+    """Why this value may not be applied, or `""`.
+
+    VALUES ARE CHECKED, NOT JUST NAMES — the overlay's second narrowing rule, and
+    it is here for the same reason it is there: a board dial is written by somebody
+    typing into an endpoint, `"enabled": "false"` is a non-empty string and
+    therefore truthy, and a name-only filter lets the natural hand-edit do the exact
+    opposite of what the dial exists for.
+    """
+    if value is None:
+        return "" if dial.nullable else (
+            f"`{path}: null` — null is not this dial's off switch, it means "
+            f"'inherit the default'. Clear the dial instead: it is the same answer "
+            f"and it leaves nothing behind saying otherwise")
+    if dial.kind == "flag":
+        return "" if isinstance(value, bool) else (
+            f"`{path}` must be true or false, not {value!r} — a quoted 'false' is "
+            f"a non-empty string and would read as ON")
+    if dial.kind == "severity":
+        return "" if isinstance(value, str) and _SEVERITY_RE.match(value) else (
+            f"`{path}` must be a severity band P1-P4, not {value!r}")
+    if dial.kind == "scope":
+        return "" if isinstance(value, str) and value.strip().lower() in _SCOPES else (
+            f"`{path}` must be one of {', '.join(_SCOPES)}, not {value!r}")
+    if dial.kind == "text":
+        return "" if isinstance(value, str) else (
+            f"`{path}` must be a string, not {type(value).__name__}")
+    # "number": int or float, and bools are excluded explicitly because `True` is
+    # an int in Python and `max_rounds: true` would otherwise resolve to one round.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"`{path}` must be a number, not {value!r}"
+    if value < 0:
+        return f"`{path}` must not be negative, and is {value!r}"
+    return ""
+
+
+def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
+    """`(dials in force, where they came from, what was refused, unreadable)`.
+
+    A repo dial beats a fleet dial of the same name, and the entry says which
+    answered. Everything the board holds that this harness does not recognise, or
+    holds at a value it may not take, is REFUSED and named — never dropped
+    silently, because a board dial nobody's harness applies while the board reports
+    it as in force is the two-sources-of-truth failure arriving from the other end.
+    """
+    body, where, why = _dial_body(github)
+    if why:
+        return {}, where, [f"{why}, so this run is on the repo's own defaults — "
+                           f"which is not the same thing as there being no dial "
+                           f"set. The values below are what {RULES_FILENAME}'s "
+                           f"layers answered, not what the board says"], True
+    rows = body.get("dials") or []
+    if not isinstance(rows, list):
+        return {}, where, [f"`dials` must be a list, not {type(rows).__name__}"], True
+
+    now = datetime.now(UTC).timestamp()
+    out: dict[str, dict] = {}
+    problems: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            problems.append(f"a dial must be an object, not {type(row).__name__} "
+                            f"— ignored")
+            continue
+        name = str(row.get("dial") or "")
+        if _expired(row, now):
+            # SILENT, and FIRST — before the name and the value are judged. An
+            # expired dial is simply ABSENT: a resolution that never had one and a
+            # resolution whose one lapsed have to be indistinguishable, or the
+            # expiry is a flag somebody still has to clear. Judged after the name,
+            # a lapsed dial with a typo in it would go on being complained about
+            # for ever, which is the one thing an expiry is supposed to end.
+            continue
+        dial = BOARD_DIALS.get(name)
+        if dial is None:
+            problems.append(
+                f"`{name}` is not a board-settable dial — ignored. This harness "
+                f"settles that list, not the board (see BOARD_DIALS); a dial the "
+                f"board reports as in force and nothing applies is worse than no "
+                f"dial at all. Settable: {', '.join(sorted(BOARD_DIALS))}")
+            continue
+        value = row.get("value")
+        problem = _dial_problem(name, dial, value)
+        if problem:
+            problems.append(problem)
+            continue
+        # Normalised HERE rather than by each consumer, so `_dials` reports the value
+        # the round actually applied. `panel_seats` upper-cases a floor and
+        # lower-cases a scope on its way in, and a provenance table showing `"p3"`
+        # beside a round that ran `P3` is a table a reader would have to second-guess.
+        if dial.kind == "severity":
+            value = value.upper()
+        elif dial.kind == "scope":
+            value = value.strip().lower()
+        scope = "repo" if row.get("scope") == "repo" else "fleet"
+        prior = out.get(name)
+        if prior is not None and (prior["scope"] == "repo" or scope != "repo"):
+            continue
+        out[name] = {"value": value, "scope": scope, "source": where,
+                     "reason": str(row.get("reason") or ""),
+                     "set_by": str(row.get("set_by") or ""),
+                     "expires_at": row.get("expires_at") or None}
+    return out, where, problems, False
+
+
+def _get_dial(cfg: dict, path: str) -> tuple[Any, bool]:
+    node: Any = cfg
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None, False
+        node = node[part]
+    return node, True
+
+
+def _set_dial(cfg: dict, path: str, value: Any) -> bool:
+    """Write one dotted path, REBINDING every mapping on the way down.
+
+    Never mutated in place, and this is the same trap the overlay names one
+    function up: for a block the rules file did not mention, `cfg["reviewers"]
+    ["claude"]` is still the `DEFAULTS` dict ITSELF — the block merge copies the
+    mapping, not its values — so an in-place write here would edit the built-in
+    defaults for the rest of the process, and every later `resolve_repo` in the
+    same run would inherit one repo's board dial.
+    """
+    head, _, rest = path.partition(".")
+    if not rest:
+        cfg[head] = value
+        return True
+    child = cfg.get(head)
+    if not isinstance(child, dict):
+        return False
+    copy = dict(child)
+    if not _set_dial(copy, rest, value):
+        return False
+    cfg[head] = copy
+    return True
+
+
+def apply_dials(cfg: dict, dials: dict[str, dict]) -> tuple[dict[str, dict], list[str]]:
+    """Overlay the board's dials on a resolved config. `(what applied, what did not)`.
+
+    Applied LAST, after the baseline merge and after the per-box overlay, so that
+    "the board states the value in force" is true rather than nearly true. The one
+    place the order could bite is `reviewers.<seat>.enabled`, where both this layer
+    and the overlay have a claim — and it does not bite, because both may only
+    narrow: whichever of the two turns a seat off, it stays off, and neither can
+    turn one back on.
+    """
+    applied: dict[str, dict] = {}
+    problems: list[str] = []
+    for path, entry in sorted(dials.items()):
+        dial = BOARD_DIALS[path]
+        current, present = _get_dial(cfg, path)
+        if not present:
+            # The dial exists in DEFAULTS but not in this resolved config, which
+            # means the rules file replaced the block holding it — `escalate_on` is
+            # merged wholesale, so a repo writing `{"quorum_failed": 1}` removes
+            # `premise_repeated` outright. Setting it back would resurrect a key the
+            # repo deliberately dropped, from a layer the repo cannot see.
+            problems.append(
+                f"`{path}` is not in this repo's resolved rules — its block was "
+                f"replaced wholesale by {SAMPLE_FILENAME}, so the board dial has "
+                f"nothing to override and is ignored")
+            continue
+        if dial.rule == "narrow" and entry["value"] and not current:
+            problems.append(
+                f"`{path}: true` would ENABLE a seat this box or "
+                f"{SAMPLE_FILENAME} has off — ignored. A board dial may only narrow "
+                f"the panel: turning a seat off is a judgement about what it is "
+                f"worth, which is what this layer is for, and turning one on is a "
+                f"claim about what this machine can run, which only the machine and "
+                f"the sample can make")
+            continue
+        if not _set_dial(cfg, path, entry["value"]):
+            problems.append(f"`{path}` could not be written — ignored")
+            continue
+        applied[path] = entry
+    return applied, problems
+
+
+def _leaf_dials(node: Any, prefix: str = "") -> list[str]:
+    """Every dotted path in a resolved config, deepest first.
+
+    A dict is walked and everything else is a leaf, so `skip_title_patterns` (a
+    list) is one dial and `escalate_on.premise_repeated` is another. Comment keys
+    are already gone by the time this runs, but they are skipped anyway: this is
+    also used on raw rules files.
+    """
+    out: list[str] = []
+    if not isinstance(node, dict):
+        return out
+    for key, val in node.items():
+        if str(key).startswith(COMMENT_PREFIX):
+            continue
+        path = f"{prefix}{key}"
+        if isinstance(val, dict) and val:
+            out.extend(_leaf_dials(val, path + "."))
+        else:
+            out.append(path)
+    return out
+
+
+def dial_layers(cfg: dict, rules: dict, baseline: str, overlay_paths: dict[str, str],
+                board: dict[str, dict]) -> dict[str, dict]:
+    """Which layer answered, FOR EVERY DIAL. The acceptance criterion, as a dict.
+
+    `{path: {"value": …, "layer": …, "source": …}}`, one entry per dial in the
+    resolved config, where `layer` is one of `defaults`, `sample`, `overlay`,
+    `board`. A board entry also carries the reason, who set it, its scope and when
+    it lapses, because a dial in force whose argument nobody can read is a dial
+    nobody can decide to remove.
+
+    BY PRESENCE, NOT BY DIFFERENCE. A rules file that writes a dial at exactly its
+    DEFAULTS value still SUPPLIED it, and this repo's own sample does that
+    deliberately for four of them (`_278_distant_merge_lines`: *"at its DEFAULTS
+    value and written out anyway"*). Reporting those as `defaults` would tell a
+    reader the file they are about to edit is not the one that answered.
+    """
+    out: dict[str, dict] = {}
+    for path in _leaf_dials({k: v for k, v in cfg.items()
+                             if k in DEFAULTS and not k.startswith(COMMENT_PREFIX)}):
+        value, _ = _get_dial(cfg, path)
+        entry: dict[str, Any] = {"value": value}
+        if path in board:
+            said = board[path]
+            entry.update(layer="board", source=said.get("source") or "board",
+                         scope=said["scope"], reason=said["reason"],
+                         set_by=said["set_by"], expires_at=said["expires_at"])
+        elif path in overlay_paths:
+            entry.update(layer="overlay", source=overlay_paths[path])
+        elif _get_dial(rules, path)[1]:
+            entry.update(layer="sample", source=baseline)
+        else:
+            entry.update(layer="defaults", source="harness_rules.DEFAULTS")
+        out[path] = entry
+    return out
+
+
 def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -> dict:
     """Full config for a repo: built-in defaults, overlaid with its rules file, plus
     the plumbing (path/github/default_branch) detected from the checkout rather than
@@ -1424,13 +2204,28 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     for what its providers will actually serve. A repo with only the legacy tracked
     `.harness-rules` resolves exactly as it always did.
 
+    "Its rules file" is now also NOT a file, for the dials a board may state: see
+    the THIRD LAYER section above. The precedence is
+    `DEFAULTS -> sample -> per-box overlay -> board`, the board applies LAST, and
+    every dial's answer names the layer that gave it.
+
     The returned dict is the same shape the old load_repo_cfg() produced, so
-    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged. Two private
+    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged. Five private
     fields describe the read itself: `_rules_from` is the human sentence
     `describe()` prints, and `_rules_baseline` is the FILENAME that supplied the
     baseline (`""` for none), which is what a caller gates on — the panel refuses to
     review a repo nobody configured, and a defaults-only review is one nobody
-    configured.
+    configured. `_rules_unreadable` says the baseline is empty because the branch
+    could not be READ.
+
+    `_dials` is the per-dial provenance table — `{path: {value, layer, source, …}}`
+    for every dial in the resolved config — and it is the answer to "which layer
+    said so", which used to be an inference from three files and a resolution order.
+    `_dials_from` names where the board layer was read (`""` on a box that is on no
+    board) and `_dials_unreadable` says the board is configured HERE and did not
+    answer, which is a different fact from there being no dial and has a different
+    remedy — a flag rather than something a caller greps out of the blurb, for the
+    reason `_rules_unreadable` is one.
     """
     if from_default_branch is None:
         from_default_branch = unattended()
@@ -1491,6 +2286,10 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     # own provenance.
     problems = list(overlay_problems)
     applied: set[str] = set()
+    # The same thing as `applied`, spelled as dotted paths, because `dial_layers`
+    # has to answer "which layer set `reviewers.codex.effort`" and a bare set of
+    # key names cannot say which SEAT they were set on.
+    overlay_paths: dict[str, str] = {}
     for seat, flags in overlay.items():
         # A seat this loop does not have to check: `_local_overlay` validated the
         # name against DEFAULTS, which is where cfg's seat names come from.
@@ -1517,17 +2316,34 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
             # write would edit the built-in defaults for the rest of the process.
             cfg[_LOCAL_BLOCK][seat] = {**base_seat, **keep}
             applied.update(keep)
+            overlay_paths.update(
+                {f"{_LOCAL_BLOCK}.{seat}.{k}": local_from for k in keep})
     # Attributed to the file that said it: the baseline's problems were reported
     # against `provenance` above, and these belong to the local file. One `where`
     # for both would send someone editing the wrong half of the split.
     _report(local_from, problems, str(root))
+
+    # THE THIRD LAYER, applied last: the board states the value in force. Read on
+    # BOTH paths, unlike the overlay above it, and the difference is not an
+    # inconsistency — the overlay is excluded unattended because it is a file in an
+    # untrusted WORKING TREE, and the board is not in the working tree. It is also
+    # the path #276's governor exists to govern, so a layer the timers could not
+    # see would be a layer that could not do its job.
+    #
+    # `github` is not yet on cfg at this point, so the scope is detected here. A
+    # repo whose remote cannot be read gets fleet-scoped dials only, which is the
+    # honest answer: nothing can say which repo it is.
+    github = detect_github(root)
+    dials, dials_from, dial_problems, dials_unreadable = board_dials(github)
+    board_applied, refused = apply_dials(cfg, dials)
+    _report(dials_from or "board", dial_problems + refused, str(root))
 
     # Detected, never declared — a rules file that sets these is ignored, since
     # the checkout in front of us is the authority on where and what it is.
     cfg["path"] = str(root)
     cfg["name"] = rules.get("name") or root.name
     cfg["default_branch"] = default_branch
-    cfg["github"] = detect_github(root)
+    cfg["github"] = github
     cfg.setdefault("executor_pr_base", default_branch)
     # WHICH file supplied the baseline, as a field rather than as a substring of the
     # blurb below: `""` means nothing was found, which is what lets the panel refuse
@@ -1552,6 +2368,30 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     if from_default_branch and (root / RULES_FILENAME).is_file() \
             and baseline == SAMPLE_FILENAME:
         cfg["_rules_from"] += f" (unattended: {RULES_FILENAME} not read)"
+    # The board's half of the same sentence. Named dials rather than a count: the
+    # reader of this line is asking which policy ran, and "3 board dials" answers a
+    # different question from "the fix floor came from the board".
+    if board_applied:
+        cfg["_rules_from"] += (f" + {dials_from} "
+                               f"({', '.join(sorted(board_applied))})")
+    elif dials_unreadable:
+        # A configured board that would not answer is NOT the same fact as a repo
+        # with no dial, and it has a different remedy, so it is said in the one line
+        # that exists to say which rules applied rather than inferred from silence.
+        cfg["_rules_from"] += f" ({dials_from}: unreadable, dials not applied)"
+
+    # WHICH LAYER ANSWERED, FOR EVERY DIAL — the whole of #305's last acceptance
+    # criterion, and the thing that keeps this from being a second place a dial is
+    # written down. `harness_rules.py --dials` prints it; `--json` carries it; and
+    # `panel.py` puts it in the round's artifact, so a round that ran under a moved
+    # floor says which layer moved it.
+    cfg["_dials"] = dial_layers(cfg, rules, provenance, overlay_paths, board_applied)
+    #: Where the board layer was read from, `""` when this host is on no board.
+    cfg["_dials_from"] = dials_from
+    #: The board is configured here and did not answer, so the dials below are the
+    #: repo's own and not necessarily the ones in force. A flag rather than something
+    #: a caller greps out of `_rules_from`, for the reason `_rules_unreadable` is one.
+    cfg["_dials_unreadable"] = dials_unreadable
 
     if not cfg["github"]:
         raise SystemExit(
@@ -1944,6 +2784,10 @@ if __name__ == "__main__":
     ap.add_argument("--repo", help="path or name (default: cwd)")
     ap.add_argument("--discover", action="store_true", help="list repos with a rules file")
     ap.add_argument("--json", action="store_true", help="dump the resolved config")
+    ap.add_argument("--dials", action="store_true",
+                    help="every dial, its value, and the layer that answered")
+    ap.add_argument("--dial", metavar="PATH",
+                    help="one dial, e.g. review_panel.fix_severity_floor")
     a = ap.parse_args()
     if a.discover:
         for p in discover():
@@ -1953,4 +2797,30 @@ if __name__ == "__main__":
         c = resolve_repo(a.repo)
     except RepoNotFound as e:
         raise SystemExit(str(e))   # a bad --repo is user error, not a crash
+    if a.dial or a.dials:
+        # THE ONE CALL. "What is the fix floor here, and which layer said so" was
+        # previously an inference from three files and a resolution order, and the
+        # inference was wrong for five rounds on #299 with nothing able to say so.
+        table = c["_dials"]
+        if a.dial:
+            said = table.get(a.dial)
+            if said is None:
+                raise SystemExit(
+                    f"no dial {a.dial!r} in this repo's resolved rules. "
+                    f"`--dials` lists them all")
+            table = {a.dial: said}
+        if c.get("_dials_unreadable"):
+            print(f"# {c['_dials_from']} would not answer — these are this repo's "
+                  f"own layers, not necessarily what is in force", file=sys.stderr)
+        width = max((len(k) for k in table), default=0)
+        for path, said in table.items():
+            line = f"{path:<{width}}  {json.dumps(said['value'])}  [{said['layer']}]"
+            if said["layer"] == "board":
+                lapses = said.get("expires_at") or "no end date"
+                line += (f" {said['scope']} — {said['reason']!r} "
+                         f"by {said['set_by']}, {lapses}")
+            elif said["layer"] != "defaults":
+                line += f" {said['source']}"
+            print(line)
+        raise SystemExit(0)
     print(json.dumps(c, indent=2) if a.json else describe(c))

@@ -384,6 +384,34 @@ fi
 step "Handling worktree directory..."
 if [[ -d "$WORKTREE_DIR" ]]; then
     cd "$WORKTREE_DIR" 2>/dev/null || true
+
+    # `qb-stash` entries live under `refs/worktree/*`, which is what makes them
+    # per-worktree — and also what makes `git worktree remove` take them with it.
+    # They are invisible to `git status`, so the dirty-file backup below does not
+    # see them. Copy them into the repo-wide namespace first, where they survive
+    # the removal and can be applied from anywhere. Cheap: a ref write per entry,
+    # and nothing at all when there are none.
+    # >>> qb-stash-rescue (extracted verbatim by harness/tests/test_stash_guard.py)
+    QB_STASH_REFS=$(git for-each-ref --format='%(refname) %(objectname)' \
+                        refs/worktree/qb-stash/ 2>/dev/null || true)
+    if [[ -n "$QB_STASH_REFS" ]]; then
+        RESCUED=0
+        while read -r qs_ref qs_sha; do
+            [[ -n "$qs_ref" ]] || continue
+            if git update-ref "refs/qb-stash-rescued/${SAFE_NAME}/${qs_ref##*/}" "$qs_sha" \
+                   2>/dev/null; then
+                RESCUED=$((RESCUED + 1))
+            fi
+        done <<< "$QB_STASH_REFS"
+        if [[ "$RESCUED" -gt 0 ]]; then
+            echo -e "${YELLOW}Rescued $RESCUED qb-stash entr$([[ $RESCUED -eq 1 ]] && echo y || echo ies)${NC}" \
+                    "— they would have died with the worktree."
+            echo "  git for-each-ref refs/qb-stash-rescued/${SAFE_NAME}/"
+            echo "  git stash apply <that ref>"
+        fi
+    fi
+    # <<< qb-stash-rescue
+
     DIRTY_FILES=$(git status --porcelain 2>/dev/null || true)
     if [[ -n "$DIRTY_FILES" ]]; then
         BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"

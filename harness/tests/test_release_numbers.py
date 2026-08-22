@@ -61,13 +61,17 @@ exists.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import re
 import subprocess
+import sys
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+import _flake_sandbox
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -491,6 +495,59 @@ def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_r
         f"README.md's release list has no `- **{newest}**` entry")
 
 
+#: `scripts/readme_releases.py`, loaded once and by path: `scripts/` is a directory of
+#: standalone tools rather than an importable package, and there is no `sys.path` entry that
+#: would make `import readme_releases` mean this repo's file rather than somebody's.
+_RENDERER = None
+
+
+def _renderer():
+    """The README list renderer, imported lazily.
+
+    Lazily because this file is also collected in sandboxes: an import at module level would
+    turn a sandbox missing `scripts/` into a collection ERROR for the whole suite, taking the
+    other twenty-odd release-metadata assertions down with it. The flake comparison below is
+    what keeps the sandbox stocked, and it can only report a missing copy if the suite it
+    guards is still collectable.
+    """
+    global _RENDERER
+    if _RENDERER is None:
+        spec = importlib.util.spec_from_file_location(
+            "readme_releases", REPO_ROOT / "scripts" / "readme_releases.py")
+        assert spec and spec.loader
+        _RENDERER = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = _RENDERER
+        spec.loader.exec_module(_RENDERER)
+    return _RENDERER
+
+
+def test_the_readme_release_list_is_in_changelog_order(readme_text, changelog_text):
+    """The list is RENDERED from CHANGELOG.md's order, and this is where drift is a failure.
+
+    It drifted for three releases in a row — `v2.61, v2.59, v2.60, v2.62, …` — and by the time
+    #296 was written nine bullets were out of place, because the ordering convention
+    was written down nowhere and checked by nothing. `74a0453` is a human pushing
+    `docs(readme): put v2.62 at the end of the release list`, which is the same class being
+    corrected by whoever happened to notice.
+
+    The renderer only ever REORDERS whole bullets, so this test failing means one of two
+    things and the message says which: the list is out of order (run
+    `scripts/readme_releases.py write`), or a release has no bullet at all, which nothing can
+    write for you.
+
+    Asserted against the renderer rather than against a second hand-rolled ordering rule here.
+    A test that re-derived the order would be the third copy of the fact — CHANGELOG, README,
+    and this file — and the third copy is the one that goes stale unnoticed."""
+    renderer = _renderer()
+    try:
+        rendered = renderer.render(readme_text, changelog_text)
+    except renderer.ListError as e:
+        pytest.fail(str(e))
+    assert rendered == readme_text, (
+        "README.md's release list is not in CHANGELOG.md's order. It is rendered, not "
+        "hand-kept: run `scripts/readme_releases.py write`")
+
+
 #: A release bullet and only a release bullet: `- **v2.33** — …`. Anchoring the closing `**`
 #: right after the number is what keeps the list's deliberate range entries out of this — a
 #: `- **v1–v2.1** —` or a `- **v3 (next)** —` simply does not match, rather than matching as
@@ -602,57 +659,38 @@ def test_an_unclosed_fence_says_which_line_opened_it():
 # written out as three-line snippets in the tests rather than having to be smuggled into
 # this file's real source.
 
-#: One copy line in the flake check's script: `cp ${./a/b} repo/a/b`, or the `install -D`
-#: form that brings its own parent directory. Anchored at line start AND on the command,
-#: because the region is bash inside a Nix indented string where `${./x}` also occurs in
-#: comments, in a commented-out copy line and in `--ignore` arguments — counting one of those
-#: as a copy is how this guard passes while the sandbox errors on the file it exists to catch.
-#: `\s*` inside the braces is for the Nix formatters that write `${ ./x }`, which would
-#: otherwise be reported as a missing copy on a repo where nothing is wrong.
-_FLAKE_COPY = re.compile(
-    r"^[ \t]*(?:cp|install)\b[^\n]*?\$\{\s*\./(?P<src>[^}\s]+)\s*\}[ \t]+(?P<dest>\S+)[ \t]*$",
-    re.MULTILINE)
-
 #: The flake attribute whose sandbox runs this suite, spelled as flake.nix spells it.
 _FLAKE_CHECK = "release-metadata-tests"
 
-#: The prefix every copy lands under: the sandbox builds a `repo/` tree and this suite's
-#: REPO_ROOT resolves to it. A destination that does not follow the rule puts the file
-#: somewhere the suite will not look, which comparing source paths alone cannot see.
-_SANDBOX_PREFIX = "repo/"
-
 #: Copied in without being read through `REPO_ROOT`, so the copies-with-no-read half of the
-#: comparison does not report it: pytest opens the suite's own file by path.
-_COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py"})
+#: comparison does not report it: pytest opens the suite's own file by path, and the shared
+#: reader below is imported rather than read.
+#:
+#: `scripts/release_stamp.py` is the third: this suite never opens it, but
+#: `scripts/readme_releases.py` — which it does open — imports it by path for the one
+#: definition of what a release heading is. A sandbox holding the renderer and not the
+#: stamper errors on the import rather than on a read, which the read-side comparison
+#: cannot see.
+_COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py",
+                                  "harness/tests/_flake_sandbox.py",
+                                  "scripts/release_stamp.py"})
+
+#: Reading a check's block out of flake.nix, parsing its copy lines and checking they land
+#: where this suite looks, is the same job for every suite with this problem — and it was
+#: written out twice, here and in `_prose_sandbox` (#257). Two hand-rolled readers of one file
+#: agree only until somebody edits one of them. `_SANDBOX_PREFIX` is kept as a thin alias
+#: because this file's assertions read it directly; the logic has one home.
+_SANDBOX_PREFIX = _flake_sandbox.SANDBOX_PREFIX
 
 
 def _flake_check_region(text: str) -> str:
-    """The `release-metadata-tests` check's own text, sliced out of flake.nix.
-
-    Both ends are anchored at line start on shapes Nix actually writes, rather than found
-    with a bare substring search. `release-metadata-tests` appears in comments, in prose and
-    in a future `checks.${system}` assembly entry; `'';` ends every indented string in the
-    file. The first occurrence of either is not necessarily this check's, and a wrong slice
-    silently compares the suite's reads against some other derivation's copies.
-    """
-    opens = list(re.finditer(rf"^[ \t]*{re.escape(_FLAKE_CHECK)}\s*=", text, flags=re.MULTILINE))
-    assert len(opens) == 1, (
-        f"flake.nix has {len(opens)} lines defining `{_FLAKE_CHECK} =`, and this comparison "
-        "needs exactly one to know which sandbox feeds this suite. If the check was renamed, "
-        "rename `_FLAKE_CHECK` here too — this is the only thing tying the suite to the "
-        "sandbox that feeds it")
-    start = opens[0].start()
-    end = re.compile(r"^[ \t]*'';[ \t]*$", re.MULTILINE).search(text, start)
-    assert end, (
-        f"no line closing an indented string (`'';`) appears after the `{_FLAKE_CHECK}` "
-        f"definition at offset {start} of flake.nix, so this comparison cannot tell where "
-        "the check ends. The check's script was restructured, or the file is truncated")
-    return text[start:end.start()]
+    """This check's own text, sliced out of flake.nix. See `_flake_sandbox.check_region`."""
+    return _flake_sandbox.check_region(text, _FLAKE_CHECK)
 
 
 def _flake_copies(region: str) -> dict[str, str]:
     """Source path -> destination, for every copy line in a check's script."""
-    return {m.group("src"): m.group("dest") for m in _FLAKE_COPY.finditer(region)}
+    return _flake_sandbox.copies(region)
 
 
 #: This file's own syntax tree, parsed once. Both readers below want it, and parsing the
@@ -955,59 +993,10 @@ def test_every_use_of_repo_root_is_one_the_reader_can_follow():
         f"{_FLAKE_CHECK} check")
 
 
-#: A flake region with everything the copy reader has to get right: a commented-out copy, a
-#: `${./x}` in prose, one in an argument that is not a copy at all, the two copy commands, and
-#: the spacing a Nix formatter leaves behind.
-_FLAKE_REGION_SAMPLE = """        release-metadata-tests = pkgs.runCommand "x" { } ''
-          # cp ${./commented-out.md} repo/commented-out.md
-          # mentions ${./prose.md} in passing
-          install -Dm644 ${./CHANGELOG.md} repo/CHANGELOG.md
-          cp ${ ./app/main.py }  repo/app/main.py
-          pytest -q --ignore=${./not-a-copy.py} tests
-          touch $out
-        '';
-"""
+# The reader itself is exercised in `test_flake_sandbox.py`, beside the module that implements
+# it — five tests here duplicated its cases after the extraction, with a fixture that had
+# already drifted from the shared one (this copy had no `cp -r` of a directory, so the shape
+# most likely to regress was covered in one place and not the other). The coupling test above
+# still runs the reader against the real flake.nix, which is what this suite needs from it.
 
 
-def test_only_real_copy_lines_count_as_copies():
-    """The guard's fail-safe direction depends on this. A `${./x}` in a comment or an argument
-    counted as a copy is a file the sandbox does not have and the comparison says it does —
-    which is the sandbox erroring on a missing file with the guard green, i.e. #163."""
-    assert _flake_copies(_FLAKE_REGION_SAMPLE) == {
-        "CHANGELOG.md": "repo/CHANGELOG.md",
-        "app/main.py": "repo/app/main.py",
-    }
-
-
-def test_the_region_reader_takes_the_whole_check_and_stops_at_its_end():
-    """`release-metadata-tests` occurs in prose and `'';` ends every indented string in
-    flake.nix, so neither end can be found by taking the first occurrence of a substring."""
-    text = ("        loops-tests = pkgs.runCommand \"a\" { } ''\n"
-            "          cp ${./decoy.md} repo/decoy.md\n"
-            "        '';\n"
-            + _FLAKE_REGION_SAMPLE
-            + "        mcp-tests = pkgs.runCommand \"b\" { } ''\n"
-              "          cp ${./later.md} repo/later.md\n"
-              "        '';\n")
-    assert set(_flake_copies(_flake_check_region(text))) == {"CHANGELOG.md", "app/main.py"}
-
-
-def test_the_region_reader_says_so_when_the_check_is_not_there():
-    """A renamed check, which is the whole reason the name is a constant here."""
-    with pytest.raises(AssertionError, match="0 lines defining"):
-        _flake_check_region("        loops-tests = pkgs.runCommand \"a\" { } ''\n        '';\n")
-
-
-def test_the_region_reader_refuses_an_ambiguous_check_name():
-    """Two definitions and there is no telling which sandbox feeds this suite."""
-    doubled = _FLAKE_REGION_SAMPLE + _FLAKE_REGION_SAMPLE
-    with pytest.raises(AssertionError, match="2 lines defining"):
-        _flake_check_region(doubled)
-
-
-def test_the_region_reader_says_what_it_saw_when_the_check_is_unterminated():
-    """Not "the parser is wrong" — the far likelier cause is a restructured check, and a
-    message that blames the wrong thing sends whoever hits it to the wrong file."""
-    with pytest.raises(AssertionError, match="no line closing an indented string"):
-        _flake_check_region("        release-metadata-tests = pkgs.runCommand \"x\" { } ''\n"
-                            "          cp ${./CHANGELOG.md} repo/CHANGELOG.md\n")

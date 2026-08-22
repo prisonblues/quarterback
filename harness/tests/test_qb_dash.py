@@ -285,7 +285,13 @@ async def _drive_plan() -> list[str]:
         # Anywhere but the ⚒: the detail line, and it must name the row clicked.
         await pilot.click(plan, offset=(40, 1))
         await pilot.pause(0.3)
-        title = str(plan.get_row_at(plan.scroll_offset.y)[4]).rstrip("…")
+        # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
+        # `scope.column` (#261), so column 4 is the title on a wide pane and the
+        # holder on a narrow one — and a narrow pane is now the default. The `? `
+        # mark on an unattributable row is part of the cell but not of the title.
+        title_at = 4 if app.scope.column else 3
+        title = str(plan.get_row_at(plan.scroll_offset.y)[title_at]).removeprefix("? ") \
+            .rstrip("…")
         if title and title not in app.detail_text:
             failures.append(f"the detail line does not describe the row clicked: "
                             f"{app.detail_text[:80]!r}")
@@ -354,9 +360,12 @@ async def _drive_panel() -> list[str]:
         # This test is about the ⚖ MECHANICS — confirm, cancel, pane not window
         # — on whatever PR happens to be newest. The cross-repo refusal has its
         # own test below; left live here it would make this one pass or fail on
-        # which of QB_DASH_REPOS holds the highest-numbered PR today. An unknown
-        # repo is exactly how the guard already stands aside.
-        app.repo_slug = None
+        # which of QB_DASH_REPOS holds the highest-numbered PR today. So the guard
+        # is STUBBED, like the launchers above it, rather than blinded: clearing
+        # `repo_slug` used to stand it aside, and now it is the one state the guard
+        # refuses on, since a dashboard that cannot name its own repo cannot aim a
+        # review from it.
+        app.wrong_repo = lambda repo, what: None
 
         # The ⚖ column asks first and starts nothing by itself.
         await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))
@@ -495,6 +504,217 @@ def test_the_seats_panel_jumps_closes_and_adds():
     thing it dispatches has to name the seat actually under the pointer.
     """
     assert asyncio.run(_drive_seats()) == []
+
+
+# ---- the scope (#261) -------------------------------------------------------
+#
+# Board data as literals, so this runs wherever textual does: the question is not
+# what the fleet is doing today, it is whether `s` narrows the rows AND drops the
+# column AND leaves the action icons where a click expects them.
+
+SCOPED_BOARD = {
+    "agents": [
+        {"holder": "daedalus/seat-quarterback-1", "repo": "quarterback",
+         "title": "here", "branch": "main"},
+        {"holder": "zeus/amber-otter", "repo": "prisonblues/nix-fleet",
+         "title": "elsewhere", "branch": "main"},
+        {"holder": "zeus/hazel-dune", "repo": None, "title": "nowhere", "branch": None},
+    ],
+    "claims": [
+        {"holder": "daedalus/one", "kind": "issue", "key": "prisonblues/quarterback#261"},
+        {"holder": "zeus/two", "kind": "issue", "key": "prisonblues/nix-fleet#3"},
+    ],
+}
+
+SCOPED_PLAN = [
+    {"item_id": "a", "repo": "prisonblues/quarterback", "title": "ours",
+     "ref": {"kind": "issue", "value": "261"}, "blocked_by": [], "claim": None},
+    {"item_id": "b", "repo": "prisonblues/nix-fleet", "title": "theirs",
+     "ref": None, "blocked_by": [], "claim": None},
+]
+
+
+def _text(widget) -> str:
+    """The plain text of a one-line Static, across textual versions.
+
+    `renderable` on 0.x/1.x, `content` on 8.x — and this suite is run by whatever
+    `uv --extra tui` resolves, so it pins the assertion rather than the version.
+    """
+    for attr in ("content", "renderable", "_renderable"):
+        if (value := getattr(widget, attr, None)) is not None:
+            return str(value)
+    return str(widget.render())
+
+
+def _titles(app) -> dict[str, str]:
+    """The panel headings, which are where a narrowed panel admits it narrowed."""
+    return {name: _text(app.query_one(f"#t_{name}")) for name in ("fleet", "claims", "plan")}
+
+
+def _cells(table, row: int) -> list[str]:
+    return [str(c) for c in table.get_row_at(row)]
+
+
+async def _drive_scope() -> list[str]:
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    # Every fetch off: this test is about how the client READS an answer, and the
+    # answer is a literal above. A live refresh landing mid-assert would repaint
+    # the tables from whatever the fleet happens to be doing.
+    app.refresh_limits = lambda: None
+    app.refresh_seats = lambda: None
+    app.refresh_board = lambda: None
+    app.refresh_plan = lambda: None
+    app.refresh_prs = lambda: None
+    app.refresh_issues = lambda: None
+
+    failures: list[str] = []
+    async with app.run_test(size=(80, 44)) as pilot:
+        # on_mount sets cfg from the board when there is one; there need not be.
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_board(SCOPED_BOARD)
+        app.render_plan(SCOPED_PLAN, None)
+        await pilot.pause()
+
+        fleet, claims, plan = (app.query_one(f"#{n}") for n in ("fleet", "claims", "plan"))
+        titles = _titles(app)
+
+        # NARROW: this project's rows, the unattributable row kept, no repo cell.
+        # Asserted on the `what` cell, which is the one the dropped column widened.
+        shown = sorted(_cells(fleet, i)[2] for i in range(fleet.row_count))
+        if shown != ["? nowhere", "here"]:
+            failures.append(f"narrow FLEET holds {shown}, not this repo's row and the "
+                            "one the board could not attribute — marked, because the "
+                            "cell that used to say so is the cell this view drops")
+        if len(fleet.columns) != 4:
+            failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 4")
+        if "1 elsewhere" not in titles["fleet"]:
+            failures.append(f"narrow FLEET does not say what it hid: {titles['fleet']!r}")
+        if "1 elsewhere" not in titles["claims"]:
+            failures.append(f"narrow CLAIMED does not say what it hid: {titles['claims']!r}")
+        if "1 elsewhere" not in titles["plan"]:
+            failures.append(f"narrow PLANS does not say what it hid: {titles['plan']!r}")
+        if claims.row_count and _cells(claims, 0)[1] != "#261":
+            failures.append(f"the claim key still carries its repo: {_cells(claims, 0)}")
+        if "quarterback" not in _text(app.query_one("#head")):
+            failures.append("the header does not name the scope it is showing")
+
+        # The icons a click acts on must not have moved with the column that went.
+        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
+            failures.append(f"the ⚒ moved out of column {app.FIX_COLUMN}: {_cells(plan, 0)}")
+
+        await pilot.press("s")
+        await pilot.pause()
+
+        fleet, claims = app.query_one("#fleet"), app.query_one("#claims")
+        titles = _titles(app)
+        if fleet.row_count != 3:
+            failures.append(f"the wide view holds {fleet.row_count} agents, not 3")
+        if len(fleet.columns) != 5:
+            failures.append(f"the wide view has {len(fleet.columns)} columns, not 5")
+        if "elsewhere" in titles["fleet"] or "elsewhere" in titles["plan"]:
+            failures.append(f"the wide view still claims to hide rows: {titles}")
+        if claims.row_count != 2 or _cells(claims, 0)[1] != "quarterback#261":
+            failures.append(f"the wide view's claims read {[_cells(claims, i) for i in range(claims.row_count)]}")
+        if "all repos" not in _text(app.query_one("#head")):
+            failures.append("the header does not say the pane went wide")
+        wide_rows = [_cells(fleet, i) for i in range(fleet.row_count)]
+        if any(cell.startswith("? ") for row in wide_rows for cell in row):
+            failures.append(f"the wide view still marks an unattributed row: {wide_rows}")
+        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
+            failures.append(f"the ⚒ moved when the column came back: {_cells(plan, 0)}")
+
+        await pilot.press("s")                     # and back, from cache
+        await pilot.pause()
+        if app.query_one("#fleet").row_count != 2:
+            failures.append("narrowing again did not redraw from what the client had")
+
+    return failures
+
+
+def test_the_scope_narrows_the_rows_and_drops_the_column_together():
+    """#261: one keypress, both halves.
+
+    Narrowing without dropping the column leaves the waste in place; dropping it
+    without narrowing leaves rows whose repo nothing states. And each panel has to
+    say what it hid — a filtered pane that reads like the whole fleet is worse
+    than an unfiltered one, because it is the same picture with fewer facts.
+    """
+    assert asyncio.run(_drive_scope()) == []
+
+
+def test_a_guard_that_cannot_tell_which_repo_it_is_in_refuses(monkeypatch):
+    """The one click on this pane that cannot be taken back, and the guard on it.
+
+    `repo_slug` returns None for any checkout whose remote is not `origin` — the
+    fork case this feature's slug comparison was written for — and reading that as
+    "nothing to check" turned the guard off for EVERY row while `gh` and
+    `git push` went on resolving a default remote of their own. A review would
+    still have commented on, and pushed a fix commit to, whatever PR wore that
+    number there.
+    """
+    app_module = _load_app()
+    app = app_module.Dash.__new__(app_module.Dash)          # no screen, no board
+    app.repo, app.repo_slug = "/somewhere", None
+    assert app.wrong_repo("prisonblues/quarterback", "PR #1") is not None
+    assert app.wrong_repo(None, "PR #1") is None, "a row naming no repo is not a mismatch"
+
+    app.repo_slug = "PrisonBlues/quarterback"
+    # Case-folded, like every other repo comparison here: `gh` reports GitHub's
+    # canonical casing and the origin URL carries whatever was typed.
+    assert app.wrong_repo("prisonblues/quarterback", "PR #1") is None
+    assert app.wrong_repo("someone/else", "PR #1") is not None
+
+
+async def _drive_icons() -> list[str]:
+    """The ⚖ and the ⚒ on a row this dashboard cannot act on."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO, "someone/else"]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    failures: list[str] = []
+    async with app.run_test(size=(90, 44)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.repo_slug = qd.REPO                            # what this checkout is
+        app.render_prs([{"number": 1, "title": "ours", "repo": qd.REPO,
+                         "isDraft": False, "statusCheckRollup": []},
+                        {"number": 2, "title": "theirs", "repo": "someone/else",
+                         "isDraft": False, "statusCheckRollup": []}], None)
+        app.render_issues([{"number": 3, "title": "ours", "repo": qd.REPO},
+                           {"number": 4, "title": "theirs", "repo": "someone/else"}], None)
+        await pilot.pause()
+
+        for table_id, column in (("#prs", app.PANEL_COLUMN), ("#issues", app.FIX_COLUMN)):
+            table = app.query_one(table_id)
+            styles = {}
+            for row in range(table.row_count):
+                cells = table.get_row_at(row)
+                number = next(str(c).lstrip("#") for c in cells
+                              if str(c).startswith("#"))
+                styles[number] = str(getattr(cells[column], "style", ""))
+            ours, theirs = ("1", "2") if table_id == "#prs" else ("3", "4")
+            if "cyan" not in styles.get(ours, ""):
+                failures.append(f"{table_id}: this repo's icon is not live ({styles})")
+            if "cyan" in styles.get(theirs, ""):
+                failures.append(f"{table_id}: another repo's icon still looks "
+                                f"clickable ({styles})")
+    return failures
+
+
+def test_an_icon_this_dashboard_cannot_act_on_says_so_before_the_click():
+    """Dimmed, not merely refused afterwards.
+
+    A bright ⚖ on a row from a repo this checkout is not is the same "drawn
+    takeable, refused one by one" the scope work exists to end — and the README
+    promises the icon itself says so.
+    """
+    assert asyncio.run(_drive_icons()) == []
 
 
 async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[str]]:

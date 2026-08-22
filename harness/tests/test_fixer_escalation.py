@@ -189,6 +189,28 @@ _STEP_REFERENCE = re.compile(
 _PREMISE_CHECK_SECTION = "The premise check (`--ask`)"
 
 
+#: Every repo-root path this suite reads, declared in one place.
+#:
+#: It is a *declaration* rather than a summary because `doc` refuses anything absent from it
+#: (below), so a new read cannot be added without adding it here. That is what the sandbox
+#: needs: this suite lives two directories below the files it reads, and
+#: `nix build .#checks.<system>.prose-consistency-tests` runs it against a sandbox holding only
+#: what that check copies in. A read nobody copied in does not FAIL there, it ERRORS on a
+#: missing file — which is how #163 sat unnoticed for a day, and #246 after it, and how this
+#: suite's own ten reads sat erroring inside `worktree-tests` (#251).
+#:
+#: Derived from `FIX_LOOPS` and `ANCHOR_DOCS` rather than relisting their entries, so a rename
+#: there still fails in one place with one message.
+READS = frozenset({
+    *FIX_LOOPS,
+    *ANCHOR_DOCS,
+    PANEL_PY,
+    "harness/loops/README.md",
+    "app/api/reviews.py",
+    "app/models/review.py",
+})
+
+
 @functools.lru_cache(maxsize=None)
 def doc(relpath: str) -> str:
     # Encoding spelled out: these files are prose full of em dashes, and `read_text()` takes the
@@ -198,6 +220,17 @@ def doc(relpath: str) -> str:
     #
     # Cached because the parametrised tests read the same handful of files several times each.
     # A plain speed-up: the module-scoped fixtures below still exist, for the slices they name.
+    # Refused rather than read, if it is not in `READS`. One accessor is the whole reason this
+    # works: every read in this suite comes through here, so this single assertion is what makes
+    # `READS` a complete enumeration rather than a list somebody has to remember to update. The
+    # alternative — parsing this file for its reads, as #182 and #246 must, since theirs are
+    # built inline — cannot chase every way of naming a path and fails silently at the first
+    # idiom it misses. Here there is nothing to chase.
+    assert relpath in READS, (
+        f"{relpath!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
+        f"check does not know to copy it into its sandbox — where this read would error as a "
+        f"FileNotFoundError rather than be asserted. Add it to READS and add an `install` line "
+        f"for it to that check.")
     return (REPO_ROOT / relpath).read_text(encoding="utf-8")
 
 
@@ -428,15 +461,30 @@ def test_the_brief_cites_no_section_of_the_file_it_was_lifted_out_of(brief: str)
         "cannot see. Say what the orchestrator does with the finding, not where that is written")
 
 
+def _fence(escalation: str, flag: str) -> str:
+    """The bash block in step 3a that runs `flag`, as its text.
+
+    Selected by the flag rather than taken as "the first fence", which is what these
+    guards used to do. Step 3a shows TWO invocations since #84 — `--premise` records the
+    premise and counts it, `--ask` puts it to the seats — and "the first fence" silently
+    re-pointed the `--ask` guards at whichever paragraph happened to come first. Same
+    idiom as `test_the_pr_less_premise_check_is_shown_...` below, which has always
+    filtered its fences by flag."""
+    fences = [f for f in re.findall(r"```bash\n(.*?)```", escalation, re.DOTALL)
+              if flag in f]
+    assert len(fences) == 1, (
+        f"step {ESCALATION_STEP} shows {len(fences)} `{flag}` invocations as bash blocks, "
+        "not 1 — these guards read the flags of exactly one")
+    return fences[0]
+
+
 def test_the_premise_check_invocation_resolves(escalation: str):
     """The anchor pointing outwards. Step 3a tells the fixer to put the premise to the seats with
     `panel.py --ask`, and adds "skip silently if the script isn't there" — which turns a wrong
     flag name into a silent no-op, so the one signal step 3a says a fixer cannot self-report
     would simply never be collected. Neither `panel.py` nor the loops README is in the change
     that added this paragraph, so nothing else here says the invocation is real."""
-    fence = re.search(r"```bash\n(.*?)```", escalation, re.DOTALL)
-    assert fence, f"step {ESCALATION_STEP} no longer shows the `--ask` invocation as a bash block"
-    snippet = fence.group(1)
+    snippet = _fence(escalation, "--ask")
     # The path first, because it is what a fixer pastes and the flag check below cannot see it:
     # a wrong path is the same silent no-op as a wrong flag name, by the paragraph's own "skip
     # silently if the script isn't there". Two assertions, because two things can drift — the
@@ -475,9 +523,7 @@ def test_the_premise_is_not_interpolated_into_a_shell_string(escalation: str):
     slash command out of a finding's prose and silently emptied a bullet. So the shown invocation
     has to keep the premise out of the command line, and has to bound the call — a hung ask
     inside a fix pass otherwise outlives the foreground Bash cap and takes the pass with it."""
-    fence = re.search(r"```bash\n(.*?)```", escalation, re.DOTALL)
-    assert fence, f"step {ESCALATION_STEP} no longer shows the `--ask` invocation as a bash block"
-    snippet = fence.group(1)
+    snippet = _fence(escalation, "--ask")
     assert re.search(r"<<\s*'[A-Z]+'", snippet), (
         "the invocation no longer builds the premise in a QUOTED heredoc, so whatever it "
         "substitutes is expanded by the shell first")
@@ -500,6 +546,53 @@ def test_the_premise_is_not_interpolated_into_a_shell_string(escalation: str):
     assert "not run" in normalised(escalation), (
         f"step {ESCALATION_STEP} bounds the ask without saying how a killed run is reported; "
         "'not run' is the verdict slot step 6 already has for it")
+
+
+def test_the_futility_brakes_invocation_resolves_too(escalation: str):
+    """#84's half of step 3a, guarded exactly as the `--ask` half is and for the same
+    reason: the paragraph tells a fixer to read an EXIT CODE, so a mistyped flag is not a
+    visible failure — argparse exits 2, which is neither the 0 that means "write the fix"
+    nor the 4 that means "do not". A wrong flag name would read as neither and be acted on
+    as one of them."""
+    snippet = _fence(escalation, "--premise")
+    invoked = re.search(r"python3\s+(\S*panel\.py)", snippet)
+    assert invoked and invoked.group(1) == PANEL_PY_INSTALLED, (
+        f"step {ESCALATION_STEP}'s `--premise` block does not run {PANEL_PY_INSTALLED!r}, "
+        "so the flags below are checked against a script it does not call")
+    panel_py = doc(PANEL_PY)
+    for flag in sorted(set(re.findall(r"--[a-z][a-z-]+", snippet))):
+        assert f'"{flag}"' in panel_py, (
+            f"step {ESCALATION_STEP} passes {flag}, which {PANEL_PY} does not declare")
+    assert "--premise-file" in snippet, (
+        f"step {ESCALATION_STEP} declares a premise with no register to count it in, which "
+        "panel.py refuses — the brake counts occurrences across a cycle")
+
+
+def test_the_declared_premise_is_not_interpolated_into_a_shell_string_either(
+        escalation: str):
+    """The same hazard, one paragraph up. A premise about code carries backticks and
+    `$(…)`, and this invocation takes the same prose the `--ask` one does."""
+    snippet = _fence(escalation, "--premise")
+    assert re.search(r"<<\s*'[A-Z]+'", snippet), (
+        "the declaration no longer builds the premise in a QUOTED heredoc, so whatever it "
+        "substitutes is expanded by the shell first")
+    given = re.search(r"--premise\s+(\S+)", snippet)
+    assert given and re.fullmatch(r'"\$[A-Za-z_]\w*"', given.group(1)), (
+        f"`--premise` is given {given and given.group(1)!r} rather than a quoted variable "
+        "holding the heredoc's value — anything else puts the premise on the command line")
+
+
+def test_the_fixer_is_told_which_exit_code_means_stop(escalation: str):
+    """The brake's whole output is an exit code, and a brief that shows the command without
+    saying what its codes mean has documented a no-op: an agent that reads the prose and
+    ignores the status writes the second patch anyway."""
+    text = normalised(escalation)
+    assert "exit code" in text, (
+        f"step {ESCALATION_STEP} shows the `--premise` command without telling the fixer to "
+        "read its exit code, which is the only thing it returns")
+    assert "escalate_on.premise_repeated" in text, (
+        f"step {ESCALATION_STEP} does not name the setting that decides when the brake "
+        "fires, so a repo that changed it leaves the brief describing another repo")
 
 
 def test_the_pr_less_premise_check_is_shown_and_is_still_a_valid_invocation():
@@ -679,3 +772,24 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
         f"{name} discusses recording an escalation without naming `deferred` in the same "
         f"paragraph or bullet; the four values it could be naming instead are {sorted(outcomes)}, "
         "and three of them would be wrong")
+
+# ---- the reads this suite declares (#251, #257) ------------------------------
+#
+# The comparison against flake.nix lives in `_prose_sandbox`, which knows every member of the
+# `prose-consistency-tests` check: the converse direction — does the check install anything
+# nothing reads — cannot be asked from inside one member, since a check serving two suites
+# installs files either one alone does not read.
+#
+# What stays here is the half that belongs beside the reads: the declaration, and `doc`'s
+# refusal of anything absent from it.
+
+
+def test_the_reads_are_declared_rather_than_summarised():
+    """`READS` is only worth comparing if it is what the suite actually reads, and `doc`'s
+    refusal is what makes that true. Asserted rather than trusted: it is the mechanism the
+    sandbox comparison rests on, and one `assert` away from being decoration."""
+    with pytest.raises(AssertionError, match="not in READS"):
+        doc("docs/DEPLOY.md")
+    # And the refusal names what to do about it, in both places that need changing.
+    with pytest.raises(AssertionError, match="install"):
+        doc("app/api/nothing_here.py")

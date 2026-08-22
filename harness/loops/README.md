@@ -99,6 +99,106 @@ Two things to know, because this path removes a file that used to be tracked:
   `git rm --cached .harness-rules`, which untracks the file while keeping it on disk,
   where it is now the overlay.
 
+### The third layer: dials the board states and the repo only defaults (#305)
+
+`review_panel.fix_severity_floor` decides which findings a fix pass may touch;
+`round_trigger_floor` decides which ones buy another round. Between them they decide
+what a review costs and what it is worth — and changing either was **a commit on a
+pull request, reviewed by the panel those dials configure.**
+
+That is the wrong shape for a policy knob, and here is what it cost: this repo's
+`.harness-rules.sample` stated both floors at P2 while every round of the five run on
+PR #299 put P4 findings in `to_fix` with `below_fix_floor` empty, which cannot happen
+under a P2 fix floor. The file that stated the policy and the rounds that applied it
+disagreed for five rounds, four agents and a landed release, because there was no way
+to **ask** what the floor was.
+
+So there is a third layer, applied last:
+
+```
+DEFAULTS  ->  .harness-rules.sample  ->  per-box overlay  ->  the board
+   (a default)      (this repo's default)    (capability)      (the value IN FORCE)
+```
+
+**The repo states a DEFAULT; the board states the value IN FORCE; and the reported
+answer names which layer produced it.** That last clause is what stops this becoming
+a second place a dial is written down (#56's rule) — nothing on the board is
+authoritative on its own, because every resolution reports the layer behind every
+dial.
+
+```bash
+harness_rules.py --dial review_panel.fix_severity_floor
+# review_panel.fix_severity_floor  "P3"  [board] repo — 'trying P3 for a fortnight'
+#                                                  by rich, 2026-09-05T00:00:00+00:00
+
+harness_rules.py --dials      # every dial, its value, and the layer that answered
+harness_rules.py --json       # the same table, as `_dials`
+```
+
+Every reviewed round records it too, in the payload's `rules.dials`, and a round that
+ran under a board dial says so in `config_notes` — which `--post` puts in the public
+PR comment.
+
+**Setting one takes no pull request:**
+
+```bash
+curl -X POST "$QUARTERBACK_BASE_URL/dials" -H "$edge_headers" -d '{
+  "repo": "prisonblues/quarterback",
+  "dial": "review_panel.fix_severity_floor",
+  "value": "P3",
+  "reason": "trying the P3 floor for a fortnight against the deferred backlog",
+  "expires_at": "2026-09-05T00:00:00Z"}'
+```
+
+Four properties, each closing a failure the two file layers have:
+
+- **It expires by itself.** `expires_at` is optional — omit it for a floor you mean
+  to keep — and an expired dial is simply *absent*: a resolution whose dial lapsed and
+  one that never had a dial are indistinguishable, so nothing has to be remembered and
+  cleared.
+- **Reads happen on BOTH paths**, unlike the overlay. The overlay is excluded
+  unattended because it is a file in an untrusted working tree; the board is not in
+  the working tree. Unattended is also the path a budget governor exists to govern
+  (#276).
+- **Writes are human-only.** Reads take any agent's bearer token; `POST /dials` takes
+  the same edge-authenticated human gate the plan's order takes. Anything running while
+  a branch under review is checked out — a test suite, a build step, a git hook — holds
+  this box's machine token, so a machine-writable dial would be the two-ref rule's own
+  hole reopened from the board side.
+- **A repo with no dial behaves exactly as before.** An empty table and an unenrolled
+  host are the same silent answer. A board that is *configured here and will not
+  answer* is a different fact, and is reported rather than swallowed.
+
+**Which dials, and the one boundary case.** The settable set is
+`harness_rules.BOARD_DIALS`, and it is the dials whose value is a judgement about
+**cost** rather than about capability: both floors, `low_severity_fix_lines`,
+`max_fix_growth`, `max_rounds`, `reviewer_scope`, `max_diff_chars`,
+`judge_max_diff_chars`, `judge_model`, `distant_merge_lines` and
+`escalate_on.premise_repeated`. Everything that decides what may be **merged** —
+`auto_merge`, the `epic` and `preland` blocks, title patterns, the loop schedule —
+stays in the sample, for the reason the overlay refuses the same set.
+
+`reviewers.<seat>.enabled` is settable and is the one dial with a direction rule: the
+board **may turn a seat off and may not turn one on.** It is both capability and
+policy, and the board's claim is the policy half only — whether a seat is worth its
+tokens. Nothing on the board knows which CLIs a machine carries, and `panel.py` counts
+a seat that never ran as coverage it did not get, so a board that could enable a seat
+could veto every round's confidence on a box that never had it. Every other dial may
+move **either way**, because raising `fix_severity_floor` from P3 to P2 makes rounds
+cheaper and coverage thinner while lowering it does the reverse: neither direction is
+the safe one, which is exactly why #276's narrow-only throttle rule cannot govern a
+floor.
+
+**The board does not know what a dial IS.** It stores an opaque name and opaque JSON.
+The harness ships the dial table and the server image carries no `harness/` directory,
+so a copy there would be the second-source-of-truth failure arriving from the other
+end. A dial the harness does not recognise, or holds at a value it may not take, is
+**refused and named on stderr at every resolution** — never dropped quietly.
+
+`QUARTERBACK_DIALS` set at all — the empty string included — is the offline switch:
+the variable becomes the whole layer and the board is not consulted. That is what the
+suites use, and what an operator uses when the board is down.
+
 Two conventions the resolver enforces so a rules file can be read like prose:
 
 - **A key starting with `_` is a comment**, at any depth (`"_": "why this seat is
@@ -201,11 +301,14 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.require_mergeable` | Must the branch be able to MERGE before a round is worth running? **true**. GitHub reporting the branch `CONFLICTING` means the merged state the review is implicitly reasoning about does not exist, and the rebase that resolves it changes the diff every finding is about — so the round is refused before any seat is dispatched. It is nearly free: mergeability rides on the PR metadata the panel already fetches, and the same check used to run only at the merge gate (`preland.check_pr_state`), i.e. after a full multi-vendor round and a judge had been spent. `false` reviews conflicted branches and says so in `config_notes`; `--force` is the per-run override. GitHub computes mergeability lazily and answers `UNKNOWN` while it does, so the question is put a second time when the first answer is cold — measured here, three consecutive reads of an open PR gave `UNKNOWN`, `CONFLICTING`, `CONFLICTING`. An `UNKNOWN` that survives both reads is a note and never a refusal. |
 | `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator opens the issue. `false` is the old two-exit behaviour. |
 | `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P3`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. The measured cut is at P2 (67.3% of findings, zero P1s lost) and this deliberately sits a tier below it: severity is model-authored, and the class a P2 floor misses is correctness expressed as craft — a missing regression test on a parser or an auth boundary, a missing timeout or cleanup, a migration rollback gap. Fixing one in a pass already open is one edit; P4 (31.3%, the tier that ballooned #236) stays out. `P4` fixes everything, the pre-#165 behaviour — for `round_stop`'s rules 1 and 3; rule 2's bar is a hardcoded `("P1", "P2")` and only `P1` moves it. A Sonar hard-gate issue is exempt from both floors at every rule. |
 | `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`** — a tier above `fix_severity_floor`, because letting a P3 buy a round costs a whole panel plus another fix pass where fixing it in the open pass costs one edit. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
+| `review_panel.low_severity_fix_lines` | Churned lines the WHOLE round may spend fixing findings below `round_trigger_floor` — at the shipped floors, the P3 band. **40**. Spent cheapest-first and COUNTED (`git diff --numstat` after each fix), never estimated; what it does not reach is reported and recorded exactly like a below-floor finding. The measurement: PR #188's feature was 185 churned lines and two fix passes made it 721 — **74% of the PR was review-response code** — with round 2's fix list 89% below P2, and on #268 85% of round-2 findings were created by the round-1 fix pass. A budget and not a per-fix cap, because #188's round 1 was 408 lines of individually reasonable small fixes that any per-fix cap waves through; and not a higher floor, because a genuinely cheap correctness-adjacent fix is still worth taking while the pass is open. `0` fixes none of the band (the applied floor becomes the cut, and the report says so); `null` is no budget at all, the pre-#297 unconditional behaviour. While a budget is in force, `round_stop`'s repeat rules are bounded at the cut rather than at the fix floor — an unpaid budgeted finding is outstanding by construction, exactly as a below-floor one is. |
 | `review_panel.max_fix_growth` | Multiple of the cycle's FIRST round's reviewed size that a later round may review before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. |
+| `review_panel.max_fix_growth` | Multiple of its size at the cycle's FIRST round that the PR may grow to before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. **Both ends are whole-PR sizes whatever `round_scope` is** (#298): that dial decides what the reviewers are asked to *look at*, this one asks how big the change has *become*. Measured on the review target it compared one round's fix commit against the cycle's whole-PR starting size, and PR #188 reached 3.90x — 185 → 593 → 721 churned lines — without the guard firing. `pr_chars` in the payload is the number both ends are read from. |
 | `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
 | `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins; this wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
@@ -325,7 +428,7 @@ ratio of `0` turns the feature all the way *on* — every diff with one relocate
 becomes a move), so its note points at `manifest_moves` instead. All three are the
 pre-flight verdict, below.
 
-### Thoroughness against convergence — #165's seven dials
+### Thoroughness against convergence — #165's seven dials, and #297's eighth
 
 The panel had one behaviour and no dials, and the measurement says that behaviour does
 not converge. Across seven PRs panelled on 2026-08-16, the last round of each raised
@@ -337,12 +440,13 @@ deferred-finding overflow.
 
 The severity split of that queue is P1 4.1% / P2 28.6% / P3 36.1% / P4 31.3% — about
 1.2 P1s per PR, roughly what a production generator-verifier loop reports. **The signal
-is calibrated; the 67.3% tail beside it is not.** These seven settings bound the tail.
+is calibrated; the 67.3% tail beside it is not.** These eight settings bound the tail.
 None of them makes the panel look less carefully, and none lowers the bar for what a fix
 round takes on: in scope, everything still gets fixed properly, with a test, and "note
 it and move on" stays forbidden.
 
-The diagnosis they act on, in three parts:
+The diagnosis they act on, in four parts — the fourth measured five days after the
+first three landed:
 
 1. **The panel computed a calibrated severity and the prompts threw it away.**
    `review-pr.md` ranked findings "for the summary table only. All of them get fixed."
@@ -355,13 +459,22 @@ The diagnosis they act on, in three parts:
    again on a new finding at any severity, and from round 2 the thing under review IS the
    previous round's fix → `round_trigger_floor`, with `max_fix_growth` as the backstop for
    the case where the fix pass has already written a second change.
+4. **The fix pass became most of the PR.** Measured again on 2026-08-21, five days after
+   the first three landed: PR #188's 185-line feature came out of two fix passes at 721
+   churned lines — **74% of the PR was review-response code** — and round 2's fix list
+   was 89% below P2. The floor above is a per-FINDING rule and cannot see that: #188's
+   round 1 was 408 lines of individually reasonable small fixes, each of which the floor
+   correctly admitted → `low_severity_fix_lines`, a combined line budget for the band
+   between the two floors, spent cheapest-first and counted rather than estimated. The
+   floor stays at P3 — the argument below for the extra tier is unchanged, and a budget
+   is what that argument was always missing.
 
 `max_rounds` and `require_failing_test` are the two that change nothing on their own:
 the first surfaces an existing constant so a repo can move it, the second reserves the
 name for the evidence contract #165 argues is the real termination condition, and reports
 that it is not built rather than pretending to enforce it.
 
-**Every one of the seven is validated, and a bad value is a hard exit** — the mechanism
+**Every one of the eight is validated, and a bad value is a hard exit** — the mechanism
 and the sentence shape `harness_rules._check_block_shape` already uses, naming the key,
 the value and the accepted set. The line is drawn between an unknown KEY and a malformed
 VALUE of a known one, and it is the line `_check_block_shape` already draws: an
@@ -371,13 +484,16 @@ upgrade at different times does not become a version pin; a value this harness c
 read is not version skew in any direction, it is a typo, and `fix_severity_floor: "p-4"`
 meaning "fix everything" must not quietly become the default and stop the pass fixing
 P3s. Unset — missing, `null`, `""` — is not a mistake and stays silent (and for
-`max_fix_growth` an explicit `null` is the off switch).
+`max_fix_growth` and `low_severity_fix_lines`, both of which distinguish an absent key
+from a written one, an explicit `null` is the off switch).
 
 **What the round applied is in the artifact.** The report carries a
 **Panel dials** line on every round, at the defaults or not, and the
-payload carries `review_panel` with all seven as applied. The orchestrator that briefs
-the fixer builds that brief out of the report, so the policy has to be readable there
-rather than from whoever remembers the repo's config.
+payload carries `review_panel` with all eight as applied, and each finding carries
+`budgeted_fix` beside `below_fix_floor` so a consumer can tell "not this round's work"
+from "this round's work while the budget lasts" without re-deriving either floor. The
+orchestrator that briefs the fixer builds that brief out of the report, so the policy
+has to be readable there rather than from whoever remembers the repo's config.
 
 ### The SonarQube token
 
@@ -803,7 +919,12 @@ rather than the caller's.
 |---|---|---|
 | `run` | the diff fits every seat's ceiling; or no seat declares one; or it is over but under the refusal multiple | exactly what every release before this one did, truncation report included |
 | `manifest` | over a ceiling **and** move-shaped **and** a manifest of it is smaller than *both* the diff and the ceiling | the seats are handed a *manifest* instead of the diff |
-| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+| `refuse` | over a ceiling by `refuse_over_cap_multiple` with no smaller honest question to ask — not move-shaped, or move-shaped with no manifest to substitute; **or** a precondition failed, which today means the branch cannot merge (`require_mergeable`) | nobody is dispatched; the refusal is printed, recorded, and posted under `--post` |
+
+A `refuse` on a **precondition** is the same verdict reached without measuring anything: the
+branch cannot merge, so no ceiling was consulted and none is quoted. It is decided before the seats, and `--force` overrides it through the
+same machinery that overrides a size refusal — leaving `preflight.would_have: refuse` behind, so
+"the tool chose to run" and "a caller overrode the tool" never look alike.
 
 A move-shaped diff over a ceiling therefore has three outcomes, not one. It gets the manifest
 whenever there IS one to substitute; when there is not — `manifest_moves` is off, or the
@@ -1176,6 +1297,30 @@ longer colliding because one stopped *re-reading* a file it still changes.
 > `--baseline`, and never the board. Do not read "the skip payload carries it" as "the
 > board can answer collision queries about a skipped PR"; it cannot.
 
+### A round the board did not take says so (#284)
+
+Recording goes through `qb record-review` and stays **best-effort** — a board that is down
+must never fail a review that already ran. What it is not is silent. `record_run` used to
+open with `if not shutil.which("qb"): return`, and since `qb` ships in the fleet's own repo
+rather than this one, whether a round was recorded depended on a binary from elsewhere being
+on the PATH of whichever box ran the panel. 67 rounds across 30 PRs went missing that way,
+leaving the board holding 39% of this repo's review history with nothing anywhere saying so
+— and every measurement taken from it (the `/panel` leaderboard, per-reviewer precision, the
+dial calibration) computed off a three-day tail nobody knew was a tail.
+
+Three ways to miss, one sentence each: **no `qb` on this host**; **`qb` refused** (no board
+URL, no token, no such subcommand); **`qb` ran and the board did not answer** — that last one
+is invisible to an exit code, because `qb record-review` exits 0 either way and distinguishes
+them on its streams. What `qb` itself said is quoted, capped, so a wrong guess about a program
+in another repo corrects itself in front of the reader.
+
+The sentence lands in **`config_notes`** — which puts it in the payload a fixer is briefed
+from, in the report, and in the `--post` PR comment — and in the `--json-file` on disk,
+because the recording is attempted *before* that file is written. The refusal notice carries
+it too. And it names its own recovery: `--json-file` writes exactly the bytes piped to `qb`,
+so `qb record-review < PAYLOAD.json` from any host with one puts the round on the board
+later. `run_key` makes the replay a join rather than a double-count.
+
 Note that `gh pr view --json` **fails the whole command** on a field it does not recognise
 rather than omitting it, so there is no graceful degradation on an older `gh` — the run
 exits before any review. `panel.py` needs a `gh` carrying `files`, `changedFiles`, `state`
@@ -1188,6 +1333,7 @@ Run-level fields worth knowing about because their meaning is conditional:
 | `scope` | `pr` \| `increment` — what this round actually reviewed. Recorded rather than inferred from the round number, because scope falls back to `pr` whenever the anchor is missing or the range is unusable, so "round 2" does not imply "increment" |
 | `since_sha` | the anchor the increment was taken from; null under `pr` scope |
 | `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
+| `pr_chars` | the size of the **whole PR**, whatever this round reviewed — the same number as `diff_chars` under `pr` scope, and the PR's own size under `increment`. This is the line that does *not* cliff at round 2, and it is what `max_fix_growth` measures at both ends (#298). Under a `manifest` verdict both measure the manifest, which is what was sent |
 | `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`cap_unit`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `cap_unit` is `chars` or `bytes` and says which reading of `shape` the `cap` and the `over_cap` beside it are in — a ratio a consumer cannot attribute to one of the two readings cannot be checked at all. `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
 | `preflight.shape` | measured on the **review target**, so it is scope-dependent exactly as `diff_chars` is: the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it. Under a `manifest` verdict it is also the only place the target's *pre-substitution* size appears, because `diff_chars` then measures the manifest — which is what was reviewed |
 | `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
@@ -1274,6 +1420,7 @@ fixing anything.
 ```bash
 python3 ~/.claude/loops/preland.py --pr 131            # the report
 python3 ~/.claude/loops/preland.py --pr 131 --json     # the payload a loop reads
+python3 ~/.claude/loops/preland.py --pr 131 --require-earned-stop   # for the caller that ran the round
 ```
 
 **May this PR be merged, and if not, what is outstanding.** One answer, three values,
@@ -1307,7 +1454,8 @@ that had written up that exact confusion an hour earlier.
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
 | `ci` | `gh`'s check rollup is red, **pending**, or **empty** — a push restarts CI, so an earlier green is stale, and no checks at all is silence rather than green. |
 | `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
-| `merge_claim` | Another agent holds `kind=merge` on `<repo>:<branch>`. |
+| `merge_claim` | Another agent holds `kind=merge` on `<repo>:<base>` — it is landing onto this PR's base right now. Keyed on the base rather than the head since [#318](https://github.com/prisonblues/quarterback/issues/318): two agents landing two *different* PRs into `main` is the collision worth serialising, and under head keys they never see each other. |
+| `queue` | This PR is not at the head of the merge queue for its base, or is not in the line at all while others are ([#227](https://github.com/prisonblues/quarterback/issues/227)). The reason names the position and who holds the place ahead. An empty line passes silently; a board with no `/merge-queue` reports `skipped-absent`. |
 | `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
 | `sw_version` | `scripts/check_sw_version.py` fails in a way `--fix` cannot repair. A repairable one is RECONCILE. |
 
@@ -1318,10 +1466,20 @@ The `review` clauses are the round's **own statements** — `head_sha`, `stopped
 discovering that merge gates trust proxies (the exit code, then the push, then the
 existence of a payload file), and this must not become the fourth.
 
-`stop_confident: false` is a **warning, not a hold**, deliberately: two permanently-absent
-reviewer seats on a headless box would otherwise make a green verdict unreachable, which is
-the noise-for-signal trade this file already argues against for `coverage_veto`. The vetoes
-are printed with it.
+`stop_confident: false` is a **warning, not a hold** by default, deliberately: two
+permanently-absent reviewer seats on a headless box would otherwise make a green verdict
+unreachable, which is the noise-for-signal trade this file already argues against for
+`coverage_veto`. The vetoes are printed with it.
+
+`--require-earned-stop` makes it a HOLD, and is for the caller that **ran the round itself**
+and is about to offer to land on the strength of it — `/panel-review-pr` §7. There an
+unearned stop is not background noise about somebody else's box: it is this cycle reporting
+that nobody read the whole diff. Which of the two a run is doing is the caller's fact rather
+than something this script can see, so it is a flag rather than a rule, and `checks.review.detail.require_earned_stop`
+records which reading produced the verdict. Either way the vetoes are reported: the flag
+changes what the verdict IS, never what the reader is told. A `stop_confident` the board
+recorded as **null** is not an unearned stop under either reading — null is a question
+nobody answered, and the caller that ran the round has its own payload to answer it from.
 
 **Capability detection, and its two exceptions.** Repo-local guardrails are detected — a
 repo without `scripts/migration_reconcile.py` records `skipped-absent` and moves on, which
@@ -1352,8 +1510,11 @@ deliberately off.
 **A check that did not run is still reported** — `skipped-absent`, `skipped-disabled`, or
 `skipped-flag` for `--skip` — because a payload must never read clean by omission.
 
-**It is read-only and takes no claim.** It reports commands and never runs them; it reads
-`kind=merge` claims and never takes one. That belongs to whatever does the merging
+**It is read-only and takes no claim, and it does not enqueue either.** It reports commands
+and never runs them; it reads `kind=merge` claims and the merge queue and writes to neither.
+Joining the line is the landing loop's job (`/fix-and-land` §4), and it has to be: a verdict
+that enqueued could not be run twice, could not run as a CI check, and would put a PR in a
+line on behalf of whoever was merely asking a question about it. That belongs to whatever does the merging
 ([#100](https://github.com/prisonblues/quarterback/issues/100)) — a verdict that mutates
 cannot run as a CI check, cannot be re-run to verify itself, and cannot be asked twice by a
 loop that wants to know whether its own fix worked. The single write is `git fetch` of the
@@ -1382,6 +1543,17 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
   `systemd.user.{services,timers}.coding-loops` in `home/rich-workstation.nix`
   (ExecStart → `%h/.claude/loops/run-loop.sh`, `OnUnitActiveSec=10min`,
   `Persistent=false`). Activate with a `rebuild`.
+- **`systemd/qb-reconcile.{service,timer}`** — reference spec too, and the odd one out in
+  this directory: the program it runs is `qb-reconcile` from `bin/`, not a loop. It is here
+  because this is where the harness's reference units live and one place for them beats two.
+  Report-only with **no `--execute` to graduate to** — the pass never edits the plan — so the
+  only cutover decision is whether to keep `--post`, which posts only when the report's
+  content has changed since the last post. Like the lander's, the service carries no
+  `[Install]`: the timer is what starts it, and enabling the oneshot would also run it at
+  every login. `OnUnitActiveSec=15min`,
+  `SuccessExitStatus=0 1` so a partial run (rate-limited `gh`, a board mid-deploy) stays out
+  of the failed state while a genuine "could not run" still goes red. See
+  [../README.md](../README.md#qb-reconcile--does-the-plan-still-describe-the-present).
 
 **Cutover to acting:** keep the timer report-only, watch a few daily logs, hand-run one
 `lander.py --execute` on a single PR, *then* set `LOOPS_EXECUTE=1` in the service env.

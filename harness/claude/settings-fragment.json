@@ -1,0 +1,31 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Task",
+        "hooks": [ { "type": "command", "command": "@QB_HOOK@ PreToolUse" } ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [ { "type": "command", "command": "@QB_HOOK@ PostToolUse" } ]
+      }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "@QB_HOOK@ SessionStart" } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "@QB_HOOK@ UserPromptSubmit" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "@QB_HOOK@ Stop" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "@QB_HOOK@ SessionEnd" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "@QB_HOOK@ Notification" } ] }
+    ]
+  }
+}

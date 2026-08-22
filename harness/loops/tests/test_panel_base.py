@@ -7,23 +7,29 @@ claim is only true relative to a base.
 
 **Two fields, because the obvious one field cannot do the job, and that is what
 most of this file exists to pin.** #98 proposed stamping GitHub's `baseRefOid`
-and comparing it later against the PR's current `baseRefOid`. That field is the
-*merge base*: GitHub recomputes it when the head branch is pushed and never when
-the base branch advances, because a common ancestor is not moved by commits
+and comparing it later against the PR's current `baseRefOid`. That field tracks
+the *fork point*: GitHub recomputes it when the head branch is pushed and never
+when the base branch advances, because a common ancestor is not moved by commits
 added to one side of it. Measured on this repo — PR #87 held `88643c14` across
 ten commits of `main`, and `git merge-base` against the moved `main` agreed with
 it afterwards. So a check resting on it alone answers "unmoved, the review still
 stands" in precisely the case it exists to catch.
 
+**And it does not even track the fork point reliably**, which is #241 and the
+second half of this file: `baseRefOid` is a field GitHub maintains for its own
+purposes, measured both older and newer than the true merge base on this repo.
+So the two ends below are now BOTH asked for as what they are.
+
 The two ends therefore mean different things and are never derived from each
 other:
 
-* `merge_base` — the PR's base commit. `gh pr diff` is the three-dot diff, so a
-  whole-PR round reads `merge_base...head_sha`. Free off metadata `run()`
-  already fetches. Moves only when the branch acts. It is the PR's anchor and
-  not always the round's — under v2.28's increment scope the target is
-  `since_sha...head_sha` — which is why nothing here asserts it IS what the
-  seats read, only that it is recorded and distinct.
+* `merge_base` — where the branch FORKED, computed by asking for a merge base
+  (#241). It was `baseRefOid` off the metadata read until that field was measured
+  wrong in both directions, which is the second half of this file. Moves only
+  when the branch acts. It is the PR's anchor and not always the round's — under
+  v2.28's increment scope the target is `since_sha...head_sha` — which is why
+  nothing here asserts it IS what the seats read, only that it is recorded and
+  distinct.
 * `base_sha` — the base branch's tip at review time. Costs its own lookup, and
   is the only end a staleness check can rest on.
 
@@ -138,24 +144,30 @@ CFG = {"github": "acme/board", "path": "/tmp/repo",
 
 
 def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
-         base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=UNSET):
+         base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=UNSET,
+         fork_point=UNSET):
     """One panel run with every subprocess replaced, so what is under test is the
     payload rather than any CLI. `base_tip` is the raw body the ref call returns,
     so a test can make that one call fail without touching the others.
 
+    `merge_base` is what GitHub STORES for the PR (`baseRefOid`) and `fork_point`
+    is what the compare API answers for the real merge base; they agree unless a
+    test separates them, which is #241's defect.
+
     `moves_to` makes the head move mid-round — the race the re-read exists for —
-    and `merge_base_after` is what the re-read then answers, so the moved-head
-    path can be driven through `run()` rather than only at the helper (128-F03).
-    The three reads are told apart by their `--json` field list: the opening
-    metadata read asks for many fields, `_head_sha_now` asks for `headRefOid`
-    alone and `_merge_base_now` for `baseRefOid` alone."""
+    and `merge_base_after` is what the fork-point read then answers, so the
+    moved-head path can be driven through `run()` rather than only at the helper
+    (128-F03). The reads are told apart by what they ask for: the opening
+    metadata read is a `--json` field list, `_head_sha_now` asks for `headRefOid`
+    alone, and `_merge_base_now` is a compare call with its own `--jq`."""
     # conftest.gh_stub knows every `gh` call panel.py makes, so this module no
     # longer has to. That is the point of it: the base-tip read below landed with
     # only one module's stub swept, and 48 tests in five others spent hours
     # emitting a note about a failure that never happened (128-F09).
     calls = []
     fake_sh = gh_stub(meta=pr_meta(title=title, head="aaa111", merge_base=merge_base),
-                      merge_base=merge_base, merge_base_after=merge_base_after,
+                      merge_base=merge_base, fork_point=fork_point,
+                      merge_base_after=merge_base_after,
                       head_moves_to=moves_to, base_tip=base_tip,
                       diff=PR_DIFF, calls=calls)
 
@@ -200,7 +212,7 @@ def test_an_unreadable_base_tip_costs_the_field_and_says_so(monkeypatch, tmp_pat
     payload, _ = _run(monkeypatch, tmp_path,
                       base_tip=subprocess.CalledProcessError(1, "gh"))
     assert payload["base_sha"] is None
-    assert payload["merge_base"] == "0ddba5e0", "the free end is unaffected"
+    assert payload["merge_base"] == "0ddba5e0", "the other end is unaffected"
     assert any("could not be read" in n for n in payload["config_notes"])
 
 
@@ -226,67 +238,159 @@ def test_the_two_ends_disagreeing_raises_no_warning(monkeypatch, tmp_path):
 def test_a_skipped_round_keeps_the_free_end_and_buys_nothing(monkeypatch, tmp_path):
     """The skip path exists to be cheap: it fetches no diff and is never recorded
     on the board, so a base tip stamped there would cost an API round trip for a
-    value with no consumer. It keeps `merge_base`, which is already in hand."""
+    value with no consumer. It keeps GitHub's stored base, which is already in
+    hand off the metadata read.
+
+    The fork-point read (#241) is held to the same bargain, and it is a newer
+    call than this test: it is worth an API round trip on a round that is about
+    to spend four seats and a judge, and worth nothing at all on one that returns
+    without reading a line."""
     payload, calls = _run(monkeypatch, tmp_path, title="Merge main into feat/x")
     assert payload["reviewed"] is False
     assert payload["merge_base"] == "0ddba5e0"
     assert payload["base_sha"] is None
-    assert not any("/git/ref/heads/" in a[2] for a in calls if a[:2] == ["gh", "api"])
+    api = [a[2] for a in calls if a[:2] == ["gh", "api"]]
+    assert not any("/git/ref/heads/" in p for p in api)
+    assert not any("/compare/" in p for p in api)
+
+
+# ----------------------------------- GitHub's stored base is not a merge base
+#
+# #241. `gh pr diff` builds its three-dot diff from `baseRefOid`, the base GitHub
+# has STORED for the PR, and that field is maintained for GitHub's purposes
+# rather than as a merge base. On PR #187 a commit shared with another PR landed
+# on `main` and nothing recomputed it, so the diff carried already-landed code
+# and a full round returned 15 judge-confirmed findings about it — with
+# `config_notes: []` and nothing anywhere in the payload saying the target was
+# wrong. It was caught by a peer noticing the diff looked smaller than GitHub
+# advertised.
+#
+# The load-bearing part of the fix is not the recorded field. It is that a
+# mis-scoped round must not be SILENT.
+# --------------------------------------------------------------------------
+
+def test_the_recorded_base_is_the_fork_point_not_githubs_stored_one(
+        monkeypatch, tmp_path):
+    """The stored base can be wrong in either direction — older than the fork
+    point on #187, newer on #270, where it was the tip of `main` and named a
+    commit the branch had never contained. Both follow from treating the two as
+    the same thing, so the recorded value comes from a merge base or from
+    nowhere."""
+    payload, _ = _run(monkeypatch, tmp_path,
+                      merge_base="e08372ae", fork_point="e38c1020")
+    assert payload["merge_base"] == "e38c1020"
+
+
+def test_a_stale_stored_base_is_named_in_config_notes(monkeypatch, tmp_path):
+    """The whole complaint. A round whose target was built against the wrong base
+    has to say so, name both commits, and give the reader the range to check a
+    finding against — because the next step of the cycle briefs a fixer to
+    resolve every confirmed finding without re-deriving it."""
+    payload, _ = _run(monkeypatch, tmp_path,
+                      merge_base="e08372ae", fork_point="e38c1020")
+    said = [n for n in payload["config_notes"] if "MIS-SCOPED" in n]
+    assert len(said) == 1, payload["config_notes"]
+    assert "e08372ae" in said[0] and "e38c1020" in said[0]
+    assert "gh pr diff" in said[0], "a reader has to be told which base was used"
+
+
+def test_a_stored_base_that_agrees_raises_no_note(monkeypatch, tmp_path):
+    """The ordinary state of a PR nobody's base moved under. A note that fires on
+    every run is a note that gets trained away, and this one has to be legible
+    when it fires."""
+    payload, _ = _run(monkeypatch, tmp_path,
+                      merge_base="0ddba5e0", fork_point="0ddba5e0")
+    assert payload["merge_base"] == "0ddba5e0"
+    assert not any("MIS-SCOPED" in n for n in payload["config_notes"])
+
+
+def test_an_unreadable_fork_point_falls_back_and_says_which_base_it_used(
+        monkeypatch, tmp_path):
+    """Best-effort like every other stamp here — the round completes — but a
+    fallback nobody is told about is the silent mis-scoping this issue is about.
+    So the note names the base that was actually recorded and warns that it is
+    not a merge base."""
+    payload, _ = _run(monkeypatch, tmp_path,
+                      merge_base="e08372ae", fork_point=None)
+    assert payload["merge_base"] == "e08372ae"
+    said = " ".join(payload["config_notes"])
+    assert "merge base could not be computed" in said
+    assert "e08372ae" in said and "not a merge base" in said
+
+
+def test_neither_base_available_records_neither_and_says_so(monkeypatch, tmp_path):
+    """A `gh` that answered no `baseRefOid` AND a compare that could not be read.
+    Naming a commit that never existed is what 128-F11 was filed over, so this
+    path claims nothing."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base=None, fork_point=None)
+    assert payload["merge_base"] is None
+    assert any("neither end of its base" in n for n in payload["config_notes"])
 
 
 # ------------------------------- the head moving takes the merge base with it
 
-def test_merge_base_is_re_read_when_the_head_moves(monkeypatch):
-    """Round 1 of #128's panel: `head_sha` was re-stamped when the head moved
-    mid-round while `merge_base` kept the value GitHub computed for the commit it
-    replaced — so the recorded pair was a range no round ever reviewed.
-
-    It is not a corner case here. GitHub recomputes `baseRefOid` on every push to
-    the head branch, and the usual reason a head moves on this repo is a merge of
-    the base branch INTO the PR (~1.8 integration merges per PR landed, #80),
-    which is exactly the push that moves it. The stored range would then begin
-    before an integration merge that its right end contains."""
+def test_the_merge_base_is_asked_for_as_a_merge_base(monkeypatch):
+    """#241. This helper used to answer `gh pr view --json baseRefOid`, which is
+    GitHub's STORED base and not a merge base — measured wrong in both directions
+    on this repo, older than the fork point on PR #187 and newer on PR #270. The
+    field it asks for is the whole of the fix, so the field is what is asserted."""
     seen = []
 
     def fake(args, **kw):
         seen.append(args)
-        return json.dumps({"baseRefOid": "bbbbbbbb2222"})
+        return "bbbbbbbb2222\n"
 
     monkeypatch.setattr(panel_core, "sh", fake)
-    assert panel._merge_base_now("acme/board", 128) == "bbbbbbbb2222"
-    assert any("baseRefOid" in " ".join(a) for a in seen), \
-        "asked GitHub for the wrong field"
+    assert panel._merge_base_now("acme/board", "main", "aaa111") == "bbbbbbbb2222"
+    asked = " ".join(seen[0])
+    assert "baseRefOid" not in asked, "asked GitHub for its stored base, not a merge base"
+    assert "/compare/main...aaa111" in asked and panel._MERGE_BASE_JQ in asked
 
 
-def test_the_merge_base_re_read_is_bounded_like_its_siblings(monkeypatch):
+def test_the_merge_base_read_is_bounded_like_its_siblings(monkeypatch):
     """On the critical path of a round, for a stamp nothing gates on. A hung `gh`
     must not be able to stall the panel."""
     seen = {}
 
     def fake(args, **kw):
         seen.update(kw)
-        return json.dumps({"baseRefOid": "b" * 12})
+        return "b" * 12
 
     monkeypatch.setattr(panel_core, "sh", fake)
-    panel._merge_base_now("acme/board", 128)
+    panel._merge_base_now("acme/board", "main", "aaa111")
     assert seen.get("timeout") == panel.FIX_RANGE_TIMEOUT_S
 
 
-def test_every_way_the_merge_base_re_read_can_fail_is_a_None(monkeypatch):
+def test_every_way_the_merge_base_read_can_fail_is_a_None(monkeypatch):
     """Same surface as its siblings, and the same reason: `sh` runs with
     `check=True`, so a missing binary is a FileNotFoundError rather than a
     CalledProcessError. A None here means "could not tell", and the caller says
     so in `config_notes` rather than pairing two ends that do not belong
-    together."""
+    together.
+
+    The last two are the shapes `--jq` makes possible and JSON parsing did not:
+    it prints a string RAW, so a missing field arrives as the four truthy
+    characters `null` and a changed response as arbitrary prose. Either would be
+    recorded as a commit id by a reader that only checked for emptiness."""
     for exc in (subprocess.CalledProcessError(1, "gh"),
                 FileNotFoundError("gh"),
                 subprocess.TimeoutExpired("gh", 60)):
         monkeypatch.setattr(panel_core, "sh", _sh_raising(exc))
-        assert panel._merge_base_now("acme/board", 128) is None, exc
-    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: "not json")
-    assert panel._merge_base_now("acme/board", 128) is None
-    monkeypatch.setattr(panel_core, "sh", lambda *a, **k: json.dumps({}))
-    assert panel._merge_base_now("acme/board", 128) is None
+        assert panel._merge_base_now("acme/board", "main", "aaa111") is None, exc
+    for body in ("", "null\n", "not a sha\n", "zzzzzzzzzz\n"):
+        monkeypatch.setattr(panel_core, "sh", _sh_returning(body))
+        assert panel._merge_base_now("acme/board", "main", "aaa111") is None, body
+
+
+def test_a_merge_base_with_an_end_missing_is_not_asked_for(monkeypatch):
+    """`compare/main...` is a different endpoint, not a merge base. A PR whose
+    head or base could not be read has no range to ask about, and the call is
+    skipped rather than sent and mis-parsed."""
+    monkeypatch.setattr(panel_core, "sh", _sh_raising(
+        AssertionError("no call should have been made")))
+    assert panel._merge_base_now("acme/board", "main", "") is None
+    assert panel._merge_base_now("acme/board", "", "aaa111") is None
+    assert panel._merge_base_now("", "main", "aaa111") is None
 
 
 # --------------------------------------------------------------------------

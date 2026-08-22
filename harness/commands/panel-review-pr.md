@@ -1,6 +1,6 @@
 # Panel Review and Fix PR
 
-@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge + SonarCloud hard gate) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. Merging stays opt-in.
+@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge + SonarCloud hard gate) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. It ends by running the pre-land gate and offering to land only on READY; merging stays opt-in.
 @arguments $ARGS: [pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 2 rounds)
 
 You are the **ORCHESTRATOR**. This is `/review-pr` with the panel as the
@@ -153,7 +153,9 @@ payload is marked `reviewed: false`), so exit 0 always means the file is there.
 - `refuse` — no seat was dispatched (`reviewed: false`, with `skip_reason`). **Stop
   the cycle here.** Do NOT go to §4: a fix pass briefed with zero findings from a
   round nobody ran is a fixer told the PR is clean. Relay the panel's reason and
-  the remedies it named — split the PR, raise the cap for a seat that can take it,
+  the remedies it named — for an oversized diff: split the PR, raise the cap for a
+  seat that can take it, or re-run with `--force`; for a branch that cannot merge
+  (`require_mergeable`, #271): rebase and re-run, turn the dial off for this repo,
   or re-run with `--force` — and let the user choose. Never add `--force` on your
   own initiative; the refusal is the panel's decision about a diff it measured, and
   overriding it unasked is exactly the failure the check was built to stop.
@@ -195,11 +197,14 @@ like a full panel.
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.
   It says which severity floor the fixer is being briefed to, what buys another round,
-  whether the fixer may defer, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
   depends on it, and it is the only place the round's policy is written down where
   you can see it (#165).
 - **To fix** — the master-confirmed findings the fix round is asked to clear (any
-  reviewer count, at or above the round's `fix_severity_floor`).
+  reviewer count, at or above the round's `fix_severity_floor`). The ones marked 💸
+  are below `round_trigger_floor` and share the round's `low_severity_fix_lines`
+  budget rather than being unconditional (#297); the note under the heading states
+  the number and the rule.
 - **Reported, not this round's work** — the master-confirmed findings BELOW that
   floor, marked 🔽. Present only where the floor left something under it. These are
   recorded and relayed and **never pasted into the fixer's brief**; §4b says what
@@ -264,10 +269,16 @@ with these overrides:
   permission to fix whatever the pass noticed, three lines from the instruction that
   establishes the floor — an open route back to fixing everything, and it bit hardest
   for precisely the P3/P4 items the floor exists to hold back.
+- **Paste the 💸 marks with the findings that carry them, and the budget with the
+  list.** The marks are how the fixer tells a budgeted finding from an unconditional
+  one, and a **To fix** list pasted without them briefs the pre-#297 behaviour: every
+  low-severity finding unconditional, which is the 408-line round-1 fix pass this
+  budget exists to stop. Copy the note under the heading verbatim — it carries the
+  line count and the spend rule.
 - **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
   itself in worktree mode and must not guess: state `fix_severity_floor`,
-  `reviewer_scope` and `fixer_may_defer` from the panel report's **Panel dials**
-  line, in the brief, as the values in force. The brief's own opening asks for them
+  `low_severity_fix_lines`, `reviewer_scope` and `fixer_may_defer` from the panel
+  report's **Panel dials** line, in the brief, as the values in force. The brief's own opening asks for them
   by name, and a fixer left to guess reverts to "fix everything you find, anywhere",
   which is the behaviour these settings exist to bound.
 - **Parallel fixes apply here too.** A panel list is typically longer than a
@@ -303,11 +314,11 @@ judge-confirmed P2s were plainly wrong — the `installPhase` it said enumerated
 three scripts does `install -m 0755 bin/*` and globs — and they are still in the
 board as confirmed.
 
-**`qb record-outcome` ships in nix-fleet and is not in force until a
-home-manager rebuild** (it is nix-fleet PR #19). Until then the verb exits 2 with
-a usage line; record the outcomes once it lands rather than dropping them, and
-say in the relay that they are outstanding — an outcome nobody records is the
-gap this whole feature exists to close.
+**`qb record-outcome` ships in this repo** (`harness/bin/qb`, as of #230) and is on PATH
+wherever the harness is — but a host still running an older `qb` from somewhere else has a
+verb that exits 2 with a usage line. If that happens, record the outcomes after the rebuild
+rather than dropping them, and say in the relay that they are outstanding — an outcome nobody
+records is the gap this whole feature exists to close.
 
 **Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
 fixer reports the ID it was given (`236-F01`, exactly as the report prints it in
@@ -353,7 +364,9 @@ One of four per finding:
   `review_panel.fixer_may_defer` — the defect is real and outside what this change is
   for, with the two justifying lines in its summary's `Deferred` block. (2) The
   panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
-  fixer's brief at all; one issue for the batch is fine and usually right, since
+  fixer's brief at all — or it was marked 💸 and the round's `low_severity_fix_lines`
+  budget ran out before it, which is the same row for the same reason (#297); one
+  issue for the batch is fine and usually right, since
   filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
   **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
@@ -425,7 +438,9 @@ Three consequences worth knowing when you read the result:
 
 - **`diff_chars` is the increment, not the PR.** It drops sharply at round 2 and
   that is the feature working, not the PR shrinking. `scope` in the payload says
-  which it is; `context_chars` is the context prepared alongside it.
+  which it is; `context_chars` is the context prepared alongside it, and `pr_chars`
+  is the whole PR's size on every round whatever its scope — that is the one to read
+  for "how big has this change become", and the one `max_fix_growth` measures (#298).
 - **The target shrinks; the bill mostly does not.** A round still sends its target
   plus its context, so do not read a small `diff_chars` as a cheap round. What the
   scoping buys is where the reviewer's attention goes, and — when a budget is set —
@@ -437,6 +452,38 @@ Three consequences worth knowing when you read the result:
   there. `scope: "pr"` on a round 2 is that, and it means the round cost what it
   always used to. The same list carries the caveats on a round that WAS scoped: a
   rebase between the rounds, or a merge commit inside the range.
+
+### When the range between the rounds is an integration (#278)
+
+An integration moves the head, and a moved head used to invalidate the round that
+preceded it outright — so merging `origin/main` into a branch to clear a stale base
+cost a whole panel cycle across every seat, whatever the merge contained. It no
+longer does. **The order is not applied blindly: what decides it is how much of the
+merge is genuinely new material to this PR.** The measurement is `git diff` between
+the commit the round read and the merge result, restricted to the files this PR
+touches, counted in changed lines, against `review_panel.distant_merge_lines`
+(default **20**; `0` admits only an empty resolution, `null` restores the old flat
+behaviour where any head move is a review of earlier code).
+
+Whenever the range carries a merge commit, the round says which reading it took, in
+`config_notes`. Read it — the two are different claims about coverage and you must
+never have to infer which happened:
+
+- **`round N follows an integration and takes the DISTANT reading`** — the merge
+  touched nothing this PR touches and the resolution was trivial or absent, so
+  **the earlier round STANDS**. Nothing is being claimed as reviewed that was not:
+  the merged code is not this PR's change and is not what the findings are about.
+  A round was not required on that merge's account, and `preland`'s `review` check
+  says the same thing as a WARNING rather than a HOLD.
+- **`round N follows an integration and takes the INVOLVED reading`** — a real
+  resolution in code this PR also touches. That resolution is unreviewed work and
+  it gets reviewed — **only that part**, which is what the increment already is
+  when it is pointed at the range between the round and the merge. `preland` HOLDs
+  until a round has read it.
+
+A range with **no** merge commit in it is never distant, whatever its size: that is
+a push, not an integration, and unreviewed work of this PR's own kind holds at any
+size. So does a range that could not be measured at all.
 
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
@@ -455,6 +502,79 @@ no with complete confidence):
   returned nothing parseable or declared a gap; the cap ran out; or the round had
   no baseline to compare against. The `veto` list says which. Report it as a stop,
   never as "clean".
+
+**Before a `stop: false` becomes another fix pass, declare the premise that pass
+will rest on.** This is the futility brake (#84), and it is yours to run — not the
+fixer's — because you are the only reader with both rounds in front of you, which
+is the same reason the *Match it by premise, not by key* rule below is yours. Every
+round from 2 on, before you go back to §4:
+
+```
+python3 ~/.claude/loops/panel.py --premise "<one sentence: what this fix pass assumes>" \
+    --pr <pr> --round <r> --premise-file /tmp/tmp.AbC123/premises.json \
+    --premise-for <each finding key the premise explains>
+```
+
+One register per PR, in the same `mktemp -d` directory as the payloads, and pass
+that path to §4's brief so the fixer can declare against the same file. It costs
+nothing — no seats, no diff, no judge, no vendor call — so it runs on every fix
+pass rather than on the ones you suspect.
+
+**Build the premise with a quoted heredoc**, exactly as `review-pr.md` step 3a
+does and for its reason: a premise about code carries backticks and `$(…)`, and
+inside a double-quoted argument bash executes them while a `$VAR` expands to
+empty and declares a premise you did not write.
+
+**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is the
+brake: `review_panel.escalate_on.premise_repeated` (default `2`) says a fix has
+already been written against this premise once in this cycle, and **the second one
+is not to be written**. Do not launch §4. The findings that premise explains become
+escalations under the `--escalated` rule below — relay them, open the premise
+issue, and stop the cycle. The command prints the `--escalated` keys for the round you are recording
+against.
+
+**Why it is here and not at the end of a round.** The cap bounds cost; this bounds
+futility — it stops when the rounds have stopped being about *different things*. On
+PR #299 (2026-08-21) rounds 1, 2 and 3 each found the previous round's fix reopening
+one hole, patched three ways — merge parents, then same-named refs, then a local
+branch — and the premise underneath all three, *that a local repository can say
+where a release number LANDED*, was named at round 3 by a human. 39 of the 53
+findings after round 1 were introduced by the previous fix pass; round 2 was 17 of
+17. Evaluated at the end of a round instead, the brake would have fired one fix
+pass and one whole panel later — which is exactly the round the rule exists to save.
+
+**Pass `--premise-file` to the ROUND as well**, on the same path. The round reads
+the register (it never writes it) and the payload then says which premises repeated
+and which fix passes declared none:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --premise-file /tmp/tmp.AbC123/premises.json \
+    --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
+    --json-file /tmp/tmp.AbC123/r<r>.json
+```
+
+A premise declared twice that reaches a round anyway ends the cycle there: it takes
+a veto line, `confident` is false, and `round_stop.reason` names the premise. That
+is the late half of the same brake — worse than stopping before the fix, better than
+the cap.
+
+**An undeclared fix pass is unescalatable, and the report says so.** If a round's
+`config_notes` says the fix pass after round N declared no premise, that is a gap in
+the record and not a clean one: nothing could have braked that pass, and a cycle
+nobody could brake reads exactly like a cycle that did not need braking. Say which
+it was in the relay.
+
+**The honest limit.** The brake counts DECLARATIONS, and comparing declarations is
+all it does — it does not infer a premise from the findings, deliberately (#84: "the
+cheap version is to have the fixer declare the premise and compare declarations …
+treat an undeclared fix as unescalatable rather than pretending to infer"). Two
+consequences you carry, not the loop: the same premise stated through two different
+proxies — `rc == 0` one round, an artefact's existence the next — shares almost no
+words and is counted as two premises, so **state the premise, never the proxy**; and
+on #299 the fixers escalated zero times across five rounds, so a brake waiting for
+someone to volunteer a declaration would not have fired either. Running it every
+round is what makes the count real.
 
 **An escalation ends the fix half of the cycle for that finding — tell the loop,
 with `--escalated`.** Pass the key on the round you learn of it — the fixer gave you
@@ -595,7 +715,8 @@ Then the part that is new, and is the point of running more than one round:
   round.
 - **Was the stop earned?** If `confident` is false, say so in those words and
   list the vetoes. A reader must never have to infer that a "no new findings"
-  round had a reviewer reading half the diff.
+  round had a reviewer reading half the diff. This is not only a line in the
+  relay: §7 blocks the offer to land on it.
 - **Coverage:** per reviewer, anything it declared it could not assess, and any
   reviewer the panel truncated (with the budget that cut it). If reviewers
   disagreed — one clean, one "could not assess X" — say so, and give the master's
@@ -603,6 +724,17 @@ Then the part that is new, and is the point of running more than one round:
   than either verdict on its own.
 - **Flagged for re-review:** findings whose reporter said the FIX needs re-reading,
   and whether the following round did find something there.
+- **Wall clock:** each round's `timing` block, one line per round: the round's
+  total, how it split across `setup` / `seats` / `judge` / `wrapup`, which seat was
+  slowest, and `gated_ms` — how long the round sat on that one seat with every
+  other seat finished and its findings undelivered. Then the fix phase between the
+  rounds, from `timing.fix`. Say `source` with it: `payload` is measured end to
+  end, `commits` is a lower bound derived from the two rounds' head commit times,
+  and a `null` with a note is not a fast fix phase, it is an unmeasured one.
+  Report the numbers; do not act on them here. **This cycle is where the evidence
+  for or against "the fixer is the slow part" is produced** (#192), and until
+  several cycles have produced it the answer is a hunch — the panel's own hunch
+  had the judge and the gating wait folded into a phase nobody had measured.
 - **Escalated:** any finding a fixer reported as the approach being wrong rather
   than the code, with its premise, what it explains, what removing it would cost,
   and its `--ask` verdict if one was run. Say it even when the answer is none. This
@@ -612,28 +744,204 @@ Then the part that is new, and is the point of running more than one round:
   and then record the finding `deferred` with that issue in `deferred_to` (§4b),
   which is the step §4b deferred to here.
 
-## 7. Merging (only if the user asks)
+## 7. The pre-land verdict, and the offer to land
 
-Run the gate first. This step used to be one line with nothing in front of it,
-and the PR that exposed that (#131) was merged on `mergeable` + CI-green over its
-own panel round — 8 P1s and 12 P2s outstanding at the moment it landed, on
-`main`, for three hours, two of them auth-shaped.
+**This step runs at the end of every cycle, not only when the user asks to
+merge.** The rounds you just ran computed whether this PR is in a landable state;
+stopping without saying so throws that away and leaves the user to know to ask.
+So: run the gate, report its verdict whatever it is, and offer to land **only on
+READY**.
+
+This step used to be one line with nothing in front of it, and the PR that exposed
+that (#131) was merged on `mergeable` + CI-green over its own panel round — 8 P1s
+and 12 P2s outstanding at the moment it landed, on `main`, for three hours, two of
+them auth-shaped.
 
 ```bash
-python3 ~/.claude/loops/preland.py --pr <pr>
+python3 ~/.claude/loops/preland.py --pr <pr> --require-earned-stop --json
 ```
 
 If that path does not exist, the box's `~/.claude/loops` predates the script — run
-`python3 harness/loops/preland.py --pr <pr> --repo .` from a checkout instead. A
-missing gate is not a passed one.
+`python3 harness/loops/preland.py --pr <pr> --repo . --require-earned-stop --json`
+from a checkout instead. A missing gate is not a passed one, and "the gate would
+not run, so I offered" is this step's failure arriving through the step itself.
 
-- **HOLD (exit 2)** — do not merge, whatever was asked for. Show the user
-  `reasons` and let them decide with them in front of them; someone asking for a
-  merge is asking for the merge they think they are getting.
-- **RECONCILE (exit 3)** — mechanical work is outstanding and this skill does not
-  do it. `/fix-and-land` §4 does, or a human does.
-- **READY (exit 0)** — `gh pr merge --merge --delete-branch`; preserve commits,
-  never squash.
+`--json` because you are going to read `verdict`, `reasons`, `actions`,
+`warnings` and `checks` out of it rather than paraphrase a report. **The verdict
+is the decision** — act on it, and never substitute your own reading of the same
+facts for it. A READY you talk yourself past and a HOLD you talk yourself through
+are the same failure in two directions.
+
+`--require-earned-stop` is what wires §5's `confident` into the landing decision.
+An unearned stop — a reviewer read a prefix of the diff, never ran, returned
+nothing parseable, or the round cap ran out — is a HOLD input in its own right,
+and without the flag preland reports it as a warning for a human to weigh, which
+on this path is nobody. The flag is not the default because a headless box with
+two permanently-absent seats could never reach a green verdict; here the round is
+one **you just ran**, so an unearned stop is this cycle saying nobody read the
+whole diff, and an offer to land resting on that is an offer resting on nothing.
+
+**Cross-check it against the round payload you already have.** Read
+`jq '.round_stop.confident' /tmp/tmp.AbC123/r<r>.json` from the last round of §5.
+If that is `false`, do not offer — whatever the gate said. The gate reads the
+round **as the board recorded it**, and a board that never took the round, or an
+API too old to store the field, leaves `stop_confident` null rather than false;
+null is not a stop that was earned, it is a question nobody answered. Two sources
+disagreeing is itself worth a line in the report.
+
+### READY — offer, and say what the offer rests on
+
+State, before the offer and in this order:
+
+- **What was checked.** Name the checks from `checks` and their statuses,
+  including any that read `skipped-flag` or `skipped-disabled` — a gate that
+  passed with `review` turned off is a materially weaker claim than one that
+  passed with it on, and the verdict alone cannot tell them apart.
+- **Which round the gate ruled on**: `checks.review.detail` gives the round
+  number, its cycle, and the head it read.
+- **What moved since the review.** `checks.review.detail.head_sha` against the
+  payload's top-level `head_sha`: equal means the round read exactly this commit
+  and nothing has been pushed since. If they differ the gate has already HELD, so
+  on a READY the honest sentence is that nothing moved — say it, because "the
+  review is of this code" is the thing the reader most needs and cannot see.
+- **Anything in `warnings`.** A READY with warnings is still a READY; a READY
+  reported as though it had none is a different PR from the one on screen.
+
+- **Whether the release entry is ready to be numbered.** preland has no check for
+  this and never returns RECONCILE for it, so it is asked here or it is not asked:
+
+  ```bash
+  python3 scripts/release_stamp.py preflight
+  ```
+
+  `preflight` asks the question and spends nothing — it does not stamp. That is
+  deliberate. `apply` resolves the placeholder against the base **as it stands
+  now**, so a number taken here could be taken by another branch while the user
+  is deciding, and the repair for that is a hand-edit. It is stamped in the merge
+  sequence below, once there is a yes. Forgetting it entirely is issue #168: two
+  of the last three releases landed unstamped and needed repair PRs (#289, #291),
+  which is why it is in the sentence the offer is made with.
+
+Then **offer, and stop**. `Land it?` — and wait for an answer. A verdict is not
+consent: the user asked for a review, and the merge is a second decision that is
+theirs. Do not merge because READY looks like permission.
+
+### RECONCILE — do the mechanical work, re-verify, then offer
+
+`actions` holds the exact commands and the files each one touches. Run them **in
+order, verbatim**, commit what they produce (they deliberately do not commit for
+you), and push. Those commits are mechanical — a `down_revision` line, a version
+counter, a generated merge migration — so they go to no fixer and need no brief,
+which is what makes this path something the skill may take on its own rather than
+hand back.
+
+**Do only what is mechanical, and nothing that is not.** Never override the
+reconciler's choice of action: relink versus merge turns on guards you are not
+re-deciding. If an action needs a judgement — a `git merge` that conflicts
+anywhere that is not mechanically obvious — that is where this path ends. Report
+it as unresolved and do not offer. Resolving product code by guess is the
+judgement this loop must not make on its own.
+
+**Then re-anchor the review, and only then run the gate again.** That push moved
+the head past the round §5 read, and preland gates on the round having read *this*
+commit — so a gate run straight after it HOLDs on `head_sha`, correctly, and no
+amount of re-running clears it. What clears it is a round at the new head: §5's
+command again at `--round <r+1>`, with every earlier round still passed as
+`--baseline`. Raise `--max-rounds` if the cap is already spent, and if you will
+not, say so and offer nothing.
+
+That round will normally be dry, and it is not there to find anything. It is
+there because a mechanical commit is still a commit no round has read, and this
+file's whole argument is that a fix nobody re-reviewed is a fix nobody reviewed.
+It is affordable here for the same reason §5 is: this skill already runs rounds,
+which is what makes the RECONCILE path available to it and not to a loop that
+reviews once.
+
+Then run the gate, with the same flags, and let it decide. Re-running it is not
+optional either — the push restarted CI, so the earlier green is a statement about
+a commit that is no longer the head. If it comes back READY, continue at the READY
+branch above, and report this as what it is: a RECONCILE that was reconciled,
+naming what you ran and the round that re-read it, rather than as a PR that was
+READY all along.
+
+### HOLD — do not offer
+
+Report `reasons` **verbatim**, every one of them, and stop. No offer, no
+"shall I merge anyway", not even if the user asked for a merge at the top of the
+run: someone asking for a merge is asking for the merge they think they are
+getting, and the reasons are what tells them which one this is. Then say what
+would clear each one and who has to do it.
+
+Do **not** clear a HOLD by re-running with the offending check turned off.
+`--skip` and `.harness-rules` exist for repos that genuinely lack a guardrail, not
+for a verdict you dislike.
+
+### Merging, once the user has said yes
+
+Claim the base, re-verify, stamp the release, merge. In that order:
+
+```bash
+qb-claim branch <base> --ttl 1800 --note "landing PR #<pr>" --json  # exit 1 = held
+python3 ~/.claude/loops/preland.py --pr <pr> --require-earned-stop --json \
+    --claim-holder "<the holder from that answer>"                 # must be READY
+python3 scripts/changelog_fragments.py assemble
+python3 scripts/release_stamp.py apply --onto origin/<base>
+git diff --stat                                                    # read this before committing
+git add -A CHANGELOG.md README.md changelog.d
+git commit -m "chore(release): stamp vNEXT" && git push
+gh pr merge <pr> --merge --delete-branch
+```
+
+- **`--ttl 1800`, not the board's hour.** Keying on the base widened what a leaked claim costs —
+  it blocks every merge onto that base rather than one branch's — and the TTL is the only backstop
+  if this session ends between the claim and the merge. Half an hour is well past any land.
+- **The branch claimed is `<base>`, not `<branch>`** — the branch being landed
+  ONTO. #318: two agents landing two *different* PRs into `main` hold
+  `<repo>:feat/a` and `<repo>:feat/b` under a head key, never see each other, and
+  both merge, which is the incident the claim was written for. The base is what a
+  simultaneous merge collides on, and it is what `preland.py`'s `merge_claim`
+  check reads, so `--claim-holder` below only excludes your own claim if the two
+  name the same key.
+- **`qb-claim` exit 1** means another agent is already landing onto this base.
+  Stop and say who holds it; two agents accepting the same offer at the same
+  moment is what the claim exists to prevent, and it is the only thing between
+  them. Exit 2 is "cannot tell" — a board outage, a rotated token — and whether to
+  land without the serialisation is the user's call, so ask rather than deciding
+  for them.
+- **Re-run the gate after claiming**, because time passed between the offer and
+  the yes: CI can have gone red and the head can have moved. `--claim-holder`
+  takes the `holder` field out of `qb-claim --json`, so your own claim is not read
+  as somebody else's. Anything but READY here ends the sequence: report the new
+  verdict, and say that you hold the claim and did not merge, so nobody reads a
+  live claim as a landing in progress. It carries a TTL and lapses on its own.
+- **The release entry, then its number, in that order and no other.** A fragment
+  names no version, so there is nothing for `apply` to rewrite until `assemble`
+  has built the entry; run it the other way round and `apply` sees a branch with
+  no placeholder, returns 0, and the fragments land unassembled with the release
+  silently unnumbered. Both are noops on a branch that ships no release, so run
+  them rather than guessing whether this one does. Exit 2 from either is a
+  refusal carrying the sentence that repairs it — read the message rather than
+  matching it against a list of causes.
+- **That commit is the last thing before the merge, and it is bounded.** Pushing
+  it moves the head past the round §5 read, so a gate run after it would HOLD on
+  `head_sha` — correctly, and about a commit two tools wrote rather than about the
+  PR. The RECONCILE path answers that by re-anchoring with another round; this one
+  cannot, because it is the terminal action and there is nothing after it to
+  verify. So the verification is the run *above* it, and what makes that sound is
+  a bound: read `git diff --stat` before committing and confirm that what moved is
+  `CHANGELOG.md`, `README.md` and the fragments those two tools consumed, and
+  nothing else — which is also why the commit stages those paths by name rather
+  than with `-a`. If anything else moved, that is not a mechanical commit: stop,
+  say so, and put it back through §4.
+- **If the PR was in the merge queue, stand its entry down once the merge lands**:
+  `merge_queue_leave(pr=<pr>, base="<base>", reason="merged")`. This command does not enqueue —
+  `/fix-and-land` does — so there is usually nothing to leave, and the call is a no-op that says
+  `left: false` rather than an error. But a PR this session merged on somebody else's behalf
+  leaves every PR behind it in the line correctly waiting for a land that already happened, and
+  any agent may retire any entry precisely so that whoever notices can fix it.
+- **`--merge`, never `--squash`.** Preserve the commits: the fix commits and the
+  rounds that reviewed them are the record of this cycle, and a squash throws away
+  the correspondence between them.
 
 **The rounds you just ran are an input to that verdict, not a substitute for it.**
 preland reads the round the panel *recorded on the board*, so a round that never

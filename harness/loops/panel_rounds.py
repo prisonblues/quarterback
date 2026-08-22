@@ -25,6 +25,9 @@ import panel_scope               # noqa: F401
 # have been a claim about another module's current contents rather than a property
 # of this file.
 from collections.abc import Iterable          # noqa: E402
+# Named here for the same reason, and used by exactly one check: a baseline's
+# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
+import math                                   # noqa: E402
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -754,6 +757,29 @@ class Baseline:
     #: see above — and the briefs name that round to the reviewers, so it has to
     #: travel with the sha rather than being guessed from this run's round number.
     head_round: int | None = None
+    #: When the LATEST prior round that recorded one FINISHED, as epoch seconds
+    #: (#192). The left-hand end of the fix phase: this round's own start is the
+    #: right-hand end, and the span between them is the fixer, the verification
+    #: and the push together — the half of a cycle's wall clock that nothing
+    #: measured at all.
+    #:
+    #: Read with the same "latest round that SUPPLIED one" rule as ``head_sha``
+    #: directly above, and for the same reason: a newer round written by an older
+    #: panel names no finish, and taking the last payload alone would clear an
+    #: answer an earlier one gave. An older left-hand end over-states the fix
+    #: phase (it spans a round as well), which is why the payload also carries
+    #: ``finished_round`` — an over-stated span whose ends are named is checkable,
+    #: and a missing one is not.
+    #:
+    #: None for a payload written before the field existed, which is not an
+    #: error: :func:`panel_timing.fix_phase` falls back to deriving the span from
+    #: the two rounds' head commit times, and says which source it used.
+    finished_at: float | None = None
+    #: Which round supplied ``finished_at``. Travels with it for the reason
+    #: ``head_round`` travels with ``head_sha``: the pair is quoted in the report,
+    #: and a span whose earlier end came from round 1 while round 2 also ran is a
+    #: different measurement from one whose ends are adjacent.
+    finished_round: int | None = None
     #: Earlier rounds that recorded a head but produced no reviewer read at all —
     #: a title-skipped round, or one whose every seat failed. The anchor advances
     #: over them (a skipped round still moved the head), so a scoped round after
@@ -806,25 +832,38 @@ class Baseline:
     #: the loop is trusting a report by the same agent whose fix pass produced
     #: it. Earliest wins on a merge, for the same reason the cycle id does.
     escalated: dict[str, int] = field(default_factory=dict)
-    #: ``(round, chars, scope)`` of the EARLIEST accepted baseline — the denominator
-    #: `review_panel.max_fix_growth` measures this round against (#165).
+    #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
+    #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
     #: The earliest, not the latest, and the round number travels with it because the
-    #: question the ceiling asks is "how much bigger is what we are reviewing now than
-    #: what this cycle STARTED from". Measured against the previous round instead, a
-    #: fix pass could triple the change three rounds running and clear the check every
-    #: time.
+    #: question the ceiling asks is "how much bigger is the change now than what this
+    #: cycle STARTED from". Measured against the previous round instead, a fix pass
+    #: could triple the change three rounds running and clear the check every time.
     #:
-    #: The scope travels too, and it is not decoration: ``diff_chars`` is
-    #: scope-dependent (see the payload's own comment on it), so under the default
-    #: `increment` scope this is round 1's whole-PR size against a later round's fix
-    #: commit, and under ``pr`` scope it is two whole-PR sizes. Both readings are worth
-    #: stopping for and they are different sentences, so whatever reports a ratio has
-    #: to be able to say which one it computed.
+    #: **A WHOLE-PR size, whatever that round REVIEWED (#298).** ``round_scope``
+    #: decides what the reviewers are asked to LOOK AT; this ceiling asks how big the
+    #: change has BECOME, and the second must not silently change meaning because the
+    #: first was configured. So the size is read off the payload's ``pr_chars``, which
+    #: every round records regardless of its scope, and off ``diff_chars`` only where
+    #: the baseline's own ``scope`` is ``pr`` and the two are the same number
+    #: (:func:`_whole_pr_chars`). Taking ``diff_chars`` unconditionally — as this did
+    #: until #298 — put a whole PR on one end and, under the default `increment`
+    #: scope, one round's fix commit on the other. That is a real quantity and not the
+    #: one that runs away: PR #188 went 185 -> 593 -> 721 churned lines, 3.90x under a
+    #: 3.0x ceiling, while its round-2 increment was 128 lines and nowhere near it.
+    #: The guard never fired.
     #:
-    #: None where no baseline was usable, or where the earliest one records no size —
-    #: a payload written before `diff_chars` existed, or a round that reviewed nothing.
-    #: The check then does not run, and says so rather than inventing a denominator.
+    #: The measurement still travels with the number, because two readings of a size
+    #: exist in this payload and whatever reports a ratio has to be able to say which
+    #: one it computed. It is the whole-PR one on both ends now by construction rather
+    #: than by luck, and printing it is what makes that checkable from the report
+    #: instead of from this comment.
+    #:
+    #: None where no baseline was usable, or where the earliest one records no
+    #: whole-PR size — a payload written before `diff_chars` existed, a round that
+    #: reviewed nothing, or an increment-scoped round written before `pr_chars`, whose
+    #: `diff_chars` is a fix commit and cannot stand in for the PR. The check then
+    #: does not run, and says so rather than inventing a denominator.
     first_reviewed: tuple[int, int, str] | None = None
     problems: list[str] = field(default_factory=list)
 
@@ -891,6 +930,40 @@ def _mtime(path: str) -> float:
         return os.path.getmtime(path)
     except OSError:
         return 0.0
+
+
+def _positive_int(value: object) -> int | None:
+    """A size a payload can be believed about, or None.
+
+    Read defensively and dropped rather than coerced, on `load_baseline`'s standing
+    rule that a bad payload costs a `problems` entry and never the review: a size
+    that is not a positive int cannot be a denominator (0 divides, a bool is an int
+    in Python, a float arrives from a hand-edited file)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _whole_pr_chars(payload: dict) -> int | None:
+    """How big the PR was when an earlier round read it, or None where that round's
+    payload cannot say.
+
+    The growth ceiling's denominator (#298), and deliberately NOT ``diff_chars``
+    wherever the two differ. ``diff_chars`` is the size of what a round REVIEWED, so
+    under `increment` scope it is one fix commit — and a cycle whose starting size is
+    a fix commit is measuring the wrong thing at the wrong end. ``pr_chars`` is the
+    PR's own size on every round whatever its scope, which is the single question
+    `max_fix_growth` asks.
+
+    ``diff_chars`` is still read where the baseline's own ``scope`` says it IS the
+    whole PR, which is the fallback for payloads written before ``pr_chars`` existed
+    — round 1 of a cycle is `pr`-scoped by construction (there is nothing yet to be
+    an increment from), so the ordinary cycle keeps its denominator across the
+    upgrade. An increment-scoped payload from before then carries no whole-PR size at
+    all and gets None: inventing one out of its increment is the bug this closes."""
+    return _positive_int(payload.get("pr_chars")) or (
+        _positive_int(payload.get("diff_chars"))
+        if str(payload.get("scope") or "pr") == "pr" else None)
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -1292,6 +1365,35 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                                   "rather than attributing against whatever that names")
                 continue
             b.head_sha, b.head_round = sha, was
+        # The fix phase's earlier end (#192), on its own pass rather than folded
+        # into the loop above: a round can record a head and no finish (a payload
+        # from before the field) or a finish and no head (a round whose PR read
+        # failed after the clock started), and pairing them would let either
+        # absence discard the other's answer. Same "latest that supplied one"
+        # rule; same reason.
+        for was, path, payload in ordered:
+            when = (payload.get("timing") or {}).get("finished_at")
+            if when is None:
+                continue
+            # Validated rather than trusted, like `head_sha` beside it. A string,
+            # a bool (an `int` subclass, so `True` would read as 1970) or a
+            # negative reading is not a wall-clock instant, and the span computed
+            # from one would be reported as a fix phase — a number that looks
+            # measured and is not, which is the failure #192 is about.
+            # `math.isfinite` as well as the range check: Python's `json`
+            # parses a bare `Infinity`, which passes `> 0` and then dates the
+            # previous round to the end of time — a fix phase computed from it is
+            # a negative infinity, and the skew branch is not where that belongs.
+            # NaN fails `> 0` already and needs no separate term.
+            ok = (isinstance(when, (int, float)) and not isinstance(when, bool)
+                  and math.isfinite(when) and when > 0)
+            if not ok:
+                b.problems.append(
+                    f"baseline {path} records a finish time of {when!r}, which is not a "
+                    "wall-clock instant — the fix phase before this round was NOT "
+                    "measured from it")
+                continue
+            b.finished_at, b.finished_round = float(when), was
         # Coverage, unlike the anchor, is a property of the LAST round alone: it is
         # what that round could not read, and an older round's list describes a
         # different diff at a different budget.
@@ -1308,17 +1410,18 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         b.unread_files = {f for f in unread if f and isinstance(f, str)}
         b.read_nothing = not latest.get("reviewed")
         # The growth denominator, off the EARLIEST accepted round — `ordered` is
-        # sorted by round, so its head. Read defensively and dropped rather than
-        # coerced, on this function's standing rule that a bad payload costs a
-        # `problems` entry and never the review: a size that is not a positive int
-        # cannot be a denominator (0 divides, a bool is an int in Python, a float
-        # arrives from a hand-edited file), and a missing one is the ordinary case for
-        # a round that reviewed nothing or a payload older than the field.
+        # sorted by round, so its head. A WHOLE-PR size and never that round's review
+        # target (#298): see `first_reviewed`, and :func:`_whole_pr_chars` for which
+        # field supplies it. `None` is the ordinary case for a round that reviewed
+        # nothing or a payload older than the field, and the check simply does not run.
         first_round, _first_path, first = ordered[0]
-        chars = first.get("diff_chars")
-        if (isinstance(chars, int) and not isinstance(chars, bool) and chars > 0
-                and first.get("reviewed")):
-            b.first_reviewed = (first_round, chars, str(first.get("scope") or "pr"))
+        chars = _whole_pr_chars(first)
+        if chars is not None and first.get("reviewed"):
+            # `"pr"` because that is what was just read, not because the label is
+            # decorative: both ends of this ratio are whole-PR sizes now, and the
+            # report prints the measurement so a reader can check that rather than
+            # take it on trust.
+            b.first_reviewed = (first_round, chars, "pr")
     return b
 
 
@@ -1444,12 +1547,447 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     return out
 
 
+# ------------------------------------------------------------- #84's futility brake
+#
+# The round cap bounds COST: N rounds and stop, whatever is happening. This bounds
+# FUTILITY — stop when the rounds have stopped being about different things.
+#
+# **The measurement (#84, and PR #299 on 2026-08-21).** Five rounds on one PR.
+# Rounds 1, 2 and 3 each found the PREVIOUS round's fix reopening the same hole,
+# patched three different ways — merge parents (`_merged_in()`), then same-named
+# refs (`_inherited`/`_fresher_bases`), then a purely local branch — and the
+# premise underneath all three, *that a local repository can say where a release
+# number LANDED*, was named only at round 3, by the orchestrating human, and the
+# answer to it was to delete the machinery. Measured across that cycle, **39 of
+# the 53 findings after round 1 were introduced by the previous fix pass, and
+# round 2 was 17 out of 17.** Nothing mechanical stopped it. The cap could not
+# have: the cap was the thing the cycle was still short of.
+#
+# **The rule**, #84's, stated as a count of OCCURRENCES rather than of rounds: the
+# second time a fix is written against a premise the previous round invalidated,
+# stop. Not the third. Which is why the brake is evaluated when a fix is
+# **proposed** — :func:`declare_premise`, through `panel.py --premise`, before the
+# fix pass runs — and not when a round completes. End-of-round is one whole fix
+# pass and one whole panel too late, and #84's own words for it are "that is too
+# late, and PR #62 is the measurement".
+#
+# **What it deliberately does NOT do.** It does not infer a premise from the
+# findings. Same-premise detection is not a string match: #62's three proxies were
+# `rc == 0`, an artefact's existence, and a head SHA moving — textually unrelated,
+# and identical in what they assumed. #84 says to start with the declaration and
+# "treat an undeclared fix as unescalatable rather than pretending to infer", so
+# the fixer DECLARES its premise (`review-pr.md` step 3a) and declarations are the
+# only thing compared. A fix pass that declared nothing cannot be braked, and that
+# is REPORTED (`undeclared_rounds`) rather than passed over: a cycle nobody could
+# have braked is a different claim from a cycle that did not need braking, and the
+# second is what silence would assert.
+#
+# **The honest limit, which is the same one `escalated` carries and is not closed
+# here.** A declaration is a claim by the agent whose fix pass is about to be
+# written. Across #299's five rounds the fixers escalated ZERO times — the premise
+# was named by the human orchestrator — so a brake that waits for a fixer to
+# volunteer would not have fired that day either. What this adds is the COUNT and
+# the STOP, which is the half that was missing; what makes the declaration happen
+# is prose in two briefs, and prose is what it is. The register is the audit trail
+# that makes the claim checkable afterwards, and the round cap still binds.
+
+#: `review_panel.escalate_on` read from where it is declared and documented, rather
+#: than spelled a second time here (`panel_ask.ASK_DEFAULTS`'s precedent, and for
+#: its reason: a default changed in the file that documents it would otherwise go
+#: on being ignored by the file that applies it).
+ESCALATE_ON_DEFAULTS = harness_rules.DEFAULTS["review_panel"]["escalate_on"]
+
+#: #78's other two reserved matters. A repo that writes one is TOLD it is recorded
+#: and not enforced, on `require_failing_test`'s precedent — a governance switch
+#: believed to be on and quietly off is the loudest possible way to make a process
+#: look governed.
+ESCALATE_ON_UNBUILT = ("quorum_failed", "judge_absent")
+
+#: Exit code for "a premise was declared for the Nth time and N reached the dial".
+#: Its own code, not 1: the caller has to be able to tell the brake FIRING from the
+#: command failing to run, and both are non-zero. 2 is argparse's usage error and 3
+#: is :data:`panel_core.UNWRITTEN_PAYLOAD_EXIT`.
+PREMISE_REPEATED_EXIT = 4
+
+#: The register's shape, so a future one can be told from a hand-written file.
+PREMISE_REGISTER_VERSION = 1
+
+
+def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
+    """`review_panel.escalate_on.premise_repeated` — the occurrence a declared
+    premise is stopped ON, or ``None`` for "do not brake".
+
+    Read per KEY rather than per block, so a repo that writes `escalate_on` at all
+    still gets the shipped default for the matters it did not mention. `review_panel`
+    is merged one level deep (`harness_rules._DEEP_BLOCKS`), so a written
+    `escalate_on` REPLACES the default object wholesale; without the per-key
+    fallback, `{"quorum_failed": true}` would silently switch the brake off.
+
+    A malformed value is a HARD EXIT through :func:`panel_seats._refuse_value`, the
+    same line the other dials draw between an unknown KEY (warned about and dropped
+    — it may be a setting only a newer harness knows) and a malformed value of a
+    known one (a typo, and applying the default anyway runs the cycle under a policy
+    the file did not ask for). ``1`` is refused with the rest: it would escalate the
+    FIRST time any premise was declared, which is not a repeat and would make every
+    declaration a stop — the fastest way to teach a fixer never to declare one."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return None                                   # unreachable
+    for key in ESCALATE_ON_UNBUILT:
+        if rules.get(key):
+            notes.append(
+                f"`escalate_on.{key}` is recorded and NOT enforced — #78 reserves the "
+                "name, and nothing implements it yet; only `premise_repeated` brakes "
+                "anything today")
+    want = rules.get("premise_repeated", ESCALATE_ON_DEFAULTS.get("premise_repeated"))
+    if want is None or want is False or want == "":
+        return None
+    n = None
+    if isinstance(want, bool):
+        n = None
+    elif isinstance(want, int):
+        n = want
+    elif isinstance(want, float) and want.is_integer():
+        n = int(want)
+    elif isinstance(want, str):
+        try:
+            n = int(want.strip())
+        except ValueError:
+            n = None
+    if n is None or n < 2:
+        _refuse_value("escalate_on.premise_repeated", want,
+                      "a whole number of OCCURRENCES >= 2 (2 means 'the second time'), "
+                      "or null to switch the brake off — 1 would escalate the first "
+                      "time any premise was declared, which is not a repeat")
+    return n
+
+
+def premise_key(text: str) -> str:
+    """A stable identity for a premise a fixer DECLARED, from its own words.
+
+    :func:`_key_from_title`'s recipe applied to prose, and deliberately the same
+    shape (16 hex characters) so a register is readable beside the finding keys it
+    sits next to — but its own namespace, because a premise and a finding are not
+    the same kind of thing and a collision between the two would be unreadable.
+
+    Exact on the NORMALISED text (:func:`_norm_title`: words only, lower-cased),
+    which is what a re-declaration has to match. The near-miss is
+    :func:`same_premise`, and it is a separate step on purpose — this one is the
+    identity the register stores, and an identity that moved when a word did could
+    not be stored at all."""
+    norm = _norm_title(text)
+    if not norm:
+        return ""
+    return hashlib.md5(f"premise|{norm}".encode(),
+                       usedforsecurity=False).hexdigest()[:16]
+
+
+def same_premise(a: str, b: str) -> bool:
+    """Are two DECLARED premises the same premise, restated?
+
+    The rule :meth:`Baseline.raised_before` already uses for a reworded finding
+    title — a high character ratio as the cheap pre-filter, and :func:`_same_words`
+    (the same content words, up to word order and a plural) as the decision — applied
+    to a declaration instead of to a title. Reused rather than invented: a second
+    similarity rule in this file would be a second thing to calibrate, and #84's
+    instruction is explicitly not to build a similarity heuristic.
+
+    Its reach is exactly that of the rule it borrows, and no further: "a repository
+    can say where a release number landed" restated in those words is caught, and
+    the same premise re-stated through a DIFFERENT PROXY — `rc == 0` one round and
+    an artefact's existence the next — is not, because the two share almost no
+    words. That gap is why the brake is a declaration and not a detector, and it is
+    the same gap `round_stop`'s docstring records for the escalation register: a key
+    is not a premise, and neither is a sentence.
+
+    Takes NORMALISED text on both sides (:func:`_norm_title`), which is what the
+    register stores."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return (difflib.SequenceMatcher(None, a, b).ratio() >= REWORD_RATIO
+            and _same_words(a, b))
+
+
+def new_premise_register(repo: str = "", pr: int | None = None) -> dict:
+    """An empty register for one PR's cycle."""
+    return {"version": PREMISE_REGISTER_VERSION, "repo": repo, "pr": pr,
+            "premises": []}
+
+
+def load_premises(path: str, repo: str = "", pr: int | None = None
+                  ) -> tuple[dict, list[str]]:
+    """The cycle's premise register, and everything wrong with it.
+
+    A MISSING file is not a problem: the first declaration of a cycle creates it,
+    and a cycle that never declared one is the ordinary undeclared case the brake
+    reports rather than an error.
+
+    Everything else is REPORTED and read as empty, never guessed at. The failure a
+    silent read would cause is the one the brake exists to prevent, arriving with
+    nothing said: an unreadable register makes the second occurrence of a premise
+    look like the first, and the fix gets written.
+
+    ``repo``/``pr`` are checked when they are given, on `load_baseline`'s rule and
+    for its reason — a register wired to another PR's path counts occurrences from
+    another cycle, and a mis-wired path must show up as a reported problem rather
+    than as a brake that fires or does not for reasons nobody can see."""
+    problems: list[str] = []
+    reg = new_premise_register(repo, pr)
+    if not path:
+        return reg, problems
+    try:
+        raw = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return reg, problems
+    except (OSError, ValueError) as e:
+        problems.append(f"premise register {path} could not be read "
+                        f"({e.__class__.__name__}) — read as EMPTY, so a premise "
+                        "declared before this round counts as declared for the first "
+                        "time and the futility brake will not fire on it")
+        return reg, problems
+    if not isinstance(raw, dict) or not isinstance(raw.get("premises"), list):
+        problems.append(f"premise register {path} is not a premise register (no "
+                        "`premises` list) — read as EMPTY, so no earlier declaration "
+                        "counts")
+        return reg, problems
+    was_repo, was_pr = str(raw.get("repo") or ""), raw.get("pr")
+    if repo and was_repo and was_repo != repo:
+        problems.append(f"premise register {path} belongs to {was_repo}, not {repo} — "
+                        "read as EMPTY rather than counting another repo's premises")
+        return reg, problems
+    if pr is not None and isinstance(was_pr, int) and was_pr != pr:
+        problems.append(f"premise register {path} belongs to PR #{was_pr}, not #{pr} — "
+                        "read as EMPTY rather than counting another cycle's premises")
+        return reg, problems
+    kept = []
+    for entry in raw["premises"]:
+        if not isinstance(entry, dict) or not str(entry.get("text") or "").strip():
+            problems.append(f"premise register {path} carries an entry that is not a "
+                            "declaration — it was NOT counted")
+            continue
+        rounds = [r for r in (entry.get("rounds") or [])
+                  if isinstance(r, int) and not isinstance(r, bool)]
+        if not rounds:
+            problems.append(f"premise register {path} carries a declaration that names "
+                            "no round — it was NOT counted, so the occurrence it stands "
+                            "for is invisible to the brake")
+            continue
+        text = str(entry["text"]).strip()
+        kept.append({"key": premise_key(text), "text": text,
+                     "norm": _norm_title(text), "rounds": sorted(rounds),
+                     "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
+                                         if _is_key(k)})})
+    reg["premises"] = kept
+    reg["repo"], reg["pr"] = repo or was_repo, pr if pr is not None else was_pr
+    return reg, problems
+
+
+def find_premise(reg: dict, text: str) -> dict | None:
+    """The register's entry for this premise, restatements included, or None."""
+    norm = _norm_title(text)
+    key = premise_key(text)
+    for entry in reg.get("premises") or []:
+        if entry.get("key") == key or same_premise(norm, entry.get("norm") or ""):
+            return entry
+    return None
+
+
+def declare_premise(reg: dict, text: str, round_no: int,
+                    findings: Iterable[str] = (), limit: int | None = None) -> dict:
+    """Record that a fix pass is about to be written against ``text``, and say
+    whether it may be.
+
+    The occurrence is recorded whether or not the brake fires, and that is the
+    point of it being a register rather than a check: what #84 counts is
+    DECLARATIONS, the log has to hold the one that was stopped as well as the ones
+    that were allowed, and "the second time" is not a fact any single call knows on
+    its own.
+
+    ``round_no`` is the round whose findings this fix pass is answering — so a
+    declaration for round 2 is about the fix that follows round 2, which is what
+    :func:`undeclared_passes` counts against. Re-declaring the same premise inside
+    ONE round is not a repeat and does not count twice: a fixer that states its
+    premise, is interrupted and states it again has proposed one fix pass, and
+    counting the restatement would fire the brake on a cycle that never circled.
+
+    ``findings`` are the keys this fix pass would have cleared. They are what the
+    caller passes to the next round's ``--escalated`` when the brake fires, which
+    is how this composes with `round_stop` instead of growing a second stop: a
+    braked premise becomes an ESCALATION, the outcome the loop already knows how to
+    end a cycle on."""
+    text = " ".join(str(text).split())
+    keys = sorted({_key_norm(k) for k in findings if _is_key(k)})
+    entry = find_premise(reg, text)
+    if entry is None:
+        entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
+                 "rounds": [], "findings": []}
+        reg.setdefault("premises", []).append(entry)
+    if round_no not in entry["rounds"]:
+        entry["rounds"] = sorted([*entry["rounds"], round_no])
+    entry["findings"] = sorted({*entry["findings"], *keys})
+    occurrence = len(entry["rounds"])
+    escalate = limit is not None and occurrence >= limit
+    if escalate:
+        reason = (f"premise declared {occurrence} time(s) — rounds "
+                  f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
+                  f"at {limit}: a human answers this premise, not another fix pass")
+    elif limit is None:
+        reason = (f"recorded (occurrence {occurrence}) — `escalate_on.premise_repeated` "
+                  "is off, so nothing brakes on a repeat")
+    else:
+        reason = (f"recorded (occurrence {occurrence} of {limit}) — write the fix")
+    return {"key": entry["key"], "text": text,
+            "restates": entry["text"] if entry["norm"] != _norm_title(text) else "",
+            "occurrence": occurrence, "rounds": list(entry["rounds"]),
+            "first_round": entry["rounds"][0], "findings": list(entry["findings"]),
+            "limit": limit, "escalate": escalate, "reason": reason,
+            "undeclared_rounds": undeclared_passes(reg, round_no)}
+
+
+def undeclared_passes(reg: dict, round_no: int) -> list[int]:
+    """Rounds of this cycle whose fix pass declared no premise at all.
+
+    A fix pass follows every round the cycle did not stop on, so rounds ``1`` to
+    ``round_no - 1`` each had one; a round with no declaration against it is a fix
+    pass the brake could not have evaluated. #84's rule for it is explicit — treat
+    an undeclared fix as UNESCALATABLE rather than pretending to infer its premise —
+    and this is the half that makes "unescalatable" a thing the payload says out
+    loud instead of a silence."""
+    declared = {r for e in (reg.get("premises") or []) for r in e.get("rounds") or []}
+    return [r for r in range(1, max(round_no, 1)) if r not in declared]
+
+
+def premise_state(reg: dict, round_no: int, limit: int | None = None) -> dict:
+    """What the cycle's declarations say, for `round_stop` and for the payload."""
+    entries = reg.get("premises") or []
+    repeated = [{"key": e["key"], "text": e["text"], "rounds": list(e["rounds"]),
+                 "occurrences": len(e["rounds"]), "findings": list(e.get("findings") or [])}
+                for e in entries
+                if limit is not None and len(e.get("rounds") or []) >= limit]
+    return {"limit": limit,
+            "declared": len(entries),
+            "repeated": repeated,
+            "undeclared_rounds": undeclared_passes(reg, round_no)}
+
+
+def premise_report(verdict: dict, register_path: str, notes: list[str],
+                   problems: list[str]) -> str:
+    """The one screen a fixer sees when it declares a premise. Plain text, because
+    the reader is an agent about to decide whether to write a patch and the decision
+    has to survive being read out of a Bash tool's stdout."""
+    out = [f"premise  {verdict['text']}",
+           f"key      {verdict['key']}",
+           f"cycle    {register_path}"]
+    if verdict["restates"]:
+        out.append(f"restates {verdict['restates']!r} — matched as the same premise "
+                   "reworded, not as a new one")
+    rounds = ", ".join(str(r) for r in verdict["rounds"])
+    out.append(f"declared occurrence {verdict['occurrence']}"
+               + (f" of {verdict['limit']}" if verdict["limit"] else " (brake off)")
+               + f" — after round(s) {rounds}")
+    if verdict["undeclared_rounds"]:
+        # #84: an undeclared fix pass is UNESCALATABLE, and saying so is the point.
+        # A cycle nobody could have braked reads exactly like one that did not need
+        # braking, and only this line tells them apart.
+        undeclared = ", ".join(str(r) for r in verdict["undeclared_rounds"])
+        out.append(f"UNESCALATABLE: the fix pass after round(s) {undeclared} declared "
+                   "no premise, so the brake could not have been evaluated on it. "
+                   "That is a gap in this count, not a clean record")
+    for line in (*problems, *notes):
+        out.append(f"note     {line}")
+    out.append("")
+    if verdict["escalate"]:
+        keys = " ".join(f"--escalated {k}" for k in verdict["findings"])
+        out += [
+            "STOP — DO NOT WRITE THIS FIX.",
+            verdict["reason"],
+            "",
+            f"This is fix pass {verdict['occurrence']} against one premise the previous "
+            "round invalidated (#84). Escalate it instead (review-pr.md step 3a): write no "
+            "patch for the findings it explains, fix everything else in the pass, and "
+            "report the premise, what it explains and what removing it would cost.",
+        ]
+        if keys:
+            out += ["", "The next round must not count them as work a fix pass can "
+                        "clear:", f"    panel.py ... {keys}"]
+        else:
+            out += ["", "No --premise-for keys were given, so nothing here names the "
+                        "findings to escalate — pass them, or map the finding IDs "
+                        "yourself (panel-review-pr.md §4b) before the next round."]
+    else:
+        out.append(verdict["reason"])
+    return "\n".join(out)
+
+
+def declare(repo_name: str | None, premise: str, register_path: str,
+            round_no: int, findings: list[str] | None = None,
+            pr_number: int | None = None, json_out: bool = False) -> int:
+    """`panel.py --premise` — #84's futility brake, evaluated where a fix is PROPOSED.
+
+    No seats, no diff, no judge, no vendor call and no board record: it reads the
+    repo's dial, reads the cycle's register, counts the occurrences of this premise
+    and either records it and returns 0, or refuses the fix and returns
+    :data:`PREMISE_REPEATED_EXIT`.
+
+    Cheap on purpose. `--ask` (#79) is the other half of the same argument and costs
+    a vendor call per seat, so it is best-effort and skippable; this one must run
+    before EVERY fix pass or the count is not a count, and a check that cost money
+    per fix pass would be the first thing dropped.
+
+    **No `review_refusal`**, unlike the review and ask paths on either side of it,
+    and the difference is what each one spends. Both of those convene SEATS — a
+    panel nobody chose, on models nobody chose, striking a tally whose whole standing
+    is that somebody configured it — so a repo with no rules file is refused. This
+    convenes nobody. The only setting it reads is one integer with a documented
+    default at the safe end, and refusing would take the brake off exactly the repos
+    that have configured the least while breaking the loop that calls it.
+
+    The occurrence is recorded even when the brake fires, and the exit code is what
+    carries the refusal. A caller that ignores it has written the fix anyway, and the
+    register is then the record that says so — which `round_stop` reads on the round
+    that follows, ending the cycle late rather than not at all."""
+    cfg = load_repo_cfg(repo_name)
+    repo_name = cfg.get("name") or repo_name
+    notes: list[str] = []
+    limit = premise_repeat_limit(cfg["review_panel"], notes)
+    reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
+    verdict = declare_premise(reg, premise, round_no, findings or [], limit)
+    write_failed = write_payload(register_path, reg)
+    if json_out:
+        print(json.dumps({**verdict, "register": register_path, "notes": notes,
+                          "problems": problems, "write_failed": write_failed},
+                         indent=2))
+    else:
+        print(premise_report(verdict, register_path, notes, problems))
+    if write_failed:
+        # The same rule `finish` applies to a round's payload, for a sharper reason:
+        # an unwritten register loses the occurrence entirely, so the NEXT
+        # declaration of this premise counts as the first and the brake never fires.
+        # A caller told the declaration was recorded when it was not is worse off
+        # than one told nothing.
+        print(f"\npanel: FAILED — the premise register was not written: "
+              f"{write_failed}. This declaration was NOT recorded, so the next one "
+              "counts as the first and the brake will not fire on it.",
+              file=sys.stderr)
+        return UNWRITTEN_PAYLOAD_EXIT
+    return PREMISE_REPEATED_EXIT if verdict["escalate"] else 0
+
+
 def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                outstanding: list[Canonical], veto: list[str],
                baseline_ok: bool = True, repeated: Iterable[str] = (),
                escalated: Iterable[str] = (), *,
                trigger_floor: str = NO_SEVERITY_FLOOR,
-               fix_floor: str = NO_SEVERITY_FLOOR) -> dict:
+               fix_floor: str = NO_SEVERITY_FLOOR,
+               premises: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -1577,6 +2115,31 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     nothing the register matches and is reported dry and confident with the
     question still open. What tracks an open premise across a whole cycle is the
     relay and its issue, not this field.
+
+    ``premises`` is #84's futility brake seen from the ROUND, and it is the second
+    half of a mechanism whose first half runs somewhere else entirely. The brake
+    proper is evaluated when a fix is PROPOSED (:func:`declare_premise`, through
+    `panel.py --premise`), because #84's whole argument is that end-of-round is one
+    fix pass and one panel too late. What arrives here is the register that check
+    wrote, and it does two things with it:
+
+    - **A premise declared as many times as the dial allows ENDS THE CYCLE**, at
+      any of the four rules, and never as convergence: it takes a veto line,
+      ``confident`` is false, and ``reason`` says a human answers the premise. This
+      is the case where the brake was overruled or never consulted and the round
+      ran anyway — late, and better than the cap. It is deliberately the same
+      terminal state a held escalation gets, because it IS one: a repeated premise
+      is #67's circling, and the answer to it was never another fix pass.
+    - **A fix pass that declared no premise is reported as unescalatable**
+      (``undeclared_rounds``), and costs the round nothing. #84 is explicit that an
+      undeclared fix is unescalatable rather than inferred, and the reason it is
+      said out loud is that a cycle nobody COULD have braked reads exactly like a
+      cycle that did not need braking — silence would assert the second.
+
+    Declarations never buy a round, only end one. A register is a claim by the
+    agent that is about to write the fix, and the one thing #67's evidence says
+    cannot be self-reported is whether the loop is making progress; letting it
+    extend the loop would hand that agent the other lever too.
 
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
@@ -1730,6 +2293,22 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
+    # #84, and BEFORE the cap on purpose: both can be true of the same round, and
+    # "the rounds stopped being about different things" is the more specific truth
+    # than "the counter ran out". A cap reached is a cost bound; this is a futility
+    # bound, and a reader told only the first would go looking for a bigger cap.
+    #
+    # It can only ever turn a `go again` into a STOP. There is no branch where a
+    # declaration makes the loop run longer — see the docstring's paragraph on why
+    # the agent writing the fix does not get that lever.
+    circling = list((premises or {}).get("repeated") or [])
+    if circling:
+        worded = "; ".join(
+            f"{p['text']!r} declared {p['occurrences']}x "
+            f"(rounds {', '.join(str(r) for r in p['rounds'])})" for p in circling)
+        stop, reason = True, (
+            f"{len(circling)} premise(s) a fix pass was written against more than once "
+            f"— {worded} — a human answers this, not another fix pass")
     capped = False
     if not stop and round_no >= max_rounds:
         stop, capped = True, True
@@ -1748,6 +2327,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #84. Unconditional rather than "only on a STOP", because `circling` forces the
+    # stop a few lines above — there is no `go again` round this can fire on, and
+    # writing the guard anyway would say there was.
+    if circling:
+        veto = [*veto, f"{len(circling)} premise(s) were declared more than once in "
+                       "this cycle — the rounds have stopped being about different "
+                       "things, and the next fix pass would be the third patch on one "
+                       "assumption (#67, #84)"]
     return {
         "stop": stop,
         "reason": reason,
@@ -1774,6 +2361,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         "trigger_floor": trigger_floor,
         "fix_floor": fix_floor,
         "new_below_trigger_floor": sorted(quiet_new),
+        # #84's register as this round read it, and ALWAYS present — an absent key
+        # and "nothing was declared" are different claims, and a consumer that had
+        # to tell them apart would be reading a payload's age rather than a cycle's
+        # state. `undeclared_rounds` is the honest half: those fix passes could not
+        # have been braked, whatever this round's stop says.
+        "premises": premise_state({"premises": []}, round_no, None) if premises is None
+        else {"limit": premises.get("limit"),
+              "declared": premises.get("declared", 0),
+              "repeated": circling,
+              "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
     }
 
 
@@ -1789,5 +2386,11 @@ __all__ = [
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
+    "_positive_int", "_whole_pr_chars",
     "load_baseline", "coverage_veto", "round_stop",
+    "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
+    "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
+    "same_premise", "new_premise_register", "load_premises", "find_premise",
+    "declare_premise", "undeclared_passes", "premise_state",
+    "premise_report", "declare",
 ]

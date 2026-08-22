@@ -8,6 +8,15 @@ waiting to land. State, not events.
   qb-dash              live, redrawing
   qb-dash --once       one frame and exit (what the tests and a pipe want)
   qb-dash --width 72   force a width instead of taking the terminal's
+  qb-dash --scope all  every repo the BOARD knows, not just this screen's
+  qb-dash --repo ~/src/nix-fleet    point it at a project other than the cwd's
+
+By default it shows ONE project's rows — the repos of the checkout it was started
+in — and drops the repo column, because a screen built for one project spends
+eleven columns of a narrow pane restating its name (#261). `--scope all` widens the
+three panels that come off the BOARD (FLEET, CLAIMED, PLANS); OPEN PRs and ISSUES
+cannot widen, because `gh` is only ever asked about the repos this dashboard
+watches. The clickable renderer toggles with `s`, which this one has no keyboard for.
 
 Board data comes from the same client the MCP server uses; PRs and issues come
 from `gh`, on a slower clock because that is a network call per refresh and
@@ -33,10 +42,10 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    LIMITS_EVERY, agent_state, ago, board_client, ci_state, claim_label, clip, fetch_board,
-    fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue, issue_key, limit_cells,
-    plan_counts, plan_ref, plan_state, plan_who, repo_colour, short_repo, sort_issues, sort_plan,
-    until,
+    LIMITS_EVERY, Scope, agent_state, ago, board_client, ci_state, claim_label, claim_repo, clip,
+    elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan, fetch_prs, claims_by_issue,
+    in_scope, issue_key, limit_cells, plan_counts, plan_ref, plan_state, plan_who, repo_arg,
+    repo_colour, resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -47,33 +56,47 @@ PLAN_ROWS = 10          # the same, for the plan: running items first, then a co
 # Repo → colour, so the same project is the same colour everywhere on the panel.
 # ---- panels ------------------------------------------------------------------
 
-def panel_agents(data: dict, width: int) -> Panel:
+
+def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
     agents = sorted(data.get("agents", []), key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
+    agents, hidden = in_scope(agents, scope)
     seats = [a for a in agents if "/seat-" in (a.get("holder") or "")]
+    show_repo = scope is None or scope.column
 
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
     t.add_column(width=7, no_wrap=True)           # state
-    t.add_column(width=11, no_wrap=True)          # repo
+    if show_repo:
+        t.add_column(width=11, no_wrap=True)      # repo
     t.add_column(ratio=1, no_wrap=True)           # what
     t.add_column(width=5, justify="right", no_wrap=True)   # ttl
 
-    body = max(18, width - 45)
+    # The cell's width plus its padding goes back to `what`, which is the column
+    # a reader is actually reading: what the agent in this seat is doing.
+    body = max(18, width - (45 if show_repo else 33))
     for a in agents:
         who = (a.get("holder") or "?").split("/", 1)[-1]
         repo = a.get("repo") or "—"
         title = a.get("title") or a.get("branch") or "—"
         is_seat = "/seat-" in (a.get("holder") or "")
         word, style = agent_state(a)
-        t.add_row(
+        cells = [
             Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
             Text(word or "—", style=style),
-            Text(clip(repo, 11), style=repo_colour(repo)),
-            Text(clip(title, body), style="white" if is_seat else "grey70"),
+        ]
+        if show_repo:
+            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        cells += [
+            # The mark rides on the cell the dropped column widened: with no repo
+            # cell, an agent working outside any checkout otherwise reads as one
+            # working here (qbdata.scope_mark).
+            Text(scope_mark(scope, a.get("repo")) + clip(title, body),
+                 style="white" if is_seat else "grey70"),
             Text(until(a.get("expires")), style="grey50"),
-        )
+        ]
+        t.add_row(*cells)
     if not agents:
-        t.add_row(Text("nobody home", style="grey50"), "", "", "", "")
+        t.add_row(Text("nobody home", style="grey50"), *[""] * (4 if show_repo else 3))
 
     subs = len(data.get("subagents") or [])
     head = f"[bold]FLEET[/] [grey50]{len(agents)} live"
@@ -81,11 +104,17 @@ def panel_agents(data: dict, width: int) -> Panel:
         head += f" · [green]{len(seats)} seat{'s' if len(seats) != 1 else ''}[/]"
     if subs:
         head += f" · {subs} sub"
+    head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35", padding=(0, 1))
 
 
-def panel_claims(data: dict, width: int) -> Panel:
+def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
     claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
+    # A claim's repo is in its KEY, not in a field of its own, and a `plan:<uuid>`
+    # key names an item rather than a repo — so the plan goes in with it, and a
+    # claim neither can attribute stays (see qbdata.claim_repo).
+    plan = data.get("plan")
+    claims, hidden = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), plan))
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)
     t.add_column(ratio=1, no_wrap=True)
@@ -93,7 +122,7 @@ def panel_claims(data: dict, width: int) -> Panel:
 
     for c in claims:
         who = (c.get("holder") or "?").split("/", 1)[-1]
-        key = claim_label(c.get("key") or "?", data.get("plan"))
+        key = claim_label(c.get("key") or "?", plan, scope)
         kind = c.get("kind") or ""
         left = until(c.get("expires"))
         t.add_row(
@@ -104,12 +133,15 @@ def panel_claims(data: dict, width: int) -> Panel:
                  and int(left[:-1]) < 10 else "grey50"),
         )
     if not claims:
-        t.add_row(Text("nothing claimed", style="grey50"), "", "")
-    return Panel(t, title=f"[bold]CLAIMED[/] [grey50]{len(claims)}[/]",
+        # In the WIDE column, not the 13-wide holder one, which rendered this as
+        # "nothing clai…" — a panel whose empty state is itself truncated.
+        t.add_row("", Text("nothing claimed", style="grey50"), "")
+    return Panel(t, title=f"[bold]CLAIMED[/] [grey50]{len(claims)}{elsewhere(hidden)}[/]",
                  title_align="left", border_style="grey35", padding=(0, 1))
 
 
-def panel_plan(items: list[dict], err: str | None, width: int) -> Panel:
+def panel_plan(items: list[dict], err: str | None, width: int,
+               scope: Scope | None = None) -> Panel:
     """What the fleet agreed to do next, running items first.
 
     FLEET says who is here and CLAIMED says what they hold; neither says what
@@ -121,69 +153,96 @@ def panel_plan(items: list[dict], err: str | None, width: int) -> Panel:
     Printed, so it does not scroll: past PLAN_ROWS it says how many it left out
     rather than pushing the panels above it off the screen.
     """
+    show_repo = scope is None or scope.column
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=1, no_wrap=True)                     # state
-    t.add_column(width=11, no_wrap=True)                    # repo
+    if show_repo:
+        t.add_column(width=11, no_wrap=True)                # repo
     t.add_column(width=4, justify="right", no_wrap=True)    # ref, if there is one
     t.add_column(ratio=1, no_wrap=True)                     # title
     t.add_column(width=13, justify="right", no_wrap=True)   # holder, or what it waits on
 
+    # Narrowed BEFORE the print limit, not after: this panel does not scroll, and
+    # the whole point of a scoped screen is that another repo's items cannot push
+    # this one's past PLAN_ROWS and into the "…and N more" line.
+    items, hidden = in_scope(items, scope)
     ordered = sort_plan(items)
     running, blocked = plan_counts(items)
+    filler = [""] * (3 if show_repo else 2)
     for item in ordered[:PLAN_ROWS]:
         glyph, colour = plan_state(item)
         who, who_colour = plan_who(item)
         repo = short_repo(item.get("repo") or "fleet")
-        t.add_row(
-            Text(glyph, style=colour),
-            Text(clip(repo, 11), style=repo_colour(repo)),
+        cells = [Text(glyph, style=colour)]
+        if show_repo:
+            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        cells += [
             Text(plan_ref(item), style="bold grey70"),
-            Text(clip(item.get("title"), max(12, width - 40)),
+            # A fleet-wide item names no repo, and with the column gone it would
+            # read as one of this project's (qbdata.scope_mark).
+            Text(scope_mark(scope, item.get("repo"))
+                 + clip(item.get("title"), max(12, width - (40 if show_repo else 28))),
                  style="white" if colour != "grey50" else "grey50"),
             Text(clip(who, 13), style=who_colour),
-        )
+        ]
+        t.add_row(*cells)
     if len(ordered) > PLAN_ROWS:
-        t.add_row("", "", "", Text(f"…and {len(ordered) - PLAN_ROWS} more", style="grey50"), "")
+        t.add_row(*filler, Text(f"…and {len(ordered) - PLAN_ROWS} more", style="grey50"), "")
     if err:
-        t.add_row(Text("!", style="red"), "", "", Text(clip(err, width - 16), style="red"), "")
+        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 16), style="red"), "")
     if not items and not err:
-        t.add_row("", "", "", Text("nothing on the plan", style="grey50"), "")
+        t.add_row(*filler, Text("nothing on the plan", style="grey50"), "")
 
     head = f"[bold]PLANS[/] [grey50]{len(items)} open"
     if running:
         head += f" · [green]{running} running[/]"
     if blocked:
         head += f" · {blocked} blocked"
+    head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
                  padding=(0, 1))
 
 
-def panel_prs(prs: list[dict], err: str | None, width: int) -> Panel:
+def panel_prs(prs: list[dict], err: str | None, width: int,
+              scope: Scope | None = None) -> Panel:
+    """The watched repos' open PRs.
+
+    Not narrowed, and it cannot be: `gh` was only ever asked about the repos this
+    dashboard watches, so there is no other repo's PR here to hide and widening
+    the scope cannot produce one. Only the repo cell answers to the scope — and
+    for the same reason as everywhere else, which is that one repo makes it the
+    same word on every row.
+    """
+    show_repo = scope is None or scope.column
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=1, no_wrap=True)           # ci
-    t.add_column(width=11, no_wrap=True)          # repo
+    if show_repo:
+        t.add_column(width=11, no_wrap=True)      # repo
     t.add_column(width=4, justify="right", no_wrap=True)   # number
     t.add_column(ratio=1, no_wrap=True)           # title
     t.add_column(width=5, justify="right", no_wrap=True)   # age
 
+    filler = [""] * (3 if show_repo else 2)
     red = 0
     for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
         glyph, colour = ci_state(pr)
         red += colour == "red"
         title = pr.get("title") or ""
         repo = short_repo(pr.get("repo") or "")
-        t.add_row(
-            Text(glyph, style=colour),
-            Text(clip(repo, 11), style=repo_colour(repo)),
+        cells = [Text(glyph, style=colour)]
+        if show_repo:
+            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        cells += [
             Text(f"#{pr.get('number')}", style="bold grey70"),
-            Text(clip(title, max(12, width - 32)),
+            Text(clip(title, max(12, width - (32 if show_repo else 20))),
                  style="grey50" if pr.get("isDraft") else "white"),
             Text(ago(pr.get("updatedAt")), style="grey50"),
-        )
+        ]
+        t.add_row(*cells)
     if err:
-        t.add_row(Text("!", style="red"), "", "", Text(clip(err, width - 12), style="red"), "")
+        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 12), style="red"), "")
     if not prs and not err:
-        t.add_row("", "", "", Text("no open PRs", style="grey50"), "")
+        t.add_row(*filler, Text("no open PRs", style="grey50"), "")
 
     head = f"[bold]OPEN PRs[/] [grey50]{len(prs)}"
     if red:
@@ -193,7 +252,7 @@ def panel_prs(prs: list[dict], err: str | None, width: int) -> Panel:
 
 
 def panel_issues(issues: list[dict], held: dict[int, dict], err: str | None,
-                 width: int) -> Panel:
+                 width: int, scope: Scope | None = None) -> Panel:
     """Open issues, with the ones somebody already holds marked as such.
 
     The free ones are the point — an unheld issue is what the next seat takes —
@@ -204,34 +263,39 @@ def panel_issues(issues: list[dict], held: dict[int, dict], err: str | None,
     the others already share: past ISSUE_ROWS it stops listing and says how many
     it did not, rather than pushing the fleet off the top of the screen.
     """
+    show_repo = scope is None or scope.column
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=1, no_wrap=True)                     # held marker
-    t.add_column(width=11, no_wrap=True)                    # repo
+    if show_repo:
+        t.add_column(width=11, no_wrap=True)                # repo
     t.add_column(width=4, justify="right", no_wrap=True)    # number
     t.add_column(ratio=1, no_wrap=True)                     # title
     t.add_column(width=9, justify="right", no_wrap=True)    # holder, or age
 
     ordered = sort_issues(issues, held)
     free = sum(1 for i in issues if issue_key(i) not in held)
+    filler = [""] * (3 if show_repo else 2)
     for issue in ordered[:ISSUE_ROWS]:
         claim = held.get(issue_key(issue))
         who = (claim.get("holder") or "?").split("/", 1)[-1] if claim else ""
         repo = short_repo(issue.get("repo") or "")
-        t.add_row(
-            Text("·" if claim else "○", style="grey50" if claim else "green"),
-            Text(clip(repo, 11), style=repo_colour(repo)),
+        cells = [Text("·" if claim else "○", style="grey50" if claim else "green")]
+        if show_repo:
+            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        cells += [
             Text(f"#{issue.get('number')}", style="bold grey70"),
-            Text(clip(issue.get("title"), max(12, width - 36)),
+            Text(clip(issue.get("title"), max(12, width - (36 if show_repo else 24))),
                  style="grey50" if claim else "white"),
             Text(clip(who, 9) if claim else ago(issue.get("updatedAt")),
                  style="yellow" if claim else "grey50"),
-        )
+        ]
+        t.add_row(*cells)
     if len(ordered) > ISSUE_ROWS:
-        t.add_row("", "", "", Text(f"…and {len(ordered) - ISSUE_ROWS} more", style="grey50"), "")
+        t.add_row(*filler, Text(f"…and {len(ordered) - ISSUE_ROWS} more", style="grey50"), "")
     if err:
-        t.add_row(Text("!", style="red"), "", "", Text(clip(err, width - 16), style="red"), "")
+        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 16), style="red"), "")
     if not issues and not err:
-        t.add_row("", "", "", Text("no open issues", style="grey50"), "")
+        t.add_row(*filler, Text("no open issues", style="grey50"), "")
 
     head = f"[bold]ISSUES[/] [grey50]{len(issues)}"
     if issues:
@@ -267,7 +331,7 @@ def limits_line(limits: list[dict], width: int, stale: bool = False) -> Text:
 
 
 def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
-           stale: bool = False) -> Panel:
+           stale: bool = False, scope: Scope | None = None) -> Panel:
     host = (cfg.agent or "?").split("/", 1)[0]
     now = datetime.now().strftime("%H:%M:%S")
     state = Text("● board up", style="green")
@@ -277,7 +341,11 @@ def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
     line.add_column(ratio=1)
     line.add_column(justify="right")
     line.add_row(Text(f"quarterback · {host}", style="bold"), state)
-    sub = Text(f"{cfg.base_url}   {now}", style="grey50")
+    # The scope, said ONCE for the whole pane. That is the trade the panels below
+    # are making: the repo column comes out of every row of every table, so the
+    # one place that still names the project has to be somewhere a reader looks.
+    where = f"   {scope.label()}" if scope is not None else ""
+    sub = Text(f"{cfg.base_url}   {now}{where}", style="grey50")
     parts = [line, Align.left(sub)]
     caps = limits_line(limits or [], width - 4, stale)
     if caps.plain:
@@ -321,15 +389,19 @@ def fetch_gh() -> dict:
     return {"prs": prs, "pr_err": pr_err, "issues": issues, "issue_err": issue_err}
 
 
-def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None) -> Group:
+def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
+          scope: Scope | None = None) -> Group:
     caps = caps or {}
+    # From the UNFILTERED claims, always: an issue this screen can see, held by an
+    # agent working out of another repo's checkout, is still held. Narrowing this
+    # would show that issue as free and send the next seat straight into it.
     held = claims_by_issue(data.get("claims", []))
-    parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error"))),
-             panel_agents(data, width),
-             panel_claims(data, width),
-             panel_plan(data.get("plan") or [], data.get("plan_err"), width),
-             panel_prs(gh["prs"], gh["pr_err"], width),
-             panel_issues(gh["issues"], held, gh["issue_err"], width)]
+    parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error")), scope),
+             panel_agents(data, width, scope),
+             panel_claims(data, width, scope),
+             panel_plan(data.get("plan") or [], data.get("plan_err"), width, scope),
+             panel_prs(gh["prs"], gh["pr_err"], width, scope),
+             panel_issues(gh["issues"], held, gh["issue_err"], width, scope)]
     if data.get("error"):
         parts.append(Panel(Text(clip(data["error"], width * 2), style="red"),
                            title="[red]ERROR[/]", title_align="left", border_style="red"))
@@ -338,15 +410,42 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None) -> Gr
 
 # ---- main --------------------------------------------------------------------
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    """`argv` so the flags can be driven by a test.
+
+    The clickable renderer's `main` takes one for the same reason: the two
+    decisions in here — which view `--scope` names, and pinning the repos BEFORE
+    the scope is resolved off them — are wiring that fails silently, and a
+    dashboard is the one program whose output nobody diffs.
+    """
     ap = argparse.ArgumentParser(prog="qb-dash", description="fleet state, for a tall pane")
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
     ap.add_argument("--width", type=int, default=None, help="force a width")
     ap.add_argument("--interval", type=float, default=BOARD_EVERY, help="board refresh seconds")
-    args = ap.parse_args()
+    ap.add_argument("--scope", choices=("repo", "all"), default=None,
+                    help="repo (default): only this screen's repos, and no repo column; "
+                         "all: every repo the board knows, in FLEET/CLAIMED/PLANS — "
+                         "PRs and issues stay the watched repos' either way. "
+                         "Overrides QB_DASH_SCOPE")
+    ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
+                    help="the project this screen is for — a checkout or an owner/name "
+                         "slug, repeatable. Overrides QB_DASH_REPOS, QB_DASH_REPO "
+                         "and the cwd")
+    args = ap.parse_args(argv)
 
     console = Console(width=args.width) if args.width else Console()
     width = console.width
+
+    # Before anything reads it: `resolve_repos` is cached and half the module asks
+    # it directly (which repos to sort the plan by, which repos to ask `gh` about),
+    # so --repo has to land in that cache rather than be passed around.
+    if args.repo:
+        try:
+            set_repos([repo_arg(r) for r in args.repo])
+        except ValueError as exc:
+            console.print(f"[red]qb-dash: --repo {exc}[/]")
+            return 2
+    scope = resolve_scope(on=None if args.scope is None else args.scope == "repo")
 
     try:
         client, cfg = board_client()
@@ -359,11 +458,11 @@ def main() -> int:
     caps = refresh_limits({"limits": [], "error": None})
 
     if args.once:
-        console.print(frame(cfg, data, gh, width, caps))
+        console.print(frame(cfg, data, gh, width, caps, scope))
         return 0
 
     last_gh = last_caps = time.monotonic()
-    with Live(frame(cfg, data, gh, width, caps), console=console,
+    with Live(frame(cfg, data, gh, width, caps, scope), console=console,
               screen=True, refresh_per_second=4) as live:
         while True:
             time.sleep(args.interval)
@@ -375,7 +474,7 @@ def main() -> int:
                 refresh_limits(caps)
                 last_caps = time.monotonic()
             width = console.width          # the pane can be resized under us
-            live.update(frame(cfg, data, gh, width, caps))
+            live.update(frame(cfg, data, gh, width, caps, scope))
 
 
 if __name__ == "__main__":

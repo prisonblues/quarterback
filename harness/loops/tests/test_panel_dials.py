@@ -1,4 +1,4 @@
-"""#165's seven `review_panel` dials — thoroughness against convergence, per repo.
+"""#165's seven `review_panel` dials, and #297's eighth — thoroughness against convergence, per repo.
 
 The panel had one behaviour and no dials. Every choice it made about what counts as
 worth reporting, what a fix round has to clear, and what buys another round was a
@@ -8,8 +8,9 @@ had and **128 of them — 63.7% — were created by the fix pass immediately bef
 against a ~7% industry baseline for bad-fix injection. Every one of those panels
 terminated on the round cap, each saying in its own output "a stop, not convergence".
 
-So there are now seven settings, and this suite is what says they are settings rather
-than documentation. Each one gets three tests, because there are exactly three ways a
+So there are now eight settings — seven from #165 and `low_severity_fix_lines` from
+#297, which answers a second measurement taken five days later on the same panel — and
+this suite is what says they are settings rather than documentation. Each one gets three tests, because there are exactly three ways a
 setting fails:
 
 * **its default** — the value a repo that configured nothing gets, which has to be
@@ -45,6 +46,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` and the dial constants live here
+import panel_scope  # noqa: E402  — the two compare calls a scoped round makes
 import panel_seats  # noqa: E402  — the resolvers live here
 import harness_rules  # noqa: E402  — DEFAULTS, the documented half
 from conftest import gh_stub  # noqa: E402
@@ -59,12 +61,13 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The seven, and where each one's default is written twice. `skip_title_patterns` and
+#: The eight, and where each one's default is written twice. `skip_title_patterns` and
 #: the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
     "fix_severity_floor": "DEFAULT_FIX_SEVERITY_FLOOR",
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
+    "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",
@@ -90,12 +93,19 @@ def _adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None,
              for i, f in enumerate(flat)], None, "")
 
 
-def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=()):
+def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(),
+         head="abc", increment=None, prior_diff=""):
     """Every process a run would spawn, replaced. `prompts` collects what each seat
     was actually handed, which is the only way to test `reviewer_scope` — its whole
     enforcement is the text of the brief. `sonar` seats SonarCloud with a red gate and
     those issues as its hard ones, which is the only way to reach the floors' one
-    exemption through the real `run()`."""
+    exemption through the real `run()`.
+
+    `increment` puts the round under the DEFAULT `increment` round scope: `head` moves
+    away from the anchor the baseline recorded, and the two compare round trips
+    `ReviewScope.decide` makes are answered here rather than through `gh`. Both are
+    needed together — a round whose head has not moved falls back to whole-PR scope,
+    which is the case the growth ceiling was already right about (#298)."""
     resolved = config or PANEL_CFG
     if sonar:
         resolved = {**resolved,
@@ -106,8 +116,19 @@ def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: resolved)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,
-              "headRefName": "h", "headRefOid": "abc"},
-        diff=diff or "diff --git a/a.py b/a.py\n+x\n"))
+              "headRefName": "h", "headRefOid": head},
+        diff=diff or "diff --git a/a.py b/a.py\n+x\n",
+        compare='{"status": "ahead", "files": [{"filename": "a.py", "patch": "@@"}]}'))
+    if increment is not None:
+        # Two ranges, told apart by their right-hand end: `anchor...head` is the fix
+        # commit (the review target), `base...anchor` is the PR as the anchoring round
+        # read it (the near-context tier).
+        monkeypatch.setattr(panel_scope, "fetch_increment",
+                            lambda repo, a, b: ((increment, "") if b == head
+                                                else (prior_diff, "")))
+        monkeypatch.setattr(panel_scope, "compare_facts",
+                            lambda *a: {"status": "ahead", "files": 1, "commits": 1,
+                                        "total_commits": 1, "merges": 0})
 
     def review(cmd_name, model, prompt, *a, **k):
         if prompts is not None:
@@ -121,9 +142,10 @@ def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(
 
 def run(monkeypatch, capsys, tmp_path, findings, *, round_no=1, baseline=(),
         max_rounds=2, config=None, diff=None, prompts=None, scope="auto",
-        name="r", sonar=()):
+        name="r", sonar=(), head="abc", increment=None, prior_diff=""):
     """One whole panel run: the report it prints and the payload it writes."""
-    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts, sonar=sonar)
+    stub(monkeypatch, findings, config=config, diff=diff, prompts=prompts, sonar=sonar,
+         head=head, increment=increment, prior_diff=prior_diff)
     out = tmp_path / f"{name}{round_no}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      round_no=round_no, baseline=list(baseline),
@@ -204,7 +226,7 @@ def test_the_payload_records_every_dial_as_applied(monkeypatch, capsys, tmp_path
 # ------------------------------------------ a bad VALUE fails; an unknown KEY does not
 
 #: One malformed value per dial, and the fragment of the accepted set the refusal has to
-#: carry. Seven rows because the answer is now one answer: a value of a key this harness
+#: carry. Eight rows because the answer is now one answer: a value of a key this harness
 #: KNOWS that it cannot read is a typo by the repo's author, and there is no
 #: forward-compatibility argument for tolerating it — no newer harness reads `p-4` as a
 #: severity either.
@@ -212,6 +234,7 @@ BAD_VALUES = [
     ("fixer_may_defer", "maybe", "true or false"),
     ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
+    ("low_severity_fix_lines", "a few", "a whole number"),
     ("max_fix_growth", "lots", "is not a number"),
     ("reviewer_scope", "everything", "diff, repo"),
     ("require_failing_test", "sometimes", "true or false"),
@@ -221,7 +244,7 @@ BAD_VALUES = [
 
 @pytest.mark.parametrize("key,bad,accepted", BAD_VALUES)
 def test_a_malformed_value_of_a_known_key_is_a_hard_exit(key, bad, accepted):
-    """All seven, in one table, because the failure they share is the one that matters:
+    """All eight, in one table, because the failure they share is the one that matters:
     a repo that wrote `fix_severity_floor: p-4` intending the pre-#165 "fix everything"
     silently got the default, stopped fixing P3s and P4s, and the review ran anyway —
     under a policy the file did not ask for, in the round the fixer was briefed from. A
@@ -253,9 +276,11 @@ def test_unset_is_still_the_silent_not_configured_reading(key, unset):
     harness and none of them is a mistake — `severity_floor`'s docstring says so and is
     right. `max_fix_growth` is the documented exception in the other direction: a
     WRITTEN null — `null` or `""`, as against an absent key — is its off switch, which
-    is still not an error."""
+    is still not an error. `low_severity_fix_lines` is the second such key and the
+    reading is the same: a written null is "no budget at all", which is not the same
+    answer as the default and not a mistake either."""
     dials = panel_seats.resolve_dials({key: unset}, None, [])
-    expected = (None if key == "max_fix_growth"
+    expected = (None if key in ("max_fix_growth", "low_severity_fix_lines")
                 else harness_rules.DEFAULTS["review_panel"][key])
     assert getattr(dials, key) == expected
 
@@ -477,11 +502,18 @@ def test_a_below_floor_finding_the_fixer_never_had_does_not_repeat_the_cycle_to_
     every round by construction — and rule 3 ("an earlier round already raised it and
     it is still there") would go again on it until the cap, which is the
     non-convergence this whole change exists to remove. P4 findings, because the fix
-    floor defaults to P3 now and a P3 IS work the fix round was asked to clear."""
+    floor defaults to P3 now and a P3 IS work the fix round was asked to clear.
+
+    `low_severity_fix_lines: null` here, which is what makes the round's REQUIRED
+    floor the fix floor: under the shipped budget a P3 is work the round was asked to
+    clear only while the budget lasts, and `Dials.cleared_floor` raises the bound to
+    the cut for that (#297, and the test below it). Null is the pre-#297 reading and
+    the one this test was written against."""
+    conf = cfg(low_severity_fix_lines=None)
     _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=1,
-                   max_rounds=3)
+                   max_rounds=3, config=conf)
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=2,
-                        baseline=[r1], max_rounds=3, scope="pr")
+                        baseline=[r1], max_rounds=3, scope="pr", config=conf)
     stop = payload["round_stop"]
     assert stop["stop"] is True, stop["reason"]
     assert "already raised" not in stop["reason"]
@@ -524,6 +556,105 @@ def test_a_fix_pass_that_multiplies_the_change_stops_the_cycle(monkeypatch, caps
     assert stop["confident"] is False
     assert any("max_fix_growth" in v for v in stop["veto"])
     assert "a stop, not convergence" in report
+
+
+#: PR #188's actual round sizes, in churned lines. The PR stood at 185 when round 1
+#: read it, 593 after the first fix pass and 721 after the second — 3.21x and then
+#: **3.90x**, under a ceiling of 3.0, and the guard fired at neither. Each round after
+#: the first reviews the fix commit, so the sizes the old measurement saw are the
+#: DIFFERENCES: 408 lines and then 128.
+LINE = "+one line of fix\n"
+PR_188 = {r: "diff --git a/a.py b/a.py\n" + LINE * n
+          for r, n in ((1, 185), (2, 593), (3, 721))}
+FIX_188 = {r: "diff --git a/a.py b/a.py\n" + LINE * n for r, n in ((2, 408), (3, 128))}
+
+
+def test_the_growth_ceiling_measures_the_pr_and_not_the_round(monkeypatch, capsys,
+                                                              tmp_path):
+    """#298, on PR #188's own three rounds: 185 -> 593 -> 721 churned lines, 3.90x
+    under a 3.0x ceiling, and no stop at either round that could have made one.
+
+    `round_scope` decides what the reviewers are asked to LOOK AT; the ceiling asks how
+    big the change has BECOME. Taken off the review target, the DEFAULT `increment`
+    scope put a fix commit over the cycle's whole-PR starting size — 2.20x at round 2
+    and **0.69x at round 3**, both comfortably under any ceiling, while the PR itself
+    had nearly quadrupled. The backstop against this repo's measured 63.7% bad-fix
+    injection rate was pointed at the wrong number, so it read as configured and
+    stopped nothing.
+
+    Run through `run()` rather than against the arithmetic, because the defect was
+    never in the arithmetic: it was in which string the numerator came from, and only
+    a round that really scopes its target can tell the two apart."""
+    # What the old measurement saw, stated as a property of the fixture: both fix
+    # commits are UNDER the ceiling against the cycle's starting size, so a test that
+    # did not scope its rounds would pass against the unfixed code.
+    assert all(len(FIX_188[r]) / len(PR_188[1]) < 3.0 for r in (2, 3))
+
+    _, r1_payload, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                            round_no=1, max_rounds=4, diff=PR_188[1])
+    _, r2_payload, r2 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                            baseline=[r1], max_rounds=4, diff=PR_188[2],
+                            head="def", increment=FIX_188[2], prior_diff=PR_188[1])
+    _, r3_payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=3,
+                           baseline=[r1, r2], max_rounds=4, diff=PR_188[3],
+                           head="fed", increment=FIX_188[3], prior_diff=PR_188[2])
+
+    for round_no, payload in ((2, r2_payload), (3, r3_payload)):
+        # The rounds really did scope, or this asserts nothing at all: with a whole-PR
+        # target the numerator was already right and the test passes unfixed.
+        assert payload["scope"] == "increment", f"round {round_no}"
+        assert payload["diff_chars"] == len(FIX_188[round_no])
+        growth = payload["round_stop"]["fix_growth"]
+        assert growth["over"] is True, (
+            f"round {round_no}: the PR went {len(PR_188[1]):,} -> "
+            f"{len(PR_188[round_no]):,} chars and the ceiling read {growth['ratio']}x "
+            "— it measured the fix commit, not the PR")
+        assert growth["chars"] == len(PR_188[round_no])
+        assert growth["first_chars"] == len(PR_188[1]) and growth["first_round"] == 1
+        assert payload["round_stop"]["stop"] is True
+        assert payload["round_stop"]["confident"] is False
+        # The reported ratio still names WHICH measurement it is — two whole-PR sizes,
+        # beside the scope the round reviewed under, which is a different fact.
+        assert growth["scope"] == "pr" and growth["first_scope"] == "pr"
+        assert growth["review_scope"] == "increment"
+        assert any("whole PR" in v and "max_fix_growth" in v
+                   for v in payload["round_stop"]["veto"])
+        # Where the denominator comes from: every round records the PR's own size
+        # beside the scope-dependent size of what it reviewed.
+        assert payload["pr_chars"] == len(PR_188[round_no])
+
+    assert r1_payload["pr_chars"] == len(PR_188[1])
+    # #188's two headline numbers, to one decimal place as the report prints them.
+    assert f"{r2_payload['round_stop']['fix_growth']['ratio']:.1f}" == "3.2"
+    assert f"{r3_payload['round_stop']['fix_growth']['ratio']:.1f}" == "3.9"
+
+
+def test_the_growth_denominator_is_a_whole_pr_size_not_an_increment(tmp_path):
+    """The other end of #298, and the reason `pr_chars` is recorded at all.
+
+    A cycle whose only baseline is a SCOPED round — which `--baseline` explicitly
+    allows, and which every round 3 of a cycle passed only its predecessor gets — has a
+    `diff_chars` that is one fix commit. Read as the cycle's starting size it would put
+    a whole PR over a fix commit and stop a cycle that has not grown at all, which is
+    the same wrong-numerator error pointing the other way."""
+    scoped = tmp_path / "scoped.json"
+    scoped.write_text(json.dumps({
+        "repo": "board", "github": "acme/board", "pr": 34, "round": 2, "cycle": "cyc",
+        "reviewed": True, "scope": "increment", "head_sha": "abc",
+        "diff_chars": len(FIX_188[3]), "pr_chars": len(PR_188[3]),
+        "reviewers_ran": ["claude"], "to_fix": [], "dismissed": [],
+        "sonar_findings": []}))
+    prior = panel.load_baseline([str(scoped)],
+                                {"github": "acme/board", "pr": 34, "round": 3})
+    assert prior.first_reviewed == (2, len(PR_188[3]), "pr")
+
+    # And a payload written before `pr_chars` existed: its increment cannot stand in
+    # for a PR, so the check does not run rather than inventing a denominator.
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({**json.loads(scoped.read_text()), "pr_chars": None}))
+    assert panel.load_baseline([str(old)],
+                               {"github": "acme/board", "pr": 34,
+                                "round": 3}).first_reviewed is None
 
 
 def test_a_fix_that_did_not_multiply_the_change_is_not_stopped(monkeypatch, capsys,
@@ -758,6 +889,294 @@ def test_a_whole_float_is_accepted_as_a_cap():
     assert panel_seats.resolve_max_rounds(None, {"max_rounds": 3.0}, []) == 3
 
 
+# ------------------------------------------------- 8. low_severity_fix_lines (#297)
+#
+# The eighth dial, and the one measured five days after the other seven landed. PR
+# #188's feature was 185 churned lines; two fix passes turned it into 721, so 74% of
+# that PR was review-response code, and round 2's fix list was 89% below P2. The fix
+# floor cannot see that shape: #188's round 1 was 408 lines of individually reasonable
+# small fixes, every one of them correctly admitted by a per-FINDING rule. So the band
+# between the two floors gets a combined line budget for the round.
+
+#: The shipped DEFAULTS, written out: this repo's own `.harness-rules.sample` closes the
+#: gap between the floors (both P2), which leaves the budget inert — see the test at the
+#: end of this section. Every test here that needs a band says so rather than inheriting
+#: it, so a later change to either default cannot quietly empty these tests out.
+BAND = {"fix_severity_floor": "P3", "round_trigger_floor": "P2"}
+
+
+def band_run(monkeypatch, capsys, tmp_path, findings, **kw):
+    """`run` with the two floors a tier apart, so there IS a band to budget."""
+    config = cfg(**{**BAND, **kw.pop("dials", {})})
+    return run(monkeypatch, capsys, tmp_path, findings, config=config, **kw)
+
+
+def test_the_budget_marks_the_band_between_the_floors_and_nothing_else(
+        monkeypatch, capsys, tmp_path):
+    """WHICH findings are on the budget, which is the whole of the mechanism's reach.
+
+    At or above `round_trigger_floor` a finding is unconditional work and is not marked
+    — the measured cut is at P2, zero P1s lost, and #297 is explicit that it is a line
+    budget and NOT a severity change. Below `fix_severity_floor` a finding is not this
+    round's work at all and keeps its 🔽. The band between them is what the fix floor
+    admits and the measurement does not, and it is the only thing 💸 may appear on."""
+    report, _, _ = band_run(monkeypatch, capsys, tmp_path,
+                            [finding("P1", "a bad cast"), finding("P2", "a race"),
+                             finding("P3", "a stale docstring", file="b.py"),
+                             finding("P4", "a typo", file="c.py")])
+    assert "💸 **P3**" in report
+    assert "💸 **P1**" not in report and "💸 **P2**" not in report
+    # And the below-floor finding is untouched by any of it: still 🔽, still under its
+    # own heading, still never 💸.
+    assert "🔽 **P4**" in report and "💸 **P4**" not in report
+
+
+def test_the_budget_note_states_the_number_the_order_and_the_measurement(
+        monkeypatch, capsys, tmp_path):
+    """The note under **To fix**, which is the only place the rule reaches a fixer.
+
+    It rides with the list rather than in a section of its own, which is the opposite
+    of the choice the below-floor findings get and for the same reason read the other
+    way: those must not be swept into a brief, and these must — with their budget. An
+    orchestrator pastes the To fix list, so the budget has to be in the heading or the
+    fixer is briefed the pre-#297 behaviour: every low finding unconditional.
+
+    Cheapest-first and COUNTED are both load-bearing. Cheapest-first is what makes a
+    budget buy the most fixes; counting is what keeps the rule mechanical, and #297 is
+    explicit that "does this risk ballooning?" asked of the fixer is a judgement by the
+    actor whose judgement the 85% impugns."""
+    report, _, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")])
+    assert "share a 40-line budget for the WHOLE round" in report
+    assert "spend cheapest first" in report
+    assert "git diff --numstat" in report
+    assert "stop when the budget is spent" in report
+    # Counted, not estimated, and the fixer is told not to answer the question at all.
+    assert "Count, do not estimate" in report
+    assert "whether a fix risks ballooning" in report
+    # And what the budget does not reach is NOT dropped — the half a reader has to be
+    # able to see, or a budget reads as a licence to ignore findings.
+    assert "reported and recorded exactly like a below-floor finding" in report
+
+
+def test_no_budget_is_the_unconditional_pre_297_fix_list(monkeypatch, capsys, tmp_path):
+    """A written `null` is the off switch, and off means exactly what the round did
+    before this key existed: every finding at or above the fix floor is unconditional
+    work, nothing is marked, and no budget note appears at all."""
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  dials={"low_severity_fix_lines": None})
+    assert payload["review_panel"]["low_severity_fix_lines"] is None
+    assert "💸" not in report
+    assert "budget for the WHOLE round" not in report
+    # Said on the dials line anyway. A dial that vanishes from the report when it is
+    # off cannot be told from one that was never applied.
+    assert "below-P2 fix budget off" in report
+    assert payload["to_fix"][0]["budgeted_fix"] is False
+
+
+def test_a_zero_budget_takes_the_band_out_of_the_fixers_list_entirely(
+        monkeypatch, capsys, tmp_path):
+    """`0` is a budget that buys nothing, and that is a third answer rather than a
+    spelling of "off": the band is then not this round's work in any sense, so it
+    leaves the fixer's list and renders where a below-floor finding renders.
+
+    The applied floor rises to the cut with it, and the report says the cut — naming
+    `fix_severity_floor` there would name a floor these findings are ABOVE while
+    listing them as not this round's work. The blurb names the key that actually
+    decided it, because the operator's next action is to edit that key."""
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  dials={"low_severity_fix_lines": 0})
+    assert "### To fix (0)" in report
+    assert "🔽 **P3**" in report and "💸" not in report
+    assert "Reported, not this round's work (1) — below the `P2` fix floor" in report
+    assert "`review_panel.low_severity_fix_lines` is 0" in report
+    assert "applied floor is the `P2` cut rather than the `P3` fix floor" in report
+    # Recorded as below the floor, not as budgeted: nothing is on a budget of zero.
+    row = payload["to_fix"][0]
+    assert row["below_fix_floor"] is True and row["budgeted_fix"] is False
+
+
+def test_the_payload_tells_budgeted_work_from_work_that_is_not_this_rounds(
+        monkeypatch, capsys, tmp_path):
+    """Three answers, three flags, and the third cannot be spelled by the other two.
+    `below_fix_floor` is "not this round's work"; `budgeted_fix` is "this round's work
+    while the budget lasts". A programmatic consumer building a fixer's brief has to be
+    able to see which without re-deriving either floor."""
+    _, payload, _ = band_run(monkeypatch, capsys, tmp_path,
+                             [finding("P2", "a race"),
+                              finding("P3", "a stale docstring", file="b.py"),
+                              finding("P4", "a typo", file="c.py")])
+    got = {r["severity"]: (r["below_fix_floor"], r["budgeted_fix"])
+           for r in payload["to_fix"]}
+    assert got == {"P2": (False, False), "P3": (False, True), "P4": (True, False)}
+
+
+def test_a_budgeted_finding_the_budget_may_not_have_reached_does_not_run_to_the_cap(
+        monkeypatch, capsys, tmp_path):
+    """The interaction that makes the budget safe, and it is the one the fix floor
+    already needed. `round_stop`'s rule 3 goes again on a finding an earlier round
+    raised that is still outstanding, justified on "the fixer was told about them and
+    they are still there" — which is exactly as false of a budgeted finding the budget
+    ran out before as it is of a below-floor one. The panel sees a fix commit, not a
+    ledger, so it cannot tell a repeated budgeted finding the fixer paid for from one
+    it never reached. Left unbounded that runs every budgeted cycle to the cap.
+
+    So while a budget is in force the REQUIRED floor is the cut."""
+    _, _, r1 = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
+                        max_rounds=3)
+    _, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                             round_no=2, baseline=[r1], max_rounds=3, scope="pr")
+    stop = payload["round_stop"]
+    assert stop["stop"] is True, stop["reason"]
+    assert "already raised" not in stop["reason"]
+    assert stop["fix_floor"] == "P2"
+
+
+def test_and_with_no_budget_that_same_repeat_still_buys_a_round(
+        monkeypatch, capsys, tmp_path):
+    """The other half of the test above, and what says it is the BUDGET doing it rather
+    than the trigger floor. With no budget the round WAS asked to clear that P3
+    unconditionally, so a repeat of it is a fixer that did not do what it was told, and
+    rule 3's justification holds word for word."""
+    off = {"low_severity_fix_lines": None}
+    _, _, r1 = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
+                        max_rounds=3, dials=off)
+    _, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                             round_no=2, baseline=[r1], max_rounds=3, scope="pr",
+                             dials=off)
+    stop = payload["round_stop"]
+    assert stop["stop"] is False
+    assert "already raised" in stop["reason"]
+    assert stop["fix_floor"] == "P3"
+
+
+def test_the_budget_is_inert_where_the_two_floors_meet(monkeypatch, capsys, tmp_path):
+    """This repo's own configuration, and it must be a no-op rather than a mis-applied
+    one. `.harness-rules.sample` has set both floors to P2 since 2026-08-20, so there
+    is no band: every finding is either unconditional or below the floor, and a budget
+    with nothing to spend it on must not mark, must not move a floor, and must not
+    change which findings a round is asked to clear."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path,
+                             [finding("P2", "a race"), finding("P3", "a nit")],
+                             config=cfg(fix_severity_floor="P2",
+                                        round_trigger_floor="P2"))
+    assert "💸" not in report
+    assert "budget for the WHOLE round" not in report
+    assert payload["to_fix"][1]["below_fix_floor"] is True
+    assert payload["to_fix"][1]["budgeted_fix"] is False
+    # Printed all the same, at the value the file wrote: a reader of the artifact has
+    # to be able to tell "inert here" from "never configured".
+    assert "below-P2 fix budget 40 lines" in report
+
+
+def test_the_dials_answer_the_three_floor_questions_separately():
+    """The unit view of the three properties, because the reports above cannot show
+    that they are three different questions rather than one asked three times.
+
+    `fix_severity_floor` is what the FILE says. `fix_floor` is what may be fixed at all
+    this round. `cleared_floor` is what the round was REQUIRED to clear, which a
+    positive budget separates from both."""
+    band = dict(fix_severity_floor="P3", round_trigger_floor="P2")
+    on = panel_seats.Dials(**band, low_severity_fix_lines=40)
+    assert (on.fix_floor, on.cleared_floor) == ("P3", "P2")
+    assert on.budgeted("P3") and not on.budgeted("P2") and not on.budgeted("P4")
+
+    zero = panel_seats.Dials(**band, low_severity_fix_lines=0)
+    assert (zero.fix_floor, zero.cleared_floor) == ("P2", "P2")
+    assert not zero.budgeted("P3"), "nothing is on a budget of zero"
+
+    off = panel_seats.Dials(**band, low_severity_fix_lines=None)
+    assert (off.fix_floor, off.cleared_floor) == ("P3", "P3")
+    assert not off.budgeted("P3")
+
+    # And with the floors met there is no band, so every answer collapses back.
+    met = panel_seats.Dials(fix_severity_floor="P2", round_trigger_floor="P2",
+                            low_severity_fix_lines=0)
+    assert (met.fix_floor, met.cleared_floor) == ("P2", "P2")
+    assert not met.budgeted("P2") and not met.budgeted("P3")
+
+    # The shape that catches a floor derived from the trigger floor without asking
+    # whether there is a band at all: a fix floor ABOVE the cut, where "raise the
+    # applied floor to the trigger floor" would LOWER it and a repo that asked to fix
+    # P1s only would start fixing P2s on the strength of a budget of zero.
+    strict = panel_seats.Dials(fix_severity_floor="P1", round_trigger_floor="P2",
+                               low_severity_fix_lines=0)
+    assert (strict.fix_floor, strict.cleared_floor) == ("P1", "P1")
+    assert not strict.budgeted("P1") and not strict.budgeted("P2")
+
+
+@pytest.mark.parametrize("written,applied", [
+    ({}, 40),                       # absent inherits the default
+    ({"low_severity_fix_lines": 0}, 0),
+    ({"low_severity_fix_lines": 12}, 12),
+    ({"low_severity_fix_lines": 12.0}, 12),       # a generator's integral float
+    ({"low_severity_fix_lines": " 12 "}, 12),     # a hand's string
+    ({"low_severity_fix_lines": None}, None),     # a written null is "no budget"
+    ({"low_severity_fix_lines": ""}, None),
+])
+def test_the_budget_reads_what_a_rules_file_can_legitimately_hold(written, applied):
+    """An ABSENT key inherits the default and a WRITTEN null does not, the distinction
+    `fix_growth_limit` draws and for a sharper reason: here `0` is a perfectly good
+    budget that means the OPPOSITE of off, so collapsing the two would leave one of the
+    two readings unwritable and a repo spelling "fix none of them" could get "fix all
+    of them"."""
+    assert panel_seats.low_severity_budget(dict(written), []) == applied
+
+
+@pytest.mark.parametrize("bad,accepted", [
+    ("a few", "a whole number"),
+    (12.5, "a whole number"),        # half a line is not a quantity numstat reports
+    ([], "a whole number"),
+    (True, "a whole number"),        # `isinstance(True, int)` — a 1-line budget, silently
+    (-1, "zero or more"),
+])
+def test_a_bad_budget_is_refused_rather_than_defaulted(bad, accepted):
+    """A bool is rejected before the integer read: `low_severity_fix_lines: false` is
+    the other way a hand writes "off", and Python would read it as a 1-line budget —
+    which is neither off nor anything else. A negative is refused rather than clamped:
+    a repo that wrote one meant something and nothing here can tell which."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.low_severity_budget({"low_severity_fix_lines": bad}, notes)
+    msg = str(refusal.value)
+    assert accepted in msg, msg
+    assert "0 to spend none, or null for no budget at all" in msg
+    assert notes == []
+
+
+def test_the_fixers_brief_carries_the_spend_rule_and_not_a_judgement_call():
+    """The prose half, and for this dial it is the half that does the work: nothing in
+    the panel can measure a fix that has not been made, so the panel budgets and the
+    fixer counts. A brief that named the budget without the procedure would be asking
+    the fixer to invent one, which is the discretion #297 exists to remove."""
+    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "low_severity_fix_lines" in flat
+    # Measure, then spend: the order is the whole of what makes cheapest-first
+    # possible, since a fix's cost is not knowable until it has been made.
+    assert "**Measure before you spend.**" in flat
+    assert "run `git diff --numstat` for it" in flat
+    assert "**Spend cheapest first, and stop when it runs out.**" in flat
+    # Exhaustion mid-list, and the list that fits entirely — both said, because a rule
+    # that only describes running out reads as "expect to lose some".
+    assert "Stop at the first one that does not fit" in flat
+    assert "If the whole list fits, the whole list gets fixed" in flat
+    assert 'never ask yourself whether a fix "risks ballooning"' in flat
+    # And the unpaid remainder has somewhere to go, or the budget reads as a licence
+    # to drop findings.
+    assert "recorded `deferred` against the issue you open for the batch" in flat
+
+
+def test_the_orchestrator_relays_the_marks_with_the_list():
+    """`/panel-review-pr` pastes the **To fix** list into a sub-agent's brief, and the
+    💸 marks are the only thing separating a budgeted finding from an unconditional
+    one. A list pasted without them briefs the pre-#297 behaviour."""
+    panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Paste the 💸 marks with the findings that carry them" in panel_md
+    assert "low_severity_fix_lines" in panel_md
+    # And the unpaid remainder joins the row the below-floor findings already use.
+    assert "budget ran out before it, which is the same row for the same reason" \
+        in panel_md
+
+
 # --------------------------------------------------------------- the report says which
 
 def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_path):
@@ -766,9 +1185,9 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     from whoever remembers the repo's config. Printed at the defaults too: a reader
     weighing a quiet round needs to know whether the quiet was measured or configured."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
-    assert ("**Panel dials** (`review_panel`): fix at/above P3 · another round at/above "
-            "P2 · reviewer scope diff · fix growth cap 3x · fixer may defer yes · "
-            "failing test required no") in report
+    assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
+            "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
+            "cap 3x · fixer may defer yes · failing test required no") in report
 
 
 def _release_pr(monkeypatch, config):
@@ -1064,3 +1483,85 @@ def test_only_a_copy_counts_as_supplying_a_file():
              "          cp -r ${./harness/commands} repo/harness/commands\n"
              "          install -Dm644 ${./.harness-rules.sample} repo/.harness-rules.sample\n")
     assert set(_FLAKE_COPY.findall(block)) == {"harness/commands", ".harness-rules.sample"}
+
+
+# ------------------------------------- which LAYER supplied the dials — #305
+
+
+#: A cfg as `resolve_repo` now returns one: the dials, and beside each of them the
+#: layer that answered. `_dials` is the whole of #305's reporting half, and the
+#: panel's job is to carry it onto the round rather than to compute it.
+def _layered(**board):
+    dials = {
+        "review_panel.fix_severity_floor": {
+            "value": "P3", "layer": "sample",
+            "source": "origin/main:.harness-rules.sample"},
+        "review_panel.max_rounds": {"value": 2, "layer": "defaults",
+                                    "source": "harness_rules.DEFAULTS"},
+        "reviewers.claude.enabled": {"value": True, "layer": "sample",
+                                     "source": "origin/main:.harness-rules.sample"},
+        # Deliberately outside the two review blocks: `resolve_repo` reports every
+        # dial in the config, and a round's artifact wants the ones that governed
+        # the round.
+        "loops.issue_executor": {"value": False, "layer": "defaults",
+                                 "source": "harness_rules.DEFAULTS"},
+    }
+    dials.update(board)
+    return {**PANEL_CFG, "_rules_from": "origin/main:.harness-rules.sample",
+            "_dials": dials, "_dials_from": "https://qb.example/dials",
+            "_dials_unreadable": False,
+            "review_panel": {"fix_severity_floor": "P3"}}
+
+
+def test_the_round_records_which_layer_supplied_each_dial(monkeypatch, capsys, tmp_path):
+    """`review_panel` said WHAT ran and never WHERE IT CAME FROM, and that is the
+    half the #299 incident turned on: the sample stated both floors at P2 while five
+    rounds put P4s in `to_fix`, and no artifact could settle which described the run.
+    """
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                        config=_layered())
+    said = payload["rules"]["dials"]
+    assert said["review_panel.fix_severity_floor"]["layer"] == "sample"
+    assert said["review_panel.max_rounds"]["layer"] == "defaults"
+    # Scoped to what governs a REVIEW. The loop schedule is a dial and did not.
+    assert "loops.issue_executor" not in said
+    assert payload["rules"]["baseline"] == ".harness-rules.sample"
+
+
+def test_a_round_that_ran_under_a_board_dial_says_so_in_the_public_notes(
+        monkeypatch, capsys, tmp_path):
+    """#52's "never silent" applied to the one layer that can move a floor without a
+    pull request. `config_notes` is where it goes because `--post` puts that list in
+    a public PR comment, so the reader of the review sees the floor it was run
+    against, who moved it and why."""
+    cfg = _layered(**{"review_panel.fix_severity_floor": {
+        "value": "P3", "layer": "board", "source": "https://qb.example/dials",
+        "scope": "repo", "reason": "trying P3 for a fortnight", "set_by": "rich",
+        "expires_at": "2999-01-01T00:00:00+00:00"}})
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], config=cfg)
+    said = [n for n in payload["config_notes"] if "from the BOARD" in n]
+    assert len(said) == 1
+    assert "review_panel.fix_severity_floor" in said[0]
+    assert "trying P3 for a fortnight" in said[0] and "rich" in said[0]
+    assert "2999-01-01" in said[0]
+    assert payload["rules"]["dials"][
+        "review_panel.fix_severity_floor"]["layer"] == "board"
+
+
+def test_a_round_whose_board_would_not_answer_says_that_too(monkeypatch, capsys,
+                                                            tmp_path):
+    """A configured board that did not answer is NOT the same fact as no dial being
+    set, and a round that quietly ran on the repo's own rules while a dial was in
+    force on the board is the disagreement this whole feature exists to end."""
+    cfg = {**_layered(), "_dials_unreadable": True}
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], config=cfg)
+    assert any("would not answer" in n for n in payload["config_notes"])
+    assert payload["rules"]["dials_unreadable"] is True
+
+
+def test_a_repo_with_no_board_dial_adds_no_note_at_all(monkeypatch, capsys, tmp_path):
+    """The quiet case has to stay quiet: a round on a repo nobody has set a dial for
+    reads exactly as it did before this landed."""
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                        config=_layered())
+    assert not [n for n in payload["config_notes"] if "BOARD" in n]
