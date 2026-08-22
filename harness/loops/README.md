@@ -1610,6 +1610,9 @@ Each finding record:
 | `needs_rereview`, `rereview_by` | a reporter declared that fixing this takes a structural change whose *result* should be read again, and which reporters said so — the declaration the next round is checked against |
 | `new_this_round` | no earlier round of this cycle raised this defect (`--baseline`); `false` on a repeat. A run with no baseline has no earlier round, so every finding is `true` — which is why a round past the first with no `--baseline` is a veto rather than a clean sweep |
 | `provenance` | **v2.24.** Which of the two things a `new_this_round` finding is: `introduced` (on a line the last fix pass wrote), `missed` (present in the earlier round's diff and not seen), `missed-unread` (in a file that round was truncated out of — a coverage failure, not a reviewer one), or `unknown` (no readable fix range, or a finding with no line to place). `null` where the question does not arise: outside a cycle, in round 1, or on a repeat — a repeat's provenance is not unknown, it is not asked, because the defect predates the fix pass under attribution |
+| `recurrence` | **#67.** Where the finding stands relative to the fix pass before it: `revisited` (the previous round complained about this file, the fixer wrote lines in it, and this finding is within ~20 lines of them), `fix-site` (the fixer wrote here and nobody had complained), `elsewhere`, or `unknown` (no readable fix range, no line, or a path that could name two changed files). `null` where the question does not arise, on the same three occasions `provenance` is null. **A position, not a verdict** — see below |
+| `recurs_of` | **#67.** The `key` of the earlier finding this one stands on, under `revisited` only. What makes the bucket checkable: an uncalibrated label nobody can trace back to the record it came from is not evidence |
+| `premise_verdict` | **#67.** The judge's own answer, asked as one extra key on the verdict it already writes: does this finding show the fix before it was built on a wrong assumption (`invalidates`), is it a separate defect (`separate`), or can it not be told (`unclear`)? `null`/absent where the question was not put — every round with no earlier round — which is not `unclear` |
 
 Provenance is a **signal, not a verdict**, and nothing gates on it. A fix can break something at a
 distance, so `missed` is evidence of a miss rather than proof of one — the same discipline as
@@ -1638,6 +1641,50 @@ Its known biases, since the defence of a heuristic is that they are written down
   — SonarCloud's new-code view — so the same reading holds; a Sonar issue that predates the PR
   would read `missed`, and that is the scanner's file scope rather than the panel's under-reading.
 
+### Recurrence (#67): is the loop making progress on this defect?
+
+`provenance` asks whether the last fix pass *wrote the line* a finding sits on. `recurrence` asks
+the question after it — was that fixer *sent* here? A fix that patches a wrong assumption produces
+the next round's findings; a fix that removes the assumption does not, and a round cap fires at the
+same point either way.
+
+**Nothing gates on it, and the first calibration is why that is right rather than merely cautious.**
+The mechanical bucket was replayed over 36 rounds from 26 pull requests — every multi-round cycle
+the board holds — against the three cycles #67 identifies as circling (#61, #29, #88) and every
+other cycle as the control:
+
+| narrowing | #61 / #29 / #88 | every other PR |
+|---|---|---|
+| same file + within 20 lines | 83% | 69% |
+| same file + within 5 lines | 79% | 64% |
+| same file + exactly on a written line | 65% | 52% |
+| …and the earlier finding within 20 lines | 29% | 27% |
+
+It does not separate them at any radius, and tightening the rule lowers both columns together. The
+reason is legible in the runs: under increment scope (#41) a later round **reads the fix commit**,
+so a new finding at the fix's site is the ordinary case rather than the exceptional one. That is why
+the bucket is named for a position (`revisited`) and not for a verdict (`circling`), and why the
+count is printed with no recommendation attached.
+
+The half that can see a repeated *premise* is the judge's, because it is the only party in the round
+holding both the earlier round's complaints and the commit that answered them. It gets them in a
+brief spliced into `JUDGE_PROMPT` at a slot that is swapped for the empty string on every round with
+no earlier round — so a round-1 judge prompt is byte-identical to the one it has always been given —
+and it answers on the verdict it is already writing, so the question costs no second model call. The
+brief spends most of its length pushing *away* from `invalidates`: a second bug in a file somebody
+just edited is a second bug, and a heuristic that triggers redesigns cheaply is worse than the cap
+it would replace.
+
+Both answers are stored, side by side, and never folded into one number — the rounds where the
+mechanical count and the judge disagree are the ones worth a human's attention.
+
+Not to be confused with **#84's premise register**, which is the other thing in this loop called a
+premise and *does* brake: that one is a fixer's own declaration of what it is about to fix on, and a
+repeat stops the pass. This is an adjudication of a finding. #67's record of PR #88 is the argument
+for keeping a self-report and an adjudication apart — the agent that wrote round 1's fix wrote
+round 2's regression of the same shape, in the same commit as a docstring stating the invariant it
+broke.
+
 Run-level fields it depends on:
 
 | field | what it is |
@@ -1645,6 +1692,7 @@ Run-level fields it depends on:
 | `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
+| `recurrence_counts`, `premise_counts` | **#67.** The two tallies over the same population, on exactly `provenance_counts`' terms (`{}` = the question does not arise; all-zero = it was asked and there was nothing). Two objects rather than one, because the whole value of asking twice is that they can disagree. `premise_counts` carries a `not-said` bucket — the judge having nothing to say is the commonest answer, and a shortfall against a denominator stored elsewhere would invent it |
 
 A baseline written before v2.24 carries no `head_sha`, so provenance degrades to `unknown` rather
 than attributing findings against a range it invented.
