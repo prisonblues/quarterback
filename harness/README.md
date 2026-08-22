@@ -21,7 +21,10 @@ board reconnects them.**
   on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
   that asks whether the board's plan still describes the present, `qb-pace`, which
   says how the shared subscription's five-hour and weekly windows stand and what a
-  job of N seats would cost against them — **and the board
+  job of N seats would cost against them, `qb-doctor`, the one command that answers
+  whether this host is wired up — comparing the board, the harness and the client
+  against each other, and checking the harness's own guards are *installed* rather
+  than merely present in git — **and the board
   client proper**: `qb-hook` (the lifecycle reflexes Claude Code fires), `qb-mcp`
   (the per-session stdio MCP shim), `qb-claude-setup` (the wiring), `qb` (the human
   CLI), and `qb-env`, the site-config library the four of them source
@@ -1443,6 +1446,153 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
+
+### `qb-doctor` — is this host wired up?
+
+Two questions nothing else on the box can answer, in one report.
+
+**The first is the one #204 was filed for.** Three independently versioned things have to
+agree — the board image, the harness on PATH, the Python client's venv — and no component
+can compare them, because each one can only see itself. So each one's staleness surfaces as
+a *different* one's error. In the order they were actually hit: `qb-dash` said
+`● board unreachable` about a board that was up (the image was six days old and had no
+`/claims` route); `qb-board` said "build a venv" about a venv that was fine (the checkout
+was 269 commits behind); the documented repair for that broke the MCP server, because the
+two documented commands install different halves of the package; and then `qb-board` said
+"this machine has no token" about a valid token. Four symptoms, none of which named its
+cause.
+
+**The second is whether the harness's own guards are INSTALLED.** On 2026-08-22 four
+mechanisms were found in one morning that had each been written, tested, documented and
+shipped — and wired up on no machine. The `qb-reconcile` timer was in-repo and on no host,
+so the board's plan went 39% wrong: 13 of 33 items pointing at closed issues. The
+`reference-transaction` stash guard was in `harness/githooks/` and in no repo, so an agent
+popped another worktree's work. `HUMAN_EDGE_SECRET` was documented in `DEPLOY.md` with a
+checklist and never deployed, so every human-only endpoint has 403'd since v2.39. Not one of
+them announced itself.
+
+```bash
+qb-doctor                     # every check against this host
+qb-doctor --fix               # also run the installers that are safe to re-run
+qb-doctor --json              # the whole report as JSON
+qb-doctor --repo DIR          # check that checkout instead of the cwd's
+qb-doctor --only hooks,edge   # just those rows
+qb-doctor --human-url URL     # the browser vhost, for the edge check
+qb-doctor --quiet             # only the rows that are not ok
+```
+
+```
+checkout   ~/source/quarterback            main @ b7c86be, 0 behind origin/main              ok
+board      https://qb.fo.ls                2.77.0, matching this checkout                    ok
+harness    …quarterback-harness-0.1.0/bin  behind this checkout: 25 differ                 FAIL
+client     …/mcp/.venv/bin/python          importable, from ~/source/quarterback/mcp         ok
+token      https://qb.fo.ls                resolved — this session is zeus                   ok
+hooks      …/.git/qb-hooks                 installed (qb-hook-forward, reference-transaction) ok
+stash      refs/stash                      guard active, 4 pre-guard entries remain        warn
+reconcile  qb-reconcile.timer              enabled, active, last run 12:26:55                ok
+edge       https://quarterback.fo.ls       302 — forward-auth, and this host has no session   ?
+tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
+```
+
+#### Look where the mechanism runs, not where its source lives
+
+`ls harness/githooks/reference-transaction` succeeds on a host with **no guard installed at
+all** — the file is in git, which is precisely what all four of the above had going for
+them. So `hooks` reads `core.hooksPath` and the files under the common git dir, `reconcile`
+asks `systemctl --user`, and `edge` makes a live request. Nothing here is satisfied by a
+path existing in the checkout.
+
+#### Four verdicts, because `unknown` is not `ok`
+
+| verdict | meaning |
+|---|---|
+| `ok` | the check ran and the answer is good |
+| `warn` | the check ran, the mechanism works, and it carries residue no installer can clear |
+| `FAIL` | the check ran and the answer is bad |
+| `?` | **the check could not be made** — and why |
+
+`unknown` is the one that matters, and it is the reason this tool exists rather than a
+shell alias. Three of the six symptoms on #204 are a check that could not run being reported
+as a check that passed: `prune-worktrees` calling a skipped database scan `Nothing to prune.
+Clean.` over a 13 MB orphan, `worktree-holder`'s exit 4 that `/tree-shake` proceeded on, and
+`qb-reconcile`'s `stopped` that the deployed board could not attribute. #324 settled the
+same argument for CI results a day before this landed. **A doctor that prints `ok` because
+it could not look is worse than one that does not check**, because it launders ignorance
+into assurance — and unlike a stale layer, a false green never announces itself later.
+
+The exit code keeps the same distinction: `0` healthy, `1` at least one check could not be
+made, `2` at least one failed, `3` it could not run at all.
+
+#### `warn` is for residue an installer cannot undo
+
+Installing the stash guard does not drain the entries pushed before it — the hook
+deliberately allows *deletions*, so old entries can still be cleared by hand. A freshly
+guarded repo is therefore protected going forward and still carries its old landmines, which
+is exactly the state this repo was in for weeks. `guard active, 4 pre-guard entries remain`
+is the report; a bare `ok` is not.
+
+#### `--fix` runs the safe half and prints the rest
+
+Each check carries at most one of two things, and they are separate fields so that nothing
+can run a command the author did not mark runnable:
+
+- **an installer** — idempotent, needing no secret, safe against a host that is already
+  correct. `qb-hooks install` and `systemctl --user enable --now qb-reconcile.timer` are
+  the two today. `--fix` runs these, then **re-checks the whole report** rather than
+  trusting the installer's exit code: "the command succeeded" and "the guard is now
+  installed" are the two sentences this tool exists to keep apart. It re-checks every
+  selected row, not just the fixed one, because one guard's state is another row's input.
+- **a command for a person** — printed, never executed. The edge secret needs a value
+  generated into 1Password *and* sops and two separate deploys; a tool that tried would
+  fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
+  precise remedy and the runbook path, which is what it prints.
+
+#### The edge row, and why it currently says `?`
+
+`app/auth.py`'s `human()` needs an edge-asserted `Remote-User` **and** the edge's own
+`X-Edge-Auth` secret. That is one boundary with two halves, so it is one row:
+
+- The **agent** vhost must refuse a `Remote-User` a caller supplied itself. Checked first,
+  because if it ever stopped stripping, anything that can reach the board could post as a
+  person. This half is checkable from any host and passes today.
+- The **browser** vhost must accept the person it authenticated. This is the half broken
+  since v2.39, and it is not visible from a machine with no forward-auth session: a `302` to
+  the auth portal is `?`, not `ok`. Set `QUARTERBACK_HUMAN_URL` so the row has somewhere to
+  ask, and `QUARTERBACK_EDGE_COOKIE` if you have a signed-in session; a `403` from that
+  request is the `FAIL` that says the secret is unset or disagrees between its two stores,
+  which is the only end-to-end detector there is, because nothing compares the stores.
+
+**A `403` is only that `FAIL` when the *board* sent it.** The auth proxy answers `401`/`403`
+to a caller with no session, and so does the app to a person the edge did not vouch for —
+identical codes, opposite diagnoses. So the body decides: `app/auth.py`'s refusal names
+`Remote-User`, `X-Edge-Auth` and `HUMAN_EDGE_SECRET` in full (deliberately, so an operator
+is not taught the wrong fix), and a refusal that does not look like that is a refusal this
+tool cannot attribute — `?`, with the proxy named as the likely author.
+
+Deliberately **not** done by asking the app whether the secret is configured: a new endpoint
+would be absent from the deployed image until the very redeploy that fixes the secret — a
+check that cannot answer until after the problem is solved.
+
+#### What the version rows compare
+
+- **board** — `GET /openapi.json`'s `.info.version` against `app/main.py`'s in this
+  checkout. Not a workaround: `CHANGELOG.md` opens by *defining* the board's version as that
+  field, and it is the same string `app/main.py` declares, so both sides are one fact
+  measured in two places. #199 would make it a first-class `/version` and make this cheaper,
+  not truer. A board that will not serve its metadata falls back to capability probing
+  (`/review-queue` answering `405` means ≥ v2.75) — which answers with a **range**, and a
+  range is not a version, so that path reports `?` with the floor as context and never a
+  pass.
+- **harness** — the files on PATH against this checkout's `harness/bin`, byte for byte.
+  Content rather than a version, because the nix flake pin is what versions the harness,
+  nothing bumps that pin automatically (#267), and no harness script can tell you it is
+  stale because each one only knows its own store path. Drift is reported in one direction:
+  a file the *install* has and the checkout does not is simply a harness newer than your
+  branch.
+- **client** — `mcp/.venv` exists, `mcp_server.server` and `mcp_server.board` both import,
+  **and** the editable install resolves to this checkout. All three, because "importable"
+  says nothing about which source tree answered (#203), and the documented repair for that
+  installs a different half of the package (#200).
 
 ## How it works
 

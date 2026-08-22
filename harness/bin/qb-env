@@ -32,6 +32,17 @@
 #                          the authoritative copy.
 #   QUARTERBACK_REPO       checkout holding mcp/ (for qb-mcp's venv).
 #   QUARTERBACK_AGENT      this machine's name in the token file. Defaults to hostname.
+#   QUARTERBACK_HUMAN_URL  optional; the BROWSER vhost, where a person is authenticated at
+#                          the edge. Read only by `qb-doctor`, which uses it to ask whether
+#                          human writes actually work (#204). Deliberately separate from
+#                          BASE_URL and deliberately without a default, for the same reason
+#                          BASE_URL has none: the two hostnames proxy to the same container
+#                          on this fleet and to nothing at all on a single-host deployment,
+#                          so deriving one from the other would send a probe somewhere
+#                          nobody asked for. Nothing renders it yet — home/scripts.nix
+#                          writes the five above — so until it does, `qb-doctor` takes it
+#                          from the environment or `--human-url`, and reports the row as
+#                          "could not check" rather than as a pass when it has neither.
 #
 # Environment beats the config file throughout, so a single invocation can override
 # any of it without editing anything.

@@ -44,7 +44,11 @@ stdenvNoCC.mkDerivation {
   # a layout is data on another machine, so it can only refer to it by name;
   # `qb-board`, which is a thing a human types on a headless box, which is
   # the whole point of it existing; `qb-reconcile`, which a systemd timer names
-  # as its ExecStart, for the same reason as the layout; and the board client's
+  # as its ExecStart, for the same reason as the layout; `qb-doctor`, which is
+  # what a person types when a box is behaving oddly and so is worth nothing at
+  # a path they would have to look up — and which additionally has to be on PATH
+  # to do its job, since one of the questions it answers is whether the harness
+  # ON PATH matches the checkout in front of you (#204); and the board client's
   # own four (#230) — `qb-hook`, which ~/.claude/settings.json names by absolute
   # path, `qb-mcp`, which ~/.claude.json does, `qb-claude-setup`, which writes
   # both of those from the home-manager activation, and `qb` for a human.
