@@ -2108,6 +2108,32 @@ own attribute names, and the fallback is to ask each configuration what `network
 it declares — correct, slow, and defeated by a host that does not evaluate here at all, which
 is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
 
+#### What `--apply` refuses, and why each one
+
+The proposal is a claim that *one particular system* was built. Every refusal below is the
+same sentence in a different place: what would be switched onto is not what was proven.
+
+- **Nothing prepared** — run `qb-bump` first.
+- **No terminal** — the next thing it does is ask for a password, so a timer, a CI job or an
+  agent gets the command printed and nothing else.
+- **The consumer's `flake.lock` moved** since the build. Re-preparing costs minutes.
+- **The cached lock is not the one that was built** — a second `qb-bump` wrote the cache
+  between the build and the apply, or a write was interrupted.
+- **The consumer has committed** since the build. `nixos-rebuild --flake <dir>` builds that
+  directory as it is now, so a commit landing afterwards means the proof is about a tree that
+  no longer exists.
+
+Two things are *said* rather than refused. Modified files in the consumer — the switch builds
+the working tree while the proof was of `HEAD`, and refusing over an uncommitted module would
+make the tool useless on the machine it was written for, so the count and the first few names
+are printed before the command. And a **later bump that was refused**: an earlier proposal
+that did build is still worth applying, so it is applied, having said that today's is broken.
+
+Preparation refuses one thing of its own: a consumer whose `flake.lock` is *already*
+uncommitted. Preparation builds `HEAD` plus one moved input, so applying the result would
+discard whatever lock change was in flight — and reading it instead is exactly what this file
+promises not to do.
+
 #### What a person is told, and where
 
 Through #274's door and in #279's vocabulary: `needs_human.announce`, class `environment` —

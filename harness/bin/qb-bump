@@ -296,7 +296,8 @@ class Consumer:
     """A flake that pins this repo: where it is, what it calls the input, what it pins."""
 
     flake: Path
-    input: str
+    input: str        #: what `nix flake update` is given — the root's name for it
+    node: str         #: what the lock stores it under, which is not always the name
     rev: str
     found_by: str
 
@@ -310,19 +311,45 @@ def repo_slug(repo: Path) -> str | None:
     return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
-def pins_repo(lock_text: str, slug: str) -> tuple[str, str] | None:
-    """``(input name, locked rev)`` if this lock pins `slug`, else None.
+def pins_repo(lock_text: str, slug: str) -> tuple[str, str, str] | None:
+    """``(input name, node id, locked rev)`` if this lock pins `slug` DIRECTLY, else None.
+
+    Two distinctions Codex made on the first cut of this file, and both of them
+    are the difference between updating the right thing and updating something
+    else:
+
+    **Direct inputs only.** `nodes` is the whole graph — every transitive
+    dependency of every input is in there — so scanning it finds a repository
+    that some other flake pins, in a consumer that does not pin it at all.
+    `nix flake update` cannot move such a node, and a lock that mentions this
+    repo three levels down is not a consumer of this harness. So the walk starts
+    at the root node's own `inputs`.
+
+    **The input's NAME is not the node's ID.** A lock disambiguates a second node
+    for the same flake as `quarterback_2`, and `nix flake update quarterback_2`
+    is not a command: the name to pass is the one the root node uses. Both are
+    returned, because the name is what updates and the id is what the lock is
+    read by.
 
     Matched on the LOCKED half rather than the original: an input written as
     `github:owner/repo` and one written as a `git+https` URL to the same
     repository are the same pin, and the locked node is where both spell it out.
     """
     try:
-        nodes = json.loads(lock_text).get("nodes") or {}
+        doc = json.loads(lock_text)
+        nodes = doc.get("nodes") or {}
+        root = nodes.get(doc.get("root") or "root") or {}
+        direct = root.get("inputs") or {}
     except (ValueError, AttributeError):
         return None
     owner, _, name = slug.partition("/")
-    for input_name, node in nodes.items():
+    for input_name, node_id in direct.items():
+        # A `follows` is spelled as a LIST (a path through the graph) rather than
+        # a node id. Such an input is somebody else's node by definition, so it is
+        # not the input a bump of this repo would move.
+        if not isinstance(node_id, str):
+            continue
+        node = nodes.get(node_id)
         locked = node.get("locked") if isinstance(node, dict) else None
         if not isinstance(locked, dict):
             continue
@@ -332,7 +359,7 @@ def pins_repo(lock_text: str, slug: str) -> tuple[str, str] | None:
             url = str(locked.get("url", "")).lower()
             same = bool(url) and slug.lower() in url
         if same:
-            return input_name, str(locked.get("rev", ""))
+            return str(input_name), node_id, str(locked.get("rev", ""))
     return None
 
 
@@ -393,7 +420,7 @@ def scan_roots(roots: list[Path], slug: str) -> list[Consumer]:
                 continue
             hit = pins_repo(text, slug)
             if hit:
-                found.append(Consumer(flake=flake, input=hit[0], rev=hit[1],
+                found.append(Consumer(flake=flake, input=hit[0], node=hit[1], rev=hit[2],
                                       found_by=f"found by scanning {root}"))
     return found
 
@@ -415,7 +442,8 @@ def named_consumer(where: Path, slug: str, how: str) -> tuple[Consumer | None, s
     if not hit:
         return None, (f"{how} names {where}, whose flake.lock does not pin {slug} — "
                       "so bumping it would not carry this harness anywhere")
-    return Consumer(flake=where.resolve(), input=hit[0], rev=hit[1], found_by=how), ""
+    return Consumer(flake=where.resolve(), input=hit[0], node=hit[1], rev=hit[2],
+                    found_by=how), ""
 
 
 def resolve_consumer(flake_arg: str | None, cfg: dict[str, str],
@@ -531,6 +559,15 @@ class Proposal:
     prepared: float
     prepared_by: str
     drift: dict
+    #: The consumer's HEAD when this was built. What was proven is THAT commit
+    #: plus one moved input, so a consumer who commits afterwards has a system
+    #: nothing here has built, and `--apply` refuses rather than switch onto it.
+    base_head: str = ""
+    #: Tracked files that were modified in the consumer when this was built,
+    #: `flake.lock` aside. They were NOT part of what was built — preparation
+    #: reads HEAD — but `nixos-rebuild --flake <dir>` builds the working tree, so
+    #: a switch WILL include them. Recorded so the person switching is told.
+    dirty: list = field(default_factory=list)
 
     @property
     def moved(self) -> bool:
@@ -553,6 +590,29 @@ def export_head(flake: Path, into: Path) -> str:
     with tarfile.open(fileobj=io.BytesIO(p.stdout), mode="r|") as tar:
         tar.extractall(into, filter="data")
     return ""
+
+
+def head_of(flake: Path) -> str:
+    rc, out, _ = run(["git", "-C", str(flake), "rev-parse", "HEAD"])
+    return out if rc == 0 else ""
+
+
+def dirty_tracked(flake: Path) -> list[str]:
+    """Tracked files modified in the consumer, `flake.lock` aside.
+
+    `flake.lock` is excluded because it is the one file this change is ABOUT and
+    :func:`lock_is_committed` has already refused if it was dirty for any other
+    reason.
+
+    `diff --name-only` rather than `status --porcelain`: the porcelain format puts
+    two status characters before the path, and this file's `run` strips the output
+    — which ate the leading space of the first line and with it the first letter of
+    the first filename. Names, not statuses, is what a caller wants anyway.
+    """
+    rc, out, _ = run(["git", "-C", str(flake), "diff", "--name-only", "HEAD"])
+    if rc != 0:
+        return []
+    return [n for n in (line.strip() for line in out.splitlines()) if n and n != "flake.lock"]
 
 
 def lock_is_committed(flake: Path) -> str:
@@ -604,7 +664,7 @@ def prepare(consumer: Consumer, attr: str, script: str,
             return None, "", f"`nix flake update {consumer.input}` failed: {tail(err, 8)}"
         new_lock = (tmp / "flake.lock").read_text(encoding="utf-8")
         try:
-            new_rev = str(json.loads(new_lock)["nodes"][consumer.input]["locked"]["rev"])
+            new_rev = str(json.loads(new_lock)["nodes"][consumer.node]["locked"]["rev"])
         except (ValueError, KeyError, TypeError):
             return None, "", "the updated lock has no rev for the input that was updated"
         rc, out, err = nix("build", f"path:{tmp}#nixosConfigurations.{attr}"
@@ -612,9 +672,11 @@ def prepare(consumer: Consumer, attr: str, script: str,
                            "--no-link", "--print-out-paths", timeout=BUILD_TIMEOUT)
         log = err or out
         if rc != 0:
+            save_refusal(new_rev, log)
             return None, log, (f"the bumped flake does not build "
                                f"(nix build exited {rc}) — not proposing it")
         proposal = Proposal(
+            base_head=head_of(consumer.flake), dirty=dirty_tracked(consumer.flake),
             flake=str(consumer.flake), attr=attr, input=consumer.input,
             old_rev=consumer.rev, new_rev=new_rev, out_path=out.splitlines()[-1] if out else "",
             base_lock_sha=sha(base_lock), new_lock_sha=sha(new_lock),
@@ -633,6 +695,33 @@ def save(proposal: Proposal, lock_text: str, log: str) -> None:
     (CACHE / "build.log").write_text(log, encoding="utf-8")
     (CACHE / "proposal.json").write_text(json.dumps(asdict(proposal), indent=2),
                                          encoding="utf-8")
+
+
+def save_refusal(rev: str, log: str) -> None:
+    """Record that a bump to `rev` was refused, beside whatever is cached.
+
+    The cache is not cleared, and that is the decision rather than an oversight.
+    An earlier proposal that DID build is still worth applying — it carries the
+    machine most of the way and it was proven — so throwing it away would answer a
+    refusal by leaving the person with nothing. What must not happen is applying
+    it silently after being told today's bump is broken, which is why `--apply`
+    reads this file and says so first.
+    """
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        (CACHE / "refused.json").write_text(
+            json.dumps({"rev": rev, "at": time.time(), "log": tail(log, 8)}, indent=2),
+            encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_refusal() -> dict | None:
+    try:
+        got = json.loads((CACHE / "refused.json").read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else None
+    except (OSError, ValueError):
+        return None
 
 
 def load() -> Proposal | None:
@@ -748,6 +837,25 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
         print(f"qb-bump: {CACHE / 'flake.lock'} is gone, so the lock this proposal names "
               "cannot be installed. Re-run `qb-bump`.", file=sys.stderr)
         return 3
+    if sha(fresh) != proposal.new_lock_sha:
+        # The cached lock is not the one this proposal was built from — a second
+        # qb-bump wrote the cache between the build and this call, or a write was
+        # interrupted. Installing it would switch onto a lock nothing here built,
+        # which is the one thing this file exists to prevent.
+        print(f"qb-bump: the cached lock is not the one this proposal was built from "
+              "(another run wrote it, or a write was interrupted). Re-run `qb-bump`.",
+              file=sys.stderr)
+        return 3
+    now = head_of(Path(proposal.flake))
+    if proposal.base_head and now and now != proposal.base_head:
+        print(f"qb-bump: {proposal.flake} has committed {proposal.base_head[:12]} -> "
+              f"{now[:12]} since this bump was built, so the system that was proven is not "
+              "the one a switch would build now. Re-run `qb-bump`.", file=sys.stderr)
+        return 3
+    refusal = load_refusal()
+    if refusal and refusal.get("at", 0) > proposal.prepared:
+        print(f"note: a later bump (to {str(refusal.get('rev', ''))[:12]}) was refused "
+              "because it does not build. This applies the earlier one, which does.")
     already = sha(current) == proposal.new_lock_sha
     if not already and sha(current) != proposal.base_lock_sha:
         print(f"qb-bump: {lock} has changed since this bump was prepared — the build that "
@@ -770,6 +878,15 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
         print(f"wrote {lock}: {proposal.input} {proposal.old_rev[:12]} -> "
               f"{proposal.new_rev[:12]}")
         print("(that file is the ONLY thing this wrote; committing it is yours)")
+    if proposal.dirty:
+        # `nixos-rebuild --flake <dir>` builds the WORKING TREE; this built HEAD.
+        # Said rather than refused: an uncommitted module is a normal state for a
+        # person's own flake, and refusing here would make the tool useless on the
+        # machine it was written for. What it must not do is let somebody believe
+        # the switch ahead of them is the one that was proven.
+        print(f"note: {len(proposal.dirty)} modified file(s) in {proposal.flake} "
+              f"({', '.join(proposal.dirty[:3])}) were NOT part of what was built — the "
+              "switch below builds your working tree, so it includes them.")
     print(" ".join(cmd))
     os.execvp("sudo", cmd)
     return 0  # unreachable; execvp does not return

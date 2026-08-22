@@ -80,9 +80,14 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _lock(rev: str, owner: str = "prisonblues", repo: str = "quarterback",
-          name: str = "quarterback") -> str:
-    return json.dumps({"nodes": {name: {"locked": {
-        "type": "github", "owner": owner, "repo": repo, "rev": rev}}}, "root": "root"})
+          name: str = "quarterback", node: str | None = None, extra: dict | None = None) -> str:
+    """A flake.lock in the shape nix writes one: a root node naming its inputs, and a
+    node per input keyed by an id that is USUALLY but not always the input's name."""
+    node = node or name
+    nodes = {"root": {"inputs": {name: node}},
+             node: {"locked": {"type": "github", "owner": owner, "repo": repo, "rev": rev}}}
+    nodes.update(extra or {})
+    return json.dumps({"nodes": nodes, "root": "root", "version": 7})
 
 
 @pytest.fixture
@@ -188,15 +193,15 @@ def test_a_doctor_that_answers_rubbish_is_unknown(tmp_path, quarterback_repo):
 # --------------------------------------------------------------------------- #
 
 def test_a_lock_that_pins_the_repo_is_recognised_by_owner_and_name():
-    assert qb.pins_repo(_lock("b" * 40), "prisonblues/quarterback") == ("quarterback",
-                                                                       "b" * 40)
+    assert qb.pins_repo(_lock("b" * 40), "prisonblues/quarterback") == (
+        "quarterback", "quarterback", "b" * 40)
 
 
 def test_a_lock_that_pins_it_by_url_is_recognised_too():
-    text = json.dumps({"nodes": {"qb": {"locked": {
+    text = json.dumps({"nodes": {"root": {"inputs": {"qb": "qb"}}, "qb": {"locked": {
         "type": "git", "url": "https://github.com/prisonblues/quarterback.git",
-        "rev": "c" * 40}}}})
-    assert qb.pins_repo(text, "prisonblues/quarterback") == ("qb", "c" * 40)
+        "rev": "c" * 40}}}, "root": "root"})
+    assert qb.pins_repo(text, "prisonblues/quarterback") == ("qb", "qb", "c" * 40)
 
 
 def test_a_lock_that_pins_something_else_is_not_a_consumer():
@@ -209,6 +214,7 @@ def test_the_scan_finds_a_consumer_one_level_down(tmp_path, consumer_repo, monke
     consumer, why = qb.resolve_consumer(None, {}, "prisonblues/quarterback")
     assert why == "" and consumer.flake == consumer_repo.resolve()
     assert consumer.input == "quarterback" and consumer.rev == "a" * 40
+    assert consumer.node == "quarterback"
 
 
 def test_two_consumers_refuse_rather_than_pick_one(tmp_path, consumer_repo, monkeypatch):
@@ -375,8 +381,8 @@ def _fake_nix(new_rev: str, build_rc: int = 0, build_err: str = ""):
 def test_a_prepared_bump_records_what_was_built_and_from_what(consumer_repo, monkeypatch):
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
-    consumer = qb.Consumer(flake=consumer_repo, input="quarterback", rev="a" * 40,
-                           found_by="--flake")
+    consumer = qb.Consumer(flake=consumer_repo, input="quarterback", node="quarterback",
+                           rev="a" * 40, found_by="--flake")
     drift = qb.Drift(verdict="fail", detail="behind", missing=["qb-admit"], differ=[])
     proposal, log, why = qb.prepare(consumer, "desktop", str(BIN / "qb-bump"), drift)
     assert why == "" and proposal is not None
@@ -393,7 +399,7 @@ def test_the_consumers_working_tree_is_untouched_by_a_preparation(consumer_repo,
     before = (consumer_repo / "flake.lock").read_text()
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
-    qb.prepare(qb.Consumer(consumer_repo, "quarterback", "a" * 40, "--flake"), "desktop",
+    qb.prepare(qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"), "desktop",
                str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
     assert (consumer_repo / "flake.lock").read_text() == before
     assert _git(consumer_repo, "status", "--porcelain") == ""
@@ -408,7 +414,7 @@ def test_a_bump_that_does_not_build_is_refused_and_carries_its_error(consumer_re
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40, build_rc=1, build_err=collision))
     proposal, log, why = qb.prepare(
-        qb.Consumer(consumer_repo, "quarterback", "a" * 40, "--flake"), "desktop",
+        qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"), "desktop",
         str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
     assert proposal is None
     assert "does not build" in why and "not proposing it" in why
@@ -473,7 +479,7 @@ def test_nothing_in_the_agent_path_ever_runs_nixos_rebuild(consumer_repo, quarte
 def prepared(consumer_repo, monkeypatch) -> "qb.Proposal":
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
-    proposal, _, _ = qb.prepare(qb.Consumer(consumer_repo, "quarterback", "a" * 40, "--flake"),
+    proposal, _, _ = qb.prepare(qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),
                                 "desktop", str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
     return proposal
 
@@ -634,3 +640,100 @@ def test_a_host_with_no_nix_says_that_rather_than_something_downstream(quarterba
     monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
     assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
     assert "no nix on this host" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# what Codex found on the first cut, each with the test that would have caught it
+# --------------------------------------------------------------------------- #
+
+def test_a_repo_pinned_only_by_a_transitive_dependency_is_not_a_consumer():
+    """`nodes` is the whole graph. A flake that pins something that pins this repo is
+    not a consumer of this harness, and `nix flake update` could not move that node
+    anyway — so scanning every node finds consumers that are not consumers."""
+    text = json.dumps({
+        "root": "root",
+        "nodes": {"root": {"inputs": {"other": "other"}},
+                  "other": {"inputs": {"quarterback": "quarterback"},
+                            "locked": {"type": "github", "owner": "someone",
+                                       "repo": "other", "rev": "1" * 40}},
+                  "quarterback": {"locked": {"type": "github", "owner": "prisonblues",
+                                             "repo": "quarterback", "rev": "2" * 40}}}})
+    assert qb.pins_repo(text, "prisonblues/quarterback") is None
+
+
+def test_the_name_to_update_is_the_roots_name_not_the_locks_node_id():
+    """A lock disambiguates a second node for one flake as `quarterback_2`, and
+    `nix flake update quarterback_2` is not a command. The name updates; the id reads."""
+    text = _lock("3" * 40, name="qb", node="quarterback_2")
+    assert qb.pins_repo(text, "prisonblues/quarterback") == ("qb", "quarterback_2", "3" * 40)
+
+
+def test_an_input_that_merely_follows_another_is_not_the_input_to_bump():
+    """A `follows` is a path through the graph, spelled as a list — somebody else's
+    node by definition, and not the one a bump of this repo would move."""
+    text = json.dumps({
+        "root": "root",
+        "nodes": {"root": {"inputs": {"quarterback": ["other", "quarterback"]}},
+                  "other": {"locked": {"type": "github", "owner": "prisonblues",
+                                       "repo": "quarterback", "rev": "4" * 40}}}})
+    assert qb.pins_repo(text, "prisonblues/quarterback") is None
+
+
+def test_a_refusal_is_recorded_so_a_later_apply_of_an_older_bump_says_so(prepared,
+                                                                        consumer_repo,
+                                                                        monkeypatch, capsys):
+    """The proposal from this morning still builds and is still worth applying. What must
+    not happen is applying it in silence right after being told today's bump is broken."""
+    monkeypatch.setattr(qb, "nix", _fake_nix("c" * 40, build_rc=1, build_err="error: nope"))
+    qb.prepare(qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),
+               "desktop", str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda f, argv: None)
+    assert qb.apply(qb.load(), dry_run=False) == 0
+    out = capsys.readouterr().out
+    assert "was refused" in out and "cccccccccccc" in out
+
+
+def test_apply_refuses_a_cached_lock_that_is_not_the_one_that_was_built(prepared,
+                                                                       consumer_repo,
+                                                                       monkeypatch, capsys):
+    """A second qb-bump wrote the cache between the build and this call, or a write was
+    interrupted. Either way the lock on disk is not the lock that was proven."""
+    (qb.CACHE / "flake.lock").write_text(_lock("e" * 40))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda *a: pytest.fail("switched onto an unbuilt lock"))
+    assert qb.apply(prepared, dry_run=False) == 3
+    assert "not the one this proposal was built from" in capsys.readouterr().err
+    assert (consumer_repo / "flake.lock").read_text() == _lock("a" * 40)
+
+
+def test_apply_refuses_when_the_consumer_has_committed_since_the_build(prepared,
+                                                                      consumer_repo,
+                                                                      monkeypatch, capsys):
+    """`nixos-rebuild --flake <dir>` builds that directory as it is now. A commit landing
+    after the build means the system that was proven is not the one a switch would make."""
+    (consumer_repo / "modules.nix").write_text("{ }\n")
+    _git(consumer_repo, "add", "-A")
+    _git(consumer_repo, "-c", "user.email=t@t", "-c", "user.name=t",
+         "-c", "commit.gpgsign=false", "commit", "-q", "-m", "later")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda *a: pytest.fail("switched onto a stale build"))
+    assert qb.apply(prepared, dry_run=False) == 3
+    assert "since this bump was built" in capsys.readouterr().err
+
+
+def test_a_modified_file_in_the_consumer_is_named_before_the_switch(consumer_repo,
+                                                                    monkeypatch, capsys):
+    """Not refused — an uncommitted module is a normal state for somebody's own flake, and
+    refusing would make this useless on the machine it was written for. But the switch
+    builds the working tree while the proof was of HEAD, so it has to be said."""
+    (consumer_repo / "flake.nix").write_text("{ outputs = _: { }; }  # edited\n")
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    proposal, _, why = qb.prepare(
+        qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),
+        "desktop", str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
+    assert why == "" and proposal.dirty == ["flake.nix"]
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda f, argv: None)
+    assert qb.apply(proposal, dry_run=False) == 0
+    assert "NOT part of what was built" in capsys.readouterr().out
