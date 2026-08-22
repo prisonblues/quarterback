@@ -197,7 +197,7 @@ function row(it, s){
         ${refHtml(it)}
         <span class="title">${esc(it.title)}</span>
         ${it.repo===null&&s!==null?`<span class="chip fleet">fleet</span>`:""}
-        ${isProject(it.repo)&&s===undefined?`<span class="chip project">project</span>`:""}
+        ${isProject(it.repo)&&it.repo!==s?`<span class="chip project">project</span>`:""}
         ${it.plan?`<span class="chip plan">${esc(it.plan.label)}</span>`:""}
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
         ${!held&&it.covered_by?`<span class="chip covered">in ${esc((it.plan&&it.plan.label)||"a plan")} held by ${who(it.covered_by.holder)}</span>`:""}

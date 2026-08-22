@@ -264,8 +264,8 @@ async def _declared_scope(session: AsyncSession, repo: str) -> str:
     **The 422 is the whole anti-typo gate**, so it carries what a caller needs to
     get it right rather than only what it got wrong: an agent that mistyped a live
     scope sees the real one in the list and fixes itself, and an agent that meant a
-    new one learns it is not its call to make. Listing them costs one query on a
-    path that is already refusing.
+    new one learns it is not its call to make. The list is read only on the way to
+    that refusal — the path that succeeds asks one indexed question and is done.
 
     The shape is checked first and separately. ``project:`` with nothing after it
     is a malformed scope and not an undeclared one, and answering "no scope called
@@ -276,9 +276,9 @@ async def _declared_scope(session: AsyncSession, repo: str) -> str:
         wanted = canonical_scope(repo)
     except BadRef as e:
         raise HTTPException(422, str(e)) from None
-    known = list(await session.scalars(select(PlanScope.name).order_by(PlanScope.name)))
-    if wanted in known:
+    if await session.scalar(select(PlanScope.name).where(PlanScope.name == wanted)):
         return wanted
+    known = list(await session.scalars(select(PlanScope.name).order_by(PlanScope.name)))
     raise HTTPException(422, detail={
         "error": f"no scope called {wanted!r} has been declared",
         "scope": wanted,
