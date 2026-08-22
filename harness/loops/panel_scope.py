@@ -1460,9 +1460,11 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
     Three things this must not do, all of them the same discipline this codebase
     applies to NULL vs `[]`:
 
-    * **`PENDING`/`unknown`/`none` must never read as `PASS`.** "CI has not run
-      yet" and "CI passed" are different facts, and a reviewer told the wrong one
-      is worse off than one told nothing. Each of the five states says which it is.
+    * **`PENDING`/`blocked`/`none`/`unknown` must never read as `PASS`.** "CI has
+      not run yet" and "CI passed" are different facts, and a reviewer told the
+      wrong one is worse off than one told nothing. Each of the six states says
+      which it is — `blocked` being #324's, for a run that exists, will not execute
+      without a person, and so reports nothing at all.
     * **A pass is not a licence to stop looking.** It says every test we thought
       to write passed — not that the code is correct. A reviewer treating green as
       evidence of correctness has stopped reviewing, and this repo's whole
@@ -1486,9 +1488,20 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
     elif status == "PENDING":
         body = ("STILL RUNNING, so its result is NOT known. This is not a pass. Anything you "
                 "would have checked against a green suite is still unchecked.")
+    elif status == "blocked":
+        # #324. This state did not exist, and the run it describes is the reason
+        # PR #282 sat for two days looking untouched: two commits pushed to fix a
+        # red suite came back `action_required`, executed nothing, and emptied the
+        # check list. "No checks" read as "nobody has pushed yet".
+        body = ("EXISTS BUT WILL NOT RUN. A workflow run was created for this commit and "
+                "is waiting on a human to approve it, so it has executed nothing and "
+                "reports nothing. This is not a pass and it is not 'not started' — "
+                "nothing will change until a person clicks. Whatever the last suite on "
+                "this branch concluded is still the newest real result.")
     elif status == "none":
-        body = ("no checks are configured for this repository, so there is no suite result "
-                "either way. This is not a pass.")
+        body = ("NO RUN EXISTS for this commit, so there is no suite result either way. "
+                "This is not a pass. It means nothing mechanical has looked at this "
+                "code, which is a fact about the commit rather than about the repo.")
     else:
         body = ("could NOT be read"
                 + (f" ({skip})" if skip else "")
@@ -1496,14 +1509,56 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
     return f"{head} {body}"
 
 
+#: `qbdata.CI_STATES` in this function's own vocabulary. The panel has spoken PASS
+#: /FAIL/PENDING since #91 and those names are in prompts, payloads and a refusal
+#: notice, so #324's two new states join them rather than renaming the three that
+#: already exist.
+CI_STATE_WORDS = {"green": "PASS", "red": "FAIL", "pending": "PENDING",
+                  "blocked": "blocked", "none": "none", "unknown": "unknown"}
+
+
+def _settle_no_checks(gh_repo: str, pr_number: int) -> tuple[str, str]:
+    """`(status, why)` when `gh pr checks` reported nothing at all.
+
+    `gh pr checks` says "no checks reported on the X branch" for two situations
+    that are not remotely the same: a repo with no CI, and a run GitHub created and
+    parked behind its workflow-approval gate — which executes nothing, contributes
+    no check runs and so is invisible to every checks endpoint there is. This asks
+    the workflow-runs API, which is the only place a gated run can be seen (#324).
+
+    A second fetch, and only here. The rule `ci_brief` states — never add a fetch
+    to make a prompt tidier — is about tidiness; this is the difference between
+    telling a reviewer "there is no CI here" and telling it the truth.
+    """
+    import harness_rules                                    # noqa: PLC0415
+    try:
+        raw = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
+             "--json", "headRefOid,headRefName,statusCheckRollup"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60)
+        pr = json.loads(raw.stdout or "{}") if raw.returncode == 0 else {}
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as e:
+        return "unknown", f"the PR's head could not be read ({e.__class__.__name__})"
+    if not pr:
+        return "unknown", "the PR's head could not be read"
+    report = harness_rules.ci_report(pr, gh_repo)
+    return CI_STATE_WORDS.get(report.state, "unknown"), report.reason
+
+
 def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]:
     """Fetch the PR's CI status via `gh pr checks`. Returns
-    (status, failing, skip_reason); status is PASS | FAIL | PENDING | none | unknown
-    and `failing` names the non-passing checks. This is a HARD-gate signal: a clean
+    (status, failing, skip_reason); status is PASS | FAIL | PENDING | blocked |
+    none | unknown and `failing` names the non-passing checks. This is a HARD-gate
+    signal: a clean
     LLM/Sonar panel means little if CI (the repo's pytest run — slow tests and all)
     is red or still pending. Panel only SURFACES it; the merge gate itself lives in
     fix-and-land's own `gh pr checks` step. `gh pr checks` exits non-zero when checks
-    fail/pend, but still prints the JSON, so we parse stdout regardless of exit code."""
+    fail/pend, but still prints the JSON, so we parse stdout regardless of exit code.
+
+    `blocked` is #324's addition and the state that had no name: a run exists, is
+    waiting on a human to approve it, and will never report. Reaching it costs a
+    second fetch, taken only on the path that would otherwise have said `none`.
+    """
     try:
         proc = subprocess.run(
             ["gh", "pr", "checks", str(pr_number), "--repo", gh_repo,
@@ -1517,7 +1572,8 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
         tail = (proc.stderr or "").strip().splitlines()
         hint = tail[-1][:80] if tail else f"exit {proc.returncode}"
         if "no checks" in hint.lower():
-            return "none", [], None
+            settled, why = _settle_no_checks(gh_repo, pr_number)
+            return settled, [], (f"ci: {why}" if settled == "unknown" and why else None)
         return "unknown", [], f"ci: {hint}"
     try:
         checks = json.loads(raw)
@@ -1527,7 +1583,8 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
     failing = [str(c.get("name", "?")) for c in checks
                if isinstance(c, dict) and str(c.get("bucket", "")).lower() == "fail"]
     if not buckets:
-        return "none", [], None
+        settled, why = _settle_no_checks(gh_repo, pr_number)
+        return settled, [], (f"ci: {why}" if settled == "unknown" and why else None)
     if "fail" in buckets:
         return "FAIL", failing, None
     if "pending" in buckets:
@@ -1550,6 +1607,7 @@ __all__ = [
     "_changed_lines", "Integration", "MergeReading", "merge_involvement",
     "_is_commitish", "_is_ref", "_same_commit",
     "_prior_round", "PR_SCOPE_HEADER", "INCREMENT_BRIEF", "JUDGE_INCREMENT_BRIEF",
+    "CI_STATE_WORDS", "_settle_no_checks",
     "ReviewScope", "_cut_note", "_cut_note_reserve", "_SONAR_SEV",
     "_sonar_findings", "_try", "review_sonarqube", "ci_brief",
     "review_ci",

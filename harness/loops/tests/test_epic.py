@@ -136,9 +136,32 @@ def test_pr_green_pending(monkeypatch):
     assert epic.pr_green("o/r", 1) == (False, "pending")
 
 
-def test_pr_green_no_checks(monkeypatch):
+@pytest.mark.parametrize("state", ["none", "blocked", "unknown"])
+def test_no_checks_reported_is_never_green_enough_to_stack(monkeypatch, state):
+    """#324, at the highest stake in the harness: this decides whether the epic
+    driver merges a sub-PR into the integration branch, and it used to read "no
+    checks reported" as GREEN. A run behind GitHub's approval gate reports exactly
+    that while the branch's last executed suite is red — so the driver would have
+    stacked a broken sub-PR on the strength of silence."""
     _fake_gh(monkeypatch, stdout="", stderr="no checks reported on the 'x' branch", rc=1)
-    assert epic.pr_green("o/r", 1) == (True, "none")
+    monkeypatch.setattr(epic, "_settle_no_checks", lambda repo, pr: state,
+                        raising=False)
+    assert epic.pr_green("o/r", 1) == (False, state)
+
+
+def test_no_checks_is_settled_by_asking_rather_than_assumed(monkeypatch):
+    """The blank line has three meanings and `gh pr checks` cannot tell them apart, so
+    the driver has to ASK the one endpoint a gated run is visible from. It used to
+    assume, and the assumption it made was the generous one."""
+    _fake_gh(monkeypatch, stdout="", stderr="no checks reported on the 'x' branch", rc=1)
+    asked = []
+
+    def settle(repo, pr):
+        asked.append((repo, pr))
+        return "blocked"
+    monkeypatch.setattr(epic, "_settle_no_checks", settle, raising=False)
+    assert epic.pr_green("o/r", 1) == (False, "blocked")
+    assert asked == [("o/r", 1)]
 
 
 # --------------------------------------------------------------- trust resolution

@@ -673,10 +673,8 @@ class Dash(App):
         self.prs, self.pr_err = prs, err
         table = self.query_one("#prs", DataTable)
         table.clear()
-        red = 0
         for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
             glyph, colour = qd.ci_state(pr)
-            red += colour == "red"
             # By repo AND number. Two watched repos both reach #42 eventually,
             # and the bare number handed this table the same row key twice (#209).
             key = f"pr:{qd.repo_ref(pr)}"
@@ -695,7 +693,15 @@ class Dash(App):
                 key=key,
             ).value
             self.rows[str(key)] = pr
-        title = f"OPEN PRs · {len(prs)}" + (f" · {red} red" if red else "")
+        # Every non-green state, not just red. A PR whose runs are gated used to
+        # contribute to no number here at all, which is #324's whole complaint:
+        # the screen said "12 open PRs, 0 red" while one of them had failed and
+        # been buried under an approval gate.
+        counts = qd.ci_counts(prs)
+        tally = "".join(f" · {counts[s]} {w}" for s, w in
+                        (("red", "red"), ("blocked", "blocked"), ("pending", "running"),
+                         ("none", "untested"), ("unknown", "unread")) if counts.get(s))
+        title = f"OPEN PRs · {len(prs)}" + tally
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
         self.query_one("#t_prs", Static).update(title)

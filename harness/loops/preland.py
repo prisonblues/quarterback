@@ -116,7 +116,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # never raises, and it returns the HTTP status because one check has to tell an
 # older board from a broken one.
 from harness_rules import (  # noqa: E402
-    BOARD_TIMEOUT, RepoNotFound, board_config, check_status, describe, resolve_repo,
+    BOARD_TIMEOUT, RepoNotFound, board_config, ci_report, describe, resolve_repo,
 )
 # #278's reading lives in `panel_scope` because that is where the review target is
 # decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
@@ -432,32 +432,65 @@ def check_checkout(root: str, pr: dict) -> Check:
     return c
 
 
-def check_ci(pr: dict) -> Check:
+#: What each non-green check state costs a merge, in the words this gate refuses
+#: with. Keyed on `qbdata.CI_STATES`, so a state added there and forgotten here
+#: falls through to the catch-all below rather than passing silently.
+CI_REFUSALS = {
+    "red": "CI is failing — never merge on red",
+    "pending": "CI has not finished; a pending check is not a green one",
+    # #324, and the state that had no vocabulary at all. A run behind GitHub's
+    # workflow-approval gate was CREATED and will never execute, so it contributes
+    # no check runs and the PR's check list goes empty — indistinguishable, before
+    # this, from a PR nobody had pushed to yet. PR #282 sat two days that way over
+    # a run that had gone red two commits earlier.
+    "blocked": "CI will not run without a human — the run for this head is gated "
+               "and has executed nothing, so nothing is verifying this change",
+    # Not a warning, for the same reason an unreadable board is not a skip: no CI
+    # signal is the absence of evidence, and this file's whole rule is that absence
+    # never reads as clean. A workflow that failed to trigger and a repo that has
+    # no CI look identical from here, and only one of them is safe. A repo
+    # genuinely without CI says so once, in writing.
+    "none": "no run has been created for this head — nothing mechanical is "
+            "verifying this change. If this repo genuinely has no CI, say so with "
+            '`"preland": {"disabled_checks": ["ci"]}` in .harness-rules rather '
+            "than reading silence as green",
+    # The #244 answer, promoted from a silent fall-through. "I could not tell"
+    # used to arrive here as `none` and read as "this repo has no CI", which is a
+    # sentence about the repo standing in for a failed lookup.
+    "unknown": "the state of CI could not be determined, which is not the same as "
+               "it being clean — a gate that merges on an unread signal is the "
+               "defect this check exists to prevent",
+}
+
+
+def check_ci(pr: dict, repo: str = "") -> Check:
     """Green, and green NOW.
 
     Pending fails as hard as red. This runs after a reconcile has pushed
     commits, and a push restarts CI: an earlier green is a statement about code
     that is no longer at the head, which is the same staleness the `review` check
     below refuses for review rounds.
+
+    SIX answers since #324, and five of them refuse. The reading is
+    :func:`harness_rules.ci_report` rather than the rollup alone because the
+    rollup cannot tell "no run was created" from "a run was created and gated",
+    and it was the second that bit: the gated run reported nothing, the check list
+    went empty, and empty read as "CI has not run yet — check back later".
+
+    The refusal for a block carries the newest EXECUTED run on the branch, which
+    is what a reader wanted all along and what nobody had: on #282 that was a
+    failure two commits back, two clicks away in a place nobody looks.
     """
-    state = check_status(pr)
+    report = ci_report(pr, repo)
     rollup = pr.get("statusCheckRollup") or []
-    c = Check("ci", "passed", f"{state} ({len(rollup)} check(s))",
-              detail={"state": state, "checks": len(rollup)})
-    if state == "red":
-        c.reasons.append("CI is failing — never merge on red")
-    elif state == "pending":
-        c.reasons.append("CI has not finished; a pending check is not a green one")
-    elif state == "none":
-        # Not a warning, for the same reason an unreadable board is not a skip:
-        # no CI signal is the absence of evidence, and this file's whole rule is
-        # that absence never reads as clean. A workflow that failed to trigger and
-        # a repo that has no CI look identical from here, and only one of them is
-        # safe. A repo genuinely without CI says so once, in writing.
-        c.reasons.append("the PR has no checks at all — nothing mechanical is "
-                         "verifying this change. If this repo genuinely has no CI, "
-                         'say so with `"preland": {"disabled_checks": ["ci"]}` in '
-                         ".harness-rules rather than reading silence as green")
+    c = Check("ci", "passed", report.summary,
+              detail={"state": report.state, "checks": len(rollup),
+                      "reason": report.reason,
+                      "last_executed": report.last_executed})
+    if report.blocking:
+        why = CI_REFUSALS.get(report.state,
+                              f"CI reports {report.state!r}, which is not green")
+        c.reasons.append(why + (f" ({report.reason})" if report.reason else ""))
     c.status = "failed" if c.reasons else "passed"
     return c
 
@@ -1343,7 +1376,7 @@ def gather(cfg: dict, pr: dict, base: BaseRef, off: dict[str, str],
     how = {
         "pr_state": lambda: check_pr_state(pr),
         "checkout": lambda: check_checkout(root, pr),
-        "ci": lambda: check_ci(pr),
+        "ci": lambda: check_ci(pr, repo),
         # Resolved OUTSIDE the lambda: a malformed `distant_merge_lines` is a hard
         # exit through `_refuse_value`, and it belongs where `disabled_checks`
         # already puts a bad rules value — before any check runs, not inside one

@@ -37,7 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
-    DEFAULTS, RepoNotFound, agent_failure, agent_gist, cli_failure_gist,
+    DEFAULTS, RepoNotFound, agent_failure, agent_gist, ci_report, cli_failure_gist,
     describe, resolve_repo, run_agent, tail_gist,
 )
 
@@ -568,9 +568,20 @@ def run_panel(repo_path: str, pr: int) -> tuple[bool, int | None]:
 
 
 def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
-    """Is the PR's CI green enough to stack? Returns (green, status). green = all
-    checks passing (or none reported); red/pending/unknown → not green. Parses
-    `gh pr checks` stdout regardless of exit code (it exits non-zero when red)."""
+    """Is the PR's CI green enough to stack? Returns (green, status).
+
+    GREEN MEANS A SUITE RAN AND PASSED, and nothing else. It used to also mean "no
+    checks reported", which is #324 in its sharpest form: this decides whether the
+    epic driver merges a sub-PR into the integration branch, and a run parked
+    behind GitHub's workflow-approval gate contributes no check runs — so `gh pr
+    checks` prints nothing, and the branch whose last executed suite went RED
+    stacked as though it were clean.
+
+    The empty case is settled by asking the workflow-runs API, the only endpoint a
+    gated run is visible from, and every answer it can give (`blocked`, `none`,
+    `unknown`) is now NOT green. A repo that genuinely has no CI is a repo this
+    driver should not be auto-merging out of on the strength of silence.
+    """
     try:
         proc = subprocess.run(["gh", "pr", "checks", str(pr), "--repo", gh_repo,
                                "--json", "bucket"],
@@ -581,18 +592,39 @@ def pr_green(gh_repo: str, pr: int) -> tuple[bool, str]:
     raw = (proc.stdout or "").strip()
     if not raw:  # no JSON → usually "no checks reported"
         tail = (proc.stderr or "").strip().lower()
-        return ("no checks" in tail), ("none" if "no checks" in tail else "unknown")
+        if "no checks" not in tail:
+            return False, "unknown"
+        return False, _settle_no_checks(gh_repo, pr)
     try:
         buckets = [str(c.get("bucket", "")).lower() for c in json.loads(raw)]
     except json.JSONDecodeError:
         return False, "ci-unparseable"
     if not buckets:
-        return True, "none"
+        return False, _settle_no_checks(gh_repo, pr)
     if "fail" in buckets:
         return False, "red"
     if "pending" in buckets:
         return False, "pending"
     return True, "green"
+
+
+def _settle_no_checks(gh_repo: str, pr: int) -> str:
+    """`blocked` / `none` / `unknown` when `gh pr checks` reported nothing.
+
+    Three facts that arrive as the same blank line, and only one of them is about
+    the repository. The one that matters is `blocked` — a run exists, a person has
+    to approve it, and until they do the newest EXECUTED run on the branch is the
+    only real result there is.
+    """
+    try:
+        got = gh_json(["pr", "view", str(pr), "--json",
+                       "headRefOid,headRefName,statusCheckRollup"], gh_repo)
+    except (subprocess.CalledProcessError, OSError, json.JSONDecodeError):
+        return "unknown"
+    if not isinstance(got, dict):
+        return "unknown"
+    report = ci_report(got, gh_repo)
+    return report.state
 
 
 def pr_head_sha(gh_repo: str, pr: int) -> str:

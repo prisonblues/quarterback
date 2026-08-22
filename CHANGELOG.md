@@ -17,6 +17,47 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.78 — an absent check result stops reading as a good one
+
+`gh pr checks 282` printed nothing for two days, and every agent that looked took that for
+"CI has not run yet". CI had run and gone **red**; the two commits pushed to fix it came
+back `action_required` — GitHub's workflow-approval gate — so they executed nothing,
+contributed no check runs, and the PR's check list went **empty**. Not red, not stale-green:
+absent. Absent is the one answer a reader treats as benign, so the failure became a
+non-event and the branch sat for 48 hours looking untouched.
+
+Verified against the incident's own commits rather than reasoned about:
+`repos/prisonblues/quarterback/commits/e5a07b5/check-runs` returns `total_count: 0`, and so
+does its check-suites. An unexecuted run contributes nothing to the head it was created for,
+which is why every checks endpoint there is shows silence.
+
+### Six states, defined once
+
+`qbdata.CI_STATES` is now a closed vocabulary — `green`, `red`, `pending`, `blocked`,
+`none`, `unknown` — and `blocked` is the one that had no word at all. The rollup answers
+four of them; the fifth and sixth need a second question, so `classify_rollup` never returns
+`none` (an empty rollup is `unknown` until somebody asks) and `ci_report` settles it against
+the workflow-runs API, the only endpoint a gated run is visible from. A block carries the
+newest run on the branch that actually **executed**, which on #282 was the failure two
+commits back that nobody saw.
+
+### Every reader
+
+- **`preland`'s `ci` gate** refuses on all five non-green states, each with its own reason.
+  `unknown` used to arrive as `none` and print "this repo has no CI" — a sentence about the
+  repo standing in for a failed lookup.
+- **`epic.pr_green`** returned **True** for "no checks reported", so the driver would stack a
+  sub-PR into the integration branch on the strength of silence. Green now means a suite ran
+  and passed, and nothing else.
+- **The panel** gained a `blocked` state through `review_ci`, `ci_brief` and the refusal
+  notice, and its report warns on every state that is not `PASS` rather than only on
+  `FAIL`/`PENDING`.
+- **Both dashboards** keep the quiet grey dot only for a `none` that was established by
+  asking; an unresolved row is `?` in yellow, a gated one is `⚑`, and the OPEN PRs title
+  counts every non-green state instead of only reds.
+- **The lander** prints why a PR is not moving when the state is one that no further tick
+  can change.
+
 ## v2.77 — a session can end
 
 There were three ways to start an agent session on this fleet and not one to end one. What

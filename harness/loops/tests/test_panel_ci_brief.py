@@ -27,17 +27,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
-import panel_core  # noqa: E402  — `sh` is defined here since #129
+import panel_core  # noqa: E402
+import panel_scope  # noqa: E402  — review_ci's own module, which is what a patch has to name  — `sh` is defined here since #129
 from conftest import gh_stub  # noqa: E402
 
 #: Every state `review_ci` can return. Named here so a new one added to the
 #: reader without a matching branch in `ci_brief` fails the sweep below rather
 #: than silently falling into the catch-all and reading as "unknown".
-STATES = ("PASS", "FAIL", "PENDING", "none", "unknown")
+STATES = ("PASS", "FAIL", "PENDING", "blocked", "none", "unknown")
 
 
 def test_every_state_says_which_one_it_is():
-    """The five states are five different facts. A reviewer told the wrong one is
+    """The six states are six different facts. A reviewer told the wrong one is
     worse off than a reviewer told nothing."""
     seen = {s: panel.ci_brief(s, []) for s in STATES}
     assert len({v for v in seen.values()}) == len(STATES), "two states render alike"
@@ -48,7 +49,7 @@ def test_every_state_says_which_one_it_is():
 def test_no_state_but_PASS_can_be_read_as_a_pass():
     """The acceptance criterion this issue turns on. PENDING, none and unknown are
     all "no green suite here", and each has been mistaken for one before."""
-    for state in ("PENDING", "none", "unknown"):
+    for state in ("PENDING", "blocked", "none", "unknown"):
         text = panel.ci_brief(state, [])
         assert "not a pass" in text.lower(), f"{state} does not deny being a pass: {text}"
         assert "PASSED" not in text, state
@@ -164,3 +165,62 @@ def test_the_seat_is_told_before_it_is_dispatched(monkeypatch, tmp_path):
     monkeypatch.setattr(panel, "review_llm", fake_review)
     assert panel.run("board", 34, post=False, record=False) == 0
     assert order and order[0] == "ci", f"CI must be read before any seat runs: {order}"
+
+
+def test_a_gated_run_is_told_apart_from_a_repo_with_no_ci():
+    """#324. `blocked` did not exist, and the state it names is what buried a red
+    suite for two days: a run GitHub created, parked behind its approval gate, and
+    never executed — contributing no check runs, so the PR's check list read empty.
+    The old `none` text said "no checks are configured for this repository", which is
+    a claim about the REPO offered in place of a fact about this commit."""
+    blocked, none = panel.ci_brief("blocked", []), panel.ci_brief("none", [])
+    assert "WILL NOT RUN" in blocked
+    assert "waiting on a human" in blocked
+    assert "NO RUN EXISTS" in none
+    for text in (blocked, none):
+        assert "no checks are configured for this repository" not in text
+
+
+# ---- what `gh pr checks` cannot see (#324) ------------------------------------
+
+
+def _checks_reported_nothing(monkeypatch):
+    """`gh pr checks` exiting 1 with "no checks reported" and no JSON."""
+    import subprocess as sp
+
+    def fake(argv, *a, **k):
+        return sp.CompletedProcess(argv, 1, "", "no checks reported on the 'x' branch")
+    monkeypatch.setattr(sp, "run", fake)
+
+
+@pytest.mark.parametrize("settled", ["blocked", "none", "FAIL"])
+def test_no_checks_reported_is_settled_rather_than_called_none(monkeypatch, settled):
+    """The blank `gh pr checks` prints has three meanings and it used to have one.
+    A run parked behind the workflow-approval gate prints exactly the same nothing
+    as a repo with no CI, and the panel told its reviewers the second."""
+    _checks_reported_nothing(monkeypatch)
+    monkeypatch.setattr(panel_scope, "_settle_no_checks",
+                        lambda repo, pr: (settled, "because"))
+    assert panel.review_ci("o/r", 1) == (settled, [], None)
+
+
+def test_the_settlement_maps_a_probed_state_onto_the_panel_vocabulary():
+    """The panel has said PASS/FAIL/PENDING since #91 and those names are in prompts,
+    payloads and a refusal notice, so the shared six-state vocabulary is translated
+    rather than the three renamed."""
+    assert panel_scope.CI_STATE_WORDS["green"] == "PASS"
+    assert panel_scope.CI_STATE_WORDS["red"] == "FAIL"
+    assert panel_scope.CI_STATE_WORDS["blocked"] == "blocked"
+    qd = panel_core.harness_rules._qbdata()
+    assert set(panel_scope.CI_STATE_WORDS) == set(qd.CI_STATES)
+
+
+def test_a_settlement_that_failed_is_reported_as_a_skip_reason(monkeypatch):
+    """"I could not tell" has to reach the round's `skipped` list, or it arrives at a
+    reviewer as a bare `unknown` with nothing saying why."""
+    _checks_reported_nothing(monkeypatch)
+    monkeypatch.setattr(panel_scope, "_settle_no_checks",
+                        lambda repo, pr: ("unknown", "the PR's head could not be read"))
+    status, failing, skip = panel.review_ci("o/r", 1)
+    assert status == "unknown" and failing == []
+    assert skip == "ci: the PR's head could not be read"

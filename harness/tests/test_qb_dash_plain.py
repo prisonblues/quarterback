@@ -388,3 +388,31 @@ def test_the_printed_renderer_maps_scope_and_pins_repos_too(dash, watched, monke
     seen.clear()
     assert dash.main(["--once", "--width", "78", "--scope", "all"]) == 0
     assert seen["scope"].on is False
+
+
+# ---- a PR whose checks are absent (#324) --------------------------------------
+
+
+def test_a_pr_with_no_check_result_is_not_drawn_as_a_quiet_grey_dot(dash):
+    """The dot is the rendering a reader scrolls past, and it used to be what an
+    absent check result got. PR #282 wore it for two days over a suite that had gone
+    red and two commits whose runs were gated. A row nobody has established anything
+    about renders as unread, in a colour that asks to be looked at."""
+    glyph, colour = dash.ci_state(PRS[0])
+    assert (glyph, colour) != ("·", "grey50")
+    assert (glyph, colour) == qd.CI_GLYPHS["unknown"]
+
+
+def test_the_open_prs_title_counts_every_state_not_only_red(dash):
+    """A gated PR contributed to no number on the screen: the title said "12 open, 0
+    red" while one of them had failed and been buried behind an approval gate."""
+    prs = [{"number": n, "title": "t", "repo": qd.REPO, "ci": qd.CiReport(state, state)}
+           for n, state in enumerate(("green", "red", "blocked", "none", "unknown"))]
+    title = dash.ci_tally(prs)
+    for word in ("1 red", "1 blocked", "1 untested", "1 unread"):
+        assert word in title, title
+    assert "green" not in title
+
+
+def test_a_state_with_nothing_in_it_is_left_out_of_the_title(dash):
+    assert dash.ci_tally([{"ci": qd.CiReport("green", "g")}]) == ""

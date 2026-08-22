@@ -976,6 +976,31 @@ the tmux cursor to that seat's pane, a claim shows its note, a plan item explain
 where it is, a PR or an issue opens on GitHub. `qb-dash` is the same views rendered
 without interaction, for a terminal that will not forward mouse events.
 
+**The CI column has six states, and only one of them is quiet.** `gh pr view` reports a
+PR's checks as a rollup, and an empty rollup means two things that are not remotely alike:
+no run has been created for this head, or a run *has* and is parked behind GitHub's
+workflow-approval gate — created, never executed, contributing no check runs at all. That
+second case is what [#324](https://github.com/prisonblues/quarterback/issues/324) was filed
+about: PR #282's suite went red, the two commits pushed to fix it came back
+`action_required`, the check list went empty, and every reader took the blank for "nobody
+has pushed since CI last ran". It sat two days.
+
+So `qbdata.classify_rollup` never answers `none` — from a rollup alone the empty case is
+`unknown` — and `qbdata.ci_report` settles it by asking the workflow-runs API, which is the
+only endpoint a gated run is visible from:
+
+| glyph | state | means |
+|---|---|---|
+| `✓` green | `green` | a run finished and every check passed |
+| `✗` red | `red` | a run finished and something failed |
+| `◐` yellow | `pending` | a run exists and is still going — wait |
+| `⚑` magenta | `blocked` | a run exists and will **not** execute without a human; the reason names the newest run on the branch that actually did execute |
+| `·` grey | `none` | no run was created for this head. Reached only by asking, never by finding the rollup empty |
+| `?` yellow | `unknown` | the state could not be determined. Not a synonym for `none` |
+
+The OPEN PRs title counts every one of those that is not green. Before this it counted reds
+and nothing else, so a PR whose runs were gated contributed to no number on the screen.
+
 `qb-dash` also carries a **REVIEW QUEUE** panel the clickable renderer does not have yet
 (#273). OPEN PRs above it says a PR exists and CI is green; it never said whether anybody
 had reviewed it, and on 2026-08-20 six of eight open PRs had never been panelled while the

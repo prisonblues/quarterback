@@ -1427,17 +1427,20 @@ def move_manifest(diff: str, shape: DiffShape | None = None,
 
 
 def _ci_line(status: str, failing: tuple[str, ...] = (), skip: str = "") -> str:
-    """One line of CI reading for a human, over :func:`panel_scope.review_ci`'s five
+    """One line of CI reading for a human, over :func:`panel_scope.review_ci`'s six
     states plus "not read at all".
 
-    Deliberately not :func:`panel_scope.ci_brief`, which covers the same five
+    Deliberately not :func:`panel_scope.ci_brief`, which covers the same six
     states: that text is written AT a reviewer model ("do not spend a finding or a
     `could_not_assess` entry on them") and is a paragraph, and both are wrong under
     a refusal notice whose whole point is that no model was involved. What the two
     must agree about is the discipline, not the words — `PENDING`, `none` and
     `unknown` each say "this is not a pass" in their own sentence, because a
     refusal notice that lets a missing gate read as a green one is the same failure
-    as a refusal that reads as a clean review.
+    as a refusal that reads as a clean review. `blocked` is the sixth and the one
+    #324 had no word for: a run that exists, will not execute without a person, and
+    so reports nothing — which is not the same sentence as `none` and must not
+    borrow its wording.
     """
     if not status:
         return "NOT read for this refusal. Its result is unknown, not a pass."
@@ -1451,9 +1454,13 @@ def _ci_line(status: str, failing: tuple[str, ...] = (), skip: str = "") -> str:
                 "reviewer had to read the diff to know it.")
     if status == "PENDING":
         return "STILL RUNNING, so its result is not known. This is not a pass."
+    if status == "blocked":
+        return ("EXISTS BUT WILL NOT RUN — the run for this commit is waiting on a "
+                "human to approve it, so it has executed nothing. This is not a pass, "
+                "and no amount of waiting changes it.")
     if status == "none":
-        return ("no checks are configured for this repository, so there is no suite "
-                "result either way. This is not a pass.")
+        return ("NO RUN EXISTS for this commit, so there is no suite result either "
+                "way. This is not a pass.")
     return ("could NOT be read" + (f" ({skip})" if skip else "")
             + ". Its result is unknown. This is not a pass.")
 

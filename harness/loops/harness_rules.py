@@ -85,9 +85,11 @@ not in panel.py.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -2407,30 +2409,91 @@ def describe(cfg: dict) -> str:
             + ("  (unattended)" if unattended() else ""))
 
 
-def check_status(pr: dict) -> str:
-    """Aggregate a PR's `statusCheckRollup` into green/red/pending/none.
+def _qbdata_candidates() -> list[Path]:
+    """Where `qbdata.py` can be, in the three layouts it is ever read from.
 
-    Shared plumbing rather than lander.py's private helper, because preland.py
-    asks the same question for the same reason — "is CI green right now?" — and
-    two implementations of a merge gate's CI clause is precisely the drift #96
-    was filed about. `pending` is deliberately NOT `green`: a check that has not
-    reported is not a check that passed, and both callers refuse to merge on it.
+    This checkout (`harness/loops` beside `harness/bin`); the nix package, where
+    `$out/bin` sits beside `$out/share/quarterback-harness/loops`; and an installed
+    harness whose `bin` is on PATH while its `loops` was linked somewhere else
+    entirely (`~/.claude/loops`, which is how the slash commands invoke it).
     """
-    rollup = pr.get("statusCheckRollup") or []
-    if not rollup:
-        return "none"
-    states = set()
-    for c in rollup:
-        # checks use 'conclusion'+'status'; statuses use 'state'
-        s = c.get("conclusion") or c.get("state") or c.get("status") or ""
-        states.add(s.upper())
-    if states & {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"}:
-        return "red"
-    if states & {"PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", ""}:
-        return "pending"
-    if states <= {"SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"}:
-        return "green"
-    return "pending"
+    here = Path(__file__).resolve().parent
+    found = shutil.which("qbdata.py")
+    return [here.parent / "bin", *([here.parents[2] / "bin"] if len(here.parents) > 2 else []),
+            *([Path(found).resolve().parent] if found else [])]
+
+
+def _qbdata():
+    """The CI vocabulary and classifier, imported from the one place it lives.
+
+    It lives in `harness/bin/qbdata.py` rather than here because the DASHBOARDS
+    read it too and they can only import a sibling of their own `$0` — see
+    `harness/package.nix` on why `qbdata.py` is the one library that lands in
+    `bin/`. Two implementations of "what do this PR's checks say" is the drift #96
+    was filed about, and #324 is what that drift cost: the dashboards' reading and
+    this one disagreed about an empty rollup, and both of them called it benign.
+
+    LOADED FROM AN EXPLICIT PATH, never off `sys.path`, and this file's own header
+    says why. The lander's red-CI fixer operates on an upstream-authored dependabot
+    branch, and this module refuses to read that branch's `.harness-rules` for
+    exactly that reason. A bare `import qbdata` would search the caller's
+    `sys.path` — which in a checkout can be the checkout — and hand a PR the chance
+    to execute a `qbdata.py` of its own inside a merge gate. So the three trusted
+    locations are tried in order and nothing else is, and `sys.path` is neither
+    read nor appended to.
+
+    Resolved lazily, so a host where it cannot be found fails at the call rather
+    than at `import harness_rules` — the panel, the epic driver and the fixer all
+    import this module for things that have nothing to do with CI. Registered in
+    `sys.modules` under its own name so this and a dashboard that imported it
+    normally hold the SAME module object; two copies would be two caches and two
+    sets of monkeypatches.
+    """
+    cached = sys.modules.get("qbdata")
+    if cached is not None:
+        return cached
+    candidates = _qbdata_candidates()
+    for cand in candidates:
+        path = cand / "qbdata.py"
+        if not path.exists():
+            continue
+        spec = importlib.util.spec_from_file_location("qbdata", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["qbdata"] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del sys.modules["qbdata"]
+            raise
+        return module
+    raise ImportError(
+        "qbdata.py holds the harness's CI check vocabulary and could not be found. "
+        "Looked in: " + ", ".join(str(c) for c in candidates))
+
+
+def ci_report(pr: dict, gh_repo: str = "", probe: bool = True):
+    """A PR's check state, settled — `qbdata.CiReport`, carrying one of `CI_STATES`.
+
+    Shared plumbing rather than a private helper in each loop, because preland,
+    the lander and the epic driver ask the same question for the same reason — "is
+    CI green right now?" — and several implementations of a merge gate's CI clause
+    is precisely the drift #96 was filed about. `pending` is deliberately NOT
+    `green`: a check that has not reported is not a check that passed.
+
+    SIX states since #324, not four, and the two new ones are the two that used to
+    hide inside `none`. An empty rollup used to be read as `none` — "this repo has
+    no CI" — and it is also what GitHub shows for a run sitting behind the
+    workflow-approval gate, which has executed nothing and will report nothing
+    until a person clicks. `gh pr checks 282` printed nothing for two days on
+    exactly that, over a run that had gone RED two commits earlier.
+
+    So when the rollup is empty this asks the workflow-runs API, the only endpoint
+    that can see a run GitHub created and never executed, and it reports the newest
+    run on the branch that DID execute alongside the block. `probe=False` is the
+    offline reading, which leaves the empty case at `unknown` rather than guessing
+    which of `none` and `blocked` it was.
+    """
+    return _qbdata().ci_report(pr, gh_repo or pr.get("repo") or None, probe=probe)
 
 
 # ------------------------------------------------- shared CLI-failure plumbing
