@@ -186,6 +186,17 @@
           # it, and 644 because the chmod below only reaches what `cp -r` made read-only.
           install -Dm644 ${./harness/hm-module.nix} harness/hm-module.nix
           install -Dm644 ${./harness/package.nix} harness/package.nix
+          # test_qb_doctor.py's two shipping guards (#204). It asserts that
+          # `package.nix`'s installPhase comment — the argued list of what belongs on
+          # PATH and why — accounts for `qb-doctor`, and that the README documents all
+          # four verdicts, because a doctor whose `?` is undocumented gets read as a
+          # `warn` and then as an `ok`. Both are reads of repo prose from a suite that
+          # otherwise drives real git repositories, which is why they ride along here
+          # rather than moving to prose-consistency-tests, exactly as test_claude_wiring's
+          # do. Without the README line those two assertions would ERROR on a missing
+          # file rather than be evaluated — #163's mechanism, and the reason five suites
+          # before them sat red in a check no workflow runs.
+          install -Dm644 ${./harness/README.md} harness/README.md
           # At the top, not under harness/: the suite computes the repo root as its own
           # parent.parent, so this is where a repo-root file has to sit. It is here so the
           # sandbox guard runs HERE — it compares this list against the paths the suite

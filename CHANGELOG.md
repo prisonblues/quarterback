@@ -17,6 +17,143 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.82 — nothing could answer "is this host wired up", so each layer's failure showed up as another layer's error
+
+Three independently versioned things have to agree — the board image, the harness on PATH,
+the Python client's venv — and no component could compare them, because each one can only
+see itself. So each one's staleness surfaced as a *different* one's error. In the order they
+were hit: `qb-dash` said `● board unreachable` about a board that was up, `qb-board` said
+"build a venv" about a venv that was fine, the documented repair for that broke the MCP
+server, and then `qb-board` said "this machine has no token" about a valid token. Four
+symptoms, none of which named its cause, each individually cheap and collectively expensive.
+
+`qb-doctor` is one command that prints a line per check and exits non-zero on any failure.
+The value is not any single row; it is that the version lines get compared to each other in
+one place, which is exactly what no component can do on its own.
+
+### It also asks whether the harness's own guards are installed
+
+2026-08-22 produced four instances of one failure in a single morning — a mechanism written,
+tested, shipped, documented, and **never wired up on the host that needed it**. The
+`qb-reconcile` timer was in-repo and on no host, so the board's plan went 39% wrong: 13 of
+33 items pointing at closed issues. The `reference-transaction` stash guard was in
+`harness/githooks/` and in no repo, so an agent popped another worktree's work.
+`HUMAN_EDGE_SECRET` was documented in `DEPLOY.md` with a checklist and never deployed, so
+every human-only endpoint has 403'd since v2.39. Not one announced itself; each was found by
+tripping over a downstream symptom.
+
+So every guard check looks where the mechanism **runs**, never where its source lives.
+`ls harness/githooks/reference-transaction` succeeds on a host with no guard installed at
+all — the file is in git, which is precisely what all four had going for them. `hooks` reads
+`core.hooksPath` and the files under it, `reconcile` asks `systemctl --user`, and `edge`
+makes a live request. The expected hook set is derived from the harness's own `githooks/`
+directory rather than listed, so a guard added there is reportable as missing the day it
+lands rather than the day someone remembers to update a list.
+
+### `unknown` is not `ok`, and it has its own exit code
+
+Four verdicts: `ok`, `warn`, `FAIL`, and `?` for a check that could not be made. Three of the
+six symptoms on the issue are that fourth one collapsing into the first — `prune-worktrees`
+calling a skipped database scan `Nothing to prune. Clean.` over a 13 MB orphan,
+`worktree-holder`'s exit 4 that `/tree-shake` proceeded on, `qb-reconcile`'s `stopped` that
+the deployed board could not attribute. A doctor that prints `ok` because it could not look
+is worse than one that does not check, because it launders ignorance into assurance — and
+unlike a stale layer, a false green never announces itself later. The exit code keeps the
+distinction the report does: `0` healthy, `1` something could not be checked, `2` something
+failed, `3` it could not run at all.
+
+`warn` is the fourth answer and it is for residue an installer cannot undo. Installing the
+stash guard does not drain the entries pushed before it — the hook deliberately allows
+deletions — so a freshly guarded repo is protected going forward and still carries its old
+landmines. `guard active, 4 pre-guard entries remain` is the report; a bare `ok` is not.
+
+### `--fix` runs the safe half and prints the exact command for the rest
+
+An installer is an argv the tool will execute (`qb-hooks install`,
+`systemctl --user enable --now qb-reconcile.timer`); a remedy for a person is a string it
+prints and never runs. Two separate fields, so nothing can execute a command the author did
+not mark runnable — the edge secret needs a value generated into 1Password *and* sops plus
+two deploys, and a tool that tried would fail halfway through somebody's production deploy.
+After fixing, the whole selected report is **re-checked** rather than inferred from the
+installer's exit code: "the command succeeded" and "the guard is now installed" are the two
+sentences this tool exists to keep apart, and one guard's state is another row's input.
+
+### Four defects a second reviewer found, and what each was
+
+Codex reviewed the diff twice and found seven real defects across the two passes. They
+collapse into four, and every one is the mistake this tool exists to catch, committed by the
+tool itself — a check reporting a definite answer it had not established:
+
+- The harness row compared the harness on PATH against **this script's own tree**, which is
+  the same directory whenever `qb-doctor` runs from PATH — i.e. in every installed use there
+  will ever be. It would have reported `ok` by comparing an installed harness with itself,
+  forever, on the one row whose whole subject is a stale install.
+- A **dead systemd user bus** was read as a missing unit. Same exit code, same empty stdout,
+  opposite answers — one sends you to install units that are already there, the other says
+  the check never happened. The first fix then matched on `No such file or directory`, which
+  is systemd's wording for a missing unit file *and* for a missing bus socket; and it guarded
+  only `is-enabled`, leaving a bus that swallowed `is-active` reported as a broken timer.
+- **Any non-200** from the agent vhost counted as proof it refuses a forged `Remote-User`, so
+  a `404` from an old image and a `502` from a dead app both vouched for "nobody can forge a
+  person" — a security property attested by a request that never reached the code enforcing
+  it. Only `401`/`403` are proof now.
+- A **`403` from the browser vhost** was attributed to the app, but the auth proxy answers
+  `401`/`403` to a caller with no session too. Telling somebody their secret is broken when
+  all they are is signed out is the wrong-remedy failure the issue's `tmux` comment is about.
+  The board's own refusal names the mechanism in its body, so that is what decides it.
+
+### The board version, without a `/version` endpoint
+
+`GET /openapi.json`'s `.info.version` against `app/main.py` in the checkout. That is not a
+workaround: `CHANGELOG.md` opens by defining the board's version as that field, and it is the
+same string `app/main.py` declares, so both sides are one fact measured in two places. #199
+would make it first-class and make this cheaper, not truer. A board that will not serve its
+metadata falls back to capability probing, which answers with a **range** — and a range is
+not a version, so that path reports `?` with the floor as context and never a pass.
+
+## v2.81 — two migration guards, adopted while the field is still empty
+
+Nothing here checked the **end state** of the migration chain. `test_migration_reconcile.py`
+checks the graph is a graph, and the two per-migration modules each check one revision's own
+before and after; between them they would all pass on a chain that builds a schema the models
+do not declare. That gap is where `alembic stamp` lives — a revision recorded without its SQL
+having run, so the version table asserts a schema that was never built and the divergence
+surfaces weeks later, on somebody else's machine, as `column does not exist`. Renumbering
+makes it sharper here than elsewhere: revision identity *is* the number, so a renumber
+changes what a stored `version_num` means, and three worktree databases had to be dropped for
+exactly that.
+
+Both guards arrive from lexray, which paid for them.
+
+`tests/test_migration_drift.py` builds a throwaway database, replays every revision from
+empty, and diffs the result against `app/models`. Any disagreement fails the build, and the
+failure names the operations alembic would still have to perform. It also pins the version
+table to one row at the chain's own head: more than one is a multi-head state, whose fix is a
+merge migration and never a stamp.
+
+`tests/test_migrations_self_contained.py` AST-scans `migrations/versions/` against an
+**allowlist** — the standard library plus `alembic`/`sqlalchemy` — rather than a denylist of
+`app`, because every first-party package carries the identical hazard. A migration that
+imports live code emits SQL for whatever columns the models have *today*, so the day a later
+migration adds one, the older migration references a column that does not exist yet at that
+point in the chain. Applied revisions never re-run, so it is invisible on every database
+already past it and detonates only on a fresh replay — which is exactly what the other guard
+does. Detect and prevent, one mechanism in two halves.
+
+All 32 migrations were already clean, which is the argument for doing it now: the cheapest
+moment to fence a field is before anything has wandered into it.
+
+The allowlist half also ships. `harness/templates/test_migrations_self_contained.py` is the
+same file with its four constants blanked, for any repo the harness sets up, kept
+byte-identical to this one by a parity test — the answer `templates/dbtarget.py` already uses
+to the objection that a scaffolded test drifts from the version somebody maintains. The drift
+test does not ship: it needs a live database, a models import path and a project's own
+alembic invocation, so a template of it would be wrong for most repos in two of those three.
+
+README gains a **Database migrations** section: never stamp always upgrade, dev and test
+databases are disposable, migrations do not import the app, and multiple rows in
+`alembic_version` mean a merge migration.
+
 ## v2.80 — Every decision owed to a human now leaves the fleet by one door, and it is the board
 
 The harness stops and says *a human has to answer this* in four places. Each one reported somewhere different, and none of them reported to the board — the one surface a human actually watches, and the one already carrying exactly this traffic from every other project in the fleet. `epic.py` printed its not-agent-doable ruling to stdout, so an unattended epic run's entire human-decision output lived in a systemd journal. `preland` returned an exit code. A panel seat had no way to say it at all. A fixer's escalation reached a PR comment thread and a new issue.

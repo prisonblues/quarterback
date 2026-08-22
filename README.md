@@ -1409,6 +1409,9 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.78** — an absent check result stops reading as a good one.
 - **v2.79** — the loop gets a ceiling in both directions, and a person holds the key.
 - **v2.80** — Every decision owed to a human now leaves the fleet by one door, and it is the board.
+- **v2.81** — two migration guards, adopted while the field is still empty.
+- **v2.82** — nothing could answer "is this host wired up", so each layer's failure showed up as
+  another layer's error.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1655,6 +1658,78 @@ QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
 uv run --extra dev --extra tui pytest -q
 ```
 
+### Database migrations
+
+Four rules. The first two are enforced by tests; the other two cannot be, and are here
+because the failures they prevent are silent and land on somebody else's machine.
+
+**Never stamp, always upgrade.** `alembic stamp` records a revision in `alembic_version`
+without executing its SQL, so the version table asserts a schema that was never built. The
+divergence surfaces much later, somewhere else, as `column does not exist`. If a migration
+fails, fix the migration.
+
+**Dev and test databases are disposable.** They are rebuilt by running the migrations
+forward, never by stamping past a failure. The suite already treats them that way — the
+schema fixture is `alembic downgrade base && alembic upgrade head`, and `create-worktree`
+gives each worktree its own copy precisely so throwing one away costs nothing. A worktree
+whose database is wedged is a `remove-worktree`/`create-worktree` away from correct.
+
+**A migration must not import live application code.** A migration is a frozen artefact
+running at a fixed point in schema history; `app/` is whatever the package says today. The
+sharpest form is an ORM model — an ORM SELECT or INSERT names *every* mapped column, so the
+day a later migration adds a column, the older migration starts emitting SQL for a column
+that does not exist yet at that point in the chain, and the replay aborts on
+`UndefinedColumn`. It is invisible on a database already past that revision, because applied
+revisions never re-run, and it detonates on a **fresh replay**: the drift test, a new
+worktree, a disaster-recovery rebuild, or an instance still behind that revision when the
+new-column code deploys. So write the SQL into the migration — `op.*`, `sa.table()`/
+`sa.column()`, `text()` — naming only the columns that exist as of that revision, and freeze
+that list in a comment.
+
+**More than one row in `alembic_version` is a multi-head state.** The fix is a merge
+migration, not a stamp. Two branches minting the same number is the way this repo reaches it
+(revision identity here *is* the number, #341), and `scripts/migration_reconcile.py` is the
+tool that renumbers and relinks before the merge rather than after.
+
+What enforces what:
+
+| Guard | What it does | Cost |
+|---|---|---|
+| `tests/test_migrations_self_contained.py` | AST-scans `migrations/versions/` against an **allowlist** — the standard library plus `alembic`/`sqlalchemy` — covering both import spellings, module-level and function-local, and constant-string `importlib.import_module`/`__import__` | no database, no app import, milliseconds |
+| `tests/test_migration_drift.py` | builds a throwaway database, replays every revision from empty, and diffs the result against `app.models` | one database, about a second |
+| `scripts/migration_reconcile.py` | renumber-and-relink when two branches both mint the next number | git only, no database |
+
+The two tests are one mechanism in two halves: the drift test is where an app-importing
+migration *detonates*, and the AST scan is what stops it being written. An allowlist rather
+than a denylist of `app`, because every first-party package carries the identical hazard and
+so does any third-party library whose next release changes what a frozen migration does.
+
+Exemptions live in that file's `EXEMPT_MODULES` and pin the **exact** import statements one
+migration may make, so an exempt file cannot quietly grow an ORM import and a stale entry
+fails the guard rather than leaving a permanent hole. It is empty today, and worth keeping
+empty.
+
+`harness/templates/test_migrations_self_contained.py` is the same guard, shipped for other
+repos: drop it into a `tests/`, adjust the four constants at the top. The two files are
+pinned byte-identical below their constants by a test in the copy here, so the one you are
+given is the one that runs.
+
+#### Writing one
+
+```bash
+# --rev-id is not optional here: revision identity IS the number, and alembic's
+# default is a random hash. The filename follows from it (`0033_<slug>.py`).
+.venv/bin/alembic revision --autogenerate --rev-id 0033 -m "what it does"
+
+# Review what autogenerate wrote — it misses renames (it sees a drop and a create),
+# server defaults and anything that is not a table, column, index or constraint.
+.venv/bin/alembic upgrade head
+.venv/bin/pytest -q tests/test_migration_drift.py tests/test_migrations_self_contained.py
+```
+
+If someone else lands `0033` first, `scripts/migration_reconcile.py` renumbers yours onto
+the new head rather than leaving two revisions claiming one id.
+
 ### Layout
 
 ```
@@ -1693,9 +1768,11 @@ app/          FastAPI service
                    needs-human/* GitHub labels it projects onto (no model, no I/O)
   api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard);
                    static/board.html, static/reviews.html
-migrations/   Alembic (async), 0001 → 0013: posts+trigger, blobs/sessions/leases,
-              refs+worktrees, session cwd/title/recap/model, post session, subagents,
-              lease repo, worktree sync, review stats + reports, agent names
+migrations/   Alembic (async), a hand-numbered linear chain 0001 → 0032. 0001-0013:
+              posts+trigger, blobs/sessions/leases, refs+worktrees, session
+              cwd/title/recap/model, post session, subagents, lease repo, worktree
+              sync, review stats + reports, agent names. Each file's own docstring
+              says what it does; the policy the chain is held to is above
 mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active/peers
               + subagent_start/end + report_git/find_commit + publish/sync_status
               (gitctx.py runs git locally to gather worktrees)
@@ -1705,6 +1782,11 @@ mcp/          FastMCP wrapper: whoami + board_* + lease/handoff/session + active
 tests/        end-to-end tests against real Postgres (conftest.py shared fixtures)
   dbtarget.py      which database the suite may rebuild; refuses a worktree
                    pointed at the main checkout's data
+  test_migration_drift.py            replays every migration into a throwaway
+                   database and diffs the result against app/models
+  test_migrations_self_contained.py  the allowlist keeping a migration from
+                   importing live app code (no database; also the guard shipped
+                   in harness/templates/)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)
@@ -1715,7 +1797,9 @@ harness/      step 2 of the install — the workflow the board coordinates
                    multiplexer, started as a seat with its own board identity),
                    qb-board (launcher for the terminal client in mcp/mcp_server/board/)
   tests/           the worktree-tooling suite (pytest driving the bash)
-  templates/       copyable .worktree.json starting points + dbtarget.py (the DB guard)
+  templates/       copyable .worktree.json starting points, dbtarget.py (the DB
+                   guard) and test_migrations_self_contained.py (the migration
+                   allowlist) — both kept byte-identical to this repo's own copy
   package.nix      the derivation; hm-module.nix wires it into ~/.claude
 flake.nix     packages.harness, homeManagerModules.default, checks (runs the harness,
               worktree and mcp/board suites)
