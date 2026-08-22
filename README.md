@@ -108,14 +108,26 @@ POST  /session/end       { session, reason }            -> {ended, lease, lease_
                          (reason = finished|killed|timed_out|context_reset|superseded.
                           Releases the lease AND every live claim that session took,
                           and stamps the lease with why. Idempotent: `ended` says
-                          whether THIS call was the one that ended a live session.)
+                          whether THIS call was the one that ended a live session.
+                          An agent by token, authorised by machine; a PERSON by the
+                          edge, authorised by being one — the fleet page's one verb.
+                          A lease that merely LAPSED can be told what happened to it
+                          too, stamped at its own expiry rather than at now; a lease
+                          already released is left alone — #378)
 GET   /session/{session}                                (latest_blob + active_lease +
                                                          ended)
 
 # session registry (v2.2 → v2.5)
 POST  /snapshot          { session, blob, cwd?, title?, recap?, model? }
                                                         (latest blob, lease NOT released)
-GET   /sessions          ?limit=                        (live + resumable, freshness + size)
+GET   /sessions          ?limit=&include_ended=          (live + resumable, freshness + size.
+                          Each row carries `last_lease` — when this key's newest lease
+                          stopped being valid, which is the clock a SILENCE is measured
+                          against; `updated_at` is the transcript's and a lease outlives
+                          its last push. include_ended widens it to sessions whose last
+                          lease was ended but which never pushed a transcript: an ending
+                          with no row behind it. Off by default because this list is
+                          paged — #378)
 
 # dev context (v2.1)
 GET   /                                                 (browser board — read the stream,
@@ -129,6 +141,8 @@ GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree di
 # coordination: collision index + sub-agents (v2.6)
 GET   /active            ?cwd=&repo=&device=&holder=&mine=&peers_only=
                                                  -> {agents:[…leases…], subagents:[…]}
+GET   /fleet             (browser view — what every agent is doing, from a phone,
+                          and how much of that reading is actually known: #378)
 POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=900 }
 POST  /subagent/end      { parent_session, agent_id }
 
@@ -665,6 +679,63 @@ kills it, or `qb-end` by hand. The line `qb-seat` draws — *"the board coordina
 work, it does not operate the machine"* — is about **dispatch**, and nothing here
 moves it: what an agent works on is still its own choice, self-selected and claimed
 atomically.
+
+**`GET /fleet` is what every agent is doing, from a phone** (#378), and the whole of
+its design is in what it refuses to conclude. Rich wanted four things off a phone —
+*"see the plan, state of each agent, drag them up and down if needed, and then the
+seats pick things up"* — and three of them existed. The data for the fourth was all
+already served (`/active`, `/sessions`, `/claims`); what was missing was a page.
+
+The naive render of that data lies in both directions, and the page is built around
+saying so instead. `/active` lists only leases inside their TTL; a lease is renewed
+once per **prompt** and runs thirty minutes against a claim's hour, so a single long
+autonomous turn drops a *working* agent out of `/active` (#252). So a row gets one of
+four readings, and only two of them are things somebody reported: `live` (a lease is
+being renewed), `ended` (somebody called `/session/end` and said why), `unclear`
+(there is no lease, nothing reported an ending, and either a claim is still standing
+or the silence is too young for the board's own passive expiry to have settled it)
+and `unreported` (old enough that expiry has had its say, and still nobody ever said
+what happened). **None of them is "dead."** The ambiguity is shown, in
+`qb-reconcile`'s own wording for the same ambiguity, rather than resolved — and a
+`working` older than `qbdata.py`'s `STALL_AFTER` is remarked on without being called
+stalled, because on a phone the row is all the reader has.
+
+One verb reaches it, `POST /session/end`, because that is what a person needs from a
+phone when something has gone wrong. Two things had to change for it to be reachable
+and useful. It depended on `app.auth.identify`, which wants a bearer token no browser
+holds, so it now goes through `app.auth.author` — an agent by token, authorised by
+machine exactly as before, or a person by an edge-proved `Remote-User`. And it only
+ever stamped a reason onto an **active** lease, so the one case somebody opens this
+page for — an agent that went quiet twenty minutes ago and never came back — was the
+one case the verb could not record: the only window in which anything could be said
+had already closed. A lapsed lease can now be told what happened to it, stamped at
+its own `expires_at` (the last moment the board knows the session was alive) rather
+than at the moment somebody got round to saying so. A lease already **released** is
+still left alone: a handoff is not an ending, and an ending already recorded belongs
+to whoever saw it first.
+
+`GET /sessions` gained two things. Every row now carries `last_lease` — when this
+key's newest lease stopped being valid — because **that is the clock a silence has to
+be measured against and `updated_at` is not it**. `updated_at` belongs to the
+transcript and moves on `/snapshot`; the lease moves on every prompt. Where the two
+diverge the gap runs the wrong way: a session that pushed at ten, kept renewing until
+noon and then died is two minutes quiet at 12:02 and two *hours* quiet by the
+transcript, so a fleet view reading the wrong one calls a working agent long gone —
+the exact misreading the page exists to prevent, arriving through the field it
+trusted.
+
+And `?include_ended=` widens the list to a session whose last lease was ended but
+which never pushed a transcript. Without it such a session is visible exactly while it
+holds a lease and vanishes the moment it ends — the one transition a fleet view most
+needs to show, and the same hole #277 fixed in `GET /session/{key}` and left in the
+list. It is a flag rather than the default because this list is paged, and folding an
+unbounded second population in would spend an existing caller's page on rows it never
+asked for. A lease that merely *lapsed* still gets no row either way: inventing one
+for a silence would be this page's own failure mode written into the endpoint.
+
+There is deliberately **no spawn button**: `qb-start` is off by default per machine
+(#360), a phone is the worst place to reason about whether a box opted in, and #371
+is where that argument belongs.
 
 `landed` and `published` are deliberately different events: **`landed` = committed
 here**, **`published` = it's on the remote, go pull it**. Only the second one tells a
@@ -2078,8 +2149,12 @@ app/          FastAPI service
   sync.py          pure staleness reasoning (no I/O), like overlap.py
   needs_human.py   the closed "a human has to look at this" vocabulary (#279) and the
                    needs-human/* GitHub labels it projects onto (no model, no I/O)
-  api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard);
-                   static/board.html, static/reviews.html
+  api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard)
+                   + GET /plan/view (the plan, and where a human reorders it)
+                   + GET /fleet (what every agent is doing, and how much of that is
+                   known rather than inferred — #378);
+                   static/board.html, static/reviews.html, static/plan.html,
+                   static/fleet.html
 migrations/   Alembic (async), one linear chain under two naming schemes: 0001 → 0034
               hand-numbered and frozen, everything above it an opaque `m<8 hex>` id
               minted by env.py's process_revision_directives hook (#341). 0001-0013:
