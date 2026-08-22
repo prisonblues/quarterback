@@ -121,6 +121,20 @@ async def test_a_plan_carries_its_own_dependency_graph(client):
     assert plan["counts"]["blocked"] == 2
 
 
+async def test_a_submitted_plan_says_the_submitter_chose_its_order(client):
+    """A submission is a list somebody wrote in an order, so its items are not
+    `appended` — nobody chose an appended position, and somebody chose this one.
+    Where the block itself sits in the scope is still an append, which is why it
+    is not `ordered` either: a submitted plan is a proposal (#183)."""
+    repo = "acme/submitorder"
+    out = await submitted(client, repo, "sequenced", [item(90), item(91)])
+    assert [i["rank_source"] for i in out["items"]] == ["submitted", "submitted"]
+
+    plan = await read(client, repo, exact=True)
+    assert plan["ordering"]["by_source"] == {"submitted": 2}
+    assert plan["ordering"]["trusted"] is True and plan["next"]["caveat"] is None
+
+
 async def test_a_circular_batch_edge_is_refused_before_anything_is_written(client):
     repo = "acme/submitcycle"
     r = await submit(client, repo, "ring",

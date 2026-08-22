@@ -26,6 +26,7 @@
   .next { border:1px solid #2f6f52; background:#141d19; border-radius:10px;
     padding:10px 12px; margin:10px 0 16px; }
   .next .lbl { color:#35c48a; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
+  .next .caveat { color:#f0b429; font-size:12px; margin-top:5px; }
 
   .item { border:1px solid var(--line); border-radius:10px; background:var(--panel);
     padding:9px 12px; margin:8px 0; display:flex; gap:10px; align-items:flex-start; }
@@ -85,7 +86,7 @@ const showDone = document.getElementById("showDone");
 // counts and the `next` the SERVER computed over the whole scope. They travel as one
 // because they have to agree — the header, the list and the next panel used to be
 // worked out separately here, over a subset, and so disagreed on the same page load.
-let plan = {items:[], counts:{}, next:null};
+let plan = {items:[], counts:{}, next:null, ordering:{}};
 let repos = new Set(); // every repo scope seen, so the filter can be built from data
 let gen = 0;           // read generation — a reply from a superseded read is discarded
 let busy = false;      // a write is in flight — the 20s tick must not read back over it
@@ -128,6 +129,20 @@ function refHtml(it){
 function scope(){ const v = repoSel.value;
   return v==="(fleet)" ? null : (!v || v==="(all)") ? undefined : v; }
 
+// Who decided this row sits here. A number with no provenance is what let ranks
+// 1-17 (a real sequence) and 18-28 (the order the adds arrived in) look identical
+// on this page — #183.
+const RANK_WHY = {
+  appended: "nobody chose this position — it was appended, which is all POST /plan/item could do",
+  submitted: "the submitter chose the order within its plan; where that plan sits is still an append",
+  placed: "placed by the agent that added it, relative to a named neighbour",
+  ordered: "ordered by a human, here",
+};
+function rankWhy(it){
+  const why = RANK_WHY[it.rank_source] || "";
+  return it.placed_for ? `${why} — for ${it.placed_for}` : why;
+}
+
 function row(it, s){
   const el = document.createElement("div");
   const held = it.claim, blocked = (it.blocked_by||[]).length;
@@ -149,7 +164,7 @@ function row(it, s){
   const dropWhy = dropTo==="open" ? "put it back"
     : dropTo ? "drop it" : "done stays done — its completion record is the point";
   el.innerHTML = `
-    <div class="rank">${it.state==="open"?it.rank:"·"}</div>
+    <div class="rank" title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
     <div class="body">
       <div class="row1">
         ${refHtml(it)}
@@ -201,9 +216,16 @@ function render(){
   countsEl.textContent = `${counts.open||0} open · ${counts.claimed||0} held · ` +
     `${counts.covered||0} in a held plan · ${counts.blocked||0} waiting · ` +
     `${counts.stale||0} stale`;
+  // `next` walks rank order, so it is exactly as good as the ranks are. The page
+  // says so in the same panel rather than somewhere a reader has to go looking:
+  // this is the surface where the answer is fixed, one drag at a time.
+  const ord = plan.ordering || {};
+  const caveat = (next && next.caveat) ? next.caveat
+    : (!next && ord.trusted === false && ord.hint) ? ord.hint : null;
   nextEl.innerHTML = next
     ? `<div class="next"><div class="lbl">next</div><div>${refHtml(next)} ${
-        esc(next.title)}</div>${next.note?`<div class="note">${esc(next.note)}</div>`:""}</div>`
+        esc(next.title)}</div>${next.note?`<div class="note">${esc(next.note)}</div>`:""}${
+        caveat?`<div class="caveat">⚠ ${esc(caveat)}</div>`:""}</div>`
     // Keyed off the same counts as the header: "everything open is spoken for" is only
     // true if something is open at all — a page of history alone gets no panel. And it
     // names all three reasons `next` skips an item, because a reader whose whole plan
@@ -237,7 +259,8 @@ async function load(){
   // A slower earlier read — the 20s tick, usually — must not repaint over a newer
   // filter change or over a list that has just been reordered.
   if(my !== gen) return;
-  plan = {items: d.items || [], counts: d.counts || {}, next: d.next || null};
+  plan = {items: d.items || [], counts: d.counts || {}, next: d.next || null,
+          ordering: d.ordering || {}};
   const seen = new Set(plan.items.map(it => it.repo || "(fleet)"));
   // Only the unscoped (all) read sees every repo, so only it may REPLACE the option
   // list; a repo read returns that repo plus the fleet band, and the fleet read returns

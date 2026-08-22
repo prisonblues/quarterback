@@ -19,9 +19,16 @@ issues, a human repeating the sequence to whoever asked, and an untracked
 2. *It never decides an item is done.* ``done`` records that the linked issue
    closed; git ancestry and GitHub remain the authority. ``epic.py`` had this
    right first: *"the file is the fast path + audit trail"*.
-3. *Only a human reorders it.* If any agent may, the plan thrashes; if only a
-   human may, it stays the shared intent it exists to be. Agents add, claim,
-   record dependencies and complete. See :func:`app.auth.human`.
+3. *Only a human reorders it — and PLACING a new item is not reordering (#183).*
+   Permuting items already in the plan is contested: two agents disagreeing about
+   whether #80 outranks #83 and rewriting each other is how the plan stops being
+   the shared intent it exists to be, so ``POST /plan/reorder`` is human-only and
+   stays that way. Choosing where a NEW item *enters* alters the relative order of
+   nothing already there — every existing pair keeps its existing relationship —
+   so it cannot thrash, and ``after`` / ``before`` on ``POST /plan/item`` let an
+   agent do it. What a placement competes with is not another agent's judgement;
+   it is this endpoint's own hard-coded "last", which nobody chose. Agents add,
+   place, claim, record dependencies and complete. See :func:`app.auth.human`.
 4. *It is not a project-management tool.* No estimates, no sprints, no
    burndown, no assignee — a claim with a TTL is the assignee, and it expires.
 
@@ -116,6 +123,10 @@ MAX_DEPS = 32
 #: A plan label is a handle an agent says out loud, not a description. The old
 #: ``phase`` column was bounded at 64 on the wire and this keeps that.
 MAX_LABEL = 64
+#: Provenance for a placed item — "Rich, 2026-08-17 23:00". An attribution, not a
+#: justification: the reasoning still goes in ``note``, and a field long enough to
+#: hold an argument would collect one.
+MAX_PLACED_FOR = 120
 #: Most items one ``POST /plan/submit`` may carry. A plan is tens of rows by
 #: design (rule 4), and the atomicity this endpoint exists for is a single
 #: transaction — an unbounded batch would hold the scope lock for as long as the
@@ -581,6 +592,11 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
                  if plan is not None else None),
         "covered_by": _covered_by(plan_claim, mine, session_id),
         "rank": item.rank,
+        # WHO decided that rank — the fact 28 ranked rows could not state (#183).
+        # `appended` means nobody did: it went last because that was all the
+        # endpoint could do. See `app.models.plan_item.RANK_SOURCES`.
+        "rank_source": item.rank_source,
+        "placed_for": item.placed_for,
         "state": item.state,
         "note": item.note,
         "depends_on": list(item.depends_on or []),
@@ -597,6 +613,61 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
         "done": item.done_at.isoformat() if item.done_at else None,
         "done_by": item.done_by,
     }
+
+
+def _ordering_view(open_views: list[dict]) -> dict:
+    """How much of this order anybody actually decided — #183's minimum fix.
+
+    ``next`` used to answer rank 1 with no caveat while the human's stated top
+    priority sat at rank 20, under a note shouting that its own rank was a lie.
+    Every signal that the ranking was untrustworthy was in free text, so no client
+    could read it as anything, and the tool's own documentation calls ``next``
+    *"the answer, already worked out"*.
+
+    It is worked out from ranks, so it is exactly as good as the ranks are. This
+    says how good that is, from the rows themselves rather than from prose:
+    ``trusted`` is false while any open item sits where it was merely appended,
+    ``from_rank`` is where that starts, and ``by_source`` breaks the list down by
+    who chose what. A plan whose every position was placed, submitted or ordered
+    is trusted — nobody has to have used the browser for the answer to be honest,
+    only somebody has to have chosen.
+    """
+    by_source: dict[str, int] = {}
+    for view in open_views:
+        by_source[view["rank_source"]] = by_source.get(view["rank_source"], 0) + 1
+    unchosen = [v for v in open_views if v["rank_source"] == "appended"]
+    return {
+        "trusted": not unchosen,
+        "by_source": by_source,
+        "unchosen": len(unchosen),
+        # The rank at which the order stops meaning anything. Null when there is
+        # nothing unchosen, rather than a sentinel a client has to know about.
+        "from_rank": min((v["rank"] for v in unchosen), default=None),
+        "hint": None if not unchosen else
+                "those items are in the order the adds arrived in, because nobody "
+                "chose one: pass `after`/`before` to POST /plan/item when you know "
+                "where an item belongs, and a human sets the rest at /plan/view",
+    }
+
+
+def _next_caveat(nxt: dict | None, ordering: dict, open_n: int) -> str | None:
+    """What ``next`` must say when the order it walked is not one anybody decided.
+
+    Returned beside the item rather than instead of it: the answer is still the
+    best one available, and an agent that reads nothing else should get it. What
+    it must not get is unqualified confidence — this is the issue's sharpest
+    complaint, and the minimum fix it asks for even if placement never landed.
+    """
+    if nxt is None or ordering["trusted"]:
+        return None
+    mine = " including this one," if nxt["rank_source"] == "appended" else ""
+    return (
+        f"{ordering['unchosen']} of {open_n} open items sit where they were "
+        f"appended,{mine} from rank {ordering['from_rank']} down: nobody chose "
+        "those positions. This is the first item that is free, in an order that is "
+        "partly just the order things were added — read the notes before you treat "
+        "it as a priority."
+    )
 
 
 async def _plans_for(session: AsyncSession, items: list[PlanItem]) -> dict[str, Plan]:
@@ -746,6 +817,96 @@ async def _next_rank(session: AsyncSession, repo: str | None) -> int:
     stmt = select(PlanItem.rank).order_by(PlanItem.rank.desc()).limit(1)
     stmt = stmt.where(PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo)
     return (await session.scalar(stmt) or 0) + 1
+
+
+def _place_refused(field: str, token: str, problem: str, hint: str) -> HTTPException:
+    """One shape for every refused placement, matching :func:`_dep_refused`.
+
+    Placement fails for the same three reasons a dependency does — no such item,
+    not open, not reachable from this scope — so it answers in the same shape, and
+    a client that can render one refusal can render both.
+    """
+    return HTTPException(422, detail={
+        "error": f"{field} {token!r}: {problem}", "field": field, "token": token,
+        "hint": hint})
+
+
+async def _resolve_anchor(session: AsyncSession, token: str, repo: str | None,
+                          field: str) -> PlanItem:
+    """The item a placement is relative to: an item id, or an issue ref like ``#84``.
+
+    The same two spellings :func:`_resolve_dep` takes, for the same reason — an
+    agent transcribing a spoken priority has an issue number, not a uuid.
+
+    **The scope is EXACT, and that is the one rule placement adds.** Ranks are
+    allocated per scope: a repo's list runs 1..n and the fleet's runs its own
+    1..n, so "after the fleet item ranked 3" would name a position in a sequence
+    this item is not in. A repo read widens to carry the fleet band along because
+    context helps; a write that moves a row cannot, for the same reason
+    :class:`ReorderIn` narrows.
+    """
+    as_uuid = _as_uuid(token)
+    if as_uuid is not None:
+        item = await session.get(PlanItem, as_uuid)
+        if item is None:
+            raise _place_refused(field, token, "no such plan item",
+                                 "place it next to an item that is in the plan, or "
+                                 "leave the position out and it appends")
+    else:
+        ref = _norm_ref(token)
+        if not ref:
+            raise _place_refused(field, token, "not an item id or an issue number",
+                                 "spell it as an item id or as an issue like '#84'")
+        stmt = select(PlanItem).where(
+            PlanItem.ref_value == ref, PlanItem.ref_kind == "issue",
+            PlanItem.state == "open",
+            PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo)
+        item = await session.scalar(stmt.order_by(PlanItem.rank).limit(1))
+        if item is None:
+            raise _place_refused(
+                field, token, "nothing open in this scope references that issue",
+                "the plan links to issues, so a position is relative to an ITEM — "
+                "add the one you mean first, or leave the position out")
+    if item.state != "open":
+        raise _place_refused(
+            field, token, f"that item is {item.state}",
+            "order is for open work: finished and dropped items keep no place, so "
+            "there is no position beside one")
+    if item.repo != repo:
+        raise _place_refused(
+            field, token,
+            f"that item is in the {item.repo or 'fleet'} list, not the "
+            f"{repo or 'fleet'} one",
+            "ranks are per scope — a repo's list and the fleet's are two sequences, "
+            "and a position in one says nothing about the other")
+    return item
+
+
+async def _place_rank(session: AsyncSession, repo: str | None, anchor: PlanItem,
+                      *, before: bool) -> int:
+    """Make room beside ``anchor`` and return the rank the new item takes.
+
+    Call under :func:`_lock_scope`, like :func:`_next_rank`: this is a
+    read-then-write over the same ranks, and two placements computing room from
+    one snapshot is the same lost update.
+
+    **OPEN items only, exactly as a reorder renumbers only open ones.** History
+    keeps the rank it had — a done row is a record of finished work, not a
+    position — so a shift that renumbered it would rewrite the record every time
+    somebody placed an item above it.
+
+    ``updated_at`` is deliberately NOT touched on the rows that shift. Staleness
+    is "has anybody paid this item any attention", and being renumbered is not
+    attention: bumping it would let one placement make a fortnight-old plan read
+    as fresh, which is precisely the plan that is believed and wrong.
+    """
+    rank = anchor.rank if before else anchor.rank + 1
+    await session.execute(
+        update(PlanItem)
+        .where(PlanItem.state == "open", PlanItem.rank >= rank,
+               PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo)
+        .values(rank=PlanItem.rank + 1))
+    return rank
 
 
 async def _counts_by_state(session: AsyncSession, repo: str | None,
@@ -927,6 +1088,18 @@ class ItemIn(BaseModel):
     note: str | None = Field(default=None, max_length=MAX_NOTE)
     #: Item ids, or issue refs (``"#55"``) resolved against the same repo.
     depends_on: list[str] = Field(default_factory=list)
+    #: WHERE it goes, as an item id or an issue ref (``"#84"``) in the same scope.
+    #: Absent, it appends exactly as it always did. Placing is not reordering —
+    #: inserting between ranks 2 and 3 leaves every existing pair's relative order
+    #: untouched, so there is no prior decision to overwrite and nothing to thrash
+    #: (#183). Permuting what is already there is still :func:`reorder`, and still
+    #: human-only.
+    after: str | None = Field(default=None, max_length=128)
+    before: str | None = Field(default=None, max_length=128)
+    #: Whose stated priority this placement transcribes — ``"Rich, 23:00"``.
+    #: Refused without a position: on its own it would be one more free-text
+    #: priority channel, which is the workaround #183 is about rather than the fix.
+    placed_for: str | None = Field(default=None, max_length=MAX_PLACED_FOR)
 
 
 class ItemRefIn(BaseModel):
@@ -1066,6 +1239,13 @@ async def read_plan(
     that reads nothing else still gets a truthful answer, and one that reads the
     list sees why the items above it were skipped (held, blocked, or covered by
     another agent's plan claim).
+
+    **And it says how much that answer is worth.** ``next`` walks rank order, so
+    it is exactly as good as the ranks — which for a long time were part real
+    sequence and part the order the adds happened to arrive in, with nothing in
+    the data telling the two apart (#183). ``ordering`` reports that from the rows
+    themselves, and ``next.caveat`` carries it to the agent that reads only the
+    headline.
     """
     _refuse_phase(phase)
     now = _utcnow()
@@ -1099,6 +1279,8 @@ async def read_plan(
         views = open_views[:limit]
     unclaimed = [v for v in open_views
                  if not v["claim"] and not v["blocked_by"] and not v["covered_by"]]
+    ordering = _ordering_view(open_views)
+    nxt = unclaimed[0] if unclaimed else None
     by_state = await _counts_by_state(session, repo, plan_id, exact)
     in_scope = sum(by_state.values()) if include_done else by_state.get("open", 0)
     plans = await _plans_view(session, repo, exact, now, caller,
@@ -1124,7 +1306,13 @@ async def read_plan(
         # Said out loud rather than left to be worked out by comparing lengths:
         # a caller that got a page is entitled to know it was one.
         "truncated": len(views) < in_scope,
-        "next": unclaimed[0] if unclaimed else None,
+        # The caveat rides on `next` and not only in `ordering`, because the whole
+        # point of `next` is that it is read alone.
+        "next": None if nxt is None else
+                {**nxt, "caveat": _next_caveat(nxt, ordering, len(open_views))},
+        # Always present, `trusted: true` and all — a flag that appears only when
+        # things are wrong is one a client never learns to look for.
+        "ordering": ordering,
         "counts": {
             "open": len(open_views),
             "claimed": sum(1 for v in open_views if v["claim"]),
@@ -1146,7 +1334,27 @@ async def add_item(
     author: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Append an item. Adding is not reordering, so an agent may do it.
+    """Add an item, appending unless you say where it goes. Placing is not reordering.
+
+    The premise this endpoint has always been documented on — *adding is not
+    reordering, so an agent may do it* — was true of adding and false of what the
+    code did, because there was no way to add an item without also deciding where
+    it went and "last" was hard-coded (#183). That is not the absence of an
+    ordering judgement; it is the specific judgement "this is the lowest-priority
+    open item", asserted on the caller's behalf and wrong whenever the new item is
+    not in fact the least important thing outstanding.
+
+    So a caller may name a neighbour: ``after`` or ``before``, an item id or an
+    issue ref in the same scope. It stays agent-permitted because **placing
+    changes the relative order of nothing already in the plan** — insert between
+    ranks 2 and 3 and every existing pair keeps its existing relationship, so
+    there is no prior decision to overwrite and nothing for two agents to thrash.
+    Permuting existing items is the contested operation, and that is
+    :func:`reorder`, which is human-only and unchanged.
+
+    Absent a position it appends, exactly as before — and says so, in
+    ``rank_source``, rather than leaving a reader of 28 ranked rows to work out
+    which of them anybody chose.
 
     A second open item for an issue already in the plan is refused, naming the
     one that is already there — the plan holding two rows about #60 is precisely
@@ -1160,18 +1368,43 @@ async def add_item(
         raise HTTPException(422, "a title is what an agent reads in `next`: it cannot be blank")
     ref_value = _norm_ref(body.ref_value)
     repo = _norm_scope(body.repo)
+    # Normalised BEFORE the either-or check: `after=""` is no position at all, and
+    # refusing `{"after": "", "before": "#84"}` as "two positions" would refuse a
+    # request that names one.
+    after, before = _norm_text(body.after), _norm_text(body.before)
+    if after and before:
+        raise HTTPException(422, detail={
+            "error": "say `after` or `before`, not both",
+            "hint": "a position is one neighbour: two of them are two positions, and "
+                    "nothing in the request says they agree"})
+    placed_for = _norm_text(body.placed_for)
+    if placed_for and not (after or before):
+        raise HTTPException(422, detail={
+            "error": "`placed_for` records whose priority a PLACEMENT transcribes, "
+                     "so it needs `after` or `before`",
+            "hint": "without a position it is a priority written into free text, which "
+                    "is the workaround this field exists to end (#183) — pass the "
+                    "position too, or put the reasoning in `note`"})
     deps = await _resolve_deps(session, body.depends_on, repo, item_id=None)
     plan = await _ensure_plan(session, body.plan, repo, author)
-    # Held to the commit: `_next_rank` is a read-then-insert, and two adds in one
-    # scope both reading the same maximum is a lost update with no unique index
-    # behind it to notice — two items at the same position, ordered thereafter by
-    # whichever happened to be created first.
+    # Held to the commit: both `_next_rank` and `_place_rank` are read-then-write
+    # over the same ranks, and two adds in one scope working from one snapshot is a
+    # lost update with no unique index behind it to notice — two items at the same
+    # position, ordered thereafter by whichever happened to be created first.
     await _lock_scope(session, repo)
+    if after or before:
+        anchor = await _resolve_anchor(session, before or after, repo,
+                                       "before" if before else "after")
+        rank = await _place_rank(session, repo, anchor, before=bool(before))
+    else:
+        rank = await _next_rank(session, repo)
     item = PlanItem(
         repo=repo, title=title, ref_kind=body.ref_kind, ref_value=ref_value,
         plan_id=plan.id if plan is not None else None,
         note=_norm_text(body.note), depends_on=deps,
-        added_by=author, rank=await _next_rank(session, repo),
+        added_by=author, rank=rank,
+        rank_source="placed" if (after or before) else "appended",
+        placed_for=placed_for,
     )
     session.add(item)
     try:
@@ -1622,10 +1855,17 @@ async def reorder(
             "hint": "order is for open work: finished and dropped items keep no place"})
     ordered = [by_id[str(i)] for i in dict.fromkeys(str(i) for i in body.order)]
     rest = [i for i in by_id.values() if i not in ordered]
+    listed = {i.id for i in ordered}
     now = _utcnow()
     for rank, item in enumerate([*ordered, *rest], start=1):
-        if item.rank != rank:
-            item.rank, item.updated_at = rank, now
+        # `ordered` is the human's sequence and `rest` is what the page did not
+        # know about, so only the listed items become `ordered`: an item that
+        # arrived after the page loaded was carried along, not decided on, and
+        # marking it would make `GET /plan` claim a human had chosen a position
+        # they never saw (#183).
+        source = "ordered" if item.id in listed else item.rank_source
+        if item.rank != rank or item.rank_source != source:
+            item.rank, item.rank_source, item.updated_at = rank, source, now
     await session.commit()
     return {
         "repo": repo, "reordered": len(ordered), "by": editor,
@@ -2481,6 +2721,12 @@ async def submit_plan(
             plan_items.append(PlanItem(
                 repo=repo, title=title, ref_kind=item.ref_kind, ref_value=ref,
                 note=_norm_text(item.note), added_by=author, rank=rank + position,
+                # Not `appended`: the submitter wrote this list in this order, so
+                # the sequence WITHIN the plan is a decision somebody took. Where
+                # the block itself sits still is an append, which is why it is not
+                # `ordered` either — a submitted plan is a proposal, and #183's
+                # `ordering` report says so.
+                rank_source="submitted",
                 depends_on=[]))
         for row in plan_items:
             session.add(row)

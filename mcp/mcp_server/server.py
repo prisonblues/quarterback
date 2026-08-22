@@ -176,13 +176,17 @@ mcp = FastMCP(
         "## What to work on (v2.39)\n"
         "**Start cold:** plan_read(repo=...) — the ordered list of what is next, "
         "with `next` already worked out: the first item that is open, unclaimed "
-        "and unblocked. Items link to issues and never restate them.\n"
+        "and unblocked. Items link to issues and never restate them. Check "
+        "`next.caveat`: it is set when part of the order is just the order things "
+        "were added, and then the rank is not a priority.\n"
         "**Then claim it:** plan_claim(item_id) BEFORE you start. That is the only "
         "post that can prevent duplicated work; a `done` afterwards can only "
         "record it. The claim expires by itself, so a session that dies frees its "
         "item with nobody intervening. plan_done(item_id) when the issue closes.\n"
-        "A human orders the plan; you add items, claim them, record what they wait "
-        "on (plan_depends) and complete them.\n"
+        "A human orders the plan; you add items — with plan_add(after=/before=) "
+        "when you are writing down a position you were GIVEN, since placing a new "
+        "item reorders nothing — claim them, record what they wait on "
+        "(plan_depends) and complete them.\n"
         "**Is that order still right?** plan_order(repo=...) — the order the "
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
@@ -830,6 +834,14 @@ def plan_read(ctx: Context, repo: str | None = None, plan: str | None = None,
     Items reference issues and never restate them: read the issue for the what
     and the why, and the plan for the order and the reasoning behind it.
 
+    **Check `next.caveat` before you act on `next`.** The answer is worked out
+    from ranks, so it is exactly as good as the ranks are — and an item that was
+    appended sits last because that was all `plan_add` could do, not because
+    anybody decided it was least important. `ordering` says how much of the
+    sequence was actually chosen and from which rank it stops meaning anything;
+    `caveat` is that fact carried to whoever reads only the headline. When it is
+    set, read the notes rather than trusting the number.
+
     Args:
         repo: this repo's items plus the fleet-wide ones. Omit for everything.
         plan: only one plan, by label ("stage 1") or by id.
@@ -896,8 +908,23 @@ def plan_order(ctx: Context, repo: str | None = None) -> dict:
 def plan_add(ctx: Context, title: str, repo: str | None = None,
              ref_kind: str | None = None, ref_value: str | None = None,
              plan: str | None = None, note: str | None = None,
-             depends_on: list[str] | None = None) -> dict:
-    """Append an item to the plan. Adding is not reordering, so you may.
+             depends_on: list[str] | None = None, after: str | None = None,
+             before: str | None = None, placed_for: str | None = None) -> dict:
+    """Add an item to the plan, appending unless you say where it goes.
+
+    **Placing is not reordering, so you may place.** Permuting items already in
+    the plan is contested — two agents rewriting each other is how it stops being
+    the shared intent it exists to be — and stays human-only. Saying where a NEW
+    item enters alters the relative order of nothing already there: insert between
+    ranks 2 and 3 and every existing pair keeps its existing relationship. There
+    is no prior decision to overwrite, so there is nothing to thrash.
+
+    **A position is for transcribing an order you were given, not asserting one
+    you formed.** If a human tells you mid-session that #85 is near the top, that
+    is theirs and you are writing it down — `after`/`before` plus `placed_for` is
+    the channel for it, and before it existed the only way to record it was to
+    write "TOP PRIORITY — Rich, 23:00" into a field meant for something else. If
+    you merely think an item is important, append it and say why in `note`.
 
     **Link, do not restate.** Pass `ref_kind='issue'` and the number; the issue
     holds the what and the why. What belongs here is the half it cannot hold —
@@ -920,11 +947,19 @@ def plan_add(ctx: Context, title: str, repo: str | None = None,
         note: why it sits where it sits.
         depends_on: what it waits on — item ids, or issue refs like "#55" that
             resolve against the same repo's items.
+        after: put it immediately below this item — an item id or an issue ref
+            ("#84") in the SAME scope (a repo's list and the fleet's are two
+            sequences, and a position in one says nothing about the other).
+        before: put it immediately above that item. One or the other, not both.
+        placed_for: whose priority the placement transcribes — "Rich, 23:00". Only
+            accepted with a position; on its own it would be a priority written
+            into free text, which is the thing this replaced.
     """
     try:
         return _get_client(ctx).plan_add({
             "title": title, "repo": repo, "ref_kind": ref_kind, "ref_value": ref_value,
-            "plan": plan, "note": note, "depends_on": depends_on or []})
+            "plan": plan, "note": note, "depends_on": depends_on or [],
+            "after": after, "before": before, "placed_for": placed_for})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_add")
 

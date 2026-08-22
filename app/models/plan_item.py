@@ -30,6 +30,31 @@ STATES = ("open", "done", "dropped")
 
 _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 
+#: How this item's rank came to be — WHO decided it sits there, which is the one
+#: thing 28 ranked rows could not say (#183). The plan was seeded, an agent was
+#: told mid-seed that #85 was near-top priority, and the only place it could
+#: record that was prose: a ``phase`` reading ``"TOP PRIORITY — Rich, 23:00"`` and
+#: a ``note`` opening ``RANK IS WRONG AND A HUMAN MUST FIX IT``. Meanwhile ranks
+#: 1-17 were a real order and 18-28 were the sequence the adds happened to arrive
+#: in, with nothing in the data telling the two apart.
+#:
+#: * ``appended`` — nobody chose it. It went last because that is all
+#:   ``POST /plan/item`` could do, which is an ordering judgement ("this is the
+#:   least important open item") asserted on the caller's behalf without being
+#:   asked.
+#: * ``submitted`` — it arrived inside a ``POST /plan/submit`` batch, so the
+#:   submitter chose the order WITHIN the plan; where the block itself sits is
+#:   still an append.
+#: * ``placed`` — an agent said where it goes, relative to a named neighbour.
+#: * ``ordered`` — a human set it with ``POST /plan/reorder``.
+#:
+#: Only ``ordered`` is the plan's shared intent. The rest are how the row got
+#: there, and ``GET /plan`` says so rather than leaving a reader to infer it from
+#: a note somebody remembered to write.
+RANK_SOURCES = ("appended", "submitted", "placed", "ordered")
+
+_RANK_SOURCE_LIST = ", ".join(f"'{s}'" for s in RANK_SOURCES)
+
 
 class PlanItem(Base):
     """One line of "what is next", ordered, and pointing at an issue.
@@ -77,6 +102,17 @@ class PlanItem(Base):
     #: Position in the list. Rewritten wholesale by a reorder; see the migration
     #: on why this is an integer and not a fraction.
     rank: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: How that rank came to be — see :data:`RANK_SOURCES`. Defaulted in the
+    #: database rather than in Python so a row written by a migration or by hand
+    #: still says something true about itself.
+    rank_source: Mapped[str] = mapped_column(
+        Text, server_default=text("'appended'"), nullable=False)
+    #: Whose stated priority a ``placed`` item transcribes — "Rich, 23:00". A
+    #: field rather than a sentence in ``note``, because the workaround #183
+    #: documents was an agent with a priority it had been told and no channel to
+    #: record it in. Only ever set alongside a position: on its own it would be
+    #: the free-text priority channel this replaced.
+    placed_for: Mapped[str | None] = mapped_column(Text)
     #: Ids of the items this one waits on, as strings. "not yet" as a fact
     #: instead of a convention.
     depends_on: Mapped[list[str]] = mapped_column(
@@ -101,6 +137,8 @@ class PlanItem(Base):
 
     __table_args__ = (
         CheckConstraint(f"state IN ({_STATE_LIST})", name="ck_plan_items_state"),
+        CheckConstraint(f"rank_source IN ({_RANK_SOURCE_LIST})",
+                        name="ck_plan_items_rank_source"),
         CheckConstraint("(ref_kind IS NULL) = (ref_value IS NULL)", name="ck_plan_items_ref_pair"),
         Index("ix_plan_items_repo_rank", "repo", "rank"),
         Index("ix_plan_items_open_ref", text("COALESCE(repo, '')"), "ref_kind", "ref_value",

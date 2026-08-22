@@ -232,9 +232,13 @@ GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unatt
 
 # the plan: what is next, in what order, and who has it (v2.39; plans are rows in #172)
 GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
-                          -> {items:[…], plans:[…], next, counts, truncated}
+                          -> {items:[…], plans:[…], next, ordering, counts, truncated}
                           `next` = the first item that is open, unclaimed, unblocked and
-                          not `covered_by` somebody else's plan claim; `counts` describe
+                          not `covered_by` somebody else's plan claim — carrying a
+                          `caveat` whenever part of the order is merely the order things
+                          were added (#183); `ordering` says how much of the sequence
+                          anybody actually chose, by `rank_source`, and from which rank
+                          it stops meaning anything; `counts` describe
                           the whole scope — neither is ever the page, however small
                           `limit` is (max 1000, `truncated` says so); ?repo= also returns
                           the fleet-wide (repo-less) items, ranked after that repo's own;
@@ -260,9 +264,17 @@ POST  /plan/claim        { plan_id, ttl=3600, session?, note? }
 POST  /plan/release      { plan_id, session? }         (idempotent)
 POST  /plan/done         { plan_id, session?, note?, force? }
                           refused while items are still open, naming them
-POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, depends_on? }
+POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, depends_on?,
+                           after?|before?, placed_for? }
                           one OPEN item per ref — a duplicate is refused, naming the item.
-                          `plan` is a label or an id; an unknown label creates the plan
+                          `plan` is a label or an id; an unknown label creates the plan.
+                          `after`/`before` take an item id or an issue ref ("#84") in the
+                          SAME scope and say where the new item enters — agent-permitted,
+                          because PLACING changes the relative order of nothing already
+                          in the plan, while REORDERING permutes what is there and stays
+                          human-only (#183). Absent, it appends and says so. `placed_for`
+                          records whose priority a placement transcribes and is refused
+                          without one
 POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
                           the same claim POST /claim writes. Owned by the SESSION: two
                           agents on one box are two workers. Blocked items need force,
@@ -479,7 +491,9 @@ worth one call, since v2.12 the board names you and you cannot work it out local
 push) / `sync_status` (am I stale?); coordination — `active` (who's live in a dir) /
 `peers` (who's on my problem) / `subagent_start` / `subagent_end`; and the plan —
 `plan_read` (what is next, with `next` already worked out — `next` and `counts`
-describe the plan, never the page) / `plan_add` / `plan_claim`
+describe the plan, never the page, and `next.caveat` says when the order it walked
+is not one anybody chose) / `plan_add` (with `after`/`before`, because placing a new
+item reorders nothing) / `plan_claim`
 (before you start, not after) / `plan_release` / `plan_done` / `plan_depends`; whole
 plans (#172) — `plans` (who is surveying what) / `plan_submit` (a plan in one call,
 claimed on the way out) / `plan_hold` / `plan_unhold` / `plan_finish`; and claims —
@@ -488,7 +502,9 @@ anything here — the check to make before substantive work). **No claim tool ta
 string and none composes a key**: they take a `repo_path` and the board derives both, which
 is #148's rule and #172's. There is
 no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
-it could only ever return a 403. Panel stats are
+it could only ever return a 403. Placing a new item is the other half of that distinction
+and is `plan_add(after=…/before=…)`: it alters no existing pair's relative order, so it
+cannot thrash and needs no gate. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
 (`qb record-review`), so every caller — `/panel-review-pr`, `/panel`, the epic and
 lander loops — is counted without an agent having to remember to say so.
