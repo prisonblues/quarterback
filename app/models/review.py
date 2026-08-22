@@ -249,6 +249,38 @@ class ReviewRun(Base):
         CheckConstraint('"round" >= 1', name="ck_review_runs_round_positive"),
         CheckConstraint("new_findings >= 0",
                         name="ck_review_runs_new_findings_non_negative"),
+        # One repository, one stored spelling — at the boundary, so that the API
+        # is not the only thing that remembers (#326, migration 0033).
+        #
+        # GitHub folds owner and repository names and preserves what you typed,
+        # so `PrisonBlues/Quarterback` and `prisonblues/quarterback` are one repo
+        # this column held as two — and every read compares it with `==`. The
+        # visible cost was `GET /review/collisions` answering `considered: 0`:
+        # an all-clear made of nothing having matched, on the endpoint written to
+        # make exactly that unrepresentable.
+        #
+        # `POST /review` folds through `canonical_repo` now, and the point of
+        # ALSO saying it here is that a write path added later cannot quietly
+        # reintroduce the second spelling: the read sites this unblocked (#326
+        # deleted the `func.lower()` folds in `app.api.plan` and
+        # `app.api.review_queue`) depend on the column, not on the endpoint.
+        # Case and surrounding space only — NOT `owner/name` shape. The shape is
+        # refused at ingest where a caller can be told why; rows written before
+        # that check existed are legitimately here, and a constraint that
+        # rejected them would make this migration unrunnable rather than make
+        # them canonical.
+        # `btrim` is given its character class because the one-argument form trims
+        # spaces and nothing else, while `canonical_repo`'s `str.strip()` takes
+        # every whitespace character — see migration 0033. Two rules disagreeing
+        # about one column is what this constraint exists to prevent.
+        #
+        # Vertical tab is `\013` and NOT `\v`, for the reason
+        # `ck_review_finding_reports_needs_human_evidence` gives below: Postgres
+        # has no `\v` escape, so it reads as the literal letter — and `btrim`
+        # would then strip a `v` off the ends of a repository name. `vercel/next`
+        # trims to `ercel/next` and fails this very constraint.
+        CheckConstraint(r"repo = lower(btrim(repo, E' \t\n\r\f\013'))",
+                        name="ck_review_runs_repo_canonical"),
     )
 
 
@@ -773,6 +805,13 @@ class ReviewFindingOutcome(Base):
         # pr), which the leftmost prefix serves. No separate index — the same
         # argument `ReviewRunFile` records for its own unique constraint.
         UniqueConstraint("repo", "pr", "finding_key", name="uq_review_finding_outcome"),
+        # The unique constraint above is only as good as the spelling it is on:
+        # `Acme/X` and `acme/x` are one repository, so without this they are two
+        # rows for one defect and "what happened to this?" has two answers again
+        # — the thing the constraint was written to stop. Same rule and same
+        # reasoning as `ck_review_runs_repo_canonical` (#326, migration 0033).
+        CheckConstraint(r"repo = lower(btrim(repo, E' \t\n\r\f\013'))",
+                        name="ck_review_finding_outcomes_repo_canonical"),
         CheckConstraint(
             "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
             name="ck_review_finding_outcomes_vocabulary",

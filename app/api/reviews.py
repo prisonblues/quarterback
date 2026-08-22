@@ -355,6 +355,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, undefer
 
 from app.auth import identify, reader
+from app.claimkey import BadRef, canonical_repo
 from app.collisions import (
     CLASSES,
     COLLIDES,
@@ -391,6 +392,53 @@ router = APIRouter(tags=["review"])
 #: the evidence was gone the moment the response was discarded — and #65's drift
 #: check, the thing this signal exists to feed, would have had nothing to read.
 _log = logging.getLogger("app.review")
+
+
+def _stored_repo(value: str) -> str:
+    """The one spelling a review row is STORED under. For a write path's validator.
+
+    GitHub treats owner and repository names case-insensitively while preserving
+    what you typed, so ``PrisonBlues/Quarterback`` and ``prisonblues/quarterback``
+    are one repository the board would otherwise hold as two — and every read in
+    this module compares the column with ``==``. A run recorded under one spelling
+    and asked about under the other produced a **404** from
+    :func:`pr_collisions`' subject lookup, or, once two spellings were both on the
+    board, a ``counts.considered`` of **0**: an all-clear made of nothing having
+    matched, which is the reading #101 exists to make unavailable (#326).
+
+    **Normalised here, on the write, rather than folded at each read**, which is
+    the choice #326 asks to be made rather than patched. The read-side fold works
+    — ``_pr_evidence`` in :mod:`app.api.plan` has carried one since #232 — and it
+    has to be remembered by every query anyone writes afterwards, which is exactly
+    how this endpoint came to be the second instance. Migration ``0022`` settled
+    the same question for release keys and its reasoning is quoted here whole:
+    *resolving once, on write, makes the alias set empty by construction.*
+    ``0033`` folds the rows written before this and puts a CHECK constraint on
+    both columns, so a future write path that forgets fails loudly at the database
+    instead of quietly inventing a second repo.
+
+    A spelling that is not ``owner/name`` is **refused**, not guessed at — see
+    :data:`app.claimkey.REPO_SHAPE`. A caller sending a clone URL or a bare name
+    got an empty answer before, which is the same false-clean this is about.
+    """
+    try:
+        return canonical_repo(value)
+    except BadRef as e:
+        raise ValueError(str(e)) from e
+
+
+def _asked_repo(value: str) -> str:
+    """:func:`_stored_repo` for a query parameter — the same fold, as a 422.
+
+    Both halves have to canonicalise or neither is worth doing: the stored value
+    is folded on the way in, so a caller's ``?repo=PrisonBlues/Quarterback`` must
+    be folded on the way out to meet it. Query parameters are not pydantic models
+    here, so the refusal has to be raised as the response directly.
+    """
+    try:
+        return canonical_repo(value)
+    except BadRef as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(e)) from e
 
 
 async def _authored_as(session: AsyncSession, author: str) -> str:
@@ -1517,6 +1565,12 @@ class ReviewIn(BaseModel):
                         ("provenance_counts", counts, isinstance(counts, Mapping)),
                     ) if val is not None and not ok)}
 
+    @field_validator("repo")
+    @classmethod
+    def _repo(cls, v: str) -> str:
+        """One repository, one stored spelling — :func:`_stored_repo`, and #326."""
+        return _stored_repo(v)
+
     @field_validator("head_sha", "merge_base", "base_sha", mode="before")
     @classmethod
     def _commit_id(cls, v: object) -> str | None:
@@ -2507,14 +2561,14 @@ class OutcomesIn(BaseModel):
     @field_validator("repo")
     @classmethod
     def _repo(cls, v: str) -> str:
-        # Trimmed because it is matched with `==` against what `POST /review`
-        # stored: a trailing space makes `known` empty and every item in the
-        # batch is then rejected with "no finding with this key on this PR",
-        # which points the caller at its keys, which were fine.
-        s = v.strip()
-        if not s:
-            raise ValueError("repo is blank")
-        return s
+        # Canonicalised, not merely trimmed, because it is matched with `==`
+        # against what `POST /review` stored — and since #326 that is the folded
+        # spelling. A trailing space made `known` empty and every item in the
+        # batch was rejected with "no finding with this key on this PR", which
+        # points the caller at its keys, which were fine; a capital did the same
+        # thing and was harder to see. `finding_key` is scoped by (repo, pr), so
+        # a second spelling here is also a second outcome row for one defect.
+        return _stored_repo(v)
 
     @field_validator("session")
     @classmethod
@@ -3286,7 +3340,7 @@ async def list_reviews(
     # itself is deferred and deliberately not fetched here — see `_run_view`.
     stmt = select(ReviewRun, _UNREAD_COUNT)
     if repo is not None:
-        stmt = stmt.where(ReviewRun.repo == repo)
+        stmt = stmt.where(ReviewRun.repo == _asked_repo(repo))  # #326
     if pr is not None:
         stmt = stmt.where(ReviewRun.pr == pr)
     if author is not None:
@@ -3387,6 +3441,10 @@ async def review_stats(
     """
     filters = []
     if repo is not None:
+        # Rebound, not folded inline: `window.repo` below echoes this back, and a
+        # response that filtered on one spelling and reported another would leave
+        # a caller unable to tell which repository it was answered about (#326).
+        repo = _asked_repo(repo)
         filters.append(ReviewRun.repo == repo)
     if author is not None:
         author = await _authored_as(session, author)
@@ -4135,6 +4193,9 @@ async def pr_finding_history(
     stored fact, and a summary that contradicts the rows underneath it is worse
     than an absent one.
     """
+    # Folded once, here, and every use below — the run lookup, the outcome lookup
+    # and the `repo` echoed back — reads the folded value. #326.
+    repo = _asked_repo(repo)
     # One over the window, so "there is older history" is a fact rather than the
     # guess "we returned exactly as many as we asked for".
     # Runs plus their unread-path counts, the count in SQL against a deferred
@@ -4666,6 +4727,20 @@ async def pr_collisions(
     not representable, which is what makes this class of bug impossible rather
     than fixed twice.
 
+    **``considered: 0`` means the population was empty, never that the repo was
+    spelt differently** (#326). It used to be able to mean the second: the column
+    was stored as the panel sent it and compared here with ``==``, so a board
+    holding one repository under two capitalisations answered a query in one
+    spelling with the rivals of that spelling alone — zero of them, read by a
+    lander as "landing this disturbs nothing". Both halves are folded through
+    :func:`app.claimkey.canonical_repo` now — the write, so there is one stored
+    spelling, and the caller's ``repo``, so it meets it — and the subject lookup
+    and the rival selection use the same folded string. The subject was found
+    under it or this call already 404ed, so zero rivals is a fact about the
+    window and the population, and the two readings are no longer confusable.
+    ``repo`` comes back in the response in its stored spelling, so a caller that
+    sent capitals can see what it was answered about.
+
     **Read the subject's own ``files_complete`` before trusting any
     ``disjoint``.** If the subject's list is a prefix, it may collide on paths it
     never reported, and no per-rival verdict below can see that.
@@ -4693,6 +4768,13 @@ async def pr_collisions(
     subject's ``files_recorded``. ``GET /review/{run_id}`` has a run's paths in
     full for a caller that wants them.
     """
+    # Folded once, before anything is selected, so the subject lookup and the
+    # rival selection cannot be asking about two different repositories (#326).
+    # That equality is what makes `considered: 0` readable: the subject was found
+    # under this exact stored string, so a rival count of zero is a statement
+    # about the population and never about the spelling.
+    repo = _asked_repo(repo)
+
     # ---- the subject.
     #
     # The subject alone falls back through earlier runs to find a file list,
@@ -5028,6 +5110,8 @@ async def needs_human_open(
         ReviewFinding.verdict.in_(("confirmed", "unjudged")),
     ]
     if repo is not None:
+        # Rebound for the reason `review_stats` gives: the response echoes it.
+        repo = _asked_repo(repo)
         scope.append(ReviewRun.repo == repo)
     if pr is not None:
         scope.append(ReviewRun.pr == pr)

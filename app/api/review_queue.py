@@ -158,7 +158,7 @@ async def _last_runs(session: AsyncSession, repo: str,
         return {}, {}
     rows = list((await session.scalars(
         select(ReviewRun)
-        .where(ReviewRun.pr.in_(numbers), func.lower(ReviewRun.repo) == repo)
+        .where(ReviewRun.pr.in_(numbers), ReviewRun.repo == repo)
         .order_by(ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
     )).all())
     newest: dict[int, ReviewRun] = {}
@@ -186,7 +186,7 @@ async def _cleared(session: AsyncSession, repo: str,
         .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
         .join(
             ReviewFindingOutcome,
-            (func.lower(ReviewFindingOutcome.repo) == repo)
+            (ReviewFindingOutcome.repo == repo)
             & (ReviewFindingOutcome.pr == ReviewRun.pr)
             & (ReviewFindingOutcome.finding_key == ReviewFinding.finding_key)
             & ReviewFindingOutcome.outcome.in_(sorted(CLEARING_OUTCOMES)),
@@ -215,10 +215,15 @@ async def _needs_human(session: AsyncSession, repo: str,
     implementation of that rule is exactly what #65's class of drift looks like,
     and one number needs none of it.
 
-    The repo is folded, as it is everywhere else on this path. ``needs_human_open``
-    compares it exactly, which is #326 — a differently-spelt repo reporting zero
-    is the failure mode a queue can least afford, since zero here reads as
-    "nobody is owed an answer".
+    The repo is compared exactly, as it is everywhere else on this path, and that
+    is safe **since #326 folded the write**: ``POST /review`` stores the
+    canonical spelling, this endpoint canonicalises ``body.repo`` once at the top,
+    and migration ``0033``'s CHECK constraint is what stops the two drifting
+    apart. The ``func.lower()`` these queries used to carry was the read-side half
+    of the same idea, and it cost the ``ix_review_runs_repo_pr`` index to say what
+    the column now guarantees. A differently-spelt repo reporting zero is the
+    failure mode a queue can least afford, since zero here reads as "nobody is
+    owed an answer".
     """
     if not numbers:
         return {}
@@ -229,7 +234,7 @@ async def _needs_human(session: AsyncSession, repo: str,
         .where(ReviewFinding.needs_human.is_(True),
                ReviewFinding.verdict.in_(("confirmed", "unjudged")),
                ReviewRun.pr.in_(numbers),
-               func.lower(ReviewRun.repo) == repo)
+               ReviewRun.repo == repo)
         .group_by(ReviewRun.pr, ReviewFinding.finding_key)
     )).all()
     if not rows:
@@ -237,7 +242,7 @@ async def _needs_human(session: AsyncSession, repo: str,
     settled = {
         (pr, key) for pr, key in (await session.execute(
             select(ReviewFindingOutcome.pr, ReviewFindingOutcome.finding_key)
-            .where(func.lower(ReviewFindingOutcome.repo) == repo,
+            .where(ReviewFindingOutcome.repo == repo,
                    ReviewFindingOutcome.pr.in_(numbers))
         )).all()
     }

@@ -148,6 +148,113 @@ def test_an_unparseable_key_is_left_alone_rather_than_reshaped():
         ("work", "prisonblues/lexray:serving-row:32022R2554")
 
 
+# ----------------------------------------- the same rule, on the review tables
+
+#: One `POST /review` body, minus the repo — the panel's smallest legal run.
+def _run(repo: str, pr: int, **over) -> dict:
+    return {"repo": repo, "pr": pr, "judged": True, "judge_model": "opus",
+            "reviewers_selected": ["claude"],
+            "reviewers": {"claude": {"model": "opus", "ran": True}},
+            "to_fix": [], "dismissed": [], "sonar_findings": [], **over}
+
+
+async def test_a_run_is_stored_under_one_spelling_however_the_panel_sent_it(client):
+    """#326's root cause. `review_runs.repo` was stored exactly as the panel sent
+    it and every read compared it with `==`, so two checkouts with two remotes put
+    one repository on the board twice — and each spelling's queries answered about
+    half of it. The fold happens on the write, so there is only ever one."""
+    r = await client.post("/review", json=_run("Acme/CaseFold", 9101), headers=LAPTOP)
+    assert r.status_code == 201, r.text
+
+    for asked in ("acme/casefold", "Acme/CaseFold", "ACME/CASEFOLD"):
+        listed = await client.get("/reviews", params={"repo": asked}, headers=LAPTOP)
+        assert listed.status_code == 200, listed.text
+        prs = [row["pr"] for row in listed.json()]
+        assert 9101 in prs, f"{asked!r} could not see the run it recorded"
+        assert [row["repo"] for row in listed.json() if row["pr"] == 9101] == \
+            ["acme/casefold"]
+
+        # And the aggregate, which is where a second spelling shows up as a
+        # second repository: `/review/stats` counts `DISTINCT repo`, which no
+        # fold in a WHERE clause could ever have corrected. Its `window` echoes
+        # the spelling it filtered on, so the two cannot disagree.
+        stats = await client.get("/review/stats",
+                                 params={"repo": asked, "judged_only": "false"},
+                                 headers=LAPTOP)
+        assert stats.status_code == 200, stats.text
+        assert stats.json()["window"]["repo"] == "acme/casefold"
+        assert stats.json()["repos"] == 1, f"{asked!r} saw more than one repository"
+
+
+async def test_an_outcome_recorded_under_capitals_settles_the_same_defect(client):
+    """The other half of the review pair, and the one with a unique constraint on
+    it. `review_finding_outcomes` is UNIQUE on `(repo, pr, finding_key)`, so a
+    second spelling is a second terminal answer to "what happened to this
+    defect?" — and the batch used to be rejected wholesale instead, with "no
+    finding with this key on this PR", which points the caller at its keys."""
+    r = await client.post("/review", json=_run(
+        "acme/outcomefold", 9102,
+        to_fix=[{"key": "F-1", "title": "a defect", "file": "a.py",
+                 "reviewer": "claude", "severity": "major"}]), headers=LAPTOP)
+    assert r.status_code == 201, r.text
+
+    recorded = await client.post("/review/outcomes", json={
+        "repo": "Acme/OutcomeFold", "pr": 9102,
+        "outcomes": [{"key": "F-1", "outcome": "fixed"}]}, headers=LAPTOP)
+    assert recorded.status_code in (200, 201), recorded.text
+    body = recorded.json()
+    assert body["recorded"] == ["F-1"], body
+    assert body["rejected"] == [], body
+    assert body["repo"] == "acme/outcomefold"
+
+
+@pytest.mark.parametrize("path,params", [
+    ("/reviews", {}),
+    ("/review/stats", {}),
+    ("/review/findings", {"pr": 1}),
+    ("/review/collisions", {"pr": 1}),
+    ("/review/needs-human", {}),
+])
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_every_review_read_refuses_a_spelling_that_is_not_a_repo(
+        client, path, params, repo):
+    """The read path matters as much as the write path, and on these endpoints it
+    matters more: a spelling the board cannot key used to come back as an empty
+    list or a 404 saying the PR was never panelled, which is a confident answer
+    made of not having matched anything."""
+    r = await client.get(path, params={"repo": repo, **params}, headers=LAPTOP)
+    assert r.status_code == 422, f"{path} accepted {repo!r}: {r.text}"
+
+
+@pytest.mark.parametrize("table", ["review_runs", "review_finding_outcomes"])
+async def test_the_database_refuses_a_second_spelling_of_one_repo(client, table):
+    """What actually closes the class, rather than fixing the endpoint twice.
+
+    #232 folded one read site, this endpoint was the second instance, and the
+    audit for #326 found twelve more — including a `COUNT(DISTINCT repo)` and a
+    Python dict keyed on `(repo, pr, finding_key)`, neither of which a
+    `func.lower()` in a WHERE clause can reach. A validator on today's write paths
+    would leave tomorrow's to remember. The CHECK constraint means it cannot
+    forget: an INSERT that bypasses the API entirely still fails.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.exc import IntegrityError
+
+    from app.db import engine
+
+    rows = {
+        "review_runs": "INSERT INTO review_runs (author, repo, pr) "
+                       "VALUES ('zeus/x', 'Acme/Sneaky', 1)",
+        "review_finding_outcomes":
+            "INSERT INTO review_finding_outcomes (repo, pr, finding_key, outcome, "
+            "set_by) VALUES ('Acme/Sneaky', 1, 'F-1', 'fixed', 'zeus/x')",
+    }
+    with pytest.raises(IntegrityError) as e:
+        async with engine.begin() as conn:
+            await conn.execute(text(rows[table]))
+    assert "repo_canonical" in str(e.value)
+
+
 # ------------------------------------------------- the half that lives in mcp/
 
 @pytest.fixture(scope="module")
