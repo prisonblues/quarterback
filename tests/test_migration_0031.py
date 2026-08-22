@@ -1,6 +1,6 @@
-"""What migration 0029 does with the two rows #323 was filed about.
+"""What migration 0031 does with the two rows #323 was filed about.
 
-The suite's schema fixture runs 0029 in both directions on every db-backed run,
+The suite's schema fixture runs 0031 in both directions on every db-backed run,
 but only over an EMPTY ``plan_items`` — the one shape a data migration cannot be
 wrong about. This module gives it the live board's rows, item ids and all.
 
@@ -18,7 +18,7 @@ the migration handles the shape the new namespace holds and raises on anything
 else, and both of those are pinned below.
 
 **A throwaway database, created and dropped here**, for ``test_migration_0025``'s
-reason: the migration is the thing under test, so it has to run for real at 0028
+reason: the migration is the thing under test, so it has to run for real at 0030
 over data, and the suite's own database is at ``head`` with every other test's
 rows in it.
 """
@@ -84,7 +84,7 @@ def _must(url: str, *args: str) -> None:
 
 
 async def _scratch(name: str):
-    """A fresh database at 0028, and the two URLs for reaching it."""
+    """A fresh database at 0030, and the two URLs for reaching it."""
     base = make_url(os.environ["DATABASE_URL"])
     db = f"{base.database}_{name}"
     sa_url = base.set(database=db).render_as_string(hide_password=False)
@@ -99,7 +99,7 @@ async def _scratch(name: str):
         await admin.execute(f'CREATE DATABASE "{db}"')
     finally:
         await admin.close()
-    _must(sa_url, "upgrade", "0028")
+    _must(sa_url, "upgrade", "0030")
     return sa_url, dsn, admin_dsn, db
 
 
@@ -113,8 +113,8 @@ async def _drop(admin_dsn: str, db: str) -> None:
 
 @pytest.fixture(scope="module")
 async def snapshots():
-    """Seed the live rows at 0028, upgrade, snapshot, downgrade, snapshot again."""
-    sa_url, dsn, admin_dsn, db = await _scratch("m0029")
+    """Seed the live rows at 0030, upgrade, snapshot, downgrade, snapshot again."""
+    sa_url, dsn, admin_dsn, db = await _scratch("m0031")
     try:
         conn = await asyncpg.connect(dsn)
         try:
@@ -144,7 +144,7 @@ async def snapshots():
         finally:
             await conn.close()
 
-        _must(sa_url, "downgrade", "0028")
+        _must(sa_url, "downgrade", "0030")
         conn = await asyncpg.connect(dsn)
         try:
             down = {
@@ -195,7 +195,7 @@ def test_the_scope_records_who_first_put_work_in_it(snapshots):
     identity that created the earliest row in the scope — better than a synthetic
     "migration" in a column about a decision."""
     assert snapshots["up"]["scopes"][0]["added_by"] == "zeus/crimson-umber"
-    assert "0029" in snapshots["up"]["scopes"][0]["note"]
+    assert "0031" in snapshots["up"]["scopes"][0]["note"]
 
 
 def test_the_plan_row_in_that_scope_moves_with_its_items(snapshots):
@@ -218,7 +218,7 @@ def test_a_repo_scope_and_the_fleet_are_left_alone(snapshots):
 
 def test_the_downgrade_leaves_the_database_as_it_found_it(snapshots):
     """Not merely "reversible": leaving `project:65lowther` behind would be WORSE
-    than the state being reverted to, because the pre-0029 code refuses a colon —
+    than the state being reverted to, because the pre-0031 code refuses a colon —
     so those rows would be unreadable by every scope including their own."""
     by_id = {str(r["id"]): r for r in snapshots["down"]["items"]}
     for item_id, repo, _, _, _ in LIVE:
@@ -243,7 +243,7 @@ async def test_a_legacy_scope_it_cannot_resolve_stops_the_migration(scope, becau
     holes (#152). A migration that fails loudly is the cheap kind; the alternative
     puts an uninterpretable string in the namespace forever, under a prefix that
     asserts a person chose it."""
-    sa_url, dsn, admin_dsn, db = await _scratch("m0029_bad")
+    sa_url, dsn, admin_dsn, db = await _scratch("m0031_bad")
     try:
         conn = await asyncpg.connect(dsn)
         try:
@@ -264,7 +264,7 @@ async def test_two_scopes_that_would_fold_into_one_stop_the_migration():
     lists in the old one, each with its own 1..n ranks. Merging them would
     interleave two orders nobody has ever compared — the failure `_scope_items`
     names — so it is refused with both spellings on the message instead."""
-    sa_url, dsn, admin_dsn, db = await _scratch("m0029_fold")
+    sa_url, dsn, admin_dsn, db = await _scratch("m0031_fold")
     try:
         conn = await asyncpg.connect(dsn)
         try:

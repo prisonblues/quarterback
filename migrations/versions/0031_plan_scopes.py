@@ -46,8 +46,8 @@ unique indexes involved (`ix_plan_items_open_ref`, `ix_plans_open_label`) both k
 on `COALESCE(repo, '')`, and renaming a whole scope at once moves every member of
 each key group together, so neither can be violated by this.
 
-Revision ID: 0029
-Revises: 0028
+Revision ID: 0031
+Revises: 0030
 """
 
 import re
@@ -55,8 +55,8 @@ import re
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0029"
-down_revision: str | None = "0028"
+revision: str = "0031"
+down_revision: str | None = "0030"
 branch_labels = None
 depends_on = None
 
@@ -97,7 +97,7 @@ def _resolve(legacy: list[str]) -> dict[str, str]:
     unresolvable = [s for s in legacy if not _NAME_RE.match(s.strip().lower())]
     if unresolvable:
         raise RuntimeError(
-            "0029 cannot resolve these plan scopes onto the project namespace: "
+            "0031 cannot resolve these plan scopes onto the project namespace: "
             + ", ".join(repr(s) for s in unresolvable)
             + ". They are neither a valid `owner/name` repo nor a name a project "
               "scope can carry (letters, digits, `.`, `-`, `_`, up to 64). Fix or "
@@ -109,7 +109,7 @@ def _resolve(legacy: list[str]) -> dict[str, str]:
         clash = next((s for s, t in plan.items() if t == target), None)
         if clash is not None:
             raise RuntimeError(
-                f"0029 would fold plan scopes {clash!r} and {scope!r} into one "
+                f"0031 would fold plan scopes {clash!r} and {scope!r} into one "
                 f"{target!r}. Each carries its own 1..n rank sequence, and merging "
                 "them would interleave two orders nobody has ever compared. Rename "
                 "one of them and run this again."
@@ -152,8 +152,8 @@ def upgrade() -> None:
             INSERT INTO plan_scopes (id, name, note, added_by)
             VALUES (gen_random_uuid(), :new, :note, :by)
             ON CONFLICT (name) DO NOTHING
-        """), {"new": new, "by": author or "migration 0029",
-               "note": f"carried over from the plan scope {old!r} by migration 0029 "
+        """), {"new": new, "by": author or "migration 0031",
+               "note": f"carried over from the plan scope {old!r} by migration 0031 "
                        "(#323): work with no repo behind it"})
         for table in _SCOPED:
             conn.execute(

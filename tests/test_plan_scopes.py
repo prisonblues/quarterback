@@ -20,7 +20,7 @@ The properties under test, in the order they matter:
   3. **A declared scope works like any other**: readable by its own name, `next`
      answers within it, ranks are its own.
 
-`tests/test_migration_0029.py` covers the other half — the live rows arriving
+`tests/test_migration_0031.py` covers the other half — the live rows arriving
 here without being hand-edited or dropped.
 """
 
@@ -342,3 +342,20 @@ async def test_a_scope_is_stripped_before_it_is_classified(client):
                          headers=LAPTOP)
     assert r.status_code == 200, r.text
     assert r.json()["repo"] == "project:stripped"
+
+
+async def test_an_item_can_be_placed_within_a_project_scope(client):
+    """#183 landed placement while this branch was open, and the two features meet
+    at `_lock_scope`/`_next_rank`, which key on the scope string. A project scope
+    is a scope, so placing inside one has to work like placing anywhere else —
+    otherwise the one kind of work with no issue to link is also the one kind whose
+    position an agent cannot write down."""
+    await declared(client, "placed")
+    first = (await add(client, "project:placed", "wardrobe")).json()["item_id"]
+    last = (await add(client, "project:placed", "bathroom")).json()["item_id"]
+    r = await add(client, "project:placed", "the ASHP", before=last)
+    assert r.status_code == 200, r.text
+    plan = (await client.get("/plan", params={"repo": "project:placed",
+                                              "exact": "true"}, headers=LAPTOP)).json()
+    assert [i["title"] for i in plan["items"]] == ["wardrobe", "the ASHP", "bathroom"]
+    assert plan["items"][0]["item_id"] == first
