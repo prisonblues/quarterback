@@ -19,12 +19,16 @@ Three things it catches that nothing else here does:
   upgrade.** A dev or test database here is a disposable artefact, rebuilt by
   running the migrations forward. If one fails, fix the migration.
 
-And one this repo has a particular need for: **renumbering rewrites revision
-identity** (#341). Because the id *is* the number, a renumber changes what a
-stored ``version_num`` means — three worktree databases had to be dropped and
-rebuilt for exactly that, and the symptom was a wall of errors from an unrelated
-migration's downgrade. A fresh-database replay is what catches the resulting
-graph being wrong once, in CI, rather than once per developer.
+And one this repo has a particular need for: **the chain runs under two naming
+schemes and the replay has to walk both** (#341). ``0001`` … ``0034`` are
+hand-numbered; everything above them carries an opaque ``m<8 hex>`` id. That split
+exists because renumbering rewrites revision *identity* — the id is what
+``alembic_version`` stores, so renaming one makes every database holding it name a
+revision the repository no longer has. Three worktree databases were dropped and
+rebuilt for exactly that on 2026-08-22, and the symptom was a wall of errors from
+an unrelated migration's downgrade. The numbered chain was therefore left alone
+rather than converted, and this replay is what keeps the resulting mixed graph
+honest: it is checked once, in CI, rather than once per developer.
 
 **Its other half is ``test_migrations_self_contained.py``.** A migration that
 imports live application code emits SQL for whatever columns the models have
@@ -209,10 +213,10 @@ async def test_a_fresh_replay_leaves_exactly_one_head(replayed):
     a stamp breaks.
 
     The expected head comes from alembic's own script directory rather than from
-    sorting filenames. Revision identity here is the number in the name (#341),
-    which makes "highest file wins" tempting and wrong — it would go red on the
-    first migration named anything else, and it would not notice a revision that
-    is on disk but unreachable from the chain.
+    sorting filenames. The legacy chain puts the revision id in the name, which
+    makes "highest file wins" tempting and wrong — it would not notice a revision
+    on disk but unreachable from the chain, and it went red the moment a migration
+    was named anything else, which since #341 every new one is.
     """
     _sa_url, dsn = replayed
     conn = await asyncpg.connect(dsn)

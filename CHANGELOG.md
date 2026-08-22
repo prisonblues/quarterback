@@ -17,6 +17,72 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.99 — something acts on a stale harness, and stops one step short of your password
+
+Landing has never been deploying. `qb-doctor` has said "the harness on PATH is behind this
+checkout" since v2.82 and nothing did anything about it: on 2026-08-22 sixteen releases
+landed and the harness half of every one of them reached this fleet's desktop only when a
+person remembered to run `nix flake update` by hand — 162 commits behind at 09:00, bumped at
+10:19, stale again by 14:00, and stale again by 22:00 with five of that day's new scripts
+absent from PATH.
+
+`qb-bump` is the half that acts. It reads `qb-doctor`'s verdict rather than forming its own,
+finds the flake that consumes this harness, updates that one input on a copy of its `HEAD`,
+**builds the machine's system closure**, and hands a person one command. A bump that does not
+build is refused rather than proposed — the first bump that morning failed on a `home.file`
+collision, and a proposal nobody built is a proposal to break somebody's machine.
+
+### The ceiling is sudo, and it is designed around rather than fought
+
+`nixos-rebuild switch` needs root; an agent has none and should not go looking for it.
+`--apply` is a person's verb — it refuses without a terminal, so a timer, a CI job or an
+agent that invokes it changes nothing and prints the command instead. What it writes into the
+consuming flake is one file, `flake.lock`, left modified and never committed.
+
+### Every `--apply` refusal is one sentence in a different place
+
+What would be switched onto is not what was proven: nothing prepared, no terminal, the
+consumer's lock moved, the cached lock is not the one that was built, or the consumer has
+committed since. Two things are said rather than refused — modified files in the consumer
+(the switch builds the working tree, the proof was of `HEAD`) and a later bump that was
+refused (the earlier one still builds, and is still worth having).
+
+### It never reads the consumer's uncommitted work
+
+Preparation runs on `git archive HEAD` unpacked into a temporary directory, so a half-edited
+secrets module in the consuming flake can neither be built nor swept into a proposal.
+
+### Finding the consumer, which is not this repo
+
+`--flake`, then `$QUARTERBACK_CONSUMER_FLAKE`, then the site config — written by the new
+`programs.quarterback-harness.consumer.{flake,attr}` options, the door a fleet declares itself
+through once — then a scan of `~/source` and `~` for a lock that pins this repo. Hits collapse
+onto their main checkout, because eight worktrees of one flake are one consumer and a bump
+prepared into a feature branch lands in somebody's in-flight work. Two genuinely different
+flakes refuse by name rather than guess. The system attribute is matched by
+`networking.hostName`, not assumed to be the hostname: this fleet's `zeus` is
+`nixosConfigurations.desktop`.
+
+### A human is told through the door that already exists
+
+`needs_human.announce`, class `environment` (#274, #279) — the drift, both revisions, the
+store path that was built and the command to type. Printed locally either way, because an
+escalation that cannot reach the board is still an escalation.
+
+## v2.98 — two branches can no longer mint the same migration id
+
+On 2026-08-22 four branches each wrote migration `0029`. All four ran `migration_reconcile.py preflight`, all four were told GO, and not one answer was wrong — at the moment each was asked, that branch really was a single clean chain sitting on main's head. The duplicate existed only in the union of four branches none of which had landed, and no check that reads one ref against a base can see that. It surfaced in CI as *"Multiple head revisions are present"*, and settling it took five preflight runs, three renumbers, two failed CI runs and three worktree databases dropped and rebuilt.
+
+The cause was the naming. When the id *is* the number, the next id is a value two branches can both work out, so a collision is something careful agents produce by being equally correct. **A new revision now gets an opaque id** — `m` and eight hex digits, drawn at random — and two branches cannot pick the same one. The same morning under this scheme is an ordinary two-head graph: a state `migration_reconcile.py heads` counts, the `migration-heads` CI job refuses, `pre-push` refuses, and a relink resolves.
+
+`migrations/env.py` mints the id, so `alembic revision --autogenerate -m "..."` produces a hash-named revision with no flag to remember; `scripts/migration_reconcile.py new-id` hands one out for the places alembic will not, such as `alembic merge heads`. An explicit `--rev-id` is still honoured rather than overridden.
+
+### Nothing was renamed, and nothing will be
+
+`0001` … `0034` keep their numbers permanently. A renumber rewrites `revision`, and `revision` is what `alembic_version` stores, so renaming one makes every database that has applied it name a revision the repository no longer has — which is what cost three worktree databases on the 22nd. The issue proposed both routes and called this one "less satisfying and much safer"; it is the one taken.
+
+So the directory holds two schemes at once, on purpose. `tests/test_migration_ids.py` pins every legacy id to its file, so a rename fails the build rather than a deployment, and refuses a new revision that carries a chain number. `tests/test_migration_drift.py` replays the mixed chain on a fresh database on every CI run, which is what keeps "the two coexist" a checked fact rather than a claim. `scripts/migration_reconcile.py` keeps renumber-and-relink for the only branch that can still need it — one cut before this change, carrying a number somebody else also took — and now derives the next free number from the numbers actually in use rather than from the head, which no longer has one.
+
 ## v2.97 — the loop gains a beginning: the dashboard's ⚒ starts a session through `qb-start`
 
 `qb-start` landed with no caller (#277, #360). The plan said what was next, the board carried
