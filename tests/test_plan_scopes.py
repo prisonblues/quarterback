@@ -189,7 +189,12 @@ async def test_a_repo_name_is_refused_by_the_declare_endpoint(client):
 async def test_a_person_declares_the_scope_and_the_row_records_who(client):
     """The column means "somebody decided this", and only a person can."""
     made = await declared(client, "garden", "beds and the shed")
-    assert made["added_by"] == "person"
+    # `human/person`, not `person`: #108 made a person an ordinary author with a
+    # reserved machine half, so `human()` returns the namespaced identity and every
+    # provenance column records it. The point of this assertion is unchanged — the
+    # row still says a person decided — and it now also says so unambiguously,
+    # which a bare name could not against a machine of the same name.
+    assert made["added_by"] == "human/person"
     assert made["label"] == "garden" and made["scope"] == "project:garden"
     assert made["note"] == "beds and the shed"
 
