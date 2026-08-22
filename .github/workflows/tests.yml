@@ -469,9 +469,15 @@ jobs:
     # push time each branch was individually single-headed, A carrying `0029` on main's
     # `0028` and B carrying `0029` on main's `0028`. The duplicate exists only in the
     # union of two branches neither of which has landed, and no check reading one ref
-    # against the base can see it, this one included. That blind spot is #338; #341 is
-    # what closes it, by hash-naming revisions so the collision is impossible rather than
-    # detectable. Detection was always the wrong shape for that case.
+    # against the base can see it, this one included. That blind spot is #338.
+    #
+    # #341 closed it from the other end rather than by adding a third check here.
+    # A revision id minted after it is opaque — `m` and eight hex digits, drawn at random
+    # by `migrations/env.py` — so two branches cannot write the same one, and the union
+    # this job could not judge is now an ordinary two-head graph, which is exactly what it
+    # DOES judge. The blind spot survives only for the frozen legacy chain `0001`…`0034`,
+    # where the id is still a number a second branch could arrive at by counting; nothing
+    # written from now on can reach it.
     #
     # A second limit, same spirit: this re-runs when the PR is pushed to, not when the
     # base moves underneath it. A PR that was single-headed when it opened and is
