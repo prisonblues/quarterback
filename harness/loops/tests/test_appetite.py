@@ -611,3 +611,13 @@ def test_a_string_agent_actors_cannot_let_the_named_agent_self_approve():
             cfg(require_human_triage=True, agent_actors="claude-agent"),
             issue(labels=["p0"]),
             events=[human_event(actor="claude-agent")])
+
+
+def test_a_label_whose_name_contains_glob_characters_still_matches_itself():
+    """`fnmatch` reads `[`, `]` and `?` as metacharacters and GitHub allows them in
+    a label name, so a repo listing a literal `blocked?` would otherwise configure
+    a pattern that does not match the label it was copied from — and on a SKIP
+    list, failing to match is the direction that lets work through."""
+    for name in ("blocked?", "needs[design]", "wont*fix"):
+        c = {"issue_pickup": {"skip_labels": [name]}}
+        assert appetite.refusal_verdict(c, [name], number=7).allowed is False

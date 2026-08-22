@@ -263,8 +263,18 @@ def refusal_verdict(cfg: dict, labels: Any, *, number: int | None = None,
 
     # Case-insensitively, because GitHub preserves the case a label was created
     # with and a rules file naming `needs-human/ui` must still catch `Needs-Human/UI`.
-    hit = sorted(n for n in names
-                 if any(fnmatch.fnmatchcase(n.casefold(), p.casefold()) for p in pats))
+    #
+    # Exact equality as well as the glob, because `fnmatch` reads `[`, `]` and `?`
+    # as metacharacters and GitHub allows them in a label name. A repo listing a
+    # literal `blocked?` would otherwise configure a pattern that does not match
+    # the very label it was copied from — and on a SKIP list, failing to match is
+    # the direction that lets work through.
+    def refuses(name: str) -> bool:
+        low = name.casefold()
+        return any(low == p.casefold() or fnmatch.fnmatchcase(low, p.casefold())
+                   for p in pats)
+
+    hit = sorted(n for n in names if refuses(n))
     if hit:
         return Verdict(False,
                        f"{who} is labelled {', '.join(repr(h) for h in hit)} — a "
