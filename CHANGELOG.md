@@ -17,6 +17,20 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.98 — two branches can no longer mint the same migration id
+
+On 2026-08-22 four branches each wrote migration `0029`. All four ran `migration_reconcile.py preflight`, all four were told GO, and not one answer was wrong — at the moment each was asked, that branch really was a single clean chain sitting on main's head. The duplicate existed only in the union of four branches none of which had landed, and no check that reads one ref against a base can see that. It surfaced in CI as *"Multiple head revisions are present"*, and settling it took five preflight runs, three renumbers, two failed CI runs and three worktree databases dropped and rebuilt.
+
+The cause was the naming. When the id *is* the number, the next id is a value two branches can both work out, so a collision is something careful agents produce by being equally correct. **A new revision now gets an opaque id** — `m` and eight hex digits, drawn at random — and two branches cannot pick the same one. The same morning under this scheme is an ordinary two-head graph: a state `migration_reconcile.py heads` counts, the `migration-heads` CI job refuses, `pre-push` refuses, and a relink resolves.
+
+`migrations/env.py` mints the id, so `alembic revision --autogenerate -m "..."` produces a hash-named revision with no flag to remember; `scripts/migration_reconcile.py new-id` hands one out for the places alembic will not, such as `alembic merge heads`. An explicit `--rev-id` is still honoured rather than overridden.
+
+### Nothing was renamed, and nothing will be
+
+`0001` … `0034` keep their numbers permanently. A renumber rewrites `revision`, and `revision` is what `alembic_version` stores, so renaming one makes every database that has applied it name a revision the repository no longer has — which is what cost three worktree databases on the 22nd. The issue proposed both routes and called this one "less satisfying and much safer"; it is the one taken.
+
+So the directory holds two schemes at once, on purpose. `tests/test_migration_ids.py` pins every legacy id to its file, so a rename fails the build rather than a deployment, and refuses a new revision that carries a chain number. `tests/test_migration_drift.py` replays the mixed chain on a fresh database on every CI run, which is what keeps "the two coexist" a checked fact rather than a claim. `scripts/migration_reconcile.py` keeps renumber-and-relink for the only branch that can still need it — one cut before this change, carrying a number somebody else also took — and now derives the next free number from the numbers actually in use rather than from the head, which no longer has one.
+
 ## v2.97 — the loop gains a beginning: the dashboard's ⚒ starts a session through `qb-start`
 
 `qb-start` landed with no caller (#277, #360). The plan said what was next, the board carried

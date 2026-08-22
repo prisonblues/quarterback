@@ -1526,6 +1526,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.95** — a pull request that ships something is asked whether it wrote an entry.
 - **v2.96** — a round cap and a spend ceiling the worker enforces on itself.
 - **v2.97** — the loop gains a beginning: the dashboard's ⚒ starts a session through `qb-start`.
+- **v2.98** — two branches can no longer mint the same migration id.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
