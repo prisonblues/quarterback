@@ -48,7 +48,7 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_state,
+    LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_counts, ci_state,
     claim_label, claim_repo, clip, elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan,
     fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells, plan_counts,
     plan_ref, plan_state, plan_who, queue_cell, queue_oldest, repo_arg, repo_colour,
@@ -211,6 +211,22 @@ def panel_plan(items: list[dict], err: str | None, width: int,
                  padding=(0, 1))
 
 
+#: How each non-green check state is called and coloured in the OPEN PRs title.
+#: `none` and `unknown` are in here and are the reason this exists: before #324 the
+#: title counted reds and said nothing at all about the PRs whose checks were absent,
+#: so a branch whose runs were gated contributed to no number on the screen.
+CI_TALLY = (("red", "red", "red"), ("blocked", "blocked", "magenta"),
+            ("pending", "running", "yellow"), ("none", "untested", "grey62"),
+            ("unknown", "unread", "yellow"))
+
+
+def ci_tally(prs: list[dict]) -> str:
+    """" · 2 red · 1 blocked" — every state worth looking at, none of them silent."""
+    counts = ci_counts(prs)
+    return "".join(f" · [{colour}]{counts[state]} {word}[/]"
+                   for state, word, colour in CI_TALLY if counts.get(state))
+
+
 def panel_prs(prs: list[dict], err: str | None, width: int,
               scope: Scope | None = None) -> Panel:
     """The watched repos' open PRs.
@@ -232,10 +248,6 @@ def panel_prs(prs: list[dict], err: str | None, width: int,
 
     filler = [""] * (3 if show_repo else 2)
     ordered = sorted(prs, key=lambda p: -p.get("number", 0))
-    # Over EVERY open PR, not only the drawn ones: the title's count is what a
-    # reader acts on, and one counted off the visible rows would say "2 red" for
-    # a repo with five, which is worse than not counting at all.
-    red = sum(1 for p in ordered if ci_state(p)[1] == "red")
     for pr in ordered[:PR_ROWS]:
         glyph, colour = ci_state(pr)
         title = pr.get("title") or ""
@@ -255,9 +267,10 @@ def panel_prs(prs: list[dict], err: str | None, width: int,
     if not prs and not err:
         t.add_row(*filler, Text("no open PRs", style="grey50"), "")
 
-    head = f"[bold]OPEN PRs[/] [grey50]{len(prs)}"
-    if red:
-        head += f" · [red]{red} red[/]"
+    # `ci_tally` counts over `prs` — every open PR, not the rows drawn above.
+    # That is the property the truncated row list would otherwise have broken:
+    # a count taken off the visible rows would say "2 red" for a repo with five.
+    head = f"[bold]OPEN PRs[/] [grey50]{len(prs)}" + ci_tally(prs)
     if len(ordered) > PR_ROWS:
         head += f" · +{len(ordered) - PR_ROWS} more"
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",

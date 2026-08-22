@@ -2667,14 +2667,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          + ". A signal, not a verdict — a fix can break something at a "
                            "distance, so `missed` is evidence rather than proof.")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
-              "none": "no checks reported", "unknown": "unknown"}.get(ci_status, ci_status)
+              "blocked": "🚧 gated — a run exists and will not execute without a human",
+              "none": "🚫 no run exists for this commit",
+              "unknown": "❓ could not be determined"}.get(ci_status, ci_status)
     lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")
     if ci_failing:
         lines.append("  - failing: " + ", ".join(ci_failing[:10])
                      + (f" (+{len(ci_failing) - 10} more)" if len(ci_failing) > 10 else ""))
-    if ci_status in ("FAIL", "PENDING"):
-        lines.append(f"  - ⚠️ CI is {ci_txt.split()[-1]} — do not merge until green, "
-                     "even if the review below is clean")
+    # Every state that is not PASS, since #324. "no checks reported" used to print
+    # with no warning under it at all, which is how an absent result read as a
+    # benign one — the three added here are the three that cannot fix themselves.
+    if ci_status != "PASS":
+        lines.append(f"  - ⚠️ CI is not green ({ci_status}) — do not merge, even if "
+                     "the review below is clean")
     gate_txt = {"OK": "✅ PASS", "ERROR": "❌ FAIL"}.get(result.sonar_gate, result.sonar_gate)
     if result.sonar_gate in ("OK", "ERROR"):
         lines.append(f"**SonarCloud quality gate (hard):** {gate_txt}")

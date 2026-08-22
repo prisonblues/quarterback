@@ -1575,3 +1575,195 @@ def test_a_shared_short_name_costs_nothing_when_no_listing_failed():
 
     queue = qd.fetch_review_queue(C(), [], repos=["org1/api", "org2/api"])
     assert queue["error"] is None
+
+
+# ---- what the checks actually say (#324) --------------------------------------
+#
+# `gh pr checks 282` printed nothing for two days and every reader took that for
+# "CI has not run yet". CI had run and gone RED; the two commits pushed to fix it
+# came back `action_required` — GitHub's workflow-approval gate — so they executed
+# nothing, contributed no check runs, and the check list went empty. Absent read as
+# benign. These pin the six answers apart.
+
+
+@pytest.fixture(autouse=True)
+def _no_probe_cache(monkeypatch):
+    """A module-level TTL cache would otherwise leak one test's answer into the next.
+
+    `raising=False` so this fixture survives a qbdata without the cache — which is
+    what the red half of red/green runs these against.
+    """
+    monkeypatch.setattr(qd, "_ci_cache", {}, raising=False)
+
+
+def _run(conclusion="success", status="completed", sha="0123456789abcdef"):
+    return {"conclusion": conclusion, "status": status, "head_sha": sha}
+
+
+def _pr(rollup=None, **over):
+    body = {"repo": "o/r", "headRefOid": "a" * 40, "headRefName": "feat/x",
+            "statusCheckRollup": rollup if rollup is not None else []}
+    return {**body, **over}
+
+
+def _stub_runs(monkeypatch, head=(), branch=(), err=None):
+    """Answer the head-sha lookup and the branch-history lookup separately.
+
+    Which one is being asked is the `sha` argument: `ci_report` passes it for the
+    head's own runs and passes `branch=` for the history it reads the last executed
+    conclusion out of.
+    """
+    head_runs, branch_runs = list(head), list(branch)
+
+    def fake(repo, sha="", branch=""):
+        if err:
+            return [], err
+        return (head_runs if sha else branch_runs), None
+
+    monkeypatch.setattr(qd, "workflow_runs", fake, raising=False)
+
+
+@pytest.mark.parametrize("rollup,state", [
+    ([{"conclusion": "SUCCESS"}, {"conclusion": "SKIPPED"}], "green"),
+    ([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}], "red"),
+    ([{"conclusion": "SUCCESS"}, {"status": "IN_PROGRESS"}], "pending"),
+    ([{"conclusion": "ACTION_REQUIRED"}], "blocked"),
+    ([{"conclusion": "STALE"}], "blocked"),
+])
+def test_the_rollup_answers_four_of_the_six_on_its_own(rollup, state):
+    assert qd.classify_rollup(rollup) == state
+
+
+def test_an_empty_rollup_is_unknown_and_never_none():
+    """The single most important line in the module. An empty rollup is either an
+    untested head or a run so gated it contributed nothing, and this function cannot
+    tell them apart — so it must not answer with the one that reads as benign.
+    `none` is reachable only by ASKING, in ci_report."""
+    assert qd.classify_rollup([]) == "unknown"
+    assert qd.classify_rollup(None) == "unknown"
+    assert "none" not in {qd.classify_rollup(r) for r in ([], None, [{}])}
+
+
+def test_a_gated_run_is_reported_as_blocked_with_the_last_executed_conclusion(monkeypatch):
+    """#324's sequence, replayed. The head's own runs are `action_required` and the
+    branch's newest EXECUTED run is a failure two commits back — the fact that was two
+    clicks away in a place nobody looks."""
+    _stub_runs(monkeypatch,
+               head=[_run(conclusion="action_required")],
+               branch=[_run(conclusion="action_required"),
+                       _run(conclusion="failure", sha="843c506aaaa")])
+    rep = qd.ci_report(_pr(), "o/r")
+    assert rep.state == "blocked" and rep.blocking
+    assert rep.last_executed == "failure at 843c506"
+    assert "waiting on a human" in rep.reason
+    assert "failure at 843c506" in rep.reason
+    assert qd.ci_state({"ci": rep}) == qd.CI_GLYPHS["blocked"]
+
+
+def test_a_head_with_no_run_at_all_is_none_and_says_it_is_untested(monkeypatch):
+    _stub_runs(monkeypatch, head=[], branch=[])
+    rep = qd.ci_report(_pr(), "o/r")
+    assert rep.state == "none" and rep.blocking
+    assert "untested" in rep.reason
+
+
+def test_a_failed_probe_is_unknown_and_not_none(monkeypatch):
+    """qb-reconcile's Unknown, one module over: "I looked and found nothing" and "I
+    could not look" are different answers, and the whole complaint behind #244 and
+    #255 is consumers that report the second as the first."""
+    _stub_runs(monkeypatch, err="HTTP 502")
+    rep = qd.ci_report(_pr(), "o/r")
+    assert rep.state == "unknown" and rep.blocking
+    assert "502" in rep.reason
+
+
+def test_a_probe_is_never_sent_to_the_fallback_repo(monkeypatch):
+    """REPO is the dashboard's placeholder, not an answer. Probing it about another
+    repo's commit would ask the wrong API and read the reply as fact."""
+    def boom(*a, **k):
+        raise AssertionError("a probe was sent with no repo named")
+    monkeypatch.setattr(qd, "workflow_runs", boom)
+    rep = qd.ci_report({"headRefOid": "b" * 40, "statusCheckRollup": []})
+    assert rep.state == "unknown" and "no repository was named" in rep.reason
+
+
+def test_completed_runs_that_contributed_no_checks_are_not_green(monkeypatch):
+    """The one direction this must never fail in. A head whose runs all completed
+    while producing no check runs is a head nothing verified."""
+    _stub_runs(monkeypatch, head=[_run(conclusion="success")], branch=[])
+    rep = qd.ci_report(_pr(), "o/r")
+    assert rep.state == "unknown"
+    assert "not a pass" in rep.reason
+
+
+def test_probe_false_leaves_the_empty_case_unknown_and_fetches_nothing(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("probe=False still reached the network")
+    monkeypatch.setattr(qd, "workflow_runs", boom)
+    rep = qd.ci_report(_pr(), "o/r", probe=False)
+    assert rep.state == "unknown"
+
+
+def test_the_probe_answer_is_cached_so_a_redraw_costs_nothing(monkeypatch):
+    calls = []
+
+    def counted(repo, sha="", branch=""):
+        calls.append(sha or branch)
+        return [], None
+    monkeypatch.setattr(qd, "workflow_runs", counted)
+    for _ in range(3):
+        qd.ci_report(_pr(), "o/r")
+    assert len(calls) == 2, calls
+
+
+def test_every_state_has_a_glyph_and_only_none_is_quiet():
+    """The grey dot is the one rendering that reads as "nothing to see", so it must
+    belong to exactly one state — the one that was actually established by asking."""
+    assert set(qd.CI_GLYPHS) == set(qd.CI_STATES)
+    quiet = [s for s, (_g, colour) in qd.CI_GLYPHS.items() if colour == "grey50"]
+    assert quiet == ["none"]
+
+
+def test_an_unresolved_pr_renders_as_unread_rather_than_as_a_quiet_dot():
+    """A row nobody probed. Before #324 this was the grey dot that meant "no news"."""
+    assert qd.ci_state({"statusCheckRollup": []}) != ("·", "grey50")
+    assert qd.ci_state({"statusCheckRollup": []}) == qd.CI_GLYPHS["unknown"]
+
+
+def test_ci_counts_names_every_state_a_panel_title_has_to_show():
+    prs = [{"ci": qd.CiReport("green", "g")}, {"ci": qd.CiReport("blocked", "b")},
+           {"statusCheckRollup": []}]
+    counts = qd.ci_counts(prs)
+    assert counts["green"] == 1 and counts["blocked"] == 1 and counts["unknown"] == 1
+    assert set(counts) >= set(qd.CI_STATES)
+
+
+@pytest.mark.parametrize("status", ["requested", "queued", "in_progress"])
+def test_a_run_on_its_way_to_starting_is_pending_and_not_blocked(monkeypatch, status):
+    """`requested` is GitHub's word for a run created and not yet started, so calling
+    it gated would say a human is needed when nobody is — a false alarm in the
+    direction that teaches people to stop reading the alarms. Found by Codex."""
+    _stub_runs(monkeypatch, head=[_run(conclusion=None, status=status)], branch=[])
+    assert qd.ci_report(_pr(), "o/r").state == "pending"
+
+
+def test_a_check_run_that_has_only_been_requested_is_pending():
+    assert qd.classify_rollup([{"status": "REQUESTED"}]) == "pending"
+
+
+def test_a_200_that_is_not_the_runs_document_is_an_error_and_not_an_empty_list(monkeypatch):
+    """A reply nobody understood must not settle the state as `none`. "No workflow
+    runs" and "the lookup did not happen" are the two answers this whole module
+    exists to keep apart."""
+    monkeypatch.setattr(qd, "_gh_api", lambda path, timeout=30: ({"message": "?"}, None))
+    runs, err = qd.workflow_runs("o/r", sha="a" * 40)
+    assert runs == [] and err
+
+
+def test_the_cache_does_not_grow_without_bound(monkeypatch):
+    """A dashboard runs for days and every push gives a PR a new head."""
+    monkeypatch.setattr(qd, "CI_CACHE_MAX", 4)
+    monkeypatch.setattr(qd, "workflow_runs", lambda repo, sha="", branch="": ([], None))
+    for n in range(20):
+        qd.ci_report(_pr(headRefOid=f"{n:040d}"), "o/r")
+    assert len(qd._ci_cache) <= 4

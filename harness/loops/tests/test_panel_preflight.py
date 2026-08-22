@@ -1074,7 +1074,8 @@ def test_the_refusal_notice_reports_the_CI_gate_and_names_the_one_it_did_NOT_rea
 @pytest.mark.parametrize("status,says", [
     ("PASS", "PASSED on this commit"),
     ("PENDING", "STILL RUNNING"),
-    ("none", "no checks are configured"),
+    ("blocked", "WILL NOT RUN"),
+    ("none", "NO RUN EXISTS"),
     ("unknown", "could NOT be read"),
     ("", "NOT read for this refusal"),
 ])
@@ -1086,6 +1087,20 @@ def test_no_CI_state_is_allowed_to_read_as_a_PASS(status, says):
     assert says in line
     if status != "PASS":
         assert "not a pass" in line
+
+
+def test_a_gated_run_does_not_borrow_the_no_run_wording():
+    """#324. `blocked` and `none` are different facts and the refusal notice has to
+    say which: one means a person has to click before anything runs, the other means
+    nothing was ever created. The old text said "no checks are configured for this
+    repository" for both, which is a sentence about the REPO standing in for a
+    sentence about this commit — and it is what let a red suite read as untested."""
+    blocked, none = pf._ci_line("blocked"), pf._ci_line("none")
+    assert blocked != none
+    assert "human" in blocked and "waiting" in blocked
+    assert "no run exists" in none.lower()
+    assert "configured for this repository" not in blocked
+    assert "configured for this repository" not in none
 
 
 def test_the_refusal_guard_survives_python_dash_O():

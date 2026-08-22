@@ -16,6 +16,7 @@ The three properties worth defending, in the order they get broken:
 
 import json
 import subprocess
+import inspect
 import sys
 from pathlib import Path
 
@@ -206,6 +207,37 @@ def test_untracked_files_only_warn(monkeypatch):
 # ------------------------------------------------------------------------- ci
 
 
+#: `qbdata.py` holds the shared CI vocabulary and lives in `bin/` — see
+#: `harness/package.nix` on why that is the one library there. The loops suite does
+#: not otherwise import it, so the path goes on here rather than in conftest.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
+import qbdata as qd                                       # noqa: E402
+
+
+@pytest.fixture
+def runs(monkeypatch):
+    """Stub the workflow-runs probe, and clear the answer cache around it.
+
+    The probe is one `gh api` call and the cache is module-level, so a test that
+    left either alone would either reach the network or read a neighbour's answer.
+    Yields a dict of `{"head": [...], "branch": [...]}` for a test to fill in.
+
+    `raising=False` on both, so the fixture still builds against a qbdata that has
+    neither — which is what the red half of red/green runs these against.
+    """
+    reply = {"head": [], "branch": []}
+    monkeypatch.setattr(qd, "_ci_cache", {}, raising=False)
+    monkeypatch.setattr(qd, "workflow_runs",
+                        lambda repo, sha="", branch="": (
+                            reply["head"] if sha else reply["branch"], None),
+                        raising=False)
+    return reply
+
+
+def run(conclusion="success", status="completed", sha="0123456789"):
+    return {"conclusion": conclusion, "status": status, "head_sha": sha}
+
+
 @pytest.mark.parametrize("rollup,status", [
     ([{"conclusion": "SUCCESS"}], "passed"),
     ([{"conclusion": "FAILURE"}], "failed"),
@@ -214,17 +246,59 @@ def test_untracked_files_only_warn(monkeypatch):
 def test_ci_gates_on_green_only(rollup, status):
     """Pending fails as hard as red: a reconcile push restarts CI, so an earlier
     green is a statement about a commit that is no longer the head."""
-    assert preland.check_ci(pr(statusCheckRollup=rollup)).status == status
+    assert preland.check_ci(pr(statusCheckRollup=rollup, repo="o/r")).status == status
 
 
-def test_a_pr_with_no_checks_at_all_holds():
+def test_a_pr_whose_head_has_no_run_at_all_holds(runs):
     """No CI signal is the absence of evidence, not evidence of green. A workflow
     that failed to trigger and a repo with no CI look identical from here, and
     only one of them is safe — so the repo that genuinely has none says so in
     .harness-rules, and the message names that switch."""
-    c = preland.check_ci(pr(statusCheckRollup=[]))
-    assert c.status == "failed"
-    assert "no checks at all" in c.reasons[0] and "disabled_checks" in c.reasons[0]
+    c = preland.check_ci(pr(statusCheckRollup=[], repo="o/r"))
+    assert c.status == "failed" and c.detail["state"] == "none"
+    assert "no run has been created" in c.reasons[0]
+    assert "disabled_checks" in c.reasons[0]
+
+
+def test_a_gated_run_holds_and_names_the_last_run_that_actually_executed(runs):
+    """#324, and the whole of it. Two commits pushed to fix a red suite came back
+    `action_required` — created, never executed, contributing no check runs — so the
+    PR's check list went EMPTY and every reader took that for "CI has not run yet".
+    The gate must refuse, must say a human is what it is waiting on, and must carry
+    the newest run that DID execute, which is the fact anybody actually wanted."""
+    runs["head"] = [run(conclusion="action_required")]
+    runs["branch"] = [run(conclusion="action_required"),
+                      run(conclusion="failure", sha="843c506aaa")]
+    c = preland.check_ci(pr(statusCheckRollup=[], repo="o/r"))
+    assert c.status == "failed" and c.detail["state"] == "blocked"
+    assert c.detail["last_executed"] == "failure at 843c506"
+    assert "human" in c.reasons[0]
+    assert "failure at 843c506" in c.reasons[0]
+
+
+def test_an_unreadable_ci_state_holds_and_does_not_read_as_no_ci(monkeypatch):
+    """The #244 rule, one gate along: "I could not tell" used to arrive here as
+    `none` and print as "this repo has no CI", which is a sentence about the repo
+    standing in for a failed lookup. A gate that merges on an unread signal is the
+    defect the check exists to prevent."""
+    monkeypatch.setattr(qd, "_ci_cache", {}, raising=False)
+    monkeypatch.setattr(qd, "workflow_runs", lambda *a, **k: ([], "HTTP 502"),
+                        raising=False)
+    c = preland.check_ci(pr(statusCheckRollup=[], repo="o/r"))
+    assert c.status == "failed" and c.detail["state"] == "unknown"
+    assert "could not be determined" in c.reasons[0]
+    assert "disabled_checks" not in c.reasons[0]
+
+
+def test_a_rollup_carrying_action_required_is_blocked_not_merely_red(runs):
+    """A check that says `ACTION_REQUIRED` reached no verdict. Calling it red is not
+    dangerous, but it is wrong in the direction that stops a reader looking for the
+    approval they have to give — and it hides the last conclusion that was real."""
+    runs["branch"] = [run(conclusion="failure", sha="843c506aaa")]
+    c = preland.check_ci(
+        pr(statusCheckRollup=[{"conclusion": "ACTION_REQUIRED"}], repo="o/r"))
+    assert c.status == "failed" and c.detail["state"] == "blocked"
+    assert c.detail["last_executed"] == "failure at 843c506"
 
 
 # --------------------------------------------------------------------- review
@@ -845,7 +919,7 @@ def test_a_check_that_crashes_holds_and_the_others_still_run(monkeypatch, repo):
     verdict is a loop deciding for itself."""
     monkeypatch.setattr(preland, "_git", lambda root, *a: HEAD if a[0] == "rev-parse" else "")
     monkeypatch.setattr(preland, "check_ci",
-                        lambda p: (_ for _ in ()).throw(KeyError("statusCheckRollup")))
+                        lambda *a: (_ for _ in ()).throw(KeyError("statusCheckRollup")))
     checks = preland.gather({"github": "o/r", "path": repo}, pr(), BASE,
                             {"review": "skipped-flag", "merge_claim": "skipped-flag",
                              "queue": "skipped-flag"})
@@ -1267,3 +1341,30 @@ def test_two_prs_landing_into_one_base_contend_on_one_key(board):
         c = preland.check_merge_claim("o/r", pr(headRefName=branch), "zeus/me")
         assert c.status == "failed", f"{branch} did not see the land in progress"
         assert "o/r:main" in c.reasons[0] and "landing onto main" in c.reasons[0]
+
+
+def test_the_ci_vocabulary_is_loaded_from_a_trusted_path_and_not_off_sys_path():
+    """The lander's red-CI fixer operates on an upstream-authored dependabot branch,
+    and this file refuses to read that branch's `.harness-rules` for exactly that
+    reason. A bare `import qbdata` would search the caller's `sys.path` — which in a
+    checkout can be the checkout — and hand a PR the chance to execute a `qbdata.py`
+    of its own inside a merge gate. Found by Codex on #324."""
+    import ast
+
+    import harness_rules
+    fn = ast.parse(inspect.getsource(harness_rules._qbdata).lstrip()).body[0]
+    # The docstring is where this rule is written down, so it is not evidence
+    # either way — the assertion is about the code under it.
+    code = "\n".join(ast.unparse(node) for node in fn.body[1:])
+    assert "import qbdata" not in code, code
+    assert "sys.path.insert" not in code and "sys.path.append" not in code, code
+    candidates = harness_rules._qbdata_candidates()
+    assert candidates and all(c.name == "bin" for c in candidates), candidates
+
+
+def test_the_gate_and_a_dashboard_share_one_qbdata_module():
+    """Two copies would be two caches and two sets of monkeypatches, which is how a
+    stubbed probe in one and a live one in the other look identical until something
+    reaches the network in CI."""
+    import harness_rules
+    assert harness_rules._qbdata() is qd

@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
@@ -813,8 +814,18 @@ PR_LIMIT = 60
 PR_ROWS = 12
 
 
-def fetch_prs(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
-    return _gh_list_many(
+def fetch_prs(repos: list[str] | None = None,
+              probe_ci: bool = True) -> tuple[list[dict], str | None]:
+    """Open PRs, each stamped with what its checks actually say.
+
+    `headRefOid` is fetched because :func:`ci_report` needs it: when the rollup
+    comes back empty the only way to tell "nothing ran" from "a run exists and is
+    gated" is to ask the workflow-runs API about that exact head (#324).
+
+    `probe_ci=False` skips the extra call and leaves the empty case reading
+    `unknown` — coarser, but never the quiet grey dot that used to mean "no news".
+    """
+    rows, err = _gh_list_many(
         "pr",
         # headRefOid / mergeable / createdAt are the review queue's inputs (#273).
         # Fetched here rather than in a second `gh` call because both panels read
@@ -822,6 +833,7 @@ def fetch_prs(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
         # moved between them.
         "number,title,isDraft,updatedAt,statusCheckRollup,headRefName,"
         "headRefOid,mergeable,createdAt", repos, PR_LIMIT)
+    return resolve_ci(rows, probe=probe_ci), err
 
 
 def fetch_issues(repos: list[str] | None = None) -> tuple[list[dict], str | None]:
@@ -1122,19 +1134,408 @@ def sort_issues(issues: list[dict], held: dict) -> list[dict]:
     return sorted(issues, key=lambda i: (taken(i), -(i.get("number") or 0)))
 
 
+# ---- what the checks actually say --------------------------------------------
+#
+# #324. `gh pr checks 282` printed nothing for two days and every reader took that
+# for "CI has not run yet". What had happened is that CI ran, went RED, and the two
+# commits pushed to fix it came back `action_required` — GitHub's workflow-approval
+# gate — so they executed nothing, contributed no check runs, and the PR's check
+# list went EMPTY. Not red, not stale-green: absent. Absent is the one answer a
+# reader treats as benign, so the red result became a benign-looking one and the
+# branch sat.
+#
+# Verified against the incident's own commits rather than reasoned about:
+# `repos/prisonblues/quarterback/commits/e5a07b5/check-runs` returns
+# `total_count: 0`, and so does its check-suites — an unexecuted run contributes
+# NOTHING to the head it was created for.
+#
+# So the rollup alone cannot answer the question, and the rule this file already
+# applies to an unreadable board applies here: the absence of a signal must never
+# render as the presence of a good one (#244, and `qb-reconcile`'s Unknown).
+
+#: The six answers a reader can get about a PR's checks. Closed, and constrained
+#: here rather than restated per reader, for the reason `qb-reconcile.CONDITIONS`
+#: is closed: they feed counts and glyphs, and an unknown value silently leaves the
+#: numerator while still counting as coverage.
+#:
+#: They are six because collapsing any pair loses the distinction that bit:
+#:
+#: * ``green``   — a run finished and every check passed.
+#: * ``red``     — a run finished and something failed.
+#: * ``pending`` — a run exists and is still going. Wait.
+#: * ``blocked`` — a run exists, will NOT execute without a human, and so will
+#:                 never report. An approval gate, a stale run, a cancelled one.
+#: * ``none``    — no run has been created for this head at all. Genuinely untested.
+#: * ``unknown`` — could not be determined. NOT a synonym for ``none``.
+CI_STATES = ("green", "red", "pending", "blocked", "none", "unknown")
+
+#: A rollup entry that says the check will never run without somebody clicking.
+#: `stale` and `cancelled` join `action_required` because all three share the
+#: property that matters: the run was created, produced no verdict, and the newest
+#: EXECUTED run is the fact a reader actually wants.
+#: `REQUESTED` is deliberately NOT here. It is GitHub's word for a check run that
+#: has been created and not started — transient, and on its way to `pending` — so
+#: reading it as gated would tell a reader a human is needed when nobody is. Found
+#: by Codex on this change. `WAITING` is here because it means a deployment
+#: protection rule, which IS a person.
+CI_BLOCKED_CONCLUSIONS = frozenset({
+    "ACTION_REQUIRED", "STALE", "CANCELLED", "WAITING"})
+CI_FAILING_CONCLUSIONS = frozenset({
+    "FAILURE", "ERROR", "TIMED_OUT", "STARTUP_FAILURE"})
+#: `WAITING` is deliberately absent: it is in the blocked set, which is tested
+#: first, so listing it here would be dead and would read as a disagreement.
+CI_RUNNING_CONCLUSIONS = frozenset({
+    "PENDING", "QUEUED", "IN_PROGRESS", "EXPECTED", "REQUESTED", ""})
+CI_PASSING_CONCLUSIONS = frozenset({"SUCCESS", "NEUTRAL", "SKIPPED", "COMPLETED"})
+
+#: A workflow run's `status`/`conclusion` when GitHub created it and is waiting on
+#: a person. `action_required` appears in both fields depending on which endpoint
+#: answered, which is why this set is matched against either. `requested` is left
+#: out for the reason above: an ordinary run passes through it on its way to
+#: starting, and calling that permanently blocked is a false alarm in the direction
+#: that makes people stop reading the alarms. It falls to `pending` instead, which
+#: still refuses a merge.
+CI_GATED_RUN = frozenset({"action_required", "waiting"})
+
+#: A run that never executed reaches a conclusion without producing a verdict, so
+#: these do NOT count as "the newest executed run".
+CI_UNEXECUTED_RUN = frozenset({"action_required", "stale", "cancelled", "skipped", ""})
+
+#: (glyph, colour) per state, for both dashboards. `none` keeps the quiet dot it
+#: has always had — but it is now only ever reached by ASKING, never by finding the
+#: rollup empty, which is the whole of the fix. `unknown` is yellow and not grey:
+#: "I could not tell" is a thing to look at, not a thing to scroll past.
+CI_GLYPHS = {
+    "green":   ("✓", "green"),
+    "red":     ("✗", "red"),
+    "pending": ("◐", "yellow"),
+    "blocked": ("⚑", "magenta"),
+    "none":    ("·", "grey50"),
+    "unknown": ("?", "yellow"),
+}
+
+#: Seconds a probe's answer is reused. The dashboards redraw on a timer and each
+#: probe is one or two `gh api` calls per PR with an empty rollup; without this a
+#: gated PR would cost two round trips every refresh, forever.
+CI_PROBE_TTL = 90
+
+#: How many probe answers to keep. A dashboard runs for days and every push gives
+#: a PR a new head, so an unbounded dict is a slow leak in a process that is meant
+#: to be left open.
+CI_CACHE_MAX = 256
+
+#: How many of a branch's workflow runs to read back when looking for the newest
+#: one that actually executed. Generous enough to see past a run of gated pushes —
+#: the incident had two, and a third would have hidden the failure just as well.
+CI_RUN_PAGE = 30
+
+_ci_cache: dict[tuple, tuple[float, "CiReport"]] = {}
+
+
+@dataclass(frozen=True)
+class CiReport:
+    """What is known about one PR's checks, and how it was established.
+
+    `state` is the answer; `reason` is why it is that answer when the answer is
+    one a reader must not skim past. Frozen because it is cached and handed to
+    several renderers, none of which owns it.
+    """
+
+    state: str
+    #: One line fit to print anywhere — a dashboard title, a preland reason, a
+    #: reviewer prompt. Never empty.
+    summary: str
+    #: The blocking or unreadable detail, when there is one.
+    reason: str = ""
+    #: "failure at 843c506" — the newest run on this branch that actually RAN.
+    #: The fact that matters when the head's own runs never executed, and the
+    #: thing #324 says must be reported alongside a block.
+    last_executed: str = ""
+    #: How many rollup entries the state was read from. 0 is not evidence.
+    checks: int = 0
+
+    @property
+    def blocking(self) -> bool:
+        """Is this an answer a merge gate must refuse on?
+
+        Every state except `green` is, and that includes `none` and `unknown` —
+        the two that used to read as "nothing to see". A gate that merges on the
+        absence of a signal is the defect, not the caller's tuning.
+        """
+        return self.state != "green"
+
+
+def classify_rollup(rollup) -> str:
+    """`green|red|pending|blocked|unknown` from a `statusCheckRollup` ALONE.
+
+    Deliberately never returns `none`. An empty rollup is exactly the ambiguity
+    #324 is about — no run created, or a run created and gated so hard it
+    contributed nothing — and this function cannot tell them apart, so it says so.
+    Only :func:`ci_report`, which asks GitHub a second question, may answer `none`.
+    """
+    entries = rollup or []
+    if not entries:
+        return "unknown"
+    states = set()
+    for c in entries:
+        s = c.get("conclusion") or c.get("state") or c.get("status") or ""
+        states.add(str(s).upper())
+    if states & CI_BLOCKED_CONCLUSIONS:
+        return "blocked"
+    if states & CI_FAILING_CONCLUSIONS:
+        return "red"
+    if states & CI_RUNNING_CONCLUSIONS:
+        return "pending"
+    if states <= CI_PASSING_CONCLUSIONS:
+        return "green"
+    return "pending"
+
+
+def _gh_api(path: str, timeout: int = 30) -> tuple[dict | list | None, str | None]:
+    """`(parsed, error)` for one `gh api` GET. Never raises, never returns both."""
+    try:
+        raw = subprocess.run(["gh", "api", path], capture_output=True, text=True,
+                             stdin=subprocess.DEVNULL, timeout=timeout)
+    except Exception as exc:                      # noqa: BLE001
+        return None, type(exc).__name__
+    if raw.returncode != 0:
+        return None, clip(raw.stderr.strip().splitlines()[-1] if raw.stderr.strip()
+                          else f"gh exit {raw.returncode}", 80)
+    try:
+        return json.loads(raw.stdout or "null"), None
+    except json.JSONDecodeError:
+        return None, "unparseable gh output"
+
+
+def workflow_runs(repo: str, sha: str = "", branch: str = "") -> tuple[list[dict], str | None]:
+    """Workflow runs for one head SHA or one branch, newest first.
+
+    This is the second source of truth #324 needs and the ONLY one that sees a
+    gated run: an unexecuted run contributes no check runs and no check suites, so
+    it is invisible to `statusCheckRollup`, to `gh pr checks` and to the commit's
+    own check-runs endpoint. It is visible here, with `conclusion:
+    "action_required"` — which is how `gh run list` showed the incident while the
+    PR showed nothing.
+    """
+    query = urllib.parse.urlencode(
+        {k: v for k, v in (("head_sha", sha), ("branch", branch),
+                           ("per_page", str(CI_RUN_PAGE))) if v})
+    got, err = _gh_api(f"repos/{repo}/actions/runs?{query}")
+    if err:
+        return [], err
+    if not isinstance(got, dict) or "workflow_runs" not in got:
+        # An error, not an empty list. A 200 carrying something other than this
+        # endpoint's document is a lookup that did not happen, and returning `[]`
+        # for it would settle the state as `none` — "no run exists" — off a reply
+        # nobody understood.
+        return [], "gh returned no workflow_runs document"
+    return list(got.get("workflow_runs") or []), None
+
+
+def _run_is_gated(run: dict) -> bool:
+    return (str(run.get("status") or "").lower() in CI_GATED_RUN
+            or str(run.get("conclusion") or "").lower() in CI_GATED_RUN)
+
+
+def _newest_executed(runs: list[dict]) -> str:
+    """'failure at 843c506' for the newest run that actually ran, else ''.
+
+    The point of the whole exercise: when the head's own runs never executed, the
+    last conclusion anybody reached is the fact that matters, and it is two clicks
+    away in a place nobody looks.
+    """
+    for run in runs:
+        conclusion = str(run.get("conclusion") or "").lower()
+        if str(run.get("status") or "").lower() != "completed":
+            continue
+        if conclusion in CI_UNEXECUTED_RUN:
+            continue
+        return f"{conclusion or 'completed'} at {str(run.get('head_sha') or '')[:7]}"
+    return ""
+
+
+def ci_report(pr: dict, repo: str | None = None, probe: bool = True) -> CiReport:
+    """The full six-state answer for one PR, asking GitHub again when it must.
+
+    The rollup answers four of the six on its own. The fifth and sixth — "no run
+    was ever created" and "a run exists and is gated" — look identical from the
+    rollup, so when it comes back empty this asks the workflow-runs API, which is
+    the only endpoint that can see a run that never executed.
+
+    `probe=False` gives the rollup-only reading, which is honest but coarser: the
+    empty case stays `unknown` rather than being resolved into `none` or `blocked`.
+    A caller with no `gh` gets that instead of a wrong answer.
+    """
+    rollup = pr.get("statusCheckRollup") or []
+    state = classify_rollup(rollup)
+    # NOT the module's REPO fallback. That constant exists so a dashboard has
+    # something to render before it has resolved anything; using it here would
+    # send a probe about one repo's commit to a different repo's API and read the
+    # answer as fact. A caller that cannot name the repo gets `unknown`, which is
+    # this module's whole discipline applied to itself.
+    repo = repo or pr.get("repo") or ""
+    sha = str(pr.get("headRefOid") or "")
+    branch = str(pr.get("headRefName") or "")
+
+    if state != "unknown":
+        report = CiReport(state, _ci_summary(state, len(rollup)), checks=len(rollup))
+        if state != "blocked" or not probe or not repo:
+            return report
+        runs, err = workflow_runs(repo, branch=branch)
+        last = _newest_executed(runs) if not err else ""
+        return _with_block_context(report, last, err)
+
+    if not probe:
+        return CiReport("unknown", "checks unread (rollup only, no probe)",
+                        reason="the check rollup is empty, which is either an "
+                               "untested head or a gated run; telling them apart "
+                               "needs a second call that was not made")
+    if not repo:
+        return CiReport("unknown", "checks unread (no repo)",
+                        reason="the check rollup is empty and no repository was "
+                               "named, so the workflow runs for this head could "
+                               "not be looked up")
+    if not sha:
+        return CiReport("unknown", "checks unread (no head sha)",
+                        reason="the PR carries no headRefOid, so the runs for its "
+                               "head could not be looked up")
+
+    cached = _ci_cache.get((repo, sha))
+    if cached and time.time() - cached[0] < CI_PROBE_TTL:
+        return cached[1]
+
+    head_runs, err = workflow_runs(repo, sha=sha)
+    if err:
+        report = CiReport("unknown", f"checks unread ({err})",
+                          reason=f"the check rollup is empty and the workflow runs "
+                                 f"for {sha[:7]} could not be read ({err}), so "
+                                 f"whether anything ran is unknown")
+        _remember(repo, sha, report)
+        return report
+
+    branch_runs, berr = ([], None) if not branch else workflow_runs(repo, branch=branch)
+    last = _newest_executed(branch_runs) if not berr else ""
+
+    report = _from_runs(head_runs, sha, last, berr)
+    _remember(repo, sha, report)
+    return report
+
+
+def _remember(repo: str, sha: str, report: CiReport) -> None:
+    """Cache one answer, dropping the expired ones once the dict gets large."""
+    now = time.time()
+    if len(_ci_cache) >= CI_CACHE_MAX:
+        for key in [k for k, (ts, _r) in _ci_cache.items() if now - ts >= CI_PROBE_TTL]:
+            del _ci_cache[key]
+        if len(_ci_cache) >= CI_CACHE_MAX:
+            _ci_cache.clear()
+    _ci_cache[(repo, sha)] = (now, report)
+
+
+def _from_runs(head_runs: list[dict], sha: str, last: str, berr: str | None) -> CiReport:
+    """The reading when the rollup was empty and the workflow runs answered instead.
+
+    Note what this deliberately never returns: `green`. A head whose runs all
+    completed while contributing no check runs is a head nothing verified, and
+    calling that green would re-commit the error the whole module is against — an
+    absent signal rendered as a good one.
+    """
+    gated = [r for r in head_runs if _run_is_gated(r)]
+    if gated:
+        return _with_block_context(
+            CiReport("blocked", f"{len(gated)} run(s) created for {sha[:7]} and gated",
+                     reason=f"{len(gated)} workflow run(s) for {sha[:7]} are waiting on a "
+                            f"human to approve them, so they have executed nothing, "
+                            f"contributed no checks and will never report on their own"),
+            last, berr)
+    running = [r for r in head_runs
+               if str(r.get("status") or "").lower() != "completed"]
+    if running:
+        return CiReport("pending", f"{len(running)} run(s) under way on {sha[:7]}",
+                        reason="a run exists for this head and has not reported yet")
+    failed = [r for r in head_runs
+              if str(r.get("conclusion") or "").upper() in CI_FAILING_CONCLUSIONS]
+    if failed:
+        return CiReport("red", f"{len(failed)} run(s) failed on {sha[:7]}",
+                        reason=f"{len(failed)} workflow run(s) for {sha[:7]} concluded "
+                               f"as failed while contributing no check runs")
+    if head_runs:
+        return _with_block_context(
+            CiReport("unknown",
+                     f"{len(head_runs)} run(s) on {sha[:7]} reported nothing",
+                     reason=f"{len(head_runs)} workflow run(s) for {sha[:7]} completed "
+                            f"without contributing a single check run, so what they "
+                            f"verified cannot be read — this is not a pass"),
+            last, berr)
+    report = CiReport("none", f"no run has been created for {sha[:7]}",
+                      reason=f"no workflow run exists for {sha[:7]} at all — this head "
+                             f"is untested, which is not the same as passing")
+    return _with_block_context(report, last, berr)
+
+
+def _with_block_context(report: CiReport, last: str, err: str | None) -> CiReport:
+    """Attach "and the last run that DID execute said X" to a block.
+
+    #324's specific ask, and the half that turns a block from a shrug into a fact:
+    the branch's last real conclusion is what a reader would have wanted all along.
+    When the lookup itself failed the report says that instead of implying there
+    was nothing to find.
+    """
+    if err:
+        return replace(report, reason=report.reason
+                       + f"; the branch's earlier runs could not be read ({err}), so "
+                         f"the last executed conclusion is unknown")
+    if not last:
+        return replace(report, reason=report.reason
+                       + "; no earlier run on this branch has executed either")
+    return replace(report, last_executed=last,
+                   reason=report.reason + f"; the newest EXECUTED run on this branch "
+                                          f"was {last}")
+
+
+def _ci_summary(state: str, checks: int) -> str:
+    return {
+        "green": f"green ({checks} check(s))",
+        "red": f"red ({checks} check(s))",
+        "pending": f"pending ({checks} check(s))",
+        "blocked": f"blocked ({checks} check(s) reported, none executed)",
+    }.get(state, f"{state} ({checks} check(s))")
+
+
+def resolve_ci(prs: list[dict], probe: bool = True) -> list[dict]:
+    """Stamp each PR with its :class:`CiReport`, under `ci`.
+
+    Done once at fetch time rather than per renderer, so the two dashboards cannot
+    drift on what a dot means and neither pays for the probe twice.
+    """
+    for pr in prs:
+        pr["ci"] = ci_report(pr, pr.get("repo"), probe=probe)
+    return prs
+
+
 def ci_state(pr: dict) -> tuple[str, str]:
-    """(glyph, colour) for a PR's check rollup."""
-    checks = pr.get("statusCheckRollup") or []
-    if not checks:
-        return "·", "grey50"
-    concs = [c.get("conclusion") or "" for c in checks]
-    if any(c in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED") for c in concs):
-        return "✗", "red"
-    if any(not c for c in concs):
-        return "◐", "yellow"
-    if all(c in ("SUCCESS", "SKIPPED", "NEUTRAL") for c in concs):
-        return "✓", "green"
-    return "?", "grey50"
+    """(glyph, colour) for a PR's checks, over all six states.
+
+    Reads the report :func:`resolve_ci` stamped on the row when there is one, and
+    falls back to the rollup-only reading when there is not — which now yields `?`
+    rather than the quiet grey dot that let #282 rot. A caller that wants the dot
+    to mean "nothing has run" has to have asked.
+    """
+    report = pr.get("ci")
+    state = report.state if isinstance(report, CiReport) else classify_rollup(
+        pr.get("statusCheckRollup"))
+    return CI_GLYPHS.get(state, CI_GLYPHS["unknown"])
+
+
+def ci_counts(prs: list[dict]) -> dict[str, int]:
+    """{state → how many PRs}, for a panel title. Zeroes omitted by the caller."""
+    counts = dict.fromkeys(CI_STATES, 0)
+    for pr in prs:
+        report = pr.get("ci")
+        state = report.state if isinstance(report, CiReport) else classify_rollup(
+            pr.get("statusCheckRollup"))
+        counts[state] = counts.get(state, 0) + 1
+    return counts
 
 
 # ---- the plan ----------------------------------------------------------------

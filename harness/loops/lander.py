@@ -25,7 +25,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
-    RepoNotFound, agent_failure, agent_gist, check_status, describe, resolve_repo,
+    RepoNotFound, agent_failure, agent_gist, ci_report, describe, resolve_repo,
     run_agent, stderr_gist,
 )
 
@@ -52,8 +52,14 @@ class Decision:
     base: str
     head: str        # the PR's head branch (dependabot/...)
     klass: str       # security | patch_minor | major | unknown
-    checks: str      # green | red | pending | none
+    #: One of `qbdata.CI_STATES` — green | red | pending | blocked | none | unknown.
+    #: Six since #324, and the three that are not green/red/pending all mean "no
+    #: verdict exists", which :func:`decide` refuses to merge on.
+    checks: str
     action: str      # would-merge | escalate | would-fix-red | leave
+    #: Why the check state is what it is, when it is not simply green or red. A
+    #: gated run printed as a bare `none` is what let #282 rot for two days.
+    why: str = ""
 
 
 def gh(args: list[str], repo: str) -> dict | list:
@@ -97,7 +103,11 @@ def decide(klass: str, checks: str, policy: str) -> str:
         return "would-merge"
     if checks == "red":
         return "would-fix-red"
-    return "leave"  # pending → wait for next tick
+    # pending → wait for the next tick. blocked/none/unknown → also leave, but for
+    # a different reason: no further tick will change them, because there is no run
+    # to finish. The printed `why` is what makes those three actionable rather than
+    # a PR that quietly never moves (#324).
+    return "leave"
 
 
 def head_commit_author(gh_repo: str, branch: str) -> str:
@@ -240,7 +250,8 @@ def run(repo_name: str, execute: bool) -> int:
 
     prs = gh(
         ["pr", "list", "--author", author, "--state", "open", "--limit", "50",
-         "--json", "number,title,baseRefName,headRefName,labels,statusCheckRollup"],
+         "--json", "number,title,baseRefName,headRefName,headRefOid,labels,"
+                   "statusCheckRollup"],
         gh_repo,
     )
 
@@ -253,16 +264,21 @@ def run(repo_name: str, execute: bool) -> int:
     for pr in prs:
         labels = [l["name"] for l in pr.get("labels", [])]
         klass = classify(pr["title"], labels)
-        checks = check_status(pr)
-        action = decide(klass, checks, policy)
+        report = ci_report(pr, gh_repo)
+        action = decide(klass, report.state, policy)
         decisions.append(Decision(
             pr["number"], pr["title"], pr["baseRefName"], pr["headRefName"],
-            klass, checks, action))
+            klass, report.state, action, report.reason))
 
     width = max(len(d.title) for d in decisions)
     for d in decisions:
         print(f"  #{d.number:<5} {d.title[:width]:<{width}}  "
               f"base={d.base:<6} {d.klass:<12} ci={d.checks:<8} -> {d.action}")
+        # Only where the state does not speak for itself. `green` and `red` are
+        # complete sentences; `blocked`, `none` and `unknown` are three different
+        # facts that used to print as the same blank.
+        if d.why and d.checks not in ("green", "red"):
+            print(f"         {d.why}")
 
     print()
     for d in decisions:
