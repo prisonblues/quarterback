@@ -17,6 +17,57 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.93 — an issue watcher that reads the tracker and mostly declines
+
+Nothing here read the backlog and said what each issue was waiting on. #63 asked for a watcher
+that runs `/investigate` or `/fix-issue` when an issue is actionable and refuses when a decision
+is still owed, and it is explicit that the refusal is the feature: of the twenty-one issues filed
+here in one day, several existed precisely to force a decision, and an agent handed one of those
+with `/fix-issue` does not stop. It picks an architecture, implements it and opens a PR, and the
+decision has been made by whichever model was cheapest that morning.
+
+`harness/loops/issue_watch.py` ships the half that declines. It surveys a repo's open issues and
+reports what each one is waiting on — a `needs-human/*` label, an *Open questions* section,
+options with no ruling, an unanswered question, an unresolved `depends on #N`, or an issue whose
+own shape puts a choice rather than a defect — with the evidence behind each. It writes no code,
+opens no PR and starts no session. Against this repo's live backlog: 25 issues read, 7 held by a
+named signal, 0 actionable, nothing started.
+
+### Landing it starts nothing, structurally rather than by promise
+
+`issue_pickup.enabled` is false in `DEFAULTS` and in `.harness-rules.sample`, so the action named
+for every issue in this repo is `none`. That is asserted against a judge that raises if it is ever
+called, so the claim is that no model was shown the text at all rather than that the watcher
+declined to act on an answer it paid for.
+
+A default can be flipped, so the stronger property is that the module cannot act even then: a test
+parses the module's own syntax tree and fails unless every `subprocess`/`os` call is a literal list
+beginning `"gh"`. Starting a session is `qb-start`'s job (#277) — a per-machine permission that
+ships off and that a repository cannot grant itself. Wiring a trigger to it is the follow-up, and
+#63 stays open for it.
+
+### The allowlist runs in one direction
+
+This repo is public, so `issue_pickup.allowed_authors` decides whose text may drive this, and the
+gate runs before the judge: a stranger's issue is surveyed, reported, and never shown to a model.
+The asymmetry is the point — **anyone's text may raise a hold and only an allowlisted author's may
+settle one.** Anyone can comment on anybody's issue, so without it "**Decided:** option B" is a
+sentence a stranger writes to take the brake off, and a reply of any kind closes a question. The
+watcher's own comments are dropped from the conversation for the same reason, or its refusal would
+answer the question it was posted to point out.
+
+### Reused rather than rebuilt
+
+The gate is `appetite.pickup_verdict` and there is no second one; `epic.triage` supplies the
+doability verdict whole, `doable=None` still meaning no judgement was possible; `epic.DEP_RE`
+parses the dependency spellings; `appetite.refusal_verdict` reads `skip_labels`;
+`needs_human.announce` is the one escalation door. What is new is the dimension triage lacks:
+`doable` asks whether an agent CAN implement an issue, not whether a human has settled what to do.
+
+`appetite.py` grows three public helpers so consumers stop reading its privates — `events_needed`
+(whether the label event log can change the verdict, which `cmd_pickup` now uses instead of its own
+copy of that condition), `author_verdict` and `unattended_writes_allowed`.
+
 ## v2.92 — the pre-push hook stops telling you to renumber a graph it never counted
 
 `migration_reconcile.py heads` exits 2 for two outcomes that want opposite remedies. Either it
