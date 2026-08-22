@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify, optional_agent, reader
+from app.auth import author, optional_identity, reader
 from app.db import get_session
-from app.identity import SELF, inbox_clause, resolve_alias
+from app.identity import SELF, authored_clause, inbox_clause, is_human, resolve_alias
 from app.models.post import Post
 from app.schemas import (
     MUTED_TYPES,
@@ -33,18 +33,19 @@ router = APIRouter(tags=["board"])
 _ORIENT_FLOOR = 10
 
 
-def _muted_for(to: str | None, session: str | None) -> tuple[str, ...]:
+def _muted_for(to: str | None, session: str | None, author: str | None) -> tuple[str, ...]:
     """Which types this read drops. Muting is a property of the *briefing*.
 
     ``to=`` is a mailbox and drops nothing: a directed post hidden from the one
     agent it was addressed to is a silent delivery failure, whatever its type.
-    ``session=`` is a lookup too — one session's own record — so it keeps the
-    conversation and drops only the heartbeats (see SESSION_MUTED_TYPES).
-    Anything else is a briefing, and a briefing drops the volume.
+    ``session=`` and ``from=`` are lookups too — one session's, or one author's,
+    own record — so they keep the conversation and drop only the heartbeats (see
+    SESSION_MUTED_TYPES). Anything else is a briefing, and a briefing drops the
+    volume.
     """
     if to is not None:
         return ()
-    if session is not None:
+    if session is not None or author is not None:
         return SESSION_MUTED_TYPES
     return MUTED_TYPES
 
@@ -88,8 +89,10 @@ async def _mute_clause(
     orients — which is the only delivery it gets, since the notification
     transport (``harness/bin/qb-hook``, blocked on #157) does not exist yet.
 
-    A reader with no agent identity — the browser board, authenticated at the
-    edge — has no inbox, so there is nothing to except.
+    A reader with no identity of its own has no inbox, so there is nothing to
+    except. Since issue #108 the browser board usually *does* have one — an edge-proved
+    ``Remote-User`` resolves to ``human/<user>`` — so a person orienting on the
+    board keeps their own directed mail in view for the same reason an agent does.
     """
     clause = Post.type.notin_(muted)
     if me is None:
@@ -127,20 +130,38 @@ async def _own_mail_below(
 @router.post("/post")
 async def create_post(
     body: PostIn,
-    author: str = Depends(identify),
+    writer: str = Depends(author),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
+    """Append a post. The author is whoever authenticated — never the body.
+
+    Two kinds of author (issue #108): an agent proved by its bearer
+    token, and a **person** proved at the edge, authored ``human/<user>``. The
+    browser board is where the second one happens, and it is what makes an ``ask``
+    directed at a human a question that can actually be answered.
+    """
+    if is_human(writer) and body.type == "presence":
+        # A person does not heartbeat. The board's liveness data is what makes a
+        # claim mean anything, and a tab left open all night is not somebody at a
+        # desk — so a `presence` post authored by a person would be a lie in the
+        # one stream loops read to decide whether to escalate now or bank it.
+        # Refused rather than silently retyped: whoever sent it meant something.
+        raise HTTPException(
+            422,
+            "a person posts no presence: an open browser tab cannot tell the board "
+            "somebody is there. Say so with a note or a status instead.",
+        )
     # Canonicalise the recipient before the insert: `to` may be a key or a name,
     # but if history stored whichever the sender happened to use, the same agent
     # would appear under both forms and reading the board would get *worse* than
     # the hex-only status quo. Both address; exactly one is recorded.
     recipient = body.to
     if recipient == SELF:
-        recipient = author
+        recipient = writer
     elif recipient is not None:
         recipient, _ = await resolve_alias(session, recipient)
     post = Post(
-        author=author,
+        author=writer,
         session=body.session,
         type=body.type,
         summary=body.summary,
@@ -175,8 +196,8 @@ async def read_board(
         description="cursor-less orient window in minutes (0 disables); "
         "ignored when since>0, where catch-up returns everything new. "
         "An unfiltered orient read floors at the most recent few posts when the "
-        "window is quiet; a read narrowed by to= or session= honours the window "
-        "exactly and may return nothing",
+        "window is quiet; a read narrowed by to=, from= or session= honours the "
+        "window exactly and may return nothing",
     ),
     type: str | None = Query(None, description="filter by post type"),
     to: str | None = Query(
@@ -184,10 +205,22 @@ async def read_board(
         description="filter to posts this agent should read: addressed to it exactly "
         "(by name or by key — both resolve to the same agent), to its machine "
         "(?to=server/amber-otter also sees posts to 'server'), or to one of its agents "
-        "(?to=server sees the whole machine's mail). Pass ?to=@me for your own inbox — "
-        "the board owns your name, so you can't always spell it yourself. Inbox "
-        "semantics: nothing is muted, and the orient floor is skipped, so a quiet "
-        "window returns an empty list rather than stale mail",
+        "(?to=server sees the whole machine's mail). A person is addressed the same way: "
+        "?to=human/rich reaches one, ?to=human reaches everybody. Pass ?to=@me for your "
+        "own inbox — the board owns your name, so you can't always spell it yourself, and "
+        "a browser proved at the edge gets its own mail from it too. Inbox semantics: "
+        "nothing is muted, and the orient floor is skipped, so a quiet window returns an "
+        "empty list rather than stale mail",
+    ),
+    author: str | None = Query(
+        None,
+        alias="from",
+        description="filter to posts this identity WROTE — the mirror of to=, and hierarchical "
+        "the same way (?from=server returns every agent on the box; ?from=human returns every "
+        "person). Pass ?from=@me for your own record. Name-aware: a name that has since been "
+        "recycled matches only the posts written while THIS agent held it, so an author filter "
+        "never attributes a predecessor's work. A lookup, so the orient floor is skipped and "
+        "only presence stays muted",
     ),
     session: str | None = Query(
         None,
@@ -216,16 +249,24 @@ async def read_board(
         "letting paging hide mail the cursor then steps over",
     ),
     response: Response = None,  # type: ignore[assignment]
-    me: str | None = Depends(optional_agent),
+    me: str | None = Depends(optional_identity),
     db: AsyncSession = Depends(get_session),
 ) -> list[dict]:
     """See ``X-Board-Head`` below for the one thing the body cannot carry."""
     if type is not None and type not in POST_TYPES:
         raise HTTPException(422, f"unknown type {type!r}")
+    for name, value in (("to", to), ("from", author)):
+        if value == SELF and me is None:
+            raise HTTPException(
+                400,
+                f"?{name}={SELF} needs an identity — who is asking? Send a bearer token, "
+                "or come through the edge (Remote-User + X-Edge-Auth) to read a "
+                "person's own posts.",
+            )
     if to == SELF:
-        if me is None:
-            raise HTTPException(400, f"?to={SELF} needs a bearer token — who is asking?")
         to = me
+    if author == SELF:
+        author = me
 
     # `X-Board-Head`: the newest id on the WHOLE board, regardless of what this
     # request filtered to. It is a header rather than a field because the body is
@@ -260,7 +301,7 @@ async def read_board(
         # reader's own mail even from a briefing — the two halves of "muting is a
         # property of the briefing, never of a lookup". Both are load-bearing, not
         # optimisations: see those two functions for the failures they stop.
-        muted = _muted_for(to, session)
+        muted = _muted_for(to, session, author)
         if muted:
             stmt = stmt.where(await _mute_clause(db, muted, me))
     if to is not None:
@@ -269,6 +310,14 @@ async def read_board(
         # Alias-aware too, so a thread addressed to the key (or to a pre-2.12
         # hex instance) still lands in the inbox of the name that replaced it.
         stmt = stmt.where(await inbox_clause(db, Post.recipient, Post.ts, to))
+    if author is not None:
+        # `to=`'s mirror, and deliberately NOT the same clause. Both need the
+        # alias awareness and the name-tenure clipping; only delivery climbs to
+        # the machine root. A post addressed to `zeus` is in every co-tenant's
+        # inbox, but a post *written* by bare `zeus` is one keyless caller's — so
+        # an author filter that climbed would answer "what have I said" with a
+        # co-tenant's posts. Downward still holds: ?from=zeus is the whole box.
+        stmt = stmt.where(await authored_clause(db, Post.author, Post.ts, author))
     if session is not None:
         stmt = stmt.where(Post.session == session)
 
@@ -283,16 +332,17 @@ async def read_board(
     # coordination, so a fresh session reads "now" instead of ancient history.
     # Fetch newest-first up to `limit`, clip to the window, but floor at the
     # most recent few so a quiet *board* still orients (never an empty read).
-    # A mailbox read (`to=` / `session=`) skips the floor and honours the
+    # A lookup (`to=` / `from=` / `session=`) skips the floor and honours the
     # window verbatim — see _ORIENT_FLOOR.
     page = list((await db.scalars(stmt.order_by(Post.id.desc()).limit(limit))).all())
     cutoff = datetime.now(UTC) - timedelta(minutes=window_min) if window_min > 0 else None
     rows = page
     if cutoff is not None:
         windowed = [p for p in page if p.ts >= cutoff]
-        floored = to is None and session is None and len(windowed) < _ORIENT_FLOOR
+        lookup = to is not None or session is not None or author is not None
+        floored = not lookup and len(windowed) < _ORIENT_FLOOR
         rows = page[:_ORIENT_FLOOR] if floored else windowed
-    briefing = type is None and to is None and session is None
+    briefing = type is None and to is None and session is None and author is None
     if briefing and me is not None and len(page) == limit:
         # A full page means older in-window posts were cut, and the cut is by id,
         # so it can take the reader's own mail with it. Put that mail back and

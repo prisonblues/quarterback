@@ -578,7 +578,7 @@ async def test_only_a_human_may_drop_or_retitle_an_item(client):
                                  "note": "superseded by #121"},
                            headers=HUMAN)
     assert ok.status_code == 200, ok.text
-    assert ok.json()["state"] == "dropped" and ok.json()["edited_by"] == "rich"
+    assert ok.json()["state"] == "dropped" and ok.json()["edited_by"] == "human/rich"
     assert (await read(client, repo))["items"] == []
 
 
@@ -701,7 +701,10 @@ async def test_the_dev_browser_bypass_reads_but_does_not_decide(client, monkeypa
     monkeypatch.setattr(settings, "browser_dev_human", True)
     ok = await client.post("/plan/item/update",
                            json={"item_id": item["item_id"], "state": "dropped"})
-    assert ok.status_code == 200 and ok.json()["edited_by"] == "devuser"
+    # Namespaced even through the bypass: the dev board must record a person the
+    # same way the real one does, or the bypass would be the one path that
+    # produces an identity nothing else on the board can produce.
+    assert ok.status_code == 200 and ok.json()["edited_by"] == "human/devuser"
 
 
 # --------------------------------------- `next` is about the plan, not the page

@@ -8,9 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
 from app.db import get_session
 from app.identity import (
+    HUMAN,
+    HUMAN_NAME_RE,
     KEY_RE,
     NAME_RE,
     NameUnavailable,
+    human_identity,
     resolve_identity,
     valid_key,
     valid_name,
@@ -34,6 +37,18 @@ NAME_HEADER = "X-Agent-Name"
 #: else can, because nothing else knows it. See :func:`human`.
 EDGE_SECRET_HEADER = "X-Edge-Auth"
 
+#: Told to a caller whose ``Remote-User`` the edge did not vouch for. Shared by
+#: :func:`human` and :func:`author` because it is one boundary, not two — the
+#: person answering an ask and the person reordering the plan are proved the same
+#: way, and a message that drifts between the two teaches an operator the wrong
+#: fix for whichever one they hit first.
+_NOT_FROM_THE_EDGE = (
+    "that Remote-User was not asserted by the edge: the human-only endpoints need "
+    "the proxy's " + EDGE_SECRET_HEADER + " secret (HUMAN_EDGE_SECRET) alongside it, "
+    "because a header anyone can send cannot be the boundary between a person and "
+    "an agent. See DEPLOY.md."
+)
+
 
 def _match_bearer(authorization: str) -> str | None:
     """Return the machine name for a valid bearer token, else None. Constant-time."""
@@ -53,6 +68,18 @@ async def _resolve(
     machine = _match_bearer(authorization)
     if machine is None:
         return None
+    if machine == HUMAN:
+        # The one namespace a token may not authenticate into. `human/…` is what
+        # the edge mints for a person (issue #108), so a machine called `human`
+        # in API_TOKENS would let every agent on that box post as one — and a
+        # board where an agent's post can read as a person's has no human
+        # identity at all, only a convention. Refused here, at the only place a
+        # token becomes a machine name, rather than trusted to stay unused.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"API_TOKENS names a machine {HUMAN!r}, which is the reserved namespace "
+            "for people. Rename that token after the machine it belongs to.",
+        )
     key, legacy_key = key.strip(), legacy_key.strip()
     sent_as = KEY_HEADER if key else LEGACY_KEY_HEADER
     key = key or legacy_key
@@ -108,23 +135,47 @@ async def identify(
     return agent
 
 
-async def optional_agent(
+async def optional_identity(
     authorization: str = Header(default=""),
     key: str = Header(default="", alias=KEY_HEADER),
     legacy_key: str = Header(default="", alias=LEGACY_KEY_HEADER),
     requested: str = Header(default="", alias=NAME_HEADER),
+    remote_user: str = Header(default="", alias="Remote-User"),
+    edge_auth: str = Header(default="", alias=EDGE_SECRET_HEADER),
     db: AsyncSession = Depends(get_session),
 ) -> str | None:
-    """The caller's identity on a read path, or None when it isn't an agent.
+    """The caller's own identity on a read path, or None when it has none.
 
     Read endpoints authorise via :func:`reader`, which also lets an edge-
     authenticated browser through. This answers the separate question "*and* who
     is asking?", so ``?to=@me`` can mean the caller's own inbox — which an agent
     can no longer spell for itself, now that the board owns its name.
+
+    A person has an inbox too (issue #108): an edge-proved ``Remote-User`` resolves to
+    ``human/<user>``, so the browser board can ask for its own mail with the same
+    ``?to=@me`` an agent uses. The proof is the same one :func:`human` demands,
+    and for the same reason — an inbox read narrows to a *named* identity, so a
+    ``Remote-User`` nobody vouched for would be a way to read any person's mail
+    by claiming to be them.
+
+    Unlike :func:`author` this never raises: a caller with no identity is reading
+    the board, not writing to it, and the honest answer to "who is asking" is
+    "nobody in particular". :func:`reader` has already decided they may look.
+
+    An unconfigured ``API_TOKENS`` makes nobody an *agent*, and nothing more: a
+    person is proved at the edge by a different credential entirely, and letting
+    an empty token map take their ``@me`` away would break the browser inbox over
+    a setting that has nothing to do with it.
     """
-    if not settings.token_map:
-        return None
-    return await _resolve(authorization, key, legacy_key, requested, db)
+    edge = _edge_person(remote_user, edge_auth)
+    if edge is not None:
+        return human_identity(edge)
+    if settings.token_map:
+        agent = await _resolve(authorization, key, legacy_key, requested, db)
+        if agent is not None:
+            return agent
+    dev = _dev_person(remote_user)
+    return human_identity(dev) if dev is not None else None
 
 
 def reader(
@@ -174,6 +225,44 @@ def _edge_asserted(edge_auth: str) -> bool:
     return bool(edge_auth) and hmac.compare_digest(edge_auth, secret)
 
 
+def _edge_person(remote_user: str, edge_auth: str) -> str | None:
+    """The person the EDGE vouched for on this request, or None.
+
+    The only tier of proof a reachable deployment may act on, and the reason the
+    two tiers are separate functions: everything below this one is a bypass, and
+    a bypass must never outrank a bearer token (see :func:`_dev_person`).
+    """
+    return remote_user if remote_user and _edge_asserted(edge_auth) else None
+
+
+def _dev_person(remote_user: str) -> str | None:
+    """Who ``BROWSER_DEV_HUMAN`` says is at the keyboard — None unless it is on.
+
+    Local dev: no edge, no secret, so the setting itself is the acknowledgement.
+    It is consulted *after* the bearer token on every write path, which
+    :func:`_edge_person` is not. The order is the whole point: on a dev board
+    with this on, a rule that let the bypass win would relabel every agent's post
+    as a person's, and the board's one distinction between the two would be lost
+    precisely where it is easiest to test.
+    """
+    if not settings.browser_dev_human:
+        return None
+    return remote_user or settings.browser_dev_user or "dev"
+
+
+def _as_person(who: str) -> str:
+    """``human/<user>``, or a 400 naming what the edge sent that cannot be one."""
+    identity = human_identity(who)
+    if identity is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Remote-User {who!r} cannot be a board identity: it must match "
+            f"{HUMAN_NAME_RE.pattern}. A '/' is the separator an identity splits "
+            "on, so a user name carrying one would not stay two levels deep.",
+        )
+    return identity
+
+
 def human(
     authorization: str = Header(default=""),
     remote_user: str = Header(default="", alias="Remote-User"),
@@ -205,20 +294,17 @@ def human(
     ``reader``'s read bypass, and reading is not deciding; a local board that
     wants the reorder buttons opts in with ``BROWSER_DEV_HUMAN=true``, which is
     off by default and documented as local-only in DEPLOY.md.
+
+    **Returns ``human/<user>``, not the bare user (issue #108).** A person is an
+    author on this board now, and an author is ``<machine>/<name>``; a decision
+    recorded as bare ``rich`` would be the one identity on the board that could
+    not be told from a machine of the same name. See :data:`app.identity.HUMAN`.
     """
-    if settings.browser_dev_human:
-        # Local dev: no edge, no secret. The setting is the acknowledgement.
-        return remote_user or settings.browser_dev_user or "dev"
+    person = _edge_person(remote_user, edge_auth) or _dev_person(remote_user)
+    if person is not None:
+        return _as_person(person)
     if remote_user:
-        if _edge_asserted(edge_auth):
-            return remote_user
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "that Remote-User was not asserted by the edge: the human-only "
-            "endpoints need the proxy's " + EDGE_SECRET_HEADER + " secret "
-            "(HUMAN_EDGE_SECRET) alongside it, because a header anyone can send "
-            "cannot be the boundary between a person and an agent. See DEPLOY.md.",
-        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_FROM_THE_EDGE)
     if _match_bearer(authorization) is not None:
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
@@ -229,5 +315,77 @@ def human(
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
         "authentication required",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def author(
+    authorization: str = Header(default=""),
+    key: str = Header(default="", alias=KEY_HEADER),
+    legacy_key: str = Header(default="", alias=LEGACY_KEY_HEADER),
+    requested: str = Header(default="", alias=NAME_HEADER),
+    remote_user: str = Header(default="", alias="Remote-User"),
+    edge_auth: str = Header(default="", alias=EDGE_SECRET_HEADER),
+    db: AsyncSession = Depends(get_session),
+) -> str:
+    """Who may write a post: an agent by token, or a **person** by the edge (#108).
+
+    The board could address a machine, one agent, and every agent on a box. It
+    could not address me, and I could not answer it — ``board.html`` was a read
+    view with two GETs in it, so an ``ask`` directed at a person was a post
+    nobody was watching and nothing could reply to. Five issues end their
+    acceptance criteria at *a human decides* (#85, #86, #78, #84, #63) and each
+    stops at a mechanism that did not exist. This is that mechanism's write half.
+
+    Both callers author under the same rules — the identity is derived from how
+    the request authenticated, never from the body — and the two are
+    distinguishable in history forever, because a person's machine half is the
+    reserved ``human`` namespace that no bearer token can authenticate into.
+
+    **Precedence, and why it is not the same in both directions.**
+
+    * An **edge-proved** ``Remote-User`` outranks a bearer token, exactly as in
+      :func:`human`. It is the stronger proof of *this request*: a secret the
+      caller cannot know, injected after an interactive sign-in. In the reference
+      deployment the two never arrive together anyway — the browser vhost has no
+      token and the agent vhost strips ``X-Edge-Auth`` — so this decides only the
+      misconfigured case, and it decides it towards the credential the app can
+      still verify.
+    * ``BROWSER_DEV_HUMAN`` does **not** outrank a bearer token. It is ambient
+      and applies to every request on the box, so letting it win would author
+      every agent's post on a dev board as ``human/dev``.
+    * ``BROWSER_DEV_USER`` is not consulted at all. It is ``reader``'s read
+      bypass — it authenticates every browser read as a fixed name, and #56's
+      constraint is that such a bypass must not become a write path. Reading is
+      not deciding, and posting to the shared record is deciding.
+
+    An unconfigured ``API_TOKENS`` is still a 503 telling an operator what to
+    set — but only for a caller that was trying to be an agent. It makes nobody
+    an agent and it says nothing about people, who are proved by a different
+    credential, so it is checked on the way out rather than on the way in.
+    """
+    person = _edge_person(remote_user, edge_auth)
+    if person is not None:
+        return _as_person(person)
+    if settings.token_map:
+        agent = await _resolve(authorization, key, legacy_key, requested, db)
+        if agent is not None:
+            return agent
+    dev = _dev_person(remote_user)
+    if dev is not None:
+        return _as_person(dev)
+    if remote_user:
+        # Named rather than folded into the 401: a browser that reaches this has
+        # an identity and a session, and the thing it is missing is a header its
+        # user cannot add — so the answer belongs to whoever configured the edge.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_FROM_THE_EDGE)
+    if not settings.token_map:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "server auth not configured (no API_TOKENS)",
+        )
+    raise HTTPException(
+        status.HTTP_401_UNAUTHORIZED,
+        "invalid or missing bearer token",
         headers={"WWW-Authenticate": "Bearer"},
     )

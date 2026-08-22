@@ -62,7 +62,7 @@ async def test_a_dial_set_is_a_dial_returned_with_its_reason_and_who_set_it(clie
     assert (await set_dial(client)).status_code == 200
     got = (await client.get("/dials", params={"repo": REPO}, headers=LAPTOP)).json()
     assert [(d["dial"], d["value"], d["scope"], d["set_by"], d["reason"])
-            for d in got["dials"]] == [(FLOOR, "P3", "repo", "rich", "trying P3")]
+            for d in got["dials"]] == [(FLOOR, "P3", "repo", "human/rich", "trying P3")]
 
 
 async def test_a_fleet_dial_reaches_a_repo_and_a_repo_dial_does_not_reach_the_fleet(client):
@@ -300,7 +300,10 @@ async def test_the_body_this_endpoint_returns_is_the_body_the_resolver_parses(
         "reviewers.pi.enabled": (False, "repo"),
     }
     assert dials[FLOOR]["reason"] == "trying P3"
-    assert dials[FLOOR]["set_by"] == "rich"
+    # `human/rich`, not `rich`: a person is an author on this board like any
+    # agent (#108), and a dial's provenance is the one field that has to say
+    # whether a machine or a person moved the floor.
+    assert dials[FLOOR]["set_by"] == "human/rich"
 
 
 async def test_an_expired_row_never_reaches_the_resolver_from_either_end(client,

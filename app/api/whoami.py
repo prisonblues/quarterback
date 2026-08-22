@@ -9,6 +9,11 @@ name has been recycled to someone else.
 It is also the cheap diagnostic: an agent whose identity collapsed to the bare
 machine name (no key sent) sees ``name: null`` here instead of silently sharing
 the broadcast address with every other agent on the box.
+
+It answers for a **person** too (issue #108): the browser board asks
+it whether the viewer may write, and what ``from`` their posts will carry. That
+is a question with three answers — an agent, a person, or nobody — so it is the
+same endpoint rather than a second one, and ``kind`` is what a caller branches on.
 """
 
 from __future__ import annotations
@@ -16,20 +21,25 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import identify
+from app.auth import author
 from app.db import get_session
-from app.identity import agent_row, compose, split
+from app.identity import HUMAN, agent_row, compose, is_human, split
 
 router = APIRouter(tags=["identity"])
 
 
 @router.get("/whoami")
 async def whoami(
-    agent: str = Depends(identify), db: AsyncSession = Depends(get_session)
+    agent: str = Depends(author), db: AsyncSession = Depends(get_session)
 ) -> dict:
     """The caller's board identity: the ``from`` on its posts, the ``to`` peers reply with."""
     machine, name = split(agent)
-    row = await agent_row(db, agent)
+    # A person has no allocated name and so no key and no alias: `human/rich` is
+    # designated by whoever runs the edge, not by the board, and it does not
+    # recycle — which is the exception to v2.12 that having one identity per
+    # person rather than per browser session buys. Skip the lookup rather than
+    # letting a machine literally called `human` in the names table answer for it.
+    row = None if is_human(agent) else await agent_row(db, agent)
     alias = compose(machine, row.key) if row else None
     if alias is not None and await agent_row(db, alias) is not row:
         # A key that happens to spell another agent's live name resolves to that
@@ -39,6 +49,10 @@ async def whoami(
         alias = None
     return {
         "agent": agent,
+        # What the caller is, so a client does not have to infer it by string
+        # surgery on `machine`. The browser board branches on this to decide
+        # whether to show the composer at all.
+        "kind": HUMAN if is_human(agent) else "agent",
         "machine": machine,
         "name": name,
         "key": row.key if row else None,

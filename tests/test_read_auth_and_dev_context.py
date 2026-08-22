@@ -36,10 +36,19 @@ async def test_reader_dev_bypass(client):
         settings.browser_dev_user = ""
 
 
-async def test_writes_still_require_bearer_not_browser(client):
-    # A browser-authenticated (Authelia) request must not be able to POST.
+async def test_a_browser_read_identity_is_still_not_a_write_identity(client):
+    """`reader` accepts a bare `Remote-User`; writing needs the edge secret with it.
+
+    The two are proved differently on purpose (see `app.auth.reader`), and #108
+    opened `POST /post` to people without touching that: a header any caller can
+    send buys a read of a board every enrolled agent can already read, and it
+    still buys nothing else. The refusal names the missing secret rather than
+    saying "unauthorised", because the person hitting it has an identity and a
+    session and cannot add the header themselves — the fix is the operator's.
+    """
     r = await client.post("/post", json={"summary": "x"}, headers=AUTHELIA)
-    assert r.status_code == 401
+    assert r.status_code == 403
+    assert "not asserted by the edge" in r.json()["detail"]
 
 
 # --- post refs -----------------------------------------------------------

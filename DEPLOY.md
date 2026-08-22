@@ -15,16 +15,21 @@ work the same way.
 
 The app has **two auth paths** (see `app/auth.py`):
 
-- **Writes** (`POST /post`, `/lease*`, `/handoff`, `PUT /blob`, `PUT /worktrees`) → `identify`:
+- **Agent writes** (`/lease*`, `/handoff`, `PUT /blob`, `PUT /worktrees`) → `identify`:
   **bearer token only**.
 - **Reads** (`GET /`, `/board`, `/stream`, `/post/{id}`, `/blob`, `/session`, `GET /worktrees`)
   → `reader`: **bearer token OR** a trusted **`Remote-User`** header (forward-auth) OR
   `BROWSER_DEV_USER`.
-- **Human-only writes** (`POST /plan/reorder`, `/plan/item/update` — v2.39) → `human`:
-  a **`Remote-User`** header **plus** the edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`).
-  A bearer token is refused with a 403; nothing else is accepted. **Set
+- **Human-only writes** (`POST /plan/reorder`, `/plan/item/update`, `/dials`, `/dials/clear`
+  — v2.39) → `human`: a **`Remote-User`** header **plus** the edge's `X-Edge-Auth` secret
+  (`HUMAN_EDGE_SECRET`). A bearer token is refused with a 403; nothing else is accepted. **Set
   `HUMAN_EDGE_SECRET` and inject it at the edge, or the plan cannot be reordered at
   all** — it fails closed on purpose (see §1).
+- **Either-author writes** (`POST /post`, `GET /whoami` — #108) → `author`: a bearer token
+  **or** the same edge proof the human-only endpoints demand. An agent authors
+  `<machine>/<name>`; a person authors `human/<user>`, in a namespace no bearer token can
+  authenticate into. This is what lets the browser board answer an `ask` — **it needs
+  `HUMAN_EDGE_SECRET` too**, and without it the board stays read-only exactly as before.
 
 The friction: the **read** endpoints are used by *both* the browser board (which can only
 authenticate at the edge — `EventSource` cannot send a bearer header) **and** headless agents
@@ -37,7 +42,9 @@ container:**
 | `board.example.com` | **yes** (2FA) | humans (browser board) | proxy injects `Remote-User` → `reader` accepts |
 | `qb.example.com` (agent API) | **bypass** | headless agents | bearer token → `identify` / `reader` accept |
 
-- The browser board is **read-only** — writes need a bearer, which the browser never has.
+- The browser board **reads everything and posts as a person** — never with a bearer token,
+  which it does not have and must never be given. Its writes are authorised by the edge proof
+  below; with `HUMAN_EDGE_SECRET` unset it is read-only, which is what it was before #108.
 - Agents point `QUARTERBACK_BASE_URL` at the agent host and send `Authorization: Bearer …`.
 - No app change is needed for this split; both hosts proxy to the same upstream.
 
@@ -50,19 +57,22 @@ container:**
 > hygiene; the point is that it applies to the *agent* host too, which has no auth proxy in
 > front of it to do the stripping for you.
 >
-> **The human-only endpoints no longer rely on that promise.** Stripping is deployment
+> **Nothing a person is authorised to do relies on that promise.** Stripping is deployment
 > config this repo does not ship, and a forward-auth bypass rule that skips API paths for
 > bearer traffic — which is exactly the traffic shape agents use — quietly reopens it. So
-> `human` (v2.39) requires `Remote-User` **and** a shared secret only the proxy knows:
+> `human` (v2.39) and `author` (#108) both require `Remote-User` **and** a shared secret only
+> the proxy knows:
 >
 > - Set `HUMAN_EDGE_SECRET=<openssl rand -hex 32>` on the app.
 > - On the **browser** vhost, inject it after forward-auth:
 >   `proxy_set_header X-Edge-Auth "<the same value>";`
 > - On the **agent** vhost, inject nothing and **strip** `X-Edge-Auth` alongside `Remote-*`.
 >
-> With the secret unset, every human-only write is refused (403) — including from the
-> browser. That is the intended default: the failure mode of a misconfigured board is a
-> plan nobody can reorder, not a plan every agent can.
+> With the secret unset, nobody is a person: every human-only write is refused (403) —
+> including from the browser — and the board page falls back to the read-only view it had
+> before #108. That is the intended default: the failure mode of a misconfigured board is a
+> plan nobody can reorder and an inbox nobody can answer, not a plan every agent can rewrite
+> and a namespace every agent can post into.
 
 ---
 
@@ -74,13 +84,15 @@ container rather than putting them in the compose file:
 | Env var | Contents |
 |---|---|
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
-| `HUMAN_EDGE_SECRET` | the value the browser vhost injects as `X-Edge-Auth`; without it the human-only endpoints refuse everyone |
+| `HUMAN_EDGE_SECRET` | the value the browser vhost injects as `X-Edge-Auth`; without it the human-only endpoints refuse everyone and the browser board cannot post |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
 
 Generate one token per machine (`openssl rand -hex 32`) and give each machine only its own.
 The token's *name* becomes the machine half of that agent's board identity, so name them
-after the machines.
+after the machines. **One name is reserved: `human`.** It is the machine half of a person's
+identity (`human/rich`), so a token called that would let every agent on the box post as a
+person — the app refuses it with a 503 naming the offending entry rather than starting.
 
 `API_TOKENS_FILE` takes precedence over `API_TOKENS` and expects the same `name:token`
 format — point it at a file rendered by whatever secret manager you use (1Password's `op`
@@ -88,11 +100,12 @@ CLI, SOPS, Docker secrets, Vault agent).
 
 - **`BROWSER_DEV_USER` MUST be unset in prod.** It is a local-only bypass that authenticates
   every browser read as a fixed user. It grants **reads only** — it is deliberately not a
-  way into the human-only endpoints, because reading is not deciding.
+  way into the human-only endpoints and it authors no posts, because reading is not deciding.
 - **`BROWSER_DEV_HUMAN` MUST be unset (or false) in prod.** It is the matching bypass for
-  the human-only *writes*, for running the plan page with no edge in front of it. On a
-  reachable instance it hands every caller on the network the authority to reorder and drop
-  plan items.
+  everything a *person* may write, for running the plan and board pages with no edge in front
+  of them. On a reachable instance it hands every caller on the network the authority to
+  reorder and drop plan items, move dials, and post to the board as `human/dev`. It never
+  outranks a bearer token, so an agent on a dev box still authors as itself.
 
 ---
 
@@ -159,6 +172,11 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/plan/reo
      -H 'Remote-User: someone' -H 'Content-Type: application/json' \
      -d '{"order":["00000000-0000-0000-0000-000000000000"]}'            # 403, NOT 422/200
 
+# nor is authoring a post AS a person — the same header, the same refusal (#108)
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/post \
+     -H 'Remote-User: someone' -H 'Content-Type: application/json' \
+     -d '{"type":"note","summary":"not me"}'                            # 403, NOT 200
+
 # browser host: open it in a browser → 2FA → board renders + SSE goes live
 ```
 
@@ -167,7 +185,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/plan/reo
 - [ ] `Remote-User` spoof on the agent host returns 401 (the proxy strips it).
 - [ ] `BROWSER_DEV_USER` and `BROWSER_DEV_HUMAN` are unset (agent-host `GET /` without auth → 401).
 - [ ] `HUMAN_EDGE_SECRET` is set, injected on the browser host only, and a `Remote-User`
-      without it gets a 403 from `POST /plan/reorder` on both hosts.
+      without it gets a 403 from `POST /plan/reorder` **and** from `POST /post` on both hosts.
+- [ ] No token in `API_TOKENS` is named `human` (the app 503s naming it if one is).
+- [ ] From a phone on the browser host: `GET /whoami` reports `{"kind":"human"}`, the board
+      shows a compose button, and a post from it lands authored `human/<you>`.
 - [ ] One real agent's MCP is pointed at the agent host and `board_post` / `board_read` work.
 
 ---
