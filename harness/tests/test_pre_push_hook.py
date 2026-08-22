@@ -725,15 +725,23 @@ def test_the_installer_reports_the_pre_push_guard(repo, home):
     assert "installed" in status.stdout
 
 
-def test_the_help_prints_the_whole_header_comment():
+def test_the_help_prints_the_whole_header_comment(repo, home):
     """`--help` is a hardcoded line range over this script's own comment block, so a comment
     that grows past it is silently truncated help. Growing it is exactly what documenting a
-    third refusal does, and the truncation is invisible from any other test here."""
+    third refusal does, and the truncation is invisible from any other test here.
+
+    Run from inside a repo, because `--help` in that position falls through to the dispatch
+    at the bottom of the script, which is past the `rev-parse --git-dir` check. Without a cwd
+    that is a checkout this asserts about an empty string in the flake's build sandbox and
+    passes on a developer's machine — which is the difference between the two, not the help.
+    """
     lines = QB_HOOKS.read_text(encoding="utf-8").splitlines()
     header = list(itertools.takewhile(lambda line: line.startswith("#"), lines[3:]))
     assert header, "qb-hooks has no header comment block where --help reads one from"
     last = next(line for line in reversed(header) if line.strip("# "))
-    out = subprocess.run([str(QB_HOOKS), "--help"], capture_output=True, text=True).stdout
+    out = subprocess.run([str(QB_HOOKS), "--help"], capture_output=True, text=True,
+                         cwd=str(repo), env=env(home)).stdout
+    assert out.strip(), "`qb-hooks --help` printed nothing at all"
     assert last.lstrip("# ") in out, (
         "`qb-hooks --help` stops before the end of its own header comment — widen the "
         "`sed -n '3,Np'` range that renders it")
