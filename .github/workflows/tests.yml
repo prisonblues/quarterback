@@ -599,3 +599,50 @@ jobs:
           sed '/^$/d; s/^/    /' "$tmp/merge.out" "$tmp/merge.err"
           echo "::error::migration single-head check failed to run (exit $merge_rc)"
           exit 1
+
+  changelog:
+    name: a change that ships carries a release note
+    # `pull_request` only, and safe to require for `frozen`'s reason rather than `stamped`'s:
+    # it reports on every pull request, which is the event branch protection gates on. On a
+    # push to main there is nothing left to ask — the fork point of a merged branch is itself,
+    # so the diff is empty and the answer would be a vacuous pass. The place to ask is before
+    # the merge, which is here.
+    #
+    # The `stamped` job's comment above argues that a PR-triggered check which is usually
+    # wrong gets switched off within a week, and that argument is the reason this job's
+    # scoping rule is a function with a forty-line docstring (`_exempt` in
+    # `scripts/changelog_fragments.py`) rather than a `git diff --name-only | grep -q`. Run
+    # against every pull request merged since fragments existed — thirty-eight of them — it
+    # refuses exactly one, and that one is #363, the branch that prompted the issue. A
+    # docs-only branch and a test-only branch pass in silence, which several that day were.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0`, and it is load-bearing exactly as it is on `frozen` and
+      # `migration-heads` above: what changed is measured from the fork point, and a depth-1
+      # checkout has no fork point at all. This job does not go quietly green in that case —
+      # `required` refuses when it cannot find a merge base — which is the difference between
+      # a gate that is unrunnable and a gate that is passing.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Before asking whether a fragment exists, ask whether the ones that do can be read.
+      # Nothing in CI ran this until now: a fragment with a `##` heading in its body, or one
+      # naming a version, was caught by the human running `assemble` at land time — which is
+      # the last moment anyone wants to discover it, and one merge queue away from the moment
+      # it is discovered by the release entry coming out wrong.
+      - name: Check every fragment parses
+        run: python3 scripts/changelog_fragments.py check
+
+      - name: Check this pull request carries a changelog entry
+        # Through the environment, never interpolated into the script body: `${{ }}`
+        # substitution happens before bash sees the line, so a base branch name spliced in
+        # that way is whoever opened the pull request executing text on this runner. As an env
+        # var it is data. (Same reasoning as the two jobs above.)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/changelog_fragments.py required --onto "origin/$BASE_REF" --branch HEAD

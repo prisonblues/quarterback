@@ -622,6 +622,29 @@ def release_entries(text: str, where: str = "") -> dict[Release, str]:
     }
 
 
+def unstamped_entry(text: str, where: str = "") -> str | None:
+    """The `## vNEXT` entry as a whole SLAB — heading line and body — or None if there is none.
+
+    `release_entries` above answers this for entries that carry a NUMBER and cannot answer it
+    for the placeholder, which by definition carries none. Both are "what does this entry
+    say", and the reason the placeholder needs its own accessor is that the one caller which
+    wants it — `changelog_fragments.py required` — has to compare an unstamped entry across
+    two refs by its TEXT: a base may legitimately carry a `## vNEXT` of its own (a stacked PR
+    onto an epic branch), so comparing by name says only that both ends have one.
+
+    Sliced out of the real text at offsets located in the masked copy, and ended at the next
+    `#` or `##`, exactly as `release_entries` does — so the two agree on where an entry stops,
+    which is the point of it living here rather than being re-derived at the call site.
+    """
+    masked = mask_code(text, where)
+    start = _HEADING_PLACEHOLDER.search(masked)
+    if start is None:
+        return None
+    end = next((m.start() for m in _SECTION.finditer(masked) if m.start() > start.start()),
+               len(text))
+    return text[start.start():end]
+
+
 def entry_names(text: str, where: str = "") -> list[str]:
     """Every release ENTRY heading in file order, spelled the way the file spells it.
 
