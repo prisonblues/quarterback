@@ -17,6 +17,22 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.91 — qb-doctor's harness row stops counting five files and naming four
+
+The row printed the full count of drifted files and only the first four names, with nothing to
+say the list had been shortened — `5 differ (create-worktree, prune-worktrees, qb-doctor,
+qb-hooks)`, and `remove-worktree` gone in silence. `--json` carried every name, so nothing was
+lost to a machine; what was lost was the point of the row, which is that a person can trust it
+at a glance without going to `--json` to check it. The count was the honest half, which is the
+confusing way round: a reader who counts the names concludes the count is broken.
+
+Both lists on that row were capped the same way and both now spell the elision out —
+`5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)`, the `+N more`
+shape `qb-dash` already uses when it trims a table. The regression guard is written against the
+row's shape rather than against the cap: it parses whatever the row prints and holds each
+counted list to its own arithmetic, so a list that starts eliding without saying so fails
+whatever the cap becomes.
+
 ## v2.90 — a session can be started by something other than a hand, and it ships off
 
 Rich asked for a loop: a plan that says what is next, a board that helps agents work through
