@@ -1244,6 +1244,7 @@ full — including what was broken before it, which is the part no diff recovers
   the outcome half is absent rather than stubbed, since a null `outcome` column invites the
   question to be answered by whoever is looking.
 - **v2.72** — "a human has to look at this" stops being a sentence nobody can count.
+- **v2.73** — an agent can say where a new plan item goes, and `next` admits when nobody decided.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
