@@ -2094,6 +2094,13 @@ and refuses rather than guessing:
    Override the roots with `QUARTERBACK_CONSUMER_ROOTS` (colon-separated) — that is also how
    a host with its flake at `/etc/nixos` says so.
 
+A lock "pins this repo" only when one of the **root node's own inputs** does. `flake.lock`
+carries the whole dependency graph, so a flake that pins something that pins this repo is not
+a consumer of this harness — and `nix flake update` could not move that node anyway. The name
+passed to `nix flake update` is the root's name for the input, which is not always the id the
+lock stores it under (a second node for one flake becomes `quarterback_2`, and
+`nix flake update quarterback_2` is not a command).
+
 A hit is collapsed onto its **main checkout** before being counted. Eight directories under
 `~/source` pinned this repo on the machine this was written for, and they were eight
 worktrees of one flake; they are not eight consumers, because a machine is rebuilt from the
