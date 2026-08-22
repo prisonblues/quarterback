@@ -220,3 +220,31 @@ async def test_a_dial_with_no_reason_is_refused(client):
     r = await client.post("/dials", json={"dial": FLOOR, "value": "P3", "reason": ""},
                           headers=HUMAN)
     assert r.status_code == 422
+
+
+# ------------------------------------------- what the board can see for itself
+
+async def test_a_reason_of_nothing_but_spaces_is_a_422_and_not_a_500(client):
+    """Pydantic's `min_length` counts characters and `"   "` has three, so without
+    a strip the natural mistake reached the database's own constraint and came back
+    as a server error instead of an answer naming the field."""
+    r = await set_dial(client, reason="   ")
+    assert r.status_code == 422
+    assert "reason" in r.json()["detail"]["error"]
+
+
+async def test_a_value_postgres_cannot_store_is_refused_where_it_is_typed(client):
+    """`json.dumps` emits the JavaScript literals `NaN` and `Infinity` by default
+    and JSONB refuses both, so a float dial set to one passed every check and failed
+    at the commit."""
+    # A raw body, because httpx refuses to ENCODE `inf` — which is the point: the
+    # only way it reaches the endpoint is from a client whose encoder is Python's
+    # default one, and Python's default one emits it.
+    r = await client.post(
+        "/dials",
+        content=('{"dial": "review_panel.max_fix_growth", "value": Infinity, '
+                 f'"reason": "no ceiling", "repo": "{REPO}"}}'),
+        headers={**HUMAN, "Content-Type": "application/json"})
+    assert r.status_code == 422
+    assert (await client.get("/dials", params={"repo": REPO},
+                             headers=LAPTOP)).json()["dials"] == []

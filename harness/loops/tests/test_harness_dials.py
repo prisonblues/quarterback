@@ -172,7 +172,7 @@ def test_applying_a_board_dial_does_not_edit_the_builtin_defaults(repo, monkeypa
           dial("review_panel.max_rounds", 3))
     cfg = hr.resolve_repo(str(repo))
     assert cfg["review_panel"]["escalate_on"]["premise_repeated"] == 5
-    assert hr.DEFAULTS == before
+    assert before == hr.DEFAULTS
 
 
 # ---------------------------------------------- 3. which layer answered, for all
@@ -402,3 +402,35 @@ def test_the_dials_flag_lists_every_dial_with_its_layer(repo, monkeypatch):
     lines = {ln.split()[0] for ln in out.stdout.splitlines() if ln.strip()}
     assert FLOOR in lines and "review_panel.judge_model" in lines
     assert all("[" in ln for ln in out.stdout.splitlines() if ln.strip())
+
+
+def test_an_enrolled_box_with_no_usable_token_is_reported_not_treated_as_unenrolled(
+        repo, monkeypatch, capsys):
+    """Two different facts, and `board_config` tells them apart by whether it
+    resolved a URL. No URL is "this box is on no board" and is silent; a URL with no
+    usable token is a MISCONFIGURED box that IS enrolled and may well have dials in
+    force this run cannot see, so reporting it as "no dials" would be the
+    silent-policy failure the module exists to prevent."""
+    hr._reported.clear()
+    monkeypatch.delenv(hr.DIALS_ENV, raising=False)
+    monkeypatch.setenv("QUARTERBACK_BASE_URL", "https://board.example")
+    monkeypatch.delenv("QUARTERBACK_TOKEN", raising=False)
+    monkeypatch.setattr(hr, "QB_CONFIG", repo / "no-such-config")
+    monkeypatch.setattr(hr, "QB_TOKEN_FILE", repo / "no-such-token")
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["_dials_unreadable"] is True
+    assert "unreadable, dials not applied" in cfg["_rules_from"]
+    assert "no board token" in capsys.readouterr().err
+
+
+def test_a_floor_is_read_case_insensitively_from_the_board_too(repo, monkeypatch):
+    """Every severity entering the panel is stripped and upper-cased, so a layer
+    that refused `"p2"` while the sample beside it accepted it would make one written
+    value mean two things depending on which layer carried it. Normalised on the way
+    in, so the provenance table shows the value the round applied."""
+    board(monkeypatch, dial(FLOOR, "p3"), dial("review_panel.reviewer_scope",
+                                               " Increment "))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["review_panel"]["fix_severity_floor"] == "P3"
+    assert cfg["review_panel"]["reviewer_scope"] == "increment"
+    assert cfg["_dials"][FLOOR]["value"] == "P3"

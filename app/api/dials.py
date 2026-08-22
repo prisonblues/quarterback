@@ -257,8 +257,22 @@ async def set_dial(
             "error": "expires_at is in the past", "expires_at": expires.isoformat(),
             "hint": "omit it for a dial with no end date; a past one would store a "
                     "setting that is absent the moment it is written"})
+    reason = body.reason.strip()
+    if not reason:
+        # Pydantic's `min_length` counts characters, and `"   "` has three. The
+        # database refuses a blank reason (`ck_dial_settings_reason`), so without
+        # this the natural mistake comes back as a 500 from the commit instead of a
+        # 422 naming the field — and a dial whose argument was never written down is
+        # one nobody can later decide to remove.
+        raise HTTPException(422, detail={
+            "error": "a dial needs a reason", "dial": dial,
+            "hint": "why is this value in force? A dial nobody can read an argument "
+                    "for is a dial nobody can decide to remove"})
     try:
-        blob = json.dumps(body.value)
+        # `allow_nan=False`: json.dumps emits the JavaScript literals `NaN` and
+        # `Infinity` by default and Postgres JSONB refuses both, so a float dial set
+        # to one would pass every check here and fail at the commit as a 500.
+        blob = json.dumps(body.value, allow_nan=False)
     except (TypeError, ValueError) as e:
         raise HTTPException(422, detail={
             "error": f"value is not JSON-serialisable: {e}", "dial": dial}) from e
@@ -280,8 +294,7 @@ async def set_dial(
             .where(DialSetting.id.in_([p.id for p in prior]))
             .values(cleared_at=now, cleared_by=editor))
     row = DialSetting(repo=scope, dial=dial, value={"value": body.value},
-                      reason=body.reason.strip(), set_by=editor, set_at=now,
-                      expires_at=expires)
+                      reason=reason, set_by=editor, set_at=now, expires_at=expires)
     session.add(row)
     try:
         await session.commit()

@@ -1765,7 +1765,12 @@ BOARD_DIALS: dict[str, Dial] = {
 #: The severity bands a floor may name. `P0` is deliberately absent: the panel's
 #: bands run P1..P4 and a floor at P0 would admit nothing at all, which is a way of
 #: switching the panel off without saying so.
-_SEVERITY_RE = re.compile(r"^P[1-4]$")
+#:
+#: CASE-INSENSITIVE, and normalised on the way in, for the reason `severity_floor`
+#: is: every severity entering the panel is stripped and upper-cased, so a layer
+#: that refused `"p2"` while the sample beside it accepted it would make one written
+#: value mean two things depending on which layer carried it.
+_SEVERITY_RE = re.compile(r"^[Pp][1-4]$")
 
 #: What `reviewer_scope` accepts. Two words, and a third would silently review the
 #: whole PR every round.
@@ -1881,7 +1886,13 @@ def _dial_body(github: str) -> tuple[dict, str, str]:
 
     url, token, why = board_config()
     if why:
-        return {}, "", ""
+        # TWO different facts, and `board_config` tells them apart by whether it
+        # managed to resolve a URL. No URL is "this box is on no board", the
+        # ordinary case, and it is silent. A URL with no usable TOKEN is a
+        # MISCONFIGURED box that IS enrolled — it may well have dials in force that
+        # this run cannot see — and reporting that as "no dials" would be exactly
+        # the silent-policy failure this module exists to prevent.
+        return ({}, "", "") if not url else ({}, f"{url}/{DIALS_PATH}", why)
     where = f"{url}/{DIALS_PATH}"
     full = f"{where}?{urllib.parse.urlencode({'repo': github})}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
@@ -1968,7 +1979,7 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
         return "" if isinstance(value, str) and _SEVERITY_RE.match(value) else (
             f"`{path}` must be a severity band P1-P4, not {value!r}")
     if dial.kind == "scope":
-        return "" if value in _SCOPES else (
+        return "" if isinstance(value, str) and value.strip().lower() in _SCOPES else (
             f"`{path}` must be one of {', '.join(_SCOPES)}, not {value!r}")
     if dial.kind == "text":
         return "" if isinstance(value, str) else (
@@ -2023,15 +2034,24 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
             # one and a resolution whose one lapsed have to be indistinguishable,
             # or the expiry is a flag somebody still has to clear.
             continue
-        problem = _dial_problem(name, dial, row.get("value"))
+        value = row.get("value")
+        problem = _dial_problem(name, dial, value)
         if problem:
             problems.append(problem)
             continue
+        # Normalised HERE rather than by each consumer, so `_dials` reports the value
+        # the round actually applied. `panel_seats` upper-cases a floor and
+        # lower-cases a scope on its way in, and a provenance table showing `"p3"`
+        # beside a round that ran `P3` is a table a reader would have to second-guess.
+        if dial.kind == "severity":
+            value = value.upper()
+        elif dial.kind == "scope":
+            value = value.strip().lower()
         scope = "repo" if row.get("scope") == "repo" else "fleet"
         prior = out.get(name)
         if prior is not None and (prior["scope"] == "repo" or scope != "repo"):
             continue
-        out[name] = {"value": row.get("value"), "scope": scope, "source": where,
+        out[name] = {"value": value, "scope": scope, "source": where,
                      "reason": str(row.get("reason") or ""),
                      "set_by": str(row.get("set_by") or ""),
                      "expires_at": row.get("expires_at") or None}
