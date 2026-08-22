@@ -68,6 +68,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.models import Base
 
+from . import dbrun
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: Suffixed onto the suite's own database name, so the throwaway is unmistakably
@@ -99,7 +101,7 @@ def _alembic(url: str, *args: str) -> None:
 
 
 @pytest.fixture(scope="module")
-async def replayed():
+async def replayed(_db_claim):
     """A database built from nothing by every migration in order.
 
     Module-scoped: the replay is the expensive part and the tests below only
@@ -111,7 +113,11 @@ async def replayed():
     sa_url = base.set(database=db).render_as_string(hide_password=False)
     dsn = base.set(drivername="postgresql", database=db).render_as_string(
         hide_password=False)
-    admin_dsn = base.set(drivername="postgresql").render_as_string(hide_password=False)
+    # The maintenance database, not the bound one: this connection creates and
+    # drops the scratch database below, and since #366 the bound database is
+    # this run's own — which a run that collects only these modules never
+    # builds, because nothing here asks for the schema fixture.
+    admin_dsn = dbrun.admin_dsn(os.environ["DATABASE_URL"])
 
     await _recreate(admin_dsn, db)
     try:

@@ -39,6 +39,8 @@ import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
 
+from . import dbrun
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: (repo, phase, rank, state, added_by, title, done_at offset in minutes).
@@ -101,7 +103,7 @@ def _alembic(url: str, *args: str) -> None:
 
 
 @pytest.fixture(scope="module")
-async def snapshots():
+async def snapshots(_db_claim):
     """Seed at 0024, upgrade, downgrade, and hand back what each direction left.
 
     Both directions in one fixture because the chain is what costs: the tests
@@ -113,7 +115,11 @@ async def snapshots():
     sa_url = base.set(database=scratch).render_as_string(hide_password=False)
     dsn = base.set(drivername="postgresql", database=scratch).render_as_string(
         hide_password=False)
-    admin_dsn = base.set(drivername="postgresql").render_as_string(hide_password=False)
+    # The maintenance database, not the bound one: this connection creates and
+    # drops the scratch database below, and since #366 the bound database is
+    # this run's own — which a run that collects only these modules never
+    # builds, because nothing here asks for the schema fixture.
+    admin_dsn = dbrun.admin_dsn(os.environ["DATABASE_URL"])
 
     admin = await asyncpg.connect(admin_dsn)
     try:
