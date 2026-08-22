@@ -1729,3 +1729,181 @@ def test_the_board_client_is_built_once_for_the_reads_and_the_write(capsys):
         qr.board_client, qr.fetch_ref_state, qr.fetch_open_prs = (
             saved_client, saved_ref, saved_prs)
     capsys.readouterr()
+
+
+# ---- a scope with no forge behind it (#323) ---------------------------------
+#
+# The third state, and the reason it is a state rather than a softer unknown. Two
+# rows on the live plan were house work under scope `65lowther` — no repo, no
+# issues, no PRs, no CI — and every tick of the fifteen-minute timer reported them
+# under COULD NOT CHECK. That is not what an unknown means here. `unknowns` is "I
+# could not look"; this is "there was never a second source to look at". A
+# permanent unresolvable warning on a surface whose whole value is that it is
+# trustworthy stops it being trustworthy in about a day.
+
+PROJECT = "project:65lowther"
+
+
+def house(**over) -> dict:
+    """A plan item in a scope that names no repository."""
+    return item(**{"repo": PROJECT, "ref": None,
+                   "title": "Move the ASHP off the window", **over})
+
+
+def test_a_scope_that_names_no_repository_is_bound_to_no_forge():
+    assert qr.forge_repo(PROJECT) is None
+    assert qr.forge_repo("Project:65Lowther") is None
+    assert qr.forge_repo(None) is None
+
+
+def test_a_repo_scope_is_bound_to_itself():
+    assert qr.forge_repo(REPO) == REPO
+
+
+def test_a_malformed_repo_is_still_a_bound_scope_and_still_an_unknown():
+    """Binding is decided by the SPELLING, not by whether the bound name works.
+
+    This is the distinction #323 turns on. `65lowther` — the pre-migration
+    spelling, and any repo somebody mistypes into the plan — claims to name a
+    repository and names an unusable one: still `gh`'s to refuse, still an honest
+    COULD NOT CHECK. Inferring "no forge" from "the name did not match" is exactly
+    the inference that would let a mistyped repo become a scope."""
+    assert qr.forge_repo("65lowther") == "65lowther"
+    rows, problem = qr.fetch_open_prs("65lowther")
+    assert rows == [] and problem is not None
+    assert problem.condition == "untracked_pr"
+
+
+def test_gh_is_never_asked_about_a_scope_with_no_forge(wired, monkeypatch):
+    """The whole defect, at its source: `fetch_open_prs` has two answers and
+    neither of them fits, so it must not be the thing that decides."""
+    asked = []
+    board = FakeBoard({"items": [house(rank=12), house(rank=14, item_id="b" * 8)]})
+    report = wired(board, open_prs=[])()
+    monkeypatch.setattr(qr, "fetch_open_prs",
+                        lambda repo: asked.append(repo) or ([], None))
+    assert asked == []
+    assert report.unknowns == [], "a scope with no forge is not an unanswered question"
+    assert report.repos == [], "it is not a repo, so it is not in the repo list either"
+
+
+def test_the_scope_is_reported_once_as_the_third_thing_it_is(wired):
+    """Not an unknown and not silence. `#323`: say once that it was not compared
+    and why there was nothing to compare, or say nothing."""
+    board = FakeBoard({"items": [house(rank=12), house(rank=14, item_id="b" * 8)]})
+    report = wired(board, open_prs=[])()
+    assert [s["scope"] for s in report.scopes_skipped] == [PROJECT]
+    assert report.scopes_skipped[0]["items"] == 2
+    assert "no repo behind it" in report.scopes_skipped[0]["reason"]
+
+
+def test_a_skipped_scope_keeps_the_report_clean_and_complete(wired):
+    """`unknowns` is what says a check did not happen, and it drives both the exit
+    code and `complete`. Nothing went unchecked here, so neither may move — a tick
+    exiting 1 forever is the same cry-wolf failure in the return value."""
+    board = FakeBoard({"items": [house()]})
+    report = wired(board, open_prs=[])()
+    payload = report.as_dict()
+    assert payload["complete"] is True and report.exit_code == 0
+    assert payload["unknowns"] == [] and payload["findings"] == []
+    assert payload["scopes_skipped"][0]["label"] == "65lowther"
+    json.dumps(payload)
+
+
+def test_a_repo_beside_a_project_scope_is_still_reconciled(wired):
+    """The skip is per scope. A plan holding house work and a repo must still get
+    the repo's disagreements — dropping a tick's real findings to silence a
+    standing one would be a worse trade than the noise."""
+    board = FakeBoard({"items": [house(rank=12),
+                                 item(rank=2, ref={"kind": "pr", "value": "182"})]})
+    report = wired(board, ref_states={("pr", "182"): {"state": "MERGED"}},
+                   open_prs=[])()
+    assert report.repos == [REPO]
+    assert [f.condition for f in report.findings] == ["done_candidate"]
+    assert [s["scope"] for s in report.scopes_skipped] == [PROJECT]
+
+
+def test_the_rendered_report_says_it_in_one_line(wired):
+    board = FakeBoard({"items": [house()]})
+    text = qr.render(wired(board, open_prs=[])())
+    assert "1 scope(s) with nothing to compare: 65lowther" in text
+    assert "COULD NOT CHECK" not in text
+    assert text.count("65lowther") == 1, "once per tick, not once per item"
+
+
+def test_a_standing_skip_is_not_content_for_quiet_or_post(monkeypatch, capsys):
+    """`prs_skipped` counts as content because it is a filter this pass APPLIED and
+    might have applied wrongly. A project scope having no forge is a standing fact
+    about the plan, true on every tick and unchanged by anything — counting it
+    would make `--quiet` print and `--post` post every fifteen minutes forever,
+    which is this issue's own complaint arriving through the gate."""
+    board = FakeBoard({"items": [house()]})
+    board.posts = []
+    board.post = lambda path, body: board.posts.append((path, body))
+    monkeypatch.setattr(qr, "_CLIENT", None)
+    monkeypatch.setattr(qr, "board_client", lambda: (board, None))
+    monkeypatch.setattr(qr, "fetch_open_prs", lambda repo: ([], None))
+    assert qr.main(["--quiet", "--post"]) == 0
+    assert board.posts == []
+    assert capsys.readouterr().out == ""
+
+
+def test_an_item_whose_scope_names_no_repository_but_carries_a_ref_is_unknown(wired):
+    """The one row this can still produce an unknown for, and it should.
+
+    The board refuses to attach an `issue` or `pr` ref to an item in a project
+    scope, so such a row can only predate the refusal — and it IS unanswerable:
+    there is no repository for `#7` to be a number in. The scope-level skip is
+    about scopes; this is about one broken row inside one."""
+    board = FakeBoard({"items": [house(ref={"kind": "issue", "value": "7"})]})
+    report = wired(board, open_prs=[])()
+    assert [u.condition for u in report.unknowns] == ["ref_unresolved"]
+    assert "names no repository" in report.unknowns[0].reason
+
+
+def test_a_repo_filter_is_folded_the_way_the_board_folds_a_scope(wired):
+    """`_norm_scope` lower-cases every scope it stores, so an unfolded `--repo`
+    matched no row, reconciled nothing, and printed "the plan agrees with GitHub on
+    everything checked" — a clean bill from a pass that never ran."""
+    board = FakeBoard({"items": [item(rank=2, ref={"kind": "pr", "value": "182"})]})
+    report = wired(board, ref_states={("pr", "182"): {"state": "MERGED"}},
+                   open_prs=[])("PrisonBlues/Quarterback")
+    assert report.items_checked == 1
+    assert [f.condition for f in report.findings] == ["done_candidate"]
+
+
+def test_a_project_filter_is_folded_too(wired):
+    board = FakeBoard({"items": [house()]})
+    report = wired(board, open_prs=[])("Project:65Lowther")
+    assert [s["scope"] for s in report.scopes_skipped] == [PROJECT]
+
+
+def test_a_filter_naming_a_scope_the_plan_does_not_have_asserts_nothing(wired):
+    """`--repo project:65lowthr` must not print "1 scope with nothing to compare".
+
+    That line says a scope exists and has nothing in it. Fabricated from the
+    argument, it says so on the strength of somebody having typed it — and the
+    registry that refuses such a typo lives on the board, which this pass reads
+    over HTTP and cannot consult. The honest report is that the plan has no rows
+    under that name."""
+    board = FakeBoard({"items": [house()]})
+    report = wired(board, open_prs=[])("project:65lowthr")
+    assert report.scopes_skipped == []
+    assert report.items_checked == 0 and report.findings == []
+    assert "nothing to compare" not in qr.render(report)
+
+
+def test_a_filter_naming_a_repo_the_plan_does_not_have_still_asks_about_it(wired):
+    """The other half, and why the guard above is narrowed to unbound scopes: a
+    repository the plan has no rows for is exactly the one whose open PRs are worth
+    asking about, because every one of them is untracked by definition."""
+    asked = []
+    board = FakeBoard({"items": [house()]})
+    report = wired(board, open_prs=[])
+    saved, qr.fetch_open_prs = qr.fetch_open_prs, lambda repo: (asked.append(repo) or
+                                                                ([], None))
+    try:
+        report("acme/notontheplan")
+    finally:
+        qr.fetch_open_prs = saved
+    assert asked == ["acme/notontheplan"]

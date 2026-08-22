@@ -83,3 +83,55 @@ def test_every_count_the_page_reads_is_one_the_endpoint_sends():
 
     read = set(re.findall(r"counts\.([a-z_]+)", PAGE.read_text()))
     assert read <= sent, f"the page reads counts the endpoint never sends: {read - sent}"
+
+
+# ---- a scope that is not a repo (#323) --------------------------------------
+
+
+def test_the_page_never_builds_a_github_url_for_a_project_scope(page):
+    """A GitHub URL is constructible only from a scope bound to a repository.
+
+    `project:65lowther` names none, so interpolating it into
+    `github.com/<repo>/issues/<n>` would produce a link to a page that does not
+    exist. The server refuses to attach an issue or PR ref to such an item at all;
+    this is the second half of that rule, at the one place the URL is built."""
+    built = re.search(r"function refUrl\(it\)\{[^}]*\}", page)
+    assert built, "could not find refUrl"
+    assert "isProject(it.repo)" in built.group(0), \
+        "refUrl must exclude a scope with no repo behind it"
+
+
+def test_the_sigil_the_page_uses_is_the_one_the_server_defines():
+    """Two spellings of one scope is the defect this whole feature is downstream
+    of, so the page may not carry its own idea of the prefix."""
+    server = re.search(r'PROJECT_SIGIL = "([^"]+)"',
+                       (REPO_ROOT / "app/scope.py").read_text())
+    assert server, "could not find PROJECT_SIGIL in app/scope.py"
+    assert f'const PROJECT_SIGIL = "{server.group(1)}"' in PAGE.read_text()
+
+
+def test_the_scope_picker_offers_a_scope_that_has_no_items_yet(page):
+    """Built from the items alone, a freshly declared scope is invisible until
+    somebody has already managed to put work in it — through a picker that does
+    not list it. So the read's own `scopes` feeds it too."""
+    assert "d.scopes" in page, "the page must read the declared scopes off the plan read"
+    assert re.search(r"want = \[.*declared.*\]", page), \
+        "the picker's options must include the declared scopes"
+
+
+def test_the_option_value_is_the_canonical_scope_and_only_the_label_is_shortened(page):
+    """The value is what the server is asked for and the text is what a person
+    reads. Shortening the value would send `65lowther` to an endpoint that
+    correctly refuses it."""
+    options = re.search(r"repoSel\.innerHTML = want\.map\([^;]*;", page)
+    assert options, "could not find the option builder"
+    assert 'value="${esc(v)}"' in options.group(0), "the value stays canonical"
+    assert "scopeLabel(v)" in options.group(0), "only the visible text is shortened"
+
+
+def test_declaring_a_scope_is_on_the_page_because_it_is_a_human_decision(page):
+    """`POST /plan/scope` is behind `app.auth.human`, which refuses a bearer token
+    — so a browser is the only way in, and this page is the browser. Without the
+    control the endpoint ships unreachable by the person it is for."""
+    assert 'id="newScope"' in page, "the page needs a way to declare a scope"
+    assert '"/plan/scope"' in page, "and it has to call the human-only endpoint"

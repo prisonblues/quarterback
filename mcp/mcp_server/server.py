@@ -187,6 +187,13 @@ mcp = FastMCP(
         "when you are writing down a position you were GIVEN, since placing a new "
         "item reorders nothing — claim them, record what they wait on "
         "(plan_depends) and complete them.\n"
+        "**A scope is not always a repo.** Most plan items belong to a "
+        "GitHub repo, spelled `owner/name`. Some belong to a `project:<name>` "
+        "scope — real work with no repo behind it, so no issues, no PRs, no CI. "
+        "`plan_read` returns the declared ones in `scopes`; name one exactly as it "
+        "is spelled there. You cannot create one: a PERSON declares a scope, "
+        "because a scope invented from a typo is a second name for work that "
+        "already has one. A misspelled repo is still refused as a repo.\n"
         "**Is that order still right?** plan_order(repo=...) — the order the "
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
@@ -842,8 +849,17 @@ def plan_read(ctx: Context, repo: str | None = None, plan: str | None = None,
     `caveat` is that fact carried to whoever reads only the headline. When it is
     set, read the notes rather than trusting the number.
 
+    **A scope is not always a GitHub repo.** `repo` names a *scope*: usually
+    `owner/name`, sometimes `project:<name>` — a scope with no repo behind it, for
+    work that has no forge (house work, admin, anything with no code). The reply's
+    `scopes` lists every project scope somebody has declared; that is where the
+    exact spelling comes from, and reading it is how you find out such work exists
+    at all.
+
     Args:
-        repo: this repo's items plus the fleet-wide ones. Omit for everything.
+        repo: the scope — `owner/name` for a repo, or `project:<name>` for one of
+            the scopes listed in `scopes`. You get that scope's items plus the
+            fleet-wide ones. Omit for everything.
         plan: only one plan, by label ("stage 1") or by id.
         include_done: include finished and dropped items (history, not work).
         limit: most items to return, from the TOP of the order (the board caps it
@@ -934,11 +950,23 @@ def plan_add(ctx: Context, title: str, repo: str | None = None,
     One open item per issue: adding an issue that is already in the plan is
     refused and names the item that is already there.
 
+    **You cannot invent a scope here, and that is deliberate.** `repo` takes a repo
+    spelled `owner/name`, or a `project:<name>` scope a PERSON has already declared
+    (they are listed in `plan_read`'s `scopes`). Anything else is refused —
+    including a bare `quarterback` and including `project:` plus a name nobody has
+    declared. If it were not, one mistyped scope would put your item in a second
+    list that no read reconciles against the first and no reader can see both
+    halves of. If a scope is genuinely missing, ask the person whose plan it is;
+    the board refuses you rather than guessing, on purpose.
+
     Args:
         title: one line, a handle for the work — not a description.
-        repo: the repo it belongs to, e.g. "prisonblues/quarterback". Omit for a
-            fleet-wide item (it shows in every repo's plan read).
-        ref_kind: "issue" or "pr".
+        repo: the scope it belongs to — a repo like "prisonblues/quarterback", or a
+            declared "project:<name>". Omit for a fleet-wide item (it shows in
+            every scope's plan read).
+        ref_kind: "issue" or "pr". Both name something on GitHub, so both need a
+            repo scope: an item in a `project:` scope has no forge to point into
+            and carries its title and note instead.
         ref_value: the number ("60" or "#60").
         plan: the plan it belongs to, by label ("stage 1") or id. A label the
             board does not know creates the plan — one row per label, folded for
@@ -1036,7 +1064,8 @@ def plans(ctx: Context, repo: str | None = None, include_closed: bool = False) -
     race a plan-level claim exists to cover.
 
     Args:
-        repo: this repo's plans plus the fleet-wide ones. Omit for everything.
+        repo: this scope's plans plus the fleet-wide ones — `owner/name`, or a
+            declared "project:<name>". Omit for everything.
         include_closed: include finished and dropped plans.
     """
     try:
@@ -1069,8 +1098,11 @@ def plan_submit(ctx: Context, label: str, items: list[dict], repo: str | None = 
               "note": "why here", "depends_on": ["@1", "#55", "<item id>"]}`
             `"@1"` means the FIRST item of this submission — which is what lets a
             plan carry its own dependency graph without being written twice.
-        repo: the repo it belongs to. Omit for a fleet-wide plan; its items can
-            still name repos of their own.
+        repo: the scope it belongs to — `owner/name`, or a declared
+            "project:<name>" (see `plan_read`'s `scopes`). Omit for a fleet-wide
+            plan; its items can still name repos of their own. A `project:` scope
+            takes no `ref_kind`/`ref_value` on its items: there is no forge behind
+            it for an issue or a PR number to mean anything against.
         note: why this plan, in your words.
         claim: hold it on the way out (default true — you wrote it).
         ttl: seconds before that claim lapses. Omit for the board's default.

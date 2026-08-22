@@ -273,7 +273,8 @@ GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unatt
 
 # the plan: what is next, in what order, and who has it (v2.39; plans are rows in #172)
 GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
-                          -> {items:[…], plans:[…], next, order_trust, counts, truncated}
+                          -> {items:[…], plans:[…], scopes:[…], next, order_trust,
+                              counts, truncated}
                           `next` = the first item that is open, unclaimed, unblocked and
                           not `covered_by` somebody else's plan claim — carrying a
                           `caveat` whenever part of the order is merely the order things
@@ -288,7 +289,9 @@ GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
                           ?session= is your session id, so a plan held by a CO-TENANT on
                           your machine reads as somebody else's rather than as yours —
                           without it the answer can only be by machine, which is coarser
-                          and honest rather than wrong
+                          and honest rather than wrong; `scopes` lists the declared
+                          project scopes, so an agent learns they exist from the read it
+                          already makes rather than from a tool it has to know to call
 GET   /plans             ?repo=&exact=&include_closed=&session=
                           who is holding which plan, and how many open items each has —
                           the read to make BEFORE you start surveying a vague problem
@@ -326,6 +329,14 @@ POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE c
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
 POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← human-only
 POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
+GET   /plan/scopes       -> {scopes:[{scope, label, note, added_by, created}], sigil}
+                          the declared PROJECT scopes only. Repo scopes are not listed
+                          and should not be: a repo scope exists because a repository
+                          does, and enumerating them here would be a second register of
+                          something GitHub already holds
+POST  /plan/scope        { name, note? }  -> 201 {scope, created}      ← human-only
+                          declare a scope with no repo behind it. Idempotent: declaring
+                          one that exists returns it with created=false
 GET   /plan/view         (browser view — the plan, and where a human reorders it)
 
 # what order the RULES imply, beside the order in force (#232, deterministic half)
@@ -355,11 +366,14 @@ GET   /plan/order-proposal/{id}  -> one proposal with its per-item evidence
 GET   /health            (no auth)
 ```
 
-The two human-only endpoints authorise on the **edge identity** (Authelia's `Remote-User`),
+The human-only endpoints authorise on the **edge identity** (Authelia's `Remote-User`),
 not a bearer token, and refuse one with a 403. That is not belt-and-braces: every agent on a
 box authenticates with the same machine token, so nothing inside a request distinguishes a
 person from a process, and the plan's order is only shared intent while agents cannot rewrite
-it. Agents add items, claim them, record what they wait on, and complete them.
+it. Agents add items, claim them, record what they wait on, and complete them. `POST
+/plan/scope` is behind the same door for the same reason one level up: *which scopes exist*
+is a decision, and an agent able to mint one would eventually mint one by typo, splitting the
+plan into two lists nobody can see both halves of.
 
 `Remote-User` is a header any caller can send, so it is not the boundary on its own: the edge
 must also inject **`X-Edge-Auth: $HUMAN_EDGE_SECRET`**, and a request without it is not a
