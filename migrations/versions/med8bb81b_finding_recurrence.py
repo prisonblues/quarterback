@@ -82,11 +82,11 @@ property of a ROUND's relationship to the round before it, not a competency of
 the reviewer that happened to raise the finding, and a per-reviewer tally of it
 would be a leaderboard axis nobody has argued for.
 
-The revision number and the release number are unrelated counters: this is schema
-revision **0035**.
+The revision id is opaque and carries no ordering (#341): this is schema revision
+**med8bb81b**, and its place in the chain is `down_revision` and nothing else.
 
-Revision ID: 0035
-Revises: 0034
+Revision ID: med8bb81b
+Revises: mdee05a89
 Create Date: 2026-08-22
 
 """
@@ -99,8 +99,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0035"
-down_revision: str | None = "0034"
+revision: str = "med8bb81b"
+down_revision: str | None = "mdee05a89"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
