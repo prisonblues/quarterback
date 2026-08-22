@@ -792,12 +792,18 @@ async def test_two_writers_updating_one_row_do_not_lose_an_edit(client):
     assert o["revisions"] == 2
 
 
-async def test_the_defect_identity_survives_a_hash_in_a_repo_or_key(client):
+async def test_the_defect_identity_survives_a_hash_in_a_key(client):
     """The distinct-defect key is a row constructor, not a `#`-joined string.
-    `repo` and `finding_key` are both free text, so any separator can occur inside
-    a value and two different triples could concatenate to one — always
-    undercounting, and undetectably."""
-    repo = "acme/v237-hash#1"
+    `finding_key` is free text, so the separator can occur inside a value and two
+    different triples could concatenate to one — always undercounting, and
+    undetectably.
+
+    **The repo half of this is now closed one level further out** (#326): since
+    `POST /review` folds through `app.claimkey.canonical_repo`, a repo carrying a
+    `#` is refused rather than stored, and `test_a_repo_carrying_a_separator_is_
+    refused_outright` below pins that. The row constructor is still what makes
+    the count right, because the key half is free text and always will be."""
+    repo = "acme/v237-hash"
     for key in ("a#b", "a", "b"):
         r = await client.post("/review", json={
             "repo": repo, "pr": 2, "judged": True, "judge_model": "opus",
@@ -815,6 +821,22 @@ async def test_the_defect_identity_survives_a_hash_in_a_repo_or_key(client):
     # Three distinct defects, one of which carries the separator in its key.
     assert next(m for m in body["by_model"])["confirmed_defects"] == 3
     assert body["by_outcome"]["not_recorded"] == 3
+
+
+async def test_a_repo_carrying_a_separator_is_refused_outright(client):
+    """What replaced the repo half of the test above. `acme/v237-hash#1` is a run
+    on this board, written before the review endpoints checked the shape — a row
+    no caller can name in a query, in a table whose every read compares the column
+    with `==`. It is a 422 now, and the message says what shape is wanted (#326).
+    """
+    r = await client.post("/review", json={
+        "repo": "acme/v237-hash#1", "pr": 2, "judged": True, "judge_model": "opus",
+        "reviewers_selected": ["claude"],
+        "reviewers": {"claude": {"model": "opus", "ran": True}},
+        "to_fix": [], "dismissed": [], "sonar_findings": [],
+    }, headers=AGENT)
+    assert r.status_code == 422, r.text
+    assert "owner/name" in r.text
 
 
 async def test_outcomes_scored_is_published_beside_the_ratio(client):
