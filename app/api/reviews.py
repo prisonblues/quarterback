@@ -556,6 +556,52 @@ def _phrases(v: object) -> list[str]:
 #: what a finding nobody attributed carries. That one is NULL.
 PROVENANCE = ("introduced", "missed", "missed-unread", "unknown")
 
+#: The buckets ``panel_scope._recurrence`` sorts a new finding into (#67), spelled
+#: exactly as it spells them — the same shared-vocabulary rule ``PROVENANCE``
+#: follows above, and for the same reason (#65's class of drift).
+#:
+#: The question after provenance and a different one. Provenance asks whether the
+#: last fix pass WROTE the line a finding sits on; this asks whether that pass was
+#: SENT there — whether the fixes are making progress on the defect at all.
+#: ``revisited`` is the conjunction of three things (the previous round complained
+#: about this file, the fixer wrote in it, this finding is near what it wrote);
+#: ``fix-site`` is the fixer having worked here on something nobody complained
+#: about.
+#:
+#: A POSITION and not a verdict. Replayed over 36 rounds of this board's history
+#: the ``revisited`` rate runs at roughly 80% and separates the cycles #67 calls
+#: circling from the rest by almost nothing — a later round is reading the fix
+#: commit, so this is where its findings normally are. It is a denominator and a
+#: baseline; ``PREMISE_VERDICTS`` below is the half that can see a repeated
+#: premise.
+#:
+#: ``unknown`` is a real answer here for the reason it is one under PROVENANCE.
+#: The finding nobody asked about carries NULL.
+RECURRENCE = ("revisited", "fix-site", "elsewhere", "unknown")
+
+#: What the JUDGE may answer #67's sharper question with, per finding: does this
+#: finding invalidate the premise of the fix that preceded it, or is it a separate
+#: defect? Spelled as ``panel_core.PREMISE_VERDICTS`` spells it.
+#:
+#: ``unclear`` is load-bearing rather than a courtesy. Without it a judge with no
+#: view either way picks whichever of the other two reads as safer, and the
+#: measurement fills with confident noise on exactly the findings that most needed
+#: a shrug.
+#:
+#: Not #84's premise register, which is a FIXER's declaration about its own next
+#: pass. This is an adjudication, and #67's record of PR #88 — where the agent
+#: that wrote round 1's fix wrote round 2's regression of the same shape in the
+#: same commit as a docstring stating the invariant it broke — is the argument for
+#: keeping a self-report and an adjudication apart.
+PREMISE_VERDICTS = ("invalidates", "separate", "unclear")
+
+#: Every tally a run may carry, and the vocabulary its keys are read against. One
+#: table, so a validator, a drift report and a stored column cannot each hold
+#: their own idea of which words are legal.
+TALLIES = {"provenance_counts": PROVENANCE,
+           "recurrence_counts": RECURRENCE,
+           "premise_counts": (*PREMISE_VERDICTS, "not-said")}
+
 #: How much of an unrecognised bucket name is echoed back to the sender. Long
 #: enough to name the drift, short enough that a caller cannot use the response
 #: as a mirror for arbitrary text. A name cut to this length is echoed with a
@@ -732,8 +778,8 @@ MAX_REJECTIONS_LOGGED = 50
 _PG_UNIQUE_VIOLATION = "23505"
 
 
-def _bucket_or_none(v: object) -> str | None:
-    """One of :data:`PROVENANCE`, or nothing.
+def _bucket_or_none(v: object, vocab: tuple[str, ...] = PROVENANCE) -> str | None:
+    """One of ``vocab`` (:data:`PROVENANCE` by default), or nothing.
 
     The :meth:`ReviewIn._state` rule, one field over and for the same reason: a
     value a consumer *filters on* must never be stored verbatim when it is not
@@ -748,7 +794,54 @@ def _bucket_or_none(v: object) -> str | None:
     if not isinstance(v, str):
         return None
     s = v.strip().lower()
-    return s if s in PROVENANCE else None
+    return s if s in vocab else None
+
+
+def _tally_or_none(v: object, vocab: tuple[str, ...]) -> dict[str, int] | None:
+    """A run's per-bucket tally, coerced against ``vocab``, or None.
+
+    One implementation for all three tallies (:data:`TALLIES`). They were one
+    validator's worth of rules written for ``provenance_counts`` and every word of
+    it applies unchanged to #67's two, so a copy would be two more places for the
+    "{} is not None" distinction to be got wrong.
+
+    ``{}`` survives as ``{}`` **when the caller sent** ``{}`` — the panel's way of
+    saying the question does not arise, which a round 1 must stay
+    distinguishable by. A tally that arrived non-empty and lost every pair lands
+    on None instead: returning the emptied dict would manufacture that statement
+    out of a payload whose every answer was refused, and would also cost the run
+    its coverage marker, since ``{}`` is deliberately excluded from those filters.
+
+    A count that cannot be believed drops WITH its key rather than becoming 0.
+    This whole family of measurements is built on zero being a claim.
+    """
+    if not isinstance(v, Mapping):
+        return None
+    out: dict[str, int] = {}
+    for k, raw in v.items():
+        bucket = _bucket_or_none(k, vocab)
+        n = _count_or_none(raw)
+        if bucket is not None and n is not None:
+            out[bucket] = n
+    return out if out or not v else None
+
+
+def _tally_drift(v: object, vocab: tuple[str, ...]) -> tuple[list[str], list[str]]:
+    """``(keys this board has no bucket for, known keys whose count it cannot
+    believe)`` — the two drop paths :func:`_tally_or_none` takes, named so
+    :func:`record_review` can report them instead of dropping them in silence.
+
+    Echoed through :func:`_echo`, the same normalisation the per-finding echo
+    uses, because ``record_review`` merges the two into one set: ``_bucket_or_none``
+    strips before testing membership, so an unstripped echo would report
+    ``"  circlng  "`` and ``"circlng"`` as two separate drifts.
+    """
+    if not isinstance(v, Mapping):
+        return [], []
+    unknown = sorted({_echo(k) for k in v if _bucket_or_none(k, vocab) is None})
+    unusable = sorted({_echo(k) for k, n in v.items()
+                       if _bucket_or_none(k, vocab) is not None and _count_or_none(n) is None})
+    return unknown, unusable
 
 
 def _echo(v: object) -> str:
@@ -1019,6 +1112,27 @@ class FindingIn(BaseModel):
     #: truthiness, or a producer sending empty buckets would look like one asking
     #: nothing.
     provenance_sent: str | None = None
+    #: Is this finding standing where the last fix pass was working, on a
+    #: complaint that pass was sent to answer (#67)? One of :data:`RECURRENCE`.
+    #: None on the same three occasions ``provenance`` is None and for the same
+    #: reason — the question does not arise — which is not the ``"unknown"``
+    #: bucket, where it was asked and could not be placed.
+    recurrence: str | None = None
+    #: What was spelled when it was not a bucket this board knows. Set by the
+    #: validator, never by the sender: a bucket the panel has started sending and
+    #: the board silently ignores is #93 happening again.
+    recurrence_sent: str | None = None
+    #: WHICH earlier finding this one stands on, as that finding's ``finding_key``.
+    #: Dropped unless ``recurrence`` is ``revisited`` — the database says the same
+    #: thing in a CHECK, and this is the layer that keeps a producer's slip from
+    #: becoming a 500.
+    recurs_of: str | None = None
+    #: The judge's own answer to the sharper question. One of
+    #: :data:`PREMISE_VERDICTS`, or None where it was never asked — the commonest
+    #: case, and one the ``"unclear"`` bucket must not be allowed to absorb.
+    premise_verdict: str | None = None
+    #: The same drift echo, for the same reason.
+    premise_verdict_sent: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -1042,7 +1156,17 @@ class FindingIn(BaseModel):
         # `["missed"]`) used to leave nothing here at all, so a type-confused
         # producer read as a finding nobody asked about. See :func:`_echo`.
         raw = v.get("provenance")
-        return {**v, "provenance_sent": None if raw is None else _echo(raw)}
+        # #67's two counted fields ride the same validator rather than adding two
+        # more of these: the claim above ("set unconditionally, so a caller cannot
+        # supply it") has to hold for every echo on this model, and three
+        # validators each rewriting the same mapping is three chances for one of
+        # them to stop being reached.
+        got = v.get("recurrence")
+        said = v.get("premise_verdict")
+        return {**v,
+                "provenance_sent": None if raw is None else _echo(raw),
+                "recurrence_sent": None if got is None else _echo(got),
+                "premise_verdict_sent": None if said is None else _echo(said)}
 
     @model_validator(mode="before")
     @classmethod
@@ -1053,6 +1177,51 @@ class FindingIn(BaseModel):
     @classmethod
     def _provenance(cls, v: object) -> str | None:
         return _bucket_or_none(v)
+
+    @field_validator("recurrence", mode="before")
+    @classmethod
+    def _recurrence(cls, v: object) -> str | None:
+        return _bucket_or_none(v, RECURRENCE)
+
+    @field_validator("premise_verdict", mode="before")
+    @classmethod
+    def _premise_verdict(cls, v: object) -> str | None:
+        return _bucket_or_none(v, PREMISE_VERDICTS)
+
+    @field_validator("recurs_of", mode="before")
+    @classmethod
+    def _recurs_of(cls, v: object) -> str | None:
+        """A finding key, bounded, or nothing.
+
+        Not membership-tested — it is an identity minted by the panel, not a word
+        from a vocabulary — so the rule is the one every other free ref on this
+        module follows: trimmed, bounded by :data:`MAX_REF_CHARS`, and dropped
+        rather than coerced. It names a row on this board and is checked against
+        one at read time, never at write time: the finding it points at belongs to
+        an EARLIER run, and refusing a pointer whose target has not been ingested
+        yet would make ingest order decide what gets recorded.
+
+        Over the bound it is dropped, not truncated: a cut key matches no finding
+        and would sit in the column looking exactly like one that does.
+        """
+        got = _trimmed_or_none(v)
+        return got if got is not None and len(got) <= MAX_REF_CHARS else None
+
+    @model_validator(mode="after")
+    def _recurs_needs_a_circle(self) -> FindingIn:
+        """A pointer to the finding being circled means nothing under any other
+        bucket, and the database refuses it in a CHECK.
+
+        Dropped here rather than 422'd, on this model's standing trade: a
+        malformed field must never cost the run its findings. Silent, and
+        deliberately so — unlike the bucket echoes above, there is no drift to
+        report. The sender named a real vocabulary word and a real key; it is the
+        COMBINATION that says nothing, and a producer emitting it is not diverging
+        from a vocabulary this board could grow into.
+        """
+        if self.recurrence != "revisited":
+            self.recurs_of = None
+        return self
 
     @field_validator("needs_human_class", mode="before")
     @classmethod
@@ -1423,6 +1592,14 @@ class ReviewIn(BaseModel):
     #: A tally that arrived non-empty and lost every pair to coercion lands on
     #: NULL, not ``{}`` — see :meth:`_prov_counts`.
     provenance_counts: dict[str, int] | None = None
+    #: #67's two tallies, on exactly the terms above — absent / ``{}`` / all-zero
+    #: are three different statements and none of them may collapse into another.
+    #: ``recurrence_counts`` is what the panel measured; ``premise_counts`` is what
+    #: the judge said, and it carries a ``not-said`` bucket because the judge
+    #: having nothing to say is the commonest answer and the one a shortfall
+    #: against some other denominator would silently invent.
+    recurrence_counts: dict[str, int] | None = None
+    premise_counts: dict[str, int] | None = None
     #: Set by the validators, never by the caller: what was trimmed, what could
     #: not be read, and which bucket names this board did not recognise. All of it
     #: reported in the response, none of it storable by the sender.
@@ -1449,6 +1626,16 @@ class ReviewIn(BaseModel):
     #: was the silent one: the release's rule is that a dropped field says so, and
     #: it was being applied to unknown NAMES only.
     provenance_counts_unusable: list[str] = Field(default_factory=list)
+    #: The same two drop paths for #67's two tallies. Their own fields rather than
+    #: one merged list: a producer misspelling a recurrence bucket and one
+    #: misspelling a provenance bucket have different bugs, and a reader told only
+    #: that *a* bucket was refused has to guess which tally to go and look at —
+    #: the argument ``base_sha_dropped`` already makes for not folding the commit
+    #: ids together.
+    recurrence_counts_unknown: list[str] = Field(default_factory=list)
+    recurrence_counts_unusable: list[str] = Field(default_factory=list)
+    premise_counts_unknown: list[str] = Field(default_factory=list)
+    premise_counts_unusable: list[str] = Field(default_factory=list)
     #: Fields whose VALUE was not a shape this board can read at all —
     #: ``unread_files: 42``, ``provenance_counts: ["introduced"]``. The coarsest
     #: drop of the lot and the last one still silent: the per-entry signals above
@@ -1511,6 +1698,10 @@ class ReviewIn(BaseModel):
             return v
         files, unread = v.get("changed_files"), v.get("unread_files")
         counts = v.get("provenance_counts")
+        recurs, premise = v.get("recurrence_counts"), v.get("premise_counts")
+        recurs_unknown, recurs_unusable = _tally_drift(recurs, RECURRENCE)
+        premise_unknown, premise_unusable = _tally_drift(
+            premise, TALLIES["premise_counts"])
         _, unusable = _unread_paths(unread)
         head = v.get("head_sha")
         merge_base, base_sha = v.get("merge_base"), v.get("base_sha")
@@ -1559,10 +1750,20 @@ class ReviewIn(BaseModel):
                 # `provenance_counts: ["introduced"]` went to NULL with nothing
                 # said — a wrong-typed producer reading exactly like one that sent
                 # nothing, which is #93's own failure mode.
+                "recurrence_counts_unknown": recurs_unknown,
+                "recurrence_counts_unusable": recurs_unusable,
+                "premise_counts_unknown": premise_unknown,
+                "premise_counts_unusable": premise_unusable,
                 "unreadable_fields": sorted(
                     name for name, val, ok in (
                         ("unread_files", unread, isinstance(unread, (str, list))),
                         ("provenance_counts", counts, isinstance(counts, Mapping)),
+                        # #67's two, on the same rule: `recurrence_counts:
+                        # ["revisited"]` is a producer sending the wrong SHAPE, and
+                        # it would otherwise land on NULL indistinguishable from a
+                        # producer that sent nothing at all.
+                        ("recurrence_counts", recurs, isinstance(recurs, Mapping)),
+                        ("premise_counts", premise, isinstance(premise, Mapping)),
                     ) if val is not None and not ok)}
 
     @field_validator("repo")
@@ -1622,15 +1823,23 @@ class ReviewIn(BaseModel):
         real sends that shape and inventing a merge rule for it would be picking
         a number nobody stated.
         """
-        if not isinstance(v, Mapping):
-            return None
-        out = {}
-        for k, raw in v.items():
-            bucket = _bucket_or_none(k)
-            n = _count_or_none(raw)
-            if bucket is not None and n is not None:
-                out[bucket] = n
-        return out if out or not v else None
+        return _tally_or_none(v, PROVENANCE)
+
+    @field_validator("recurrence_counts", mode="before")
+    @classmethod
+    def _recurrence_counts(cls, v: object) -> dict[str, int] | None:
+        """#67's mechanical tally, by the rule directly above — see
+        :func:`_tally_or_none`, which both of these and ``provenance_counts`` now
+        share."""
+        return _tally_or_none(v, RECURRENCE)
+
+    @field_validator("premise_counts", mode="before")
+    @classmethod
+    def _premise_counts(cls, v: object) -> dict[str, int] | None:
+        """The judge's tally, same rule, over a vocabulary with one extra word:
+        ``not-said`` is a bucket here and not an absence, because "the judge was
+        asked and had nothing to say" is a measurement and the commonest one."""
+        return _tally_or_none(v, TALLIES["premise_counts"])
 
     @field_validator("changed_files", mode="before")
     @classmethod
@@ -2114,6 +2323,8 @@ async def record_review(
         # carries a fact — "the question does not arise" — that no derivation
         # from findings could express.
         provenance_counts=body.provenance_counts,
+        recurrence_counts=body.recurrence_counts,
+        premise_counts=body.premise_counts,
         changed_lines=body.changed_lines,
         # Stored AS SENT rather than backfilled from len(changed_files). A caller
         # that sends the paths and not the count leaves this NULL, and NULL there
@@ -2242,6 +2453,9 @@ async def record_review(
                 # The irreplaceable one: per finding, so nothing the board keeps
                 # could reconstruct it after the fact.
                 provenance=p.f.provenance,
+                recurrence=p.f.recurrence,
+                recurs_of=p.f.recurs_of,
+                premise_verdict=p.f.premise_verdict,
             ),
             p.reports,
         )
@@ -2363,6 +2577,29 @@ async def record_review(
         if len(body.provenance_counts_unusable) > MAX_UNKNOWN_BUCKETS:
             dropped["provenance_counts_unusable_total"] = len(
                 body.provenance_counts_unusable)
+    # #67's two vocabularies, reported by exactly the rules above and through one
+    # loop rather than two more copies of them. Their own response keys, because a
+    # producer misspelling a recurrence bucket and one misspelling a provenance
+    # bucket have different bugs, and a reader told only that *a* bucket was
+    # refused has to guess which field to go and look at.
+    for name, sent, tally_unknown, tally_unusable in (
+            ("recurrence",
+             [p.f.recurrence_sent for p in findings
+              if p.f.recurrence is None and p.f.recurrence_sent is not None],
+             body.recurrence_counts_unknown, body.recurrence_counts_unusable),
+            ("premise_verdict",
+             [p.f.premise_verdict_sent for p in findings
+              if p.f.premise_verdict is None and p.f.premise_verdict_sent is not None],
+             body.premise_counts_unknown, body.premise_counts_unusable)):
+        names = sorted(set(sent) | set(tally_unknown))
+        if names:
+            dropped[f"{name}_unknown"] = names[:MAX_UNKNOWN_BUCKETS]
+            if len(names) > MAX_UNKNOWN_BUCKETS:
+                dropped[f"{name}_unknown_total"] = len(names)
+        if tally_unusable:
+            dropped[f"{name}_counts_unusable"] = tally_unusable[:MAX_UNKNOWN_BUCKETS]
+            if len(tally_unusable) > MAX_UNKNOWN_BUCKETS:
+                dropped[f"{name}_counts_unusable_total"] = len(tally_unusable)
     # Every needs_human class this board did not recognise, from the findings and
     # from their reporters' own declarations. Named rather than swallowed, for the
     # reason `provenance_unknown` beside it is: a misspelt class would otherwise
@@ -3065,6 +3302,8 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # round's own statement about its attribution and the thing a reader needs
         # beside every per-finding bucket.
         "provenance_counts": r.provenance_counts,
+        "recurrence_counts": r.recurrence_counts,
+        "premise_counts": r.premise_counts,
         "changed_lines": r.changed_lines,
         # The count only — the paths themselves are per-run children and would
         # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
@@ -3280,6 +3519,15 @@ def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport],
         # caused it. null = the question does not arise (round 1, outside a cycle,
         # or a repeat) and is NOT the `"unknown"` bucket.
         "provenance": f.provenance,
+        # #67's third question over the same comparison: not "did the fix write
+        # this line" but "was the fixer SENT here". `recurs_of` names the earlier
+        # finding under `revisited` and is what makes the bucket checkable;
+        # `premise_verdict` is the judge's own answer to the sharper question, kept
+        # beside the mechanical one rather than folded into it, because the rows
+        # where the two disagree are the ones worth reading.
+        "recurrence": f.recurrence,
+        "recurs_of": f.recurs_of,
+        "premise_verdict": f.premise_verdict,
         # What happened to the DEFECT afterwards (v2.37), null where nobody has
         # said yet. It is deliberately the same object on every observation of one
         # defect: the outcome is a fact about the defect, not about the round that
@@ -4100,6 +4348,48 @@ async def review_stats(
         key = "not_attributed" if bucket is None else str(bucket)
         by_provenance[key] = by_provenance.get(key, 0) + int(n or 0)
 
+    # #67's two splits over the same window and the same population, by the rule
+    # `by_provenance` directly above: the whole vocabulary zeroed first, and the
+    # NULLs under a name that cannot be mistaken for a bucket.
+    #
+    # Two queries rather than one grouped pair, because the useful reading is each
+    # against the same denominator rather than their cross-product: a run where the
+    # mechanical count and the judge disagree is interesting, and a 4x5 grid of
+    # combinations is how that stops being legible.
+    recurrence_rows = (
+        await session.execute(
+            select(ReviewFinding.recurrence, func.count(ReviewFinding.id))
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .where(*filters, ReviewFinding.verdict == "confirmed")
+            .group_by(ReviewFinding.recurrence)
+        )
+    ).all()
+    by_recurrence = dict.fromkeys(RECURRENCE, 0)
+    # Every finding the question never reached — a round 1, a run outside a cycle,
+    # a repeat, and everything recorded before this column existed. NOT the
+    # `unknown` bucket, which was asked and could not be placed.
+    by_recurrence["not_measured"] = 0
+    for bucket, n in recurrence_rows:
+        key = "not_measured" if bucket is None else str(bucket)
+        by_recurrence[key] = by_recurrence.get(key, 0) + int(n or 0)
+
+    premise_rows = (
+        await session.execute(
+            select(ReviewFinding.premise_verdict, func.count(ReviewFinding.id))
+            .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+            .where(*filters, ReviewFinding.verdict == "confirmed")
+            .group_by(ReviewFinding.premise_verdict)
+        )
+    ).all()
+    by_premise = dict.fromkeys(PREMISE_VERDICTS, 0)
+    # The judge was never asked, or was asked and said nothing. Distinct from
+    # `unclear`, which is the judge looking and being unable to tell — the
+    # distinction the whole vocabulary exists to keep.
+    by_premise["not_asked"] = 0
+    for verdict, n in premise_rows:
+        key = "not_asked" if verdict is None else str(verdict)
+        by_premise[key] = by_premise.get(key, 0) + int(n or 0)
+
     # The same after-the-fact split at the window's grain: how much of what this
     # loop confirmed turned out to be real. Counted per DEFECT, once, rather than
     # once per member that raised it — a sum across `by_model` double-counts every
@@ -4159,6 +4449,12 @@ async def review_stats(
         # of the same cycle is another row, carrying NULL provenance, so repeats
         # land in `not_attributed`. See the docstring.
         "by_provenance": by_provenance,
+        # #67, and read the two together rather than either alone: `by_recurrence`
+        # is mechanical and `by_premise` is adjudicated, and neither gates
+        # anything. Nothing here is calibrated — the issue asks for the instrument
+        # first and a few dozen cycles of it is what a rule would be fitted to.
+        "by_recurrence": by_recurrence,
+        "by_premise": by_premise,
         # What became of this window's confirmed findings once somebody acted on
         # them, per DEFECT — `fixed` and `refuted` are the judgement about whether
         # the finding was right, `deferred` and `superseded` are decisions about
@@ -4635,6 +4931,8 @@ async def pr_finding_history(
              "merge_base": r.merge_base,
              "base_sha": r.base_sha,
              "provenance_counts": r.provenance_counts,
+             "recurrence_counts": r.recurrence_counts,
+             "premise_counts": r.premise_counts,
              "unread_files_count": unread_counts[r.id],
              "confirmed": r.n_confirmed, "dismissed": r.n_dismissed,
              "unjudged": r.n_unjudged, "sonar": r.n_sonar,

@@ -536,6 +536,90 @@ Report all of them.
 #: else in the prompt can produce is inert until it is deliberately swapped.
 JUDGE_CODE_SLOT = "<<<CODE_ACCESS_BRIEF>>>"
 
+#: The judge prompt's placeholder for #67's recurrence question. A second literal
+#: token, for the reason :data:`JUDGE_CODE_SLOT` is one, and swapped for the empty
+#: string on every round that has no earlier round to compare against — so a round
+#: 1 judge prompt stays BYTE-IDENTICAL to the one it has always been. That is the
+#: same discipline `PR_SCOPE_HEADER` keeps for whole-PR scope, and it exists so a
+#: comparison between rounds is not also a comparison between two prompts.
+JUDGE_RECURRENCE_SLOT = "<<<RECURRENCE_BRIEF>>>"
+
+#: What the judge may answer #67's question with, per finding. NULL — the field
+#: absent — is the fourth state and the commonest: the question was not put,
+#: because there was no earlier round to put it about.
+#:
+#: **Not #84's premise register**, which is the other thing called a premise in
+#: this loop and is nearly its opposite. That one holds what a FIXER declared it
+#: was about to fix on, and brakes when the same declaration comes round twice.
+#: This is what a JUDGE says about a finding, and brakes nothing. #67's own record
+#: of PR #88 is the argument for having both: the agent that wrote round 1's fix
+#: wrote round 2's regression of the same shape, in the same commit as a docstring
+#: stating the invariant it broke — "the strongest argument yet that the signal
+#: cannot be self-reported". A declaration and an adjudication are two different
+#: witnesses and the disagreement between them is the interesting row.
+#:
+#: ``unclear`` is a real answer and the one this must keep making available.
+#: Without it a judge with no view either way picks whichever of the other two
+#: reads as safer, and the measurement fills up with confident noise on exactly
+#: the findings that most needed a shrug.
+PREMISE_VERDICTS = ("invalidates", "separate", "unclear")
+
+#: What a judge is told when there IS an earlier round, and what it is asked on
+#: top of its ordinary ruling.
+#:
+#: One extra key on a verdict it is already writing, so this costs no second model
+#: call — the same trade `coverage_note` made. It is asked of the judge rather
+#: than computed because the mechanical half cannot answer it: `_recurrence` can
+#: see that a fixer was working where a finding now stands, and cannot see whether
+#: the finding says that fixer's ASSUMPTION was wrong. That distinction is #67's
+#: whole point, and the judge is the only party in the round already holding both
+#: the earlier round's complaints and the commit that answered them.
+#:
+#: **It is the half of #67 that can actually work**, and the measurement says so
+#: rather than the design claiming it. :func:`panel_scope._recurrence`'s replay
+#: over 36 rounds of this board's history found the mechanical site test firing on
+#: about four new findings in five, at the same rate on the cycles #67 calls
+#: circling as on the ones it does not — because a round past the first is reading
+#: the fix commit, so "at the fix's site" is the ordinary case. Position saturates;
+#: only something that can see what a finding SAYS can separate one premise
+#: patched twice from two bugs in a busy file. That is this.
+#:
+#: The brief spends most of its length pushing AWAY from `invalidates`, and that
+#: is deliberate. The failure that would make this worthless is a judge that reads
+#: "was the last fix wrong?" as an invitation and says yes; a second bug in a busy
+#: file is the common case and `separate` is the answer that should be dull to
+#: give. #67's own limit — recurrence is not always circling — is the sentence
+#: this brief exists to enforce.
+RECURRENCE_BRIEF = """ONE EXTRA QUESTION, and it is not about the diff (#67).
+
+A fixer worked on this PR between the previous round and this one. The findings that
+round asked it to fix are listed below. For each verdict you return, add one more key:
+
+  "premise": "invalidates" | "separate" | "unclear"
+
+The question is NOT "is this finding near that fix". It is:
+
+  Does this finding show that the fix which preceded it was built on a WRONG ASSUMPTION —
+  so that patching where this finding points would keep that assumption standing — or is it
+  simply a different defect?
+
+- "separate" — a different defect. THIS IS THE DEFAULT AND THE COMMON CASE. A second bug in
+  a file somebody just edited is a second bug. Busy code attracts findings. Say "separate"
+  unless you can name the assumption.
+- "invalidates" — you can state, in your `reason`, the assumption the earlier fix rests on
+  and the sentence in this finding that contradicts it. If you cannot name both, it is not
+  this.
+- "unclear" — you cannot tell from what you were given. A real answer, and the right one
+  whenever you would otherwise be guessing.
+
+Nothing is decided by your answer. It is recorded and counted, no round is stopped by it,
+and no fix is skipped because of it — so there is no reason to hedge toward either side.
+Leave the key off entirely if there is nothing to say.
+
+Findings the previous round ({prior_round}) asked the fixer to fix:
+{prior_findings}
+"""
+
 #: What a seat that was handed the PR's tree is told about it. Empty for every seat
 #: that was not — see SEAT_READS_CODE — so those seats' prompts are unchanged.
 #:
@@ -627,6 +711,7 @@ Coverage declared by the reviewers:
 {coverage}
 {ci}
 <<<CODE_ACCESS_BRIEF>>>
+<<<RECURRENCE_BRIEF>>>
 {diff}
 """
 
@@ -1634,6 +1719,25 @@ def _member_ids(raw) -> list[int]:
     return out
 
 
+def _premise_verdict(raw) -> str:
+    """The judge's answer to #67's recurrence question, or ``""`` for no answer.
+
+    Membership-tested against :data:`PREMISE_VERDICTS` rather than pattern-matched, the
+    same rule the board's ingest applies to a provenance bucket one process over
+    (#65's class of drift): a value a consumer COUNTS must never be stored when it
+    is not one of the values that consumer knows. A judge that answers
+    "invalidates the premise" or "probably separate" has said something this
+    cannot count, so it counts nothing rather than counting it as the word it
+    starts with.
+
+    Absent is the ordinary case and is not a failure. The brief explicitly tells
+    the judge to leave the key off when it has nothing to say, and every round
+    with no earlier round never carries the brief at all.
+    """
+    said = raw.strip().lower() if isinstance(raw, str) else ""
+    return said if said in PREMISE_VERDICTS else ""
+
+
 def _ruling(raw) -> str:
     """The judge's verdict on one issue, from its ``real`` flag.
 
@@ -2189,6 +2293,8 @@ __all__ = [
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
+    "JUDGE_RECURRENCE_SLOT", "PREMISE_VERDICTS", "RECURRENCE_BRIEF",
+    "_premise_verdict",
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
