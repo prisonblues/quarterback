@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""qb-end — end a session on the board: hand back its claims and its lease, and say why.
+
+  qb-end 24e8ee23-...                        it finished
+  qb-end "$sid" --reason killed              something closed it
+  qb-end "$sid" --reason context_reset       /clear: the pane lives on, this conversation does not
+
+  0  recorded  — the board has the ending (including "it had already ended")
+  1  refused   — the board decided against it: another machine's session, or a reason it will not take
+  2  unknown   — cannot tell: no board configured, no token, an outage
+
+**The verb the fleet did not have.** There were three ways to start a session here
+and not one to end one, so the only thing that ever released a finished agent's
+claims was the TTL. That is a floor, not a report: an expired lease says *nobody
+renewed*, which is the identical row whether the work landed, the pane was closed,
+or the agent is thinking hard (#252). #263 is the sharper half — a seat whose
+context was reset kept every claim the previous conversation took, renewing them
+from a conversation with no memory of taking them, where passive expiry could
+never reach them because nothing had died.
+
+**It records; it does not operate.** Nothing here signals a process or closes a
+pane. Whatever stopped the session is what calls this — `qb-hook` on SessionEnd,
+`qb-seat-click` before it kills a pane. The board still only coordinates, and the
+machine is operated by something that lives on the machine.
+
+**1 and 2 are different exits for the reason `qb-claim` gives.** A refusal is
+permanent and a caller should stop; an outage is a thing you wait out. This is
+called from a hook and from a button, and neither may treat a board outage as a
+reason to abandon what it was doing — so both of them ignore the code and it is
+here for a human and for the tests.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client  # noqa: E402
+
+RECORDED, REFUSED, UNKNOWN = 0, 1, 2
+
+#: Why a session stopped. The board's vocabulary (`app/api/leases.py`), restated
+#: here only so `--help` and a bad `--reason` can name the choices without a round
+#: trip; the board is what enforces it, and it answers 422 for anything else.
+REASONS = ("finished", "killed", "timed_out", "context_reset", "superseded")
+
+#: HTTP answers where the board DECIDED rather than being unavailable, and what to
+#: say about each. Same split as `qb-claim`'s: retrying is the remedy for an outage
+#: and no remedy at all for either of these.
+DEFINITE = {
+    403: "that session is leased by another machine — a session is ended by the "
+         "box it runs on, or by whatever is closing it there",
+    422: f"the board would not take that reason (it accepts: {', '.join(REASONS)})",
+}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-end", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session", nargs="?", default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                    help="the session key — its Claude Code session id "
+                         "(default: $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--reason", default="finished", choices=REASONS,
+                    help="why it stopped (default: finished)")
+    ap.add_argument("--json", action="store_true",
+                    help="print the board's whole answer on stdout")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    if not args.session:
+        # Not an argparse `required`: the default comes from the environment, so
+        # the failure a caller actually hits is "there was no session id anywhere",
+        # and saying that is more use than "the following arguments are required".
+        say("unknown: no session given and $CLAUDE_CODE_SESSION_ID is unset — "
+            "there is nothing to end")
+        return UNKNOWN
+
+    try:
+        client, _cfg = board_client()
+    except Exception as e:                                        # noqa: BLE001
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    try:
+        answer = client.post("/session/end",
+                             {"session": args.session, "reason": args.reason})
+    except urllib.error.HTTPError as e:
+        detail = _detail(e)
+        if e.code in DEFINITE:
+            say(f"refused: HTTP {e.code} — {DEFINITE[e.code]}")
+            say(f"  the board said: {_message(detail)}")
+            return REFUSED
+        say(f"unknown: the board answered HTTP {e.code} — {_message(detail)}")
+        return UNKNOWN
+    except Exception as e:                                        # noqa: BLE001
+        # Broad on purpose, and it reports rather than shrugs: an outage, an
+        # unresolvable token command and a TLS failure are all "cannot tell".
+        say(f"unknown: could not reach the board — {e.__class__.__name__}: {e}")
+        return UNKNOWN
+
+    claims = answer.get("released_claims") or []
+    if answer.get("ended"):
+        say(f"ended: {args.session} — {args.reason}, "
+            f"{len(claims)} claim(s) handed back")
+    else:
+        # Not a failure. Two callers race here by design — a hook and a human on
+        # the ✕ — and the second must not read as broken because the first won.
+        say(f"already: {args.session} was {answer.get('lease_was') or 'not held'}"
+            f"{f', {len(claims)} claim(s) handed back' if claims else ''}")
+    for claim in claims:
+        say(f"  released {claim.get('kind')}/{claim.get('key')}")
+    if answer.get("refused_claims"):
+        say(f"  {len(answer['refused_claims'])} claim(s) stamped with this session "
+            f"are held by another machine and were left alone")
+    if args.json and not args.quiet:
+        print(json.dumps(answer, indent=2))
+    return RECORDED
+
+
+def _detail(e: urllib.error.HTTPError):
+    """The board's own error body, or None. Never raises — this runs on the way
+    out of a failure and must not become a second one."""
+    try:
+        return json.loads(e.read().decode()).get("detail")
+    except Exception:                                             # noqa: BLE001
+        return None
+
+
+def _message(detail) -> str:
+    if isinstance(detail, dict):
+        return str(detail.get("error") or detail)
+    return str(detail) if detail else "no detail"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

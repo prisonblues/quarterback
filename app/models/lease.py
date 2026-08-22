@@ -45,6 +45,19 @@ class Lease(Base):
     #: asserting something about a holder that stopped talking to it.
     state: Mapped[str | None] = mapped_column(Text)
     state_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: WHY this session stopped, when something reported it: ``finished``,
+    #: ``killed``, ``timed_out``, ``context_reset``, ``superseded``. The
+    #: vocabulary lives at the edge (:data:`app.api.leases.END_REASONS`), not in
+    #: a CHECK constraint, for the reason ``state`` gives above.
+    #:
+    #: NULL is not "we don't know why" — it is a lease nothing ever ended. That
+    #: is the distinction the column exists for. ``released_at`` set with no
+    #: reason is a handoff or a plain release; ``released_at`` NULL with
+    #: ``expires_at`` in the past is a lease that merely LAPSED, which says
+    #: nobody renewed and says nothing about whether the work finished or the
+    #: agent died. Before this column those three read identically off the board,
+    #: which is why a finished session and a slow one looked alike.
+    end_reason: Mapped[str | None] = mapped_column(Text)
     ttl_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False)
     acquired_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

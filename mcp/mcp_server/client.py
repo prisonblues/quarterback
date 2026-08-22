@@ -228,6 +228,13 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def end_session(self, session: str, reason: str) -> dict:
+        """End a session: release its lease and its claims, saying why (#277)."""
+        resp = self._http.post(self._url("/session/end"),
+                               json={"session": session, "reason": reason})
+        resp.raise_for_status()
+        return resp.json()
+
     # -- resource claims + release allocation (v2.31) -------------------
 
     def claim(self, body: dict) -> dict:

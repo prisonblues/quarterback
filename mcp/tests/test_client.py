@@ -118,6 +118,16 @@ def test_health_asks_for_a_shorter_timeout_than_the_rest():
     assert handler.last.extensions["timeout"]["read"] == 10.0
 
 
+def test_ending_a_session_names_it_and_says_why():
+    """`POST /session/end` — the stop verb (#277). Both fields go in the body and
+    neither is optional here: a session ended without a reason is the state the
+    field exists to remove, and the board refuses one anyway."""
+    handler = Recorder()
+    make_client(handler).end_session("sid-1", "killed")
+    assert handler.last.url.path == "/session/end"
+    assert json.loads(handler.last.content) == {"session": "sid-1", "reason": "killed"}
+
+
 # -- errors ------------------------------------------------------------
 
 
