@@ -117,6 +117,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 # older board from a broken one.
 from harness_rules import (  # noqa: E402
     BOARD_TIMEOUT, RepoNotFound, board_config, ci_report, describe, resolve_repo,
+    ssl_context,
 )
 # #278's reading lives in `panel_scope` because that is where the review target is
 # decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
@@ -128,6 +129,10 @@ from panel_scope import (  # noqa: E402
     DEFAULT_DISTANT_MERGE_LINES, Integration, merge_involvement,
 )
 from panel_seats import distant_merge_lines  # noqa: E402
+# #274's one door. Imported rather than a `board_request(… "post" …)` written
+# here, so that when #328's blocker row becomes the store there is one function
+# to repoint and not one per producer.
+from needs_human import announce, digest  # noqa: E402
 
 READY, RECONCILE, HOLD = "READY", "RECONCILE", "HOLD"
 
@@ -259,11 +264,33 @@ class Check:
     warnings: list[str] = field(default_factory=list)
     actions: list[Action] = field(default_factory=list)
     detail: dict = field(default_factory=dict)
+    #: The subset of `reasons` that only a PERSON can clear, each with #279's
+    #: class: `[{"class": …, "reason": …}]`. Recorded beside `reasons` rather
+    #: than derived from them afterwards, because the check that wrote the
+    #: sentence is the only party that knows which kind of remedy it named — a
+    #: classifier reading the prose back would be a second opinion about a
+    #: judgement already made, and would go wrong on exactly the sentences that
+    #: mention a person while describing mechanical work.
+    human: list[dict] = field(default_factory=list)
+
+    def hold_for_human(self, cls: str, reason: str) -> None:
+        """Append a reason AND record that it is a person's to clear.
+
+        Most HOLDs are not this. A checkout at the wrong commit, a PR missing
+        from the landing queue, another agent's merge claim — all clear
+        themselves or clear with a command, and announcing them would turn the
+        board into a CI log, which is the one failure #274 names as worse than
+        silence. So this is called deliberately, at the seven sites where the
+        sentence's own remedy is a person, and `reasons.append` stays the
+        default everywhere else."""
+        self.reasons.append(reason)
+        self.human.append({"class": cls, "reason": reason})
 
     def as_dict(self) -> dict:
         return {"status": self.status, "summary": self.summary,
                 "reasons": self.reasons, "warnings": self.warnings,
                 "actions": [a.as_dict() for a in self.actions],
+                "needs_human": self.human,
                 "detail": self.detail}
 
 
@@ -315,7 +342,8 @@ def board_request(path: str, params: dict) -> tuple[object, str, int | None]:
     full = f"{url}/{path.lstrip('/')}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=BOARD_TIMEOUT,
+                                    context=ssl_context()) as r:
             return json.loads(r.read().decode()), "", r.status
     except urllib.error.HTTPError as e:
         # Before URLError: it is a subclass, and an HTTP status says far more
@@ -383,7 +411,11 @@ def check_pr_state(pr: dict) -> Check:
         c.reasons.append("the PR is a draft; mark it ready for review first")
     mergeable, said = mergeability(pr)
     if mergeable == "CONFLICTING":
-        c.reasons.append(said)
+        # The only pr_state objection a person has to clear. A closed PR ends the
+        # run and a draft is one `gh pr ready` away; a conflict is somebody
+        # choosing which side of two edits survives, which is the definition of
+        # a judgement no diff can settle.
+        c.hold_for_human("decision", said)
     elif said:
         c.warnings.append(said)
     c.detail = {"state": pr["state"], "draft": bool(pr.get("isDraft")),
@@ -462,6 +494,29 @@ CI_REFUSALS = {
                "defect this check exists to prevent",
 }
 
+#: Which CI refusals only a PERSON can clear, and what kind of judgement each
+#: needs (#274, using #279's vocabulary). Beside :data:`CI_REFUSALS` rather than
+#: inside it, because a state's sentence and whether it is anybody's to answer
+#: are two facts and only one of them is printed.
+#:
+#: `red` and `pending` are absent deliberately: a failing build is work an agent
+#: does and a pending one clears itself, so announcing either would put a CI log
+#: on somebody's queue — the failure #274 names as worse than the silence it
+#: replaces. The three that ARE here each name a person in their own text.
+CI_HUMAN_CLASSES = {
+    # A workflow behind GitHub's approval gate will never execute until somebody
+    # presses the button. Nothing an agent does moves it.
+    "blocked": "decision",
+    # "Does this repo have CI, or did the workflow fail to trigger?" is a
+    # question about the repository that only its owner can settle, and the
+    # sentence asks for it to be settled in writing.
+    "none": "decision",
+    # Not `decision`: nobody has anything to decide. The lookup failed, which is
+    # a fact about this box's ability to read GitHub — #279's `environment`, and
+    # the same call the unreadable-board reasons make.
+    "unknown": "environment",
+}
+
 
 def check_ci(pr: dict, repo: str = "") -> Check:
     """Green, and green NOW.
@@ -490,7 +545,9 @@ def check_ci(pr: dict, repo: str = "") -> Check:
     if report.blocking:
         why = CI_REFUSALS.get(report.state,
                               f"CI reports {report.state!r}, which is not green")
-        c.reasons.append(why + (f" ({report.reason})" if report.reason else ""))
+        said = why + (f" ({report.reason})" if report.reason else "")
+        cls = CI_HUMAN_CLASSES.get(report.state, "")
+        c.hold_for_human(cls, said) if cls else c.reasons.append(said)
     c.status = "failed" if c.reasons else "passed"
     return c
 
@@ -655,7 +712,8 @@ def check_review(repo: str, pr: dict, earned_stop: bool = False,
     rows, err = board_get("reviews", {"repo": repo, "pr": pr["number"], "limit": 20})
     if err:
         c.status, c.summary = "error", "review state unreadable"
-        c.reasons.append(f"{err}. Cannot tell whether this PR was reviewed, and "
+        c.hold_for_human("environment",
+                         f"{err}. Cannot tell whether this PR was reviewed, and "
                          "absent must not read as clean. Turn this check off "
                          'deliberately with `"preland": {"disabled_checks": '
                          '["review"]}` in .harness-rules if this repo is not '
@@ -815,7 +873,8 @@ def check_merge_claim(repo: str, pr: dict, mine: str) -> Check:
     body, err = board_get("claims", {"kind": "merge", "key": key})
     if err:
         c = Check("merge_claim", "error", "claims unreadable")
-        c.reasons.append(f"{err}. Cannot tell whether another agent is landing "
+        c.hold_for_human("environment",
+                         f"{err}. Cannot tell whether another agent is landing "
                          f"{key!r}")
         return c
     claims = body.get("claims") if isinstance(body, dict) else None
@@ -989,7 +1048,8 @@ def check_queue(repo: str, pr: dict) -> Check:
         return _queue_absent(base)
     if err:
         c = Check("queue", "error", "the queue is unreadable")
-        c.reasons.append(
+        c.hold_for_human(
+            "environment",
             f"{err}. Cannot tell whether another PR is ahead of this one in the "
             f"line to land on {base!r}, and absent must not read as clean. Turn "
             'this check off deliberately with `"preland": {"disabled_checks": '
@@ -1031,7 +1091,8 @@ def _queue_absent(base: str) -> Check:
         return Check("queue", "skipped-absent",
                      f"this board has no landing queue (no /{QUEUE_PATH})")
     c = Check("queue", "error", "the queue is unreadable")
-    c.reasons.append(
+    c.hold_for_human(
+        "environment",
         f"the board answered 404 for /{QUEUE_PATH}, and /claims — which has existed "
         f"far longer — came back with: {err}. So this is not a board that merely "
         "predates the queue, and nothing here can tell whether another PR is ahead "
@@ -1166,7 +1227,8 @@ def _migration_plan(plan: dict, base: BaseRef, code: int) -> Check:
             "generate the merge migration, then re-run preland to re-verify one head"))
         return c
     c.status = "failed"
-    c.reasons.append(
+    c.hold_for_human(
+        "decision",
         (f"the reconciler says STOP: {plan.get('reason')}" if action == "stop"
          else f"the reconciler returned an action this check does not know ({action!r})")
         + f" — {base.name} must be reconciled first, and that is not this PR's job")
@@ -1275,7 +1337,8 @@ def check_sw_version(root: str, base: BaseRef) -> Check:
                                 "the fix is not committed for you"))
         return c
     c.status = "failed"
-    c.reasons.append(f"{script} exited {proc.returncode} and this is not the "
+    c.hold_for_human("decision",
+                     f"{script} exited {proc.returncode} and this is not the "
                      f"mechanically fixable case: {said[:200]}")
     return c
 
@@ -1433,6 +1496,11 @@ def payload(cfg: dict, pr: dict, checks: list[Check], base: BaseRef) -> dict:
         "base_fresh": base.fresh,
         "head_sha": pr["headRefOid"],
         "reasons": [r for c in checks for r in c.reasons],
+        # The subset of `reasons` a PERSON has to clear, each with its check and
+        # #279's class. A caller that wants "is this HOLD mine or the machine's"
+        # reads this instead of pattern-matching the prose; an empty list on a
+        # HOLD is the honest answer that the remaining work is mechanical.
+        "needs_human": [{"check": c.name, **h} for c in checks for h in c.human],
         "warnings": [*run_notes, *(w for c in checks for w in c.warnings)],
         "actions": [a.as_dict() for c in checks for a in c.actions],
         "checks": {c.name: c.as_dict() for c in checks},
@@ -1452,6 +1520,10 @@ def report(out: dict, checks: list[Check]) -> None:
             print(f"\n{label}:")
             for item in items:
                 print(f"  - {item}")
+    if out.get("needs_human"):
+        print("\nWAITING ON A HUMAN — these are not reconcilable:")
+        for h in out["needs_human"]:
+            print(f"  - [{h['class']}] {h['check']}: {h['reason']}")
     if out["actions"]:
         print("\nRECONCILE — run these, then run preland again:")
         for a in out["actions"]:
@@ -1459,6 +1531,56 @@ def report(out: dict, checks: list[Check]) -> None:
             print(f"      why: {a['why']}")
             if a["files"]:
                 print(f"      touches: {', '.join(a['files'])}")
+
+
+def announce_hold(out: dict, cfg: dict) -> list[str]:
+    """Tell the board about the parts of a HOLD only a person can clear (#274).
+
+    One post per CLASS rather than one per reason. A HOLD is routinely several
+    sentences about one situation — PR #131 held on two independent counts — and
+    the question a human is being asked is "what kind of judgement do you owe
+    me", which is the class. Two sentences of one class are one interruption.
+
+    Nothing is announced for a READY, for a RECONCILE, or for a HOLD whose every
+    reason is mechanical. That last exclusion is the point of `Check.human`
+    existing at all: an unpushed branch and a red CI job hold this gate all day
+    and neither is a question, so a gate that posted every HOLD would be a CI log
+    with an addressee, which #274 names as worse than the silence it replaces.
+
+    Keyed on the head sha, so re-running the gate on the same commit — which
+    `fix-and-land` does on every attempt — says it once, while a push that
+    changes nothing about the objection says it again. That is the right way
+    round: the second is a new fact about a commit nobody has judged.
+    """
+    items = out.get("needs_human") or []
+    if out.get("verdict") != HOLD or not items:
+        return []
+    by_class: dict[str, list[dict]] = {}
+    for h in items:
+        by_class.setdefault(h["class"], []).append(h)
+    said = []
+    for cls, group in by_class.items():
+        checks = ", ".join(sorted({h["check"] for h in group}))
+        note = announce(
+            cls=cls, reason=group[0]["reason"],
+            summary=(f"PR #{out['pr']} cannot land — {len(group)} "
+                     f"{'objection' if len(group) == 1 else 'objections'} "
+                     f"({checks}) only a person can clear"),
+            repo=out.get("repo", ""), cfg=cfg,
+            # The REASONS are in the key, not just the commit and the class: a
+            # second run on one head can raise a new objection of a class
+            # already announced — the board comes back and the queue check now
+            # answers — and a coarser key would suppress it (Codex).
+            key=(f"preland:{out.get('repo')}:{out['pr']}:{cls}:"
+                 f"{out.get('head_sha', '')}:"
+                 + digest(*sorted(h["reason"] for h in group))),
+            detail="\n".join([f"preland HOLD on {out.get('branch')} → {out.get('base')} "
+                               f"at {str(out.get('head_sha', ''))[:12]}.", ""]
+                              + [f"- [{h['check']}] {h['reason']}" for h in group]),
+            refs=[{"kind": "pr", "value": str(out["pr"]), "repo": out.get("repo", "")}])
+        if note:
+            said.append(note)
+    return said
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1494,6 +1616,11 @@ def main(argv: list[str] | None = None) -> int:
 
     checks = gather(cfg, pr, base, off, args.claim_holder, args.earned_stop)
     out = payload(cfg, pr, checks, base)
+    # Ahead of the render, so a payload a caller acts on has already been
+    # announced: the post is the cheap half and an escalation that fails to
+    # print must still have reached a human (#274's "post first, then file").
+    for note in announce_hold(out, cfg):
+        print(note, file=sys.stderr if args.as_json else sys.stdout)
     if args.as_json:
         print(json.dumps(out, indent=2))
     else:

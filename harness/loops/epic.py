@@ -41,6 +41,7 @@ from harness_rules import (  # noqa: E402
     DEFAULTS, RepoNotFound, agent_failure, agent_gist, ci_report, cli_failure_gist,
     describe, resolve_repo, run_agent, tail_gist,
 )
+from needs_human import announce, class_or_none  # noqa: E402
 
 PANEL = Path(__file__).with_name("panel.py")
 # State must live OUTSIDE the script dir for the same reason (the store is read-only).
@@ -78,7 +79,15 @@ by editing this repo.
 - fable: the hardest — cross-cutting schema/engine changes, concurrency/idempotency subtleties,
   ambiguous specs that need design judgment.
 
-Return ONLY JSON: {{"doable": true|false, "reason": "<one short line>", "model": "<tier>"}}
+3. NEEDS_HUMAN — only when `doable` is false, say WHICH KIND of human is needed, one of:
+decision (which of these, or whether at all — product, architecture, policy) · taste (is this the
+right name, the right sentence, the right shape) · ui (does it actually look and behave right on a
+real screen) · environment (does it work on the box it has to work on) · auth (does the credential
+path actually work, end to end) · other (a human judgement none of the five names — say which in
+the reason). Omit it when `doable` is true.
+
+Return ONLY JSON: {{"doable": true|false, "reason": "<one short line>", "model": "<tier>",
+"needs_human": "<class>"}}
 
 Issue #{n}: {title}
 
@@ -163,6 +172,13 @@ class IssueWork:
     # unwrapping at the comparison site is how one of them ends up matching
     # nothing, silently.
     labels: list[str] = field(default_factory=list)
+    #: Which KIND of human judgement this sub-issue is waiting on, from #279's
+    #: closed vocabulary. Empty while the issue is doable — there is nobody to
+    #: wait for. It exists because "not agent-doable" is not one thing: a licence
+    #: to buy, a screen to look at and a box to configure are three different
+    #: afternoons, and a count that collapses them says only "five things are
+    #: stuck" (see app/needs_human.py, which defines the classes).
+    human_class: str = ""
 
 
 def gh_json(args: list[str], repo: str):
@@ -424,15 +440,36 @@ def toposort(work: list[IssueWork], edges: list) -> list[IssueWork]:
 TRIAGE_TIMEOUT = 300
 
 
-def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
+#: The class an untriaged sub-issue is waiting on. Not `decision`: nobody decided
+#: anything — the judge never ran, or ran and could not answer, and every branch
+#: that produces one of those diagnoses is about this BOX (no `claude` on PATH, a
+#: CLI that would not start, a timeout). #279's `environment` is exactly "does it
+#: work on the box it has to work on", and filing it as a decision would put a
+#: broken install in the queue of things a person has to think about.
+UNTRIAGED_CLASS = "environment"
+
+#: The class a real NOT-agent-doable ruling falls back to when the judge did not
+#: name one. `decision` rather than `other`, because the prompt's own list of
+#: what makes a sub-issue undoable — a licence, a commercial or legal call, a
+#: sign-off — is a decision in five of its six entries, and `other` is the escape
+#: hatch #279 reserves for a judgement none of the five names.
+RULING_CLASS = "decision"
+
+
+def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str, str]:
     """Master decides whether a coding agent can actually implement this issue, and
     which model tier should implement it. The judge runs at `model` — the tier the
     epic run was initiated with — and picks an equal-or-lesser tier per sub-issue
-    (clamped; see MODEL_TIERS). Returns (doable, reason, impl_model). doable=None
-    means no judgment was possible (treated as 'not confirmed' → skipped on
-    --execute); impl_model='' means model routing is off for this run."""
+    (clamped; see MODEL_TIERS). Returns (doable, reason, impl_model, human_class).
+    doable=None means no judgment was possible (treated as 'not confirmed' →
+    skipped on --execute); impl_model='' means model routing is off for this run.
+
+    `human_class` is #279's vocabulary and is empty for a doable issue. It is the
+    fourth member rather than something derived later from `reason` because the
+    judge is the only party that knows: "needs a licence" and "needs somebody to
+    look at it on a phone" are one string apart and two different queues."""
     if not shutil.which("claude"):
-        return None, "untriaged (no judge available)", ""
+        return None, "untriaged (no judge available)", "", UNTRIAGED_CLASS
     choices = allowed_models(model)
     prompt = TRIAGE_PROMPT.format(n=w.num, title=w.title, body=w.body[:6000],
                                   models=", ".join(choices) or "(default)")
@@ -446,19 +483,19 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
         proc = subprocess.run(args, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL, timeout=TRIAGE_TIMEOUT)
     except subprocess.TimeoutExpired:
-        return None, f"untriaged (judge timed out after {TRIAGE_TIMEOUT}s)", ""
+        return None, f"untriaged (judge timed out after {TRIAGE_TIMEOUT}s)", "", UNTRIAGED_CLASS
     except OSError as e:
         # errno and strerror, not the bare class name: "OSError" says nothing,
         # and "Argument list too long" says everything.
         why = " ".join(str(x) for x in (e.errno, e.strerror or e) if x)[:120]
-        return None, f"untriaged (judge could not start: {why})", ""
+        return None, f"untriaged (judge could not start: {why})", "", UNTRIAGED_CLASS
     if proc.returncode:
         # A non-zero exit means the RUN failed, so whatever reached stdout is not
         # a verdict even when it parses — the rule the two branches below already
         # get from cli_failure_gist, applied before anything is parsed rather
         # than after, since valid-looking JSON printed on the way out would
         # otherwise be accepted as a real ruling and the failure never reported.
-        return None, f"untriaged (judge failed: {cli_failure_gist(proc)})", ""
+        return None, f"untriaged (judge failed: {cli_failure_gist(proc)})", "", UNTRIAGED_CLASS
     m = re.search(r"\{.*\}", proc.stdout or "", re.S)
     if not m:
         # Exit 0 with no JSON means the judge ANSWERED and simply did not rule.
@@ -473,14 +510,23 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str]:
         # and reports the failure instead. (#31)
         said = tail_gist(proc.stdout or "")
         about = "no JSON in reply" + (f" — said: {said}" if said else "")
-        return None, f"untriaged (no verdict: {cli_failure_gist(proc, about)})", ""
+        return None, f"untriaged (no verdict: {cli_failure_gist(proc, about)})", "", UNTRIAGED_CLASS
     try:
         v = json.loads(m.group(0))
     except json.JSONDecodeError:
         return None, ("untriaged (bad verdict: "
-                      f"{cli_failure_gist(proc, 'malformed JSON')})"), ""
-    return (bool(v.get("doable", False)), str(v.get("reason", ""))[:120],
-            clamp_model(str(v.get("model", "")), model))
+                      f"{cli_failure_gist(proc, 'malformed JSON')})"), "", UNTRIAGED_CLASS
+    doable = bool(v.get("doable", False))
+    # An unrecognised spelling is NOT silently kept: it would leave every by-class
+    # count while still reading as a flag, which is the direction that hides the
+    # signal (app/needs_human.py says so about the same value at ingest). A
+    # doable issue is waiting on nobody, so it carries no class however the judge
+    # answered — a class attached to work an agent can do is a queue entry for a
+    # question nobody asked.
+    said = class_or_none(v.get("needs_human"))
+    return (doable, str(v.get("reason", ""))[:120],
+            clamp_model(str(v.get("model", "")), model),
+            "" if doable else (said or RULING_CLASS))
 
 
 # --------------------------------------------------------------- per-issue pipeline
@@ -914,6 +960,24 @@ def work_issue(cfg: dict, w: IssueWork, execute: bool, base: str | None = None,
         # judge never answered. Both are skipped; only one of them was judged.
         verdict = "NOT agent-doable" if w.doable is False else "not confirmed doable"
         print(f"  #{w.num}: {verdict} ({w.reason}) — skipping (needs a human)")
+        # …and it says so on the board (#274). Only on a real run: a dry run is a
+        # plan preview, and announcing what a run WOULD be stuck on is how the
+        # queue fills with questions nobody is actually blocked by. Keyed on the
+        # issue and the class so an epic on a timer re-announces a ruling once a
+        # day rather than once a tick.
+        if execute:
+            said = announce(
+                cls=w.human_class, reason=w.reason or verdict,
+                summary=f"#{w.num} {w.title[:80]} — {verdict}",
+                repo=gh_repo, cfg=cfg,
+                key=f"epic:{gh_repo}:{w.num}:{w.human_class}",
+                detail=(f"The epic driver will not hand #{w.num} to an implementing "
+                        f"agent: {verdict}.\n\nJudge's reason: {w.reason}\n\n"
+                        f"Nothing happens to this sub-issue until a human either "
+                        f"resolves it or makes it agent-doable."),
+                refs=[{"kind": "issue", "value": str(w.num), "repo": gh_repo}])
+            if said:
+                print(f"    {said}")
         return WorkResult(w.num, "blocked", detail=w.reason)
 
     if not execute:
@@ -1140,6 +1204,10 @@ def plan_entry(cfg: dict, w: IssueWork, phase_index: int, base: str | None = Non
         "checked": w.checked, "issue_state": w.issue_state,
         "pr_number": w.pr_number, "pr_state": w.pr_state,
         "doable": w.doable, "reason": w.reason, "model": w.model,
+        # The plan carries the class as well as the reason so a consumer of
+        # --json — the /epic skill, a reconciler, #328's blocker row — can count
+        # what the fleet is waiting on without parsing English out of `reason`.
+        "needs_human": w.human_class,
         "phase": w.phase, "phase_index": phase_index,
         "base": base, "branch": branch,
         "worktree": worktree_path(cfg, branch),
@@ -1264,7 +1332,7 @@ def run(repo_name: str, epic: int, execute: bool, max_issues: int | None,
             futs = {ex.submit(triage, w, ceiling): w for w in impl}
             for fut in futs:
                 w = futs[fut]
-                w.doable, w.reason, w.model = fut.result()
+                w.doable, w.reason, w.model, w.human_class = fut.result()
                 # `is not True`, not `is False`: an untriaged sub-issue (doable
                 # is None — the judge timed out, crashed, or printed nothing) has
                 # no doability ruling at all, and handing it to the autonomous

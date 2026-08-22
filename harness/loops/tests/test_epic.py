@@ -295,7 +295,7 @@ def test_triage_quotes_the_whole_diagnosis_not_its_first_half(monkeypatch):
     fixture used elsewhere in this file could not see it."""
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout="", stderr=DENIED)
-    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    _doable, reason, _impl, _cls = epic.triage(mk(1), "opus")
     assert "auto-denied" in reason
     assert "permissions.allow in settings.json" in reason
 
@@ -307,7 +307,7 @@ def test_triage_no_verdict_names_what_stderr_said(monkeypatch):
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout="", stderr="a tool required the \"command\" "
              "permission that headless mode cannot prompt for, so it was auto-denied")
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "no verdict" in reason and "auto-denied" in reason
 
@@ -316,7 +316,7 @@ def test_triage_no_verdict_falls_back_to_the_exit_code(monkeypatch):
     """A crash with nothing on stderr still beats a bare "no verdict"."""
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout="", stderr="", rc=2)
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "exited 2" in reason
 
@@ -332,7 +332,7 @@ def test_triage_blames_the_reply_not_the_stderr_when_the_judge_answered(monkeypa
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout="I think this one is doable, roughly speaking.",
              stderr="loaded 3 plugins")
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "no JSON in reply" in reason
     assert "plugins" not in reason
@@ -345,7 +345,7 @@ def test_triage_bad_verdict_says_what_was_wrong_with_it(monkeypatch):
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout='{"doable": True, "reason": unquoted}',
              stderr="loaded 3 plugins")
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "bad verdict" in reason and "malformed JSON" in reason
     assert "plugins" not in reason
@@ -357,7 +357,7 @@ def test_triage_bad_verdict_on_a_crash_still_quotes_stderr(monkeypatch):
     monkeypatch.setattr(epic.shutil, "which", lambda _: "/usr/bin/claude")
     _fake_gh(monkeypatch, stdout='{"doable": tru}',
              stderr="error: the model pin is unusable", rc=1)
-    _doable, reason, _impl = epic.triage(mk(1), "opus")
+    _doable, reason, _impl, _cls = epic.triage(mk(1), "opus")
     assert "the model pin is unusable" in reason
 
 
@@ -371,7 +371,7 @@ def test_triage_refuses_a_verdict_from_a_judge_that_exited_non_zero(monkeypatch)
     _fake_gh(monkeypatch, stdout=json.dumps(
         {"doable": True, "reason": "looks fine", "model": "sonnet"}),
         stderr="error: the model pin is unusable", rc=1)
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "judge failed" in reason and "the model pin is unusable" in reason
     assert "looks fine" not in reason
@@ -386,7 +386,7 @@ def test_triage_names_the_timeout_rather_than_a_bare_judge_error(monkeypatch):
         raise subprocess.TimeoutExpired(cmd="claude", timeout=epic.TRIAGE_TIMEOUT)
 
     monkeypatch.setattr(subprocess, "run", boom)
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert f"timed out after {epic.TRIAGE_TIMEOUT}s" in reason
 
@@ -400,7 +400,7 @@ def test_triage_names_why_the_judge_could_not_be_launched(monkeypatch):
         raise OSError(7, "Argument list too long")
 
     monkeypatch.setattr(subprocess, "run", boom)
-    doable, reason, impl = epic.triage(mk(1), "opus")
+    doable, reason, impl, _cls = epic.triage(mk(1), "opus")
     assert doable is None and impl == ""
     assert "could not start" in reason and "Argument list too long" in reason
 
@@ -419,9 +419,9 @@ def test_an_untriaged_sub_issue_is_blocked_rather_than_handed_to_the_executor(
         "_rules_from": "test", "loops": {"issue_executor": True}})
     monkeypatch.setattr(epic, "build_worklist", lambda repo, e: [mk(1), mk(2), mk(3)])
     monkeypatch.setattr(epic, "gh_json", lambda args, repo: {"title": "an epic"})
-    verdicts = {1: (None, "untriaged (judge timed out after 300s)", ""),
-                2: (False, "needs a licence purchase", ""),
-                3: (True, "self-contained", "sonnet")}
+    verdicts = {1: (None, "untriaged (judge timed out after 300s)", "", "environment"),
+                2: (False, "needs a licence purchase", "", "decision"),
+                3: (True, "self-contained", "sonnet", "")}
     monkeypatch.setattr(epic, "triage", lambda w, model: verdicts[w.num])
 
     assert epic.run("r", 7, execute=False, max_issues=None, json_out=True,
@@ -457,7 +457,7 @@ def test_triage_reads_a_real_verdict_unchanged(monkeypatch):
     _fake_gh(monkeypatch, stdout=json.dumps(
         {"doable": True, "reason": "self-contained", "model": "sonnet"}),
         stderr="loaded 3 plugins")
-    assert epic.triage(mk(1), "opus") == (True, "self-contained", "sonnet")
+    assert epic.triage(mk(1), "opus") == (True, "self-contained", "sonnet", "")
 
 
 # ------------------------------------------------- the refusal gate (#85/#86)
@@ -475,7 +475,7 @@ def _plan(monkeypatch, capsys, work, cfg_extra=None, triaged=None):
 
     def judge(w, model):
         asked.add(w.num)
-        return (triaged or {}).get(w.num, (True, "self-contained", "sonnet"))
+        return (triaged or {}).get(w.num, (True, "self-contained", "sonnet", ""))
 
     monkeypatch.setattr(epic, "triage", judge)
     assert epic.run("r", 7, execute=False, max_issues=None, json_out=True,

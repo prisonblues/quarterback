@@ -57,6 +57,9 @@ from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
                            RULES_FILENAME, SAMPLE_FILENAME,
                            RepoNotFound, cli_outcome, describe,
                            resolve_repo, stderr_gist)
+# #279's vocabulary, through the one module that knows where it is defined.
+from needs_human import (class_or_none as needs_human_class_or_none,  # noqa: E402
+                         reason_or_none as needs_human_reason_or_none)
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -350,7 +353,8 @@ SEAT_MODEL_DEFAULTS = {"claude": "sonnet"}
 #: instead, which is true of a diff and of a manifest alike.
 _FINDINGS_ENVELOPE = """Return ONLY a JSON object (no prose):
   {{"findings": [{{"severity": "P1|P2|P3|P4", "file": "path", "line": <int|null>,
-                  "title": "...", "detail": "...", "needs_rereview": true|false}}],
+                  "title": "...", "detail": "...", "needs_rereview": true|false,
+                  "needs_human": false, "needs_human_class": "", "needs_human_reason": ""}}],
     "could_not_assess": ["..."]}}
 An empty `findings` array only if the material below is genuinely flawless.
 
@@ -365,6 +369,16 @@ whether another review will be needed — you cannot observe findings you have n
 - `needs_rereview` (per finding): true when fixing it takes a STRUCTURAL change whose
   RESULT should be read again — the fix can create new interactions the current diff does
   not contain. False for a local edit whose correctness is evident from the fix itself.
+- `needs_human` (per finding): true only when NO REVIEWER OF ANY KIND could settle this
+  from a diff — not "I lacked context", which is `could_not_assess` and a wider scope or a
+  grep would close. This is "no context would close it". When true you MUST give both:
+  `needs_human_class`, one of decision (which of these, or whether at all — product,
+  architecture, policy) · taste (is this the right name, the right sentence, the right
+  shape) · ui (does it actually look and behave right on a real screen) · environment
+  (does it work on the box it has to work on) · auth (does the credential path actually
+  work, end to end) · other (say which in the reason); and `needs_human_reason`, one line
+  saying what the person has to answer. A flag with no reason is discarded, and a flag is
+  a way OUT of work — reaching for it to end a review you find tedious is counted per seat.
 
 {ci}
 {code}
@@ -664,6 +678,20 @@ class Finding:
     #: that called it and the member that missed it indistinguishable on exactly
     #: the statistic that separates them (see :attr:`Canonical.rereview_by`).
     needs_rereview: bool = False
+    #: This reporter's own declaration that no reviewer of any kind can settle
+    #: the question from a diff — #279's vocabulary, carried per reporter for the
+    #: reason :attr:`needs_rereview` gives and one sharper: a flag is a way OUT
+    #: of work, so #67's "do not escalate to end a cycle you find tedious" is
+    #: only enforceable if the rate at which each seat reaches for it is on the
+    #: row it is scored by.
+    needs_human: bool = False
+    #: One of ``app.needs_human.NEEDS_HUMAN_CLASSES``, normalised. Empty when the
+    #: seat named nothing recognisable — and an empty class REFUSES the flag
+    #: rather than escalating without one (see :func:`_needs_human`), the same
+    #: biconditional the database CHECK enforces one layer out.
+    needs_human_class: str = ""
+    #: What the person has to answer. Required by the same rule.
+    needs_human_reason: str = ""
 
 
 @dataclass
@@ -1363,16 +1391,49 @@ def _flag(val) -> bool:
     return False
 
 
+def _needs_human(it: dict) -> tuple[bool, str, str]:
+    """One finding's escalation declaration: `(flagged, class, reason)`.
+
+    **Evidence or nothing.** A seat that says `needs_human: true` and names
+    neither a class nor a reason has escalated on its own authority with nothing
+    behind it, and #279 refuses exactly that at the API and again at the database
+    CHECK. Refusing it here too means the panel never SENDS the shape the board
+    would reject, so the refusal is not something the operator has to read out of
+    a `needs_human_refused` key after the fact.
+
+    The refusal is total and deliberately not partial: a flag with a class and no
+    reason is not filed under that class, because a class with no argument behind
+    it still lands in the count that decides whose afternoon this is. And the
+    evidence is dropped when the flag is not set, for the reason an orphan reads
+    badly at ingest — a class with no flag behind it looks precisely like a
+    declaration somebody later withdrew.
+    """
+    if not _flag(it.get("needs_human")):
+        return False, "", ""
+    cls = needs_human_class_or_none(it.get("needs_human_class"))
+    why = needs_human_reason_or_none(it.get("needs_human_reason"))
+    if not cls or not why:
+        return False, "", ""
+    return True, cls, why
+
+
 def _to_findings(reviewer: str, items: list) -> list[Finding]:
-    return [Finding(
-        reviewer=reviewer,
-        severity=_severity(it.get("severity"), "P3"),
-        file=str(it.get("file", "?")),
-        line=it.get("line") if isinstance(it.get("line"), int) else None,
-        title=str(it.get("title", "")).strip(),
-        detail=str(it.get("detail", "")).strip(),
-        needs_rereview=_flag(it.get("needs_rereview")),
-    ) for it in items]
+    out = []
+    for it in items:
+        flagged, cls, why = _needs_human(it)
+        out.append(Finding(
+            reviewer=reviewer,
+            severity=_severity(it.get("severity"), "P3"),
+            file=str(it.get("file", "?")),
+            line=it.get("line") if isinstance(it.get("line"), int) else None,
+            title=str(it.get("title", "")).strip(),
+            detail=str(it.get("detail", "")).strip(),
+            needs_rereview=_flag(it.get("needs_rereview")),
+            needs_human=flagged,
+            needs_human_class=cls,
+            needs_human_reason=why,
+        ))
+    return out
 
 
 def _findings_of(reviewer: str, obj: dict, items: list) -> list[Finding]:

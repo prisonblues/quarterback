@@ -90,6 +90,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -1876,6 +1877,34 @@ def _token_from(cfg: dict[str, str]) -> str:
         return ""
 
 
+def ssl_context() -> ssl.SSLContext | None:
+    """A context that trusts something, on interpreters that trust nothing.
+
+    A uv-installed standalone Python has no CA bundle of its own and no NixOS ssl
+    paths, so `urllib` there fails every HTTPS request with
+    CERTIFICATE_VERIFY_FAILED — while the same code works on the interpreter the
+    harness packages. `qbdata._ssl_context` was written after that bit the
+    dashboard, and it is a second copy only because `harness/bin` and
+    `harness/loops` are installed as separate flat store paths and cannot import
+    each other.
+
+    Every board call in this package goes through it, which is not tidiness. The
+    failure arrives as *"the board was unreachable"* — a sentence about a board
+    that is up — so the same run that cannot read a dial cannot read a review
+    round either, and reports both as an outage. It was found by running #274's
+    own measurement out of a project venv, where an escalation announced fine on
+    one interpreter and vanished on the other.
+
+    certifi is not a dependency; it is used when the interpreter already has it,
+    which is exactly the case where the default store is empty.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None                                 # the default store, which is fine
+    return ssl.create_default_context(cafile=certifi.where())
+
+
 def board_config() -> tuple[str, str, str]:
     """(base_url, token, why-it-is-unusable) for this host's board.
 
@@ -1945,7 +1974,8 @@ def _dial_body(github: str) -> tuple[dict, str, str]:
     full = f"{where}?{urllib.parse.urlencode({'repo': github})}"
     req = urllib.request.Request(full, headers={"Authorization": f"Bearer {token}"})
     try:
-        with urllib.request.urlopen(req, timeout=DIALS_TIMEOUT) as r:
+        with urllib.request.urlopen(req, timeout=DIALS_TIMEOUT,
+                                    context=ssl_context()) as r:
             body = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         # Before URLError, which it subclasses: a 404 means this board is older

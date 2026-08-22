@@ -245,3 +245,22 @@ def test_record_false_records_nothing_and_claims_nothing(monkeypatch, capsys):
     _round(monkeypatch, qb_present=False)
     assert panel.run("board", 284, post=False, json_out=True, record=False) == 0
     assert _notes(json.loads(capsys.readouterr().out)) == []
+
+
+def test_record_false_does_not_announce_an_escalation_either(monkeypatch, capsys):
+    """An escalation post is a board write like any other (#274), so a run told
+    to stay off the board stays off it — a preview that silently interrupted a
+    person would be the same surprise as a round the board never heard about,
+    in the other direction."""
+    called: list[dict] = []
+    monkeypatch.setattr(panel, "announce_escalations",
+                        lambda payload, cfg: called.append(payload) or [])
+    _round(monkeypatch, qb_present=True)
+    assert panel.run("board", 284, post=False, json_out=True, record=False) == 0
+    capsys.readouterr()
+    assert called == [], "--no-record still wrote to the board"
+
+    _round(monkeypatch, qb_present=True)
+    assert panel.run("board", 284, post=False, json_out=True, record=True) == 0
+    capsys.readouterr()
+    assert len(called) == 1, "a recorded round no longer announces its escalations"

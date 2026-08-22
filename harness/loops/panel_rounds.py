@@ -91,6 +91,29 @@ def _account(f: Finding) -> str:
     return " — ".join(x for x in (f.title, f.detail) if x)
 
 
+def _first_human(reports: list[Finding]) -> Finding | None:
+    """The first account carrying a WHOLE escalation, or none.
+
+    Whole, because a class and a reason are one declaration: taking the class
+    from one member and the reason from another manufactures a statement neither
+    of them made, and the board would store it as a single seat's. `panel_core`
+    already refuses a half — a flag without both is not a flag — so in practice
+    this is the first flagged account, and saying it this way keeps that true if
+    the parser is ever loosened.
+    """
+    return next((f for f in reports
+                 if f.needs_human and f.needs_human_class and f.needs_human_reason),
+                None)
+
+
+def _human_report(group: list[Finding]) -> dict:
+    """One reviewer's escalation fields as the board's `reported_by` wants them."""
+    head = _first_human(group)
+    return {"needs_human": head is not None,
+            "needs_human_class": head.needs_human_class if head else "",
+            "needs_human_reason": head.needs_human_reason if head else ""}
+
+
 def _fold_reports(reports: list[Finding]) -> list[dict]:
     """The accounts as they are SERIALISED: one entry per reviewer.
 
@@ -118,6 +141,12 @@ def _fold_reports(reports: list[Finding]) -> list[dict]:
             # board scores it at: a member that called the structural fix and one
             # that missed it are the same row otherwise.
             "needs_rereview": any(f.needs_rereview for f in group),
+            # Same grain, same reason, one level sharper: a flag is a way OUT of
+            # work, so the rate at which each seat reaches for it has to be on
+            # the seat's own row or #67's rule is unenforceable. The class and
+            # the reason travel with the flag and are never assembled half from
+            # one account and half from another — `_first_human` says why.
+            **_human_report(group),
         })
     return out
 
@@ -315,6 +344,41 @@ class Canonical:
         contradiction of it."""
         return any(f.needs_rereview for f in self.reported_by)
 
+    @property
+    def needs_human(self) -> bool:
+        """Did ANY reporter say no diff can settle this. Same rule as above and
+        for the same reason: one member recognising a design question is the
+        observation, and the others reviewing the code as code is not a
+        contradiction of it."""
+        return any(f.needs_human for f in self.reported_by)
+
+    @property
+    def needs_human_by(self) -> list[str]:
+        """Which members escalated. Read off the reporters, never reconstructed:
+        this is what #279 scores `human_flagged` from, and a flag credited to
+        everyone who happened to raise the same defect makes the member that saw
+        the design question and the member that missed it one row."""
+        return sorted({f.reviewer for f in self.reported_by if f.needs_human})
+
+    @property
+    def needs_human_class(self) -> str:
+        """The class the finding is filed under — the first WHOLE declaration.
+
+        Two members may disagree about the class of one defect. The board keeps
+        both, per reporter, in `reported_by`; the finding-level value has to be
+        one of them, and taking the first is the same arrival-order rule
+        `reviewers` already uses. It is never blended: see :func:`_first_human`.
+        """
+        head = _first_human(self.reported_by)
+        return head.needs_human_class if head else ""
+
+    @property
+    def needs_human_reason(self) -> str:
+        """The reason belonging to :attr:`needs_human_class`, from the same
+        account. The pair is one statement and is never split."""
+        head = _first_human(self.reported_by)
+        return head.needs_human_reason if head else ""
+
     def as_dict(self) -> dict:
         return {
             "id": self.id,
@@ -329,6 +393,10 @@ class Canonical:
             "reviewers": self.reviewers,
             "needs_rereview": self.needs_rereview,
             "rereview_by": self.rereview_by,
+            "needs_human": self.needs_human,
+            "needs_human_class": self.needs_human_class,
+            "needs_human_reason": self.needs_human_reason,
+            "needs_human_by": self.needs_human_by,
             "related": self.related,
             "rationale": self.rationale,
         }

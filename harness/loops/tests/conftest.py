@@ -402,3 +402,21 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
         return ""
 
     return sh
+
+
+@pytest.fixture(autouse=True)
+def _no_escalation_posts(monkeypatch):
+    """No test posts a real escalation to a real board (#274).
+
+    Autouse and unconditional, because the failure it prevents is invisible from
+    inside the suite: `announce` resolves the board out of this HOST's site
+    config, so on a developer's enrolled machine a `preland` or `epic` test that
+    reaches a producer would put a `stuck` post addressed to a person on the live
+    board — green suite, real interruption. In the nix sandbox there is no board
+    and nothing would have happened, which is precisely why nobody would have
+    found this by running CI.
+
+    The two suites that exercise the door turn it back on themselves, around a
+    stubbed opener — see `test_needs_human.py`.
+    """
+    monkeypatch.setenv("QUARTERBACK_NEEDS_HUMAN", "off")
