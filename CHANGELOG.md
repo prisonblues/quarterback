@@ -17,6 +17,59 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v2.94 — /fix-issue stops offering a database it then guarantees is unsafe
+
+`/fix-issue` step 2 asked the agent to classify its change — "read-only / no DB → shared DB is
+fine and faster" — and step 7 then ran the full suite, unconditionally, on every invocation.
+Those cannot both happen: the suite's teardown truncates, so running it against the shared
+database destroys what the main checkout has. PR #30's conftest guard caught it and refused to
+run, twice in one day, which is the only reason nothing was lost — but an agent following step 2
+correctly arrived at step 7 and stopped.
+
+Classifying more conservatively was not the fix. What decides whether the shared database is
+safe is not "does my change touch the DB", it is "will anything I run truncate it" — and step 7
+answers yes for every invocation without exception. So the question is gone rather than
+tightened: the worktree always gets its own copy, and `/fix-issue` passes no DB flag at all.
+`--shared-db` stays on `create-worktree`, where it is meaningful for a caller that genuinely
+runs no suite.
+
+### The route nobody chose
+
+`feat/issue-85` reached the shared database with `--shared-db` passed nowhere. `/fix-issue`
+**reused an existing worktree** — the branch already existed from work abandoned weeks earlier,
+so `create-worktree` refused the directory, provisioned nothing, and the agent inherited a
+pre-#30 `.env` from before per-worktree databases existed. The DB decision in step 2 was made,
+was correct, and was silently irrelevant.
+
+The skill's isolation check could not catch that: it read `create-worktree`'s output for the
+residual-`.env` warning, so it ran only when `create-worktree` ran. The one route where nothing
+provisioned a database — and the `.env` is therefore least trustworthy — was the one route that
+skipped the check. A check conditional on the safe path having been taken is not a check.
+
+Step 3 now ends in an isolation check that every route passes through, on the resolved `.env`:
+
+```
+check-db-isolation "$WT_DIR"
+```
+
+A new harness script that asks which database a checkout's `.env` actually names, and refuses
+when another checkout of the same repository names it too. It **imports**
+`harness/templates/dbtarget.py` rather than re-implementing the comparison, so it and the pytest
+guard that refuses at collection time cannot disagree about what "the same database" means: host
+aliases collapse, an omitted port is filled in, a bare `PGDATABASE=myapp` is compared by name
+because it states no server, and anything unparseable is read as a collision. What it adds over
+that guard is *when* — before the work rather than at the start of the run that was going to
+destroy something.
+
+Salvaging an abandoned branch is a normal thing to want and was the right call for #85 and #86,
+so the rule is not "never reuse". It is that reuse re-verifies.
+
+Measured on one box while writing this: of 38 worktrees carrying a `.env`, six named the shared
+`quarterback` database, five of them besides the main checkout. Nothing counted either number
+until somebody looked. Run over all 61 checkouts of that repo afterwards, the new check clears
+50 and refuses 11 — every refusal an `.env`-less worktree that the suite's own guard refuses
+identically today, and no checkout where the two disagree.
+
 ## v2.93 — an issue watcher that reads the tracker and mostly declines
 
 Nothing here read the backlog and said what each issue was waiting on. #63 asked for a watcher

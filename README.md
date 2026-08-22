@@ -1469,6 +1469,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.91** — qb-doctor's harness row stops counting five files and naming four.
 - **v2.92** — the pre-push hook stops telling you to renumber a graph it never counted.
 - **v2.93** — an issue watcher that reads the tracker and mostly declines.
+- **v2.94** — /fix-issue stops offering a database it then guarantees is unsafe.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
