@@ -2471,3 +2471,480 @@ def test_collision_reports_a_readable_fork_point_on_an_ordinary_branch(repo, cap
 
     assert run(repo, "collision", "--onto", "main", "--json") == 0
     assert json.loads(capsys.readouterr().out)["fork_point"] == "read"
+
+
+# ---------------------------------------------------------------------------
+# `frozen` — a released entry's TEXT, not its number
+# ---------------------------------------------------------------------------
+#
+# Everything above this line reads the CHANGELOG as a list of NUMBERS: is one missing, is one
+# repeated, did this branch claim one somebody else took. On 2026-08-20 a merge resolution
+# moved a branch's own 133-line entry under `## v2.59`, on top of that release's notes, and
+# every one of those questions still answered correctly — the headings were all present,
+# unique and in order. The branch was pushed and sat on an open PR for two days (#325).
+#
+# So these tests are about the bytes. `frozen` is fork-relative like `collision` and asked of
+# two refs for the same reason, so the working tree is left somewhere else here too.
+
+#: What a shipped release says. Deliberately several lines with a sub-heading in it: an entry
+#: whose slab stopped at the first `###` would compare only the first paragraph, and the
+#: corruption this catches replaces everything.
+SHIPPED = """The plan has had an order since v2.39 and one writer for it: a human.
+
+### The rules, and why they are labelled
+
+`app/ordering.py` is a pure function: candidates in, an order out, no session, no clock.
+"""
+
+#: The branch's own entry — the text that ended up under the wrong heading.
+MOVED = """`claims()` returned `[]`. Not filtered — empty, fleet-wide, for every caller.
+
+### A key the dashboard can tell apart
+
+Derive it, make the plan a row, block on pickup.
+"""
+
+
+def _corrupted_by_the_resolution(repo: Path) -> None:
+    """Write the CHANGELOG exactly as `843c506` left it, at this fixture's scale.
+
+    Two `## vNEXT` headings with one body between them belonging to the second, and the
+    branch's own entry relocated under the newest released heading, whose text it replaced.
+    Every heading is present, unique among the numbered ones, and correctly ordered.
+    """
+    write(repo, "CHANGELOG.md",
+          CHANGELOG_HEAD
+          + "## vNEXT — an order the rules derive\n"
+          + "## vNEXT — a claim nobody takes\n\n"
+          + "A paragraph belonging to the second heading.\n\n"
+          + entry("v2.33", body=MOVED, title="a row key the dashboard can tell apart")
+          + entry("v2.32") + entry("v2"))
+
+
+@pytest.fixture
+def shipped(repo: Path) -> Path:
+    """The fixture repo with real prose under its newest release, on `main` and on `work`."""
+    git(repo, "checkout", "-q", "main")
+    write(repo, "CHANGELOG.md",
+          CHANGELOG_HEAD
+          + entry("v2.33", body=SHIPPED, title="a row key the dashboard can tell apart")
+          + entry("v2.32") + entry("v2"))
+    commit(repo, "v2.33 ships its notes")
+    git(repo, "checkout", "-q", "work")
+    git(repo, "merge", "-q", "--ff-only", "main")
+    return repo
+
+
+def test_frozen_refuses_the_merge_resolution_that_replaced_a_shipped_release(shipped, capsys):
+    """#325 itself, reconstructed: the body moved, the heading left standing.
+
+    The second half of the assertion is the whole reason this command exists. `collision` —
+    the strongest release check this repo had — passes on the identical tree, because the
+    numbers are all fine. The prose is what is gone.
+    """
+    _corrupted_by_the_resolution(shipped)
+    commit(shipped, "chore: resolving merge conflicts with origin/main")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    err = capsys.readouterr().err
+    assert "v2.33" in err
+    assert "is changed" in err
+    assert "Release-Body-Edit: v2.33" in err, "the override is named where it is needed"
+
+    assert run(shipped, "collision", "--onto", "main", "--branch", "work") == 0, (
+        "the guard that existed passes on this tree — that is the gap #325 is about")
+    capsys.readouterr()
+
+
+def test_frozen_refuses_a_released_entry_that_has_vanished(shipped, capsys):
+    """The stronger form of the same defect, and nothing else sees it either: counting
+    duplicates and taking a maximum both survive a release simply ceasing to exist."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace(entry("v2.32"), "", 1))
+    commit(shipped, "a resolution that dropped an entry entirely")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "v2.32 is gone" in capsys.readouterr().err
+
+
+def test_frozen_refuses_a_retitled_released_heading(shipped, capsys):
+    """The heading line is part of the slab. `collision` deliberately does NOT compare
+    heading text — a retitled old entry is a false positive there, with a repair message that
+    is nonsense for an entry that shipped a year ago. Here it is precisely the finding: a
+    shipped title is as shipped as the prose under it, and the trailer is how a deliberate
+    rewrite says so."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md",
+          text.replace("## v2.33 — a row key the dashboard can tell apart",
+                       "## v2.33 — a row key the dashboard can actually tell apart", 1))
+    commit(shipped, "rewrite a shipped title")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "line 1:" in capsys.readouterr().err, "the heading line is the one that differs"
+
+
+def test_frozen_names_the_first_line_that_differs(shipped, capsys):
+    """A refusal that only says `v2.33` sends somebody to read two 130-line entries side by
+    side. One line separates "the whole body was replaced" from "a word was rewrapped", and
+    those want different repairs."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace("no session, no clock", "no session", 1))
+    commit(shipped, "rewrap a shipped paragraph")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    err = capsys.readouterr().err
+    assert "line 7: was" in err, "the line NUMBER, counted from the heading"
+    assert "no session, no clock." in err and "no session." in err, (
+        "and both texts, so a rewrap is distinguishable from a body swap without opening "
+        "the file")
+
+
+def test_frozen_passes_a_branch_that_is_merely_behind(shipped, capsys):
+    """The fork-relative half, and the failure mode that would have this switched off inside
+    a week: `main` has taken two releases since `work` forked, and `work` never opened the
+    file. Compared against `main` itself, both of those would read as entries this branch
+    deleted."""
+    write(shipped, "docs.md", "# how\n\nA branch that ships no release.\n")
+    commit(shipped, "docs only")
+    advance_the_integration_branch(shipped, "v2.35", "v2.34")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "origin/main", "--branch", "work") == 0
+    assert "released entries unchanged" in capsys.readouterr().out
+
+
+def test_frozen_passes_an_unstamped_placeholder_and_the_release_it_becomes(shipped):
+    """Neither state is visible to this check: `## vNEXT` carries no number, and the entry a
+    branch is shipping has no earlier text to be identical to. So there is nothing here for a
+    release PR to trip over, which is what makes it safe on `pull_request` — the trigger the
+    `stamped` job cannot have."""
+    place(shipped)
+    commit(shipped, "the placeholder, as intended")
+    git(shipped, "checkout", "-q", "main")
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 0
+
+    git(shipped, "checkout", "-q", "work")
+    assert run(shipped, "apply", "--onto", "main") == 0
+    commit(shipped, "stamp it")
+    git(shipped, "checkout", "-q", "main")
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 0
+
+
+def test_frozen_is_answered_from_the_refs_and_not_from_the_worktree(shipped):
+    """The property both gates are built on: a push carrying a rewritten release is refused
+    even from a checkout that does not have it, and CI judges the merge commit."""
+    _corrupted_by_the_resolution(shipped)
+    commit(shipped, "the resolution")
+    git(shipped, "checkout", "-q", "main")
+    assert MOVED not in (shipped / "CHANGELOG.md").read_text(), "the worktree must be clean"
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+
+
+def test_frozen_reads_a_whole_entry_across_its_sub_headings(shipped, capsys):
+    """An entry ends at the next `##`, never at a `###`. Sub-headings are how a long entry is
+    structured — `changelog.d` requires `###` or deeper for exactly this reason — and a slab
+    that stopped at the first one would compare an opening paragraph and call the other
+    hundred lines unchanged."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md",
+          text.replace("no session, no clock.", "no session, no clock, no board.", 1))
+    commit(shipped, "edit text below a sub-heading of a shipped entry")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_a_fenced_heading_inside_an_entry_does_not_end_it(repo, capsys):
+    """This repo's own CHANGELOG quotes release headings inside fenced blocks, and one of
+    them read as a section boundary would truncate the entry containing it — leaving
+    everything below the fence uncompared, which is the half of the file a corrupted
+    resolution lands in."""
+    git(repo, "checkout", "-q", "main")
+    fenced = "An example:\n\n```\n## v9.9 — a heading in a fence\n```\n\nAnd then the point.\n"
+    write(repo, "CHANGELOG.md",
+          CHANGELOG_HEAD + entry("v2.33", body=fenced) + entry("v2.32") + entry("v2"))
+    commit(repo, "v2.33 documents the convention it follows")
+    git(repo, "checkout", "-q", "work")
+    git(repo, "merge", "-q", "--ff-only", "main")
+    write(repo, "CHANGELOG.md",
+          (repo / "CHANGELOG.md").read_text().replace("And then the point.",
+                                                      "And then something else.", 1))
+    commit(repo, "edit below the fence, inside a shipped entry")
+    git(repo, "checkout", "-q", "main")
+
+    assert run(repo, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_frozen_ignores_the_files_preamble(shipped):
+    """Everything above the first `## vX.Y` is the convention documenting itself, and it is
+    edited on purpose — this release edits it. A guard that froze it would be red on the
+    branch that improved the instructions, and off by the end of the week."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md",
+          text.replace("Entries are newest first.",
+                       "Entries are newest first, and released ones never change.", 1))
+    commit(shipped, "sharpen the preamble")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 0
+
+
+def test_frozen_declines_to_align_a_number_declared_twice(shipped, capsys):
+    """There is no saying which of two `## v2.33` entries answers to which. That state is
+    already `collision`'s refusal, with a repair attached; reporting it a second time in
+    different words helps nobody, and guessing would report the wrong entry as rewritten."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md",
+          text.replace("## v2.33", entry("v2.33", body=MOVED) + "## v2.33", 1))
+    commit(shipped, "a keep-both-sides resolution")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 0
+    captured = capsys.readouterr()
+    assert "uncompared: v2.33" in captured.err, (
+        "and says which entry it did not read — an `ok:` line on its own would claim cover "
+        "this run does not have")
+    assert "2 released entries unchanged" in captured.out, "the other two still were"
+    assert run(shipped, "collision", "--onto", "main", "--branch", "work") == 2, (
+        "the check that owns this state still refuses it")
+
+
+def test_a_release_body_edit_trailer_waives_the_release_it_names(shipped, capsys):
+    """The sanctioned exception: a typo in a shipped entry. Declared on a commit, where a
+    reviewer sees it, rather than pushed past with `--no-verify`."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace("candidates in", "candidates in,", 1))
+    commit(shipped, "docs: a comma in v2.33's entry\n\nRelease-Body-Edit: v2.33")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 0
+    captured = capsys.readouterr()
+    assert "waived: v2.33" in captured.err, "a waived edit is still an edited release"
+    assert "unchanged" in captured.out
+
+
+def test_a_commit_body_quoting_the_refusal_is_not_consent(shipped, capsys):
+    """Codex found this one. The refusal ENDS with a ready-to-paste
+    `Release-Body-Edit: v2.33`, so a commit message quoting the message it just got is the
+    most likely one this branch will ever produce — and reading it as consent would waive the
+    entry on the strength of a paste. Git's own trailer parser is what makes it a trailer
+    rather than a line that looks like one: this is in the middle of a paragraph, and there
+    is a real trailer after it that git parses instead.
+    """
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace("candidates in", "candidates in,", 1))
+    commit(shipped,
+           "fix: the changelog\n\nThe hook said: Release-Body-Edit: v2.33 was the way to "
+           "declare this, but\nI have not decided yet.\n\nRefs: #325\n")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_a_trailer_naming_another_release_waives_nothing(shipped, capsys):
+    """Per-entry, not a switch. A branch legitimately fixing v2.32 has said nothing about
+    v2.33, and the resolution that ate v2.33 is exactly what would otherwise ride along."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace("candidates in", "candidates in,", 1))
+    commit(shipped, "docs: a comma\n\nRelease-Body-Edit: v2.32")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_a_trailer_that_landed_does_not_waive_the_next_branch(shipped, capsys):
+    """The reason the exemption is a commit trailer and not a file. It is read from
+    `base..branch`, so once the edit lands the trailer is behind the merge base and the entry
+    is immutable again for everybody after — where a stored exemption would sit in the repo
+    forever, waiving the one entry somebody once had a reason to touch."""
+    text = (shipped / "CHANGELOG.md").read_text()
+    write(shipped, "CHANGELOG.md", text.replace("candidates in", "candidates in,", 1))
+    commit(shipped, "docs: a comma in v2.33's entry\n\nRelease-Body-Edit: v2.33")
+    git(shipped, "checkout", "-q", "main")
+    git(shipped, "merge", "-q", "--ff-only", "work")
+
+    git(shipped, "checkout", "-q", "-b", "later", "main")
+    write(shipped, "CHANGELOG.md",
+          (shipped / "CHANGELOG.md").read_text().replace("no session, no clock", "nothing", 1))
+    commit(shipped, "a later branch, saying nothing")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "later") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_frozen_refuses_a_branch_that_deleted_the_changelog_outright(shipped, capsys):
+    """The largest version of the defect, and the one shape a "does this file exist" guard
+    turns into a silent pass. Reported as the whole file rather than as three entries each
+    individually gone: the count is the fact, and one line of it is more legible than N.
+    """
+    (shipped / "CHANGELOG.md").unlink()
+    commit(shipped, "a resolution that took the file with it")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work") == 2
+    err = capsys.readouterr().err
+    assert "has no CHANGELOG.md at all" in err
+    assert "3 released entries" in err
+
+
+def test_frozen_says_when_it_could_not_read_the_fork_point(repo, capsys):
+    """No merge base is no shipped text to be identical to. Passing is the only honest answer
+    — refusing every entry would stop a correct branch over a question this could not ask —
+    so a gate consuming it has to be told it got the weaker one, in a word it can test for."""
+    git(repo, "checkout", "-q", "--orphan", "detached-history")
+    write(repo, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33") + entry("v2"))
+    commit(repo, "a history with no common ancestor")
+
+    assert run(repo, "frozen", "--onto", "main", "--branch", "detached-history") == 0
+    captured = capsys.readouterr()
+    assert "limited: no merge base" in captured.err
+    assert "0 released entries compared" in captured.out
+
+
+def test_frozen_says_so_when_the_branch_is_already_contained_in_the_base(shipped, capsys):
+    """The documented blind spot, pinned so it cannot be mistaken for cover.
+
+    Once the corruption has landed, `main`'s fork point with `origin/main` is `main` itself,
+    every entry is identical to itself, and there is nothing left for this to find. The guard
+    for the commit going straight to `main` is `pre-push`, which asks the same question
+    BEFORE the push, while `origin/main` is still behind. What must not happen is this run
+    reading like the eighty-five-entry one.
+    """
+    _corrupted_by_the_resolution(shipped)
+    commit(shipped, "the resolution")
+    git(shipped, "checkout", "-q", "main")
+    git(shipped, "merge", "-q", "--ff-only", "work")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "main") == 0
+    captured = capsys.readouterr()
+    assert "limited: main is already contained in main" in captured.err
+    assert "0 released entries compared" in captured.out
+
+    # And the same commit, asked before it lands, is the refusal. Same tool, same question,
+    # the difference being only which ref the base still points at.
+    assert run(shipped, "frozen", "--onto", "main~1", "--branch", "main") == 2
+    assert "v2.33" in capsys.readouterr().err
+
+
+def test_frozen_reports_its_verdict_as_json(shipped, capsys):
+    _corrupted_by_the_resolution(shipped)
+    commit(shipped, "the resolution")
+    git(shipped, "checkout", "-q", "main")
+
+    assert run(shipped, "frozen", "--onto", "main", "--branch", "work", "--json") == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert payload["fork_point"] == "read"
+    assert payload["compared"] == 3
+    assert [c["release"] for c in payload["changed"]] == ["v2.33"]
+    assert payload["changed"][0]["what"] == "changed"
+    assert "line 3: was 'The plan has had an order" in payload["changed"][0]["where"], (
+        "the heading survived the resolution, which is why nothing else saw this; the body "
+        "under it is where the difference starts")
+    assert payload["skipped"] == [] and payload["exempt"] == []
+    assert payload["branch_sha"] == git(shipped, "rev-parse", "work").strip()
+    assert "#325" in payload["refusal"]
+
+
+def test_frozen_says_which_ref_it_cannot_find(repo, capsys):
+    """A gate consuming 0/2 reads Python's uncaught-exception 1 as "unknown"."""
+    assert run(repo, "frozen", "--onto", "main", "--branch", "no-such-ref") == 2
+    assert "does not exist here" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# the CI job that runs `frozen`
+# ---------------------------------------------------------------------------
+#
+# A tool nothing calls is the state #325 is a report about: "diff the bodies of neighbouring
+# released entries" was a line in the lander's brief for five landings in a row, and one of
+# them would eventually have been the landing where somebody skimmed it. So the workflow's
+# shape is asserted here rather than assumed — specifically the checkout depth, because a
+# depth-1 clone has no fork point, `frozen` correctly reports `limited:` and exits 0, and the
+# job goes green forever while reading nothing at all.
+
+
+def _frozen_job() -> dict:
+    """The job that runs `frozen`, found by what it runs rather than by its name."""
+    yaml = pytest.importorskip("yaml")
+    workflow = Path(__file__).resolve().parent.parent / ".github/workflows/tests.yml"
+    jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+    running = [
+        job for job in jobs.values()
+        if any("release_stamp.py frozen" in "\n".join(
+            line for line in str(step.get("run", "")).splitlines()
+            if not line.lstrip().startswith("#"))
+            for step in job.get("steps", []))
+    ]
+    assert len(running) == 1, (
+        f"{len(running)} jobs in tests.yml run `release_stamp.py frozen`; the guard against a "
+        "rewritten release entry has to run exactly once and has to run at all")
+    return running[0]
+
+
+def test_the_frozen_job_checks_out_the_whole_history():
+    """The one way this job can be wrong and look right.
+
+    `actions/checkout@v4` fetches a single commit by default. There is then no merge base,
+    nothing to compare a released entry with, and `frozen` reports `limited:` and passes —
+    which is a required check reporting green on a corrupted CHANGELOG.
+    """
+    checkouts = [step for step in _frozen_job()["steps"]
+                 if str(step.get("uses", "")).startswith("actions/checkout")]
+    assert checkouts, "the frozen job does not check the repo out at all"
+    assert all(str(step.get("with", {}).get("fetch-depth")) == "0" for step in checkouts), (
+        "the frozen job checks out at the default depth of 1, so it has no fork point and "
+        "`frozen` will report `limited:` and pass on every run")
+
+
+def test_the_frozen_job_runs_on_pull_requests():
+    """Where the failure it catches actually sits. The corrupted branch in #325 was on an
+    open PR for two days; on `main` the merge base with `origin/main` is HEAD and there is
+    nothing left to compare, which is why `pre-push` covers that side instead."""
+    assert "pull_request" in str(_frozen_job().get("if", "")), (
+        "the frozen job does not name pull_request in its `if`, so it either never runs on "
+        "the event that matters or runs on push-to-main where it can only be a no-op")
+
+
+def test_a_depth_one_clone_says_it_read_nothing_rather_than_reporting_a_clean_bill(
+        tmp_path, capsys):
+    """The behaviour the assertion above is protecting against, run rather than described.
+
+    In a depth-1 clone `origin/main` and HEAD are the same grafted commit, so the fork point
+    is the branch itself and every entry is trivially identical to itself. The danger is not
+    that the answer is wrong — it is that a run which judged nothing is worded exactly like a
+    run which judged eighty-five entries. So this one is `limited:`, in the same word every
+    other unaskable question here reports with, and the CI job asks for the whole history.
+
+    Built as a real shallow clone for the same reason `check`'s is: what is under test is
+    what git reports across a graft, and a stand-in would only ever assert the stand-in.
+    """
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(origin, "init", "-q", "-b", "main")
+    git(origin, "config", "user.email", "t@example.com")
+    git(origin, "config", "user.name", "t")
+    write(origin, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33", body=SHIPPED) + entry("v2"))
+    commit(origin, "v2.33 ships its notes")
+    write(origin, "CHANGELOG.md",
+          CHANGELOG_HEAD + entry("v2.33", body=MOVED) + entry("v2"))
+    commit(origin, "and then something replaced them")
+
+    clone = shallow_clone_of(origin, tmp_path / "clone")
+    assert git(clone, "rev-parse", "--is-shallow-repository").strip() == "true"
+
+    assert run(clone, "frozen", "--onto", "origin/main", "--branch", "HEAD") == 0
+    captured = capsys.readouterr()
+    assert "limited: HEAD is already contained in origin/main" in captured.err
+    assert "0 released entries compared" in captured.out, (
+        "the count is what a reader checks; two entries were there and neither was judged")

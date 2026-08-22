@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pre-push hook — the BACKSTOP half of this fleet's migration and release discipline.
 #
-# Two refusals, both computed from the files AT THE PUSHED COMMIT and never from a live
+# Three refusals, all computed from the files AT THE PUSHED COMMIT and never from a live
 # database or from whatever happens to be checked out:
 #
 #   1. A protected branch would receive a migration graph that does not have exactly one
@@ -12,6 +12,13 @@
 #   2. A branch that stamped a release number somebody else has since taken. Fork-relative:
 #      the question is whether THIS branch claimed the number, which needs the merge base as
 #      a third reference point. Delegated to the repo's own `release_stamp.py collision`.
+#   3. A branch that rewrote or deleted a release entry that had already SHIPPED. A CHANGELOG
+#      conflict resolved by moving a body under the wrong heading leaves every heading present
+#      and correctly ordered, so every check that reads the file as a list of headings passes
+#      while a released entry's prose — the part no diff recovers — is gone (#325).
+#      Fork-relative for the same reason as 2: the merge base holds the shipped text to
+#      compare against, and a branch merely behind has touched nothing. `release_stamp.py
+#      frozen`, and a deliberate edit says so in a `Release-Body-Edit:` commit trailer.
 #
 # WHY A HOOK AND NOT A RUNBOOK. On 2026-08-22 four branches each minted migration `0029`.
 # Each author ran the reconciler's `preflight`, each got a TRUTHFUL answer, and each
@@ -38,6 +45,7 @@
 #   git push --no-verify                              one push, express
 #   git config --bool qb.prePush.migrationHeads false one repo, recorded, and
 #   git config --bool qb.prePush.releaseNumber  false `qb-hooks status` says so
+#   git config --bool qb.prePush.releaseBodies  false
 # What must not exist is a path where the hook does not run and nobody notices.
 #
 # WHAT A GREEN RUN DOES AND DOES NOT PROVE. Both checks read the COMMIT being pushed, so a
@@ -484,6 +492,96 @@ duplicate headings were checked")
 }
 
 # ---------------------------------------------------------------------------
+# 3. this branch has not rewritten or deleted a release that already shipped
+# ---------------------------------------------------------------------------
+# The half neither check above can do. Both of them read the CHANGELOG as a LIST OF NUMBERS —
+# is one missing, is one repeated, did this branch claim one somebody took — and the failure
+# this catches leaves the numbers perfect: a conflict resolved by relocating a body under an
+# existing heading, which deleted a shipped release's notes and passed every guard in the
+# repo for two days on an open PR (#325).
+#
+# Same base as the number check, same fork-relative reasoning, and the same "silent where it
+# does not apply". A branch that never opens CHANGELOG.md passes by construction, which is
+# what lets this run on every push rather than on the protected ones.
+check_release_bodies() {
+    local branch="$1" sha="$2" stamper py out base base_label rc
+
+    stamper=$(find_tool QB_RELEASE_STAMP qb.releaseStamp scripts/release_stamp.py) || return 0
+
+    base="$BASE_REF"
+    base_label="${BASE_REF#refs/remotes/}"
+    if [[ -n "$BASE_IN_PUSH" && "$branch" != "$BASE_BRANCH" ]]; then
+        base="$BASE_IN_PUSH"
+        base_label="$BASE_BRANCH (as this push would leave it)"
+    fi
+
+    # No base, no CHANGELOG at either end: there is no shipped text to compare against, so
+    # there is no question here to ask. Unlike the number check this stays quiet even when a
+    # base was NAMED and is missing — that refusal already fires from check_release_number on
+    # the identical condition, and a second copy of it would refuse one push with two
+    # paragraphs saying the same thing.
+    [[ -n "$base" ]] || return 0
+    # The BASE is what decides whether this applies, and only the base. Asking the pushed
+    # commit as well — the way the number check does, correctly, since a deleted CHANGELOG
+    # cannot collide with anything — would make DELETING the file the one edit that passes
+    # silently, which is the largest version of the defect this check exists for. Where the
+    # base has no release notes there is nothing shipped to protect, and this stays quiet.
+    git cat-file -e "$base:$CHANGELOG" 2>/dev/null || return 0
+
+    if ! py=$(find_python); then
+        refuse \
+            "REFUSE: this repo ships release notes ($CHANGELOG) and no Python interpreter is" \
+            "        on PATH, so a rewritten release entry cannot be checked for. An" \
+            "        unrunnable gate is not a passing gate." \
+            "        Install python3, or bypass this one push: git push --no-verify"
+        return 1
+    fi
+
+    out=$("$py" "$stamper" frozen --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
+    rc=$?
+    if (( rc == 2 )); then
+        refuse \
+            "REFUSE: $branch changes or removes the text of a release that has already" \
+            "        shipped, as judged against $base_label:" \
+            "" \
+            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
+            "" \
+            "        This is almost always a CHANGELOG conflict resolved by moving a body" \
+            "        under the wrong heading. Restore the shipped entry from the base and" \
+            "        put your own entry back above it." \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    elif (( rc != 0 )); then
+        refuse \
+            "REFUSE: the released-entry check could not run (exit $rc), so this push of" \
+            "        $branch is unverified rather than clean. An unrunnable gate is not a" \
+            "        passing gate." \
+            "" \
+            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
+            "" \
+            "        The command that failed:" \
+            "            $py $stamper frozen --onto $base --branch $sha" \
+            "" \
+            "        Deliberate? git push --no-verify"
+        return 1
+    fi
+
+    # `limited:` is the stamper saying it had no fork point and therefore compared nothing.
+    # Reported for the same reason the number check reports it: a gate that covered less than
+    # it advertises has to say so, or the weak answer reads as the strong one.
+    if [[ "$out" == limited:* || "$out" == *$'\n'limited:* ]]; then
+        notes+=("released-entry check LIMITED against $base_label — no merge base, so no \
+shipped text to compare with")
+    elif [[ "$out" == waived:* || "$out" == *$'\n'waived:* ]]; then
+        notes+=("$(printf '%s\n' "$out" | grep '^waived:' | head -n1)")
+    else
+        notes+=("no shipped release entry rewritten since $base_label")
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 for index in "${!push_branches[@]}"; do
     branch="${push_branches[$index]}"
     sha="${push_shas[$index]}"
@@ -493,6 +591,9 @@ for index in "${!push_branches[@]}"; do
     fi
     if enabled qb.prePush.releaseNumber; then
         check_release_number "$branch" "$sha"
+    fi
+    if enabled qb.prePush.releaseBodies; then
+        check_release_bodies "$branch" "$sha"
     fi
 done
 

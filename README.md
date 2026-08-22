@@ -797,6 +797,7 @@ scripts/release_stamp.py preflight        # what it would take, read-only
 scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
 scripts/release_stamp.py apply --major    # …as v3 rather than v2.34
 scripts/release_stamp.py check            # nothing unstamped, no number used twice
+scripts/release_stamp.py frozen           # no shipped entry's text was rewritten
 ```
 
 `assemble` needs `--title` only past one fragment; a lone fragment lends the release its own
@@ -874,6 +875,47 @@ claim on v2.34 never kept v2.34 free, and what it left instead was a table of nu
 for every PR still open. A namespace nobody claims in does not need an allocator, and a stale record
 of one is worse than none — it is a second answer to a question that has one, which is exactly the
 defect #172 is about. Nine releases landed in a day off `apply` alone, with no collisions.
+
+### A released entry is immutable
+
+Once a number is stamped and merged, that entry is finished. It says what was broken or
+missing before that release, which is the part no diff recovers, so a branch rewriting it is
+destroying the only copy — and doing it behind headings that still read perfectly.
+
+That is not hypothetical. A CHANGELOG conflict on `feat/issue-232` was resolved by moving the
+branch's own 133-line entry **under `## v2.59`**, on top of that release's notes. It was
+pushed, and sat on an open PR for two days, and every guard here was green: they all read this
+file as a list of headings, and every heading was present, unique and in the right order. A
+landing agent caught it by diffing the bodies by hand (#325).
+
+`scripts/release_stamp.py frozen` asks it as a machine question. For every `## vX[.Y]` entry
+present at both the **merge base** and the commit being judged, the whole slab — heading line
+and body — must be byte-identical; an entry that has vanished is a refusal too. The merge base
+is the same third reference point the collision check uses and for the same reason: it
+separates what this branch did from what it merely inherited, so a branch that is behind is
+never asked about releases that landed while it was open. There is no stored digest to
+maintain and nothing extra for a merge to conflict over — the shipped text is in git already,
+where a bad resolution cannot reach it.
+
+It runs in `harness/githooks/pre-push` on every push and in the `frozen` CI job on every pull
+request. Both are safe to require, because a branch that does not touch a released entry
+passes by construction and `## vNEXT` carries no number and is invisible to it. What it does
+**not** see: a corruption that has already landed on `main` (the merge base moves with it, so
+the window is the one PR carrying it), a commit pushed straight to `main` after the fact, and
+anything outside a numbered entry — the file's preamble is living documentation and is edited
+on purpose.
+
+Fixing a typo in a shipped entry is legitimate and rare, so it is declared rather than
+bypassed. Put a trailer on a commit of the branch, where a reviewer sees it:
+
+```
+Release-Body-Edit: v2.59
+```
+
+A real git trailer, in the block at the end of the message — the refusal prints a pasteable
+copy of that line, and a commit body quoting the refusal is not consent to it. It is read from
+`base..HEAD` only, so it expires with the merge it was written for; nothing carries a
+permanent exemption forward.
 
 For the same reason **test files are named after what they test, not after the release that shipped
 them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A version in a filename is a
@@ -1415,6 +1457,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.83** — a push that would break the migration graph or the release numbering is refused before
   it leaves the machine.
 - **v2.84** — a repository spelt with capitals is the same repository.
+- **v2.85** — a shipped release's notes cannot be quietly replaced by a merge resolution.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

@@ -396,3 +396,48 @@ jobs:
 
       - name: Check every release on main carries a number
         run: python3 scripts/release_stamp.py check
+
+  frozen:
+    name: no shipped release entry was rewritten
+    # `pull_request` only, and — unlike `stamped` above — that makes this one SAFE to
+    # require: it reports on every pull request, which is the event branch protection
+    # gates on. It is skipped on push-to-main for a mechanical reason rather than a
+    # policy one. The check is fork-relative, and on main the merge base with
+    # `origin/main` is HEAD itself, so there is nothing left to compare; the guard for a
+    # commit going straight to main is `harness/githooks/pre-push`, which asks the same
+    # question before the push, while `origin/main` is still behind.
+    #
+    # It cannot cry wolf, which is the property the `stamped` job's comment above says a
+    # PR-triggered check has to have. A branch that does not touch a released entry's text
+    # passes by construction, and the only way to make it red is to change or delete the
+    # notes of a release that already shipped — which is never something a correct branch
+    # does. `## vNEXT` carries no number and is invisible to it, so a release PR is not a
+    # special case here the way it is for `stamped`.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0`. The whole question is what the CHANGELOG said at the commit this
+      # branch forked from, and the default depth-1 checkout has no fork point at all — the
+      # check would report `limited:` and pass on every run, which is the shape of a job that
+      # reports green while verifying nothing. Depth 0 is also what puts `origin/main` in the
+      # clone: checkout's shallow fetch takes the PR ref alone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Against the branch this PR TARGETS, not against main by name: a stacked PR onto an
+      # epic integration branch would otherwise be judged against a base it is not merging
+      # into. HEAD here is the merge commit GitHub builds for the PR, which is exactly what
+      # would land, so a corruption introduced by the merge itself is caught as well as one
+      # committed on the branch.
+      - name: Check no released CHANGELOG entry changed
+        # Through the environment, never interpolated into the script body. A branch name
+        # arrives from whoever opened the pull request, and `${{ }}` substitution happens
+        # before bash ever sees the line — so a `${{ github.base_ref }}` spliced into the
+        # command is that person's text executing on this runner. As an env var it is data.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_stamp.py frozen --onto "origin/$BASE_REF" --branch HEAD
