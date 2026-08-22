@@ -151,6 +151,103 @@ from the two order columns on read, because a stored copy is free to disagree wi
 it came from, which is the failure #232 names when it says a planner must never regenerate
 from its own prior output.
 
+## v2.70 — the same defect twice, so the third attempt has nowhere to put it
+
+v2.23 recorded which FILES a PR touched and shipped no query over them. That was deliberate and
+it is the whole story of this release: the query had been written twice and pulled twice, and a
+four-seat panel found the **same defect** in both rounds — with round 2's instance introduced by
+round 1's fix.
+
+| round | the bug | the shape |
+|---|---|---|
+| r1 (`88-F06`) | a rival was answered for by its newest **file-bearing** run | filter on *has files*, **then** pick newest |
+| r2 (`88-F01`) | a rival was answered for by its newest **OPEN-state** run | filter on *state*, **then** pick newest |
+
+Both reproduced against the running endpoint. In r2's case a rival panelled while OPEN, merged,
+then re-panelled after the merge came back in `collides` with `pr_state: "OPEN"` from the stale
+run — while the docstring written in that same commit said "a PR is represented by its newest run
+outright". `88-F07` is the same disease from the other side: r1's fix made "has a file list" true
+when `changed_files_total IS NOT NULL`, so a rival claiming 2,500 files with none stored passed the
+predicate, contributed no join rows, and was silently absent from **both** `collides` and the
+unanswered list — read by a caller as "answered, and disjoint".
+
+**One premise sits behind all three:** that the rival population can be narrowed by filters composed
+at query level, with the newest-run selection as just another filter in that composition. It cannot.
+Any predicate placed in front of the selection resurrects a run the board has already superseded,
+and any "is this answerable" test evaluated apart from "did it actually contribute paths" lets a
+rival vanish. Per #67 that was reported rather than patched a third time (#101), and this is the
+redesign it was reported for.
+
+**Select first, classify second.** `GET /review/collisions` runs one unconditional
+`DISTINCT ON (pr)` per rival — this repo, this window, and nothing else — which is each rival's
+newest run, full stop. Every other question is asked afterwards, per *selected* run, in
+`app/collisions.py`: a pure ladder, no I/O, taking an already-selected run and returning exactly one
+of five classes. A predicate written into it cannot change which run answers for a PR, because by
+the time it runs the run is chosen. `include_closed` and `exclude_drafts` therefore reclassify
+rather than un-filter.
+
+The five classes, and the reason it is five rather than three:
+
+- **`collides`** — shares at least one path. A *floor* on the overlap wherever the rival's own list
+  is a prefix, never a ceiling.
+- **`partial`** — answerable, shares nothing, and not shown to be complete: its
+  `changed_files_total` says the stored list is a prefix, or nobody counted at all. It may overlap
+  on files it never reported, so it can never be called disjoint. `88-F07` lands here by
+  construction.
+- **`unanswerable`** — its newest run recorded no file list (every pre-v2.23 run). Not disjoint:
+  unanswered.
+- **`excluded`** — its newest run saw it merged, closed, or drafted when the caller asked for
+  drafts to be set aside. `excluded_because` says which.
+- **`disjoint`** — counted, complete, sharing nothing.
+
+`counts` reports all five against `considered`, so a caller can check the partition rather than
+trust it — and `considered` is counted from the selected rows, not summed from the buckets, so the
+two agreeing is a real assertion about the ladder. **Absence stops being representable**, which is
+what makes this class of bug impossible rather than fixed twice.
+
+`disjoint` is the only bucket that is a safety claim, and the only one with a completeness test in
+front of it. A list nobody counted cannot earn it: nothing says an uncounted list is a prefix and
+nothing says it is not, and granting the safe verdict from evidence that never attested to it is
+exactly the failure mode above, one rung down. The subject's own `files_complete` is the same guard
+one level out — a subject holding 1 of 2,500 paths under-reports its *own* collisions, and no
+per-rival verdict can see that from the other side of the join, so a caller reads it before
+trusting anything in `disjoint`.
+
+Two limits are in the **response**, not only in the docs, because neither is discoverable from the
+numbers. The population is *PRs this board has panelled within the window*: a PR nobody ever ran a
+panel on leaves no row and cannot be reported at all, so an empty `collides` means "none of the PRs
+I have seen" and never "none exist" (#80's to close; and #94 means a *skipped* run never reaches
+the board, so merges and format-the-world commits are invisible in both directions). And every cap
+says what it dropped, per class — `88-F04`'s point, since the unanswered list is by construction the
+*larger* one, `days=3650` is a permitted argument, and an automated lander issues this in a loop.
+Per-row shared paths are capped the same way, with the shared *count* never trimmed, because that
+count is what a ranking function weighs by (#232).
+
+Two things that are deliberately not symmetrical, both tested rather than only commented:
+
+- **The subject falls back through earlier runs to find a file list; a rival never does.** A caller
+  naming a PR is asking about *that* PR, so "404, its last round recorded nothing" serves nobody
+  when an earlier round recorded a good list. For a rival the same fallback substitutes stale data
+  into an answer nobody asked to be approximate. The subject's `run_id`/`ts` come back so its
+  fallback is visible; a rival's staleness would not be. And the fallback takes the newest run that
+  recorded *a* list, never the newest that recorded a *complete* one — reaching for the better list
+  would be this endpoint's own disease inside its one sanctioned exception.
+- **The window bounds rivals, not the subject.** `days` says which rivals are current enough to
+  matter, not how far back the board may look to learn what the subject itself touches.
+
+`88-F02` — "`DISTINCT ON` is PostgreSQL-only" — is resolved as **not a defect**, and its history is
+worth more than its verdict. This service has never been able to run on anything but Postgres:
+migration `0001` creates a `plpgsql` function and a `NOTIFY` trigger, `LISTEN/NOTIFY` *is* the SSE
+live leg, 11 of 16 migrations use Postgres-only DDL, and `JSONB`, `postgresql.UUID` and
+`ON CONFLICT` are used throughout. The finding came from a code comment repeating a round-1
+reviewer conjecture that all four seats had declared unverifiable — a round's guess became a
+comment became the next round's premise. `DISTINCT ON` costs nothing that has not been paid ten
+times over since the first commit.
+
+The three regressions were each confirmed to fail against the pre-fix behaviour before being
+committed, per v2.58: r1's by putting the has-files predicate back in front of the selection, r2's
+by putting the state predicate there, and `88-F07`'s by removing the `partial` rung.
+
 ## v2.69 — the review loop becomes usable
 
 ### the landing queue stops being advice and starts being a verdict
