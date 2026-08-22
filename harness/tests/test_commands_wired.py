@@ -40,7 +40,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: `nix build .#checks.<system>.prose-consistency-tests` installs; a read nobody installed does
 #: not FAIL there, it ERRORS on a missing file, which is #163's mechanism and how four suites
 #: before this one sat red in a check no workflow runs (#246, #251, #257).
-READS = frozenset({"harness/commands", "harness/hm-module.nix"})
+#:
+#: `.github/workflows/tests.yml` and `harness/loops/preland.py` arrived with the landing-hazards
+#: guards at the end of this file: the hazards section points a lander at a CI job by id and at
+#: preland's refusal sentence, and a pointer is only worth writing while it resolves. Reading the
+#: workflow is what makes a renamed job a failure here rather than a page quietly citing a check
+#: that will never appear in anybody's PR. `harness/loops` is already a sandbox TREE (it has to be
+#: importable for a sibling suite), so only the workflow needed a new install line.
+READS = frozenset({"harness/commands", "harness/hm-module.nix",
+                   "harness/loops/preland.py", ".github/workflows/tests.yml"})
 
 
 def _at(rel: str) -> Path:
@@ -629,3 +637,207 @@ def test_the_landing_claim_is_taken_on_a_bounded_ttl(name: str):
     assert "--ttl" in claim.group(1), (
         f"{name} takes the landing claim on the board's default hour, so a session that dies "
         "between the claim and the merge blocks every land onto that base for an hour")
+
+
+# --------------------------------------------------- the landing hazards (#367)
+#
+# `fix-and-land.md` covered the decisions and said nothing about what goes wrong while you
+# carry them out, so nine landings on 2026-08-22 were each briefed by hand with the same seven
+# warnings and the knowledge went with the session. The section that fixes that is prose, and
+# prose about tooling rots in a way that is invisible from inside the prose: a job renamed in
+# `tests.yml` leaves the page pointing at a guard that does not exist, and pointing at nothing
+# reads exactly like pointing at something. These assertions are the anchors, in the same
+# spirit as `test_fixer_escalation.py`'s — they check that what the page points AT is still
+# there, and deliberately not that any of it is good advice.
+
+#: The heading the section lives under, and therefore the token every pointer at it uses.
+#: One string because three files spell it: the in-file link at the top of `fix-and-land.md`,
+#: and the two review commands that point here rather than carrying a copy.
+HAZARDS_HEADING = "The hazards"
+
+#: The pointer shape the guarded list uses — ``the `frozen` job, *"no shipped release entry
+#: was rewritten"*`` — parsed rather than listed here, so a guard added to that list in the
+#: same shape is checked without anybody remembering to extend this file. Whitespace is
+#: collapsed before matching because a quoted job name wraps across lines in the markdown.
+_GUARD_POINTER = re.compile(r"the `(?P<job>[a-z][a-z-]*)` job, \*\"(?P<name>[^\"]+)\"\*")
+
+#: One job's `name:` in the workflow, keyed by its id. `^  <id>:` is a top-level job; the
+#: `name:` that follows before the next such line is that job's display name, which is the
+#: string a reader sees in the PR's checks list and therefore the string worth quoting.
+_JOB = re.compile(r"^  (?P<id>[a-z][a-z0-9-]*):\n(?P<body>(?:(?!^  \S).*\n)*)", re.MULTILINE)
+_JOB_NAME = re.compile(r"^    name: (?P<name>.+)$", re.MULTILINE)
+
+
+def _squashed(text: str) -> str:
+    """Whitespace collapsed, so a sentence that wraps in markdown still matches one that wraps
+    in Python. Quote characters go with it: `preland.py` writes its refusals as adjacent string
+    literals, so the sentence a reader sees has `" "` seams in the source that no reader has."""
+    return re.sub(r"[\"\s]+", " ", text)
+
+
+def _hazards() -> str:
+    """`fix-and-land.md` from the hazards heading to the end of the file."""
+    text = command("fix-and-land")
+    marker = f"\n## {HAZARDS_HEADING}\n"
+    at = text.find(marker)
+    assert at >= 0, (
+        f"fix-and-land.md has no `## {HAZARDS_HEADING}` section. Every assertion below would "
+        "then be about an empty string, and three files point at that heading by name (#367)")
+    return text[at:]
+
+
+def _workflow_jobs() -> dict[str, str]:
+    text = _at(".github/workflows/tests.yml").read_text(encoding="utf-8")
+    jobs = {m["id"]: (_JOB_NAME.search(m["body"]) or {"name": ""})["name"]
+            for m in _JOB.finditer(text)}
+    assert len(jobs) > 3, "no jobs were parsed out of tests.yml — the shape has changed"
+    return jobs
+
+
+#: #367's own grep, split back into the four things it was looking for. As one alternation it is
+#: satisfied by `#260` alone — Codex's finding, and a fair one: a section that dropped three of
+#: the four traps would still match. Each branch is therefore asserted separately, and the names
+#: are the failure message.
+_MEASURED = {
+    "the --delete-branch cleanup failing from a worktree": r"delete-branch[\s\S]*worktree",
+    "#260 itself, by number": r"#260",
+    "the host-specific artefact, in the words the grep looked for": r"host artefact",
+    "two concurrent pytest runs": r"concurrent[\s\S]{0,80}pytest|pytest[\s\S]{0,80}concurrent",
+}
+
+
+@pytest.mark.parametrize("what", sorted(_MEASURED))
+def test_the_hazards_answer_the_measurement_that_filed_them(what: str):
+    """#367 was filed on a grep that returned nothing across every command brief on this fleet,
+    and the fix is only real while that grep returns this file. Asserted as the issue's own
+    pattern rather than as "the words are there", because the words are what a rewrite moves and
+    the measurement is what the rewrite has to keep answering."""
+    assert re.search(_MEASURED[what], _hazards(), re.IGNORECASE), (
+        f"the hazards section no longer covers {what}, which #367's measurement looked for. That "
+        "grep returned zero when the issue was filed; a rewrite that drops one trap puts part of "
+        "it back to zero without any other check noticing")
+
+
+def test_every_guard_the_hazards_point_at_is_still_a_job_in_the_workflow():
+    """A trap with a mechanism gets one line naming the mechanism instead of a paragraph
+    restating the trap — which is only worth doing while the name resolves. A renamed job leaves
+    the page telling a lander to read a check that will never appear in its PR's list, and that
+    failure is silent from both ends: CI is happy, and the sentence still parses."""
+    jobs = _workflow_jobs()
+    pointers = list(_GUARD_POINTER.finditer(_hazards()))
+    assert len(pointers) >= 3, (
+        "fewer than three guard pointers were parsed out of the hazards section, so this check "
+        "is green about almost nothing — #325, #351 and #365 each landed one")
+    for m in pointers:
+        job, quoted = m["job"], m["name"]
+        assert job in jobs, (
+            f"the hazards section points at a `{job}` job, and .github/workflows/tests.yml has "
+            f"no such job — it has {sorted(jobs)}. A lander told to read that check will never "
+            "see it report")
+        assert _squashed(quoted) in _squashed(jobs[job]), (
+            f"the hazards section quotes the `{job}` job as {quoted!r}, but the workflow names "
+            f"it {jobs[job]!r}. The quoted string is what a reader matches against the checks "
+            "list on the PR, so a stale one sends them looking for a check that is right there")
+
+
+def test_the_ci_state_the_hazards_name_is_still_the_state_preland_refuses_on():
+    """#324's guard is a word — `blocked` — and the value of the one-line pointer is that a
+    lander reading "no checks at all" knows there is a state for it and what preland says. Both
+    halves have to survive: the vocabulary in `qbdata.CI_STATES`, and the refusal sentence the
+    page quotes, which is the text the lander will actually be looking at."""
+    source = _at("harness/loops/preland.py").read_text(encoding="utf-8")
+    preland = _squashed(source)
+    hazards = _hazards()
+    assert "qbdata.CI_STATES" in hazards, (
+        "the hazards section stopped naming the vocabulary #324 landed, so the pointer says a "
+        "guard exists without saying where to read it")
+    # Codex, round 1: naming the vocabulary is not the same as the state still being in it. The
+    # page's whole claim is that `blocked` is the word for a run that will never report, so the
+    # refusal table keyed on `qbdata.CI_STATES` has to still have that key — a state deleted
+    # there leaves the page describing a distinction the gate can no longer draw.
+    refusals = re.search(r"^CI_REFUSALS = \{$(?P<body>.*?)^\}$", source, re.MULTILINE | re.DOTALL)
+    assert refusals, "preland.py no longer defines CI_REFUSALS as a top-level dict literal"
+    assert '"blocked":' in refusals.group("body"), (
+        "preland's CI_REFUSALS has no `blocked` key, so the state #324 landed is gone and the "
+        "hazards section is describing a distinction nothing draws any more")
+    quoted = re.search(r"\*\"(CI will not run without a human[^\"]+)\"\*", hazards)
+    assert quoted, "the hazards section no longer quotes preland's refusal for a gated run"
+    assert _squashed(quoted.group(1)) in preland, (
+        "the hazards section quotes a refusal sentence preland.py does not contain. The point "
+        "of quoting it is that a lander can match the words in front of it against this page")
+
+
+def test_the_closing_keyword_check_is_the_graphql_query_and_never_a_grep():
+    """#374's whole finding is that the check everyone reaches for does not work: GitHub's
+    parser ignores negation, so `close #371` inside "this does not close #371" is a closing
+    reference and a keyword grep reads the sentence as a disclaimer. The runnable block has to
+    be the authoritative query, because what an agent copies is the fenced text."""
+    hazards = _hazards()
+    # Codex, round 1: the identifier appearing anywhere in any fence proves nothing — a passing
+    # mention in an unrelated block would satisfy it. What the reader copies is one block, so the
+    # block that names the field has to be the `gh api graphql` call that fetches it.
+    blocks = re.findall(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", hazards, re.DOTALL | re.MULTILINE)
+    queries = [b for b in blocks if "closingIssuesReferences" in b]
+    assert queries, (
+        "the hazards section describes the closing-keyword trap without a runnable "
+        "`closingIssuesReferences` query — leaving a reader to invent the check, which is how "
+        "#374 happened twice in one day")
+    assert any("gh api graphql" in b and "pullRequest" in b for b in queries), (
+        "the block naming `closingIssuesReferences` is not a `gh api graphql` query against a "
+        "pull request, so the thing an agent copies out of this section is not the check. The "
+        "whole finding of #374 is that the obvious check — a grep — gives the wrong answer")
+    assert "#374" in hazards, (
+        "nothing points at #374, so a reader cannot tell whether a CI guard has since landed "
+        "and made this section background rather than procedure")
+
+
+def test_the_host_specific_trap_is_fenced_off_from_the_permanent_ones():
+    """The half of #367 that is easy to get wrong. #260 and the dcg refusals are properties of
+    tools and will be true on the next box; the failing claim test is a property of THIS box's
+    PATH and will read as nonsense elsewhere. A page that mixes them ages badly and then gets
+    distrusted whole — so the host-specific one lives under its own heading, below everything
+    permanent, and carries the date it was checked."""
+    hazards = _hazards()
+    artefact = "test_a_missing_qb_claim_does_not_abort_the_run_under_set_e"
+    heading = re.search(r"^### (?P<title>.*this box.*)$", hazards, re.MULTILINE | re.IGNORECASE)
+    assert heading, (
+        "the hazards section has no heading marking which trap is a property of this machine "
+        "rather than of the tools, so a reader on another box cannot tell what to ignore")
+    assert re.search(r"\d{4}-\d{2}-\d{2}", heading.group("title")), (
+        "the host-specific heading carries no date. It is a claim about one machine's PATH, and "
+        "the date is what tells a later reader how much to trust it")
+    at = hazards.find(artefact)
+    assert at > heading.start(), (
+        f"{artefact} is named at or above the host-specific heading. It fails here and passes "
+        "in CI because this box has qb-claim on PATH — filed among the permanent traps it reads "
+        "as a defect in the repo")
+
+
+@pytest.mark.parametrize("name", ("review-pr", "panel-review-pr"))
+def test_the_review_commands_point_at_the_hazards_rather_than_carrying_a_copy(name: str):
+    """Two copies of a document is the thing this repo has re-learned twice: they agree until
+    somebody edits one, and then the stale one is indistinguishable from the current one. Both
+    commands merge from the same worktrees on the same box, so they need the same warnings —
+    by reference, and the reference has to name the heading it lands on."""
+    text = command(name)
+    assert HAZARDS_HEADING in text and "fix-and-land" in text, (
+        f"{name}.md does not point at fix-and-land.md's `{HAZARDS_HEADING}` section, so an agent "
+        "landing through this command gets none of it")
+    assert "closingIssuesReferences" not in _fenced(text), (
+        f"{name}.md carries its own copy of the closing-reference query. One copy, in "
+        "fix-and-land.md — a second drifts, and a drifted copy of a check reads exactly like "
+        "a current one")
+
+
+def test_the_in_file_pointer_at_the_hazards_resolves_to_the_heading():
+    """The steps are what a lander reads on the way in; the hazards are what it needs on the way
+    out, and a page whose only route to them is scrolling to the bottom is a page they are found
+    on the second landing. The link at the top is that route, and a markdown anchor that does not
+    match its heading fails silently — it lands the reader at the top of the file."""
+    text = command("fix-and-land")
+    link = re.search(r"\[[^\]]+\]\(#(?P<anchor>[a-z0-9-]+)\)", text)
+    assert link, "fix-and-land.md's steps no longer link to the hazards section at all"
+    slug = re.sub(r"[^a-z0-9]+", "-", HAZARDS_HEADING.lower()).strip("-")
+    assert link.group("anchor") == slug, (
+        f"the pointer links to #{link.group('anchor')} and the heading slugs to #{slug}, so it "
+        "silently lands the reader at the top of the file instead")

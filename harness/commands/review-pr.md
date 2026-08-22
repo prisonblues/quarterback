@@ -715,6 +715,14 @@ issue in `deferred_to`.
 `gh pr merge --merge --delete-branch` — preserve individual commits; never
 squash; delete the remote branch after.
 
+**Read `fix-and-land.md`'s *The hazards* section before you act on anything that
+looks like a failure here.** It is one copy, not a second one: `--delete-branch`
+failing its cleanup from a worktree while the merge lands, a body whose "does not
+close #N" closes #N, impossible-looking test failures that are a concurrent pytest,
+and the two refusals that meet a lander trying to undo a change. Everything on that
+page applies to this path too — this command merges from the same worktrees, on the
+same box, against the same GitHub.
+
 Then hand back the claim on the issue the PR closes: `qb-release issue <n>` (#337).
 `create-worktree` took a `kind=work` claim on it at checkout — held by the machine,
 no session, 8h TTL — and merging a PR does not touch it; on 2026-08-22 four issues

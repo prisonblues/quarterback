@@ -1743,6 +1743,8 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3** — the release number gets an allocator, and it is a git tag.
 - **v3.1** — the review loop starts measuring whether its fixes are getting anywhere.
 - **v3.2** — a release gets its tag on a machine that has never been told who it is.
+- **v3.3** — the landing procedure now says what goes wrong, not only what to decide.
+- **v3.4** — a PR body saying "this does not close #N" no longer closes #N.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

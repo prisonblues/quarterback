@@ -17,6 +17,73 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.4 — a PR body saying "this does not close #N" no longer closes #N
+
+GitHub's closing-keyword parser does not understand negation. PR #372 opened with **"This
+does not close #371 — see the bottom"**, the parser matched the literal `close #371`, and
+`closingIssuesReferences` listed the issue the PR existed to keep open; a keyword grep over
+that body returned exactly one hit and it read, to a human, as a disclaimer. PR #363 nearly
+did the same to #63 the same day. PR #243 had already done it to #165 two days earlier, at
+02:06:11 on 2026-08-20, one second after it landed, and nobody noticed until the survey
+written for this change went looking.
+
+A new `closing-refs` job compares two facts a machine can see, neither of them prose: the
+issues GitHub says the merge will close, read from `closingIssuesReferences`, against the
+reference lines in the branch's own commits. A branch whose commit says `Refs #N` and whose
+pull request would close #N is refused; a closing keyword anywhere in the range settles it;
+a branch that never mentions the issue is not refused, which is most of them.
+
+An issue the merge would close that no commit on the branch names at all is not refused —
+#207 closed #174 on a body keyword alone and was right to — but it is reported as
+`unclaimed:` and the job raises a `::warning::` for it. That gap is not theoretical: the
+first body of the pull request adding this check closed three issues it did not mean to,
+because it was a body about closing keywords and quoted them next to real numbers.
+
+It has no waiver trailer, deliberately. The remedy is to make the branch and the pull
+request agree — `Fixes #N` on a commit, or a body reworded until GitHub stops linking the
+issue — and both are one line and both re-trigger the check, which is why the job carries the
+`edited` trigger and lives in its own workflow file rather than in `tests.yml`.
+
+What it cannot see is stated in the script rather than left to be discovered: #363's original
+state, where the commit said `Fixes #63` and GitHub agreed, so the contradiction existed only
+against the PR's prose. `harness/commands/fix-and-land.md` now carries the GraphQL query for
+that case, where the landing agent reads.
+
+## v3.3 — the landing procedure now says what goes wrong, not only what to decide
+
+`fix-and-land.md` was 320 lines about decisions — the merge queue, `kind=merge`, the confidence
+gate, the escalation path — and said nothing about the hazards. So the hazards travelled by
+prompt. Nine PRs were landed by agents on 2026-08-22 and every one of them was briefed by hand
+with the same warnings; by the fifth the same paragraphs were being pasted with the issue numbers
+swapped. A grep for any of them across every command brief on this fleet returned nothing.
+
+The brief now carries a **The hazards** section, written from the symptom rather than the cause,
+because a landing that has gone wrong announces itself as an error message. `gh pr merge
+--delete-branch` from a worktree fails its cleanup and reads like a failed merge, when the merge
+has in fact landed and the remote branch is what survived (#260). A PR body saying "this does not
+close #371" closes #371, because GitHub's parser ignores negation and a keyword grep reads the
+sentence as a disclaimer — the check that works is `closingIssuesReferences`, and it is written
+out (#374). Impossible test failures that move between runs are a second pytest against the same
+worktree database, not the PR (#366). `git stash push` and `git checkout HEAD -- <path>` are both
+refused, and each one's advice is the other. And "served version unchanged" is the correct answer
+for a harness-only release, not a failed deploy.
+
+The four traps that have since been mechanised get one line each naming the guard and quoting
+what it says when it fires — `frozen` (#325), `changelog` (#365), `migration-heads` (#351) and
+the `blocked` CI state (#324) — rather than a paragraph restating a trap nobody has to catch by
+hand any more.
+
+Permanent and host-specific are kept apart, which is the half that decides whether the page is
+still trusted next year: everything above is a property of the tools, and the one failing test
+that is a property of *this box's* `PATH` sits under its own dated heading at the bottom.
+`review-pr.md` and `panel-review-pr.md` point at the section rather than copying it.
+
+`test_commands_wired.py` holds the pointers to their targets: a guard named in the page must
+still be a job in `tests.yml` under the id and display name quoted, preland must still refuse a
+gated run in the words the page quotes, the host-specific trap must stay below the host heading,
+and the in-file link must slug to the heading it names. A pointer at a renamed guard reads
+exactly like a pointer at something.
+
 ## v3.2 — a release gets its tag on a machine that has never been told who it is
 
 The job that records a tag for every release on `main` failed the first time it ran, and
