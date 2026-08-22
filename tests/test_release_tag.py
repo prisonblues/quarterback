@@ -441,6 +441,74 @@ def test_an_annotated_tag_reports_the_commit_it_peels_to(repo, capsys):
     assert taken["v2.34"] == where["v2.34"]
 
 
+def no_identity(repo: Path, monkeypatch, blank: str = "") -> None:
+    """Leave this repo in the state a CI runner is in: git can find no name to tag with.
+
+    A runner has no `user.name` and an empty GECOS field, so git auto-detects an email from
+    the login and the host, finds no name at all, and refuses. Reproducing that by *deleting*
+    things would not survive leaving this machine — a developer box has a GECOS name, so the
+    same deletions there leave git perfectly able to tag and the test passes over a bug. The
+    exported empty `GIT_COMMITTER_NAME` is deterministic everywhere and hits the same code in
+    git: `fatal: empty ident name`, the message from run 32601361711 (#379).
+    """
+    git(repo, "config", "--unset", "user.name")
+    git(repo, "config", "--unset", "user.email")
+    monkeypatch.setenv("EMAIL", "runner@runnervm.invalid")
+    for var in ("GIT_COMMITTER_NAME", "GIT_AUTHOR_NAME"):
+        monkeypatch.setenv(var, blank)
+    for var in ("GIT_COMMITTER_EMAIL", "GIT_AUTHOR_EMAIL"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def tagger(repo: Path, name: str) -> str:
+    return git(repo, "for-each-ref", "--format=%(taggername) %(taggeremail)",
+               f"refs/tags/{name}").strip()
+
+
+@pytest.mark.parametrize("blank", ["", " "], ids=["unset", "whitespace"])
+def test_backfill_tags_where_git_has_no_identity_to_tag_with(repo, monkeypatch, blank):
+    """The whole of #379: the `tagged` job runs straight after `actions/checkout` on a runner
+    that has never been told who it is, and an annotated tag cannot be written without a
+    tagger. Two releases landed untagged before anybody noticed, because every other place
+    this command runs — a developer machine, this suite's own fixtures — has an identity
+    already.
+
+    A name of one space is the same nothing: git strips an ident before it judges it, so a
+    fallback that only looks for the empty string leaves that one failing exactly as before.
+    """
+    where = landed(repo, "v2.34")
+    no_identity(repo, monkeypatch, blank)
+
+    assert run(repo, "backfill") == 0
+
+    assert git(repo, "rev-list", "-n1", "v2.34").strip() == where["v2.34"]
+    assert git(repo, "cat-file", "-t", "v2.34").strip() == "tag", "still annotated"
+    assert tagger(repo, "v2.34") == "release_tag.py <release-tag@quarterback.invalid>"
+
+
+def test_backfill_leaves_a_configured_identity_alone(repo):
+    """Filling a gap, not taking over. Where git can name a tagger the tag is FROM that
+    person, exactly as it was before this — a git config is somebody's own answer to this
+    question and the script's is only for where there is none."""
+    landed(repo, "v2.34")
+
+    assert run(repo, "backfill") == 0
+
+    assert tagger(repo, "v2.34") == "t <t@example.com>"
+
+
+def test_backfill_keeps_the_half_of_an_identity_that_is_configured(repo, monkeypatch):
+    """A set `user.name` with no resolvable email is a real shape, and git refuses on it just
+    as flatly. Only the half that is missing gets invented."""
+    landed(repo, "v2.34")
+    no_identity(repo, monkeypatch)
+    git(repo, "config", "user.name", "somebody")
+
+    assert run(repo, "backfill") == 0
+
+    assert tagger(repo, "v2.34") == "somebody <release-tag@quarterback.invalid>"
+
+
 # ---------------------------------------------------------------------------
 # check — the reconciliation
 # ---------------------------------------------------------------------------

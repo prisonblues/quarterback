@@ -1023,6 +1023,12 @@ number is already `stamped`'s red job and there is nothing here to fix. What it 
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
 
+The tags are annotated, so writing one means writing an object, and git will not write an
+object without a tagger. `backfill` supplies one itself where the environment cannot name
+anybody — a CI runner has no `user.name` and no GECOS field to guess from, which is how #379
+cost `v2.99` and `v3` their tags. A resolvable identity is never overridden: where `git var
+GIT_COMMITTER_IDENT` answers, the tag is from whoever ran the command.
+
 ### A released entry is immutable
 
 Once a number is stamped and merged, that entry is finished. It says what was broken or
@@ -1665,6 +1671,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.99** — something acts on a stale harness, and stops one step short of your password.
 - **v3** — the release number gets an allocator, and it is a git tag.
 - **v3.1** — the review loop starts measuring whether its fixes are getting anywhere.
+- **v3.2** — a release gets its tag on a machine that has never been told who it is.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
