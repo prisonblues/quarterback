@@ -1,7 +1,7 @@
 # Agent coding loops — engine
 
-Agent-driven PR loops: a dependabot lander, a multi-reviewer panel, and an epic
-driver. Originally designed in selfhost `issues/open/117-feature-agent-coding-loops.md`,
+Agent-driven PR loops: a dependabot lander, a multi-reviewer panel, an epic
+driver, and an issue watcher that reads the tracker and mostly declines. Originally designed in selfhost `issues/open/117-feature-agent-coding-loops.md`,
 which remains the reference for the *why*. **The gates are the product.**
 
 > **Where this lives.** Source: `harness/loops/` in the quarterback repo, which is
@@ -329,7 +329,8 @@ were filed here in one day, every one a response to something real, which is wha
 makes it a risk rather than a bug.
 
 The policy lives here rather than in the issue watcher (#63) that first wanted it,
-because that watcher is one consumer. The PR watcher (#54), the epic driver and
+because that watcher is one consumer — see [Issue watcher](#issue-watcher-issue_watchpy--63),
+which reads these blocks and adds none of its own. The PR watcher (#54), the epic driver and
 whatever acquires an appetite next want the same brakes, and a brake implemented
 per-consumer is three brakes that will disagree. `appetite.py` reads these blocks
 and answers; nothing else should re-implement the question.
@@ -1574,6 +1575,127 @@ head SHA is where it was) is *reported* rather than failed — finding nothing t
 legitimate, and by the last round it is the point — but it is reported with the agent's
 own last sentence, because it is the same shape as a review that was stopped from
 fixing anything.
+
+## Issue watcher (`issue_watch.py`) — #63
+
+```bash
+python3 ~/.claude/loops/issue_watch.py --repo quarterback            # survey the backlog
+python3 ~/.claude/loops/issue_watch.py --repo quarterback --issue 63 # one issue (exits 3 if held)
+python3 ~/.claude/loops/issue_watch.py --repo quarterback --json     # machine-readable
+python3 ~/.claude/loops/issue_watch.py --repo quarterback --announce --comment
+```
+
+Reads a repo's open issues and says, for each one, **what it is waiting on** — a human
+decision, an open dependency, a triage ruling, or nothing. It writes no code, opens no
+PR and starts no session.
+
+**It reports; it does not act, and that is the deliverable rather than a stage it has
+not reached yet.** #63 measured why: of the twenty-one issues filed here on one day,
+several existed precisely to force a decision, and an agent handed one of those with
+`/fix-issue` does not stop — it picks an architecture, implements it, opens a PR, and
+the decision has been made by whichever model was cheapest that morning. So the refusal
+is the default and acting is what needs justifying. The rung above this one is
+`qb-start` (#277), a per-machine permission that ships off and that a repository cannot
+grant itself; wiring a trigger to it is the follow-up, and it is deliberately not built.
+
+### The two questions, and why they are not one
+
+| | asks | answered by |
+|---|---|---|
+| the gate | may a loop CHOOSE this issue, unprompted? | `appetite.pickup_verdict` |
+| decision owed | has a human settled WHAT TO DO? | the signals below |
+| doable | can a coding agent implement it? | `epic.triage` |
+
+There is **one** pickup gate on the fleet and this is a consumer of it, not a second
+one: `issue_pickup.enabled` is off, `only_labels` and `allowed_authors` are empty, and
+nothing here relaxes any of that. `epic.triage` is reused whole — the same
+`(doable, reason, impl_model, human_class)` verdict, with the same `doable=None` meaning
+*no judgement was possible*, treated as not-confirmed. What triage does not answer is
+whether a **human** has decided, and #63's own example is that #51 was perfectly
+implementable and must not have been implemented.
+
+### The signals that a decision is owed
+
+Six, and each carries the evidence for it — "a decision is owed" with nothing behind it
+costs somebody an interruption, which is the rule `needs_human.announce` already applies
+to a flag with no reason.
+
+| signal | fires on |
+|---|---|
+| `needs_human_label` | a `needs-human/*` label, via `appetite.refusal_verdict` (not a second reading of `skip_labels`) |
+| `open_questions` | an *Open questions* heading — a section, not the phrase in a sentence |
+| `unrecommended_options` | two or more `Option X` and nothing in the thread that reads as a ruling |
+| `unanswered_question` | the newest utterance asks something and nothing follows it |
+| `open_dependency` | `depends on #N` / `blocked by #N` / `once #N lands` (`epic.DEP_RE`) where #N is not closed |
+| `decision_shape` | the title is a question, or a question in the body puts a choice |
+
+They are deliberately eager: a false positive costs a report line a human waves through
+and a false negative costs an unwanted PR against a question nobody answered. Two places
+where that eagerness is bounded rather than indulged, both because a signal that fires on
+most of the backlog says nothing about the six issues that matter — a choice phrase must
+appear inside a **question** (`which of the` turns up in ordinary description), and code
+fences are stripped first (a traceback holds question marks; a config sample holds the
+word "option"; the one issue class this exists to let through is the one with a good
+repro).
+
+**Anyone's text may RAISE a signal; only an allowlisted author's may SETTLE one.**
+The allowlist bounds who may open an issue that drives an agent, but anyone can comment
+on anybody's issue — so without this asymmetry "**Decided:** option B" is a sentence a
+stranger can write on a public repo to take the brake off, and a reply of any kind
+underneath a question closes it. Raising a hold costs a report line a human waves
+through; clearing one spends money and writes code, and the two do not get the same
+admission. For the same reason the watcher's **own** comments are not part of the
+conversation: its refusal is the newest thing on the thread and is signed by an
+allowlisted account, so counting it would answer the very question it was posted to
+point out and make the issue actionable on the next run.
+
+A closed issue earns no action whatever the config says. A backlog sweep only ever sees
+open ones, but `--issue 63` names one and `gh issue view` answers about a closed issue
+just as readily.
+
+`skip_when_unlabelled` deliberately does **not** apply to the survey half.  That setting
+answers "may I select this out of an untriaged backlog", which is the gate's question and
+`pickup_verdict` has already asked it; asking it again here would report every unlabelled
+issue as one a human owes a decision on, and bury the ones that do.
+
+### The ladder, and what it costs
+
+Gate → signals → judge, in that order. Only an issue the gate admitted and no signal held
+is shown to a model at all, which is the cost control and the security property at once:
+this repo is **public**, anyone may open an issue, and under a watcher that text becomes
+an agent's instructions. `issue_pickup.allowed_authors` is the mitigation and it is an
+allowlist rather than a filter — a filter is a list of the phrasings somebody already
+thought of. A stranger's issue is surveyed and reported and its text never reaches a
+judge.
+
+At the end of the ladder the watcher names an action; it does not run one.
+`/investigate` is the default rung and `/fix-issue` the escalation, because
+`/investigate` produces understanding and writes no code, so it is the safer answer
+whenever the choice is close. Escalating wants evidence that somebody wrote down what
+"fixed" means — an *Acceptance*, *Steps to reproduce* or *Expected/Actual* heading.
+
+### Saying so
+
+`--announce` posts a held issue to the board through `needs_human.announce` (one door for
+every escalation the harness raises, #274); `--comment` says the same thing on the issue,
+where the person who can answer it is already looking. Silence is indistinguishable from
+a broken watcher, which was #63's diagnosis of half the tracker.
+
+Both are opt-in flags and both are bounded:
+
+- Only an issue a **signal** held. A gate refusal is the repo's standing answer, not a
+  question about this issue — announcing one per issue would post the whole backlog the
+  first time a watcher ran.
+- Only an issue whose **author is on the allowlist**. Commenting does not need
+  `issue_pickup.enabled` (saying what an issue is waiting on chooses no work), but it does
+  need `allowed_authors`: a stranger who could make the watcher comment could make it
+  quote them under the repo owner's account, a thousand times.
+- Not under `HARNESS_UNATTENDED=1` unless `issue_filing.unattended` says so — the setting
+  a repo has already answered "may a loop write here with nobody watching" with, rather
+  than a second switch that would come to disagree with it.
+- Never twice for the same thing: the comment carries a digest of its signals, so an
+  issue whose questions get answered and replaced is a new thing to say rather than a
+  suppressed one.
 
 ## Pre-land verdict (`preland.py`)
 
