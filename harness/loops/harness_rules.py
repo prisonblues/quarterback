@@ -2201,13 +2201,28 @@ def resolve_repo(spec: str | None, *, from_default_branch: bool | None = None) -
     for what its providers will actually serve. A repo with only the legacy tracked
     `.harness-rules` resolves exactly as it always did.
 
+    "Its rules file" is now also NOT a file, for the dials a board may state: see
+    the THIRD LAYER section above. The precedence is
+    `DEFAULTS -> sample -> per-box overlay -> board`, the board applies LAST, and
+    every dial's answer names the layer that gave it.
+
     The returned dict is the same shape the old load_repo_cfg() produced, so
-    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged. Two private
+    callers read `cfg["github"]`, `cfg["loops"][...]` etc. unchanged. Five private
     fields describe the read itself: `_rules_from` is the human sentence
     `describe()` prints, and `_rules_baseline` is the FILENAME that supplied the
     baseline (`""` for none), which is what a caller gates on — the panel refuses to
     review a repo nobody configured, and a defaults-only review is one nobody
-    configured.
+    configured. `_rules_unreadable` says the baseline is empty because the branch
+    could not be READ.
+
+    `_dials` is the per-dial provenance table — `{path: {value, layer, source, …}}`
+    for every dial in the resolved config — and it is the answer to "which layer
+    said so", which used to be an inference from three files and a resolution order.
+    `_dials_from` names where the board layer was read (`""` on a box that is on no
+    board) and `_dials_unreadable` says the board is configured HERE and did not
+    answer, which is a different fact from there being no dial and has a different
+    remedy — a flag rather than something a caller greps out of the blurb, for the
+    reason `_rules_unreadable` is one.
     """
     if from_default_branch is None:
         from_default_branch = unattended()
