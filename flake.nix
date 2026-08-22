@@ -545,6 +545,19 @@
               board.tokenCommand = "cat /run/secrets/tok";
             };
 
+            # #277's spawn switch. `spawning` is a host that has opted in; `wired` is
+            # every host that has not, which is the state that has to stay free.
+            spawning = with' {
+              enable = true;
+              board.url = "https://board.example";
+              board.tokenCommand = "cat /run/secrets/tok";
+              spawn = { enable = true; commands = [ "/fix-issue" ]; maxSessions = 2; };
+            };
+            badSpawn = with' {
+              enable = true;
+              spawn = { enable = true; commands = [ "/anything-i-like" ]; };
+            };
+
             act = c: c.home.activation.quarterbackClaudeWiring;
           in
           pkgs.writeText "quarterback-hm-module-eval" (builtins.toJSON {
@@ -614,6 +627,35 @@
               (disabled.home.file == { } && disabled.home.activation == { }
                 && disabled.home.packages == [ ])
               "the module writes something with enable = false";
+            # AC (#277): "on a machine with spawning disabled — the default — a spawn
+            # request is refused and changes nothing". The ABSENCE of the file is what
+            # off means, so this asserts what is NOT produced: a host that has not opted
+            # in has nothing on disk for qb-start to misread, and no tmux pulled in for a
+            # capability it does not have.
+            noSpawnPolicyByDefault = expect
+              (!(has wired.xdg.configFile "quarterback/spawn.json"))
+              "the module renders quarterback/spawn.json on a host that never enabled spawning, which is the one file whose presence means yes";
+            spawnIsOffWithoutTmux = expect
+              (!(builtins.elem pkgs.tmux wired.home.packages))
+              "a host that cannot spawn is still made to carry tmux for it";
+            # And when a machine does opt in, what it opted into is what lands.
+            spawnPolicyRendered = expect
+              (let text = spawning.xdg.configFile."quarterback/spawn.json".text; in
+                pkgs.lib.hasInfix "\"enabled\":true" text
+                && pkgs.lib.hasInfix "\"/fix-issue\"" text
+                && pkgs.lib.hasInfix "\"max_sessions\":2" text)
+              "the spawn policy does not carry what the options say, so qb-start reads something other than the module";
+            spawningPullsInTmux = expect
+              (builtins.elem pkgs.tmux spawning.home.packages)
+              "a machine that may spawn has no multiplexer to spawn into — a spawn IS a tmux window";
+            # An unspawnable command is an eval error naming the option, rather than a
+            # refusal on a box nobody is watching.
+            unknownSpawnCommandIsRefused = expect
+              (builtins.any (a: !a.assertion) badSpawn.assertions)
+              "spawn.commands accepts a command qb-start cannot start, so the refusal happens on the box instead of at the rebuild";
+            knownSpawnCommandsAreAccepted = expect
+              (builtins.all (a: a.assertion) spawning.assertions)
+              "an ordinary spawn.commands trips an assertion";
             # The commands still land, which is what the module did before it did anything else.
             commandsStillLand = expect
               (has wired.home.file ".claude/loops" && has wired.home.file ".claude/commands/fix-issue.md")

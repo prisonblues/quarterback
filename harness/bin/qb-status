@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""qb-status — is that session alive, finished or gone? Both answers, and the gap (#277).
+
+  qb-status                      this session ($CLAUDE_CODE_SESSION_ID)
+  qb-status 24e8ee23-...         another one
+  qb-status --json               the whole answer, both sources side by side
+
+  0  alive     — something is running it
+  1  finished  — it ended, and something said so
+  2  gone      — nothing is running it and nobody reported an ending
+  3  unknown   — cannot tell: no board, no token, an outage
+
+**TWO SOURCES, BECAUSE THEY ANSWER DIFFERENT QUESTIONS.** `qb-dash-tui` has read
+both for a while and its own comment says why: tmux knows whether a PROCESS is
+there, the board knows what the AGENT last said about itself, and neither is a
+substitute for the other. A single "is it alive" that picked one would be wrong
+in whichever direction it picked.
+
+**THE DISAGREEMENT IS THE DIAGNOSIS.** That is the whole of this command, and it
+is what #277 asked for. Each combination is a different fault with a different
+remedy, and before this they all arrived as the same shrug:
+
+    pane running + lease fresh        working, and nothing to say
+    pane running + lease STALE        a long turn (#252). Not stalled: the state
+                                      beacon only moves at turn boundaries, so a
+                                      turn over eight minutes reads as stuck and
+                                      one over thirty drops out of /active
+    pane running + lease ENDED        #263's shape — the conversation ended and
+                                      the pane lives on. A /clear, or a session
+                                      something superseded
+    pane running + no lease at all    an agent the board has never heard of: no
+                                      token, no hooks, or a board that was down
+                                      when it started
+    pane gone + lease live            a crashed or killed seat that never got to
+                                      say so. The board will show it working
+                                      until the TTL runs out — `qb-end <id>
+                                      --reason killed` is the missing report
+    pane gone + ended                 finished, and everything agrees
+
+**"GONE" IS NEVER GUESSED FROM AN ABSENCE OF TMUX.** Run outside a multiplexer,
+the pane source answers *cannot tell* and says so. Reporting a session as gone
+because this process could not see a pane would be the same class of mistake as
+reading an expired lease as a finished one — an inability dressed up as a fact,
+which is what the ending vocabulary exists to stop (#244).
+
+**IT OBSERVES AND NOTHING ELSE.** No process is signalled, no pane is closed, no
+lease is touched, and it never ends a session it finds ended. `qb-end` is the
+verb; this is the question you ask before you use it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import UTC, datetime
+
+ALIVE, FINISHED, GONE, UNKNOWN = 0, 1, 2, 3
+
+#: How old a `working` state may be before it is worth remarking on. #252
+#: measured the beacon: it is refreshed at turn boundaries only, so eight minutes
+#: is an ordinary long turn and this is not an alarm — it is the sentence that
+#: stops a reader concluding "stuck" from a timestamp.
+STALE_AFTER = 8 * 60
+
+
+def tmux_panes() -> list[dict] | None:
+    """Every pane on this tmux server that names a session, or None for "cannot tell".
+
+    None and [] are different answers and the distinction is the point: [] means
+    tmux was asked and knows of no such pane, None means there was nothing to ask.
+    """
+    if not os.environ.get("TMUX"):
+        return None
+    fields = ("pane_id", "@qb_session", "@qb_seat", "@qb_spawn", "@qb_spawn_ended",
+              "@qb_state", "pane_dead", "pane_current_command", "session_name")
+    fmt = "\t".join("#{%s}" % f for f in fields)
+    try:
+        got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
+                             capture_output=True, text=True, timeout=5)
+    except Exception:                                             # noqa: BLE001
+        return None
+    if got.returncode != 0:
+        return None
+    panes = []
+    for line in got.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != len(fields) or not parts[1]:
+            continue
+        panes.append(dict(zip(fields, parts)))
+    return panes
+
+
+def pane_answer(session: str) -> dict:
+    """What the machine says: is a process running this session?
+
+    ``verdict`` is one of ``running``, ``exited``, ``absent`` and ``unknown``.
+    ``exited`` is reachable only for a pane `qb-start` made, because that is the
+    only pane that records its own agent leaving — a seat's pane drops to a shell
+    with nothing to say about what was there before.
+    """
+    panes = tmux_panes()
+    if panes is None:
+        return {"verdict": "unknown", "why": "not inside tmux — no pane could be "
+                                             "asked about, which is not the same as "
+                                             "there being none", "pane": None}
+    mine = [p for p in panes if p["@qb_session"] == session]
+    if not mine:
+        return {"verdict": "absent", "why": "no pane on this tmux server carries "
+                                            "that session id", "pane": None}
+    # A RUNNING pane wins over a finished one, and taking the first match does not
+    # do that. One session id can be on two panes at once: `qb-start` leaves its
+    # window open after the agent exits (its output is the only record of what
+    # happened), so resuming that session in a new pane leaves the corpse behind
+    # wearing the same stamp — and whichever `list-panes` happened to name first
+    # would then decide the verdict. If anything is running that session, that is
+    # the answer; the leftovers are not evidence against it.
+    pane = next((p for p in mine
+                 if p["pane_dead"] != "1" and not p["@qb_spawn_ended"]), mine[0])
+    if pane["pane_dead"] == "1":
+        return {"verdict": "exited", "why": "the pane's process has exited",
+                "pane": pane["pane_id"], "spawn": pane["@qb_spawn"] or None}
+    if pane["@qb_spawn_ended"]:
+        return {"verdict": "exited",
+                "why": f"the spawned agent ({pane['@qb_spawn']}) exited and left "
+                       f"the window open",
+                "pane": pane["pane_id"], "spawn": pane["@qb_spawn"] or None}
+    return {"verdict": "running",
+            "why": f"pane {pane['pane_id']} in tmux session "
+                   f"{pane['session_name']!r} is running {pane['pane_current_command']}",
+            "pane": pane["pane_id"], "seat": pane["@qb_seat"] or None,
+            "spawn": pane["@qb_spawn"] or None,
+            "pane_state": pane["@qb_state"] or None}
+
+
+def agent_answer(session: str) -> dict:
+    """What the board says: does this session hold a lease, and did it end?
+
+    Two calls to two endpoints that already exist, and no new board surface:
+    ``/session/{key}`` carries the ending (the ``ended`` block v2.77 added) while
+    ``/active`` is the only place the ``state``/``state_at`` PAIR is published —
+    and it is the pair that separates a long turn from a stall, so a status that
+    read only the first would be reporting the thing #252 is about without the
+    field that explains it.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        from qbdata import board_client
+        client, cfg = board_client()
+    except Exception as e:                                        # noqa: BLE001
+        return {"verdict": "unknown",
+                "why": f"could not reach the board — {e.__class__.__name__}: {e}"}
+    here = getattr(cfg, "agent", None) or None
+
+    ended = None
+    known = True
+    try:
+        record = client.get(f"/session/{session}")
+        ended = record.get("ended")
+    except Exception as e:                                        # noqa: BLE001
+        # A 404 is an ANSWER — the board has no record of this key at all — and
+        # every other failure is an inability that must not be read as one. Taken
+        # off `HTTPError.code` rather than matched in the message: "404" appears
+        # in a session id often enough, and a status tool that mistook an outage
+        # for "no such session" would be making #244's mistake in the one command
+        # written to stop it.
+        if getattr(e, "code", None) != 404:
+            return {"verdict": "unknown",
+                    "why": f"the board could not be asked about {session} — "
+                           f"{e.__class__.__name__}: {e}"}
+        known = False
+
+    live = None
+    try:
+        for agent in (client.get("/active").get("agents") or []):
+            if agent.get("session") == session:
+                live = agent
+                break
+    except Exception as e:                                        # noqa: BLE001
+        return {"verdict": "unknown",
+                "why": f"the board's live list could not be read — "
+                       f"{e.__class__.__name__}: {e}"}
+
+    if live is not None:
+        age = _age(live.get("state_at"))
+        # WHOSE BOX IS THAT LEASE ON. The pane source can only ever see THIS tmux
+        # server, so "no pane carries that session" says nothing at all about a
+        # session leased by another machine — and the codex review was right that
+        # calling it `gone` was this tool asserting something it had not looked
+        # at. A `holder` is `machine/name` and its machine half is proved by the
+        # token that authenticated the lease; `cfg.agent` is what this box calls
+        # itself, which is a GUESS in the same way `qb-dash-tui.seat_state`'s is —
+        # the board's machine name comes from the token map and need not match.
+        # So it is only ever used to say "elsewhere" when the two DISAGREE, never
+        # to confirm that a lease is local.
+        holder = live.get("holder") or ""
+        machine = holder.split("/", 1)[0] if holder else ""
+        return {"verdict": "leased", "holder": holder or None,
+                "state": live.get("state"), "state_at": live.get("state_at"),
+                "state_age": age, "expires": live.get("expires"),
+                "stale": age is not None and age > STALE_AFTER,
+                "machine": machine or None,
+                "elsewhere": bool(machine and here and machine != here),
+                "why": _lease_line(live, age)}
+    if ended:
+        return {"verdict": "ended", "reason": ended.get("reason"),
+                "at": ended.get("at"), "holder": ended.get("holder"),
+                "why": f"ended at {ended.get('at')} — {ended.get('reason')}, "
+                       f"reported by {ended.get('holder')}"}
+    if not known:
+        return {"verdict": "never",
+                "why": "the board has never heard of that session id"}
+    return {"verdict": "lapsed",
+            "why": "the board knows the session and holds no live lease for it, "
+                   "and nothing ever reported an ending — the lease ran out with "
+                   "nobody saying anything"}
+
+
+def _age(stamp: str | None) -> int | None:
+    if not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return int((datetime.now(UTC) - when).total_seconds())
+
+
+def _lease_line(live: dict, age: int | None) -> str:
+    state = live.get("state") or "no state reported"
+    if age is None:
+        return f"{live.get('holder')} holds a live lease, {state}"
+    if age <= 0:
+        # A state stamped in the future is clock skew between this box and the
+        # board, not a session that has not happened yet. Rendered as "just now"
+        # rather than as a negative age, which reads as a bug in this tool and
+        # sends a reader looking in the wrong place.
+        return f"{live.get('holder')} holds a live lease, {state} just now"
+    return (f"{live.get('holder')} holds a live lease, {state} as of "
+            f"{age // 60}m{age % 60:02d}s ago")
+
+
+#: Every combination of the two sources, and what it means. A table rather than a
+#: chain of `if`s because the table IS the feature: a reader checking that the
+#: crashed-seat case is handled should be able to find the row, and a case nobody
+#: has thought of should be an obviously missing line rather than a fall-through.
+#:
+#: `(pane verdict, agent verdict) -> (exit, disagreement or "")`.
+TABLE: dict[tuple[str, str], tuple[int, str]] = {
+    ("running", "leased"):  (ALIVE, ""),
+    ("running", "ended"):   (ALIVE, "the pane is running and the board says this "
+                                    "session ENDED — #263's shape: a /clear or a "
+                                    "supersede, where the pane lives on and this "
+                                    "conversation does not"),
+    ("running", "lapsed"):  (ALIVE, "the pane is running and its lease has lapsed "
+                                    "— nothing has renewed it, so the board has "
+                                    "already stopped counting this agent"),
+    ("running", "never"):   (ALIVE, "the pane is running an agent the board has "
+                                    "never heard of — no token, no lifecycle "
+                                    "hooks, or a board that was down at its start"),
+    ("running", "unknown"): (ALIVE, "the pane is running; the board could not be "
+                                    "asked, so nothing here is a report about the "
+                                    "agent"),
+
+    ("exited", "leased"):   (GONE,  "the agent exited and the board still shows a "
+                                    "live lease — nothing reported the ending, and "
+                                    "it will sit there until the TTL runs out. "
+                                    "`qb-end <id> --reason killed` is what is missing"),
+    ("exited", "ended"):    (FINISHED, ""),
+    ("exited", "lapsed"):   (GONE, ""),
+    ("exited", "never"):    (GONE, ""),
+    ("exited", "unknown"):  (GONE,  "the agent exited; the board could not be asked "
+                                    "whether anything recorded it"),
+
+    # Only reached once the lease is known to be held on THIS box — see
+    # :func:`verdict`, which turns the other case into `unknown` before this row
+    # can claim anything about it.
+    ("absent", "leased"):   (GONE,  "no pane is running this session and the board "
+                                    "shows it live — a crashed or killed seat that "
+                                    "never got to report itself. `qb-end <id> "
+                                    "--reason killed` is the report nothing made. "
+                                    "(#252 reads the same way from the other side, "
+                                    "so check the state's age above first)"),
+    ("absent", "ended"):    (FINISHED, ""),
+    ("absent", "lapsed"):   (GONE, ""),
+    ("absent", "never"):    (GONE,  "no pane, no lease, no record — either it never "
+                                    "existed or it is on another machine"),
+    ("absent", "unknown"):  (UNKNOWN, "no pane here, and the board could not be "
+                                      "asked — neither source has an answer"),
+
+    # No tmux at all. The board is then the only witness, and it is reported as
+    # exactly that rather than promoted to the whole truth.
+    ("unknown", "leased"):  (ALIVE, "the board's answer only — this is not running "
+                                    "inside tmux, so no pane was checked"),
+    ("unknown", "ended"):   (FINISHED, ""),
+    ("unknown", "lapsed"):  (UNKNOWN, "the lease lapsed and no pane could be "
+                                      "checked — a lapse is nobody saying anything, "
+                                      "not a report that it finished"),
+    ("unknown", "never"):   (UNKNOWN, "no pane could be checked and the board has "
+                                      "no record — nothing here knows anything "
+                                      "about that session"),
+    ("unknown", "unknown"): (UNKNOWN, "neither source could be asked"),
+}
+
+
+def verdict(pane: dict, agent: dict) -> tuple[str, int, str]:
+    code, gap = TABLE[(pane["verdict"], agent["verdict"])]
+    if pane["verdict"] == "absent" and agent.get("elsewhere"):
+        # Not a crashed seat and not a verdict at all: this box's tmux server is
+        # not where that session runs, so the pane half of the evidence is
+        # missing rather than negative. Run it on that machine for an answer.
+        code, gap = UNKNOWN, (
+            f"that lease is held on {agent['machine']} and this is not that box, "
+            f"so no pane here could have carried it — the absence above is this "
+            f"tool's blind spot, not a report. Ask {agent['machine']}")
+    name = {ALIVE: "alive", FINISHED: "finished",
+            GONE: "gone", UNKNOWN: "unknown"}[code]
+    if not gap and code == ALIVE and agent.get("stale"):
+        gap = (f"the pane is running and the agent last spoke "
+               f"{agent['state_age'] // 60}m ago — a long turn, not a stall. The "
+               f"state beacon moves at turn boundaries only (#252), so an old "
+               f"`{agent.get('state')}` describes a busy pane rather than a stuck one")
+    return name, code, gap
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-status", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("session", nargs="?",
+                    default=os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                    help="the session key (default: $CLAUDE_CODE_SESSION_ID)")
+    ap.add_argument("--json", action="store_true",
+                    help="print the whole answer, both sources, on stdout")
+    ap.add_argument("--quiet", "-q", action="store_true",
+                    help="exit code only — nothing on stdout or stderr, and it wins "
+                         "over --json, because that is the stronger promise")
+    args = ap.parse_args()
+
+    def say(message: str) -> None:
+        if not args.quiet:
+            print(message, file=sys.stderr)
+
+    if not args.session:
+        say("unknown: no session given and $CLAUDE_CODE_SESSION_ID is unset — "
+            "there is nothing to ask about")
+        return UNKNOWN
+
+    pane = pane_answer(args.session)
+    agent = agent_answer(args.session)
+    name, code, gap = verdict(pane, agent)
+
+    say(f"{name}: {args.session}")
+    say(f"  pane:  {pane['verdict']} — {pane['why']}")
+    say(f"  agent: {agent['verdict']} — {agent['why']}")
+    if gap:
+        say(f"  ⚠ {gap}")
+    if args.json and not args.quiet:
+        print(json.dumps({"session": args.session, "verdict": name,
+                          "pane": pane, "agent": agent,
+                          "disagreement": gap or None}, indent=2))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

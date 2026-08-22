@@ -39,6 +39,25 @@ let
     QUARTERBACK_REPO="${board.repo}"
   '';
 
+  # What `qb-start` compiles in (its SPAWNABLE table). Restated here so a bad
+  # `spawn.commands` is an eval error naming the option rather than a refusal on a
+  # box nobody is watching; `harness/tests/test_qb_start.py` fails if the two lists
+  # ever disagree, which is the same guard `test_in_flight_drift.py` puts between
+  # `qb-admit` and `harness_rules.DEFAULTS`.
+  spawnableCommands = [
+    "/fix-issue" "/fix-and-review" "/fix-and-land" "/review-pr" "/panel-review-pr"
+  ];
+
+  # The machine's spawn policy, read by `qb-start` and by nothing else. Written ONLY
+  # when spawn.enable is true: the absence of this file is what "off" means, so a
+  # host that has not opted in has nothing on disk for a bug to misread.
+  spawnPolicy = builtins.toJSON {
+    enabled = true;
+    commands = cfg.spawn.commands;
+    max_sessions = cfg.spawn.maxSessions;
+    skip_permissions = cfg.spawn.skipPermissions;
+  };
+
   # One message for every value that is emitted single-quoted, so a new one cannot be
   # added with the assertion forgotten.
   noSingleQuote = name: value: {
@@ -94,6 +113,82 @@ in
         the loops and the worktree tooling, which is not a trade a default gets
         to make on their behalf.
       '';
+    };
+
+    # ---- may this machine start a session on its own? (#277) -----------------
+    #
+    # OFF, AND IT HAS TO BE A MACHINE THAT SAYS OTHERWISE. `qb-start` is a
+    # remote-execution primitive on a box holding ~/.claude, ~/.config/gh and the
+    # board token, so the switch lives here — in the module a person edits and
+    # rebuilds — and nowhere a repository, an issue body or an agent can reach.
+    # With `enable = false` the file below is not written at all, and `qb-start`
+    # refuses before it has looked for a board, a token, a network or tmux.
+    #
+    # `commands` IS A SECOND LOCK and it is empty on purpose, the way
+    # `issue_pickup.only_labels` is: turning spawning on is one decision, and
+    # saying what may come through it is another. It can only ever NARROW
+    # qb-start's compiled-in table (harness/bin/qb-start, SPAWNABLE) — a name
+    # this module has never heard of is refused there, and the assertion below
+    # refuses it here, at eval time, where the message can name the option.
+    spawn = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Let `qb-start` begin an agent session on this machine. Off by default,
+          and the default costs nothing: with this false, nothing is written to
+          ~/.config/quarterback and `qb-start` exits 3 without consulting
+          anything at all.
+
+          What it permits is narrow by construction. The brief is a named slash
+          command with a number — never free text — the session takes a board
+          claim before the process exists, it runs in a real tmux window a human
+          can attach to and interrupt, and it can be stopped with
+          `qb-end <session>` from the moment it is created.
+        '';
+      };
+
+      commands = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "/fix-issue" "/panel-review-pr" ];
+        description = ''
+          Which commands this machine will start. Empty — the default — means
+          none, so `spawn.enable` alone still spawns nothing.
+
+          Must be a subset of what `qb-start` compiles in: /fix-issue,
+          /fix-and-review, /fix-and-land, /review-pr, /panel-review-pr. A name
+          outside that set is an eval error rather than a silent no-op.
+        '';
+      };
+
+      maxSessions = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 1;
+        description = ''
+          How many spawned sessions may run on this machine at once. 0 is a
+          freeze — legal, and it means admit nothing without taking the
+          allowlist apart.
+
+          The count is spawned tmux panes whose agent has not exited, so a
+          window left open to read is not one of them.
+        '';
+      };
+
+      skipPermissions = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Pass --dangerously-skip-permissions to a spawned agent. On by default,
+          for `qb-seat`'s reason: a spawned window is a pane nobody is watching,
+          so the first tool call wanting a permission it does not hold stops it
+          in the one way this cannot recover from — the pane looks busy, the
+          board shows a live agent holding a claim, and nothing is moving.
+
+          Turn it off and a spawn gets prompts back, which on an unattended pane
+          means it stops at the first one.
+        '';
+      };
     };
 
     installScripts = lib.mkOption {
@@ -273,6 +368,26 @@ in
         (noSingleQuote "board.url" board.url)
         (noSingleQuote "board.agent" board.agent)
         {
+          # Refused at EVAL time, where the message can name the option, rather than
+          # at spawn time on a box nobody is watching. `qb-start` refuses an unknown
+          # command too — this is the same refusal moved to the moment a person can
+          # read it, which is the whole argument for an allowlist over a filter.
+          assertion = cfg.spawn.commands == []
+            || (lib.subtractLists spawnableCommands cfg.spawn.commands) == [ ];
+          message = ''
+            programs.quarterback-harness.spawn.commands names ${
+              lib.concatStringsSep ", " (lib.subtractLists spawnableCommands cfg.spawn.commands)
+            }, which qb-start cannot start. It knows only: ${
+              lib.concatStringsSep ", " spawnableCommands
+            }.
+
+            The set is compiled into harness/bin/qb-start (SPAWNABLE) because each
+            entry carries the resource its session claims, and a command whose unit
+            of work nobody has worked out is one that cannot be counted. This option
+            narrows that set; it cannot widen it.
+          '';
+        }
+        {
           # The one value emitted double-quoted, because `$HOME` in it is meant to expand.
           # That makes `"` and a backtick the characters it cannot carry.
           assertion = board.repo == null
@@ -303,7 +418,9 @@ in
         # config for it — so it has to be the tmux they can see and configure, not
         # one hidden inside a wrapper where `tmux attach` from their own shell
         # would find a different binary.
-        ++ lib.optionals cfg.seats.enable [ pkgs.tmux ];
+        # A spawn IS a tmux window — there are no hidden sessions, so a host that
+        # may start one needs the multiplexer whether or not it runs a seat screen.
+        ++ lib.optionals (cfg.seats.enable || cfg.spawn.enable) [ pkgs.tmux ];
 
       home.file = lib.mkMerge (
         # ~/.claude/loops is a store symlink, i.e. READ-ONLY. epic.py already
@@ -322,6 +439,13 @@ in
     # The site config: only when this module has been told which board. See board.url.
     (lib.mkIf wantConfig {
       xdg.configFile."quarterback/config".text = configText;
+    })
+
+    # The spawn policy: only when this machine has said it may start sessions. See
+    # spawn.enable — the ABSENCE of this file is the default, and it is what makes
+    # the default free rather than merely safe.
+    (lib.mkIf cfg.spawn.enable {
+      xdg.configFile."quarterback/spawn.json".text = spawnPolicy;
     })
 
     # ---- the activation ------------------------------------------------------
