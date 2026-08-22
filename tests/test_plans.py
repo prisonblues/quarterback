@@ -132,7 +132,7 @@ async def test_a_submitted_plan_says_the_submitter_chose_its_order(client):
 
     plan = await read(client, repo, exact=True)
     assert plan["order_trust"]["by_source"] == {"appended": 1, "submitted": 1}
-    assert plan["order_trust"]["from_rank"] == 1
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 1
 
 
 async def test_each_submission_leaves_exactly_one_position_nobody_chose(client):

@@ -1219,7 +1219,9 @@ async def test_next_admits_when_the_order_is_one_nobody_chose(client):
 
     plan = await read(client, repo, exact="true")
     assert plan["order_trust"]["trusted"] is False
-    assert plan["order_trust"]["unchosen"] == 2 and plan["order_trust"]["from_rank"] == 1
+    assert plan["order_trust"]["unchosen"] == 2
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 1
+    assert plan["order_trust"]["first_unchosen"]["repo"] == repo
     assert plan["order_trust"]["by_source"] == {"appended": 2}
     assert "nobody chose" in plan["next"]["caveat"]
 
@@ -1237,7 +1239,7 @@ async def test_a_human_ordering_the_list_is_what_makes_next_confident(client):
 
     plan = await read(client, repo, exact="true")
     assert plan["order_trust"] == {"trusted": True, "by_source": {"ordered": 2},
-                                "unchosen": 0, "from_rank": None, "hint": None}
+                                "unchosen": 0, "first_unchosen": None, "hint": None}
     assert plan["next"]["caveat"] is None
     assert plan["next"]["rank_source"] == "ordered"
 
@@ -1257,10 +1259,11 @@ async def test_a_reorder_claims_no_decision_about_an_item_the_page_never_saw(cli
     assert r.json()["appended"] == [unseen["item_id"]]
     plan = await read(client, repo, exact="true")
     assert plan["order_trust"]["by_source"] == {"ordered": 2, "appended": 1}
-    assert plan["order_trust"]["trusted"] is False and plan["order_trust"]["from_rank"] == 3
+    assert plan["order_trust"]["trusted"] is False
+    assert plan["order_trust"]["first_unchosen"]["rank"] == 3
     assert plan["next"]["caveat"] is not None
-    assert " including this one," not in plan["next"]["caveat"], \
-        "next itself was ordered by a human — the caveat is about the tail"
+    assert " this one among them," not in plan["next"]["caveat"], \
+        "next itself was ordered by a human — the caveat is about the rest"
 
 
 async def test_a_placed_item_is_a_chosen_position(client):
@@ -1283,7 +1286,7 @@ async def test_the_caveat_names_the_answers_own_position_when_that_is_the_proble
     repo = "acme/caveatself"
     await issue(client, repo, 940)
     plan = await read(client, repo, exact="true")
-    assert " including this one," in plan["next"]["caveat"]
+    assert " this one among them," in plan["next"]["caveat"]
 
 
 async def test_an_empty_scope_is_trusted_rather_than_suspicious(client):

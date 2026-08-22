@@ -237,8 +237,8 @@ GET   /plan              ?repo=&plan=&include_done=&exact=&limit=200&session=
                           not `covered_by` somebody else's plan claim — carrying a
                           `caveat` whenever part of the order is merely the order things
                           were added (#183); `order_trust` says how much of the sequence
-                          anybody actually chose, by `rank_source`, and from which rank
-                          it stops meaning anything; `counts` describe
+                          anybody actually chose, by `rank_source`, and names the first
+                          item whose position nobody did; `counts` describe
                           the whole scope — neither is ever the page, however small
                           `limit` is (max 1000, `truncated` says so); ?repo= also returns
                           the fleet-wide (repo-less) items, ranked after that repo's own;

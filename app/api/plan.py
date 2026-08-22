@@ -633,27 +633,36 @@ def _order_trust(open_views: list[dict]) -> dict:
     It is worked out from ranks, so it is exactly as good as the ranks are. This
     says how good that is, from the rows themselves rather than from prose:
     ``trusted`` is false while any open item sits where it was merely appended,
-    ``from_rank`` is where that starts, and ``by_source`` breaks the list down by
-    who chose what. A plan whose every position was placed, submitted or ordered
-    is trusted — nobody has to have used the browser for the answer to be honest,
-    only somebody has to have chosen.
+    ``by_source`` breaks the list down by who chose what, and ``first_unchosen``
+    points at one row rather than declaring a boundary. A plan whose every
+    position was placed, submitted or ordered is trusted — nobody has to have used
+    the browser for the answer to be honest, only somebody has to have chosen.
+
+    **``first_unchosen`` is an item and not a rank**, and the difference is a
+    claim this refused to make. A bare rank invites "everything from here down is
+    unchosen", which is false the moment a placed item follows an appended one —
+    and it does not even name one position, because a repo read carries the fleet
+    band along and the two are separate 1..n sequences, so "rank 3" is two rows.
+    So it carries the item's id, its rank and its scope, and asserts about that
+    row alone; ``unchosen`` is how many there are, and ``by_source`` is where they
+    are concentrated.
     """
     by_source: dict[str, int] = {}
     for view in open_views:
         by_source[view["rank_source"]] = by_source.get(view["rank_source"], 0) + 1
-    # In the read's own order, which is what makes `from_rank` below meaningful.
+    # In the read's own order, so `first_unchosen` is the first one a reader
+    # walking this list actually meets.
     unchosen = [v for v in open_views if v["rank_source"] == "appended"]
     return {
         "trusted": not unchosen,
         "by_source": by_source,
         "unchosen": len(unchosen),
-        # Where the order stops meaning anything: the rank of the first item, IN
-        # THIS READ'S OWN ORDER, whose position nobody chose. Taken in list order
-        # rather than as the smallest rank, because a repo read carries the fleet
-        # band after the repo's own items and the two are separate 1..n sequences
-        # — `min` over both would name a rank the reader never reaches first.
-        # Null when nothing is unchosen, rather than a sentinel to know about.
-        "from_rank": unchosen[0]["rank"] if unchosen else None,
+        # One row, named exactly: the first item in this read whose position
+        # nobody chose. Null when there is none, rather than a sentinel a client
+        # has to know about.
+        "first_unchosen": None if not unchosen else {
+            "item_id": unchosen[0]["item_id"], "rank": unchosen[0]["rank"],
+            "repo": unchosen[0]["repo"]},
         "hint": None if not unchosen else
                 "those items are in the order the adds arrived in, because nobody "
                 "chose one: pass `after`/`before` to POST /plan/item when you know "
@@ -671,13 +680,17 @@ def _next_caveat(nxt: dict | None, trust: dict, open_n: int) -> str | None:
     """
     if nxt is None or trust["trusted"]:
         return None
-    mine = " including this one," if nxt["rank_source"] == "appended" else ""
+    first = trust["first_unchosen"]
+    # Says where the unchosen positions START and never that everything after
+    # them is one of them — a placed item can perfectly well follow an appended
+    # one, and a caveat that overstates its case is read past like any other.
+    mine = " this one among them," if nxt["rank_source"] == "appended" else ""
     return (
         f"{trust['unchosen']} of {open_n} open items sit where they were "
-        f"appended,{mine} from rank {trust['from_rank']} down: nobody chose "
-        "those positions. This is the first item that is free, in an order that is "
-        "partly just the order things were added — read the notes before you treat "
-        "it as a priority."
+        f"appended and nobody chose those positions —{mine} the first at rank "
+        f"{first['rank']} of the {first['repo'] or 'fleet'} list. This is the "
+        "first free item in rank order, and that order is partly just the order "
+        "things were added: read the notes before you treat it as a priority."
     )
 
 
@@ -2756,7 +2769,7 @@ async def submit_plan(
                 # exactly the "17 chosen, 11 by arrival, nothing telling them
                 # apart" this issue is about — one boundary instead of eleven, but
                 # the same lie. So each submission contributes exactly one
-                # unchosen position, and `from_rank` names the seam.
+                # unchosen position, and `first_unchosen` names the seam.
                 rank_source="appended" if position == 0 else "submitted",
                 depends_on=[]))
         for row in plan_items:
