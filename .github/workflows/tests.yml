@@ -441,3 +441,161 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/release_stamp.py frozen --onto "origin/$BASE_REF" --branch HEAD
+
+  migration-heads:
+    name: one migration head after the merge
+    # `pull_request` only, and that trigger is the whole of #351 rather than a detail of
+    # it. `harness/githooks/pre-push` already asks this exact question — and gates it on
+    # `is_protected "$branch"`, so a feature-branch push skips it, while `gh pr merge`
+    # goes through the GitHub API and touches no local hook at all. This fleet lands every
+    # PR that way (twelve on 2026-08-22 alone), so the hook's migration half had no path
+    # to fire: on #349's landing, with a real migration in play, it printed exactly one
+    # line and that line was about release numbers. The hook is correct and stays exactly
+    # as it is — it is the backstop for anyone pushing a protected branch directly. This
+    # job is the same check at the place the merge actually happens (#343, #351).
+    #
+    # Unlike `stamped` above, a pull_request trigger is right here, and the difference is
+    # worth stating because the two look alike. That job's comment argues at length that a
+    # pull_request version of ITSELF would fire on every release PR and be switched off
+    # within a week — because an unstamped `## vNEXT` is the CORRECT state of a branch in
+    # flight. Nothing here has that shape. A two-headed graph is never the correct state
+    # of any branch, so there is no legitimate red for anyone to switch this off over.
+    # The corollary for branch protection is `frozen`'s rather than `stamped`'s: this
+    # reports on every pull request, so it is safe to make a required status check.
+    #
+    # WHAT IT DOES NOT CATCH, stated here rather than left for whoever trips it to find
+    # out: two UNLANDED branches that each minted the same revision id. Four did on
+    # 2026-08-22, all four preflights truthfully said GO, and none of them was wrong — at
+    # push time each branch was individually single-headed, A carrying `0029` on main's
+    # `0028` and B carrying `0029` on main's `0028`. The duplicate exists only in the
+    # union of two branches neither of which has landed, and no check reading one ref
+    # against the base can see it, this one included. That blind spot is #338; #341 is
+    # what closes it, by hash-naming revisions so the collision is impossible rather than
+    # detectable. Detection was always the wrong shape for that case.
+    #
+    # A second limit, same spirit: this re-runs when the PR is pushed to, not when the
+    # base moves underneath it. A PR that was single-headed when it opened and is
+    # two-headed after a sibling lands is not re-judged until something touches it.
+    #
+    # What it does buy: a pull request whose merge would leave the base with a graph
+    # `alembic upgrade head` cannot run is refused, at the place this fleet merges instead
+    # of at a place it never pushes.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0`, for the same reason spelled out on `frozen` above: at the
+      # default depth of 1 the checkout is the PR's merge commit and nothing else, the
+      # base branch is not in the clone at all, and a check that reads it would be
+      # reporting on a comparison it never made. The step below refuses to run rather
+      # than going quietly green if that ever regresses.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check the merge would leave exactly one migration head
+        # Through the environment, never interpolated into the script body: `${{ }}`
+        # substitution happens before bash sees the line, so a base branch name spliced
+        # in that way is whoever opened the pull request executing text on this runner.
+        # As an env var it is data. (Same reasoning as the `frozen` step above.)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+
+          reconciler=scripts/migration_reconcile.py
+          base="origin/$BASE_REF"
+          tmp=$(mktemp -d)
+
+          # Read every run, not only the failing ones. The base's own head list is what
+          # tells a red report whether this branch introduced the second head or merely
+          # inherited one, and it is what lets a PR that RESOLVES a two-headed base be
+          # recognised as the fix rather than as a fluke. It is also what makes
+          # `fetch-depth: 0` load-bearing on every run, which is the point of failing here.
+          if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+            echo "::error::$base is not in this clone, so the merge cannot be judged against the branch it targets. That is what fetch-depth: 0 on the checkout is for; at the default depth of 1 the base branch is never fetched."
+            exit 1
+          fi
+
+          # stdout and stderr kept APART rather than merged with 2>&1. The reconciler puts
+          # the head ids on stdout and its `# N head(s)` summary on stderr, and a merged
+          # capture interleaves them by whichever flushed first — pre-push learned that one
+          # and its success note read back `single migration head (# 1 head(s))`. Both are
+          # shown on a refusal, because discarding stderr leaves a genuine tool error
+          # looking exactly like a two-head refusal with no detail.
+          heads_at() {
+            local rc=0
+            python3 "$reconciler" heads --ref "$1" >"$tmp/$2.out" 2>"$tmp/$2.err" || rc=$?
+            return "$rc"
+          }
+
+          # HEAD on a pull_request checkout is the merge commit GitHub builds for the PR —
+          # what would actually land — so this reads the post-merge graph rather than the
+          # branch's own, and a two-headed state introduced by the merge itself is caught
+          # alongside one committed on the branch.
+          base_rc=0; heads_at "$base" base || base_rc=$?
+          merge_rc=0; heads_at HEAD merge || merge_rc=$?
+
+          if (( merge_rc == 0 )); then
+            printf 'migration graph after this merge: %s\n' "$(cat "$tmp/merge.out")"
+            if (( base_rc != 0 )); then
+              printf '%s itself is not single-headed; this PR resolves it:\n' "$base"
+              sed 's/^/    /' "$tmp/base.out" "$tmp/base.err"
+            fi
+            exit 0
+          fi
+
+          if (( merge_rc == 2 )); then
+            # Two different answers arrive as the same exit 2, and they must not be
+            # reported as the same thing. `heads` returns 2 by itself when it counted the
+            # heads and the count was not one — that is a graph defect, and the ids are on
+            # stdout. Everything the reconciler refuses to answer at all comes back as
+            # `STOP:` on stderr with nothing on stdout: a duplicate revision id, a
+            # migration it cannot parse, or git failing under it. Calling the last of those
+            # a two-headed graph would send the reader off to renumber a graph that is fine.
+            if grep -q '^STOP: ' "$tmp/merge.err"; then
+              annotation="the migration reconciler refused the graph at this PR's merge commit"
+              echo 'The migration reconciler will not accept the graph at the merge commit of'
+              echo 'this pull request, so merging it would leave the base branch in a state'
+              echo '`alembic upgrade head` cannot be trusted to run. It says which, below —'
+              echo 'usually a duplicate revision id, sometimes a migration it cannot read:'
+            else
+              annotation="merging would leave $BASE_REF with a multi-head migration graph"
+              echo 'Merging this pull request would leave the base branch with a migration'
+              echo 'graph `alembic upgrade head` cannot run: the graph at the merge commit is'
+              echo 'not exactly one head.'
+            fi
+            echo
+            sed '/^$/d; s/^/    /' "$tmp/merge.out" "$tmp/merge.err"
+            echo
+            if (( base_rc == 0 )); then
+              printf '%s is single-headed (%s), so this branch is where it comes from.\n' \
+                "$base" "$(head -n1 "$tmp/base.out")"
+            else
+              printf '%s does not pass this check either, so it predates the branch:\n' "$base"
+              sed '/^$/d; s/^/    /' "$tmp/base.out" "$tmp/base.err"
+            fi
+            echo
+            echo 'Reconcile before merging — the tool chooses the resolution:'
+            echo "    python3 $reconciler preflight --onto $base"
+            echo "    python3 $reconciler apply     --onto $base"
+            echo
+            echo 'Note what this check cannot see, so it is not read as more than it is: a'
+            echo 'revision id duplicated across two branches that have BOTH yet to land is'
+            echo 'invisible to it, because each branch is single-headed on its own (#338).'
+            echo '#341 is what closes that case.'
+            echo "::error::$annotation"
+            exit 1
+          fi
+
+          # Anything other than 0 or the reconciler's documented 2 is the tool failing to
+          # answer, and the two must not be reported as the same thing: a refusal that
+          # asserts a two-headed graph over what was really a traceback sends the reader
+          # off to renumber a graph that is fine. An unrunnable gate is not a passing gate,
+          # so this is red rather than skipped.
+          echo "the migration single-head check could not run (exit $merge_rc), so this"
+          echo 'pull request is unverified rather than clean:'
+          echo
+          sed '/^$/d; s/^/    /' "$tmp/merge.out" "$tmp/merge.err"
+          echo "::error::migration single-head check failed to run (exit $merge_rc)"
+          exit 1

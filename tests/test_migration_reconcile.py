@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 from argparse import Namespace
@@ -1206,3 +1208,322 @@ def test_the_repos_own_migration_chain_is_single_headed():
         pytest.skip("no migrations in this copy of the tree")
     assert mr.duplicate_ids(revs) == [], "two migrations in the worktree claim one id"
     assert len(mr.heads(revs)) == 1, "the worktree's migration chain has two heads"
+
+
+# ---------------------------------------------------------------------------
+# the CI job that runs `heads`
+# ---------------------------------------------------------------------------
+#
+# `harness/githooks/pre-push` asks this same question and, in this fleet, can never be the
+# one to answer it: the hook gates the migration half on `is_protected "$branch"`, so a
+# feature-branch push skips it, and `gh pr merge` goes through the GitHub API and touches
+# no local hook at all. Twelve PRs landed that way on 2026-08-22 and the check ran on none
+# of them (#351). So `.github/workflows/tests.yml` carries a `migration-heads` job that
+# asks it at the merge, and the tests below assert that job's shape and then EXECUTE its
+# own script body against throwaway repositories.
+#
+# Running the body rather than reading it is the point. A workflow step is the one kind of
+# code in this repo that nothing else ever calls, and the failure mode it has — passing
+# because it read nothing — is silent by construction. `fetch-depth` is the specific
+# worry, and `test_a_checkout_without_the_base_branch_is_refused` is that worry run rather
+# than described.
+
+WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "tests.yml"
+RECONCILER = Path(__file__).resolve().parent.parent / "scripts" / "migration_reconcile.py"
+
+# The job's body is bash driving git and python3. All three are on ubuntu-latest, where
+# the `app suite` job collects this file, so nothing here skips in CI.
+_MISSING_TOOLS = tuple(t for t in ("bash", "git", "python3") if not shutil.which(t))
+needs_a_shell = pytest.mark.skipif(
+    bool(_MISSING_TOOLS),
+    reason=f"the job's body is bash driving git and python3; missing: {', '.join(_MISSING_TOOLS)}",
+)
+
+
+def _uncommented(step: dict) -> str:
+    """A step's `run` with its comment lines dropped — so a job is found by what it
+    executes and not by what its comments happen to mention."""
+    return "\n".join(
+        line
+        for line in str(step.get("run", "")).splitlines()
+        if not line.lstrip().startswith("#")
+    )
+
+
+def _runs_the_reconciler(step: dict) -> bool:
+    return "migration_reconcile.py" in _uncommented(step)
+
+
+def _heads_job() -> dict:
+    """The job that runs the reconciler, found by what it runs rather than by its name."""
+    yaml = pytest.importorskip("yaml")
+    jobs = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))["jobs"]
+    running = [
+        job
+        for job in jobs.values()
+        if any(_runs_the_reconciler(step) for step in job.get("steps", []))
+    ]
+    assert len(running) == 1, (
+        f"{len(running)} jobs in tests.yml run `migration_reconcile.py`; the guard against "
+        "a merge that would leave two migration heads has to run exactly once and has to "
+        "run at all — the pre-push hook cannot cover it, because this fleet merges through "
+        "the GitHub API"
+    )
+    return running[0]
+
+
+def _heads_script() -> str:
+    return str(next(s for s in _heads_job()["steps"] if _runs_the_reconciler(s))["run"])
+
+
+def test_the_heads_job_checks_out_the_whole_history():
+    """The one way this job can be wrong and look right.
+
+    `actions/checkout@v4` fetches a single commit by default, and the base branch is then
+    not in the clone at all. #348's `frozen` job put it best: that is the shape of a job
+    that reports green while verifying nothing.
+    """
+    checkouts = [
+        step
+        for step in _heads_job()["steps"]
+        if str(step.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert checkouts, "the migration-heads job does not check the repo out at all"
+    assert all(str(step.get("with", {}).get("fetch-depth")) == "0" for step in checkouts), (
+        "the migration-heads job checks out at the default depth of 1, so the base branch "
+        "is not in the clone and the merge cannot be judged against what it targets"
+    )
+
+
+def test_the_heads_job_runs_on_pull_requests():
+    """Where this fleet actually merges. `pre-push` covers a direct push to a protected
+    branch and nothing else — and nobody here pushes one."""
+    assert "pull_request" in str(_heads_job().get("if", "")), (
+        "the migration-heads job does not name pull_request in its `if`, so it does not "
+        "run on the event this fleet lands PRs through, which was the whole of #351"
+    )
+
+
+def test_the_heads_job_records_what_it_cannot_catch():
+    """#351 asked for the limitation to sit on the job, not only in the issue.
+
+    A duplicate revision id minted by two branches that have both yet to land is invisible
+    here — each branch is single-headed on its own — and the person who trips this check
+    should learn that from the check rather than from a later incident.
+    """
+    raw = WORKFLOW.read_text(encoding="utf-8")
+    block = raw[raw.index("\n  migration-heads:") :]
+    assert "#338" in block and "#341" in block, (
+        "the migration-heads job no longer names #338 (the blind spot it inherits) and "
+        "#341 (what closes it), so it now reads as covering more than it does"
+    )
+
+
+def _job_repo(tmp_path: Path) -> Path:
+    """A repo laid out the way the runner's workspace is: the reconciler at the path the
+    job invokes, and git identity pinned by `_git`."""
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    shutil.copy(RECONCILER, repo / "scripts" / "migration_reconcile.py")
+    _git(repo, "init", "-q", "-b", "main")
+    return repo
+
+
+def _as_pull_request(repo: Path) -> None:
+    """Leave the repo the way `actions/checkout@v4` leaves a pull_request run: the base at
+    `refs/remotes/origin/main`, and HEAD detached on the merge commit GitHub builds for the
+    PR — which is what would actually land, and so what the job has to judge."""
+    _git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    _git(repo, "checkout", "-q", "--detach", "main")
+    _git(repo, "merge", "-q", "--no-ff", "-m", "Merge pull request", "work")
+
+
+def _run_job(repo: Path, base_ref: str = "main") -> subprocess.CompletedProcess:
+    """The workflow step's own script, run verbatim."""
+    return subprocess.run(
+        ["bash", "-c", _heads_script()],
+        cwd=repo,
+        env={**os.environ, "BASE_REF": base_ref},
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def split_merge_repo(tmp_path: Path) -> Path:
+    """The case the job exists for, and the reason a per-branch check cannot see it.
+
+    `main` moves on to `0019` off `0017`; the branch adds `0018`, also off `0017`. Neither
+    ref is two-headed on its own — `main` has one head and so does the branch, so every
+    per-branch gate in the repo says GO — and the merge of the two has two.
+    """
+    repo = _job_repo(tmp_path)
+    _write(repo, "0016_a.py", "0016", None, "a")
+    _write(repo, "0017_b.py", "0017", "0016", "b")
+    _commit(repo, "chain to 0017")
+    _git(repo, "checkout", "-q", "-b", "work")
+    _write(repo, "0018_mine.py", "0018", "0017", "mine")
+    _commit(repo, "branch: 0018 on 0017")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "0019_theirs.py", "0019", "0017", "theirs")
+    _commit(repo, "main: 0019 on 0017")
+    _as_pull_request(repo)
+    return repo
+
+
+@needs_a_shell
+def test_neither_side_of_the_split_is_two_headed_on_its_own(split_merge_repo: Path):
+    """The premise of the test below, asserted rather than assumed: if either ref were
+    already refused, the merge being refused would prove nothing about the merge."""
+    repo = str(split_merge_repo)
+    assert mr.main(["heads", "--repo", repo, "--ref", "origin/main"]) == 0
+    assert mr.main(["heads", "--repo", repo, "--ref", "work"]) == 0
+
+
+@needs_a_shell
+def test_the_job_refuses_a_merge_that_would_leave_two_migration_heads(split_merge_repo: Path):
+    """The acceptance criterion of #351, on a real two-head graph rather than a stand-in."""
+    done = _run_job(split_merge_repo)
+
+    assert done.returncode != 0, f"the job passed a two-headed merge:\n{done.stdout}"
+    assert "0018" in done.stdout and "0019" in done.stdout, (
+        f"the refusal does not carry the reconciler's own head list:\n{done.stdout}"
+    )
+    assert "::error::" in done.stdout, "the refusal leaves no annotation on the run"
+    assert "this branch is where it comes from" in done.stdout, (
+        "the base is single-headed, so the refusal has to say the branch introduced the "
+        f"second head rather than leaving the reader to guess:\n{done.stdout}"
+    )
+    assert "#341" in done.stdout, "the refusal does not say what it cannot catch"
+
+
+@needs_a_shell
+def test_the_job_passes_a_merge_that_adds_one_migration_in_the_right_place(tmp_path: Path):
+    repo = _job_repo(tmp_path)
+    _write(repo, "0016_a.py", "0016", None, "a")
+    _write(repo, "0017_b.py", "0017", "0016", "b")
+    _commit(repo, "chain to 0017")
+    _git(repo, "checkout", "-q", "-b", "work")
+    _write(repo, "0018_mine.py", "0018", "0017", "mine")
+    _commit(repo, "branch: 0018 on 0017")
+    _as_pull_request(repo)
+
+    done = _run_job(repo)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "migration graph after this merge: 0018" in done.stdout
+
+
+@needs_a_shell
+def test_a_pull_request_touching_no_migration_is_a_no_op(tmp_path: Path):
+    repo = _job_repo(tmp_path)
+    _write(repo, "0016_a.py", "0016", None, "a")
+    _write(repo, "0017_b.py", "0017", "0016", "b")
+    _commit(repo, "chain to 0017")
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "README.md").write_text("nothing to do with migrations\n")
+    _commit(repo, "branch: docs only")
+    _as_pull_request(repo)
+
+    done = _run_job(repo)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "migration graph after this merge: 0017" in done.stdout
+
+
+@needs_a_shell
+def test_a_repo_with_no_migrations_at_all_passes_and_says_so(tmp_path: Path):
+    """The job is wired into a workflow that also runs on repos mid-bootstrap, and the
+    reconciler's answer for "there is nothing to break" is a sentence, not an exit 2."""
+    repo = _job_repo(tmp_path)
+    (repo / "README.md").write_text("no migrations here\n")
+    _commit(repo, "empty")
+    _git(repo, "checkout", "-q", "-b", "work")
+    (repo / "README.md").write_text("still none\n")
+    _commit(repo, "branch: still none")
+    _as_pull_request(repo)
+
+    done = _run_job(repo)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "(no migrations)" in done.stdout
+
+
+@needs_a_shell
+def test_a_branch_that_resolves_a_two_headed_base_is_green(tmp_path: Path):
+    """The gate is the merge commit, never the base — otherwise the one branch that fixes
+    a two-headed `main` is the one branch that cannot be merged."""
+    repo = _job_repo(tmp_path)
+    _write(repo, "0016_a.py", "0016", None, "a")
+    _write(repo, "0017_b.py", "0017", "0016", "b")
+    _write(repo, "0018_mine.py", "0018", "0017", "mine")
+    _write(repo, "0019_theirs.py", "0019", "0017", "theirs")
+    _commit(repo, "main: two heads, 0018 and 0019 both on 0017")
+    _git(repo, "checkout", "-q", "-b", "work")
+    _write(repo, "0019_theirs.py", "0019", "0018", "theirs")
+    _commit(repo, "branch: relink 0019 onto 0018")
+    _as_pull_request(repo)
+
+    done = _run_job(repo)
+
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "migration graph after this merge: 0019" in done.stdout
+    assert "this PR resolves it" in done.stdout
+
+
+@needs_a_shell
+def test_a_checkout_without_the_base_branch_is_refused(split_merge_repo: Path):
+    """`fetch-depth: 0`, run rather than described.
+
+    At the default depth of 1 the base branch is not fetched, and a job that shrugged that
+    off would be green on precisely the graph the fixture above is two-headed on. So the
+    same repo, minus the base ref: it must go red, and it must name the reason.
+    """
+    _git(split_merge_repo, "update-ref", "-d", "refs/remotes/origin/main")
+
+    done = _run_job(split_merge_repo)
+
+    assert done.returncode != 0, f"a checkout with no base branch reported clean:\n{done.stdout}"
+    assert "fetch-depth" in done.stdout, (
+        f"the refusal does not name the checkout depth that caused it:\n{done.stdout}"
+    )
+
+
+@needs_a_shell
+def test_a_duplicate_revision_id_reads_as_the_reconciler_refusing_rather_than_as_two_heads(
+    tmp_path: Path,
+):
+    """Two answers arrive as the same exit 2, and the wrong one is the reassuring one.
+
+    `heads` returns 2 by itself when it counted the heads and the count was not one. It
+    also returns 2 when it declined to build a graph at all — a duplicate revision id, an
+    unreadable migration, git failing underneath it — and there the head count is not a
+    thing it has. Reporting the second as "two heads" would send a reader off to renumber a
+    graph that may be fine, so the job splits them on the reconciler's own `STOP:`.
+
+    The graph here is the one this repo actually reaches: `main` landed `0018` and the
+    branch minted its own. Once one of the two has landed this IS caught — it is only the
+    pair where BOTH are unlanded that no ref-against-ref check can see (#338).
+    """
+    repo = _job_repo(tmp_path)
+    _write(repo, "0016_a.py", "0016", None, "a")
+    _write(repo, "0017_b.py", "0017", "0016", "b")
+    _commit(repo, "chain to 0017")
+    _git(repo, "checkout", "-q", "-b", "work")
+    _write(repo, "0018_mine.py", "0018", "0017", "mine")
+    _commit(repo, "branch: 0018")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, "0018_theirs.py", "0018", "0017", "theirs")
+    _commit(repo, "main: 0018")
+    _as_pull_request(repo)
+
+    done = _run_job(repo)
+
+    assert done.returncode != 0, f"the job passed a duplicate revision id:\n{done.stdout}"
+    assert "duplicate revision id" in done.stdout, (
+        f"the refusal does not carry the reconciler's own words:\n{done.stdout}"
+    )
+    assert "not exactly one head" not in done.stdout, (
+        "the reconciler never counted the heads here, so the job must not report a head "
+        f"count it was not given:\n{done.stdout}"
+    )

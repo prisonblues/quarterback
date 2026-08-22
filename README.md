@@ -1462,6 +1462,8 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.85** — a shipped release's notes cannot be quietly replaced by a merge resolution.
 - **v2.86** — a claim is handed back when the work ends, and a repo may bound how much work is in
   flight.
+- **v2.87** — qb-doctor stops counting the packaging as drift.
+- **v2.88** — the migration-heads guard now runs where the fleet actually merges.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1748,6 +1750,9 @@ What enforces what:
 | `tests/test_migrations_self_contained.py` | AST-scans `migrations/versions/` against an **allowlist** — the standard library plus `alembic`/`sqlalchemy` — covering both import spellings, module-level and function-local, and constant-string `importlib.import_module`/`__import__` | no database, no app import, milliseconds |
 | `tests/test_migration_drift.py` | builds a throwaway database, replays every revision from empty, and diffs the result against `app.models` | one database, about a second |
 | `scripts/migration_reconcile.py` | renumber-and-relink when two branches both mint the next number | git only, no database |
+| `migration-heads` CI job | refuses a pull request whose **merge** would leave the base with more than one Alembic head, reporting the reconciler's own head list | git only, no database, seconds |
+
+`harness/githooks/pre-push` asks the multi-head question too, and in this fleet it is never the one that answers: it gates that check on the branch being protected, and `gh pr merge` goes through the GitHub API and touches no local hook at all. So the CI job is where it actually fires and the hook is the backstop for a direct push to `main` (#343, #351). Neither sees a revision id minted by two branches that have **both** yet to land — each is single-headed on its own, and the duplicate exists only in their union. That is #338, and #341 closes it by hash-naming revisions so the collision cannot be made rather than being caught after.
 
 The two tests are one mechanism in two halves: the drift test is where an app-importing
 migration *detonates*, and the AST scan is what stops it being written. An allowlist rather
