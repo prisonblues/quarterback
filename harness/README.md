@@ -547,7 +547,7 @@ hand, `qb-hooks uninstall` to take it off. `install` is idempotent, and re-runni
 repo that was set up before a new guard existed picks it up — `create-worktree` runs it on the
 main checkout every time it makes a worktree, so that normally happens on its own.
 
-### The pre-push guard — a two-headed graph, a pre-stamped release, a rewritten one
+### The pre-push guard — a two-headed graph, a pre-stamped release, a rewritten one, and the release number itself
 
 The other hook `qb-hooks` installs, and the reason it exists is that on 2026-08-22 four
 branches each minted migration `0029`. Every one of those authors ran
@@ -560,9 +560,9 @@ way.
 A runbook would have been followed correctly by all four and changed nothing. The failure
 was not disobedience, so a procedure cannot fix it. Hence a hook.
 
-It refuses three things, all read from the files **at the commit being pushed** rather than
-from the working tree or from a live database — so a push carrying a broken graph is refused
-even from a checkout that does not have it:
+It refuses three things and **takes** a fourth, all read from the files **at the commit being
+pushed** rather than from the working tree or from a live database — so a push carrying a
+broken graph is refused even from a checkout that does not have it:
 
 **A protected branch that would receive a multi-head migration graph.** `alembic upgrade
 head` refuses to load one, and the deployed database is then stuck wherever the last deploy
@@ -612,6 +612,27 @@ in the message: the refusal ends with a pasteable copy of that line, and a commi
 the refusal is not consent to it. It is scoped to `base..HEAD`, so the exemption expires with
 the merge it was written for.
 
+**And the one step here that takes something rather than checking it: the release number.**
+Where the pushed commit adds a release number the base does not have, `release_tag.py reserve`
+creates `refs/tags/vX.Y` on the remote. A ref create is compare-and-swap — it succeeds for
+exactly one caller and is rejected for every other, forever — which is the lock #296 says the
+release number has never had. Everything above is a *reading* of a shared CHANGELOG, and two
+landers who read it seconds apart read the same free number; the second one is refused here
+instead of merging and turning `main` red.
+
+Push time is the only moment it can be taken, and that is the substance rather than a detail.
+At stamp time the number is still fork-relative — `apply` runs in one worktree and a tag
+created there is a note to self. At merge time there is no local hook at all: this fleet lands
+through `gh pr merge` on the GitHub API, which is what #351 is about. At push time the release
+commit exists, the remote is right there, and the create wins or loses cleanly.
+
+It is safe on every push because it is scoped the same way the number check is: a branch whose
+newest heading is one it *inherited* has taken nothing and says so. And it is the one place
+this file departs from *"an unrunnable gate is not a passing gate"* — a reservation that could
+not be made leaves the repository exactly as the three checks above found and passed it, so
+there is nothing to be wrong about. It is reported as a note on the push rather than hidden,
+and a remote that is briefly unreachable does not block a push that is provably fine.
+
 **Where a check does not apply, it says nothing at all.** No `migrations/versions/` at the
 pushed commit, no `CHANGELOG.md`, no reconciler or stamper in the repo: silence, not a
 warning. This harness installs into repos that are neither quarterback nor lexray, and a hook
@@ -626,13 +647,14 @@ worse than no hook, because it reads as protection.
 **Bypassable deliberately, never accidentally.** `git push --no-verify` is the express opt-out
 for one push. A repo that genuinely does not want a check records it —
 `git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.releaseNumber`, or
-`qb.prePush.releaseBodies` — and
+`qb.prePush.releaseBodies`, or `qb.prePush.reserveRelease` — and
 `qb-hooks status` reports it, so a guard that has been switched off cannot look like one
 quietly passing.
 
-The tools are found at `scripts/migration_reconcile.py` and `scripts/release_stamp.py`,
-overridable per repo with `qb.migrationReconcile` / `qb.releaseStamp` (or the
-`QB_MIGRATION_RECONCILE` / `QB_RELEASE_STAMP` env vars for a one-off). The base ref comes from
+The tools are found at `scripts/migration_reconcile.py`, `scripts/release_stamp.py` and
+`scripts/release_tag.py`, overridable per repo with `qb.migrationReconcile` / `qb.releaseStamp`
+/ `qb.releaseTag` (or the `QB_MIGRATION_RECONCILE` / `QB_RELEASE_STAMP` / `QB_RELEASE_TAG` env
+vars for a one-off). The base ref comes from
 `refs/remotes/<remote>/HEAD`, falling back to `main`, `master`, `test`, and overridable with
 `qb.baseBranch` — which, when set, gets no fallback: an operator who named a base meant that
 base, so a `qb.baseBranch` that is not fetched is a refusal with `git fetch` as the remedy

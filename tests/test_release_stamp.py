@@ -2948,3 +2948,166 @@ def test_a_depth_one_clone_says_it_read_nothing_rather_than_reporting_a_clean_bi
     assert "limited: HEAD is already contained in origin/main" in captured.err
     assert "0 released entries compared" in captured.out, (
         "the count is what a reader checks; two entries were there and neither was judged")
+
+
+# ---------------------------------------------------------------------------
+# tags: what has been ISSUED, as against what has landed
+# ---------------------------------------------------------------------------
+#
+# `max(headings at --onto) + 1` is a reading of a shared file, and two landers seconds apart
+# read the same answer — the defect this module's own header opens with. `refs/tags/vX.Y` is
+# where a number that has been handed out but not yet merged is written down, and these are
+# the four places that changes what this tool says (#296).
+
+
+def reserved_elsewhere(repo: Path, version: str, *, on: str = "main") -> str:
+    """A sibling's reservation: a tag on a commit the working branch does not contain.
+
+    Built as a real commit off `main` rather than as a tag on an existing one, because the
+    property under test is exactly "not an ancestor of this branch" — a tag on a commit
+    `work` already has would be a backfilled tag for a landed release, which is the case
+    that must NOT refuse anything.
+    """
+    here = git(repo, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    git(repo, "checkout", "-q", on)
+    write(repo, "sibling.md", f"the other lander's release, {version}\n")
+    text = (repo / "CHANGELOG.md").read_text()
+    at = text.index("## ")
+    write(repo, "CHANGELOG.md", text[:at] + entry(version, title="somebody else's") + text[at:])
+    commit(repo, f"a sibling stamps {version}")
+    sha = git(repo, "rev-parse", "HEAD").strip()
+    git(repo, "tag", version, sha)
+    git(repo, "reset", "-q", "--hard", "HEAD~1")
+    git(repo, "checkout", "-q", here)
+    return sha
+
+
+def test_a_number_a_tag_already_holds_is_not_handed_out_again(repo):
+    """The whole point. `main` is at v2.33 and says nothing about v2.34 — the sibling that
+    took it has not merged — so headings alone hand this branch v2.34 as well. The tag is
+    the only record that the number is gone, and it is enough."""
+    reserved_elsewhere(repo, "v2.34")
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main") == 0
+
+    assert "## v2.35 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_a_major_bump_starts_above_the_tags_too(repo):
+    """`--major` picks one of two answers rather than producing a third, so the floor the
+    two are computed from has to be the same one."""
+    reserved_elsewhere(repo, "v3")
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+
+    assert "## v4 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_a_branch_that_stamped_a_number_a_sibling_reserved_is_refused(repo, capsys):
+    """#289/#291's window, closed. Both branches stamped v2.34 before either landed, so it
+    is at neither ref and the three heading-shaped collision checks all pass. Only the tag
+    knows, and it knows because creating it is what took the number."""
+    held = reserved_elsewhere(repo, "v2.34")
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 0
+    # Undo the tag's effect on the number so the branch really is carrying v2.34, which is
+    # what a branch stamped BEFORE the sibling's tag arrived would have.
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.35", "## v2.34"))
+    write(repo, "README.md", (repo / "README.md").read_text().replace("v2.35", "v2.34"))
+    commit(repo, "as if this branch had stamped v2.34 first")
+    capsys.readouterr()
+
+    assert run(repo, "collision", "--onto", "main", "--branch", "HEAD") == 2
+
+    err = capsys.readouterr().err
+    assert "v2.34 is already tagged at" in err
+    assert held[:12] in err
+    assert "vNEXT" in err, "and the repair, which is two tokens"
+
+
+def test_a_tag_for_a_release_this_branch_contains_is_not_a_collision(repo):
+    """The property that lets this run on every push. Backfilling gives every landed release
+    a tag, and every one of those is an ancestor of every branch off `main` — so a check that
+    only asked "is this number tagged" would refuse the entire repository."""
+    git(repo, "checkout", "-q", "main")
+    git(repo, "tag", "v2.33", "HEAD")
+    git(repo, "tag", "v2.32", "HEAD")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main") == 0
+
+    assert "## v2.34 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_a_tag_that_is_not_a_release_number_is_ignored(repo):
+    """`v2.99-rc1`, `v2.99.1` and `salvage/issue-85` are somebody else's refs. Reading one as
+    a release would hand out v2.100 and nothing in the repository would explain why."""
+    git(repo, "checkout", "-q", "main")
+    for name in ("v2.99-rc1", "v2.99.1", "salvage/issue-85", "release-v2.99"):
+        git(repo, "tag", name, "HEAD")
+    git(repo, "checkout", "-q", "work")
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main") == 0
+
+    assert "## v2.34 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_the_plan_reports_the_newest_tag_beside_the_newest_heading(repo, capsys):
+    """Two different facts — what has landed at the base, and what has been issued to
+    anybody — and the day they disagree is the day a sibling is mid-land with the number
+    this branch would otherwise have taken. Folding them into one line would hide exactly
+    that."""
+    reserved_elsewhere(repo, "v2.34")
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 0
+
+    out = capsys.readouterr().out
+    assert "would stamp v2.35" in out
+    assert "newest at main: v2.33" in out
+    assert "newest tag: v2.34" in out
+
+
+def test_a_checkout_with_no_tags_says_so_rather_than_saying_nothing(repo, capsys):
+    """Ninety-five releases shipped here before a tag existed, and that state has to read as
+    itself rather than as a checkout whose tags simply were not fetched."""
+    place(repo)
+
+    assert run(repo, "preflight", "--onto", "main") == 0
+
+    assert "no release tags in this checkout" in capsys.readouterr().out
+
+
+def test_the_next_free_number_a_collision_advises_is_past_the_tags(repo, capsys):
+    """Advising a colliding branch to take a number a sibling has already reserved is
+    advising the next collision."""
+    reserved_elsewhere(repo, "v2.34")
+    place(repo)
+    assert run(repo, "apply", "--onto", "main") == 0
+    text = (repo / "CHANGELOG.md").read_text()
+    write(repo, "CHANGELOG.md", text.replace("## v2.35", "## v2.33"))
+    write(repo, "README.md", (repo / "README.md").read_text().replace("v2.35", "v2.33"))
+    commit(repo, "a branch that stamped a number main already has")
+    capsys.readouterr()
+
+    assert run(repo, "collision", "--onto", "main", "--branch", "HEAD") == 2
+
+    assert "next free number is v2.35" in capsys.readouterr().err
+
+
+def test_apply_names_the_command_that_actually_takes_the_number(repo, capsys):
+    """The stamp is a file edit until the tag exists. `apply` is the last thing a lander runs
+    before committing, so it is the one place a line about the step that is a lock will be
+    read."""
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main") == 0
+
+    out = capsys.readouterr().out
+    assert "release_tag.py reserve" in out
+    assert "pre-push" in out

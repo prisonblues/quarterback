@@ -38,10 +38,17 @@ write a fragment without racing for a number — the number is decided at land t
 ## At land time
 
 ```bash
+git fetch origin --tags                                  # a sibling's reserved number too
 scripts/changelog_fragments.py check                     # do the fragments parse?
 scripts/changelog_fragments.py assemble --title "<what this release does>"
 scripts/release_stamp.py apply --onto origin/main        # vNEXT -> the next free number
+git commit -a                                            # and then push
 ```
+
+The **push** is what takes the number: `harness/githooks/pre-push` creates `refs/tags/vX.Y`
+on the remote, which succeeds for exactly one caller and is rejected for every other. Until
+then `apply` has only read a shared file, and two landers reading it seconds apart read the
+same answer (#296).
 
 `assemble` folds every fragment present into one `## vNEXT — <title>` entry at the top of
 `CHANGELOG.md`, adds the matching `- **vNEXT** — …` bullet to the README's release list, and

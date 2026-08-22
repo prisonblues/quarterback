@@ -802,7 +802,7 @@ race for a number entirely rather than deferring it.
 At land time the fragments become one release entry, and then that entry gets its number:
 
 ```bash
-git fetch origin
+git fetch origin --tags
 scripts/changelog_fragments.py check                    # do the fragments parse?
 scripts/changelog_fragments.py assemble --title "…"     # -> `## vNEXT — …` + the README bullet
 scripts/release_stamp.py preflight        # what it would take, read-only
@@ -811,6 +811,11 @@ scripts/release_stamp.py apply --major    # …as v3 rather than v2.34
 scripts/release_stamp.py check            # nothing unstamped, no number used twice
 scripts/release_stamp.py frozen           # no shipped entry's text was rewritten
 ```
+
+Then commit and push, and the push is what **takes** the number — `harness/githooks/pre-push`
+creates `refs/tags/vX.Y` on the remote for you. `--tags` on that first fetch is not a detail:
+a number somebody has reserved and not yet merged lives on a tag pointing at their branch, and
+a plain `git fetch` follows tags only into history it fetched.
 
 `assemble` needs `--title` only past one fragment; a lone fragment lends the release its own
 title. A fragment that lands unassembled is not lost — the next `assemble` sweeps it into that
@@ -833,10 +838,12 @@ proves it wrong.
 Whether v2.34 or v3 follows v2.33 is the one thing no ref can answer, so `--major` is a flag and
 never an inference: `apply --major` stamps `v3`, and the plan says which kind of bump it made.
 
-Two branches that stamp in the same minute get the same number, and nothing can prevent that —
-what the tool does instead is make it impossible to miss. Once `apply` has run the placeholder is
-gone, so there is no automatic re-stamp and none is claimed; what there is instead is a refusal on
-each of the two shapes the collision takes. `preflight` and `apply` refuse on both: the duplicate
+Two branches that stamp in the same minute get the same number — the stamp itself is a file
+read, and a read reserves nothing. What stops the second one landing is the tag the push takes
+(the next section); what the stamper does is make the collision impossible to miss when the tag
+was never taken. Once `apply` has run the placeholder is gone, so there is no automatic
+re-stamp and none is claimed; what there is instead is a refusal on each of the shapes the
+collision takes. `preflight` and `apply` refuse on both: the duplicate
 number a "keep both sides" merge leaves behind, and a number this branch *added* which already
 exists at `origin/main`. `check` sees the first only — it deliberately takes no base ref, so there
 is no `origin/main` for it to compare against, and it reads CHANGELOG headings and README bullets
@@ -853,10 +860,13 @@ nothing left to stamp may carry one newly-issued number — the next minor or th
 both — and a branch that still has a placeholder may carry none at all, since stamping would then
 write the number in twice.
 
-What that cannot catch, and does not claim to: a hand-written `max+1`, which is the same bytes
-`apply` writes and is what somebody numbering by hand off the top of `main` actually picks. The
-guard catches the number that overshoots and the number already taken at the base; a lucky guess
-still lands. Write the placeholder — it is the only thing here that makes the number unguessable.
+What that cannot catch by reading the CHANGELOG alone, and does not claim to: a hand-written
+`max+1`, which is the same bytes `apply` writes and is what somebody numbering by hand off the
+top of `main` actually picks. From the headings the guard catches the number that overshoots and
+the number already taken at the base; a lucky guess still lands. It is caught anyway when the
+number has been reserved, because a **tag** is not a guess and the check that reads them does not
+care who typed the heading — but that is the tag doing it, not this. Write the placeholder: it is
+still the only thing here that makes the number unguessable in the first place.
 
 **An unstamped `vNEXT` at the base stops the branches that need a number, and only those.** It is
 still a refusal when this branch ships a release — you cannot hand out `max+1` while the base holds
@@ -887,6 +897,106 @@ claim on v2.34 never kept v2.34 free, and what it left instead was a table of nu
 for every PR still open. A namespace nobody claims in does not need an allocator, and a stale record
 of one is worse than none — it is a second answer to a question that has one, which is exactly the
 defect #172 is about. Nine releases landed in a day off `apply` alone, with no collisions.
+
+**A git tag is not that, and the difference is the whole of #296.** `POST /release/claim`
+recorded an intention; `refs/tags/v2.96` *is* the number, and after the create succeeds nobody
+can be issued it again whether or not they look. That is the property the board claim never had
+and could not have, and it is why the next section adds an allocator to a mechanism this
+paragraph spent a page arguing did not need one.
+
+### The number is taken, not merely written down
+
+Everything above is a **reading** of a shared file. `apply` computes `max(headings at
+origin/main) + 1`, which is the right answer to the question it asks and is not a lock: two
+landers who ask seconds apart get the same answer, because reading a file cannot reserve
+anything. [scripts/release_stamp.py](scripts/release_stamp.py) says so in its first
+paragraph — *"a release number is a shared namespace with no lock on it"* — and the three
+guards above are all responses to that sentence rather than fixes for it.
+
+The lock was in git the whole time, and this repo had **zero tags** until #296. Creating a
+ref on a remote is compare-and-swap:
+
+```bash
+scripts/release_tag.py reserve      # git push origin <sha>:refs/tags/v2.96
+```
+
+It succeeds for exactly one caller and is rejected for every other, forever. No server, no
+table of numbers going stale for every PR still open — which is what #172 deleted, and it was
+right to: that allocator recorded an *intention* to take a number, which nothing read. This
+one **is** the number.
+
+**It is taken at push time**, by [harness/githooks/pre-push](harness/githooks/pre-push), and
+that placement is the substance rather than a detail. At stamp time the tag would be
+fork-relative like everything else — `apply` runs in one worktree, and a tag created there is
+a note to self until it is pushed. At merge time there is no local hook to run at all: this
+fleet lands through `gh pr merge` on the GitHub API, which is #351's finding one domain over.
+At push time the release commit exists, the remote is right there, and the create either wins
+or loses cleanly. Nobody has to remember it, which matters more here than anywhere: ten
+collisions in two days made the original case, and the tenth landed an hour after the board's
+allocator shipped and worked, because two agents did not call it.
+
+`--onto` is what makes it safe to run on every push rather than on release pushes only. A
+branch whose newest heading is one it *inherited* has taken nothing and says so, in one
+subprocess and no network write.
+
+**What the tag then does for everybody else.** `release_stamp.py` reads
+`refs/tags/vX[.Y]` as well as the CHANGELOG:
+
+- `next_release` folds tags into the same `max`, so a number a sibling has reserved and not
+  yet merged is skipped rather than handed out a second time;
+- `collision` refuses a number this branch added that a tag holds **on a commit this branch
+  does not contain**. Both halves are required: "this branch added it" keeps a branch that
+  merely inherited a released heading out of it, and "not contained here" is what tells a
+  sibling's live reservation from a backfilled tag for a release already in this history.
+  A tag on `main` is an ancestor of every branch off `main`, so this is silent for all of
+  them, which is the property that lets it run on every push.
+
+That closes the window the README used to describe as unclosable: *"two branches that stamp
+in the same minute get the same number, and nothing can prevent that"*. Something can now,
+and it is refused at the second **push** rather than reported after the second **merge** —
+the difference between one branch being told to re-stamp and `main` going red for everybody.
+
+**What it does not close, since a guard whose blind spot is undocumented is how the last one
+survived.** `git push --no-verify` skips the hook, as does a push from a checkout where the
+hook was never installed; neither can be closed from inside a hook. If **neither** lander
+reserves, nothing here helps — both stamp the same number and `release_stamp.py check` turns
+main red at the second merge, exactly as before.
+
+A reservation can also outlive the push it was taken for. A hook runs *before* the push, so a
+push git then fails to deliver leaves the tag behind, as does a pull request that is
+abandoned. Both cost a skipped release number and nothing else: `check` lists a tag that is
+not on the integration ref as a reservation rather than a defect, because that is also
+exactly what every release in flight looks like.
+
+### Every release has a tag, and every tag has a release
+
+```bash
+scripts/release_tag.py backfill --push    # tag what already landed; never moves a tag
+scripts/release_tag.py check              # reconcile the tags against CHANGELOG.md
+scripts/release_tag.py taken              # which numbers this checkout's tags hold
+```
+
+Ninety-seven releases shipped here before any of this, so `backfill` reads the CHANGELOG at
+each commit along `main`'s first-parent line and tags every release at the commit that first
+declared it — which is the merge that landed it, not the branch commit that wrote it. The
+invariant it maintains and `check` verifies is one line: **a tag `vX.Y` points at a commit
+whose `CHANGELOG.md` declares `## vX.Y`.**
+
+**It never moves a tag.** One in the wrong place is reported and left there, for a human to
+decide whether the tag or the entry is wrong. Everything downstream of a tag — a `git
+describe`, a deploy that pinned it, somebody's bookmark — quietly changes meaning when tags
+move, and a moved tag is worse than an absent one: absent, everybody knows to look it up.
+
+`check` reports one condition per line rather than one verdict, and has a third answer that
+is not a lesser second — **0** clean, **1** checked but something could not be checked, **2**
+stop. That is `qb-reconcile`'s shape from #255, and the reason for it is the same: a doctor
+that cannot reach the remote must say so, not report a tidy repo.
+
+The `every release on main has a tag` CI job runs `backfill --push` after every merge. It is
+the **record** and not the lock — by the time it runs the merge has happened, so a duplicate
+number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
+release that landed through a `--no-verify` push, so the tags do not quietly drift out of
+step with the file they are supposed to be about.
 
 ### A released entry is immutable
 

@@ -397,6 +397,46 @@ jobs:
       - name: Check every release on main carries a number
         run: python3 scripts/release_stamp.py check
 
+  tagged:
+    name: every release on main has a tag
+    # `main` only, like `stamped` above and for a related reason, but this one is a RECORD
+    # rather than a lock and the distinction is the whole of why it exists (#296).
+    #
+    # The lock is `harness/githooks/pre-push`, which calls `release_tag.py reserve` and takes
+    # `refs/tags/vX.Y` on the remote at the moment the release commit is pushed. A ref create
+    # is compare-and-swap, so exactly one of two landers gets the number and the other is
+    # refused before its branch is anywhere near here. What a hook cannot cover is `git push
+    # --no-verify` and a checkout where the hook was never installed, and neither can be
+    # closed from inside a hook. This job closes them for the RECORD: after the merge, every
+    # release on main gets the tag it should already have had.
+    #
+    # It is not a second allocator and must not be read as one. By the time it runs the merge
+    # has happened, so it can only write down what landed — if two branches both landed
+    # `## v2.96`, `stamped` above is already red and this job has nothing to fix. Calling it
+    # a lock would be the reassuring wrong answer this repo keeps finding.
+    #
+    # `backfill` never moves a tag, so this is idempotent and additive: the usual run creates
+    # nothing at all, and where it creates nothing it pushes nothing and needs no write
+    # access. `contents: write` is here for the exception, and it is job-scoped rather than
+    # widened at the top of the file, where two jobs run arbitrary test code.
+    #
+    # `fetch-depth: 0` is load-bearing twice over: a release's tag names the commit that
+    # first declared it, which is a question about the whole history, and depth-1 has one
+    # commit — so a shallow checkout would tag all ninety-odd releases at HEAD, permanently,
+    # and tags are not moved by anything here.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Record a tag for every release that has landed
+        run: python3 scripts/release_tag.py backfill --ref HEAD --push
+
   frozen:
     name: no shipped release entry was rewritten
     # `pull_request` only, and — unlike `stamped` above — that makes this one SAFE to
