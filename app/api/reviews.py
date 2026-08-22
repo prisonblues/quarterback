@@ -3370,6 +3370,115 @@ async def list_reviews(
             for r in runs]
 
 
+#: The largest window ``GET /review/spend`` will look back over, in hours. Four
+#: weeks, because a ceiling is a rate and a caller asking for a year's total has
+#: stopped asking a ceiling's question — and because the answer is computed on
+#: demand over every scorecard in the range.
+MAX_SPEND_WINDOW_HOURS = 24 * 28
+
+
+def _spend_totals(row) -> dict:
+    """One window's spend, in the two units a ceiling can be denominated in.
+
+    ``tokens`` is input + output, which is :func:`review_stats`' own ``billable``
+    and for its reasons: cached input is a slice OF input and reasoning sits
+    inside output for some vendors and beside it for others, so adding either
+    double-counts exactly the seats a ceiling is trying to price.
+
+    ``tokens`` is **null when nothing in the window was instrumented**, never
+    zero. The distinction is the whole honesty of this endpoint: a repo whose
+    every run predates #15 has spent plenty and measured none of it, and a `0`
+    there would report that as a clean budget. ``rows`` and ``measured_rows`` say
+    how much of the window the number covers, so a client can tell a real zero
+    from an unmeasured one and say which it got.
+    """
+    billable = [t for t in (row.input_tokens, row.output_tokens) if t is not None]
+    return {
+        "runs": int(row.runs or 0),
+        "rows": int(row.rows or 0),
+        "measured_rows": int(row.measured_rows or 0),
+        "tokens": int(sum(billable)) if billable else None,
+        "cost_usd": float(row.cost_usd) if row.cost_usd is not None else None,
+    }
+
+
+@router.get("/review/spend")
+async def review_spend(
+    _reader: str = Depends(reader),
+    repo: str | None = Query(None),
+    pr: int | None = Query(None, ge=1),
+    hours: int = Query(24, ge=1, le=MAX_SPEND_WINDOW_HOURS),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """What review has already cost — the measurement a spend ceiling is checked against (#55).
+
+    Three windows in one call, because a caller deciding whether to start a round
+    has to check all of them before it starts and a ceiling enforced in three
+    round trips is a ceiling that races itself:
+
+    * ``repo_window`` — this repo over the last ``hours``. Absent without ``repo``.
+    * ``fleet_window`` — every repo on this board over the same window.
+    * ``pr`` — one pull request's whole life, across every cycle and every head it
+      has had. Absent without both ``repo`` and ``pr``.
+
+    **This endpoint states what was spent and never what may be.** The ceiling
+    itself is a dial (:mod:`app.api.dials`), the board does not know what a dial
+    means, and the comparison is the harness's — ``harness/loops/panel_caps.py``.
+    Putting the arithmetic here would make this the second place that knows
+    ``review_panel.budget.tokens_per_day`` is a number of tokens, which is the
+    drift #305 exists to end and which :mod:`app.review_queue` already refuses for
+    ``max_rounds`` in the same words.
+
+    A window with no runs in it is ``{"runs": 0, "rows": 0, "measured_rows": 0,
+    "tokens": null, "cost_usd": null}`` — a real zero for the counts and a null
+    for the sums, so "nobody reviewed anything" and "nobody measured anything"
+    stay apart.
+    """
+    now = datetime.now(UTC)
+    since = now - timedelta(hours=hours)
+    scope = _asked_repo(repo) if repo is not None else None
+
+    def totals(*where):
+        # LEFT join, so a run that recorded no scorecard at all still counts as a
+        # run. It cost whatever it cost; a ceiling that only counted instrumented
+        # runs would be loosened by the failure to instrument them.
+        return (
+            select(
+                func.count(func.distinct(ReviewRun.id)).label("runs"),
+                func.count(ReviewReviewer.id).label("rows"),
+                func.count(ReviewReviewer.id).filter(sa_or(
+                    ReviewReviewer.input_tokens.isnot(None),
+                    ReviewReviewer.output_tokens.isnot(None))).label("measured_rows"),
+                func.sum(ReviewReviewer.input_tokens).label("input_tokens"),
+                func.sum(ReviewReviewer.output_tokens).label("output_tokens"),
+                func.sum(ReviewReviewer.cost_usd).label("cost_usd"),
+            )
+            .select_from(ReviewRun)
+            .outerjoin(ReviewReviewer, ReviewReviewer.run_id == ReviewRun.id)
+            .where(*where)
+        )
+
+    out: dict = {
+        "now": now.isoformat(),
+        "repo": scope,
+        "pr": pr,
+        "window_hours": hours,
+        "since": since.isoformat(),
+        "fleet_window": _spend_totals(
+            (await session.execute(totals(ReviewRun.ts >= since))).one()),
+    }
+    if scope is not None:
+        out["repo_window"] = _spend_totals((await session.execute(
+            totals(ReviewRun.repo == scope, ReviewRun.ts >= since))).one())
+        if pr is not None:
+            # No time bound, deliberately. A per-PR ceiling is about one pull
+            # request's whole cost, and a rolling window would let a PR reviewed
+            # daily for a fortnight stay under a ceiling it passed on day two.
+            out["pr_total"] = _spend_totals((await session.execute(
+                totals(ReviewRun.repo == scope, ReviewRun.pr == pr))).one())
+    return out
+
+
 @router.get("/review/stats")
 async def review_stats(
     _reader: str = Depends(reader),
