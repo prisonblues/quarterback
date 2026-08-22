@@ -15,7 +15,7 @@
   7  refused    — this repo's window is full, or `qb-admit` could not read it
   8  refused    — somebody holds that work, or the claim could not be taken at all
   9  could not start it — no tmux, tmux refused, or the pane could not be stamped.
-                 The claim is handed back
+                 The claim goes back, and it says so if that failed too
 
 **THE HALF OF #277 THAT WAS NEVER BUILT.** There were three ways to start a
 session here and every one of them ended at a human hand: `qb-seat` in a pane

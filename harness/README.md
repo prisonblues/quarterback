@@ -890,7 +890,7 @@ qb-start --dry-run /fix-issue 277     # every refusal, nothing started
 #   exit 6  the shared window is spent, or qb-pace could not read it
 #   exit 7  this repo's window is full, or qb-admit could not read it
 #   exit 8  somebody holds that work, or the claim could not be taken at all
-#   exit 9  could not start it — the claim is handed back
+#   exit 9  could not start it — the claim goes back, and it says if that failed
 ```
 
 **Off by default, and the default costs nothing — not even a file.** With no
