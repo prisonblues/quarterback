@@ -12,7 +12,9 @@ because the harness owns the vocabulary and this server does not.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from sqlalchemy import delete, update
@@ -248,3 +250,79 @@ async def test_a_value_postgres_cannot_store_is_refused_where_it_is_typed(client
     assert r.status_code == 422
     assert (await client.get("/dials", params={"repo": REPO},
                              headers=LAPTOP)).json()["dials"] == []
+
+
+# ------------------------------- the two ends, pinned against each other (#199)
+
+def _harness_rules():
+    """`harness/loops/harness_rules.py`, imported by path.
+
+    The harness is not a package and is not on this suite's path, and it is
+    deliberately imported HERE rather than the endpoint being re-described in the
+    harness suite: the skew this guards against is between a body this server
+    PRODUCES and a body that resolver PARSES, so the test has to hold both.
+    """
+    import importlib.util
+    import sys
+    root = Path(__file__).resolve().parent.parent / "harness" / "loops"
+    sys.path.insert(0, str(root))
+    spec = importlib.util.spec_from_file_location(
+        "harness_rules_under_test", root / "harness_rules.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+async def test_the_body_this_endpoint_returns_is_the_body_the_resolver_parses(
+        client, monkeypatch):
+    """Client/server skew is #199, and a settings channel is where it would hurt
+    most: a board reporting a floor as in force while every box's resolver quietly
+    ignored the shape it arrived in is precisely the disagreement #305 exists to end.
+
+    So this takes a REAL response from the real endpoint and hands it to the real
+    resolver, rather than either side asserting against a hand-written literal.
+    """
+    hr = _harness_rules()
+    await set_dial(client, value="P3", reason="trying P3", repo=REPO)
+    await set_dial(client, dial="review_panel.max_rounds", value=2, repo=None,
+                   reason="fleet-wide")
+    await set_dial(client, dial="reviewers.pi.enabled", value=False, repo=REPO,
+                   reason="metered, and not worth it here")
+    body = (await client.get("/dials", params={"repo": REPO},
+                             headers=LAPTOP)).json()
+
+    monkeypatch.setenv(hr.DIALS_ENV, json.dumps(body))
+    dials, _where, problems, unreadable = hr.board_dials(REPO)
+    assert (problems, unreadable) == ([], False)
+    assert {k: (v["value"], v["scope"]) for k, v in dials.items()} == {
+        FLOOR: ("P3", "repo"),
+        "review_panel.max_rounds": (2, "fleet"),
+        "reviewers.pi.enabled": (False, "repo"),
+    }
+    assert dials[FLOOR]["reason"] == "trying P3"
+    assert dials[FLOOR]["set_by"] == "rich"
+
+
+async def test_an_expired_row_never_reaches_the_resolver_from_either_end(client,
+                                                                        monkeypatch):
+    """Both ends filter, and neither relies on the other doing it: the endpoint
+    because a client that had to filter could forget to, and the resolver because
+    `$QUARTERBACK_DIALS` is a hand-written body with no server in front of it."""
+    hr = _harness_rules()
+    await set_dial(client)
+    async with async_session() as s:
+        await s.execute(update(DialSetting).values(
+            expires_at=datetime.now(UTC) - timedelta(hours=1)))
+        await s.commit()
+    body = (await client.get("/dials", params={"repo": REPO},
+                             headers=LAPTOP)).json()
+    assert body["dials"] == []
+
+    # And the same row, handed straight to the resolver as though no server had
+    # filtered it.
+    raw = {"dials": [{"dial": FLOOR, "value": "P3", "scope": "repo",
+                      "reason": "r", "set_by": "rich",
+                      "expires_at": (datetime.now(UTC)
+                                     - timedelta(hours=1)).isoformat()}]}
+    monkeypatch.setenv(hr.DIALS_ENV, json.dumps(raw))
+    assert hr.board_dials(REPO)[0] == {}
