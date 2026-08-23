@@ -68,6 +68,8 @@
   .rank { color:var(--muted); font-size:12px; min-width:2.4em; text-align:right;
     padding-top:1px; min-height:44px; }
   .rank.chosen { color:var(--fg); font-weight:600; }
+  /* Neither of the two answers — see rankClass(). fleet.html's `unclear` colour. */
+  .rank.unclear { color:#f0b429; }
   .body { flex:1; min-width:0; }
   .row1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .title { font-weight:600; }
@@ -250,17 +252,35 @@ const RANK_WHY = {
   placed: "placed by the agent that added it, relative to a named neighbour",
   ordered: "ordered by a human, here",
 };
+// A source this page has no sentence for is an UNKNOWN, and an unknown may not be
+// rendered as one of the answers. Left to `|| ""` it came out as no explanation at
+// all — on a row still drawn in the muted weight that means "nobody chose this",
+// which is a definite claim about the one row the page cannot make one about. The
+// board's own vocabulary is a CHECK constraint today, so this is reachable only by
+// a page older or newer than the board it is talking to; that is exactly when a
+// silent wrong answer is worst, because nothing on either side is broken.
 function rankWhy(it){
-  const why = RANK_WHY[it.rank_source] || "";
-  return it.placed_for ? `${why} — for ${it.placed_for}` : why;
+  const known = RANK_WHY[it.rank_source];
+  const why = known || `the board called this position “${it.rank_source ?? "nothing at all"}”`
+    + `, which this page has no sentence for — so whether anybody chose it is not `
+    + `something it can tell you`;
+  // Only ever appended to a sentence there is one of: "— for X" alone says nothing.
+  return (known && it.placed_for) ? `${why} — for ${it.placed_for}` : why;
 }
 // The half of the provenance that has to be legible WITHOUT reading the sentence:
 // did anybody choose this position, or is it just where the row landed? That is
 // the whole distinction #183 exists to draw, and a `title` draws it for a mouse
 // only. Weight, not colour alone, so it survives a reader who cannot see the
 // colour and a phone screen in daylight.
+//
+// Three-valued, for the reason fleet.html's verdict is: `chosen` and `appended`
+// are things the board REPORTED, and `unclear` is the shape of an answer it gave
+// that this page cannot read. Neither of the first two, and not hidden.
 const RANK_CHOSEN = new Set(["ordered", "placed"]);
-function rankChosen(it){ return RANK_CHOSEN.has(it.rank_source); }
+function rankClass(it){
+  if(!(it.rank_source in RANK_WHY)) return " unclear";
+  return RANK_CHOSEN.has(it.rank_source) ? " chosen" : "";
+}
 
 // A control that will not act, without `disabled`. The gate is the same one it
 // always was — the difference is that the browser still delivers the tap, so the
@@ -303,9 +323,8 @@ function row(it, s){
   const dropWhy = dropTo==="open" ? "put it back"
     : dropTo ? "drop it" : "done stays done — its completion record is the point";
   el.innerHTML = `
-    <div class="rank${rankChosen(it)?" chosen":""}"${rankWhy(it)
-        ? ` data-why="${esc(rankWhy(it))}" title="${esc(rankWhy(it))}"` : ""
-      }>${it.state==="open"?it.rank:"·"}</div>
+    <div class="rank${rankClass(it)}" data-why="${esc(rankWhy(it))}"
+      title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
     <div class="body">
       <div class="row1">
         ${refHtml(it)}

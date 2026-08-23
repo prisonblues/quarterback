@@ -291,6 +291,29 @@ def test_a_position_somebody_chose_is_legible_without_reading_the_sentence(page)
         "colour alone is not a distinction every reader can see"
 
 
+def test_a_rank_source_the_page_cannot_read_is_not_reported_as_an_append(page):
+    """The same class of hole #335 found in the review marker: the one row nobody
+    can attribute is the one that renders as nothing.
+
+    `RANK_WHY[it.rank_source]` misses when the board names a source this page has
+    no sentence for. Left to `|| ""` that row lost its explanation *and* kept the
+    muted weight that means "nobody chose this position" — a definite claim about
+    the one row no claim can be made about. Three-valued, like `fleet.html`'s
+    verdict: what was reported, and the shape of an answer that cannot be read."""
+    cls = re.search(r"function rankClass\(it\)\{(.*?)\n\}", page, re.S)
+    assert cls, "could not find rankClass"
+    assert "in RANK_WHY" in cls.group(1), \
+        "an unknown source has to be detected before it is classified"
+    assert "unclear" in cls.group(1), "and given its own reading, not one of the two"
+    assert re.search(r"\.rank\.unclear \{[^}]*\}", page), \
+        "an unclear rank needs to look like neither answer"
+    # The row still carries a reason — an empty one reads as no provenance at all.
+    why = re.search(r"function rankWhy\(it\)\{(.*?)\n\}", page, re.S)
+    assert why and '|| ""' not in why.group(1), \
+        "an empty explanation is indistinguishable from no explanation"
+    assert "no sentence for" in why.group(1), "it has to say what it cannot say"
+
+
 def test_every_rank_source_the_server_sends_has_a_reason_on_the_page():
     """A source the page has no sentence for renders as an empty explanation, which
     reads exactly like a rank with no provenance at all."""
