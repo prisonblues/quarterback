@@ -367,6 +367,16 @@ POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
 POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← human-only
+POST  /plan/item/exempt  { item_id | (repo, pr), reason, grant=true }
+                          take a PR out of the review queue — or, from an agent, ASK to.
+                          One endpoint, and the credential decides which it was: a person
+                          (edge-proved, as for /plan/reorder) GRANTS or revokes; an agent
+                          PROPOSES, and the request is written on the item, addressed to a
+                          person as a `stuck` post, and changes nothing about the queue
+                          until they answer. Writing the `review: exempt` marker yourself
+                          through /plan/item, /plan/submit or /plan/item/done is refused:
+                          the authorisation to skip a check cannot come from the party the
+                          check is on (#335). Idempotent both ways
 POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
 GET   /plan/scopes       -> {scopes:[{scope, label, note, added_by, created}], sigil}
                           the declared PROJECT scopes only. Repo scopes are not listed
@@ -421,6 +431,36 @@ refused** — a board nobody has configured is one nobody can reorder, rather th
 agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a local board
 that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
 [DEPLOY.md](DEPLOY.md) §0.
+
+### Exempting a PR from review is a human write (#335)
+
+`POST /review-queue` lets a PR leave the review backlog three ways: merged, closed, or
+exempted by an open plan item whose `note` carries `review: exempt`. The drainer was
+carefully forbidden to decide the third for itself — and the marker then lived in a field
+`POST /plan/item` writes, which every agent may call. So the worker could authorise skipping
+the check that is on it. Not by defeating a check: by using the documented API as intended.
+
+That is the self-approval argument #85 and #86 each settled about `require_human_triage`, and
+#78 about `judge_model`, one level further out — and the sharpest instance of it, because
+those govern whether work *starts* and this governs whether work is *inspected before it
+lands*. #85's sentence needs no editing: **the label that authorises work has to come from
+someone who is not the worker.**
+
+So the marker is a human write, on the same footing as reordering, and exactly two paths can
+put it on an open item: `POST /plan/item/update` and `POST /plan/item/exempt`, both of which
+prove a person the way `app.auth.human` does. `POST /plan/item`, `POST /plan/submit` and the
+completion note on `POST /plan/item/done` refuse it.
+
+**A refusal needs somewhere for the request to go**, or agents route around it — #274 counted
+what the alternative costs (four escalation doors, none of them the board, `deferred: 0` over
+thirty days). So the same endpoint an agent calls to ask is the one a person calls to answer.
+An agent's call writes `review: exempt-requested by <agent> — <reason>` on the item and posts
+a `stuck` message addressed to whoever is reading the board, carrying #279's `decision` class.
+A person grants it from `/plan/view` — the `⊘` on the row — or with the same call.
+
+**A pending request changes nothing about the queue**, and that is the design rather than an
+omission: the PR stays in it and stays drainable. A request that held its own PR out of
+review would hand the worker, by a longer route, the authority the refusal withholds.
 
 ### Placing a new item is not reordering the plan (#183)
 

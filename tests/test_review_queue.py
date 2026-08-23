@@ -56,10 +56,13 @@ from app.review_queue import (
     same_commit,
 )
 
-from .conftest import LAPTOP, SERVER
+from .conftest import LAPTOP, PINNED_SETTINGS, SERVER
 
 REPO = "acme/drainrepo"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d27327"}
+#: A person, as the edge proves one. Since #335 an exemption is a human write,
+#: so the suite that reads exemptions has to be able to make one.
+HUMAN = {"Remote-User": "rich", "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
 OTHER = {**SERVER, "X-Agent-Instance": "d27328"}
 
 SHA_A = "a" * 40
@@ -488,12 +491,24 @@ async def test_recorded_outcomes_clear_findings_and_move_the_pr_off_unresolved(c
 
 
 async def test_an_exempting_plan_item_takes_a_pr_out_of_the_line_and_says_which(client):
+    """Written as an AGENT until #335, and that was the hole this suite could not see.
+
+    The queue was careful that its reader never writes an exemption, and the
+    marker was then left on `POST /plan/item`, which every agent may call — so
+    the worker held the authority the drainer had been denied. The refusal is
+    tested in `test_review_exemption.py`; what this one now pins is the other
+    half, that a marker a PERSON wrote still takes the PR out of the line
+    exactly as before. Nothing about reading an exemption changed.
+    """
     r = await client.post("/plan/item", headers=AGENT, json={
         "title": "PR 7340 is parked", "repo": REPO, "ref_kind": "pr",
-        "ref_value": "7340",
-        "note": "review: exempt — waiting on the upstream release, do not spend rounds"})
+        "ref_value": "7340"})
     assert r.status_code == 200, r.text
     item_id = r.json()["item_id"]
+    r = await client.post("/plan/item/update", headers=HUMAN, json={
+        "item_id": item_id,
+        "note": "review: exempt — waiting on the upstream release, do not spend rounds"})
+    assert r.status_code == 200, r.text
 
     q = await ask(client, [snapshot(7340), snapshot(7341)])
     ex = entry(q, 7340)

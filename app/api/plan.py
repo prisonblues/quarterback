@@ -45,11 +45,11 @@ from __future__ import annotations
 
 import hashlib
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select, text, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,17 +66,30 @@ from app.api.claims import (
     live_claim,
     may_mutate,
 )
-from app.auth import human, identify, reader
+from app.auth import author, human, identify, reader
 from app.claimkey import WORK, BadRef, canonical_repo, derive
 from app.db import get_session
-from app.identity import same_machine
+from app.identity import HUMAN, is_human, same_machine
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
 from app.models.plan_scope import PlanScope
+from app.models.post import Post
 from app.models.resource_lease import ResourceLease
 from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
+from app.needs_human import label_for
 from app.ordering import BASES, Candidate, Ordering, moves_between, suggest_order
+from app.review_queue import (
+    EXEMPTABLE_REF_KIND,
+    MarkerInReason,
+    exempting,
+    grant_line,
+    granted_exemption,
+    request_line,
+    requested_exemption,
+    safe_reason,
+    strip_exemption_lines,
+)
 from app.scope import (
     PROJECT_SIGIL,
     SCOPE_SHAPE,
@@ -320,6 +333,77 @@ def _refuse_forge_ref(repo: str | None, ref_kind: str | None,
                 f"{ref_kind} to name. Put the item in the repo scope if the work "
                 "really is an issue or a PR, or drop the ref and let the title and "
                 "note carry it — which is what every item in a project scope does.",
+    })
+
+
+#: The longest reason an exemption request or grant may carry into an item's
+#: ``note``. Short on purpose: the note is a human's reasoning about the plan and
+#: this is one line inside it, not the argument. The argument goes in the board
+#: post, which has room.
+MAX_EXEMPT_REASON = 500
+
+#: How long the same exemption question goes unrepeated on the board. The same
+#: bound ``harness/loops/needs_human.py`` puts on :func:`announce`, and for the
+#: same reason: the note already refuses a second request while one is pending,
+#: but withdrawing and asking again would slip past that and cost a person one
+#: notification per loop iteration. An escalation queue nobody can trust to be
+#: quiet is one nobody reads.
+EXEMPT_ANNOUNCE_WINDOW = timedelta(hours=1)
+
+#: #279's class for "which of these, or whether at all". An exemption from review
+#: is a policy call about a specific PR, so it is a ``decision`` and not a taste
+#: or an environment question. Spelled once, here, and validated at import by the
+#: module that owns the vocabulary.
+EXEMPT_DECISION_CLASS = "decision"
+
+
+def _refuse_agent_exemption(ref_kind: str | None, note: str | None,
+                            *, position: int | None = None) -> None:
+    """Refuse an exemption an agent wrote for the PR the exemption is about (#335).
+
+    #273's queue lets a PR leave the review backlog three ways: merged, closed,
+    or exempted by an open plan item. The drainer was carefully forbidden to
+    decide the third for itself — and then the marker was put in ``note``, on an
+    endpoint any agent may call, which handed the worker the authority the
+    drainer had been denied. Not by defeating a check: by using the documented
+    API exactly as intended.
+
+    That is the self-approval argument #85 and #86 each settled about
+    ``require_human_triage``, and #78 about ``judge_model``, one level further
+    out. Those two govern whether work *starts*; this governs whether work is
+    *inspected before it lands*, which is the sharper instance. #85's sentence
+    transfers unaltered: **the label that authorises work has to come from
+    someone who is not the worker.**
+
+    So the marker is a human write, on the same footing as ``POST /plan/reorder``
+    and for the reasoning :func:`app.auth.human` already gives. Only two paths can
+    put it on an open item now, and both take :func:`app.auth.human`:
+    ``POST /plan/item/update`` and :func:`exempt_item`'s grant half.
+
+    **The refusal is not a dead end**, which is the other half of #335 and the
+    reason this is not a bare 403: an agent may still *propose* an exemption at
+    ``POST /plan/item/exempt``, and the proposal is durable, attributed and
+    announced to a person. A refusal with nowhere for the request to go is one
+    agents route around.
+
+    Scoped to :data:`app.review_queue.EXEMPTABLE_REF_KIND` because that is the
+    only ref kind the queue reads a marker off — an item about an *issue* whose
+    note happens to discuss ``review: exempt`` exempts nothing, and refusing it
+    would make writing about this feature harder than using it.
+    """
+    if ref_kind != EXEMPTABLE_REF_KIND or not exempting(note):
+        return
+    raise HTTPException(403, detail={
+        "error": f"{f'item {position}: ' if position is not None else ''}"
+                 "exempting a PR from review is a human write: an agent may not "
+                 "write the `review: exempt` marker on the plan item for a PR",
+        **({"item": position} if position is not None else {}),
+        "hint": "the authorisation to skip a check cannot come from the party the "
+                "check is on (#85, #86, #78, #335). Ask for it instead: "
+                "POST /plan/item/exempt {item_id|repo+pr, reason} records the "
+                "request on the item, announces it to a person on the board, and "
+                "leaves the PR in the queue until they grant it.",
+        "propose": "POST /plan/item/exempt",
     })
 
 
@@ -671,6 +755,26 @@ def _covered_by(claim: ResourceLease | None, mine: str | None,
             "expires": claim.expires_at.isoformat()}
 
 
+def _review_view(item: PlanItem) -> dict | None:
+    """This item's exemption state, for a reader that should not parse a note.
+
+    The marker is a token inside free text — that is what makes it cheap, and it
+    is also what would have every consumer writing its own regex over ``note``
+    within a fortnight. One derivation, published beside the note it came from,
+    so the plan page and the review queue cannot come to different views of the
+    same row.
+    """
+    if item.ref_kind != EXEMPTABLE_REF_KIND:
+        return None
+    granted, pending = granted_exemption(item.note), requested_exemption(item.note)
+    return {
+        "exempt": exempting(item.note),
+        "granted_by": None if granted is None else granted.by,
+        "requested_by": None if pending is None else pending.by,
+        "requested_reason": None if pending is None else pending.reason,
+    }
+
+
 def _item_view(item: PlanItem, claim: ResourceLease | None,
                blockers: list[PlanItem], now: datetime,
                plan: Plan | None = None, plan_claim: ResourceLease | None = None,
@@ -693,6 +797,10 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
         "placed_for": item.placed_for,
         "state": item.state,
         "note": item.note,
+        # What the note says about review, read once here rather than by every
+        # consumer greping prose. `null` on anything that is not a PR item,
+        # because the marker means nothing there (#335).
+        "review": _review_view(item),
         "depends_on": list(item.depends_on or []),
         # Only OPEN dependencies block: a dropped one will never be done, and
         # waiting on it forever would be the plan quietly lying about "next".
@@ -1280,6 +1388,48 @@ class UpdateIn(ItemRefIn):
     state: Literal["open", "dropped"] | None = None
 
 
+class ExemptIn(BaseModel):
+    """Ask for, grant, or withdraw an exemption from the review queue (#335).
+
+    The item is named either by ``item_id`` or by the PR it is about
+    (``repo`` + ``pr``) — the second because an agent thinks in PR numbers and
+    made-up spellings of "which item" is how an endpoint stops being called.
+    """
+
+    item_id: uuid.UUID | None = None
+    repo: str | None = Field(default=None, max_length=200)
+    #: ``"331"`` or ``"#331"`` — the same normalisation every other ref gets.
+    pr: str | None = Field(default=None, max_length=64)
+    #: Why. Required in both directions and for the same reason #279 gives about
+    #: a bare flag: an exemption with nothing behind it is the confident
+    #: assertion #67 warns about, and it costs somebody an interruption.
+    reason: str = Field(min_length=1, max_length=MAX_EXEMPT_REASON)
+    #: ``true`` asks for (agent) or grants (person) the exemption; ``false``
+    #: withdraws a request or revokes a granted one.
+    grant: bool = True
+    session: str | None = Field(default=None, max_length=MAX_SESSION)
+
+    @field_validator("reason")
+    @classmethod
+    def _a_flag_costs_a_reason(cls, v: str) -> str:
+        """Blank is not a reason, and ``min_length=1`` lets ``"   "`` through.
+
+        The same normalisation :func:`_norm_text` applies to every other stored
+        free-text field, applied here because this one goes on to a person's
+        interruption queue: #279 refuses a bare needs-human flag at the API and
+        at the database CHECK, and an exemption asked for with nothing behind it
+        is that flag under another name.
+        """
+        try:
+            said = safe_reason(v)
+        except MarkerInReason as e:
+            raise ValueError(str(e)) from None
+        if not said:
+            raise ValueError("a reason cannot be blank: say why review can be "
+                             "skipped, because somebody has to judge it")
+        return said
+
+
 class SubmitItemIn(BaseModel):
     """One line of a plan being submitted. No ``repo`` and no ``plan``: both come
     from the submission, so an item cannot land in a different scope from the plan
@@ -1625,6 +1775,7 @@ async def add_item(
     ref_value = _norm_ref(body.ref_value)
     repo = await _norm_scope(session, body.repo)
     _refuse_forge_ref(repo, body.ref_kind)
+    _refuse_agent_exemption(body.ref_kind, body.note)
     # Normalised BEFORE the either-or check: `after=""` is no position at all, and
     # refusing `{"after": "", "before": "#84"}` as "two positions" would refuse a
     # request that names one.
@@ -1924,6 +2075,11 @@ async def complete_item(
         raise HTTPException(409, detail={
             "error": "a human dropped this item", "item_id": str(item.id),
             "hint": "if the work happened anyway, ask for it to be reopened first"})
+    # The COMPLETING agent's own words, never the note it is appending to: an
+    # exemption a person already granted must not make its own PR impossible to
+    # record as finished. A completed item exempts nothing anyway — the queue only
+    # reads OPEN items — but a human may reopen one, and that is the seam.
+    _refuse_agent_exemption(item.ref_kind, body.note)
     now = _utcnow()
     claim = await live_claim(session, CLAIM_KIND, claim_key(item), now)
     mine = claim is not None and _is_mine(claim, holder, body.session)
@@ -2055,6 +2211,301 @@ async def update_item(
         raise await _ref_taken(session, *ref) from None
     return {**(await _view_items(session, [item], now, mine=editor))[0],
             "edited_by": editor}
+
+
+async def _exempt_target(session: AsyncSession, body: ExemptIn) -> PlanItem:
+    """The open plan item this request is about, or a 4xx saying why there is none.
+
+    An exemption is a marker on a plan item, so there has to be one. A PR with no
+    item is not exempt and cannot be — *"silence is not exemption"* is #273's own
+    rule — and the refusal says how to make one rather than inventing it here: an
+    item created as a side effect of asking to skip its review is a row nobody
+    ranked, in a plan nobody chose to put it in.
+    """
+    if body.item_id is not None:
+        # Locked, not just read. Everything below is read-modify-write over one
+        # free-text column: two proposals landing together would each see no
+        # request and each write one, and — worse — a proposal that read the note
+        # before a human granted would strip the grant back off on the way past.
+        # An agent must not be able to undo a person's decision by racing it.
+        item = await session.get(PlanItem, body.item_id, with_for_update=True)
+        if item is None:
+            raise HTTPException(404, "plan item not found")
+    else:
+        pr = _norm_ref(body.pr)
+        if not pr:
+            raise HTTPException(422, detail={
+                "error": "name the item: `item_id`, or `repo` and `pr`",
+                "hint": "an exemption is a marker on a plan item, so there has to "
+                        "be one — add it with POST /plan/item first"})
+        repo = await _norm_scope(session, body.repo)
+        item = await session.scalar(
+            select(PlanItem).where(
+                PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo,
+                PlanItem.state == "open",
+                PlanItem.ref_kind == EXEMPTABLE_REF_KIND,
+                PlanItem.ref_value == pr,
+            ).with_for_update())
+        if item is None:
+            raise HTTPException(404, detail={
+                "error": f"no open plan item for pr {pr} in {repo or 'the fleet scope'}",
+                "hint": "silence is not exemption (#273): a PR with no plan item is "
+                        "in the queue. Add the item with POST /plan/item, then ask."})
+    if item.ref_kind != EXEMPTABLE_REF_KIND:
+        raise HTTPException(422, detail={
+            "error": f"item {item.id} names {item.ref_kind or 'nothing'}, not a pr",
+            "item_id": str(item.id),
+            "hint": "the review queue reads the marker off the plan item for a PR, "
+                    "so an exemption on anything else would exempt nothing"})
+    if item.state != "open":
+        raise HTTPException(409, detail={
+            "error": f"that item is {item.state}: only an open item exempts a PR",
+            "item_id": str(item.id),
+            "hint": "the queue reads open items only, so a marker here would be a "
+                    "record of a decision and not the decision"})
+    return item
+
+
+def _exempt_note(item: PlanItem, line: str | None) -> str:
+    """The item's note with every exemption line replaced by ``line`` (or none).
+
+    Bounded rather than truncated. ``_completion_note`` trims from the left,
+    which is right for a receipt appended to reasoning nobody will read again; it
+    is wrong here, because the left of this note is the human's argument for the
+    item's position and an exemption is not worth silently eating it.
+    """
+    rest, _ = strip_exemption_lines(item.note)
+    merged = "\n".join(x for x in (rest, line) if x)
+    if len(merged) > MAX_NOTE:
+        raise HTTPException(409, detail={
+            "error": "that item's note has no room for the exemption line",
+            "item_id": str(item.id),
+            "hint": f"a note is at most {MAX_NOTE} characters and this one is "
+                    f"{len(item.note or '')}; shorten it, or shorten the reason"})
+    return merged
+
+
+def _exempt_view(item: PlanItem) -> dict:
+    """What the note says about this item's exemption, in structured form."""
+    granted = granted_exemption(item.note)
+    pending = requested_exemption(item.note)
+    return {
+        "exempted": exempting(item.note),
+        "granted": None if granted is None else {
+            "by": granted.by, "reason": granted.reason},
+        "requested": None if pending is None else {
+            "by": pending.by, "reason": pending.reason},
+    }
+
+
+def _exemption_ask(item: PlanItem, who: str, reason: str, session_id: str | None) -> Post:
+    """The board post that carries an exemption request to a person — #274's door.
+
+    #274 measured the cost of four escalation paths and no destination: over
+    thirty days and sixty-five rounds, ``deferred: 0`` and not one ``stuck`` post
+    from any part of this repo's review machinery. Its answer was that every
+    escalation leaves by one door, and this is that door — ``type='stuck'``,
+    addressed to a person, carrying #279's class and reason — written from the
+    board rather than from :func:`harness.loops.needs_human.announce` only
+    because the refusal happens here and an announcement a caller has to remember
+    to make separately is one that eventually is not made.
+
+    Addressed to :data:`app.identity.HUMAN`, the bare namespace, which reaches
+    every person on the board rather than one named account. There is no
+    configured addressee to get wrong and nothing to leave unwired: whoever is
+    reading the board on a phone is who this is for.
+    """
+    pr, repo = item.ref_value, item.repo
+    where = f"[{repo}] " if repo else ""
+    lines = [
+        f"class:  {EXEMPT_DECISION_CLASS}",
+        f"label:  {label_for(EXEMPT_DECISION_CLASS)}",
+        f"reason: {reason}",
+    ]
+    if repo:
+        lines.append(f"repo:   {repo}")
+    lines += [
+        f"item:   {item.id} ({item.title})",
+        "",
+        f"{who} has asked to take PR #{pr} out of the review queue. **It is not "
+        "out.** An exemption is a human write (#335) — the same footing as "
+        "reordering the plan — so the PR stays in the queue and stays drainable "
+        "until a person grants this.",
+        "",
+        "Grant it on the plan page (/plan/view — the ⊘ on that row), or:",
+        f'  POST /plan/item/exempt {{"item_id": "{item.id}", "reason": "…"}}',
+        "Decline it with the same call and \"grant\": false.",
+    ]
+    return Post(
+        author=who,
+        session=session_id,
+        type="stuck",
+        summary=(f"{where}needs a human ({EXEMPT_DECISION_CLASS}): exempt PR "
+                 f"#{pr} from review? {reason}").strip()[:900],
+        detail="\n".join(lines),
+        recipient=HUMAN,
+        refs=[r for r in (
+            {"kind": "pr", "value": str(pr), **({"repo": repo} if repo else {})},
+            {"kind": "repo", "value": repo} if repo else None,
+        ) if r is not None],
+    )
+
+
+async def _already_announced(session: AsyncSession, item: PlanItem,
+                             now: datetime) -> bool:
+    """Has this PR's exemption question already been put to a person recently?
+
+    Matched on the post's own ``refs`` rather than on its prose, because the ref
+    is the structured half and a summary is not a key. Counted over
+    :data:`EXEMPT_ANNOUNCE_WINDOW` rather than for ever: a question a person has
+    left unanswered for a day is one worth asking again.
+    """
+    ref: dict = {"kind": "pr", "value": str(item.ref_value)}
+    if item.repo:
+        ref["repo"] = item.repo
+    return bool(await session.scalar(
+        select(func.count()).select_from(Post).where(
+            Post.type == "stuck",
+            Post.recipient == HUMAN,
+            Post.ts >= now - EXEMPT_ANNOUNCE_WINDOW,
+            Post.refs.contains([ref]),
+        )))
+
+
+@router.post("/plan/item/exempt")
+async def exempt_item(
+    body: ExemptIn,
+    who: str = Depends(author),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Ask for an exemption from review, or — if you are a person — grant one.
+
+    **The refusal and the request are one endpoint on purpose.** #335's whole
+    argument is that an agent must not exempt its own PR, and the repo has twice
+    learned the other half: a control with nowhere for the refused request to go
+    is a control agents route around (#274 counted the result — four escalation
+    doors, none of them the board, and thirty days of ``deferred: 0``). So the
+    same call an agent makes to ask is the call a person makes to answer, and the
+    only thing the caller's credential decides is which of the two it was.
+
+    * **An agent** proposes. The request is written on the item as
+      ``review: exempt-requested by <agent> — <reason>``, which the queue reports
+      and no reader can mistake for the exemption itself, and it is announced on
+      the board as a ``stuck`` post addressed to :data:`app.identity.HUMAN`.
+      Nothing about the PR's queue state changes: it stays in the queue, it stays
+      drainable, and it stays reviewable. **That is not an oversight.** Letting a
+      pending request hold a PR out of review would hand the worker, by a longer
+      route, exactly the authority this endpoint exists to withhold — an agent
+      could suspend its own review indefinitely by asking.
+    * **A person** disposes — ``grant: true`` writes the marker, ``grant: false``
+      withdraws a request or revokes a granted exemption. A person is proved
+      through :func:`app.auth.author` by the edge's ``X-Edge-Auth`` secret, which
+      is the same proof :func:`app.auth.human` requires of the reorder that is
+      known to work in production — not a second boundary invented here.
+
+      The two differ on exactly one axis, and this endpoint is the stricter of
+      them: ``human()`` lets ``BROWSER_DEV_HUMAN`` outrank a bearer token, and
+      ``author()`` does not. That ordering is deliberate and it is the right one
+      here — on a local board with that flag on, letting it win would make every
+      agent's ``exempt`` call a grant, which is this endpoint's own hole reopened
+      for the convenience of a dev bypass. ``BROWSER_DEV_HUMAN`` is off by
+      default and DEPLOY.md's checklist requires it unset in production.
+
+    Both halves are idempotent: asking twice is one request, granting twice is
+    one exemption, and neither reposts to the board.
+
+    **If the human path is not deployed, nothing is lost and nothing is wrongly
+    granted.** With no ``HUMAN_EDGE_SECRET`` nobody is a person, so every call
+    here is a proposal — requests accumulate, attributed and visible, and take
+    effect when somebody can answer them. An exemption that waits is the safe
+    direction; an exemption the subject grants itself is not.
+    """
+    item = await _exempt_target(session, body)
+    reason = body.reason          # already one line, and not blank — see ExemptIn
+    person = is_human(who)
+    before = _exempt_view(item)
+
+    def _unchanged(why: str) -> dict:
+        """Idempotent: the state is already what was asked for, so nothing moves.
+
+        Not an error, and not a second board post. An agent that retries — or two
+        agents on one PR — must cost the person reading the board one message,
+        not one per attempt.
+        """
+        return {"item_id": str(item.id), "pr": item.ref_value, "repo": item.repo,
+                "by": who, "acted": False, "proposed": False, "announced": False,
+                "post": None, "why": why, **before}
+
+    if person:
+        if body.grant:
+            line = grant_line(who, reason)
+        elif not (before["exempted"] or before["requested"]):
+            raise HTTPException(409, detail={
+                "error": "there is no exemption or request on that item to withdraw",
+                "item_id": str(item.id)})
+        else:
+            line = None
+    elif body.grant:
+        if before["exempted"]:
+            return _unchanged("a person has already exempted this PR")
+        if before["requested"]:
+            return _unchanged("an exemption has already been asked for on this item")
+        line = request_line(who, reason)
+    else:
+        if before["exempted"]:
+            raise HTTPException(403, detail={
+                "error": "an agent may not revoke an exemption a person granted",
+                "item_id": str(item.id),
+                "hint": "if the PR should be reviewed anyway, review it — nothing "
+                        "here stops that. Revoking is a person's call, on the same "
+                        "footing as granting."})
+        if not before["requested"]:
+            raise HTTPException(409, detail={
+                "error": "there is no request on that item to withdraw",
+                "item_id": str(item.id)})
+        if before["requested"]["by"] != who:
+            # Yours to withdraw, or a person's to decline — not another agent's to
+            # clear away. Withdraw-and-re-ask is also the one loop that gets past
+            # the "already asked" branch, so leaving it open to anybody would make
+            # a person's notification queue writable by every agent on the board.
+            raise HTTPException(403, detail={
+                "error": f"that request is {before['requested']['by'] or 'somebody'}'s, "
+                         "not yours to withdraw",
+                "item_id": str(item.id),
+                "hint": "a person can decline it here; an agent can only take back "
+                        "the request it made itself"})
+        line = None
+
+    now = _utcnow()
+    announcing = not person and body.grant
+    quiet = announcing and await _already_announced(session, item, now)
+    item.note = _exempt_note(item, line) or None
+    item.updated_at = now
+    posted = (_exemption_ask(item, who, reason, clean_session(body.session))
+              if announcing and not quiet else None)
+    if posted is not None:
+        session.add(posted)
+    await session.commit()
+    await session.refresh(item)
+    if posted is not None:
+        await session.refresh(posted)
+    after = _exempt_view(item)
+    return {
+        "item_id": str(item.id),
+        "pr": item.ref_value,
+        "repo": item.repo,
+        "by": who,
+        "acted": True,
+        "proposed": announcing,
+        # Recorded is not the same as announced, and a caller that cannot tell
+        # them apart will re-ask to make sure. `false` here means the request is
+        # on the item and a person has already been told about this PR inside the
+        # last hour — not that anything failed.
+        "announced": announcing and not quiet,
+        "post": None if posted is None else posted.id,
+        **after,
+        "item": (await _view_items(session, [item], _utcnow(), mine=who))[0],
+    }
 
 
 async def _ref_taken(session: AsyncSession, repo: str | None, ref_kind: str | None,
@@ -2928,6 +3379,7 @@ async def submit_plan(
             raise HTTPException(422, detail={
                 "error": f"item {n}: a ref needs both kind and value, or neither"})
         _refuse_forge_ref(repo, item.ref_kind, position=n)
+        _refuse_agent_exemption(item.ref_kind, item.note, position=n)
     seen: dict[tuple[str | None, str], int] = {}
     for n, (item, ref) in enumerate(zip(body.items, refs, strict=True), start=1):
         if ref is None:

@@ -48,6 +48,9 @@
   .chip.covered { color:#e0c890; border-color:#4a3b1e; }
   .chip.fleet { color:#8fb4e8; border-color:#31435c; }
   .chip.project { color:#d9a5c8; border-color:#5c3149; }
+  .chip.exempt { color:#9fddc7; border-color:#2e5c48; }
+  /* An ASK, not an exemption — amber, like the other "somebody is waiting" chips. */
+  .chip.asked { color:#f0b429; border-color:#5c4a1e; }
   .refless { color:var(--muted); }
   .acts { display:flex; gap:4px; }
   .acts button { font:inherit; font-size:11px; cursor:pointer; background:#222831;
@@ -171,6 +174,11 @@ function rankWhy(it){
   return it.placed_for ? `${why} — for ${it.placed_for}` : why;
 }
 
+// What the server says the note means about review — never re-derived here. The
+// marker is a token in free text, and a second regex on this page is how the page
+// and the queue would come to disagree about the same row.
+function rv(it){ return it.review || {}; }
+
 function row(it, s){
   const el = document.createElement("div");
   const held = it.claim, blocked = (it.blocked_by||[]).length;
@@ -191,6 +199,17 @@ function row(it, s){
   const dropTo = it.state==="done" ? null : (it.state==="dropped" ? "open" : "dropped");
   const dropWhy = dropTo==="open" ? "put it back"
     : dropTo ? "drop it" : "done stays done — its completion record is the point";
+  // Exempting a PR from review is a HUMAN write, on the same footing as reordering
+  // (#335, and app.auth.human for the reasoning). It is on this page because this
+  // page is where a person is: an agent that could exempt its own PR would be
+  // authorising the skipping of the check that is on it — the self-approval
+  // argument #85, #86 and #78 each settled, one level further out. Agents ASK, at
+  // POST /plan/item/exempt, and the ask shows up on the row as an amber chip.
+  const canExempt = it.state==="open" && it.ref && it.ref.kind==="pr";
+  const exemptWhy = !canExempt ? ""
+    : rv(it).exempt ? "put this PR back in the review queue"
+    : rv(it).requested_by ? `${rv(it).requested_by} asked: ${rv(it).requested_reason||""}`
+    : "take this PR out of the review queue";
   el.innerHTML = `
     <div class="rank" title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
     <div class="body">
@@ -203,6 +222,11 @@ function row(it, s){
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
         ${!held&&it.covered_by?`<span class="chip covered">in ${esc((it.plan&&it.plan.label)||"a plan")} held by ${who(it.covered_by.holder)}</span>`:""}
         ${blocked?`<span class="chip block">waiting on ${it.blocked_by.map(b=>esc(b.ref?("#"+b.ref):b.title)).join(", ")}</span>`:""}
+        ${rv(it).exempt?`<span class="chip exempt" title="${esc(
+          rv(it).granted_by?("granted by "+rv(it).granted_by):"the note carries the marker")
+          }">review exempt</span>`:""}
+        ${!rv(it).exempt&&rv(it).requested_by?`<span class="chip asked" title="${esc(
+          rv(it).requested_reason||"")}">exemption asked for by ${who(rv(it).requested_by)}</span>`:""}
         ${it.stale?`<span class="chip stale">stale ${it.idle_days}d</span>`:""}
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
@@ -216,6 +240,8 @@ function row(it, s){
         title="${esc(why||"move up")}">▲</button>
       <button data-move="down" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
         title="${esc(why||"move down")}">▼</button>
+      ${canExempt?`<button data-exempt="${rv(it).exempt?"false":"true"}"
+        data-id="${esc(it.item_id)}" title="${esc(exemptWhy)}">⊘</button>`:""}
       <button data-id="${esc(it.item_id)}" ${dropTo?`data-state="${dropTo}"`:"disabled"}
         title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>
     </div>`;
@@ -365,8 +391,23 @@ async function post(path, body){
 listEl.addEventListener("click", async (e)=>{
   const move = e.target.closest("button[data-move]");
   const state = e.target.closest("button[data-state]");
+  const exempt = e.target.closest("button[data-exempt]");
   let path, body;
-  if(state){
+  if(exempt){
+    const grant = exempt.dataset.exempt === "true";
+    // A reason in both directions, and required by the server — an exemption with
+    // nothing behind it is the bare flag #279 refuses, and somebody has to be able
+    // to judge it in a fortnight. The pending ask is offered as the default so
+    // agreeing with an agent's reasoning is one tap and one Enter.
+    const it = plan.items.find(x => x.item_id === exempt.dataset.id) || {};
+    const asked = (it.review && it.review.requested_reason) || "";
+    const reason = (prompt(grant
+      ? "Why can this PR skip review? It stays in the record, with your name on it."
+      : "Why is it going back in the queue?", grant ? asked : "") || "").trim();
+    if(!reason) return;
+    path = "/plan/item/exempt";
+    body = {item_id: exempt.dataset.id, reason, grant};
+  } else if(state){
     // Belt and braces beside the disabled button in row(): dropping a done item would
     // throw away the completion record the row exists to hold (the server 409s too).
     const it = plan.items.find(x => x.item_id === state.dataset.id);

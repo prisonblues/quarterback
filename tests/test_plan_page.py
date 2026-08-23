@@ -135,3 +135,28 @@ def test_declaring_a_scope_is_on_the_page_because_it_is_a_human_decision(page):
     control the endpoint ships unreachable by the person it is for."""
     assert 'id="newScope"' in page, "the page needs a way to declare a scope"
     assert '"/plan/scope"' in page, "and it has to call the human-only endpoint"
+
+
+def test_exempting_a_pr_from_review_is_on_the_page_because_only_a_person_may(page):
+    """The disposal half of #335, and the reason a refusal is not a dead end.
+
+    An agent may ask for an exemption and may not grant one, so the grant has to
+    be reachable by the person it is for — on a phone, in one tap. Without the
+    control the endpoint ships unwired, which is the pattern #169 is about: a
+    mechanism nobody can reach is not a control.
+    """
+    assert '"/plan/item/exempt"' in page, "the page has to call the endpoint"
+    assert "data-exempt" in page, "and offer it on the row"
+    # A reason in both directions. #279 refuses a bare flag at the API and at the
+    # database CHECK; a button that sent one would just move the refusal.
+    assert re.search(r"data-exempt.{0,600}reason", page, re.S), \
+        "the control must collect a reason, because the endpoint requires one"
+
+
+def test_the_page_never_re_derives_what_a_note_means_about_review(page):
+    """The marker is a token in free text, so a regex on this page is how the page
+    and the queue would come to disagree about the same row. `GET /plan` publishes
+    `review` on every PR item; the page reads that and nothing else."""
+    assert "it.review" in page, "the page reads the server's derivation"
+    for token in ("exempt-requested", "review: exempt", "review:exempt"):
+        assert token not in page, f"the page must not look for {token!r} itself"
