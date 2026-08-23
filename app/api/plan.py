@@ -770,6 +770,12 @@ def _review_view(item: PlanItem) -> dict | None:
     return {
         "exempt": exempting(item.note),
         "granted_by": None if granted is None else granted.by,
+        # The BOOLEAN is the fact a reader acts on, and it is not the same as
+        # having an author: a marker somebody typed by hand carries neither name
+        # nor reason, and a page keying its chip off `requested_by` would render
+        # nothing at all for the one request nobody can attribute. That is the
+        # direction that loses information, so the flag is published separately.
+        "requested": pending is not None,
         "requested_by": None if pending is None else pending.by,
         "requested_reason": None if pending is None else pending.reason,
     }

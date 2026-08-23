@@ -605,3 +605,22 @@ async def test_an_agent_racing_a_person_cannot_strip_the_grant_back_off(client):
     e = entry(await snapshot(client, 8440), 8440)
     assert e["state"] == "exempt", "the person's grant did not survive the race"
     assert e["plan_item"]["granted_by"] == "human/rich"
+
+
+async def test_a_request_nobody_can_attribute_is_still_shown_as_one(client):
+    """A marker typed by hand carries no name and no reason, and a page keying its
+    chip off the author would render nothing at all for the one request nobody can
+    attribute — the direction that loses information. So `GET /plan` publishes the
+    flag as well as the name."""
+    item = await add_pr_item(client, 8450)
+    r = await client.post("/plan/item/update", headers=HUMAN, json={
+        "item_id": item["item_id"], "note": "review: exempt-requested"})
+    assert r.status_code == 200, r.text
+    assert r.json()["review"] == {
+        "exempt": False, "granted_by": None,
+        "requested": True, "requested_by": None, "requested_reason": None}
+
+    e = entry(await snapshot(client, 8450), 8450)
+    assert e["plan_item"]["exemption_requested"] is True
+    assert e["exemption_requested"]["by"] is None
+    assert e["drainable"] is True

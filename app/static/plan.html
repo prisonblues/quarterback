@@ -208,7 +208,7 @@ function row(it, s){
   const canExempt = it.state==="open" && it.ref && it.ref.kind==="pr";
   const exemptWhy = !canExempt ? ""
     : rv(it).exempt ? "put this PR back in the review queue"
-    : rv(it).requested_by ? `${rv(it).requested_by} asked: ${rv(it).requested_reason||""}`
+    : rv(it).requested ? `${rv(it).requested_by||"somebody"} asked: ${rv(it).requested_reason||""}`
     : "take this PR out of the review queue";
   el.innerHTML = `
     <div class="rank" title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
@@ -225,8 +225,9 @@ function row(it, s){
         ${rv(it).exempt?`<span class="chip exempt" title="${esc(
           rv(it).granted_by?("granted by "+rv(it).granted_by):"the note carries the marker")
           }">review exempt</span>`:""}
-        ${!rv(it).exempt&&rv(it).requested_by?`<span class="chip asked" title="${esc(
-          rv(it).requested_reason||"")}">exemption asked for by ${who(rv(it).requested_by)}</span>`:""}
+        ${!rv(it).exempt&&rv(it).requested?`<span class="chip asked" title="${esc(
+          rv(it).requested_reason||"")}">exemption asked for by ${
+          rv(it).requested_by?who(rv(it).requested_by):"somebody"}</span>`:""}
         ${it.stale?`<span class="chip stale">stale ${it.idle_days}d</span>`:""}
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
