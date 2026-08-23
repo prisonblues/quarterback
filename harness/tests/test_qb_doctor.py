@@ -1115,8 +1115,15 @@ def _gh_says(monkeypatch, *, out: str = "", rc: int = 0, err: str = "") -> None:
     Real git, faked GitHub. The row's git half — which remote, is it GitHub, is there an
     allocator — is most of what can be wrong with it, and a fixture that stubbed that too
     would be asserting the stub.
+
+    `which` is stubbed as well, and that is not tidiness: this suite runs inside
+    flake.nix's `worktree-tests` sandbox, which carries git and NOT `gh`. Without it every
+    test below short-circuits on "no gh on this host" and passes locally while turning the
+    flake check red — the host-fact dependency #204's own comments are about, happening to
+    the suite that checks for it.
     """
     real = qd.run_cmd
+    real_which = qd.shutil.which
 
     def fake(argv, **kwargs):
         if argv and argv[0] == "gh":
@@ -1124,6 +1131,8 @@ def _gh_says(monkeypatch, *, out: str = "", rc: int = 0, err: str = "") -> None:
         return real(argv, **kwargs)
 
     monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which",
+                        lambda name: "/usr/bin/gh" if name == "gh" else real_which(name))
 
 
 def test_a_repo_that_allows_squash_merges_fails_and_says_what_to_switch_off(
