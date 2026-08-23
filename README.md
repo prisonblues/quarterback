@@ -1759,6 +1759,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.7** — the one judgement in the release mechanism stops being a flag anything can pass.
 - **v3.8** — QUARTERBACK_INSTANCE finally names something.
 - **v3.11** — a deploy that does not fire now retries, and then says so out loud.
+- **v3.12** — the reconciler stops caring what order you work in.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -2188,6 +2189,26 @@ corrected.
 
 If someone else lands a migration first, `scripts/migration_reconcile.py` relinks yours onto
 the new head. Your revision keeps the id it was born with.
+
+**Merging the base in first is fine.** `preflight` and `apply` are a function of the two refs
+they are given, and that now holds whatever order you work in. If `--branch` names a merge
+commit — which it does whenever you merged `origin/main` to resolve the `CHANGELOG.md`
+conflict before reconciling — the feature side is read off the merge: the parent `--onto`
+already contains is the integration side, so the other one is yours. The plan says which two
+refs it used. When the merge does not answer the question (an octopus merge, two feature
+branches merged together) it says that instead of picking one, and names the explicit
+`--onto`/`--branch` invocation that does work.
+
+`apply` still refuses to rewrite text it never read; it just no longer confuses that with
+commit identity. HEAD may be any commit that contains `--branch`, provided the tree it holds
+is one the two refs account for: every migration at `--branch` byte-for-byte at HEAD, and
+every migration at HEAD byte-for-byte at one of the two refs. Nothing else may be there —
+a third branch's migration that neither ref has would leave the applied tree two-headed while
+the plan that produced it said one. Mode is half of "byte-for-byte", because git stores a
+symlink as a blob holding its target and `apply` writes through one. A conflict resolved
+*inside* a migration file fails all of this and is refused, which is the point. `heads --ref` is unchanged and deliberately does not take a merge apart:
+CI runs it on the merge commit GitHub builds for a pull request precisely to see the
+post-merge graph.
 
 ### Layout
 
