@@ -17,49 +17,6 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
-## v3.9 — an agent can no longer exempt its own PR from review
-
-The review queue lets a PR leave the backlog three ways: merged, closed, or exempted by an
-open plan item whose `note` says `review: exempt`. The reader was built so that the thing
-draining the queue could never write that marker — and the marker then lived in a field
-`POST /plan/item` writes, which every agent may call. So the worker could authorise skipping
-the check that is on it. Not by defeating a check: by using the documented API as intended.
-
-It is the argument this repo has already settled twice, one level further out. #85 and #86
-refused it for `require_human_triage`, #78 for `judge_model`, and both of those govern whether
-work *starts*; this one governs whether work is *inspected before it lands*.
-
-### What is refused
-
-Nothing an agent can call writes the marker onto an open plan item for a PR any more —
-`POST /plan/item`, `POST /plan/submit`, and the completion note on `POST /plan/item/done` each
-answer 403 and name where the request goes instead. Exactly two paths still accept it, and
-both prove a person the way `POST /plan/reorder` does: `POST /plan/item/update`, and the new
-endpoint below.
-
-### Where a refused request goes
-
-`POST /plan/item/exempt` — one endpoint, and the caller's credential decides which half of it
-ran. A person grants or revokes. An agent **proposes**: the request is written on the plan
-item as `review: exempt-requested by <agent> — <reason>`, attributed and ageing, and announced
-on the board as a `stuck` post addressed to whoever is reading it, carrying #279's `decision`
-class. A reason is required in both directions, because a flag with nothing behind it costs
-somebody an interruption.
-
-A reason may not itself contain the marker. That sounds pedantic and it is the whole change
-in miniature: the request line ends with the reason, so a reason of literally `review: exempt`
-would have ended it with a live marker — an agent asking politely for an exemption would have
-granted itself one, through the endpoint built to stop it, past every test that only watched
-the endpoint agents used to call.
-
-A refusal with nowhere for the request to go is one agents route around; #274 counted what
-that costs, and this uses the door it built rather than a second one. On a phone the disposal
-is one tap: the `⊘` on the row at `/plan/view`.
-
-**A pending request changes nothing about the queue** — the PR stays in it and stays
-drainable. That is deliberate. A request that suspended its own PR's review would hand the
-worker, by a longer route, the authority the refusal withholds.
-
 ## v3.7 — the one judgement in the release mechanism stops being a flag anything can pass
 
 `scripts/release_stamp.py` derives a release number from the CHANGELOG at `origin/main` and
