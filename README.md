@@ -1699,6 +1699,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.8** — QUARTERBACK_INSTANCE finally names something.
 - **v3.11** — a deploy that does not fire now retries, and then says so out loud.
 - **v3.12** — the reconciler stops caring what order you work in.
+- **v3.13** — a release stops being something a branch does.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

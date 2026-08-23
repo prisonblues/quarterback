@@ -17,6 +17,317 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.13 — a release stops being something a branch does
+
+### nobody stamps anywhere, because there is nowhere left to do it
+
+A branch that shipped anything used to edit the same lines at the top of the same two files.
+That made N branches in flight N-choose-2 conflicts **by construction** — over nothing, since
+both entries are right and both belong, and git cannot know that two insertions at one offset
+are independent. On the night this landed, six pull requests were open: the three carrying a
+release entry were all `CONFLICTING`, the three without were all `MERGEABLE`, and `main` did
+not move for three hours with seven green PRs queued behind it. PR #398 landed both ways and
+settled it — unmergeable with the entry, zero conflicts once it was reverted, same branch, same
+work, same base.
+
+The number had already been moved to land time behind a `## vNEXT` placeholder, and that half
+worked: no branch picked a number again. What did not work was leaving `apply` runnable on a
+branch. Every brief in the repo told a worker to run it, so every worker did, correctly, as
+instructed. **The affordance was the bug**, which is an argument this repo had already settled
+one domain over: if agents can both apply a label and act on it, the gate is decorative (#85).
+
+### What was deleted
+
+`scripts/release_stamp.py` is gone, not deprecated — `apply`, `preflight`, `check` and
+`collision` with it. So is `release_tag.py reserve`, the push-time compare-and-swap that took
+`refs/tags/vX.Y` on the remote; it existed only because a branch could stamp, and there is no
+race on `main` to reserve against. So are the `no unstamped release on main` CI job, the
+pre-push release-number check, and `changelog_fragments.py assemble`. A stale brief now gets
+`No such file or directory`, which is the loudest thing a removal can say.
+
+That takes #406 with it. The reserved tag named a branch-side `chore(release)` commit, and a
+squash merge discarded the commit while the release's entry landed perfectly — leaving
+`refs/tags/v3.8` pointing at history nobody could reach, with every check in the repo green
+because a tag of that name resolved. There is no branch-side commit any more, so a rewriting
+merge has nothing to lose. `release_tag.py check` keeps the discriminator that told an orphan
+from a reservation, because the repo still has to be able to tell them apart.
+
+### What replaced it
+
+`scripts/release.py`, which runs on `main` after the merge, once per batch:
+
+```bash
+scripts/release.py preview --title "…"   # what it would issue; changes nothing, runs anywhere
+scripts/release.py run --title "…"       # assemble, number, write, commit, tag, push
+```
+
+`run` refuses unless the checkout is on the default branch, clean, and level with its remote.
+Those are not advice: a branch cannot cut a release, a work-in-progress tree cannot be swept
+into one, and a checkout missing a merge cannot issue a number that merge is going to want.
+The **Cut a release** workflow is the same command with its inputs collected from a form, and
+it is `workflow_dispatch` rather than push-triggered because a release is a decision about when
+a batch is done — six fragments from six merges are one release, not six.
+
+`--major` survives intact and moves to the one caller that remains. Whether v4 or v3.13 follows
+v3.12 is a statement about what the release MEANS, so it asks for the number at the controlling
+terminal and refuses where there is none (#386). For an unattended run the workflow's `major`
+field takes the same answer — type the number it would issue, or it refuses. A fragment field
+and a PR label were both considered and rejected: either puts the judgement back on a branch.
+
+### The consolidated files are output, and are guarded rather than deleted
+
+`CHANGELOG.md` stays in git, so `git log CHANGELOG.md` keeps working and a reader offline keeps
+the history. `release.py guard` refuses a branch that edits its release entries or the README's
+release list, and names `changelog.d/<issue>.<kind>.md` in the refusal — a worker told only
+"no" retries or works around it, and both are worse than the original mistake. The guard is the
+mechanism rather than the file's absence: *exists but is refused* is enforceable, where *does
+not exist* is enforceable nowhere, since nothing stops a branch creating a file.
+
+It runs in the pre-push hook **and** in CI on `pull_request`, because neither is sufficient
+alone: a local hook cannot see `gh pr merge`, a CI job cannot stop a bad push, and a hook is
+per-checkout and best-effort — this is exactly the class of mechanism that ships uninstalled.
+The CHANGELOG's preamble and the rest of the README are outside it on purpose; a guard that
+taxed documentation is a guard that stops being installed.
+
+Two guards were kept rather than folded away. `frozen` still compares the bytes of shipped
+entries, now pointed at the release job's own writes as well as at branches, because a guard
+deleted on the grounds that another guard covers it is how a repo ends up with neither. And
+`changelog_fragments.py required` — the guarantee that a change which ships carries a release
+note — is now satisfied only by a fragment: a hand-written entry used to count, and crediting
+it would let a branch pass one gate by doing the thing the other exists to stop.
+
+### the fleet can see how far along each agent is, not just what it is on
+
+Every fleet surface showed repo, branch and title — the three fields that read identically writing the first cut and coming out of the third review round. The one fact that moves as work progresses lived in a file on the machine that said it: `qb-stage` writes `F0`, `R1`, `R1F`, `R2` to `~/.cache/claude-code/session-stage/<session>`, the pane footer reads it, and nothing else ever could. Cross-machine the marker is not there to read; same-machine nothing read it. So glance at one pane and you know how far along it is; open the board over the same eight sessions and you do not.
+
+It cannot be recovered by a reader, either. A round number is handed to `panel.py` as `--round <r>` and never derived, so it is not in the repo, the process table or the posts log. It has to be *said*.
+
+Now it is said to the board as well as to the bar. `POST /lease/stage` puts it on the session's lease beside `state` — `state` says whether the pane is moving, `stage` says where it has got to — and `qb-stage` reports it in the same call that writes the marker, because `qb-stage` is the only thing in the system that is told it. The lifecycle hook could have read the marker on each heartbeat instead; it would need no board-facing code, and it would make a fact the fleet acts on arrive up to a heartbeat late for no gain.
+
+The shape is checked and the vocabulary deliberately is not: 1–6 alphanumerics, the same check `qb-stage` has always made, so a skill inventing `R4F` needs no server release. An unknown-but-well-formed token renders as six harmless characters; a rejected one stops a workflow to argue about a cosmetic field.
+
+### Where it shows up
+
+`/active` and `/overlap` carry it, so the fleet page, `qb-board`, `qb-dash`, `qb-dash-tui` and the `peers` and `active` MCP tools all show it. `R2` on the PR you were about to review means the round you would be duplicating is already running; `F0` on the issue you were about to claim means the first cut is being written right now — which is the same question `/overlap` exists to answer and answered until now with three fields that never change.
+
+A transition also emits one `status` post, so the only thing anyone actually follows live carries it. The fleet pane polls `/active` every 20s and `qb-dash-tui` every 4s; a stage change is a handful of events per session per day against the heartbeats that stream already carries. The post is written by the board rather than by `qb-stage`, so "on change" is a comparison against the stored value and re-asserting the same stage twice says nothing.
+
+### A stage nobody reported reads as nobody having reported one
+
+Most sessions never call `qb-stage` at all, so NULL is the majority case and the one a column must not dress up. `/fleet` says `unreported`, in the same four-word vocabulary it already uses for a session nobody ended (`live | ended | unclear | unreported`). The terminal panels have six columns and no room for the word, so they use the dash they already use for every unsaid value — and because a stage is 1–6 alphanumerics by construction, a dash can never be read as one. A blank cell can: it is equally consistent with a clipped column, a rendering fault, and an agent that has no stage.
+
+Sub-agents get no stage of their own and do not borrow the parent's, the same rule `repo` and `branch` already follow in a fan-out row.
+
+### The report cannot cost the caller anything
+
+`qb-stage` writes a marker a person's status line depends on, so a board that is down, slow, unconfigured or asking for a passphrase must not break it or make anyone wait. The report is a backgrounded `curl` with stdin closed and its output discarded, and the board config is resolved inside that same subshell — a `QUARTERBACK_TOKEN_CMD` is an arbitrary program, and one blocking on a gpg prompt would otherwise hang a workflow over a status field. There is no exit code to check and no message on failure, which is the point.
+
+`qb-stage --clear` and `/drop-worktree` clear the lease as well as the marker: a lease still advertising `R2` after the work landed sends the next reader to a round that is over, which is worse than saying nothing. Lease expiry covers the crash case for free.
+
+### the terminal plan row could not say what the web page says
+
+`GET /plan` answers with 32 fields and a ten-key envelope. `qbdata.fetch_plan` kept
+`data["items"]` and dropped the rest on every four-second refresh, so `qb-dash` and
+`qb-dash-tui` drew five cells and none of the envelope: no rank, no ref kind, no counts the
+board had already computed, and no `next`, `order_trust` or `truncated` at all. Both then
+re-derived the plan's order locally — a second answer about an ordered list, computed against
+that list's own order, and the reason the two surfaces disagreed about what to pick up next.
+
+`fetch_plan` now returns the whole envelope and the panels read it. A row carries its rank,
+marked `~12` where nobody chose that position (#183), and its ref as `#78` or `PR#78` so a
+PR-backed item's dim `⚒` has a reason on the row. The holder keeps the machine it is on —
+agent names are recycled, so two boxes read as one agent — and a held row that is also
+blocked says both. The board's own `next` wears a filled `◉`, and its caveat is on the detail
+line behind a click, where a sentence fits. The title reports the board's counts rather than a
+local recount, so a **covered** item is no longer folded into **running** — a blocked item
+needs work finishing, a covered one needs a word with its holder — and says `truncated at N`
+when the page is not the whole list. Nothing here adds a row to a pane that is already over
+budget (#269).
+
+### the read now says which session is asking
+
+`fetch_plan` sent no `session`, so `GET /plan` resolved `covered_by` by machine — and a
+machine here runs several agents on one token. A plan held by the agent in the next pane came
+back as the reader's own: every item of it drawn with the cyan "free to take" glyph, its `⚒`
+offered, and `next` pointing straight at it. That is the duplicated work a plan claim exists
+to prevent, restored on the read path.
+
+### the round, what it waits on and its place in the line reach a screen
+
+Three endpoints have been shipped, tested and documented for releases, and **no page or pane
+had ever called one of them**. `GET /reviews` has carried `round`, `cycle`, `stopped`,
+`stop_reason`, `pr_state` and `ci_status` per panel run since v2.15; `GET /review/needs-human`
+answers, per defect, what kind of judgement is waiting on a person and how old the question is;
+`GET /merge-queue` says which pull request is landing, who is driving it and who is behind
+them. Rich asked to see *"the round"* and *"is it blocked by anything"*. Both were already
+computed, already served, and reached no screen.
+
+`GET /prs` is where they land. One row per pull request the board knows about, from board reads
+only — no new endpoint, no GitHub credential, no new column.
+
+### It never states a fact it does not hold
+
+- **`pr_state` and `ci_status` are memories, not readings.** `ReviewRun` is explicit that the
+  board is told about panels and not about merges, so a PR merged after its final round still
+  reads `OPEN`. Each is drawn with the round and the age it came from, and a round old enough
+  for that to matter says so in as many words.
+- **A queue verdict is pinned to a commit.** An entry whose `verdict` is `ready` against a
+  `ready_sha` the head has since moved off is drawn as retired, naming both commits, rather
+  than as a PR that may land.
+- **An empty line is not a drained one.** Nothing enqueues automatically — preland is a gate
+  nothing invokes (#258) — so a queue with no entries cannot be told apart from a queue nobody
+  feeds. The board holds nothing that separates them, so the page says which two readings it
+  cannot separate instead of drawing a clean zero. That is `/fleet`'s rule for an absent lease,
+  one contract over.
+- **A zero on the human count has a scope.** Only a panel round raises a needs-human defect, so
+  a pull request nothing has panelled contributes nothing to it, and the page says so rather
+  than letting the zero read as "nothing needs you". Where the endpoint's own cap trimmed the
+  list, every row says "none listed" rather than "none flagged", and the headline is the
+  board's `waiting` count rather than the sum of what fitted on the page.
+- **An absent queue entry is not a pull request nobody queued.** `GET /merge-queue` answers
+  about one `(repo, base)` and the page asks about a derived, capped handful — so the cell
+  distinguishes "the line was read and does not name it" from "this page did not read that
+  line", and a line that would not answer settles nothing about its rows.
+- **A read that fails does not leave the last one looking current.** The figures stay on
+  screen, and say on the same line how long it has been since anything refreshed them.
+
+### Round is not stage
+
+#262's `stage` is where a *session* is in its own loop, reported onto the lease.
+`ReviewRun.round` is how many panel rounds this *pull request* has been through. Different
+objects, different questions, and this page draws only the second. A blank cell that could be
+read as either is worse than two honest cells, so an absent round says which of the two
+absences it is — and never "never panelled", because the page reads a *window* of runs and that
+would be a claim about the whole table made from the edge of a query. Where a needs-human
+defect is on the row it is proof a round ran, since only a round raises one, and the cell says
+so.
+
+### Not on `/panel`
+
+#57 argues that page is a research instrument answering "which reviewer earns its cost", and
+that "what is running and what is it waiting on" is a different question that should not dilute
+it. This is that other page, at `/prs` because it reads three JSON paths and owns none of them
+— the same reason `/fleet` is not under one of its three.
+
+The terminal half of #395 — the round and the needs-human count on `qb-dash`'s REVIEW QUEUE
+panel, and that panel existing at all on `qb-dash-tui` — is deliberately not here: #262 and
+#394 are both in `harness/bin/qbdata.py` and both dashboards as this lands. It is #400.
+
+### an agent can no longer exempt its own PR from review
+
+The review queue lets a PR leave the backlog three ways: merged, closed, or exempted by an
+open plan item whose `note` says `review: exempt`. The reader was built so that the thing
+draining the queue could never write that marker — and the marker then lived in a field
+`POST /plan/item` writes, which every agent may call. So the worker could authorise skipping
+the check that is on it. Not by defeating a check: by using the documented API as intended.
+
+It is the argument this repo has already settled twice, one level further out. #85 and #86
+refused it for `require_human_triage`, #78 for `judge_model`, and both of those govern whether
+work *starts*; this one governs whether work is *inspected before it lands*.
+
+### What is refused
+
+Nothing an agent can call writes the marker onto an open plan item for a PR any more —
+`POST /plan/item`, `POST /plan/submit`, and the completion note on `POST /plan/item/done` each
+answer 403 and name where the request goes instead. Exactly two paths still accept it, and
+both prove a person the way `POST /plan/reorder` does: `POST /plan/item/update`, and the new
+endpoint below.
+
+### Where a refused request goes
+
+`POST /plan/item/exempt` — one endpoint, and the caller's credential decides which half of it
+ran. A person grants or revokes. An agent **proposes**: the request is written on the plan
+item as `review: exempt-requested by <agent> — <reason>`, attributed and ageing, and announced
+on the board as a `stuck` post addressed to whoever is reading it, carrying #279's `decision`
+class. A reason is required in both directions, because a flag with nothing behind it costs
+somebody an interruption.
+
+A reason may not itself contain the marker. That sounds pedantic and it is the whole change
+in miniature: the request line ends with the reason, so a reason of literally `review: exempt`
+would have ended it with a live marker — an agent asking politely for an exemption would have
+granted itself one, through the endpoint built to stop it, past every test that only watched
+the endpoint agents used to call.
+
+A refusal with nowhere for the request to go is one agents route around; #274 counted what
+that costs, and this uses the door it built rather than a second one. On a phone the disposal
+is one tap: the `⊘` on the row at `/plan/view`.
+
+**A pending request changes nothing about the queue** — the PR stays in it and stays
+drainable. That is deliberate. A request that suspended its own PR's review would hand the
+worker, by a longer route, the authority the refusal withholds.
+
+### the plan page's reorder controls can say why they are dead
+
+On a phone `/plan/view` opened, drew every row, and would move none of them. The
+gate was right — order is per exact scope, and the picker defaults to `(all)`,
+which is several scopes at once — but its reason lived in a `title=` attribute,
+and a touch screen has no hover. Three different states looked identical from a
+thumb: *pick a scope*, *this row is ordered in another list*, and *the edge
+refused your write*.
+
+The gate is unchanged. What changed is that each of the three now has a surface a
+tap can reach.
+
+- **Which list you are in** — one line above the plan, present exactly when the
+  picker is on `(all)`, naming the state and the control that fixes it. Said once,
+  not repeated on every row.
+- **This row in particular** — an open row riding along from another list says so
+  on its own meta line, and every dead control answers a tap in the header rather
+  than swallowing it. `aria-disabled` rather than `disabled`, so the button is
+  still visibly dead but can be asked why.
+- **Who is looking** — the page asks `/whoami` and says, before anything is
+  tapped, whether the writes on it will be accepted; every one of them is behind
+  `app.auth.human`. Same banner and the same wording as the fleet page, which
+  answers the same question about its own one verb.
+
+The rank column's provenance (#183) came off the same tooltip: a position somebody
+chose now reads differently from one that was merely appended, and the sentence
+behind it is a tap away.
+
+The picker also remembers the scope you last chose, so `(all)` — the one state in
+which nothing moves — is no longer where every visit starts.
+
+### a squash-merged release no longer orphans its own tag in silence
+
+The release number is locked by creating `refs/tags/vX.Y` on the remote at push time, against
+the branch's stamped `chore(release)` commit — which is what makes the number un-stealable,
+and which a squash merge quietly undoes. PR #391 was squash-merged while every other landing
+that night used a merge commit; the squash discarded the commit the tag had been reserved
+against, and `refs/tags/v3.8` spent the night addressing a commit that is not in main's
+history at all. The v3.8 entry landed correctly and was correctly ordered, so nothing looked
+wrong. `git diff v3.7..v3.8` was comparing main to an off-history commit.
+
+The CI job that should have caught it is called `every release on main has a tag`, and it
+checked that a tag of that **name** resolved. `v3.8` did.
+
+### The guard now asks the question its name promises
+
+`release_tag.py check` asserts that each release tag is an **ancestor** of the ref it claims
+to tag, and the `tagged` job runs it after the backfill. The subtlety is that being off the
+ref is two opposite things wearing one face, and the discriminator is not the tag but the
+CHANGELOG at the ref: a release the ref does not declare has not landed, so its tag is a
+reservation held by an open pull request — `v3.9`, `v3.10` and `v3.12` all were, in the same
+minute — while a release the ref **does** declare has shipped, so its tag being off the ref
+means a rewrite orphaned it. The report names the commit the release actually landed at and
+the `--force-with-lease` that re-points it atomically.
+
+### And `qb-doctor` now asks whether the next one can happen
+
+Turning a setting off in one repository's GitHub UI is not a fix; it is the shape of defect
+this repo has closed five instances of. So the doctor grew a `merges` row: a repo that
+reserves release tags and allows squash or rebase merges is a `FAIL` with the exact
+`gh api -X PATCH` that closes it. It asks nothing where the question does not apply — the
+scope is a repo with a tag allocator, found the way the pre-push hook finds it — and it says
+`unknown` rather than `ok` wherever it cannot look, including the common case of a token
+without push access, to which GitHub simply does not state its merge settings.
+
+The row is the first of a new `landing` group ("can work actually land"), beside the existing
+`host` one ("is this host wired up"). `--only landing` selects it. On the night this was
+filed `qb-doctor` reported nine green rows while the merge queue held seven ready-looking
+pull requests with none ready, main had not moved in three hours and a release tag pointed
+off main's history: every row was correct, and not one was about the pipeline the work has to
+travel down.
+
 ## v3.12 — the reconciler stops caring what order you work in
 
 `scripts/migration_reconcile.py` computes everything from migration files at a git ref — that
