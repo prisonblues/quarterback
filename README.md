@@ -2169,6 +2169,23 @@ corrected.
 If someone else lands a migration first, `scripts/migration_reconcile.py` relinks yours onto
 the new head. Your revision keeps the id it was born with.
 
+**Merging the base in first is fine.** `preflight` and `apply` are a function of the two refs
+they are given, and that now holds whatever order you work in. If `--branch` names a merge
+commit — which it does whenever you merged `origin/main` to resolve the `CHANGELOG.md`
+conflict before reconciling — the feature side is read off the merge: the parent `--onto`
+already contains is the integration side, so the other one is yours. The plan says which two
+refs it used. When the merge does not answer the question (an octopus merge, two feature
+branches merged together) it says that instead of picking one, and names the explicit
+`--onto`/`--branch` invocation that does work.
+
+`apply` still refuses to rewrite text it never read; it just no longer confuses that with
+commit identity. HEAD may be any commit that contains `--branch`, provided every file the
+edit touches is byte-identical at the two and no file at HEAD already claims an id the
+renumber would mint. A conflict resolved *inside* a migration file fails that and is refused,
+which is the point. `heads --ref` is unchanged and deliberately does not take a merge apart:
+CI runs it on the merge commit GitHub builds for a pull request precisely to see the
+post-merge graph.
+
 ### Layout
 
 ```
