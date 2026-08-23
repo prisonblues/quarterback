@@ -1106,6 +1106,43 @@ def plan_done(ctx: Context, item_id: str, note: str | None = None) -> dict:
 
 
 @mcp.tool()
+def plan_exempt(ctx: Context, reason: str, item_id: str | None = None,
+                repo: str | None = None, pr: str | None = None,
+                withdraw: bool = False) -> dict:
+    """ASK for a PR to be taken out of the review queue. You cannot grant it.
+
+    Exempting a PR from review is a human write, on the same footing as
+    reordering the plan (#335): the authorisation to skip a check cannot come
+    from the party the check is on. Writing the `review: exempt` marker yourself
+    — through `plan_add`, `plan_submit` or `plan_done` — is refused.
+
+    This is where the request goes instead, and it is not a formality. It is
+    recorded on the plan item, attributed to you, and announced on the board as a
+    `stuck` post addressed to whoever is reading it, so a person can grant or
+    decline it from a phone. **Until they do, nothing changes**: the PR stays in
+    the queue and stays reviewable, because a request that suspended its own
+    review would be the same self-approval by a longer route.
+
+    Asking twice is one request. Say why in a sentence somebody can judge in a
+    fortnight — "docs only" is a reason, "not needed" is not.
+
+    Args:
+        reason: why review can be skipped. Required, and not blank.
+        item_id: the plan item, if you have its id.
+        repo, pr: name it by the PR instead — the item must already exist, since
+            a PR with no plan item is in the queue and cannot be exempted.
+        withdraw: take back a request you made. It will not remove an exemption a
+            person granted — if the PR should be reviewed anyway, review it.
+    """
+    try:
+        return _get_client(ctx).plan_item("exempt", {
+            "item_id": item_id, "repo": repo, "pr": pr,
+            "reason": reason, "grant": not withdraw})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_exempt")
+
+
+@mcp.tool()
 def plans(ctx: Context, repo: str | None = None, include_closed: bool = False) -> dict:
     """Which plans exist, who is holding one, and how many open items each has.
 
