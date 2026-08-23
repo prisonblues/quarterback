@@ -32,6 +32,10 @@
   .counts { color:var(--muted); font-size:13px; width:100%; }
   .counts b { font-weight:600; color:var(--fg); }
   #err { color:#e5484d; font-size:13px; width:100%; }
+  /* Numbers that stopped being refreshed have to say so where the numbers are.
+     An error message elsewhere on the page leaves a reader no way to tell a
+     current reading from a frozen one. */
+  .stale { color:#f0b429; }
 
   main { max-width:720px; margin:0 auto;
     padding:10px calc(12px + var(--sar)) calc(28px + var(--sab)) calc(12px + var(--sal)); }
@@ -118,8 +122,10 @@
 </header>
 <main>
   <div id="list"></div>
-  <div id="empty" class="empty">the board holds no panel round, no outstanding
-    human judgement and no queue entry for any pull request</div>
+  <div id="empty" class="empty">no panel run in the window this page reads, and
+    no outstanding human judgement — so nothing named a pull request, and no line
+    was asked about. A queue on a base nothing here named would not be found from
+    this page.</div>
   <div class="section">the line to land</div>
   <div id="queues"></div>
   <div id="scope" class="scope"></div>
@@ -213,6 +219,13 @@ let rows = [];        // one per (repo, pr)
 let queues = [];      // one per (repo, base) asked about
 let scopeNote = "";
 let gen = 0;          // read generation — a superseded read is discarded
+let readAt = null;    // when the rows on screen were read
+let waiting = null;   // /review/needs-human's own count, over everything it matched
+// A failed tick keeps the last good reading rather than blanking the page — but
+// the page then says how old it is, on every line, until a read succeeds. An
+// error message beside numbers that still look current is the same collapse this
+// page is about: the reader has no way to tell which of the two they are seeing.
+let staleSince = null;
 
 // ---- helpers (house style, shared with fleet.html / plan.html) --------------
 
@@ -232,6 +245,9 @@ function ago(iso){ const s=secsSince(iso); return s===null ? "an unreadable time
 function until(iso){ const s=(Date.parse(iso)-Date.now())/1000;
   return isNaN(s) ? "an unreadable time" : s<=0 ? "lapsed" : "in "+span(s); }
 function say(msg){ errEl.textContent = msg||""; }
+// A read did not land. Say why, and mark everything already on screen as the
+// older reading it now is.
+function fell(msg){ say(msg); staleSince = staleSince || readAt || Date.now(); render(); }
 function shortRepo(r){ const s=String(r||""); const i=s.indexOf("/");
   return i<0 ? s : s.slice(i+1); }
 function sha(s){ return String(s||"").slice(0,12); }
@@ -285,23 +301,51 @@ function memoryCell(key, value, r){
 }
 
 // Where it is in the line, and against which commit the verdict was formed.
+//
+// An absent entry is NOT "not queued". `GET /merge-queue` answers about exactly
+// one `(repo, base)` and this page asks about a derived, capped handful of them,
+// so a missing entry means "not in a line this page read" and, when the PR's base
+// was never among them, not even that. Three cells, and only one of them is a
+// statement about the queue.
 function queueCell(r){
   const e = r.entry;
-  if(!e) return {k:"in line", v:"not queued", unknown:true,
-    asof:"no live merge-queue entry — nothing enqueued it"};
-  const stale = e.verdict === "ready" && e.ready === false;
-  return {k:"in line", v:`#${e.position} of ${r.queueDepth}`,
-    asof:`${e.verdict}${stale ? " (retired)" : ""} · held by ${e.holder || "somebody"}`
-       + ` · expires ${until(e.expires)}`};
+  if(e){
+    const stale = e.verdict === "ready" && e.ready === false;
+    const more = r.entries > 1
+      ? ` · in ${r.entries} of the lines this page read` : "";
+    return {k:"in line", v:`#${e.position} of ${r.queueDepth}`,
+      asof:`${e.verdict}${stale ? " (retired)" : ""} · `
+         + `${e.holder ? "held by " + e.holder : "holder not recorded"}`
+         + ` · expires ${until(e.expires)}${more}`};
+  }
+  if(r.lineRead)
+    return {k:"in line", v:"not in the line", unknown:true,
+      asof:`the line for ${shortRepo(r.repo)} → ${r.base} was read and does not `
+         + `name it`};
+  return {k:"in line", v:"line not read", unknown:true,
+    asof: r.base
+      ? `this page did not ask about the line for ${shortRepo(r.repo)} → ${r.base}`
+      : `nothing this page read names the base this PR would land on, so no line `
+        + `was asked about it`};
 }
 
 // How many human judgements this PR is holding, and of what kind.
 function humanCell(r){
-  if(!r.needs.length) return {k:"waiting on a human", v:"none flagged", unknown:true,
-    asof:"no outstanding needs-human defect on this PR"};
+  // `truncated` says the endpoint's own cap trimmed the LIST while `waiting`
+  // still counts the whole of it — so an empty row under truncation means "none
+  // among the ones listed" and nothing more. Carried onto every row, because a
+  // footnote at the bottom of the page does not repair a false cell in the
+  // middle of it.
+  if(!r.needs.length) return {k:"waiting on a human",
+    v: r.listTrimmed ? "none listed" : "none flagged", unknown:true,
+    asof: r.listTrimmed
+      ? `the needs-human list was trimmed at its own cap, so this says only that `
+        + `none of the ones it returned are on this PR`
+      : "no outstanding needs-human defect on this PR"};
   const oldest = Math.max(...r.needs.map(d => d.age_seconds || 0));
-  return {k:"waiting on a human", v:`${r.needs.length}`,
-    asof:`oldest asked ${span(oldest)} ago`};
+  return {k:"waiting on a human", v:`${r.needs.length}${r.listTrimmed ? "+" : ""}`,
+    asof:`oldest asked ${span(oldest)} ago`
+       + (r.listTrimmed ? " · the list was trimmed; there may be more" : "")};
 }
 
 // The one summary judgement, and it is deliberately not a lifecycle. Each value
@@ -350,6 +394,11 @@ function caveats(r){
       + `${sha(r.entry.ready_sha) || "no commit"}, and the entry now names `
       + `${sha(r.entry.head)}. The board has already retired it — this entry is `
       + `in the line but may not land on this head.`});
+  if(r.entries > 1)
+    out.push({settled:false, text:
+      `it is standing in ${r.entries} of the lines this page read. The cell above `
+      + `shows the first of them; the board holds no rule that makes one of `
+      + `them the real one.`});
   if(!r.run && r.entry)
     out.push({settled:false, text:
       `it is in the line to land and no panel round for it is among the newest `
@@ -415,11 +464,22 @@ function render(){
   for(const r of shown) listEl.appendChild(prRow(r));
 
   const hidden = rows.length - shown.length;
-  const human = rows.reduce((n, r) => n + r.needs.length, 0);
+  // `waiting` is the endpoint's count over EVERYTHING it matched; `items` is the
+  // page of it that fits under its own cap. Summing the rows would report the
+  // trimmed number under the untrimmed label, which is the one figure on this
+  // page a person is meant to act on.
+  const drawn = rows.reduce((n, r) => n + r.needs.length, 0);
+  const human = waiting === null ? drawn : waiting;
   countsEl.innerHTML =
-    `<b>${human}</b> waiting on a human · <b>${counts.queued + counts.landing}</b> in line · `
+    `<b>${esc(human)}</b> waiting on a human · `
+    + `<b>${counts.queued + counts.landing}</b> in line · `
     + `<b>${counts.unclear + counts.noround}</b> neither`
-    + (hidden ? ` · ${hidden} quiet not shown` : "");
+    + (hidden ? ` · ${hidden} quiet not shown` : "")
+    + (waiting !== null && drawn !== waiting
+        ? ` · ${drawn} of the ${waiting} drawn on a row` : "")
+    + (staleSince ? `<span class="stale"> · not refreshed for ${
+        span((Date.now() - staleSince) / 1000)} — every figure above is that old`
+      : "");
   emptyEl.style.display = rows.length ? "none" : "block";
   renderQueues();
   scopeEl.textContent = scopeNote;
@@ -445,8 +505,8 @@ function renderQueues(){
       : `no merge claim held — the queue orders around one, and nobody is holding it`;
     return `<div class="queue">
       <h2>${esc(q.repo)} → ${esc(q.base)}</h2>
-      <div class="sub">${n} in the line · ${
-        (q.counts && q.counts.ready) || 0} ready · ${esc(q.ordering || "fifo")}</div>
+      <div class="sub">${n} in the line · ${esc(
+        (q.counts && q.counts.ready) || 0)} ready · ${esc(q.ordering || "fifo")}</div>
       <div class="sub">${claim}</div>
       ${n ? `<ol>${q.entries.map(e =>
         `<li><b>#${esc(e.pr)}</b> · ${esc(e.verdict)}${
@@ -479,28 +539,33 @@ async function load(){
       fetch("/review/needs-human?limit=500", {headers:{Accept:"application/json"}}),
     ]);
     if(!a.ok || !b.ok){
-      if(my===gen) say(`the board would not answer (${[a,b].map(r=>r.status).join("/")})`);
+      if(my===gen) fell(`the board would not answer (${[a,b].map(r=>r.status).join("/")})`);
       return;
     }
     [runs, needs] = await Promise.all([a.json(), b.json()]);
   } catch(err) {
     // Without this the last good page stays on screen looking live, with nothing
     // to say it stopped refreshing — this page's own failure mode, in the page.
-    if(my===gen) say("the board is unreachable — " + ((err && err.message) || "network error"));
+    if(my===gen) fell("the board is unreachable — " + ((err && err.message) || "network error"));
     return;
   }
   if(my !== gen) return;
 
   // Newest run per PR. `/reviews` is ordered newest first, so the first one seen
   // for a key is the newest and every later one is an earlier round.
+  const trimmed = !!(needs && needs.truncated);
+  waiting = (needs && typeof needs.waiting === "number") ? needs.waiting : null;
   const byPr = new Map();
   const seen = new Set();
+  const blank = (repo, pr, extra) => ({repo, pr, title:null, run:null, base:null,
+    needs:[], entry:null, entries:0, queueDepth:0, lineRead:false,
+    listTrimmed:trimmed, ...extra});
   for(const run of (runs || [])){
     const key = `${run.repo}#${run.pr}`;
     if(seen.has(key)) continue;
     seen.add(key);
-    byPr.set(key, {repo:run.repo, pr:run.pr, title:run.pr_title, run,
-                   needs:[], entry:null, queueDepth:0, inWindow:true});
+    byPr.set(key, blank(run.repo, run.pr,
+                        {title:run.pr_title, run, base:run.base}));
   }
 
   // A defect can name a PR whose last round fell outside the run window. That PR
@@ -508,21 +573,24 @@ async function load(){
   // rather than no row at all.
   for(const d of (needs && needs.items) || []){
     const key = `${d.repo}#${d.pr}`;
-    if(!byPr.has(key)) byPr.set(key, {repo:d.repo, pr:d.pr, title:null, run:null,
-                                      needs:[], entry:null, queueDepth:0, inWindow:false});
+    if(!byPr.has(key)) byPr.set(key, blank(d.repo, d.pr, {}));
     byPr.get(key).needs.push(d);
   }
 
-  // Which lines to ask about: every `(repo, base)` a run in the window named,
-  // plus `main` for every repo seen. Capped — and the cap says so.
+  // Which lines to ask about: `main` for every repo seen FIRST, then every
+  // `(repo, base)` a run in the window named. The order is the point — derived
+  // bases are a long tail, and eight recent feature branches would otherwise
+  // consume the cap and drop the one line this page promises to ask about.
   const pairs = new Map();
+  for(const rp of new Set([...(runs||[]).map(x => x.repo),
+                           ...(((needs&&needs.items)||[]).map(x => x.repo))]))
+    if(rp) pairs.set(`${rp}\u0001${DEFAULT_BASE}`, [rp, DEFAULT_BASE]);
   for(const run of (runs || [])){
-    if(run.repo && run.base) pairs.set(`${run.repo} ${run.base}`, [run.repo, run.base]);
+    if(run.repo && run.base)
+      pairs.set(`${run.repo}\u0001${run.base}`, [run.repo, run.base]);
   }
-  for(const r of new Set([...(runs||[]).map(x => x.repo),
-                          ...(((needs&&needs.items)||[]).map(x => x.repo))]))
-    if(r) pairs.set(`${r} ${DEFAULT_BASE}`, [r, DEFAULT_BASE]);
   const asked = [...pairs.values()].slice(0, QUEUE_CALLS);
+  const askedKeys = new Set(asked.map(([rp, b]) => `${rp}\u0001${b}`));
 
   const answers = await Promise.all(asked.map(async ([repo, base]) => {
     try {
@@ -539,18 +607,31 @@ async function load(){
   if(my !== gen) return;
 
   for(const q of answers){
+    if(q.error) continue;      // a line nobody could read proves nothing about it
     for(const e of (q.entries || [])){
       const key = `${q.repo}#${e.pr}`;
-      if(!byPr.has(key)) byPr.set(key, {repo:q.repo, pr:e.pr, title:null, run:null,
-                                        needs:[], entry:null, queueDepth:0, inWindow:false});
-      const row = byPr.get(key);
-      row.entry = e;
-      row.queueDepth = (q.entries || []).length;
+      if(!byPr.has(key)) byPr.set(key, blank(q.repo, e.pr, {base:q.base}));
+      const r = byPr.get(key);
+      // The FIRST line it was found in wins the cell, and `entries` says there
+      // were others. Overwriting would quietly report one membership and one
+      // depth for a PR standing in two of them.
+      r.entries += 1;
+      if(!r.entry){ r.entry = e; r.queueDepth = (q.entries || []).length;
+                    r.base = r.base || q.base; }
     }
   }
+  // Whether this page read the line a row would land in. That is what makes
+  // "not in the line" a statement about the queue rather than about the page.
+  const answered = new Set(answers.filter(q => !q.error)
+                                  .map(q => `${q.repo}\u0001${q.base}`));
+  for(const r of byPr.values())
+    r.lineRead = !!(r.base && askedKeys.has(`${r.repo}\u0001${r.base}`)
+                    && answered.has(`${r.repo}\u0001${r.base}`));
 
   queues = answers;
   rows = [...byPr.values()];
+  readAt = Date.now();
+  staleSince = null;
   scopeNote =
     `${(runs||[]).length} panel run${(runs||[]).length===1?"":"s"} read (the newest `
     + `${RUN_WINDOW}) — a pull request whose last round is older than that has no row `
@@ -562,7 +643,10 @@ async function load(){
     + (pairs.size > asked.length
         ? `, ${pairs.size - asked.length} more derived and not asked (the page asks at `
           + `most ${QUEUE_CALLS})` : "")
-    + `. ${PANEL_MEMORY}.`;
+    + `. A line is only asked about if something above named its base, so a queue `
+    + `on a base no run and no waiting defect mentions is not merely unasked — it `
+    + `is undiscoverable from here and the number just given cannot count it. `
+    + `${PANEL_MEMORY}.`;
   say("");
   render();
 }

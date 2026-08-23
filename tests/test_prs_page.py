@@ -26,8 +26,9 @@ from, and each has a test here:
   for an absent lease, one contract over.
 * **Round is not stage.** #262's ``stage`` is a fact about a *session*;
   ``ReviewRun.round`` is a fact about a *pull request*. A blank cell that could be
-  read as either is worse than two honest cells, so a PR with no round says
-  ``never panelled``.
+  read as either is worse than two honest cells, so an absent round says which of
+  the two absences it is — and never "never panelled", which is a claim about the
+  whole table made from the edge of a windowed query.
 
 There is no JS test runner here, so the page half greps the file that ships — the
 same crude-but-real guard ``test_fleet_page.py`` uses on ``fleet.html`` and
@@ -46,6 +47,29 @@ from app.models.merge_queue import VERDICTS
 from app.needs_human import NEEDS_HUMAN_CLASSES
 
 from .conftest import LAPTOP
+
+
+def body(script: str, name: str) -> str:
+    """One function's source, comments stripped.
+
+    Every assertion below that names a behaviour looks inside the function that
+    has to implement it. A bare grep over the whole page is satisfied by the
+    comment arguing for the behaviour, which is exactly the test that passes
+    while the behaviour is gone.
+    """
+    m = re.search(rf"\n(?:async )?function {name}\([^)]*\)\s*\{{", script)
+    assert m, f"{name}() has gone"
+    depth, i = 0, m.end() - 1
+    while i < len(script):
+        if script[i] == "{":
+            depth += 1
+        elif script[i] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return re.sub(r"^\s*//.*$", "", script[m.end():i], flags=re.M)
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PAGE = REPO_ROOT / "app/static/prs.html"
@@ -85,7 +109,8 @@ async def test_the_page_does_not_take_the_path_of_any_json_it_fetches(client):
     """`/reviews`, `/review/needs-human` and `/merge-queue` are the JSON this page
     reads, and one path cannot be both without content negotiation nobody would
     remember was there. The same rule that put the panel at `/panel`."""
-    for path in ("/reviews", "/review/needs-human"):
+    for path in ("/reviews", "/review/needs-human",
+                 "/merge-queue?repo=prisonblues/quarterback&base=main"):
         r = await client.get(path, headers=LAPTOP)
         assert r.status_code == 200, r.text
         assert "<!doctype html>" not in r.text.lower()
@@ -165,8 +190,7 @@ def test_an_absent_round_is_never_reported_as_a_pr_nobody_panelled(script):
     code = re.sub(r"^\s*//.*$", "", script, flags=re.M)   # the comment argues it
     assert "never panelled" not in code
     assert "outside this window" in code
-    body = re.search(r"function roundCell\(r\)\{(.*?)\n\}", script, re.S).group(1)
-    assert "r.needs.length" in body, (
+    assert "r.needs.length" in body(script, "roundCell"), (
         "roundCell no longer distinguishes a PR whose defect proves a round ran")
 
 
@@ -183,9 +207,7 @@ def test_the_page_never_draws_a_session_stage(page):
 def test_the_round_cell_names_the_run_it_came_from(script):
     """A round number with no as-of is the same class of lie as a stage column that
     fills in for local rows only."""
-    body = re.search(r"function roundCell\(r\)\{(.*?)\n\}", script, re.S)
-    assert body, "roundCell has gone"
-    assert "ago(r.run.ts)" in body.group(1)
+    assert "ago(r.run.ts)" in body(script, "roundCell")
 
 
 # ---- a memory is drawn as a memory ------------------------------------------
@@ -206,16 +228,20 @@ def test_the_page_words_the_panel_memory_the_way_the_model_already_does():
 def test_pr_state_and_ci_are_never_drawn_without_the_round_they_came_from(script):
     """Both are what the panel saw at run time and nothing has refreshed them. The
     one function that renders either always attaches the round and the age."""
-    body = re.search(r"function memoryCell\(key, value, r\)\{(.*?)\n\}", script, re.S)
-    assert body, "memoryCell has gone"
-    assert "as of round ${r.run.round}" in body.group(1)
-    assert "ago(r.run.ts)" in body.group(1)
-    # And nothing else may draw them.
+    src = body(script, "memoryCell")
+    assert "as of round ${r.run.round}" in src
+    assert "ago(r.run.ts)" in src
+    # And nothing else may draw them: every other mention of either field, with
+    # the comments stripped, has to be handing it TO memoryCell or deciding
+    # whether the staleness caveat is owed.
+    code = re.sub(r"^\s*//.*$", "", script, flags=re.M)
+    code = code.replace(src, "")
     for field in ("pr_state", "ci_status"):
-        uses = [m for m in re.findall(rf"[^\n]*\.{field}[^\n]*", script)
-                if not m.strip().startswith("//")]
-        assert all("memoryCell" in u or "run.pr_state ||" in u or "caveat" in u.lower()
-                   or "r.run.ci_status" in u for u in uses), (field, uses)
+        for line in code.splitlines():
+            if f".{field}" not in line:
+                continue
+            assert "memoryCell(" in line or "out.push" in line or "old &&" in line, (
+                f"{field} is drawn somewhere other than memoryCell: {line!r}")
 
 
 # ---- a verdict is pinned to a commit ----------------------------------------
@@ -225,8 +251,13 @@ def test_a_ready_verdict_on_a_moved_head_is_not_drawn_as_ready(script):
     """`GET /merge-queue` already computes `ready = verdict == "ready" and
     ready_sha == head`. A page that drew the word and ignored the boolean would
     report a PR as landable on a commit nobody judged."""
-    assert 'e.verdict === "ready" && e.ready === false' in script
-    assert "retired" in script
+    cell = body(script, "queueCell")
+    assert 'e.verdict === "ready" && e.ready === false' in cell
+    assert "retired" in cell
+    # And the queue listing, which draws the same entry a second time.
+    listing = body(script, "renderQueues")
+    assert 'e.verdict==="ready" && e.ready===false' in listing.replace(" ===", "===")
+    assert "retired" in listing
 
 
 def test_the_page_shows_the_verdict_the_board_issued_rather_than_a_gloss(script):
@@ -252,24 +283,26 @@ def test_an_empty_queue_says_it_cannot_tell_empty_from_unfed(script):
     assert "nothing enqueues automatically" in script
     assert "#258" in script
     # And the sentence is rendered where the zero is, not filed in a comment.
-    render = re.search(r"function renderQueues\(\)\{(.*?)\n\}", script, re.S)
-    assert render, "renderQueues has gone"
-    assert "QUEUE_UNFED" in render.group(1)
+    assert "QUEUE_UNFED" in body(script, "renderQueues")
 
 
 def test_a_queue_that_could_not_be_read_is_not_an_empty_queue(script):
     """The other half of the same collapse: a 500 from `/merge-queue` rendered as an
     empty list reads as a drained line. `qbdata.fetch_review_queue` refuses the same
     conflation for the same reason."""
-    render = re.search(r"function renderQueues\(\)\{(.*?)\n\}", script, re.S)
-    assert "q.error" in render.group(1)
-    assert "not an empty queue" in script
+    listing = body(script, "renderQueues")
+    assert "q.error" in listing
+    assert "not an empty queue" in listing
+    # And an unreadable line must not settle a row's own cell either: a PR
+    # missing from a queue nobody could read is not a PR that is not queued.
+    assert "if(q.error) continue" in re.sub(r"^\s*//.*$", "", script, flags=re.M)
 
 
 def test_a_zero_on_the_human_count_says_what_it_covers(script):
     """Only a panel round raises a needs-human defect, so a PR nothing has panelled
     contributes nothing. Without that said, the zero reads as "nothing needs you"."""
     assert "only a panel round raises one of these" in script
+    assert "NEEDS_HUMAN_SCOPE" in body(script, "load")
 
 
 def test_the_classes_the_page_shows_are_the_classes_the_board_defines(page):
@@ -289,29 +322,29 @@ def test_only_a_row_the_board_holds_nothing_outstanding_about_can_be_hidden(scri
     """The toggle may hide a settled row and nothing else. A PR waiting on a human,
     or standing in the line, being one tap away is the false-clean this page is
     about — `/fleet`'s rule, and the same shape of failure."""
-    body = re.search(r"function quiet\(r\)\{(.*?)\n\}", script, re.S)
-    assert body, "quiet() has gone"
-    src = body.group(1)
-    assert "r.needs.length || r.entry" in src
-    assert "return false" in src
-    assert "r.run.stopped === true" in src
+    src = [ln.strip() for ln in body(script, "quiet").splitlines() if ln.strip()]
+    # The refusal is the FIRST thing the function does, so nothing later can
+    # reach past it: a row with an outstanding judgement or a place in the line
+    # returns before any other rule is consulted.
+    assert src[0] == "if(r.needs.length || r.entry) return false;", src
+    assert any("r.run.stopped === true" in ln for ln in src), src
 
 
 def test_the_page_caps_nothing(script):
     """`/fleet` caps its settled tail because three months of dead sessions is a page
     that does not open. There is no equivalent here — the run window is the cap, it
     is on the FETCH, and the footer says so. Nothing slices the row list."""
-    render = re.search(r"\nfunction render\(\)\{(.*?)\n\}", script, re.S)
-    assert render, "render() has gone"
-    assert ".slice(" not in render.group(1)
+    assert ".slice(" not in body(script, "render")
 
 
 def test_the_footer_says_what_the_page_did_not_look_at(script):
     """A list that reads as complete and is not is the same defect as an empty queue
     that reads as drained. The window, the needs-human cap and the number of lines
     it declined to ask about are all stated."""
-    assert "has no row" in script
-    assert "asked about" in script
+    src = body(script, "load")
+    assert "has no row" in src
+    assert "asked about" in src
+    assert "undiscoverable from here" in src
 
 
 # ---- it never silently stops refreshing -------------------------------------
@@ -320,12 +353,129 @@ def test_the_footer_says_what_the_page_did_not_look_at(script):
 def test_an_unreachable_board_is_said_and_not_left_on_a_stale_page(script):
     """Without this the last good page stays on screen looking live, with nothing to
     say it stopped refreshing — this page's own failure mode, in the page."""
-    assert "the board is unreachable" in script
-    assert "the board would not answer" in script
+    src = body(script, "load")
+    assert "the board is unreachable" in src
+    assert "the board would not answer" in src
+    # Both go through `fell`, which marks what is already on screen as the older
+    # reading it now is. An error message beside numbers that still look current
+    # leaves the reader no way to tell which of the two they are seeing.
+    assert src.count("fell(") == 2, src
+    assert "staleSince" in body(script, "fell")
+    assert "staleSince" in body(script, "render")
 
 
 def test_a_slow_read_cannot_paint_over_a_newer_one(script):
     """Three of the four fetches are awaited after another await, so two ticks can
     overlap. The generation counter is what stops the older one landing last."""
-    assert "const my = ++gen" in script
-    assert script.count("if(my !== gen) return") >= 2
+    src = body(script, "load")
+    assert "const my = ++gen" in src
+    # Every line that commits a read to module state has to come AFTER a guard.
+    guards = [i for i, ln in enumerate(src.splitlines())
+              if "if(my !== gen) return" in ln]
+    commits = [i for i, ln in enumerate(src.splitlines())
+               if re.match(r"\s*(rows|queues|scopeNote|readAt|waiting) =", ln)]
+    assert guards and commits
+    assert all(any(g < c for g in guards) for c in commits), (guards, commits)
+
+
+# ---- the page reads a sample, and never speaks for what it did not read ------
+
+
+def test_an_absent_queue_entry_is_never_reported_as_a_pr_nobody_queued(script):
+    """`GET /merge-queue` answers about exactly one `(repo, base)` and this page
+    asks about a derived, capped handful. So a missing entry means "not in a line
+    this page read" — and where the PR's base was never among them, not even
+    that. Reporting it as "not queued" would be the same collapse as reading an
+    absent lease as a dead agent."""
+    cell = body(script, "queueCell")
+    assert "not queued" not in cell
+    assert "r.lineRead" in cell, "the cell no longer distinguishes the two absences"
+    assert "line not read" in cell
+
+
+def test_a_line_that_could_not_be_read_settles_nothing_about_its_rows(script):
+    """A 500 from one `(repo, base)` must not make every PR that would land there
+    read as unqueued. The rows are only marked read against lines that answered."""
+    src = body(script, "load")
+    assert "answered" in src
+    assert "if(q.error) continue" in src
+
+
+def test_a_trimmed_needs_human_list_is_not_rendered_as_a_complete_one(script):
+    """`truncated` says the endpoint's own cap trimmed the LIST while `waiting`
+    still counts the whole of it. A row with no listed defect under truncation
+    means "none among the ones returned" — and a footnote at the bottom of the
+    page does not repair a false cell in the middle of it."""
+    cell = body(script, "humanCell")
+    assert "r.listTrimmed" in cell
+    assert "none listed" in cell
+
+
+def test_the_headline_human_count_is_the_boards_own_and_not_the_drawn_rows(script):
+    """Summing the rows reports the trimmed number under the untrimmed label, and
+    this is the one figure on the page a person is meant to act on."""
+    src = body(script, "render")
+    assert "waiting === null" in src
+    assert "drawn" in src
+
+
+def test_the_default_line_is_asked_about_before_any_derived_one(script):
+    """The cap is real, and derived bases are a long tail. Eight recent feature
+    branches inserted first would consume it and drop the one line this page
+    promises to ask about, for every repo on it."""
+    src = body(script, "load")
+    default_at = src.index("DEFAULT_BASE")
+    derived_at = src.index("run.base) pairs.set") if "run.base) pairs.set" in src \
+        else src.index("pairs.set(`${run.repo}")
+    assert default_at < derived_at, (
+        "the derived pairs go in before the default ones; the cap now drops main")
+
+
+def test_a_pr_in_two_of_the_lines_read_is_not_silently_collapsed(script):
+    """Overwriting would report one membership and one depth for a PR standing in
+    two lines, and undercount "in line". The first wins the cell and the row says
+    there were others."""
+    src = body(script, "load")
+    assert "r.entries += 1" in src
+    assert "if(!r.entry)" in src
+    assert "r.entries > 1" in body(script, "caveats")
+
+
+# ---- every payload value crosses esc() on its way to innerHTML --------------
+
+
+def test_no_payload_value_reaches_innerhtml_without_esc(script):
+    """Every value on this page is agent-supplied. `esc()` is safe in an attribute
+    as well as in text, and it is the only door — an interpolation that skips it is
+    a hole whether or not today's value happens to be a number.
+
+    Only the four functions that BUILD markup are checked. The cell builders
+    (`roundCell`, `queueCell`, …) return plain strings that `factEl` escapes on the
+    way in, so escaping them twice would render `&amp;` in a PR title."""
+    #: Interpolations the page composes ITSELF, listed one by one so that adding
+    #: another is a deliberate act rather than a token that happens to match.
+    #: `r.repo`/`r.pr` build the GitHub URL, which is escaped where it is used.
+    OWN = {
+        'r.repo', 'r.pr', 'v', 'r.title?"":" untitled"', 'n', 'claim',
+        'hidden', 'human', 'drawn', 'waiting', 'rows.length',
+        'counts.queued + counts.landing', 'counts.unclear + counts.noround',
+    }
+    holes = []
+    for fn in ("prRow", "render", "renderQueues"):
+        for expr in re.findall(r"\$\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}",
+                               body(script, fn)):
+            e = " ".join(expr.split())
+            if not e or e in OWN:
+                continue
+            if any(tok in e for tok in ("esc(", "who(", "factEl", "caveats(",
+                                        "LABEL[", "span(")):
+                continue
+            holes.append((fn, e))
+    assert not holes, holes
+
+
+def test_the_page_is_free_of_stray_control_characters(page):
+    """A NUL that reached this file through an editor once already. It survived a
+    green test run and a commit, because nothing looked."""
+    stray = sorted({ord(c) for c in page if ord(c) < 32 and c not in "\t\n\r"})
+    assert not stray, stray
