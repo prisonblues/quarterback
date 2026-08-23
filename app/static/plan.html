@@ -337,10 +337,6 @@ function row(it, s){
   // argument #85, #86 and #78 each settled, one level further out. Agents ASK, at
   // POST /plan/item/exempt, and the ask shows up on the row as an amber chip.
   const canExempt = it.state==="open" && it.ref && it.ref.kind==="pr";
-  const exemptWhy = !canExempt ? ""
-    : rv(it).exempt ? "put this PR back in the review queue"
-    : rv(it).requested ? `${rv(it).requested_by||"somebody"} asked: ${rv(it).requested_reason||""}`
-    : "take this PR out of the review queue";
   // #398's ⊘ and its two review chips arrived hover-only — written before this
   // mechanism existed, and they are exactly the defect this PR is about. Each
   // explanation is hoisted to a sentence and carried by `data-why` as well as
@@ -350,6 +346,10 @@ function row(it, s){
   const grantWhy = rv(it).granted_by ? `granted by ${rv(it).granted_by}`
     : "the note carries the marker";
   const askedWhy = rv(it).requested_reason || "no reason was given with the request";
+  const exemptWhy = !canExempt ? ""
+    : rv(it).exempt ? "put this PR back in the review queue"
+    : rv(it).requested ? `${rv(it).requested_by||"somebody"} asked: ${askedWhy}`
+    : "take this PR out of the review queue";
   el.innerHTML = `
     <div class="rank${rankClass(it)}" data-why="${esc(rankWhy(it))}"
       title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
@@ -555,17 +555,18 @@ listEl.addEventListener("click", async (e)=>{
   // through to a reorder the gate has already refused.
   const why = e.target.closest("[data-why]");
   note(why ? why.dataset.why : "");
-  // What stops the fall-through is the REFUSAL, not the explanation. `dead()` is the
-  // only thing that marks a control refused, and it marks it with `aria-disabled`, so
-  // that is what is read here rather than the mere presence of a reason. A LIVE
-  // control may need an explanation too — #398's ⊘ says what tapping it will do, and
-  // a thumb has no other way to be told — and for that one, being readable must not
-  // be a way of being quietly disabled. Anything with a reason and no verb (the rank,
-  // the review chips, a refless ref) has already been answered and falls out below.
-  if(why && why.getAttribute("aria-disabled") === "true") return;
   const move = e.target.closest("button[data-move]");
   const state = e.target.closest("button[data-state]");
   const exempt = e.target.closest("button[data-exempt]");
+  // What stops the fall-through is the REFUSAL, and it is read off the button that
+  // carries the VERB — never off whichever element happened to explain itself. Read
+  // the verb first and a refused reorder runs; read the reason first and any LIVE
+  // control that learns to explain itself goes quietly dead in the act of learning
+  // (#398's ⊘ says what tapping it will do, and a thumb has no other way to be told).
+  // Anything with a reason and no verb — the rank, the review chips, a refless ref —
+  // has been answered already and falls out of the `else` below.
+  const act = exempt || state || move;
+  if(act && act.matches('.dead, [aria-disabled="true"]')) return;
   let path, body;
   if(exempt){
     const grant = exempt.dataset.exempt === "true";
