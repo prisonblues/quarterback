@@ -1757,6 +1757,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.5** — a page that says what every agent is doing, and how much of that is actually known.
 - **v3.6** — two test runs in one worktree stop corrupting each other.
 - **v3.7** — the one judgement in the release mechanism stops being a flag anything can pass.
+- **v3.8** — QUARTERBACK_INSTANCE finally names something.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
