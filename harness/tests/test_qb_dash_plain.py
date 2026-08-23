@@ -92,14 +92,24 @@ BOARD = {
     "plan": [],
 }
 
-PLAN = [
-    {"item_id": "a", "repo": qd.REPO, "title": "ours",
-     "ref": {"kind": "issue", "value": "261"}, "blocked_by": [], "claim": None},
-    {"item_id": "b", "repo": "prisonblues/nix-fleet", "title": "theirs",
-     "ref": None, "blocked_by": [], "claim": None},
-    {"item_id": "c", "repo": None, "title": "fleet-wide",
-     "ref": None, "blocked_by": [], "claim": None},
-]
+PLAN = {
+    "items": [
+        {"item_id": "a", "repo": qd.REPO, "title": "ours", "rank": 1,
+         "rank_source": "ordered",
+         "ref": {"kind": "issue", "value": "261"}, "blocked_by": [], "claim": None},
+        {"item_id": "b", "repo": "prisonblues/nix-fleet", "title": "theirs", "rank": 2,
+         "rank_source": "appended",
+         "ref": None, "blocked_by": [], "claim": None},
+        {"item_id": "c", "repo": None, "title": "fleet-wide", "rank": 1,
+         "rank_source": "appended",
+         "ref": None, "blocked_by": [], "claim": None},
+    ],
+    "counts": {"open": 3, "claimed": 0, "covered": 0, "blocked": 0, "stale": 0},
+    "order_trust": {"trusted": False, "unchosen": 2},
+    "next": {"item_id": "a", "repo": qd.REPO, "ref": {"kind": "issue", "value": "261"},
+             "caveat": "nobody chose two of these positions"},
+    "truncated": False,
+}
 
 PRS = [{"number": 265, "title": "a pr", "isDraft": False, "updatedAt": None,
         "statusCheckRollup": [], "repo": qd.REPO}]
@@ -147,13 +157,14 @@ def _titles(panel) -> str:
 
 # ---- the column count, which is the whole risk -------------------------------
 
-@pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
+# who state stage [repo] what ttl — five narrow, six wide.
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
 def test_the_fleet_panel_builds_the_columns_it_declared(dash, scope, expected):
     panel = dash.panel_agents(BOARD, 78, scope)
     assert len(_table(panel).columns) == expected
 
 
-@pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
 def test_an_empty_fleet_pads_to_the_same_width(dash, scope, expected):
     """"nobody home" is a hand-counted filler row, and a wrong count grows a
     column that every real row is then drawn against."""
@@ -161,14 +172,40 @@ def test_an_empty_fleet_pads_to_the_same_width(dash, scope, expected):
     assert len(_table(panel).columns) == expected
 
 
-@pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
+# ---- how far along, which is the only column that moves (#262) ---------------
+
+def test_the_fleet_panel_shows_a_reported_stage(dash):
+    """`who state stage repo what ttl` — beside `state`, because the two are read
+    together and answer different questions: whether the pane is moving, and
+    where it has got to."""
+    board = {**BOARD, "agents": [{**BOARD["agents"][0], "stage": "R1F"}]}
+    assert "R1F" in [c for row in _cells(dash.panel_agents(board, 78, WIDE)) for c in row]
+
+
+def test_a_lease_that_reported_no_stage_is_not_drawn_as_one(dash):
+    """The majority case, and the one that must not lie.
+
+    Every agent in BOARD predates the field, exactly as most leases will for a
+    while. A cell that came out empty would read as a clipped column or a
+    rendering fault; `qbdata.STAGE_UNREPORTED` is not alphanumeric, so it cannot
+    be confused with a stage somebody actually said — a stage is 1-6
+    alphanumerics by construction, at the board's edge and in `qb-stage`.
+    """
+    rows = _cells(dash.panel_agents(BOARD, 78, WIDE))
+    stages = [row[2] for row in rows]
+    assert stages == [qd.STAGE_UNREPORTED] * len(BOARD["agents"])
+    assert not any(s.strip().isalnum() for s in stages)
+
+
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
 def test_the_plan_panel_and_its_three_filler_rows_agree(dash, scope, expected):
     """Three shapes through one panel: rows, the "…and N more" line, and an error
     row that starts with a glyph and pads with `filler[1:]`."""
     assert len(_table(dash.panel_plan(PLAN, None, 78, scope)).columns) == expected
-    assert len(_table(dash.panel_plan([], None, 78, scope)).columns) == expected
+    assert len(_table(dash.panel_plan({}, None, 78, scope)).columns) == expected
     assert len(_table(dash.panel_plan(PLAN, "board is down", 78, scope)).columns) == expected
-    many = [dict(PLAN[0], item_id=str(n), title=f"item {n}") for n in range(30)]
+    many = {**PLAN, "items": [dict(PLAN["items"][0], item_id=str(n), title=f"item {n}")
+                              for n in range(30)]}
     assert len(_table(dash.panel_plan(many, None, 78, scope)).columns) == expected
 
 
@@ -248,8 +285,8 @@ def test_the_claims_panel_keeps_its_three_columns_when_it_is_empty(dash):
 def test_the_printed_panels_narrow_and_say_what_they_hid(dash):
     fleet = dash.panel_agents(BOARD, 78, NARROW)
     # Sorted by repo, so the row nothing could attribute leads — wearing the mark
-    # that is all this view has left to say so.
-    assert [r[2] for r in _cells(fleet)] == ["? nowhere", "here"]
+    # that is all this view has left to say so. Column 3: who state stage what ttl.
+    assert [r[3] for r in _cells(fleet)] == ["? nowhere", "here"]
     assert "1 elsewhere" in _titles(fleet)
 
     claims = dash.panel_claims(BOARD, 78, NARROW)
@@ -257,17 +294,65 @@ def test_the_printed_panels_narrow_and_say_what_they_hid(dash):
     assert "1 elsewhere" in _titles(claims)
 
     plan = dash.panel_plan(PLAN, None, 78, NARROW)
-    assert [r[2] for r in _cells(plan)] == ["ours", "? fleet-wide"]
+    assert [r[3] for r in _cells(plan)] == ["ours", "? fleet-wide"]
     assert "1 elsewhere" in _titles(plan)
+
+
+def test_the_plan_row_carries_the_rank_and_who_chose_it(dash):
+    """The human's order used to reach the terminal as row position and nothing
+    else — the one presentation that cannot tell a chosen priority from where an
+    add happened to land (#183). `~` is the mark, and the title counts them."""
+    rows = _cells(dash.panel_plan(PLAN, None, 78, WIDE))
+    assert [r[2] for r in rows] == ["1", "~2", "~1"]
+    assert [r[3] for r in rows] == ["#261", "", ""]
+
+
+def test_the_printed_plan_draws_the_boards_order_and_not_its_own(dash):
+    """`sort_plan` re-banded the rows here — taken, free, blocked — which is a
+    second answer about an ordered list computed against that list's own order,
+    and the reason the two surfaces disagreed about what was next."""
+    plan = {**PLAN, "items": [dict(PLAN["items"][0], item_id="held", title="held",
+                                   claim={"holder": "zeus/one"}),
+                              dict(PLAN["items"][0], item_id="free", title="free")]}
+    assert [r[4] for r in _cells(dash.panel_plan(plan, None, 78, WIDE))] == ["held", "free"]
+
+
+def test_a_narrow_pane_gives_up_a_column_rather_than_the_glyph(dash):
+    """Every column but the title is fixed, so the title cell pays for all of
+    them — and rich takes the shortfall out of the fixed columns from the LEFT, so
+    at 45 columns the state glyph itself came out blank. The rank goes instead,
+    and its headline (`~N unchosen`) is in the title either way."""
+    wide = _table(dash.panel_plan(PLAN, None, 100, WIDE))
+    narrow = _table(dash.panel_plan(PLAN, None, 45, WIDE))
+    assert len(wide.columns) == 6 and len(narrow.columns) == 5
+    assert [r[0] for r in _cells(dash.panel_plan(PLAN, None, 45, WIDE))] == ["◉", "○", "○"], \
+        "the state glyph was squeezed out of a narrow pane"
+    title = _titles(dash.panel_plan(PLAN, None, 45, WIDE))
+    assert "next #261" in title, "the answer went before the tally that qualifies it"
+
+
+def test_the_printed_plan_title_carries_the_envelope(dash):
+    """Six of the board's answers reached no terminal surface at all. They are
+    facts about the LIST, so they go in the title — #269 measured 55 rows drawn
+    into a 38-row pane, and nothing here may add a row."""
+    title = _titles(dash.panel_plan({**PLAN, "truncated": True}, None, 78, WIDE))
+    assert "3 open" in title and "next #261" in title
+    assert "~2 unchosen" in title and "truncated at 3" in title
+
+
+def test_the_printed_plan_marks_the_row_the_board_would_take_next(dash):
+    rows = _cells(dash.panel_plan(PLAN, None, 78, WIDE))
+    assert [r[0] for r in rows] == ["◉", "○", "○"]
 
 
 def test_the_printed_panels_go_wide_and_claim_to_hide_nothing(dash):
     """Sorted by repo, so the unattributed row leads — and it needs no mark here,
     because the cell that says so is back."""
     fleet = dash.panel_agents(BOARD, 78, WIDE)
-    assert [r[3] for r in _cells(fleet)] == ["nowhere", "elsewhere", "here"]
+    # who state stage repo what ttl.
+    assert [r[4] for r in _cells(fleet)] == ["nowhere", "elsewhere", "here"]
     assert "1 elsewhere" not in _titles(fleet)
-    assert [r[2] for r in _cells(fleet)] == ["—", "prisonblue…", "quarterback"]
+    assert [r[3] for r in _cells(fleet)] == ["—", "prisonblue…", "quarterback"]
     assert "quarterback#261" in [r[1] for r in _cells(dash.panel_claims(BOARD, 78, WIDE))]
 
 

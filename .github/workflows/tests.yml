@@ -424,6 +424,21 @@ jobs:
     # first declared it, which is a question about the whole history, and depth-1 has one
     # commit — so a shallow checkout would tag all ninety-odd releases at HEAD, permanently,
     # and tags are not moved by anything here.
+    #
+    # AND IT CHECKS WHAT IT WROTE DOWN (#406). For five months this job's name was a claim it
+    # did not test. `backfill` creates a tag where a release has none; it says nothing about a
+    # tag that already exists, and "already exists" was the whole of what `every release on
+    # main has a tag` meant. v3.8 was squash-merged, the squash discarded the `chore(release)`
+    # commit its tag had been reserved against, `refs/tags/v3.8` resolved perfectly to a
+    # commit that is not in main's history at all — and this job was green. So the second step
+    # asks the question the name promises: is the tag an ANCESTOR of the branch it claims to
+    # tag. It is one `git merge-base --is-ancestor` per release, and it is what turns a silent
+    # inconsistency into a red job in the minutes after the merge.
+    #
+    # `check` runs AFTER `backfill` deliberately: backfill's job is to make `untagged` empty,
+    # so checking first would go red on a release this very run is about to tag. And it must
+    # not be folded into backfill, which never moves a tag and must stay that way — the whole
+    # separation is that one records and the other judges.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -436,6 +451,17 @@ jobs:
 
       - name: Record a tag for every release that has landed
         run: python3 scripts/release_tag.py backfill --ref HEAD --push
+
+      # A tag that is off HEAD is TWO opposite things and this step is the only thing in the
+      # repo that tells them apart. Every release still in flight has a reservation pointing
+      # at a branch commit — v3.9, v3.10 and v3.12 were all legitimately off main on the night
+      # #406 was filed, held by three open pull requests — and flagging those would train
+      # everybody to ignore the row. The discriminator is the CHANGELOG at HEAD: it declares
+      # the releases that have LANDED, so a tag off HEAD for a release HEAD declares is an
+      # orphan, and one for a release HEAD does not declare is a reservation. See
+      # `release_tag.reconcile`.
+      - name: Every landed release's tag is on main
+        run: python3 scripts/release_tag.py check --ref HEAD
 
   frozen:
     name: no shipped release entry was rewritten

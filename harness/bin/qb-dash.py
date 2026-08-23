@@ -50,9 +50,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
     LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_counts, ci_state,
     claim_label, claim_repo, clip, elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan,
-    fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells, plan_counts,
-    plan_ref, plan_state, plan_who, queue_cell, queue_oldest, repo_arg, repo_colour,
-    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until, waited,
+    fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells,
+    plan_head_bits, plan_items, plan_next_id, plan_rank, plan_ref, plan_state, plan_who,
+    queue_cell, queue_oldest, repo_arg, repo_colour,
+    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, stage_cell, until, waited,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -74,6 +75,11 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
     t.add_column(width=7, no_wrap=True)           # state
+    # Next to `state`, and narrow: `state` says whether the pane is moving, this
+    # says where it has got to, and they are read together (#262). Six, because a
+    # stage IS six characters at most — the shape qb-stage and the board both
+    # enforce — so nothing here is ever truncated to make it fit.
+    t.add_column(width=6, no_wrap=True)           # stage
     if show_repo:
         t.add_column(width=11, no_wrap=True)      # repo
     t.add_column(ratio=1, no_wrap=True)           # what
@@ -81,7 +87,11 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
 
     # The cell's width plus its padding goes back to `what`, which is the column
     # a reader is actually reading: what the agent in this seat is doing.
-    body = max(18, width - (45 if show_repo else 33))
+    # The stage column costs `what` its width plus padding. That is a real cost on
+    # a narrow pane and it is paid deliberately: `what` is already clipped on every
+    # row and reads the same at every stage of a PR's life, so eight characters of
+    # title buy the one column that changes as the work progresses.
+    body = max(18, width - (53 if show_repo else 41))
     for a in agents:
         who = (a.get("holder") or "?").split("/", 1)[-1]
         repo = a.get("repo") or "—"
@@ -91,6 +101,7 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         cells = [
             Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
             Text(word or "—", style=style),
+            Text(*stage_cell(a)),
         ]
         if show_repo:
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
@@ -104,7 +115,7 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         ]
         t.add_row(*cells)
     if not agents:
-        t.add_row(Text("nobody home", style="grey50"), *[""] * (4 if show_repo else 3))
+        t.add_row(Text("nobody home", style="grey50"), *[""] * (5 if show_repo else 4))
 
     subs = len(data.get("subagents") or [])
     head = f"[bold]FLEET[/] [grey50]{len(agents)} live"
@@ -121,7 +132,7 @@ def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
     # A claim's repo is in its KEY, not in a field of its own, and a `plan:<uuid>`
     # key names an item rather than a repo — so the plan goes in with it, and a
     # claim neither can attribute stays (see qbdata.claim_repo).
-    plan = data.get("plan")
+    plan = plan_items(data.get("plan"))
     claims, hidden = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), plan))
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)
@@ -148,64 +159,97 @@ def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
                  title_align="left", border_style="grey35", padding=(0, 1))
 
 
-def panel_plan(items: list[dict], err: str | None, width: int,
+def _title_room(width: int, show_repo: bool, show_rank: bool, who_width: int) -> int:
+    """How many columns the title cell has left once the fixed ones have taken theirs.
+
+    The panel's border and padding cost 4, and `Table.grid(padding=(0, 1))` puts a
+    space after every column but the last.
+    """
+    fixed = [1] + ([11] if show_repo else []) + ([4] if show_rank else []) + [6, who_width]
+    return width - 4 - sum(fixed) - len(fixed)
+
+
+def panel_plan(plan: dict, err: str | None, width: int,
                scope: Scope | None = None) -> Panel:
-    """What the fleet agreed to do next, running items first.
+    """What the fleet agreed to do next, in the board's own order.
 
     FLEET says who is here and CLAIMED says what they hold; neither says what
     the work is FOR. This is the board's plan — one ordered list per repo, plus
-    the fleet-wide one — so the panel leads with the items somebody is on and
-    then reads down to the ones that are free, which is the order a human asks
-    the questions in.
+    the fleet-wide one.
+
+    **The order is the board's and is not re-derived here.** A plan is an ordered
+    list, that order is a human decision, and this panel used to re-band it
+    locally — taken, then free, then blocked — which is a second answer about the
+    plan computed against the plan's own answer, and the reason the two surfaces
+    disagreed about what was next. What the banding was FOR was finding the row a
+    seat can pick up, and the board answers that outright: `next` is in the title
+    and wears the ◉ on its row.
 
     Printed, so it does not scroll: past PLAN_ROWS it says how many it left out
     rather than pushing the panels above it off the screen.
     """
     show_repo = scope is None or scope.column
+    # WHAT A NARROW PANE GIVES UP, AND IN WHICH ORDER. Every column but the title
+    # is fixed, so the title cell pays for all of them, and below a dozen
+    # characters a title says nothing at all. Two give way rather than squeezing
+    # it to nothing: the holder's machine first — back to the 13 columns it had
+    # before this panel showed one, so a narrow pane is no worse off than it was
+    # yesterday — and then the rank, whose headline (`~N unchosen`) stays in the
+    # title either way. Squeezing instead is not a smaller version of this: rich
+    # takes the room out of the fixed columns from the left, and at 45 columns the
+    # state glyph itself came out blank.
+    who_width = 17 if width >= 60 else 13
+    show_rank = _title_room(width, show_repo, True, who_width) >= 12
+    room = max(6, _title_room(width, show_repo, show_rank, who_width))
+
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=1, no_wrap=True)                     # state
     if show_repo:
         t.add_column(width=11, no_wrap=True)                # repo
-    t.add_column(width=4, justify="right", no_wrap=True)    # ref, if there is one
+    if show_rank:
+        t.add_column(width=4, justify="right", no_wrap=True)  # rank, and who chose it
+    t.add_column(width=6, justify="right", no_wrap=True)    # ref, if there is one
     t.add_column(ratio=1, no_wrap=True)                     # title
-    t.add_column(width=13, justify="right", no_wrap=True)   # holder, or what it waits on
+    t.add_column(width=who_width, justify="right", no_wrap=True)  # holder, or its wait
 
     # Narrowed BEFORE the print limit, not after: this panel does not scroll, and
     # the whole point of a scoped screen is that another repo's items cannot push
     # this one's past PLAN_ROWS and into the "…and N more" line.
-    items, hidden = in_scope(items, scope)
-    ordered = sort_plan(items)
-    running, blocked = plan_counts(items)
-    filler = [""] * (3 if show_repo else 2)
-    for item in ordered[:PLAN_ROWS]:
-        glyph, colour = plan_state(item)
+    items, hidden = in_scope(plan_items(plan), scope)
+    next_id = plan_next_id(plan)
+    filler = [""] * (2 + int(show_repo) + int(show_rank))
+    for item in items[:PLAN_ROWS]:
+        glyph, colour = plan_state(item, next_id)
         who, who_colour = plan_who(item)
+        rank, rank_colour = plan_rank(item)
         repo = short_repo(item.get("repo") or "fleet")
         cells = [Text(glyph, style=colour)]
         if show_repo:
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
+        if show_rank:
+            cells.append(Text(rank, style=rank_colour))
         cells += [
             Text(plan_ref(item), style="bold grey70"),
             # A fleet-wide item names no repo, and with the column gone it would
             # read as one of this project's (qbdata.scope_mark).
-            Text(scope_mark(scope, item.get("repo"))
-                 + clip(item.get("title"), max(12, width - (40 if show_repo else 28))),
+            Text(scope_mark(scope, item.get("repo")) + clip(item.get("title"), room),
                  style="white" if colour != "grey50" else "grey50"),
-            Text(clip(who, 13), style=who_colour),
+            Text(clip(who, who_width), style=who_colour),
         ]
         t.add_row(*cells)
-    if len(ordered) > PLAN_ROWS:
-        t.add_row(*filler, Text(f"…and {len(ordered) - PLAN_ROWS} more", style="grey50"), "")
+    if len(items) > PLAN_ROWS:
+        t.add_row(*filler, Text(f"…and {len(items) - PLAN_ROWS} more", style="grey50"), "")
     if err:
         t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 16), style="red"), "")
     if not items and not err:
         t.add_row(*filler, Text("nothing on the plan", style="grey50"), "")
 
-    head = f"[bold]PLANS[/] [grey50]{len(items)} open"
-    if running:
-        head += f" · [green]{running} running[/]"
-    if blocked:
-        head += f" · {blocked} blocked"
+    # The room the title actually has: the panel's own width, less its border, the
+    # word PLANS, and whatever `elsewhere` is about to add.
+    room = max(20, width - 12 - len(elsewhere(hidden)))
+    head = "[bold]PLANS[/] [grey50]" + " · ".join(
+        f"[{colour}]{text}[/]" if colour else text
+        for text, colour in plan_head_bits(plan, items, hidden, room))
     head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
                  padding=(0, 1))
@@ -490,6 +534,9 @@ def fetch_state(client) -> dict:
     already took.
     """
     data = fetch_board(client)
+    # The whole envelope under "plan", not its `items`: what the board CONCLUDED
+    # about the list — next, how much of the order anybody chose, the counts,
+    # whether this is all of it — is the half the panel could not say before.
     data["plan"], data["plan_err"] = fetch_plan(client)
     return data
 
@@ -539,7 +586,7 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
                     queue),
              panel_agents(data, width, scope),
              panel_claims(data, width, scope),
-             panel_plan(data.get("plan") or [], data.get("plan_err"), width, scope),
+             panel_plan(data.get("plan") or {}, data.get("plan_err"), width, scope),
              panel_prs(gh["prs"], gh["pr_err"], width, scope),
              panel_review_queue(queue, width, scope),
              panel_issues(gh["issues"], held, gh["issue_err"], width, scope)]

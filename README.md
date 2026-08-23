@@ -100,6 +100,15 @@ POST  /lease             { session, device, ttl=300, cwd?, repo?, branch?, title
                           two are read together: `stalled` is what a reader concludes
                           from an old `working`, never something a holder reports.)
 POST  /lease/renew       { lease_id }
+POST  /lease/stage       { session, stage? }            -> {session, stage, changed}
+                         (stage = F0|R1|R1F|R2… — how far along the work is. Reported by
+                          `qb-stage`, the only thing in the system that is TOLD one; the
+                          SHAPE is checked, 1-6 alphanumerics, and never the vocabulary,
+                          so a skill inventing `R4F` needs no server edit. Null clears it.
+                          Rides the lease to /active, /overlap and /fleet, and emits one
+                          `status` post when it CHANGES so the live stream carries the
+                          transition. Null there means nobody said — not `F0`, and not
+                          finished.)
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }
                                                         (record latest blob + release)
@@ -1076,7 +1085,8 @@ A reservation can also outlive the push it was taken for. A hook runs *before* t
 push git then fails to deliver leaves the tag behind, as does a pull request that is
 abandoned. Both cost a skipped release number and nothing else: `check` lists a tag that is
 not on the integration ref as a reservation rather than a defect, because that is also
-exactly what every release in flight looks like.
+exactly what every release in flight looks like — unless the ref declares that release, in
+which case it is not in flight at all. See below.
 
 ### Every release has a tag, and every tag has a release
 
@@ -1107,6 +1117,33 @@ the **record** and not the lock — by the time it runs the merge has happened, 
 number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
+
+#### A tag that is off the ref, and is not a reservation (#406)
+
+For five months that job's name was a claim it did not test. It asked whether a tag of that
+**name** resolved. `v3.8` was squash-merged — the squash discarded the `chore(release)`
+commit the tag had been reserved against — so `refs/tags/v3.8` resolved perfectly to a commit
+that is not in main's history at all, and the job was green. The entry landed correctly and
+was correctly ordered; only the tag was wrong, which is the version of this that nobody
+notices until `git diff v3.7..v3.8` starts comparing main to an off-history commit.
+
+So the job now runs `check` after `backfill`, and `check` asks whether each tag is an
+**ancestor** of the ref — one `git merge-base --is-ancestor` per release. The subtlety is
+that being off the ref is two opposite things wearing one face, and the discriminator is not
+the tag but the CHANGELOG at the ref:
+
+- the ref does **not** declare `vX.Y` — it has not landed, so a tag off the ref is a
+  **reservation**. Listed, never a finding. On the night #406 was filed, `v3.9`, `v3.10` and
+  `v3.12` were all legitimately off main, held by three open pull requests. A check that
+  flagged those would have trained everybody to ignore it.
+- the ref **does** declare `vX.Y` — it has shipped, so its tag must be reachable from the
+  commit that landed it. Off the ref, it is **orphaned**, and the report names the commit it
+  actually landed at and the `--force-with-lease` that re-points it atomically.
+
+Fixing the tag afterwards is a repair, not a policy. The policy half is
+`qb-doctor`'s `merges` row, which fails a repo that allows squash or rebase merges while
+reserving release tags at push time — because the merge that rewrites the commit is the
+thing that made the tag wrong.
 
 The tags are annotated, so writing one means writing an object, and git will not write an
 object without a tagger. `backfill` supplies one itself where the environment cannot name
@@ -1762,6 +1799,9 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.5** — a page that says what every agent is doing, and how much of that is actually known.
 - **v3.6** — two test runs in one worktree stop corrupting each other.
 - **v3.7** — the one judgement in the release mechanism stops being a flag anything can pass.
+- **v3.8** — QUARTERBACK_INSTANCE finally names something.
+- **v3.11** — a deploy that does not fire now retries, and then says so out loud.
+- **v3.12** — the reconciler stops caring what order you work in.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1826,6 +1866,14 @@ workflow's `deploy` job POSTs to a redeploy webhook which pulls the new image. B
 URL and its token are repository secrets (`DEPLOY_WEBHOOK_URL`, `DEPLOY_TOKEN`); leave them unset
 and the deploy job skips, so a fork still builds. Migrations run on boot from the stack
 entrypoint (`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
+
+The webhook is attempted **three times**, 5s and then 10s apart, each capped at 30s (#392). A
+healthy call is milliseconds; the two failures on record took exactly the cap, which is a call
+that got no answer rather than a slow one, so the cap is not the thing to raise. Exhausting all
+three still fails the job — and now says so where somebody is: an `::error` annotation, a run
+summary, and a `stuck` post on the board carrying curl's exit code and its per-phase timings.
+A rollout that did not happen is the one failure that hides behind every other signal being
+green, because the *next* release's deploy pulls the image the skipped one built.
 
 Watch a rollout land with `.info.version` in `/openapi.json`. Note the image only contains
 `pyproject.toml`, `alembic.ini`, `migrations/` and `app/`: a change confined to `.github/` or the
@@ -2184,6 +2232,26 @@ corrected.
 If someone else lands a migration first, `scripts/migration_reconcile.py` relinks yours onto
 the new head. Your revision keeps the id it was born with.
 
+**Merging the base in first is fine.** `preflight` and `apply` are a function of the two refs
+they are given, and that now holds whatever order you work in. If `--branch` names a merge
+commit — which it does whenever you merged `origin/main` to resolve the `CHANGELOG.md`
+conflict before reconciling — the feature side is read off the merge: the parent `--onto`
+already contains is the integration side, so the other one is yours. The plan says which two
+refs it used. When the merge does not answer the question (an octopus merge, two feature
+branches merged together) it says that instead of picking one, and names the explicit
+`--onto`/`--branch` invocation that does work.
+
+`apply` still refuses to rewrite text it never read; it just no longer confuses that with
+commit identity. HEAD may be any commit that contains `--branch`, provided the tree it holds
+is one the two refs account for: every migration at `--branch` byte-for-byte at HEAD, and
+every migration at HEAD byte-for-byte at one of the two refs. Nothing else may be there —
+a third branch's migration that neither ref has would leave the applied tree two-headed while
+the plan that produced it said one. Mode is half of "byte-for-byte", because git stores a
+symlink as a blob holding its target and `apply` writes through one. A conflict resolved
+*inside* a migration file fails all of this and is refused, which is the point. `heads --ref` is unchanged and deliberately does not take a merge apart:
+CI runs it on the merge commit GitHub builds for a pull request precisely to see the
+post-merge graph.
+
 ### Layout
 
 ```
@@ -2203,7 +2271,7 @@ app/          FastAPI service
   api/posts.py     POST /post, GET /board, GET /post/{id}
   api/stream.py    GET /stream (SSE via LISTEN/NOTIFY), event_stream() generator
   api/blobs.py     PUT/GET /blob/{sha} (content-addressed)
-  api/leases.py    POST /lease[/renew,/release], POST /session/end, POST /handoff,
+  api/leases.py    POST /lease[/renew,/stage,/release], POST /session/end, POST /handoff,
                    POST /snapshot,
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap

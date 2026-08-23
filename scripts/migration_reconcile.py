@@ -467,6 +467,10 @@ class Plan:
     duplicate_ids: list[str] = field(default_factory=list)
     guards: dict[str, bool | None] = field(default_factory=_guards)
     warnings: list[str] = field(default_factory=list)
+    #: Set when `--branch` named a merge commit and the feature side was read off it
+    #: rather than taken literally — the plan is a function of two refs, so which two
+    #: it used has to be in the record. See `_branch_side_of_merge`.
+    branch_derivation: str | None = None
 
     @property
     def exit_code(self) -> int:
@@ -1102,10 +1106,7 @@ def revs_at_ref(
     `-z` stops `core.quotePath` C-quoting a non-ASCII filename into a spec that then
     resolves to nothing.
     """
-    listing = _git(
-        repo, "ls-tree", "-r", "--name-only", "-z", "--end-of-options", ref, "--", pathspec
-    )
-    files = [f for f in listing.split("\0") if f.endswith(".py") and Path(f).name != "__init__.py"]
+    files = _versions_files_at(repo, ref, pathspec)
     blobs = _cat_file_batch(repo, [f"{ref}:{f}" for f in files])
     revs = []
     for f in files:
@@ -1122,9 +1123,45 @@ def revs_at_ref(
         )
         raise DuplicateRevisionError(
             f"at {ref}, revision id(s) {dupes} are declared by more than one file "
-            f"({detail}); Alembic cannot load that graph — renumber one of each pair"
+            f"({detail}); Alembic cannot load that graph — renumber one of each pair, or, "
+            "if the files came from two different branches, plan the renumber from those "
+            "refs rather than from the tree that mixes them: "
+            "`preflight --onto <integration ref> --branch <feature ref>`"
         )
     return revs
+
+
+def _versions_files_at(repo: str, ref: str, pathspec: str) -> list[str]:
+    """Migration file paths under `pathspec` at `ref`, in git's order."""
+    listing = _git(
+        repo, "ls-tree", "-r", "--name-only", "-z", "--end-of-options", ref, "--", pathspec
+    )
+    return [f for f in listing.split("\0") if f.endswith(".py") and Path(f).name != "__init__.py"]
+
+
+def _versions_entries_at(repo: str, ref: str, pathspec: str) -> dict[str, tuple[str, str]]:
+    """`{path: (mode, object id)}` for every migration file under `pathspec` at `ref`.
+
+    The MODE is half the identity and not decoration. Git stores a symlink as a blob
+    holding its target, so a regular file whose whole content is `x.py` and a symlink
+    pointing at `x.py` have the same object id: comparing ids alone would call them the
+    same file, and `apply` writes through `Path.write_text`, which follows the link and
+    edits something else. A gitlink or a directory appearing at a migration path is the
+    same class of answer and is kept for the same reason — "not a blob" must not read
+    as "not there".
+    """
+    listing = _git(repo, "ls-tree", "-r", "-z", "--end-of-options", ref, "--", pathspec)
+    out: dict[str, tuple[str, str]] = {}
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        if not path.endswith(".py") or Path(path).name == "__init__.py":
+            continue
+        bits = meta.split()
+        if len(bits) >= 3:
+            out[path] = (bits[0], bits[2])
+    return out
 
 
 def ancestor_ids_of(
@@ -1339,6 +1376,8 @@ def _print_plan(plan: Plan, merged_ok: bool | None, merged_heads: list[str] | No
     print(f"action : {plan.action.upper()}")
     print(f"reason : {plan.reason}")
     print(f"guards : {_format_guards(plan.guards)}")
+    if plan.branch_derivation:
+        print(f"note   : {plan.branch_derivation}")
     if plan.onto_head:
         print(f"integration head : {plan.onto_head}")
     if plan.collisions:
@@ -1390,6 +1429,75 @@ def _resolve(repo: str, ref: str, flag: str) -> str:
         ) from e
 
 
+def _parents_of(repo: str, sha: str) -> tuple[str, ...]:
+    """The commit's parents, in git's own order."""
+    line = _git(repo, "rev-list", "--parents", "-n", "1", "--end-of-options", sha).split()
+    return tuple(line[1:])
+
+
+def _is_ancestor(repo: str, earlier: str, later: str) -> bool:
+    """Does `later` already contain `earlier`? Exit 1 is the answer "no", not a failure."""
+    try:
+        _git(repo, "merge-base", "--is-ancestor", "--end-of-options", earlier, later)
+        return True
+    except GitError as e:
+        if e.returncode == 1:
+            return False
+        raise
+
+
+def _branch_side_of_merge(
+    repo: str, branch_sha: str, onto_sha: str
+) -> tuple[str | None, str | None]:
+    """Which parent of a merge commit is the feature side — `(sha, note)` — or
+    `(None, why not)`.
+
+    A branch that merged the integration ref to resolve a `CHANGELOG.md` conflict has a
+    merge commit at its tip, and its tree holds BOTH sides' migrations. Reading that
+    tree as "the branch" is what made the tool order-dependent (#166): the same repo in
+    the same state planned or refused depending only on whether you had merged yet,
+    because a tree mixing two branches' `0020`s is a graph Alembic cannot load and the
+    duplicate check fires before anything can be planned. The two refs the plan is a
+    function of are still both there — they are the merge's parents.
+
+    Which parent, though, is decided by evidence and not by git's first-parent order.
+    First-parent says which branch the merge was made *on*, and `git merge feature` run
+    on `main` puts the feature side second. What actually identifies the integration
+    side is that `--onto` already contains it. So: exactly one parent contained in
+    `--onto` names the other one as the feature side. Anything else — an octopus merge,
+    two feature branches merged together, a merge already wholly landed — is a question
+    this cannot answer, and it says so instead of picking one.
+    """
+    parents = _parents_of(repo, branch_sha)
+    if len(parents) < 2:
+        return None, None
+    short = branch_sha[:12]
+    if len(parents) > 2:
+        return None, (
+            f"--branch {short} is an octopus merge of {len(parents)} parents, so it does "
+            "not name one feature side; pass --branch explicitly"
+        )
+    contained = [i for i, sha in enumerate(parents) if _is_ancestor(repo, sha, onto_sha)]
+    if not contained:
+        return None, (
+            f"--branch {short} is a merge and --onto contains neither parent "
+            f"({parents[0][:12]}, {parents[1][:12]}), so which side is the feature cannot "
+            "be told from here; pass --branch explicitly"
+        )
+    if len(contained) == 2:
+        return None, (
+            f"--branch {short} is a merge and --onto already contains both parents, so "
+            "there is no unlanded feature side to read off it"
+        )
+    integration = parents[contained[0]]
+    feature = parents[1 - contained[0]]
+    return feature, (
+        f"--branch {short} is a merge; --onto already contains parent "
+        f"{integration[:12]}, so the feature side is {feature[:12]} and the plan is "
+        "computed from that rather than from the tree that mixes both"
+    )
+
+
 def _plan_for(args: argparse.Namespace) -> tuple[Plan, list[Rev], list[Rev]]:
     """Both refs are resolved to commit shas ONCE and everything reads those.
 
@@ -1400,12 +1508,26 @@ def _plan_for(args: argparse.Namespace) -> tuple[Plan, list[Rev], list[Rev]]:
     """
     onto_sha = _resolve(args.repo, args.onto, "--onto")
     branch_sha = _resolve(args.repo, args.branch, "--branch")
+    # A merge commit is not a feature side, it is two of them in one tree. Read the
+    # feature side off it when the merge says which one it is, and carry the note
+    # either way — including when it cannot say, because "I cannot tell which of these
+    # two is your branch" is an answer and picking one silently is not (#166).
+    derived, derivation = _branch_side_of_merge(args.repo, branch_sha, onto_sha)
+    if derived:
+        branch_sha = derived
     skipped: list[str] = []
     onto_revs = revs_at_ref(args.repo, onto_sha, args.versions_path, skipped)
-    branch_revs = revs_at_ref(args.repo, branch_sha, args.versions_path, skipped)
+    try:
+        branch_revs = revs_at_ref(args.repo, branch_sha, args.versions_path, skipped)
+    except DuplicateRevisionError as e:
+        # The tool could not read the branch side as a graph, and when the reason is a
+        # merge it could not take apart, saying so beats "renumber one of each pair" —
+        # which reads as an instruction to do by hand the thing this tool exists to do.
+        raise DuplicateRevisionError(f"{e}. {derivation}" if derivation else str(e)) from e
     ancestors = ancestor_ids_of(args.repo, onto_sha, branch_sha, args.versions_path)
     plan = reconcile(onto_revs, branch_revs, ancestors)
     plan.onto_sha, plan.branch_sha = onto_sha, branch_sha
+    plan.branch_derivation = derivation
     plan.warnings.extend(
         f"{f} is under {args.versions_path} and carries no migration metadata, so it "
         "is not part of the graph"
@@ -1453,6 +1575,7 @@ def _reject(plan: Plan, reason: str) -> Plan:
         duplicate_ids=list(plan.duplicate_ids),
         guards=dict(plan.guards),
         warnings=list(plan.warnings),
+        branch_derivation=plan.branch_derivation,
     )
 
 
@@ -1477,18 +1600,75 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return plan.exit_code
 
 
+def _head_moved_past_branch(args: argparse.Namespace, plan: Plan, head_sha: str) -> str | None:
+    """Why HEAD being a different commit from `--branch` is fatal here, or None.
+
+    The rule used to be commit identity, and identity is not the property that matters.
+    Merging the integration ref into your branch — which is what you are there to do
+    when `CHANGELOG.md` conflicts — moves HEAD past `--branch` without touching a
+    single migration, and the tool answered the same question two ways depending only
+    on whether you had merged yet: a plan from `preflight`, a refusal from `apply`, and
+    a refusal naming the one recovery that cannot work, since checking out the
+    pre-merge commit discards the resolution the merge carries (#166).
+
+    What `apply` actually needs is that the tree it edits is the tree the plan
+    describes. The plan is a function of two refs, so that is exactly checkable, and it
+    is checked as content rather than as history — every migration at `--branch` must
+    be byte-for-byte at HEAD, and every migration at HEAD must be byte-for-byte at one
+    of the two refs. Nothing else is allowed to be there.
+
+    Checking only the files the rewrite touches is not enough, and the case is
+    ordinary rather than exotic: HEAD picks up `0090` from a third branch, the plan
+    renumbers `0018 -> 0019` against refs that never saw it, every touched blob still
+    matches, and the apply leaves a tree with two heads while the plan that produced it
+    said one. A resolution whose result is not the resolution that was blessed is the
+    reassuring wrong answer this tool exists to refuse.
+    """
+    branch_sha = plan.branch_sha or "?"
+    if not _is_ancestor(args.repo, branch_sha, head_sha):
+        return (
+            f"apply edits the working tree (HEAD {head_sha[:12]}), and HEAD does not "
+            f"contain --branch {args.branch} ({branch_sha[:12]}), so the plan was computed "
+            "from content that is not on disk. Check out that branch first, then re-run "
+            "apply."
+        )
+    at_head = _versions_entries_at(args.repo, head_sha, args.versions_path)
+    at_branch = _versions_entries_at(args.repo, branch_sha, args.versions_path)
+    at_onto = _versions_entries_at(args.repo, plan.onto_sha or branch_sha, args.versions_path)
+
+    diverged = sorted(f for f, entry in at_branch.items() if at_head.get(f) != entry)
+    if diverged:
+        return (
+            f"HEAD ({head_sha[:12]}) contains --branch ({branch_sha[:12]}) but its copy of "
+            f"{diverged} differs, so the plan describes text that is not on disk — which is "
+            "what resolving a conflict inside a migration file leaves behind. Nothing here "
+            "can guess which version you meant: read those files, then re-run preflight "
+            "against refs that carry the text you want reconciled."
+        )
+    unaccounted = sorted(
+        f for f, entry in at_head.items() if entry not in (at_branch.get(f), at_onto.get(f))
+    )
+    if unaccounted:
+        return (
+            f"HEAD ({head_sha[:12]}) carries {unaccounted}, which is at neither --onto "
+            f"({(plan.onto_sha or '?')[:12]}) nor --branch ({branch_sha[:12]}), so the plan "
+            "was computed without them and cannot say what the tree becomes once it is "
+            "applied. Re-run preflight against refs that account for the tree you are in."
+        )
+    return None
+
+
 def _refuse_apply(args: argparse.Namespace, plan: Plan) -> str | None:
     """Why `apply` must not write, or None. Every check is about the gap between the
     git *blobs* the plan was computed from and the *working tree* it rewrites."""
     # `apply` edits the working tree, which reflects the checked-out HEAD. If --branch
-    # names a different commit, the plan was computed from content that is not on disk.
+    # names a different commit, the plan may have been computed from content that is
+    # not on disk — `_head_moved_past_branch` is where "may have been" is settled.
     head_sha = _rev_parse(args.repo, "HEAD")
     if plan.branch_sha != head_sha:
-        return (
-            f"apply edits the working tree (HEAD {head_sha[:12]}), but --branch "
-            f"{args.branch} is {(plan.branch_sha or '?')[:12]}. Check out that branch "
-            "first, then re-run apply."
-        )
+        moved = _head_moved_past_branch(args, plan, head_sha)
+        if moved:
+            return moved
     # Equal shas do not mean equal content. An uncommitted edit, a new unstaged
     # migration, a half-staged rename or an untracked file sitting on a destination
     # path all mean the rewrite operates on text the plan never saw — in the worst
