@@ -7,8 +7,8 @@
   qb-bump --apply --dry-run     print that command rather than running it
 
   0  nothing to carry — the harness on PATH is this checkout's
-  1  cannot tell — not in a quarterback checkout, no qb-doctor, no nix, no
-     consuming flake, or more than one
+  1  cannot tell — not in a quarterback checkout, a harness row that is neither
+     ok nor fail, no qb-doctor, no nix, no consuming flake, or more than one
   2  a bump is prepared and BUILT, and one command by a person finishes it
   3  nothing to apply — no prepared bump, a moved tree, no terminal, or a bad flag
   4  the bump does not build — refused to propose it
@@ -317,10 +317,11 @@ def resolve_repo(repo_arg: str | None, cfg: dict[str, str]) -> tuple[Checkout | 
         where = as_path(declared)
         root = quarterback_checkout(where) if where else None
         if root is None:
-            return None, (f"QUARTERBACK_REPO names {declared}, which is not a quarterback "
-                          "checkout — no harness/bin in it — and the working directory "
-                          f"({cwd}) is not one either, so this cannot tell whether the "
-                          "harness on PATH is stale")
+            return None, (f"cannot tell: QUARTERBACK_REPO names {declared}, which is not a "
+                          "quarterback checkout — no harness/bin in it — and the working "
+                          f"directory ({cwd}) is not one either, so there is nothing here to "
+                          "compare the harness on PATH against. Run it from a checkout or "
+                          "pass --repo DIR")
         return Checkout(root, "declared by QUARTERBACK_REPO"), ""
 
     return None, (f"cannot tell: {cwd} is not a quarterback checkout, and nothing declares "
@@ -347,6 +348,20 @@ class Drift:
     @property
     def stale(self) -> bool:
         return self.verdict == "fail"
+
+    @property
+    def current(self) -> bool:
+        """`ok` and only `ok`, which is not the same as "not `fail`".
+
+        Found by Codex on #414's own branch, one function away from the bug being
+        fixed there and the identical category error: `not stale` used to mean
+        "nothing to carry", so a `harness` row of `unknown` — "no harness on PATH
+        (create-worktree not found), so nothing to compare this checkout against",
+        which is a machine with NO harness on it at all — came back as exit 0 and
+        an all-clear. A box that has never had the harness installed is the most
+        carrying-needed state there is.
+        """
+        return self.verdict == "ok"
 
 
 def doctor_path(script: str) -> str | None:
@@ -1010,6 +1025,7 @@ def render_proposal(proposal: Proposal, drift: Drift, checkout: Checkout,
     lines = [
         f"stale: {drift.detail}",
         "",
+        f"harness    {drift.subject or 'the one on PATH'}",
         f"checkout   {checkout.path} ({checkout.found_by})",
         f"consumer   {consumer.flake} ({consumer.found_by})",
         f"input      {proposal.input}",
@@ -1080,10 +1096,17 @@ def main(argv: list[str] | None = None) -> int:
     if drift is None:
         return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
     out["drift"] = {"verdict": drift.verdict, "detail": drift.detail,
-                    "missing": drift.missing, "differ": drift.differ}
-    if not drift.stale:
+                    "subject": drift.subject, "missing": drift.missing, "differ": drift.differ}
+    installed = f"{drift.subject}, " if drift.subject else ""
+    if drift.current:
         return report(args, {**out, "outcome": "current",
-                             "detail": f"nothing to carry: {drift.detail} ({against})"}, 0)
+                             "detail": f"nothing to carry: {drift.detail} "
+                                       f"({installed}{against})"}, 0)
+    if not drift.stale:
+        return report(args, {**out, "outcome": "unknown",
+                             "detail": f"cannot tell: qb-doctor's harness row is "
+                                       f"{drift.verdict}, not ok — {drift.detail} "
+                                       f"({installed}{against})"}, 1)
 
     if not have_nix():
         return report(args, {**out, "outcome": "unknown",

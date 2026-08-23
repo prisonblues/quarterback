@@ -882,3 +882,51 @@ def test_the_no_op_names_the_checkout_it_compared(tmp_path, quarterback_repo, ca
     said = capsys.readouterr().out
     assert "nothing to carry" in said
     assert f"compared against {quarterback_repo} (named by --repo)" in said
+
+
+NO_HARNESS = {"checks": [{"name": "harness", "subject": "-", "verdict": "unknown",
+                          "detail": "no harness on PATH (create-worktree not found), so "
+                                    "nothing to compare this checkout against", "extra": {}}]}
+
+
+def test_a_harness_row_that_is_not_ok_is_not_an_all_clear(tmp_path, quarterback_repo, capsys,
+                                                          monkeypatch):
+    """Found by Codex on this branch, one function from #414 and the same mistake: "nothing to
+    carry" used to mean `not fail`, so a row of `unknown` — a machine with no harness on PATH
+    AT ALL, which is the most carrying-needed state there is — came back as exit 0."""
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, NO_HARNESS))
+    assert qb.main(["--repo", str(quarterback_repo), "--json", "--no-announce"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["outcome"] == "unknown"
+    assert out["detail"].startswith("cannot tell") and "unknown, not ok" in out["detail"]
+    assert out["drift"]["verdict"] == "unknown"
+
+
+def test_only_ok_and_fail_are_answers_and_a_warn_is_neither(tmp_path, quarterback_repo,
+                                                            monkeypatch):
+    warned = {"checks": [{"name": "harness", "subject": "/nix/store/x/bin", "verdict": "warn",
+                          "detail": "something the doctor is not sure about", "extra": {}}]}
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, warned))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
+
+
+def test_the_no_op_names_the_installed_harness_as_well_as_the_checkout(tmp_path,
+                                                                      quarterback_repo,
+                                                                      capsys, monkeypatch):
+    """A comparison has two sides, and the one that is actually in doubt is which `bin/` PATH
+    resolved to. `qb-doctor` already reports it as the row's subject; this stops dropping it."""
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, CURRENT))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    assert "/nix/store/x/bin, compared against" in capsys.readouterr().out
+
+
+def test_the_environment_beats_the_site_config_for_the_declared_checkout(tmp_path,
+                                                                        quarterback_repo,
+                                                                        monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QUARTERBACK_REPO", str(quarterback_repo))
+    checkout, why = qb.resolve_repo(None, {"QUARTERBACK_REPO": str(tmp_path / "from-the-file")})
+    assert why == "" and checkout.path.resolve() == quarterback_repo.resolve()

@@ -2145,8 +2145,9 @@ qb-bump --apply             # what a PERSON runs: install the prepared lock and 
 qb-bump --apply --dry-run   # print that command rather than running it
 
 #   exit 0  nothing to carry — the harness on PATH is this checkout's
-#   exit 1  cannot tell — not in a quarterback checkout, no qb-doctor, no nix,
-#           no consuming flake, or more than one
+#   exit 1  cannot tell — not in a quarterback checkout, a harness row that is
+#           neither ok nor fail, no qb-doctor, no nix, no consuming flake, or
+#           more than one
 #   exit 2  a bump is prepared and BUILT; one command by a person finishes it
 #   exit 4  the bump does not build — refused to propose it
 ```
@@ -2189,12 +2190,21 @@ repo. `qb-bump` asks three questions in order, and **refuses** if none of them a
    used and named, so running it from `harness/tests` means the same thing as running it from
    the top.
 3. `$QUARTERBACK_REPO`, then `QUARTERBACK_REPO` in `~/.config/quarterback/config` — the key
-   `qb-env` writes and `qb-mcp` and `qb-doctor` already read. Declaring it once is what makes
-   `qb-bump` answer correctly from anywhere on the box.
+   `qb-env` writes, `qb-mcp` execs its venv out of, and `qb-doctor` reads as the *client*
+   checkout. On this fleet all three are the same directory; the one this needs is the one with
+   a `harness/bin` in it, and if what the key names has no `harness/bin`, that is said rather
+   than worked around. Declaring it once is what makes `qb-bump` answer correctly from anywhere
+   on the box.
 
 "A checkout" means a git repository with a `harness/bin` in it, because `harness/bin` is
 literally what is being compared. A `--repo` or a `QUARTERBACK_REPO` that names something
 else is treated as a typo and refused rather than fallen back from.
+
+**A `harness` row that is not `ok` is not an all-clear either.** The verdict is `qb-doctor`'s,
+and only `ok` means there is nothing to carry: `fail` prepares a bump, and anything else — the
+`unknown` that means "no harness on PATH (`create-worktree` not found), so nothing to compare
+this checkout against", which is a machine with no harness on it at all — is `cannot tell`. That
+one was found by Codex reviewing the fix below, one function away from it and the same mistake.
 
 **With none of the three it says `cannot tell`, and that is the whole of #414.** It used to
 resolve the checkout from the working directory and say so nowhere, so run from
@@ -2283,6 +2293,7 @@ still an escalation.
 stale: behind this checkout: 5 absent (check-db-isolation, qb-admit, qb-release, qb-start,
        +1 more), 5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)
 
+harness    /nix/store/…-quarterback-harness-0.1.0/bin
 checkout   /home/rich/source/quarterback (the working directory)
 consumer   /home/rich/source/nix-fleet (found by scanning /home/rich/source)
 input      quarterback
