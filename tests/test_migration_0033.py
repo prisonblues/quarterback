@@ -40,6 +40,8 @@ import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
 
+from . import dbrun
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: One repository, spelt the two ways two checkouts spell it, plus one whose case
@@ -176,7 +178,11 @@ async def _scratch(name: str):
     sa_url = base.set(database=db).render_as_string(hide_password=False)
     dsn = base.set(drivername="postgresql", database=db).render_as_string(
         hide_password=False)
-    admin_dsn = base.set(drivername="postgresql").render_as_string(hide_password=False)
+    # The maintenance database, not the bound one: this connection creates and
+    # drops the scratch database below, and since #366 the bound database is
+    # this run's own — which a run that collects only these modules never
+    # builds, because nothing here asks for the schema fixture.
+    admin_dsn = dbrun.admin_dsn(os.environ["DATABASE_URL"])
     admin = await asyncpg.connect(admin_dsn)
     try:
         # FORCE, because a half-finished earlier run may still hold a session on it
@@ -198,7 +204,7 @@ async def _drop(admin_dsn: str, db: str) -> None:
 
 
 @pytest.fixture(scope="module")
-async def migrated():
+async def migrated(_db_claim):
     """Seed two spellings at 0032, upgrade, then ask what the board holds."""
     sa_url, dsn, admin_dsn, db = await _scratch("m0033")
     try:

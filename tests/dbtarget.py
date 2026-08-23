@@ -1,8 +1,11 @@
 """Which database the suite is allowed to point its destructive rebuild at.
 
-The session fixture rebuilds the schema with ``alembic downgrade base && upgrade
-head``. That destroys every row in the target database, so *which* database the
-target is has to be decided deliberately rather than inherited by accident.
+The session fixture builds the schema with ``alembic upgrade head``, into a
+database of its own named after the run (``tests/dbrun.py``, #366). That name is
+derived from the one resolved here, and the derivation is what the guard is
+guarding: a checkout that resolves to another checkout's database has a ``.env``
+that is wrong about which server and which data it owns, whatever the suite then
+goes on to build under that name.
 
 The accident this exists to prevent: ``create-worktree`` gives a worktree its own
 database and writes the name into the worktree's ``.env`` — but pydantic-settings

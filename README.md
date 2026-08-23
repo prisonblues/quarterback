@@ -1746,6 +1746,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.3** — the landing procedure now says what goes wrong, not only what to decide.
 - **v3.4** — a PR body saying "this does not close #N" no longer closes #N.
 - **v3.5** — a page that says what every agent is doing, and how much of that is actually known.
+- **v3.6** — two test runs in one worktree stop corrupting each other.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -1967,11 +1968,16 @@ docker compose up -d postgres
 .venv/bin/alembic upgrade head
 .venv/bin/uvicorn app.main:app --reload
 
-# Tests. The database-backed ones need the postgres container up; the suite
-# rebuilds the schema, so it DESTROYS every row in its target database. The
-# first line of every run — `-q` included — names that database. It is this
-# checkout's .env, or DATABASE_URL=… to pin another.
+# Tests. The database-backed ones need the postgres container up. Every run
+# BUILDS ITS OWN database — `<base>_r<pid>`, created empty and dropped when the
+# run ends — so two runs at once in one checkout cannot touch each other's rows.
+# The first line of every run, `-q` included, names it. The base it is derived
+# from is this checkout's .env, or DATABASE_URL=… to pin another.
 .venv/bin/pytest -q
+
+# Keep the database a run built, to look at what it left. Still per run, so
+# nothing reuses it; the next run reaps it once this pid is gone.
+QB_TEST_DB_KEEP=1 .venv/bin/pytest -q
 
 # The guard deciding which database that may be, and the rest of the pure unit
 # tests, need no Postgres at all:
@@ -1992,6 +1998,52 @@ QUARTERBACK_TOKEN=… QUARTERBACK_BASE_URL=http://localhost:8000 \
 uv run --extra dev --extra tui pytest -q
 ```
 
+### Two test runs at once (#366)
+
+**Every run gets its own database, so there is nothing to coordinate.** The suite builds its
+schema from empty, which is why the answer had to be one of those two: a landing agent ran a
+targeted suite beside a full one in the same worktree, and the full one reported **118
+failures** on a merged PR. It re-ran alone and passed. The failures were never real.
+
+That is the dangerous shape of failure, and it is worth naming precisely. The victim run does
+not stop when its tables go: it keeps going against whatever the other run just built and
+reports a scattered handful of impossible-looking failures — `relation "posts" does not
+exist`, a row it committed a line ago missing, `assert 0 == 1` — in whichever modules happened
+to be executing. They **move around between runs**, so they read as flakiness or as the
+branch's fault, and the honest response, re-running, makes them disappear and confirms the
+wrong conclusion.
+
+PR #30 gave every worktree its own database and closed the cross-checkout case. It could not
+close two runs inside one worktree, which is what a landing agent does by default.
+
+So the name carries the run: **`<base>_r<pid>`**, created empty, migrated to head, dropped at
+the end. `tests/dbrun.py` composes it; `tests/dbtarget.py` still decides what the base may be.
+Three consequences worth knowing:
+
+- **Nothing waits.** lexray met this bug first (its #1418) and answered it with a claim, so
+  runs queued — correct, and then it stopped their work, because a claim is held for a whole
+  session and a 2.6s test spent 54.5s waiting out a full suite. Per-run databases were where
+  they ended up; quarterback already had per-worktree ones, so it was the shorter step.
+- **The migration suites came along for free.** `tests/test_migration_*.py` derive their own
+  scratch databases by suffixing whatever the run is bound to and `DROP … WITH (FORCE)` them,
+  which kills every connection on them. Those names were per checkout too. They are per run
+  now without those modules choosing to be.
+- **A collision is a refusal that names the other run.** Two runs can only compute one name if
+  a pid was reused or two machines share the server, and a run takes a PostgreSQL advisory
+  lock on its database before it touches it. One that cannot stops the session with the
+  holding backend's pid, `application_name` and connect time — never a scattered set of
+  impossible failures. That is the whole point: the symptom had to stop pointing away from its
+  cause.
+
+Databases do not accumulate: the run id is a pid, so each run drops any of **this checkout's**
+run databases whose process is gone. It leaves a database alone unless the name is one this
+checkout composes, the database comment says the suite created it, **and** its claim is free —
+dropping one out from under a live suite is far worse than leaving one behind. Another
+checkout's leftovers are another agent's to reap.
+
+`QB_TEST_DB_KEEP=1` keeps a run's database for inspection. `QB_TEST_RUN_ID=<digits>` names the
+run id in advance, which is how the refusal above is tested.
+
 ### Database migrations
 
 Five rules. Three are enforced — by `test_migrations_self_contained.py`,
@@ -2006,9 +2058,10 @@ fails, fix the migration.
 
 **Dev and test databases are disposable.** They are rebuilt by running the migrations
 forward, never by stamping past a failure. The suite already treats them that way — the
-schema fixture is `alembic downgrade base && alembic upgrade head`, and `create-worktree`
-gives each worktree its own copy precisely so throwing one away costs nothing. A worktree
-whose database is wedged is a `remove-worktree`/`create-worktree` away from correct.
+schema fixture creates the run's database empty and runs `alembic upgrade head` into it, and
+`create-worktree` gives each worktree its own copy precisely so throwing one away costs
+nothing. A worktree whose database is wedged is a `remove-worktree`/`create-worktree` away
+from correct.
 
 **A migration must not import live application code.** A migration is a frozen artefact
 running at a fixed point in schema history; `app/` is whatever the package says today. The

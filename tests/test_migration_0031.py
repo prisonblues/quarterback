@@ -35,6 +35,8 @@ import asyncpg
 import pytest
 from sqlalchemy.engine import make_url
 
+from . import dbrun
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: The two rows, copied from the live plan as #323 quotes them. The ids are the
@@ -90,7 +92,11 @@ async def _scratch(name: str):
     sa_url = base.set(database=db).render_as_string(hide_password=False)
     dsn = base.set(drivername="postgresql", database=db).render_as_string(
         hide_password=False)
-    admin_dsn = base.set(drivername="postgresql").render_as_string(hide_password=False)
+    # The maintenance database, not the bound one: this connection creates and
+    # drops the scratch database below, and since #366 the bound database is
+    # this run's own — which a run that collects only these modules never
+    # builds, because nothing here asks for the schema fixture.
+    admin_dsn = dbrun.admin_dsn(os.environ["DATABASE_URL"])
     admin = await asyncpg.connect(admin_dsn)
     try:
         # FORCE, because a half-finished earlier run may still hold a session on it
@@ -112,7 +118,7 @@ async def _drop(admin_dsn: str, db: str) -> None:
 
 
 @pytest.fixture(scope="module")
-async def snapshots():
+async def snapshots(_db_claim):
     """Seed the live rows at 0030, upgrade, snapshot, downgrade, snapshot again."""
     sa_url, dsn, admin_dsn, db = await _scratch("m0031")
     try:
@@ -235,7 +241,7 @@ def test_the_downgrade_leaves_the_database_as_it_found_it(snapshots):
     ("../etc/passwd", "a path is not a scope"),
     ("a" * 80, "past what a scope name may carry"),
 ])
-async def test_a_legacy_scope_it_cannot_resolve_stops_the_migration(scope, because):
+async def test_a_legacy_scope_it_cannot_resolve_stops_the_migration(scope, because, _db_claim):
     """It raises rather than minting `project:<whatever that was>`.
 
     There is no rule separating "a name somebody meant" from "something that went
@@ -259,7 +265,7 @@ async def test_a_legacy_scope_it_cannot_resolve_stops_the_migration(scope, becau
         await _drop(admin_dsn, db)
 
 
-async def test_two_scopes_that_would_fold_into_one_stop_the_migration():
+async def test_two_scopes_that_would_fold_into_one_stop_the_migration(_db_claim):
     """`65lowther` and `65Lowther` are one scope in the new namespace and were two
     lists in the old one, each with its own 1..n ranks. Merging them would
     interleave two orders nobody has ever compared — the failure `_scope_items`
