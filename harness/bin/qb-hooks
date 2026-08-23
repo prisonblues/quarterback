@@ -15,9 +15,9 @@ set -uo pipefail
 # just the harness's own scripts.
 #
 # A `pre-push` hook that refuses a multi-head migration graph on a protected
-# branch, a branch that has stamped a release number the base already carries
-# (issue #343), and a branch that has rewritten or deleted a release entry that
-# already shipped (issue #325). All three are silent in a repo the check does not
+# branch, a branch that has edited a file the release job generates (issue #122),
+# and a branch that has rewritten or deleted a release entry that already shipped
+# (issue #325). All three are silent in a repo the check does not
 # apply to — no migrations, no CHANGELOG, no reconciler — because this installs
 # into repos that are neither quarterback nor lexray, and a warning nobody there
 # can act on is how the whole thing gets uninstalled. See
@@ -145,9 +145,9 @@ do_install() {
     echo -e "  ${GREEN}stash guard installed${NC} — 'git stash' in this repo now refuses to"
     echo "  write the shared refs/stash while linked worktrees exist. Use 'qb-stash'."
     echo -e "  ${GREEN}pre-push guard installed${NC} — a push is refused when it would leave a"
-    echo "  protected branch multi-headed in migrations, when the branch has stamped a"
-    echo "  release number the base already carries, or when it rewrites the text of a"
-    echo "  release that already shipped. Silent where none of those applies."
+    echo "  protected branch multi-headed in migrations, when the branch edits a file the"
+    echo "  release job generates (CHANGELOG.md, the README's release list), or when it"
+    echo "  rewrites the text of a release that already shipped. Silent where none applies."
     if [[ "$exported" -gt 0 ]]; then
         echo "  ($exported managed hook(s) re-exported from $delegate)"
     fi
@@ -174,8 +174,8 @@ do_status() {
     # has been switched off cannot look like one where it is quietly passing. That is the
     # whole difference between an escape hatch and a hole.
     local knob off
-    for knob in qb.prePush.migrationHeads qb.prePush.releaseNumber \
-               qb.prePush.releaseBodies qb.prePush.reserveRelease; do
+    for knob in qb.prePush.migrationHeads qb.prePush.generatedFiles \
+               qb.prePush.releaseBodies; do
         off=$(git -C "$repo" config --bool --get "$knob" 2>/dev/null) || off=""
         if [[ "$off" == "false" ]]; then
             echo -e "           ${YELLOW}$knob is off${NC} for this repo"

@@ -1,0 +1,119 @@
+name: Cut a release
+
+# The one place a version number is written, and the whole of "nobody stamps anywhere".
+#
+# A branch writes `changelog.d/<issue>.<kind>.md` and names no version. This assembles every
+# fragment on `main` into one numbered entry, against the commit that actually exists, and
+# tags it. Once per batch, not once per pull request — a release IS everything since the last
+# one, so six fragments from six merges become one release rather than six.
+#
+# DELIBERATELY `workflow_dispatch` AND NOT `push`. A release is a decision about when a batch
+# is done: it needs a title somebody wrote, and sometimes it needs `--major`, and neither is
+# something a merge can answer. Firing on every push to main would cut a release per PR and
+# put the title back on a branch, which is the affordance #122 exists to remove. The board
+# accumulated six fragments over one night and they are one release, not six.
+#
+# WHY IT CAN RUN HERE AT ALL, when `release.py run` refuses everywhere but `main`: this
+# checkout IS `main`, clean, and level with the remote by construction — those are exactly
+# the three conditions the tool checks, and it checks them here too rather than trusting the
+# runner. It can equally be run at a keyboard (`scripts/release.py run --title "…"`), which is
+# the path `--major` normally takes, and the two are the same command with the same refusals.
+#
+# #406 CANNOT RECUR HERE. The tag names the commit this job creates on `main`. There is no
+# branch-side `chore(release)` commit for a squash merge to discard, so there is no way to
+# leave a tag pointing at history nobody can reach.
+#
+# ONE THING THIS DOES NOT GET, said here rather than left to be discovered: a push made with
+# `GITHUB_TOKEN` does not trigger other workflows, so the `Tests` run and the board
+# announcement that normally follow a push to `main` do not fire for the release commit. What
+# that commit contains is `CHANGELOG.md`, `README.md`'s release list and — when the release
+# touched `app/` — two version literals, none of which any suite asserts about beyond the
+# checks `release.py run` makes itself before it writes. Run it at a keyboard instead if you
+# want the full suite over it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      title:
+        description: "The release heading — what this release does, in one line"
+        required: true
+        type: string
+      major:
+        # Not a checkbox, and that is the whole of #386. `y` answers "did you mean to tick
+        # the box", and the box was never the mistake — the mistake was a version sequence
+        # that read correctly in a prompt, which is how this repo went from v2.99 to v3
+        # instead of v2.100. What has to be taken in is `v4, NOT v3.13`, and the only way to
+        # be sure that sentence was read is to make the answer repeat the half being chosen.
+        # `release.py run` refuses unless this matches the number it would issue.
+        description: "Type the MAJOR version to issue it (e.g. v4). Leave blank for the next minor."
+        required: false
+        default: ""
+        type: string
+      serve:
+        description: "Served version: infer (default), force, or skip"
+        required: false
+        default: infer
+        type: choice
+        options: [infer, force, skip]
+      dry_run:
+        description: "Preview only — write nothing, commit nothing, tag nothing"
+        required: false
+        default: false
+        type: boolean
+
+# Job-scoped rather than widened at the top of the file: this job pushes a commit and a tag
+# to `main`, and nothing else in this repository's workflows needs write access.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: assemble, number, tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # `fetch-depth: 0` and `fetch-tags` are both load-bearing. The number is one past the
+      # highest `## vX.Y` heading folded with the highest release TAG, and the served-version
+      # inference diffs against the previous release's tag — a shallow checkout has neither,
+      # and would issue a number somebody already has.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Name the commit this job makes
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Cut it
+        # Every input through the environment, never interpolated into the script body: a
+        # `${{ inputs.title }}` spliced into a command line is whoever dispatched the workflow
+        # running shell on this runner. As env vars they are data.
+        env:
+          TITLE: ${{ inputs.title }}
+          MAJOR: ${{ inputs.major }}
+          SERVE: ${{ inputs.serve }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # `if` blocks rather than `[[ … ]] && …`: under `set -e` a short-circuited `&&`
+          # returns 1 and takes the whole step down, so the blank-`major` path — the normal
+          # one — would fail before running anything.
+          args=(--title "$TITLE")
+          if [[ -n "$MAJOR" ]]; then args+=(--major); fi
+          case "$SERVE" in
+            force) args+=(--serve) ;;
+            skip)  args+=(--no-serve) ;;
+          esac
+          # `preview` is not gated on `--major` and takes no confirmation: asking what a
+          # release would be decides nothing, and its `(--major, NOT v3.13)` line is the
+          # sentence that makes a slip visible before anybody commits to it.
+          if [[ "$DRY_RUN" == "true" ]]; then
+            python3 scripts/release.py preview "${args[@]}"
+            exit 0
+          fi
+          if [[ -n "$MAJOR" ]]; then args+=(--major-confirm "$MAJOR"); fi
+          python3 scripts/release.py run "${args[@]}"

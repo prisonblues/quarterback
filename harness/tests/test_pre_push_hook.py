@@ -12,9 +12,10 @@ The scenarios are the ones from #343, stated as the failures they are:
     migration `0029` on 2026-08-22, each ran `preflight`, and each got a truthful answer.
     It reached CI as "Multiple head revisions are present". This is the push that should
     have stopped.
-  * `test_a_branch_that_stamped_a_number_the_base_has_taken_is_refused` — the #287 case: a
-    branch took v2.60 while it sat, main took v2.60 meanwhile, and the collision hit four
-    files. The `stamped` CI job cannot ask this question, because it runs on main only.
+  * `test_a_branch_that_writes_a_release_entry_is_refused` — the #122 case: three of six
+    open pull requests each wrote an entry at the top of `CHANGELOG.md` on the same night,
+    so each conflicted with both others over nothing. A CI job cannot stop a push, and this
+    is the push that should have stopped.
   * `test_a_branch_that_is_merely_behind_is_not_refused` — the reason the check above is
     fork-relative and not base-relative. A guard that fires on every branch that forked a
     while ago is a guard that gets switched off, and this is the test that says so.
@@ -176,7 +177,7 @@ def repo(tmp_path, home):
     write_migration(work, "0001", None)
     write_migration(work, "0002", "0001")
     (work / "CHANGELOG.md").write_text(CHANGELOG_V1)
-    ship_tools(work, "migration_reconcile.py", "release_stamp.py", "release_tag.py")
+    ship_tools(work, "migration_reconcile.py", "release.py", "release_tag.py")
     commit(work, "initial", home)
     git(work, "remote", "add", "origin", str(bare), home=home)
     install(work, home)
@@ -424,7 +425,7 @@ def test_deleting_a_branch_is_not_guarded(repo, home):
 
 
 # ---------------------------------------------------------------------------
-# 2. the release number
+# 2. the files the release job generates
 # ---------------------------------------------------------------------------
 
 
@@ -441,39 +442,50 @@ def advance_main_to_v2(repo: Path, home: Path) -> None:
     assert r.returncode == 0, r.stderr
 
 
-def test_a_branch_that_stamped_a_number_the_base_has_taken_is_refused(repo, home):
-    """#287, exactly. The branch forked when v1 was the top of the file and stamped v2;
-    main took v2 for something else while it sat. Both entries are right and both belong —
-    but one number cannot describe two releases, and the merge would not conflict on it."""
-    fork_at_first_commit(repo, home, "pre-stamped")
-    advance_main_to_v2(repo, home)
-
-    git(repo, "switch", "-q", "pre-stamped", home=home)
+def test_a_branch_that_writes_a_release_entry_is_refused(repo, home):
+    """The push that should have stopped on 2026-08-23. Three of six open pull requests each
+    wrote an entry at the top of the same file, so each conflicted with both others over
+    nothing — both entries right, both belonging, and git unable to know that two insertions
+    at one offset are independent (#122)."""
+    fork_at_first_commit(repo, home, "writes-the-changelog")
     (repo / "CHANGELOG.md").write_text(
         CHANGELOG_V1.replace(
             "## v1 — the first one",
-            "## v2 — what this branch shipped\n\nSomething else entirely.\n\n## v1 — the first one",
+            "## v2 — what this branch shipped\n\nSomething else entirely.\n\n"
+            "## v1 — the first one",
         )
     )
-    commit(repo, "stamp v2 on the branch", home)
+    commit(repo, "a release entry on a branch", home)
 
-    r = push(repo, home, "pre-stamped")
+    r = push(repo, home, "writes-the-changelog")
 
     assert r.returncode != 0
     assert "REFUSE" in r.stderr
-    assert "v2" in r.stderr
-    # v2.1, not v3: `release_stamp.py`'s own arithmetic is (major, minor + 1), and a major
-    # bump is a statement about what the release MEANS that no ref can answer. The hook
-    # names the number the stamper would hand out, because it asked the stamper.
-    assert "next free number is v2.1" in r.stderr, "max(base, head) + 1 must be named"
-    assert remote_sha(repo, "pre-stamped", home) == ""
+    assert "CHANGELOG.md" in r.stderr
+    # THE REMEDY, not just the refusal. A worker told only "no" retries or works around it.
+    assert "changelog.d/<issue>.<kind>.md" in r.stderr
+    assert remote_sha(repo, "writes-the-changelog", home) == ""
+
+
+def test_a_branch_that_writes_a_fragment_is_not_refused(repo, home):
+    """The whole point of the refusal above: there is somewhere else to write, it is one file
+    per change, and no two branches ever open the same path."""
+    fork_at_first_commit(repo, home, "writes-a-fragment")
+    (repo / "changelog.d").mkdir(exist_ok=True)
+    (repo / "changelog.d" / "296.feat.md").write_text("# a thing\n\nIt was missing.\n")
+    commit(repo, "feat: a thing", home)
+
+    r = push(repo, home, "writes-a-fragment")
+
+    assert r.returncode == 0, r.stderr
+    assert "REFUSE" not in r.stderr
 
 
 def test_a_branch_that_is_merely_behind_is_not_refused(repo, home):
     """The whole reason the check is fork-relative. This branch never touched the CHANGELOG;
-    main has taken v2 since it forked, so a base-relative comparison sees a branch whose
-    highest number is below the base's and reports a regression. There is nothing to report:
-    the merge takes the base's value cleanly, there being no competing edit."""
+    main has cut v2 since it forked, so a base-relative comparison sees a file that differs
+    and refuses a branch that has done nothing. A gate that fires on every branch open while a
+    release landed is a gate switched off within a week."""
     fork_at_first_commit(repo, home, "behind")
     advance_main_to_v2(repo, home)
 
@@ -487,50 +499,10 @@ def test_a_branch_that_is_merely_behind_is_not_refused(repo, home):
     assert "REFUSE" not in r.stderr
 
 
-def test_a_branch_that_takes_the_next_free_number_is_not_refused(repo, home):
-    """A legitimate release branch. It stamped ABOVE everything the base carries, which is
-    what `release_stamp.py apply` produces, and refusing it would make every release in this
-    repo need `--no-verify`."""
-    fork_at_first_commit(repo, home, "releasing")
-    advance_main_to_v2(repo, home)
-
-    git(repo, "switch", "-q", "releasing", home=home)
-    (repo / "CHANGELOG.md").write_text(
-        CHANGELOG_V1.replace(
-            "## v1 — the first one",
-            "## v3 — the next free one\n\nStamped against a base it had read.\n\n## v1 — the first one",
-        )
-    )
-    commit(repo, "stamp v3", home)
-
-    r = push(repo, home, "releasing")
-
-    assert r.returncode == 0, r.stderr
-
-
-def test_an_unstamped_placeholder_is_the_correct_state_of_a_branch_in_flight(repo, home):
-    """The one thing this must never do. `## vNEXT` is what every branch in flight is
-    supposed to carry — it is what stops two of them picking the same number — and a hook
-    that refused it would be the mistake the `stamped` CI job's main-only trigger avoids,
-    made a second time and closer to the keyboard."""
-    fork_at_first_commit(repo, home, "in-flight")
-    (repo / "CHANGELOG.md").write_text(
-        CHANGELOG_V1.replace(
-            "## v1 — the first one",
-            "## vNEXT — not yet numbered\n\nStill in flight.\n\n## v1 — the first one",
-        )
-    )
-    commit(repo, "a placeholder, as intended", home)
-
-    r = push(repo, home, "in-flight")
-
-    assert r.returncode == 0, r.stderr
-
-
-def test_a_branch_that_inherited_the_number_by_merging_is_not_refused(repo, home):
-    """Once the branch has taken the merge, v2 is inherited rather than claimed, and the
-    merge base moves with it. Text equality would still see the same heading on both sides
-    and refuse; the merge base is what tells the two apart."""
+def test_a_branch_that_inherited_the_release_by_merging_is_not_refused(repo, home):
+    """Once the branch has taken the merge, v2's entry is inherited rather than written, and
+    the merge base moves with it. Comparing file contents would still see a CHANGELOG that
+    differs from the fork point and refuse; the merge base is what tells the two apart."""
     fork_at_first_commit(repo, home, "merged-in")
     advance_main_to_v2(repo, home)
 
@@ -578,18 +550,24 @@ def test_a_branch_that_rewrote_a_shipped_release_entry_is_refused(repo, home):
     assert remote_sha(repo, "work", home) == "", "and nothing was pushed"
 
 
-def test_the_number_check_passes_the_very_push_the_body_check_refuses(repo, home):
+def test_the_body_check_still_refuses_when_the_generated_file_check_is_off(repo, home):
     """Stated as an assertion because it is the whole argument for a third check. Both read
-    the same file at the same commit against the same base; one reads the numbers, which are
-    faultless here, and the other reads the bytes."""
+    the same file at the same commit against the same base; one asks WHETHER it was touched
+    and the other asks what the touch DID.
+
+    Check 2 refuses this push too, and would in any repo that has left it on. The point is
+    that switching it off does not switch this one off with it — a repo that has decided its
+    branches may edit `CHANGELOG.md` still may not have them rewrite a shipped entry, and a
+    guard that only fired behind another guard would be absent exactly there."""
     git(repo, "checkout", "-qb", "work", home=home)
+    git(repo, "config", "--bool", "qb.prePush.generatedFiles", "false", home=home)
     rewrite_the_shipped_entry(repo, home)
-    git(repo, "config", "--bool", "qb.prePush.releaseBodies", "false", home=home)
 
     r = push(repo, home, "work")
 
-    assert r.returncode == 0, r.stderr
-    assert "no release-number collision" in r.stdout + r.stderr
+    assert r.returncode != 0
+    assert "REFUSE" in r.stderr
+    assert "already" in r.stderr and "shipped" in r.stderr
 
 
 def test_a_branch_that_deleted_the_changelog_is_refused(repo, home):
@@ -610,10 +588,12 @@ def test_a_branch_that_deleted_the_changelog_is_refused(repo, home):
 
 
 def test_a_branch_that_only_adds_a_release_entry_is_not_refused(repo, home):
-    """The release branch this must never fire on. `v2` is new text above an untouched `v1`,
-    which is what every release in this repo looks like, and a guard that stopped them all
-    would be off within the week."""
+    """Check 2b must never fire on an APPENDED entry, which is all a release ever is: `v2` is
+    new text above an untouched `v1`. Check 2 is switched off here because it refuses this
+    push for a different reason — no branch writes that file at all — and the question this
+    test asks is what 2b makes of a correct release commit on `main`."""
     git(repo, "checkout", "-qb", "work", home=home)
+    git(repo, "config", "--bool", "qb.prePush.generatedFiles", "false", home=home)
     (repo / "CHANGELOG.md").write_text(CHANGELOG_V2)
     commit(repo, "ship v2", home)
 
@@ -627,6 +607,7 @@ def test_a_release_body_edit_trailer_lets_the_push_through(repo, home):
     """Deliberate, declared, and still reported. A waived edit is an edited release, and the
     push that let it through is the place that cannot be quiet about it."""
     git(repo, "checkout", "-qb", "work", home=home)
+    git(repo, "config", "--bool", "qb.prePush.generatedFiles", "false", home=home)
     (repo / "CHANGELOG.md").write_text(CHANGELOG_V1.replace("It did a thing.",
                                                             "It did a thing, once."))
     commit(repo, "docs: a word in v1's entry\n\nRelease-Body-Edit: v1", home)
@@ -641,6 +622,7 @@ def test_the_released_entry_opt_out_is_recorded_in_config_and_reported_by_status
     """Bypassable deliberately, never accidentally — and a guard that has been switched off
     must never look like one quietly passing."""
     git(repo, "checkout", "-qb", "work", home=home)
+    git(repo, "config", "--bool", "qb.prePush.generatedFiles", "false", home=home)
     rewrite_the_shipped_entry(repo, home)
     git(repo, "config", "--bool", "qb.prePush.releaseBodies", "false", home=home)
 
@@ -689,7 +671,7 @@ def test_a_repo_with_migrations_but_no_changelog_is_silent_about_releases(tmp_pa
     work = tmp_path / "migrations-only"
     init(work, home)
     write_migration(work, "0001", None)
-    ship_tools(work, "migration_reconcile.py", "release_stamp.py")
+    ship_tools(work, "migration_reconcile.py", "release.py")
     commit(work, "initial", home)
     git(work, "remote", "add", "origin", str(bare), home=home)
     install(work, home)
@@ -706,7 +688,7 @@ def test_a_repo_with_migrations_but_no_changelog_is_silent_about_releases(tmp_pa
 
 def test_a_repo_with_a_changelog_but_no_stamper_is_silent_about_releases(tmp_path, home):
     """Absence of the stamper is absence of the CONVENTION, not an unrunnable gate: a repo
-    that does not ship `release_stamp.py` does not write `## vNEXT`, so there is no claim to
+    that does not ship `release.py` has no generated release files, so there is no claim to
     adjudicate. This is the one place the "unrunnable is not passing" rule does not apply,
     and it is worth pinning so nobody tightens it into a refusal on every unrelated repo
     that happens to keep a CHANGELOG."""
@@ -924,7 +906,7 @@ def test_a_first_push_carrying_the_base_and_a_collision_is_refused(tmp_path, hom
     work = tmp_path / "fresh"
     init(work, home)
     (work / "CHANGELOG.md").write_text(CHANGELOG_V1)
-    ship_tools(work, "release_stamp.py")
+    ship_tools(work, "release.py")
     commit(work, "initial", home)
     git(work, "remote", "add", "origin", str(bare), home=home)
     install(work, home)
@@ -998,36 +980,30 @@ def test_a_configured_base_that_is_not_here_is_refused_rather_than_swapped(repo,
 
 def test_a_configured_base_that_is_here_is_the_one_used(repo, home):
     """And when it resolves, it is used — not `main`, which is what the fallback would have
-    picked. `release` carries v2; the branch stamped v2 too, and only a check against
-    `release` can see that."""
-    git(repo, "update-ref", "refs/remotes/origin/release",
-        git(repo, "rev-parse", "origin/main", home=home).stdout.strip(), home=home)
-    git(repo, "config", "qb.baseBranch", "release", home=home)
-    git(repo, "switch", "-q", "-c", "topic", home=home)
-    (repo / "CHANGELOG.md").write_text(CHANGELOG_V2)
-    commit(repo, "stamp v2 on the branch", home)
-    assert push(repo, home, "topic").returncode == 0, "nothing to collide with yet"
-
-    # `release` takes v2 for something else, and `main` never does — so a fallback to main
-    # would still report clean.
+    picked. `release` has cut v2 and `main` has not, so the base this branch is judged against
+    is visible in the answer: judged against `main` the fork point is the same commit, and the
+    refusal would name a different ref."""
     git(repo, "switch", "-q", "-c", "release", "origin/main", home=home)
+    (repo / "CHANGELOG.md").write_text(CHANGELOG_V2)
+    commit(repo, "release: v2 on the release branch", home)
+    git(repo, "update-ref", "refs/remotes/origin/release",
+        git(repo, "rev-parse", "HEAD", home=home).stdout.strip(), home=home)
+    git(repo, "config", "qb.baseBranch", "release", home=home)
+
+    git(repo, "switch", "-q", "-c", "topic", "origin/main", home=home)
     (repo / "CHANGELOG.md").write_text(
         CHANGELOG_V1.replace(
             "## v1 — the first one",
-            "## v2 — the release branch's\n\nSomething else.\n\n## v1 — the first one",
+            "## v2 — the topic branch's\n\nSomething else.\n\n## v1 — the first one",
         )
     )
-    commit(repo, "stamp v2 on release", home)
-    git(repo, "update-ref", "refs/remotes/origin/release",
-        git(repo, "rev-parse", "HEAD", home=home).stdout.strip(), home=home)
+    commit(repo, "a release entry on a branch", home)
 
-    git(repo, "switch", "-q", "topic", home=home)
-    (repo / "more.txt").write_text("more branch work\n")
-    commit(repo, "more work", home)
     r = push(repo, home, "topic")
 
     assert r.returncode != 0
-    assert "origin/release" in r.stderr
+    assert "origin/release" in r.stderr, "the configured base has to be the one named"
+    assert remote_sha(repo, "topic", home) == ""
 
 
 def test_the_configured_base_pushing_itself_for_the_first_time_is_not_refused(tmp_path, home):
@@ -1038,7 +1014,7 @@ def test_the_configured_base_pushing_itself_for_the_first_time_is_not_refused(tm
     work = tmp_path / "fresh-release"
     init(work, home)
     (work / "CHANGELOG.md").write_text(CHANGELOG_V1)
-    ship_tools(work, "release_stamp.py")
+    ship_tools(work, "release.py")
     commit(work, "initial", home)
     git(work, "remote", "add", "origin", str(bare), home=home)
     git(work, "config", "qb.baseBranch", "release", home=home)
@@ -1051,12 +1027,12 @@ def test_the_configured_base_pushing_itself_for_the_first_time_is_not_refused(tm
     assert "REFUSE" not in r.stderr
 
 
-def test_a_stamper_that_cannot_answer_is_reported_as_unverified_not_as_a_collision(
+def test_a_release_tool_that_cannot_answer_is_reported_as_unverified_not_as_a_finding(
         repo, home, tmp_path):
-    """A tool that fell over is not a verdict. Reporting exit 1 as a confirmed collision
-    sends the reader to unstamp an entry that was never the problem — and the push is still
-    refused either way, so the only thing the conflation costs is the reader's afternoon."""
-    broken = tmp_path / "broken-stamper.py"
+    """A tool that fell over is not a verdict. Reporting exit 1 as a confirmed finding sends
+    the reader to undo an edit that was never the problem — and the push is refused either
+    way, so the only thing the conflation costs is the reader's afternoon."""
+    broken = tmp_path / "broken-release-tool.py"
     # No shebang: the hook runs these through the interpreter it resolved
     # (`python3 <path>`), never by exec'ing the file, so one would be decoration — and a
     # `/usr/bin/env` line in a string literal does not exist inside a nix build sandbox
@@ -1065,13 +1041,18 @@ def test_a_stamper_that_cannot_answer_is_reported_as_unverified_not_as_a_collisi
     (repo / "notes.txt").write_text("x\n")
     commit(repo, "something", home)
 
-    r = git(repo, "push", "origin", "main", home=home, check=False,
-            QB_RELEASE_STAMP=str(broken))
+    git(repo, "switch", "-q", "-c", "topic", home=home)
+    (repo / "notes.txt").write_text("y\n")
+    commit(repo, "something else", home)
+
+    r = git(repo, "push", "origin", "topic", home=home, check=False,
+            QB_RELEASE=str(broken))
 
     assert r.returncode != 0
     assert "could not run (exit 1)" in r.stderr
     assert "unverified rather than clean" in r.stderr
-    assert "refuses against" not in r.stderr, "it must not read as a verdict"
+    assert "edits a file the release job generates" not in r.stderr, \
+        "it must not read as a verdict"
     assert "kaboom" in r.stderr, "and it must show what the tool said"
 
 
@@ -1115,241 +1096,6 @@ def test_a_branch_with_no_merge_base_says_the_check_was_limited(repo, home):
 
 
 # ---------------------------------------------------------------------------
-# 4. the release number is RESERVED, atomically, on the remote
-# ---------------------------------------------------------------------------
-# The one step in the hook that takes something rather than checking it, and the reason it
-# is in a hook at all: `release_stamp.py` hands out `max(headings at the base) + 1`, which
-# is a reading of a shared file, and two landers seconds apart read the same answer. Section
-# 2 above can only report that afterwards. `git push <remote> <sha>:refs/tags/v3` cannot be
-# done twice (#296).
-
-
-def remote_tags(repo: Path, home: Path) -> dict[str, str]:
-    """{tag name: sha} on the remote. `^{}` lines dropped — the hook creates lightweight
-    tags via a refspec push, and a peeled line would double-count an annotated one."""
-    out = git(repo, "ls-remote", "--tags", "origin", home=home).stdout
-    found = {}
-    for line in out.splitlines():
-        sha, _, ref = line.partition("\t")
-        ref = ref.strip()
-        if ref.startswith("refs/tags/") and not ref.endswith("^{}"):
-            found[ref[len("refs/tags/"):]] = sha.strip()
-    return found
-
-
-def fork_at_v2(repo: Path, home: Path, name: str) -> None:
-    """Advance the remote's `main` to v2, then branch off THAT.
-
-    Off the advanced base rather than off the first commit, because these tests are about
-    what happens above a shared newest release: a branch forked at v1 that then wrote v2's
-    entry would be claiming v2 as well as v3, which is a different refusal entirely and one
-    section 2 already covers.
-    """
-    advance_main_to_v2(repo, home)
-    git(repo, "switch", "-q", "-c", name, "origin/main", home=home)
-
-
-def stamp_v3(repo: Path, home: Path, what: str) -> str:
-    """Write the release entry a branch carries once `release_stamp.py apply` has run."""
-    (repo / "CHANGELOG.md").write_text(
-        CHANGELOG_V2.replace(
-            "## v2 — the second one",
-            f"## v3 — {what}\n\n{what}.\n\n## v2 — the second one",
-        )
-    )
-    return commit(repo, f"stamp v3: {what}", home)
-
-
-def test_a_branch_that_stamps_a_number_takes_it_on_the_remote(repo, home):
-    """The whole point. Pushing the release commit creates `refs/tags/v3` on the remote, and
-    it names the commit that carries the entry — so the number is spoken for from the moment
-    it leaves the machine rather than from the moment the pull request merges."""
-    fork_at_v2(repo, home, "releasing")
-    sha = stamp_v3(repo, home, "the next free one")
-
-    r = push(repo, home, "releasing")
-
-    assert r.returncode == 0, r.stderr
-    assert remote_tags(repo, home).get("v3") == sha
-    assert "reserved v3" in r.stdout, r.stdout
-
-
-def test_the_second_lander_of_two_stamping_the_same_number_is_refused(repo, home, tmp_path):
-    """#289/#291's shape, reconstructed, and the case every other guard here sees too late.
-
-    Two landers fork at v2, both read v2 as the newest, and both stamp v3 — which is what
-    `apply` correctly hands each of them, because at the moment each asked, v3 WAS free. The
-    branches conflict on nothing: different files, different commits, and each is
-    individually clean against `origin/main`. Under the checks in section 2 both pushes are
-    accepted, both pull requests merge, and `main` ends up with two `## v3` entries and a red
-    `stamped` job blocking everybody else's landing.
-
-    The tag makes the second push the failure instead of the second merge. Whoever pushes
-    first creates `refs/tags/v3`; the create is compare-and-swap, so the other one cannot.
-    """
-    bare = git(repo, "remote", "get-url", "origin", home=home).stdout.strip()
-    advance_main_to_v2(repo, home)
-
-    # A genuinely separate checkout, the way two landers on two machines are separate: same
-    # remote, its own worktree, its own hook. Simulating it inside one repo would prove
-    # nothing, since the interesting question is what the REMOTE does when both arrive.
-    other = tmp_path / "other"
-    git(tmp_path, "clone", "-q", bare, str(other), home=home)
-    git(other, "config", "user.email", "t@example.com", home=home)
-    git(other, "config", "user.name", "Test", home=home)
-    install(other, home)
-
-    git(repo, "switch", "-q", "-c", "lander-a", "origin/main", home=home)
-    first = stamp_v3(repo, home, "what lander A shipped")
-
-    git(other, "switch", "-q", "-c", "lander-b", "origin/main", home=home)
-    (other / "unrelated.txt").write_text("lander B's actual work\n")
-    commit(other, "lander B's work", home)
-    stamp_v3(other, home, "what lander B shipped")
-
-    won = push(repo, home, "lander-a")
-    assert won.returncode == 0, won.stderr
-    assert remote_tags(repo, home).get("v3") == first
-
-    lost = git(other, "push", "origin", "lander-b", home=home, check=False)
-
-    assert lost.returncode != 0, "the second lander must not get v3 too"
-    assert "REFUSE" in lost.stderr
-    assert "already reserved" in lost.stderr
-    assert "v3" in lost.stderr
-    assert remote_sha(other, "lander-b", home) == "", "and nothing was pushed"
-    # Still exactly one holder, and it is the first lander's commit. A tag is not moved by
-    # anything here — a moved tag would be the collision arriving quietly instead of loudly.
-    assert remote_tags(repo, home).get("v3") == first
-
-
-def test_a_branch_that_stamps_nothing_reserves_nothing(repo, home):
-    """What makes this safe to run on every push rather than on release pushes only. An
-    ordinary feature branch's newest heading is one it INHERITED, and taking a tag for that
-    would create a tag for somebody else's release on every push in the repo."""
-    fork_at_v2(repo, home, "ordinary")
-    (repo / "notes.txt").write_text("work with no release in it\n")
-    commit(repo, "ordinary work", home)
-
-    r = push(repo, home, "ordinary")
-
-    assert r.returncode == 0, r.stderr
-    # v2 and only v2 — the release main itself pushed. Nothing was taken for this branch.
-    assert set(remote_tags(repo, home)) == {"v2"}
-
-
-def test_an_unstamped_placeholder_reserves_nothing(repo, home):
-    """`## vNEXT` names no number, which is the entire reason a branch writes it. There is
-    nothing here to take, and a hook that invented one would be picking the number at exactly
-    the moment the placeholder exists to avoid picking it."""
-    fork_at_first_commit(repo, home, "in-flight")
-    (repo / "CHANGELOG.md").write_text(
-        CHANGELOG_V1.replace(
-            "## v1 — the first one",
-            "## vNEXT — not yet numbered\n\nStill in flight.\n\n## v1 — the first one",
-        )
-    )
-    commit(repo, "a placeholder, as intended", home)
-
-    r = push(repo, home, "in-flight")
-
-    assert r.returncode == 0, r.stderr
-    assert remote_tags(repo, home) == {}
-
-
-def test_a_refused_push_takes_no_tag(repo, home):
-    """A tag is permanent — that is what lets it be a lock — so one taken for a branch that
-    is about to be refused burns a release number on a push that never happened. The reserve
-    pass runs only after every check has passed."""
-    fork_at_first_commit(repo, home, "pre-stamped")
-    advance_main_to_v2(repo, home)
-    on_main = remote_tags(repo, home)["v2"]
-    git(repo, "switch", "-q", "pre-stamped", home=home)
-    (repo / "CHANGELOG.md").write_text(
-        CHANGELOG_V1.replace(
-            "## v1 — the first one",
-            "## v2 — what this branch shipped\n\nSomething else.\n\n## v1 — the first one",
-        )
-    )
-    branch_tip = commit(repo, "stamp a number the base has taken", home)
-
-    r = push(repo, home, "pre-stamped")
-
-    assert r.returncode != 0
-    # v2 still names main's commit. Nothing was taken for the refused branch, and nothing
-    # that already existed was moved onto it.
-    assert remote_tags(repo, home) == {"v2": on_main}
-    assert on_main != branch_tip
-
-
-def test_a_repo_with_no_tagger_pushes_exactly_as_before(tmp_path, home):
-    """Silent where it does not apply, like every other check in this file. The hook ships
-    with the harness into repos that are neither quarterback nor lexray, and a note about a
-    tool they do not have is how the whole hook gets uninstalled."""
-    bare = bare_remote(tmp_path, home)
-    work = tmp_path / "work"
-    init(work, home)
-    (work / "CHANGELOG.md").write_text(CHANGELOG_V1)
-    ship_tools(work, "release_stamp.py")
-    commit(work, "initial", home)
-    git(work, "remote", "add", "origin", str(bare), home=home)
-    install(work, home)
-    assert push(work, home, "-u", "main").returncode == 0
-
-    (work / "CHANGELOG.md").write_text(CHANGELOG_V2)
-    commit(work, "release: v2", home)
-    r = push(work, home, "main")
-
-    assert r.returncode == 0, r.stderr
-    assert "reserve" not in r.stdout
-    assert remote_tags(work, home) == {}
-
-
-def test_the_reserve_opt_out_is_recorded_in_config_and_reported_by_status(repo, home):
-    """An escape hatch that `qb-hooks status` cannot see is a hole. This one is per-repo,
-    recorded in git config, and reported — the same shape as the three checks above."""
-    git(repo, "config", "--bool", "qb.prePush.reserveRelease", "false", home=home)
-    fork_at_v2(repo, home, "releasing")
-    stamp_v3(repo, home, "the next free one")
-
-    r = push(repo, home, "releasing")
-    assert r.returncode == 0, r.stderr
-    assert "v3" not in remote_tags(repo, home)
-
-    status = subprocess.run(
-        [str(QB_HOOKS), "status", "--repo", str(repo)], capture_output=True, text=True,
-        env=env(home),
-    )
-    assert "qb.prePush.reserveRelease is off" in status.stdout
-
-
-def test_a_taken_number_is_refused_before_the_sibling_has_merged(repo, home):
-    """The window that nothing before this could see. `release_stamp.py collision` asks
-    whether the number is at `origin/main` — and until the first lander's pull request
-    merges, it is not. The tag is at neither ref and is the only record that the number is
-    gone, which is why `_collision` learned to read tags as well as headings."""
-    fork_at_v2(repo, home, "second")
-    # Somebody else's reservation: a tag on a commit this branch does not contain, and no
-    # `## v3` anywhere on `main`.
-    git(repo, "switch", "-q", "main", home=home)
-    (repo / "sibling.txt").write_text("the other lander's work\n")
-    sibling = commit(repo, "a sibling's release commit", home)
-    git(repo, "push", "-q", "--no-verify", "origin", f"{sibling}:refs/tags/v3", home=home)
-    git(repo, "reset", "-q", "--hard", "origin/main", home=home)
-    git(repo, "fetch", "-q", "origin", "--tags", home=home)
-
-    git(repo, "switch", "-q", "second", home=home)
-    stamp_v3(repo, home, "what the second lander shipped")
-
-    r = push(repo, home, "second")
-
-    assert r.returncode != 0
-    assert "REFUSE" in r.stderr
-    assert "v3" in r.stderr
-    assert remote_sha(repo, "second", home) == ""
-
-
-# ---------------------------------------------------------------------------
 # 5. this suite's own sandbox
 # ---------------------------------------------------------------------------
 
@@ -1361,7 +1107,12 @@ def test_a_taken_number_is_refused_before_the_sibling_has_merged(repo, home):
 READS = (
     "harness/githooks",      # the hook under test, and the forwarder it chains through
     "scripts/migration_reconcile.py",
-    "scripts/release_stamp.py",
+    "scripts/release.py",
+    # `release.py guard` loads both of these from beside itself, lazily — which is why they
+    # are declared here rather than trusted to the import graph: the failure would arrive
+    # inside a refusal path, in a build log, rather than at startup.
+    "scripts/changelog_fragments.py",
+    "scripts/readme_releases.py",
     "scripts/release_tag.py",
 )
 
@@ -1391,7 +1142,9 @@ def test_every_declared_read_is_a_path_this_file_names(path: str):
     answering it, and the two then keep each other alive over a file nothing needs."""
     named = {str(HOOKS.relative_to(ROOT))} | {
         str((SCRIPTS / name).relative_to(ROOT)) for name in ("migration_reconcile.py",
-                                                             "release_stamp.py",
+                                                             "release.py",
+                                                             "changelog_fragments.py",
+                                                             "readme_releases.py",
                                                              "release_tag.py")}
     assert any(p == path or p.startswith(path + "/") for p in named), (
         f"READS declares {path}, which no constant in this module resolves to — either the "

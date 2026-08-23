@@ -23,13 +23,14 @@ repo gets switched off.
 
 **Two things changed under this file's feet, and it now asserts both.**
 
-*A branch no longer writes a number at all* (#122). It writes the `vNEXT` placeholder and
-`scripts/release_stamp.py` resolves it against the ref being merged into, so a repo in this
-suite's sights is legitimately in one of two states: released, or carrying exactly one
-unstamped entry. Both are asserted, and the placeholder assertions are here rather than
-delegated to the stamper for the same reason the version regexes are duplicated below — this
-suite checks the FILES, and a check that ran the tool would agree with the tool by
-construction rather than agree with the repo.
+*A branch no longer writes a release entry at all* (#122). It writes
+`changelog.d/<issue>.<kind>.md` and nothing else; `scripts/release.py run` assembles the
+fragments on `main` after the merge, numbers the entry against the commit it is about to tag,
+and writes both files. So `CHANGELOG.md` in this suite's sights is always released — there is
+no in-flight state to allow for, and `vNEXT` is a retired token whose reappearance is itself
+the finding. The assertions are here rather than delegated to the release tool for the same
+reason the version regexes are duplicated below: this suite checks the FILES, and a check that
+ran the tool would agree with the tool by construction rather than agree with the repo.
 
 *The filename rule flipped.* An earlier version of this docstring argued that a
 `tests/test_vNNN.py` rule "would be wrong outright, since a harness-side release ships no app
@@ -106,11 +107,11 @@ def _fmt(r: Release) -> str:
     return f"v{r[0]}" if r[1] == 0 else f"v{r[0]}.{r[1]}"
 
 
-#: Ends a version, and does it with `(?![\w.])` rather than `\b` for the reason the stamper's
+#: Ends a version, and does it with `(?![\w.])` rather than `\b` for the reason the release tool's
 #: own `_END` gives: `\b` fires between a digit and a dot, so `## v2.33.1` would be read here
 #: as release v2.33 — truncating a three-component heading to two and putting a number into
-#: the ordering and duplicate checks that nobody wrote. The stamper refuses such a heading as
-#: unparseable, and this suite exists to agree with the stamper about what a release heading
+#: the ordering and duplicate checks that nobody wrote. The release tool refuses such a heading as
+#: unparseable, and this suite exists to agree with the release tool about what a release heading
 #: is, so a heading it will not number must not match here either.
 _END = r"(?![\w.])"
 
@@ -119,8 +120,10 @@ _END = r"(?![\w.])"
 #: two assertions on a correctly-updated repo.
 _V = rf"v\d+(?:\.\d+)?{_END}"
 
-#: The token a branch writes instead of a number, until `scripts/release_stamp.py` resolves
-#: it. Spelled here rather than imported from the script: see the docstring.
+#: The retired placeholder (#122). It meant "an entry whose number is not decided yet", and
+#: there are no undecided entries any more — the release job numbers what it writes, in the
+#: same pass. Kept as a constant because its REAPPEARANCE is the finding: a `## vNEXT` in
+#: `CHANGELOG.md` means somebody followed a document that has not caught up.
 PLACEHOLDER = "vNEXT"
 
 
@@ -136,11 +139,11 @@ def _without_fenced_blocks(text: str) -> str:
 
     A fenced block is documentation OF this convention rather than a use of it: a ```` ```md ````
     example showing `## vNEXT — <title>` at column 0 is how the README teaches a branch what to
-    write, and every `^##` pattern below would read it as a real unstamped entry. The stamper
+    write, and every `^##` pattern below would read it as a real release entry. The release tool
     masks fences before it matches, so `check` would be quietly right while this suite went red
     on a repo doing exactly what it was told.
 
-    The logic is duplicated from `scripts/release_stamp.py` rather than imported, for the reason
+    The logic is duplicated from `scripts/release.py` rather than imported, for the reason
     the module docstring gives at length about the version regexes: this suite checks the FILES,
     and a check that borrowed the tool's matching would agree with the tool by construction
     instead of agreeing with the repo. The duplication is the point.
@@ -150,7 +153,7 @@ def _without_fenced_blocks(text: str) -> str:
     span can ever contain the beginning of one of these matches.
 
     Length is preserved (blanked to NUL, which no pattern here can match) so that offsets taken
-    from the masked text — `test_an_unstamped_entry_is_at_the_top` compares two of them — still
+    from the masked text — several assertions here compare two of them — still
     describe positions in the file a reader would open.
     """
     out = list(text)
@@ -165,17 +168,17 @@ def _without_fenced_blocks(text: str) -> str:
         elif marker and marker[0] == fence[0] and len(marker) >= len(fence) and not info:
             # A closing fence is the same character, AT LEAST as long as the opener, and
             # carries no info string. All three conditions are CommonMark's, all three are the
-            # stamper's, and each matters here: the README fences a ```` ```md ```` sample
+            # release tool's, and each matters here: the README fences a ```` ```md ```` sample
             # containing its own ``` lines, so a length-blind close would end the block on the
             # first of them, and an info-blind close would end an outer ``` block on an inner
             # ```py — either way the rest of the sample reads as prose and a `## vNEXT` in it
-            # is counted as a real unstamped entry that the stamper, masking correctly, ignores.
+            # is counted as a real release entry that the tool, masking correctly, ignores.
             fence = None
         if inside or marker:  # the fence lines themselves are blanked too
             out[pos:pos + len(line)] = "\0" * len(line)
         pos += len(line) + 1
-    # A fence left open blanks every remaining line, which would make a real unstamped entry
-    # below it invisible to every assertion here at once — the same silent hole the stamper
+    # A fence left open blanks every remaining line, which would make a real release entry
+    # below it invisible to every assertion here at once — the same silent hole the release tool
     # refuses on, and the reason to refuse rather than mask a best effort. Loud, and it names
     # the line the fence was opened on, because "your CHANGELOG is fine and this suite went
     # red" is not a failure anybody can act on, and neither is a marker that occurs forty times.
@@ -215,9 +218,10 @@ def changelog_releases(changelog_prose) -> list[Release]:
     release, and parsing one as though it were would put an invented number into the ordering
     check and into `served <= newest`.
 
-    The `## vNEXT` heading is deliberately not in here. Every test below reads position 0 as
-    "the newest release that exists", and an unstamped entry is the one thing that is not one
-    — folding it in would make `served <= newest` pass against a release nothing has shipped.
+    The retired `## vNEXT` heading is deliberately not matched here. Every test below reads
+    position 0 as "the newest release that exists"; a placeholder is the one thing that is
+    not one, and folding it in would make `served <= newest` pass against a release nothing
+    has shipped. `test_the_changelog_carries_no_retired_placeholder` is what reports it.
     """
     found = re.findall(rf"^## ({_V})", changelog_prose, flags=re.MULTILINE)
     assert found, "CHANGELOG.md has no release headings — the parser is wrong, not the file"
@@ -332,52 +336,30 @@ def test_the_served_version_never_leads_the_newest_release(served_version,
 #: asserted them accurately was still a test whose subject should not have existed.
 
 
-def test_at_most_one_release_is_unstamped(changelog_prose):
-    """A branch ships one release, so there is at most one placeholder.
+def test_the_changelog_carries_no_retired_placeholder(changelog_prose):
+    """`## vNEXT` is what a branch used to write, and writing it is what put a release entry —
+    and then a number, and then a conflict with every sibling — on a branch (#122).
 
-    Two `## vNEXT` headings cannot both become one number, and choosing between them is
-    exactly the judgement nothing here is entitled to make. It is also the shape a bad merge
-    leaves behind: two branches whose entries were kept side by side, which under the old
-    convention would have been two different numbers and is now visibly one question."""
+    There is nothing left to resolve it: the release job numbers an entry in the same pass
+    that writes it. So a placeholder here is not an in-flight release, it is an entry that
+    will ship with the literal string in it, and it says that whoever wrote it was reading a
+    stale document. Fenced examples are masked out by the fixture, which is how the README and
+    this file's own prose can go on discussing the convention."""
     found = re.findall(rf"^## {PLACEHOLDER}\b.*$", changelog_prose, flags=re.MULTILINE)
-    assert len(found) <= 1, (
-        f"CHANGELOG.md has {len(found)} unstamped entries: "
+    assert not found, (
+        f"CHANGELOG.md carries {len(found)} `## {PLACEHOLDER}` entr(y/ies): "
+        + " | ".join(f.strip() for f in found)
+        + ". Nothing stamps that any more — write changelog.d/<issue>.<kind>.md instead")
+
+
+def test_the_readme_release_list_carries_no_retired_placeholder(readme_prose):
+    """The other half, and it fails on a different day. A `- **vNEXT** — …` bullet is what
+    `insert_bullet` used to write on a branch; the release list is now written on `main` by
+    the release job, with the number it just issued."""
+    found = re.findall(rf"^- \*\*{PLACEHOLDER}\*\*.*$", readme_prose, flags=re.MULTILINE)
+    assert not found, (
+        f"README.md's release list carries a `{PLACEHOLDER}` bullet: "
         + " | ".join(f.strip() for f in found))
-
-
-def test_an_unstamped_entry_is_at_the_top(changelog_prose, changelog_releases):
-    """The file is newest first and an unreleased entry is newer than everything in it.
-
-    Stamped where it sits below a numbered heading, it would be a number out of order in a
-    file every other test here reads by position — and `test_the_changelog_is_newest_first`
-    would then fail on the release AFTER the mistake, pointing at the wrong commit."""
-    placeholder = re.search(rf"^## {PLACEHOLDER}\b", changelog_prose, flags=re.MULTILINE)
-    if not placeholder:
-        # Named in flake.nix's allowed-skip list; see the note in the git test above.
-        pytest.skip("nothing unstamped — this branch is not writing a release")
-    first_numbered = re.search(rf"^## {_V}", changelog_prose, flags=re.MULTILINE)
-    assert first_numbered and placeholder.start() < first_numbered.start(), (
-        f"CHANGELOG.md's `## {PLACEHOLDER}` entry sits below "
-        f"{_fmt(changelog_releases[0])} — an unreleased entry belongs above every released one")
-
-
-def test_the_changelog_and_the_readme_are_unstamped_together(changelog_prose, readme_prose):
-    """Half a release entry is the failure this catches: a README bullet stamped with a
-    number whose CHANGELOG section does not exist, or an entry written up and never listed.
-
-    Both directions, because they fail on different days. The bullet without the entry is
-    the release-day mistake; the entry without the bullet is the one the old convention
-    made every time, since the bullet lived under a paragraph that had to be rewritten by
-    hand and the hand sometimes stopped there."""
-    in_changelog = bool(re.search(rf"^## {PLACEHOLDER}\b", changelog_prose, flags=re.MULTILINE))
-    # No punctuation after the bold run. The stamper's `_SITE` rewrites `**vNEXT` followed by
-    # anything, so `- **vNEXT**: …` is a bullet it stamps; requiring the em dash here would
-    # fail that branch with a message swearing the bullet does not exist while it sits in the
-    # file, correctly written in a punctuation style this test happened not to have seen.
-    in_readme = bool(re.search(rf"^- \*\*{PLACEHOLDER}\*\*", readme_prose, flags=re.MULTILINE))
-    assert in_changelog == in_readme, (
-        f"CHANGELOG.md {'has' if in_changelog else 'has no'} `## {PLACEHOLDER}` entry but "
-        f"README.md {'has' if in_readme else 'has no'} `- **{PLACEHOLDER}**` bullet")
 
 
 def test_no_test_file_is_named_after_a_release():
@@ -485,9 +467,7 @@ def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_r
     scoped to match: what this catches is a release written up and never listed, which
     is the mistake that happens on the day of the release.
 
-    No separator is required after the bold run, for the reason
-    `test_the_changelog_and_the_readme_are_unstamped_together` gives: the stamper rewrites
-    `**vNEXT` followed by anything, so `- **v2.34**: …` is a bullet it stamps and this repo
+    No separator is required after the bold run: `- **v2.34**: …` is a bullet this repo
     accepts. Demanding the em dash here would have failed a correctly-listed release on its
     punctuation alone, and said the bullet did not exist while it sat in the file."""
     newest = _fmt(changelog_releases[0])
@@ -556,16 +536,13 @@ _README_RELEASE_BULLET = re.compile(rf"^- \*\*({_V})\*\*", re.MULTILINE)
 
 
 def test_no_release_number_appears_twice(changelog_releases, readme_prose):
-    """A number that means two releases is the exact state the placeholder convention exists
-    to make impossible, and it is the one state nothing else here can see.
+    """A number that means two releases is the one state nothing else here can see.
 
-    `release_stamp.py check` looks for the literal `vNEXT`, which is the right thing to look
-    for right up until the moment a number is stamped: after that there is no placeholder left
-    anywhere, so two branches that were each stamped v2.34 against the same base and then
-    merged with both sides kept produce a repo that passes the guard, passes preflight, and
-    documents one number twice. Git does not conflict on it either — two entries added in
-    different places of a long file merge cleanly, and "keep both" is the resolution a human
-    reaches for on the ones where it does conflict.
+    Only the release job writes a number now and it reads the file before it does, so this is
+    a corruption check rather than a race: two entries added in different places of a long
+    file merge cleanly, and "keep both" is the resolution a human reaches for on the ones
+    where it does conflict. Every heading is then present, unique-looking and correctly
+    ordered, and one number documents two releases.
 
     Both files, because they carry the number independently. The CHANGELOG half restates
     `test_no_release_number_is_claimed_twice` from the merge's side rather than the parser's,
@@ -584,8 +561,8 @@ def test_no_release_number_appears_twice(changelog_releases, readme_prose):
     in_readme = dupes(
         [_release(m.group(1)) for m in _README_RELEASE_BULLET.finditer(readme_prose)])
     assert not in_changelog and not in_readme, (
-        "a release number is used twice — two branches were stamped the same number and the "
-        "merge kept both sides, so the number now means two releases: "
+        "a release number is used twice — a merge kept both sides of an edit to this list, "
+        "so the number now means two releases: "
         + "; ".join(filter(None, [
             f"CHANGELOG.md headings for {', '.join(in_changelog)}" if in_changelog else "",
             f"README.md bullets for {', '.join(in_readme)}" if in_readme else ""])))
@@ -594,15 +571,15 @@ def test_no_release_number_appears_twice(changelog_releases, readme_prose):
 # --------------------------------------------------------------- the helpers themselves
 #
 # Everything above reads the real CHANGELOG.md and README.md, which is this suite's whole
-# argument and also its blind spot: a helper that stops matching what the stamper matches
+# argument and also its blind spot: a helper that stops matching what the release tool matches
 # stays green for as long as the repo happens to be in a shape the loosened helper still
 # accepts, and goes wrong on the one day a release is written in the shape it lost. Each
-# test below pins a rule where this file and `scripts/release_stamp.py` had already drifted
+# test below pins a rule where this file and `scripts/release.py` had already drifted
 # apart, on text written here rather than on whatever the repo currently contains.
 
 
 def test_a_three_component_heading_is_not_read_as_a_release():
-    """`## v2.33.1` is a heading the stamper refuses to number. Parsed here as v2.33 it would
+    """`## v2.33.1` is a heading the release tool refuses to number. Parsed here as v2.33 it would
     be a release nobody wrote — duplicating the real v2.33 in the collision checks, or landing
     out of order in the newest-first check."""
     text = "## v2.33.1 — a patch\n\n## v2.33 — the release\n"
@@ -612,7 +589,7 @@ def test_a_three_component_heading_is_not_read_as_a_release():
 
 
 def test_a_release_bullet_is_found_whatever_punctuation_follows_it():
-    """The em dash is this README's house style and not a rule the stamper enforces."""
+    """The em dash is this README's house style and not a rule the release tool enforces."""
     for line in ("- **v2.34** — the release\n", "- **v2.34**: the release\n",
                  "- **v2.34** - the release\n", "- **v2.34**\n"):
         assert _readme_bullet("v2.34").search(line), line
@@ -624,7 +601,7 @@ def test_a_release_bullet_is_found_whatever_punctuation_follows_it():
 def test_an_inner_info_fence_does_not_close_an_outer_block():
     """A closer carries no info string, which is CommonMark's rule and `mask_code`'s. Without
     it a ```` ```py ```` inside a ```` ``` ```` sample ends the block early, and this suite
-    reads the rest of the sample as prose while the stamper reads it as code."""
+    reads the rest of the sample as prose while the release tool reads it as code."""
     text = ("```\n"
             "## vNEXT — a sample entry\n"
             "```py\n"
@@ -666,14 +643,14 @@ _FLAKE_CHECK = "release-metadata-tests"
 #: comparison does not report it: pytest opens the suite's own file by path, and the shared
 #: reader below is imported rather than read.
 #:
-#: `scripts/release_stamp.py` is the third: this suite never opens it, but
+#: `scripts/release.py` is the third: this suite never opens it, but
 #: `scripts/readme_releases.py` — which it does open — imports it by path for the one
 #: definition of what a release heading is. A sandbox holding the renderer and not the
-#: stamper errors on the import rather than on a read, which the read-side comparison
+#: release tool errors on the import rather than on a read, which the read-side comparison
 #: cannot see.
 _COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py",
                                   "harness/tests/_flake_sandbox.py",
-                                  "scripts/release_stamp.py"})
+                                  "scripts/release.py"})
 
 #: Reading a check's block out of flake.nix, parsing its copy lines and checking they land
 #: where this suite looks, is the same job for every suite with this problem — and it was

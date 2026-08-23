@@ -178,21 +178,26 @@
           # does not exist, asserted in neither check (#340).
           install -Dm644 ${./harness/commands/fix-issue.md} harness/commands/fix-issue.md
           # The two tools the pre-push guard hands its questions to. Its whole contract is
-          # that it DELEGATES — the graph to `migration_reconcile.py heads --ref`, the release
-          # number to `release_stamp.py collision` — so test_pre_push_hook.py copies the real
-          # ones into every fixture repo it builds; a stub would verify the hook against a
-          # thing nobody runs. Named files rather than the `scripts/` tree, because this
-          # sandbox exists for the worktree scripts and a directory of unrelated tools would
-          # leave the next reader guessing which of them a test needs.
-          # test_pre_push_hook.py's own coupling guard holds this pair against what it reads.
+          # that it DELEGATES — the graph to `migration_reconcile.py heads --ref`, the
+          # generated release files to `release.py guard` and a rewritten release entry to
+          # `release.py frozen` — so test_pre_push_hook.py copies the real ones into every
+          # fixture repo it builds; a stub would verify the hook against a thing nobody runs.
+          # Named files rather than the `scripts/` tree, because this sandbox exists for the
+          # worktree scripts and a directory of unrelated tools would leave the next reader
+          # guessing which of them a test needs.
+          # test_pre_push_hook.py's own coupling guard holds this set against what it reads.
           install -Dm644 ${./scripts/migration_reconcile.py} scripts/migration_reconcile.py
-          install -Dm644 ${./scripts/release_stamp.py} scripts/release_stamp.py
-          # And the third, since #296: the hook now RESERVES the release number as well as
-          # checking it, by handing `release_tag.py reserve` the commit being pushed. That is
-          # the only step in the hook that creates anything, so a fixture repo without the
-          # tool would exercise every refusal and none of the lock. `release_tag.py` loads
-          # `release_stamp.py` from beside itself for the one definition of a release
-          # heading, which is why the pair above is not optional here either.
+          install -Dm644 ${./scripts/release.py} scripts/release.py
+          # `release.py` loads `changelog_fragments.py` and `readme_releases.py` from beside
+          # itself — the release list's shape and a fragment's shape are each defined once —
+          # so `guard` errors on a missing import without them. They are lazy imports, which
+          # is exactly why they have to be here: the failure would arrive inside a refusal
+          # path rather than at startup.
+          install -Dm644 ${./scripts/changelog_fragments.py} scripts/changelog_fragments.py
+          install -Dm644 ${./scripts/readme_releases.py} scripts/readme_releases.py
+          # And `release_tag.py`, which the suite copies into fixture repos as one of the
+          # tools a repo may ship. It loads `release.py` from beside itself for the one
+          # definition of a release heading, which is why the file above is not optional.
           install -Dm644 ${./scripts/release_tag.py} scripts/release_tag.py
           # test_claude_wiring.py's reads (#230). It stays in THIS check rather than
           # joining prose-consistency-tests, and the split is the same one that check's
@@ -342,11 +347,11 @@
           install -Dm644 ${./README.md}      repo/README.md
           # The README's release list is RENDERED from the CHANGELOG's order (#296), and the
           # suite asserts the file matches the render — so the renderer is part of the
-          # question, not a tool beside it. It imports the stamper by path for the one
+          # question, not a tool beside it. It imports `release.py` by path for the one
           # definition of a release heading, which is why both are here; the suite records
-          # the stamper in `_COPIED_BUT_NOT_READ` because it reaches it through an import.
+          # `release.py` in `_COPIED_BUT_NOT_READ` because it reaches it through an import.
           install -Dm644 ${./scripts/readme_releases.py} repo/scripts/readme_releases.py
-          install -Dm644 ${./scripts/release_stamp.py}   repo/scripts/release_stamp.py
+          install -Dm644 ${./scripts/release.py}        repo/scripts/release.py
           install -Dm644 ${./pyproject.toml} repo/pyproject.toml
           install -Dm644 ${./app/main.py}    repo/app/main.py
           install -Dm644 ${./flake.nix}      repo/flake.nix

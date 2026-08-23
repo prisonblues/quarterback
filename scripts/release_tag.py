@@ -1,106 +1,61 @@
 #!/usr/bin/env python3
-"""Give the release number the lock its own stamper says it does not have.
-
-`release_stamp.py` opens with the diagnosis and does not pretend otherwise:
-
-    A release number is a shared namespace with no lock on it.
-
-Everything it does follows from that sentence. A branch writes `## vNEXT`, the number is
-resolved at land time against `origin/main`, and three separate mechanisms exist to catch
-the case where two branches resolved it in the same minute. What none of them is, and
-what the file says plainly, is an allocator: `max(headings at --onto) + 1` is a *reading*
-of a shared file, and two landers reading it seconds apart read the same answer.
-
-The primitive that IS an allocator was sitting unused in git the whole time. Creating a
-ref on a remote is atomic and it is compare-and-swap:
-
-    git push origin <sha>:refs/tags/v2.96
-
-succeeds for exactly one caller and is rejected for every other, forever, with no lock
-file, no server, no table of numbers going stale for every PR still open — which is the
-allocator #172 deleted, and it was deleted for good reasons that do not apply here. That
-one recorded an INTENTION to take a number and nothing consulted it. This one is the
-number: after it succeeds, v2.96 cannot be issued again, whether or not anybody remembers
-to look.
-
-## The invariant
+"""Every release has a tag, and every tag points at the commit that shipped it.
 
     A tag `vX.Y` points at a commit whose CHANGELOG.md declares `## vX.Y`.
 
-Every command here maintains it and `check` verifies it. It is what makes the tag a fact
-about the repository rather than a label somebody attached — and it is why `reserve` wants
-the stamp COMMITTED rather than sitting in the worktree: a tag on the commit before the
-stamp would name a release that commit has never heard of.
+That is the whole invariant. `backfill` establishes it and `check` verifies it, and between
+them they make a release number a fact about the repository rather than a label somebody
+attached. `git describe`, `gh release view`, "what was running on the box that afternoon" —
+all of it is downstream of this one line holding.
 
-## When the tag is taken, and what that closes
-
-At PUSH time, by `harness/githooks/pre-push`, which already refuses a branch whose number
-somebody else has taken and now also takes the number for the branch that is entitled to
-it. That placement is the whole point and it is not the obvious one:
-
-  * **At stamp time** the tag would be fork-relative like everything else — `apply` runs in
-    a worktree, and a tag created locally is a note to self until it is pushed.
-  * **At merge time** the merge is `gh pr merge` through the GitHub API, which runs no local
-    hook at all. That is #351's finding one domain over, and a tag taken there would be a
-    RECORD of what landed rather than a reservation that stops the second lander.
-  * **At push time** the commit exists, the remote is right there, the hook already runs,
-    and the create either succeeds or is rejected. Two landers pushing release commits in
-    the same second: one push carries the tag, the other is refused with the repair.
-
-**What it does not close, stated here rather than left to be discovered.** `git push
---no-verify` skips the hook, as does a push from a checkout where the hook is not installed,
-and neither can be closed from inside a hook. For those the `tagged` CI job on `main`
-creates the tag AFTER the merge — a record, not a lock, and it is described as one. And if
-NEITHER lander reserves, nothing here helps: both stamp the same number, the second merge
-lands a duplicate heading, and `release_stamp.py check` turns main red exactly as it does
-today. The lock is real; it is not automatic in a checkout that has opted out of hooks.
-
-A hook also runs BEFORE the push it guards, so a reservation can outlive a push git then
-fails to deliver, and a reservation whose pull request is abandoned outlives it too. Both
-cost a skipped release number and nothing else: `check` lists a tag that is not on the
-integration ref as a reservation rather than a defect, because that is also exactly what
-every release still in flight looks like.
-
-## The tag that is off the ref and is NOT a reservation (#406)
-
-Being off the integration ref is therefore two opposite things wearing one face, and for
-five months this file could only see the harmless one. A release merged with a SQUASH (or a
-rebase) leaves the same shape behind: the stamped commit the tag was reserved against is
-discarded by the rewrite, so the tag addresses a commit that is not in the history it
-claims to tag, while the release's CHANGELOG entry lands perfectly. `v3.8` shipped that way
-and every check the repo had reported it as fully tagged, because they asked whether a tag
-of that NAME resolved.
-
-What separates the two is not the tag. It is the CHANGELOG at the ref:
-
-  * the ref does not declare `vX.Y` — the release has not landed, so a tag off the ref is a
-    RESERVATION. Listed, never a finding.
-  * the ref does declare `vX.Y` — the release HAS landed, so its tag must be reachable from
-    the commit that landed it. Off the ref, it is ORPHANED, and that is a finding.
-
-One `git merge-base --is-ancestor` cannot make that call on its own; it needs the file to
-say which releases have landed. `reconcile` below is the one place either question is
-answered, because two implementations of "defect or reservation" agree right up until the
-morning one of them is asked about a squash.
-
-## Commands
-
-    release_tag.py reserve  [--repo DIR] [--remote NAME] [--commit REF] [--version vX.Y]
     release_tag.py backfill [--repo DIR] [--ref REF] [--remote NAME] [--push]
     release_tag.py taken    [--repo DIR]
     release_tag.py check    [--repo DIR] [--ref REF]
 
-`backfill` is how the ninety-seven releases that shipped before any of this got tags. It reads the
-CHANGELOG at each commit along `--ref`'s first-parent line and tags every release at the
-commit that first declared it, which is where it landed. It **never moves a tag** — a tag
-that already exists is left exactly where it is, and one pointing somewhere the invariant
-does not hold is REPORTED rather than corrected. A moved tag is worse than an absent one:
-absent, everybody knows they have to look it up; moved, everybody trusts the wrong answer.
+`backfill` is how the ninety-seven releases that shipped before any of this got tags. It reads
+the CHANGELOG at each commit along `--ref`'s first-parent line and tags every release at the
+commit that first declared it, which is where it landed. It **never moves a tag** — a tag that
+already exists is left exactly where it is, and one pointing somewhere the invariant does not
+hold is REPORTED rather than corrected. A moved tag is worse than an absent one: absent,
+everybody knows they have to look it up; moved, everybody trusts the wrong answer.
 
 The tags it writes are annotated, which means it writes an OBJECT, which means git wants to
 know who is tagging. It supplies a tagger itself when the environment cannot name one, so the
 command works on a bare CI runner and not only where somebody remembered to run `git config`
 first (#379). A resolvable identity is never overridden: see `_tagger_env`.
+
+## There is nothing to reserve any more (#122)
+
+`reserve` is deleted. It existed to take `refs/tags/vX.Y` on the remote at PUSH time, as a
+compare-and-swap that succeeded for exactly one lander — the lock a branch-side stamp needed,
+because `max(headings at the base) + 1` is a *reading* of a shared file and two landers
+reading it seconds apart read the same answer.
+
+Branches do not stamp. The number is issued on `main`, after the merge, by
+`scripts/release.py run`, which reads the CHANGELOG at the commit it is about to tag. There is
+no race on `main`, so there is nothing to reserve, nothing to collide, and no separate
+`chore(release)` commit on a branch for a squash merge to discard — which is #406 removed
+rather than detected. `release.py run` creates the tag itself, on the commit it just made;
+`backfill` is the repair for a release that landed without one.
+
+## The tag that is off the ref, and what it means now
+
+Off the integration ref is two things wearing one face, and the CHANGELOG at the ref is what
+separates them:
+
+  * the ref does **not** declare `vX.Y` — the release is not there. Since #122 that means a
+    release cut locally and not yet pushed, or a tag left over from the reservation era.
+    Listed as `reserved`, never a finding: it holds a number nothing else will hand out, and
+    deleting a tag is something this file will not do for the same reason it never moves one.
+  * the ref **does** declare `vX.Y` — the release HAS landed, so its tag must be reachable
+    from the commit that landed it. Off the ref, it is `orphaned`, and that is a finding.
+    `v3.8` shipped that way in the reservation era and every check the repo had reported it
+    as fully tagged, because they asked whether a tag of that NAME resolved (#406).
+
+One `git merge-base --is-ancestor` cannot make that call on its own; it needs the file to say
+which releases have landed. `reconcile` below is the one place either question is answered,
+because two implementations of "defect or leftover" agree right up until the morning one of
+them is asked about a squash.
 
 ## Exit codes
 
@@ -110,8 +65,8 @@ The 1 is the third answer `qb-reconcile` settled the shape for in #255, and it i
 rather than inherited: a doctor that cannot reach the remote must say so, not report a tidy
 repo. Every unexpected exception is mapped to 2 with a sentence, so a bare 1 out of the
 Python interpreter can never be mistaken for the documented one — the same promise
-`release_stamp.py` makes about never exiting 1 at all, kept by a different route because
-this file has a use for the code.
+`release.py` makes about never exiting 1 at all, kept by a different route because this file
+has a use for the code.
 """
 
 from __future__ import annotations
@@ -135,7 +90,7 @@ class Unavailable(Exception):
 
 
 def _load_stamper():
-    """Import `release_stamp.py` from beside this file.
+    """Import `release.py` from beside this file.
 
     `scripts/` is a directory of standalone tools rather than a package, so this is a path
     load and not an import statement. It is worth the awkwardness: what counts as a release
@@ -145,19 +100,19 @@ def _load_stamper():
     first until the day it did not, and the day it did not is the day a tag gets created for
     a release that only ever existed in a code sample.
     """
-    path = Path(__file__).resolve().parent / "release_stamp.py"
+    path = Path(__file__).resolve().parent / "release.py"
     if not path.exists():
         raise TagError(
             f"no {path} beside this script. The release tag is the number the stamper hands "
             "out, and what counts as a release heading is that file's answer, not a second "
             "one kept in step by hand"
         )
-    spec = importlib.util.spec_from_file_location("release_stamp", path)
+    spec = importlib.util.spec_from_file_location("release", path)
     if spec is None or spec.loader is None:  # pragma: no cover - defensive
         raise TagError(f"{path} could not be loaded as a module")
     module = importlib.util.module_from_spec(spec)
     # Registered before it executes: @dataclass resolves annotations through
-    # sys.modules[cls.__module__], and `release_stamp` defines dataclasses at import.
+    # sys.modules[cls.__module__], and `release` defines dataclasses at import.
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
@@ -165,14 +120,14 @@ def _load_stamper():
 
 rs = _load_stamper()
 
-#: A tag this tool owns. `v2`, `v2.96` — the exact spellings `release_stamp.fmt` produces,
+#: A tag this tool owns. `v2`, `v2.96` — the exact spellings `release.fmt` produces,
 #: anchored at both ends so `v2.96-rc1`, `salvage/issue-85` and `v2.96.1` are somebody
 #: else's refs and are left entirely alone. This tool has no opinion about tags it did not
 #: create, and a repo is allowed to have others.
 #:
-#: The stamper's pattern, not a copy of it: `next_release` skips past the numbers these tags
-#: hold, so the two files have to mean the same thing by "release tag" or one of them hands
-#: out a number the other has already locked.
+#: The release tool's pattern, not a copy of it: `next_release` folds the numbers these tags
+#: hold into the same `max`, so the two files have to mean the same thing by "release tag" or
+#: one of them hands out a number the other has already issued.
 _TAG = rs.TAG_NAME
 
 CHANGELOG = "CHANGELOG.md"
@@ -256,7 +211,6 @@ def is_ancestor(repo: Path, older: str, newer: str) -> bool:
     return _git_ok(repo, "merge-base", "--is-ancestor", older, newer)
 
 
-
 def changelog_at(repo: Path, rev: str) -> str | None:
     """CHANGELOG.md at a commit, or None when that commit has none.
 
@@ -281,24 +235,24 @@ def releases_at(repo: Path, rev: str) -> set[rs.Release]:
 def local_tags(repo: Path) -> dict[rs.Release, str]:
     """Every release tag in this checkout, as {release: commit sha}.
 
-    The stamper's own reader, not a second one. `release_stamp.next_release` folds these
+    The release tool's own reader, not a second one. `release.next_release` folds these
     numbers into the counter, so "which tags are release tags" has to have exactly one
     answer: two implementations of that predicate agree until the day one of them reads
     `v2.96-rc1` as a release, and by then a tag exists for a number nothing explains.
     """
     try:
         return rs.tag_releases(repo)
-    except rs.StampError as e:
+    except rs.ReleaseError as e:
         raise TagError(str(e)) from e
 
 
 def remote_tag(repo: Path, remote: str, name: str) -> str | None:
     """The sha `refs/tags/<name>` has ON THE REMOTE right now, or None if it is not there.
 
-    The authority, and the reason `reserve` does not trust the local tag list. A sibling's
-    reservation points at a commit on the sibling's branch, which is not reachable from
-    `main` — and `git fetch <remote>` follows tags only into history it fetched, so a plain
-    fetch does not bring it back. The one place the answer is always current is the remote.
+    The authority. A tag created in another checkout and pushed points at a commit that need
+    not be reachable from `main` — and `git fetch <remote>` follows tags only into history it
+    fetched, so a plain fetch does not bring it back. The one place the answer is always
+    current is the remote.
     """
     proc = _run(repo, "ls-remote", "--tags", "--", remote, f"refs/tags/{name}")
     if proc.returncode != 0:
@@ -346,7 +300,7 @@ def has_remote(repo: Path, remote: str) -> bool:
     return remote in _git(repo, "remote").split()
 
 
-# --------------------------------------------------------------------------- reserve
+# ------------------------------------------------------------------- what a ref declares
 
 
 def newest_release_at(repo: Path, rev: str) -> rs.Release:
@@ -359,132 +313,15 @@ def newest_release_at(repo: Path, rev: str) -> rs.Release:
     text = changelog_at(repo, rev)
     if text is None:
         raise TagError(
-            f"no {CHANGELOG} at {rev[:12]}, so there is no release there to reserve a number "
-            "for. Commit the stamped entry first"
+            f"no {CHANGELOG} at {rev[:12]}, so there is no release there to tag"
         )
     found = rs.releases_in(text, f"{rev}:{CHANGELOG}")
     if not found:
         raise TagError(
-            f"{CHANGELOG} at {rev[:12]} declares no `## vX.Y` release. A branch still "
-            f"carrying `## {rs.PLACEHOLDER}` has no number yet — run `release_stamp.py "
-            "apply --onto origin/main` and commit it, then reserve"
+            f"{CHANGELOG} at {rev[:12]} declares no `## vX.Y` release, so there is no "
+            "number here to tag. Releases are cut on `main` by `release.py run`"
         )
     return max(found)
-
-
-def cmd_reserve(args: argparse.Namespace) -> int:
-    """Take the number, atomically, against the remote.
-
-    The whole mechanism is one `git push` of one ref that does not exist yet. Everything
-    around it is there to produce a message worth reading when that push is rejected —
-    because "rejected (already exists)" is correct and tells a lander nothing about what to
-    do next, and the repair here is genuinely two tokens.
-
-    Without `--version` the number is the newest release the COMMIT declares, which is what a
-    lander has just stamped. On a branch that stamped nothing that is a number it merely
-    inherited — harmless once `backfill` has run, since the tag for a landed release is then
-    an ancestor of every branch and this reports "already ours" without creating anything,
-    and avoided outright by `--onto`, which the pre-push hook always passes.
-    """
-    repo = Path(args.repo).resolve()
-    commit = resolve(repo, args.commit)
-
-    if args.version:
-        m = _TAG.match(args.version)
-        if not m:
-            raise TagError(
-                f"{args.version!r} is not a release number this repo uses. They are spelled "
-                "`v2` and `v2.96` — two components, no prefix, no suffix"
-            )
-        version = rs.release(m.group(1), m.group(2))
-        declared = releases_at(repo, commit)
-        if version not in declared:
-            raise TagError(
-                f"{CHANGELOG} at {args.commit} ({commit[:12]}) does not declare "
-                f"`## {rs.fmt(version)}`. A tag names a release the commit it points at "
-                "actually contains — reserving one it does not would put a number in the "
-                "repository that no document explains"
-            )
-    else:
-        version = newest_release_at(repo, commit)
-
-    name = rs.fmt(version)
-
-    # `--onto` makes this safe to run on EVERY push, which is what puts it in the pre-push
-    # hook rather than in a runbook step somebody has to remember. A branch that stamped
-    # nothing carries the base's newest release as its own newest heading — inherited, not
-    # claimed — and reserving that would be one pointless round-trip per push at best and,
-    # in a repo whose tags are behind, a tag created for a release somebody else landed.
-    # Present at the base means landed, means already somebody's, means nothing to take.
-    if args.onto:
-        onto = resolve(repo, args.onto)
-        if version in releases_at(repo, onto):
-            _say(args, {"version": name, "commit": commit, "state": "nothing-to-reserve"},
-                 f"nothing to reserve: {name} is already at {args.onto} — this commit adds "
-                 "no release number of its own.")
-            return 0
-
-    if not has_remote(repo, args.remote):
-        raise Unavailable(
-            f"no remote named {args.remote!r} in this repo, so {name} cannot be reserved "
-            "against anything. A tag that exists only here reserves nothing — the lock is "
-            "the remote refusing the second create"
-        )
-
-    held = remote_tag(repo, args.remote, name)
-    if held is not None:
-        if held == commit or is_ancestor(repo, held, commit):
-            _say(args, {"version": name, "commit": commit, "held_by": held,
-                        "state": "already-ours"},
-                 f"{name} is already tagged at {held[:12]}, which this commit contains — "
-                 "nothing to reserve.")
-            return 0
-        raise TagError(
-            f"{name} is already reserved on {args.remote}, at {held[:12]}, which is not a "
-            f"commit this branch contains. Another branch stamped {name} and pushed first, "
-            f"so {name} is theirs.\n"
-            f"{_repair(name)}"
-        )
-
-    proc = _run(repo, "push", "--no-verify", "--", args.remote,
-                f"{commit}:refs/tags/{name}")
-    if proc.returncode != 0:
-        # The `ls-remote` above is a courtesy that produces a good message; THIS is the lock.
-        # A rejection here after a clean read is the real race — two landers between the read
-        # and the push — and it is the case the whole file exists for, so it is reported as
-        # the collision it is rather than as a git error.
-        again = None
-        with contextlib.suppress(Unavailable):
-            again = remote_tag(repo, args.remote, name)
-        if again is not None and again != commit:
-            raise TagError(
-                f"{name} was taken on {args.remote} between reading it and creating it — "
-                f"it is at {again[:12]} now. That is two landers in the same second, which "
-                "is the collision this tag exists to make impossible rather than merely "
-                f"unlikely: the create is atomic, so exactly one of you has {name}.\n"
-                f"{_repair(name)}"
-            )
-        raise Unavailable(
-            f"could not create refs/tags/{name} on {args.remote}: "
-            f"{(proc.stderr or proc.stdout).strip() or 'git push failed'}"
-        )
-
-    _say(args, {"version": name, "commit": commit, "held_by": commit, "state": "reserved"},
-         f"reserved {name} at {commit[:12]} on {args.remote} — "
-         f"refs/tags/{name} now exists and cannot be created again.")
-    return 0
-
-
-def _repair(name: str) -> str:
-    return (
-        f"Put THIS branch's entry back to `## {rs.PLACEHOLDER} — …` (and its README bullet "
-        f"back to `- **{rs.PLACEHOLDER}** — …`), then:\n"
-        "    git fetch origin --tags\n"
-        "    scripts/release_stamp.py apply --onto origin/main\n"
-        "    git commit --amend -a\n"
-        "then push again. Nothing on the branch was written in terms of the number, which "
-        "is what makes that a two-token edit rather than a rewrite."
-    )
 
 
 # -------------------------------------------------------------------------- backfill
@@ -608,8 +445,8 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 def cmd_taken(args: argparse.Namespace) -> int:
     """Which numbers are spoken for, according to this checkout's tags.
 
-    Deliberately local and deliberately not the authority — `reserve` is. This answers "what
-    would `release_stamp.py` skip past", which is a question about the refs that are here.
+    Deliberately local and deliberately not the authority — the remote is. This answers "what
+    would `release.py` skip past", which is a question about the refs that are here.
     """
     repo = Path(args.repo).resolve()
     have = local_tags(repo)
@@ -639,7 +476,8 @@ def reconcile(repo: Path, ref: str) -> dict:
                       the release landed, so its tag has to be reachable from where it
                       landed. A squash or rebase merge is how this happens.
     ``reserved``      a tag for a release the ref does NOT declare, pointing off the ref.
-                      Every release in flight looks exactly like this. Never a finding.
+                      A release cut locally and not pushed, or a leftover from before #122
+                      deleted push-time reservation. Never a finding.
 
     ``findings`` is the subset that means something is wrong: `untagged`, `misplaced`,
     `orphaned`. `reserved` is deliberately outside it.
@@ -676,8 +514,9 @@ def reconcile(repo: Path, ref: str) -> dict:
 def _ref_oid(repo: Path, r: rs.Release) -> str:
     """What `refs/tags/vX.Y` itself holds, unpeeled — the value a lease has to expect.
 
-    NOT the peeled commit `tag_releases` reports. A tag `reserve` created is lightweight and
-    the two are the same sha; one `backfill` created is annotated and they are not, and a
+    NOT the peeled commit `tag_releases` reports. A lightweight tag and its commit are the
+    same sha; an annotated one — which `backfill` and `release.py run` both write — is not,
+    and a
     `--force-with-lease` quoting the commit against an annotated tag is refused. Refused
     safely, but the printed remedy is somebody's starting point and it should work.
     """
@@ -712,7 +551,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         f"{len(declared) - len(untagged)}/{len(declared)} release(s) at {args.ref} have a tag",
         f"{sound}/{len(have)} tag(s) point at a commit that declares them",
         f"{len(orphaned)} landed release(s) whose tag is not on {args.ref}",
-        f"{len(reserved)} tag(s) not on {args.ref} (a release in flight, or abandoned)",
+        f"{len(reserved)} tag(s) not on {args.ref} (cut locally and unpushed, or a "
+        "pre-#122 reservation)",
     ]
 
     if args.json:
@@ -729,7 +569,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     for line in lines:
         print(line)
     for x, sha in reserved:
-        print(f"  {rs.fmt(x)} reserved at {sha[:12]}, not merged into {args.ref}")
+        print(f"  {rs.fmt(x)} tagged at {sha[:12]}, not reachable from {args.ref}")
     if untagged:
         print(f"\nSTOP: no tag for {', '.join(rs.fmt(x) for x in untagged)}. That number is "
               "not locked, so nothing stops it being issued twice.\n"
@@ -744,8 +584,8 @@ def cmd_check(args: argparse.Namespace) -> int:
             landed = where.get(x)
             print(f"STOP: {rs.fmt(x)} is tagged at {sha[:12]}, which is NOT on {args.ref} — "
                   f"but {args.ref} declares {rs.fmt(x)}, so it shipped. A squash or rebase "
-                  "merge discards the commit the tag was reserved against and leaves the "
-                  "tag addressing history nobody can reach.\n"
+                  "merge of a branch-side release commit discards the commit the tag named "
+                  "and leaves the tag addressing history nobody can reach.\n"
                   + (f"    It landed at {landed[:12]}. Re-point it deliberately, with a "
                      f"lease so it is atomic:\n"
                      f"        git tag -f {rs.fmt(x)} {landed[:12]}\n"
@@ -787,21 +627,6 @@ def main(argv: list[str] | None = None) -> int:
     def common(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--repo", default=".", help="repo dir (default: cwd)")
         sp.add_argument("--json", action="store_true", help="machine-readable output")
-
-    rv = sub.add_parser("reserve", help="take this commit's release number on the remote")
-    common(rv)
-    rv.add_argument("--remote", default="origin", help="the remote that holds the lock")
-    rv.add_argument("--commit", default="HEAD",
-                    help="the commit to tag (default: HEAD). A commit, not a worktree — the "
-                         "pre-push hook reserves for what is being PUSHED.")
-    rv.add_argument("--version", default=None,
-                    help="the number to reserve (default: the newest release the commit "
-                         "declares)")
-    rv.add_argument("--onto", default=None,
-                    help="do nothing unless the number is one this commit ADDS — i.e. it is "
-                         "not already present at this ref. What makes the command safe to "
-                         "run on every push.")
-    rv.set_defaults(func=cmd_reserve)
 
     bf = sub.add_parser("backfill", help="tag every release that has already landed")
     common(bf)

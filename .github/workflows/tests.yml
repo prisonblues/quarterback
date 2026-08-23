@@ -245,8 +245,8 @@ jobs:
     # a human typed `nix build`, which is how a red `main` went a day without
     # anyone noticing.
     #
-    # For anyone wiring up branch protection: unlike `stamped` below, this job
-    # runs on pull_request as well as push, so it is safe to require.
+    # For anyone wiring up branch protection: this job runs on pull_request as
+    # well as push, so it is safe to require.
     #
     # Same fifteen minutes as the jobs above. No measurement is written down
     # here on purpose. Cold runs have come in around a minute end to end, but the
@@ -370,50 +370,64 @@ jobs:
       - name: nix flake check
         run: nix flake check -L
 
-  stamped:
-    name: no unstamped release on main
-    # `main` only, and that is the whole design rather than an optimisation. An
-    # unstamped `## vNEXT` is the CORRECT state of every branch in flight — the
-    # placeholder is what stops two branches picking the same number — and becomes
-    # a defect at exactly one moment: when it lands. A check running on pull_request
-    # would fire on every release PR in the repo and be switched off within a week,
-    # which is the failure mode `harness/tests/test_release_numbers.py` was written
-    # around and this job is not going to re-invent.
+  generated:
+    name: generated release files are output
+    # `CHANGELOG.md` and the README's release list are written by the release job on `main`
+    # and by nothing else. A branch that edits either conflicts with every sibling that does
+    # the same, at the same offset, over nothing — on 2026-08-23 that was three of six open
+    # PRs, all CONFLICTING, while the three that wrote no release entry all merged clean.
+    # PR #398 landed both ways and settles it: unmergeable stamped, zero conflicts once the
+    # stamp was reverted, same branch, same work, same base (#122).
     #
-    # It is a guard, not the mechanism: `release_stamp.py apply` is meant to run
-    # before the merge, and this is what makes forgetting it visible in the minutes
-    # after rather than in whatever document a reader hits the literal string in.
+    # This is the CI half of a guard that also lives in `harness/githooks/pre-push`, and both
+    # are needed for #343's reason. A local hook cannot see `gh pr merge`; a CI job cannot
+    # stop a bad push; and a hook is per-checkout and best-effort — `qb-hooks` has to have
+    # been run, and this is exactly the class of mechanism that ships uninstalled (#169, five
+    # instances in two days). A guard that only exists in a hook is absent on the machine that
+    # needed it.
     #
-    # The corollary, for anyone wiring up branch protection: do NOT make this a
-    # required status check. The `if` below means it never reports on a
-    # pull_request, and a required check that never reports is not a check — it is
-    # every PR in the repo stuck pending forever, waiting for a run that by design
-    # will not happen. Require `app suite` and `harness suites`, which do run there.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # SAFE TO REQUIRE, for `frozen`'s reason rather than the deleted `stamped` job's: it
+    # reports on every pull request and it cannot cry wolf. A branch that writes a fragment
+    # and nothing else passes by construction, and a branch that is merely BEHIND a release
+    # passes too, because the check is fork-relative. The only way to make it red is to do
+    # the one thing no branch has any business doing.
+    #
+    # The refusal names `changelog.d/<issue>.<kind>.md` — see `release.py cmd_guard`. A worker
+    # that is refused and not told where to write instead retries or works around it, and
+    # both are worse than the original mistake.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
+      # `fetch-depth: 0`. The check is fork-relative and the default depth-1 checkout has no
+      # fork point at all — it would report `limited:` and pass on every run, which is the
+      # shape of a job that reports green while verifying nothing.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check every release on main carries a number
-        run: python3 scripts/release_stamp.py check
+      - name: Check no branch edits a generated release file
+        # Through the environment, never interpolated into the script body: a branch name
+        # arrives from whoever opened the pull request, and `${{ }}` substitution happens
+        # before bash sees the line.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release.py guard --onto "origin/$BASE_REF" --branch HEAD
 
   tagged:
     name: every release on main has a tag
-    # `main` only, like `stamped` above and for a related reason, but this one is a RECORD
-    # rather than a lock and the distinction is the whole of why it exists (#296).
+    # `main` only, and a RECORD rather than a lock. `scripts/release.py run` tags the commit
+    # it creates, so on the normal path every release arrives here already tagged and this
+    # job writes nothing. What it covers is the release cut with `--no-push`, the tag push
+    # that failed after the commit push succeeded, and the ninety-seven releases that shipped
+    # before any of this existed.
     #
-    # The lock is `harness/githooks/pre-push`, which calls `release_tag.py reserve` and takes
-    # `refs/tags/vX.Y` on the remote at the moment the release commit is pushed. A ref create
-    # is compare-and-swap, so exactly one of two landers gets the number and the other is
-    # refused before its branch is anywhere near here. What a hook cannot cover is `git push
-    # --no-verify` and a checkout where the hook was never installed, and neither can be
-    # closed from inside a hook. This job closes them for the RECORD: after the merge, every
-    # release on main gets the tag it should already have had.
-    #
-    # It is not a second allocator and must not be read as one. By the time it runs the merge
-    # has happened, so it can only write down what landed — if two branches both landed
-    # `## v2.96`, `stamped` above is already red and this job has nothing to fix. Calling it
-    # a lock would be the reassuring wrong answer this repo keeps finding.
+    # There is no lock to be, and nothing here should be read as one. Release numbers are
+    # issued on `main`, after the merge, by one caller reading the CHANGELOG at the commit it
+    # is about to tag — there is no race on `main`, so there is nothing to reserve (#122).
+    # The push-time reservation this job used to complement is deleted.
     #
     # `backfill` never moves a tag, so this is idempotent and additive: the usual run creates
     # nothing at all, and where it creates nothing it pushes nothing and needs no write
@@ -430,7 +444,9 @@ jobs:
     # tag that already exists, and "already exists" was the whole of what `every release on
     # main has a tag` meant. v3.8 was squash-merged, the squash discarded the `chore(release)`
     # commit its tag had been reserved against, `refs/tags/v3.8` resolved perfectly to a
-    # commit that is not in main's history at all — and this job was green. So the second step
+    # commit that is not in main's history at all — and this job was green. Branch-side stamp
+    # commits are gone, so that cannot recur; the check stays because a name that is a claim
+    # ought to test the claim. So the second step
     # asks the question the name promises: is the tag an ANCESTOR of the branch it claims to
     # tag. It is one `git merge-base --is-ancestor` per release, and it is what turns a silent
     # inconsistency into a red job in the minutes after the merge.
@@ -453,32 +469,33 @@ jobs:
         run: python3 scripts/release_tag.py backfill --ref HEAD --push
 
       # A tag that is off HEAD is TWO opposite things and this step is the only thing in the
-      # repo that tells them apart. Every release still in flight has a reservation pointing
-      # at a branch commit — v3.9, v3.10 and v3.12 were all legitimately off main on the night
-      # #406 was filed, held by three open pull requests — and flagging those would train
-      # everybody to ignore the row. The discriminator is the CHANGELOG at HEAD: it declares
+      # repo that tells them apart. The discriminator is the CHANGELOG at HEAD: it declares
       # the releases that have LANDED, so a tag off HEAD for a release HEAD declares is an
-      # orphan, and one for a release HEAD does not declare is a reservation. See
-      # `release_tag.reconcile`.
+      # ORPHAN and a finding, while one for a release HEAD does not declare is a release cut
+      # locally and not pushed — or, historically, a reservation — and is never a finding.
+      # See `release_tag.reconcile`.
       - name: Every landed release's tag is on main
         run: python3 scripts/release_tag.py check --ref HEAD
 
   frozen:
     name: no shipped release entry was rewritten
-    # `pull_request` only, and — unlike `stamped` above — that makes this one SAFE to
-    # require: it reports on every pull request, which is the event branch protection
-    # gates on. It is skipped on push-to-main for a mechanical reason rather than a
+    # `pull_request` only, and safe to require: it reports on every pull request, which is
+    # the event branch protection gates on. It is skipped on push-to-main for a mechanical
+    # reason rather than a
     # policy one. The check is fork-relative, and on main the merge base with
     # `origin/main` is HEAD itself, so there is nothing left to compare; the guard for a
     # commit going straight to main is `harness/githooks/pre-push`, which asks the same
     # question before the push, while `origin/main` is still behind.
     #
-    # It cannot cry wolf, which is the property the `stamped` job's comment above says a
-    # PR-triggered check has to have. A branch that does not touch a released entry's text
-    # passes by construction, and the only way to make it red is to change or delete the
-    # notes of a release that already shipped — which is never something a correct branch
-    # does. `## vNEXT` carries no number and is invisible to it, so a release PR is not a
-    # special case here the way it is for `stamped`.
+    # It cannot cry wolf: a branch that does not touch a released entry's text passes by
+    # construction, and the only way to make it red is to change or delete the notes of a
+    # release that already shipped, which is never something a correct branch does.
+    #
+    # `generated` above subsumes it on a pull request — a branch that edits CHANGELOG.md at
+    # all is refused there first, with the fragment path named. This is kept as the second
+    # opinion that guard would need if it were ever misconfigured, and because it is what
+    # `release.py run` asserts about its own writes. A guard deleted because another guard
+    # covers it is how a repo ends up with neither.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -506,7 +523,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          python3 scripts/release_stamp.py frozen --onto "origin/$BASE_REF" --branch HEAD
+          python3 scripts/release.py frozen --onto "origin/$BASE_REF" --branch HEAD
 
   migration-heads:
     name: one migration head after the merge
@@ -520,14 +537,10 @@ jobs:
     # as it is — it is the backstop for anyone pushing a protected branch directly. This
     # job is the same check at the place the merge actually happens (#343, #351).
     #
-    # Unlike `stamped` above, a pull_request trigger is right here, and the difference is
-    # worth stating because the two look alike. That job's comment argues at length that a
-    # pull_request version of ITSELF would fire on every release PR and be switched off
-    # within a week — because an unstamped `## vNEXT` is the CORRECT state of a branch in
-    # flight. Nothing here has that shape. A two-headed graph is never the correct state
-    # of any branch, so there is no legitimate red for anyone to switch this off over.
-    # The corollary for branch protection is `frozen`'s rather than `stamped`'s: this
-    # reports on every pull request, so it is safe to make a required status check.
+    # A pull_request trigger is right here, and the reason is the one every gate in this
+    # file is judged by: can it be red on a correct branch. A two-headed graph is never the
+    # correct state of any branch, so there is no legitimate red for anyone to switch this
+    # off over, and it is safe to make a required status check.
     #
     # WHAT IT DOES NOT CATCH, stated here rather than left for whoever trips it to find
     # out: two UNLANDED branches that each minted the same revision id. Four did on
@@ -674,15 +687,14 @@ jobs:
 
   changelog:
     name: a change that ships carries a release note
-    # `pull_request` only, and safe to require for `frozen`'s reason rather than `stamped`'s:
-    # it reports on every pull request, which is the event branch protection gates on. On a
+    # `pull_request` only, and safe to require: it reports on every pull request, which is
+    # the event branch protection gates on. On a
     # push to main there is nothing left to ask — the fork point of a merged branch is itself,
     # so the diff is empty and the answer would be a vacuous pass. The place to ask is before
     # the merge, which is here.
     #
-    # The `stamped` job's comment above argues that a PR-triggered check which is usually
-    # wrong gets switched off within a week, and that argument is the reason this job's
-    # scoping rule is a function with a forty-line docstring (`_exempt` in
+    # A PR-triggered check that is usually wrong gets switched off within a week, and that
+    # is the reason this job's scoping rule is a function with a forty-line docstring (`_exempt` in
     # `scripts/changelog_fragments.py`) rather than a `git diff --name-only | grep -q`. Run
     # against every pull request merged since fragments existed — thirty-eight of them — it
     # refuses exactly one, and that one is #363, the branch that prompted the issue. A
@@ -702,9 +714,11 @@ jobs:
 
       # Before asking whether a fragment exists, ask whether the ones that do can be read.
       # Nothing in CI ran this until now: a fragment with a `##` heading in its body, or one
-      # naming a version, was caught by the human running `assemble` at land time — which is
-      # the last moment anyone wants to discover it, and one merge queue away from the moment
-      # it is discovered by the release entry coming out wrong.
+      # naming a version, used to be caught by the human assembling the release at land time
+      # — the last moment anyone wants to discover it, and one merge queue away from the
+      # moment it is discovered by the release entry coming out wrong. Now that assembly
+      # happens on `main` after the merge, this is the ONLY place it is caught before it
+      # reaches the release job.
       - name: Check every fragment parses
         run: python3 scripts/changelog_fragments.py check
 

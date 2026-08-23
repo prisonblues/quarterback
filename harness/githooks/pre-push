@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # pre-push hook — the BACKSTOP half of this fleet's migration and release discipline.
 #
-# Three refusals and one CREATE, all computed from the files AT THE PUSHED COMMIT and never
-# from a live database or from whatever happens to be checked out:
+# Three refusals, all computed from the files AT THE PUSHED COMMIT and never from a live
+# database or from whatever happens to be checked out:
 #
 #   1. A protected branch would receive a migration graph that does not have exactly one
 #      head. `alembic upgrade head` refuses to run against a two-headed graph, and the
@@ -11,39 +11,39 @@
 #      files at a ref. Two refusals, not one, because the reconciler has two answers here
 #      and only the first wants a renumber: it counted the heads and the count was not one,
 #      or it DECLINED TO ANSWER and there is no head count to report (#357).
-#   2. A branch that stamped a release number somebody else has since taken. Fork-relative:
-#      the question is whether THIS branch claimed the number, which needs the merge base as
-#      a third reference point. Delegated to the repo's own `release_stamp.py collision`.
+#   2. A branch that edits a file the release job GENERATES — `CHANGELOG.md`, or the
+#      README's release list. Those are output: the release number is applied on `main`
+#      after the merge, by `release.py run`, against the commit that actually exists. A
+#      branch that writes one of them conflicts with every sibling that does the same, over
+#      nothing, and on 2026-08-23 that was three of six open PRs while the three that had
+#      written no release entry all merged clean (#122). Delegated to `release.py guard`,
+#      fork-relative so a branch that is merely BEHIND — and has therefore inherited a
+#      release somebody else cut — passes by construction.
+#      THE REFUSAL NAMES `changelog.d/<issue>.<kind>.md`. A worker told only "no" retries or
+#      works around it, and both are worse than the original mistake.
+#      This is half a guard on its own and is meant to be: a local hook cannot see
+#      `gh pr merge`, and a hook is per-checkout and best-effort — `qb-hooks` has to have
+#      been run. The `generated release files are output` CI job on `pull_request` is the
+#      other half, and neither is sufficient alone (#169, #343).
 #   3. A branch that rewrote or deleted a release entry that had already SHIPPED. A CHANGELOG
 #      conflict resolved by moving a body under the wrong heading leaves every heading present
 #      and correctly ordered, so every check that reads the file as a list of headings passes
 #      while a released entry's prose — the part no diff recovers — is gone (#325).
 #      Fork-relative for the same reason as 2: the merge base holds the shipped text to
-#      compare against, and a branch merely behind has touched nothing. `release_stamp.py
-#      frozen`, and a deliberate edit says so in a `Release-Body-Edit:` commit trailer.
-#   4. THE ONE STEP HERE THAT TAKES SOMETHING RATHER THAN CHECKING IT. Where the pushed
-#      commit adds a release number the base does not have, `release_tag.py reserve` creates
-#      `refs/tags/vX.Y` on the remote — which is a compare-and-swap: it succeeds for exactly
-#      one caller and is rejected for every other, forever. That is the lock #296 says the
-#      release number has never had, and this is the only moment it can be taken. At stamp
-#      time the number is still a reading of a shared file in one worktree; at merge time
-#      the merge is `gh pr merge` through the GitHub API, which runs no local hook at all
-#      (#351's finding, one domain over). At push time the release commit exists, the remote
-#      is right there, and the create either wins or loses cleanly.
-#      It runs LAST and only when 1-3 all passed, because a tag taken for a branch that is
-#      about to be refused is a number nobody can ever use again.
-#      WHAT IT CANNOT AVOID, said here rather than left to be found: a pre-push hook runs
-#      BEFORE the push, so a tag is created for a push git then fails to deliver — a rejected
-#      non-fast-forward, a dropped connection, or a second ref in the same push being refused
-#      after the first was reserved. The tag is then a reservation for a branch that never
-#      arrived. That costs a skipped release number and nothing else: `release_tag.py check`
-#      lists a tag that is not on the integration ref as a reservation rather than a defect,
-#      because that is also what every release still in flight looks like. The alternative is
-#      deleting a tag, which this file will not do for the same reason it never moves one.
-#      A tag off the integration ref for a release that ref DOES declare is a different
-#      animal — the release shipped and a history-rewriting merge orphaned its tag (#406) —
-#      and `release_tag.py check` tells the two apart. Nothing in this hook can: the rewrite
-#      happens at merge time, in GitHub, long after the last local hook has run.
+#      compare against, and a branch merely behind has touched nothing. `release.py frozen`,
+#      and a deliberate edit says so in a `Release-Body-Edit:` commit trailer.
+#      Kept even though 2 subsumes it on a pull request, because 2 could be misconfigured and
+#      a guard deleted because another guard covers it is how a repo ends up with neither.
+#
+# NOTHING HERE TAKES A RELEASE NUMBER ANY MORE. A fourth step used to: where the pushed
+# commit added a release number the base did not have, `release_tag.py reserve` created
+# `refs/tags/vX.Y` on the remote as a compare-and-swap, so the second of two landers was
+# refused rather than merged (#296). It existed because a branch could stamp, and the number
+# a branch stamped was a READING of a shared file rather than a lock. Branches do not stamp;
+# there is no race on `main`; there is nothing to reserve. It also cost #406 — the reserved
+# tag named a branch-side `chore(release)` commit that a squash merge then discarded, leaving
+# `refs/tags/v3.8` pointing at history nobody could reach — and that whole class is gone with
+# it, because a tag applied to a `main` commit has no separate commit to lose.
 #
 # WHY A HOOK AND NOT A RUNBOOK. On 2026-08-22 four branches each minted migration `0029`.
 # Each author ran the reconciler's `preflight`, each got a TRUTHFUL answer, and each
@@ -61,25 +61,24 @@
 #
 # WHERE A CHECK DOES NOT APPLY IT IS SILENT. This ships with the harness and is installed
 # into repos that are neither quarterback nor lexray. No `migrations/versions/` at the
-# pushed commit, no `CHANGELOG.md`, no release stamper in the repo — nothing is printed at
+# pushed commit, no `CHANGELOG.md`, no release tool in the repo — nothing is printed at
 # all, because a warning nobody in that repo can act on is how the whole hook gets
 # uninstalled. Silence here is the difference between a guard that ships everywhere and one
 # that ships once.
 #
 # BYPASSABLE DELIBERATELY, NEVER ACCIDENTALLY.
 #   git push --no-verify                              one push, express
-#   git config --bool qb.prePush.migrationHeads false one repo, recorded, and
-#   git config --bool qb.prePush.releaseNumber  false `qb-hooks status` says so
-#   git config --bool qb.prePush.releaseBodies  false
-#   git config --bool qb.prePush.reserveRelease false
+#   git config --bool qb.prePush.migrationHeads   false one repo, recorded, and
+#   git config --bool qb.prePush.generatedFiles   false `qb-hooks status` says so
+#   git config --bool qb.prePush.releaseBodies    false
 # What must not exist is a path where the hook does not run and nobody notices.
 #
 # WHAT A GREEN RUN DOES AND DOES NOT PROVE. Both checks read the COMMIT being pushed, so a
 # push carrying a bad graph is refused even from a checkout that does not have it. The
-# TOOLS, though — the reconciler, the stamper, the base ref — are read from this checkout,
-# so a checkout whose `origin/main` is a week stale judges the release number against a week
-# old base and can miss a collision that landed since. Fetch freshness is CI's job; this is
-# the cheap guard that catches it at the keyboard.
+# TOOLS, though — the reconciler, the release tool, the base ref — are read from this
+# checkout, so a checkout whose `origin/main` is a week stale judges a branch against a week
+# old base. Fetch freshness is CI's job; this is the cheap guard that catches it at the
+# keyboard.
 #
 # Installed by `qb-hooks install`, which also leaves a `pre-push.delegate` symlink when the
 # machine's managed hooks dir has a pre-push of its own — `core.hooksPath` REPLACES the hooks
@@ -152,11 +151,11 @@ fi
 # ---------------------------------------------------------------------------
 # knobs, all read from git config so a repo can answer for itself
 # ---------------------------------------------------------------------------
-# NOT configurable, deliberately. `release_stamp.py` reads and writes `CHANGELOG.md` by name
+# NOT configurable, deliberately. `release.py` reads and writes `CHANGELOG.md` by name
 # throughout, so a `qb.changelogPath` knob here would only decide which file this hook checks
 # for EXISTENCE before handing the question to a tool that then looks somewhere else — a repo
-# that set it would have every push refused as a tool failure. The stamper owns the path; this
-# reads it rather than repeating it, and there is nothing here to read it from.
+# that set it would have every push refused as a tool failure. The release tool owns the path;
+# this reads it rather than repeating it, and there is nothing here to read it from.
 CHANGELOG="CHANGELOG.md"
 
 VERSIONS=$(git config --get qb.migrationsVersionsPath 2>/dev/null) || VERSIONS=""
@@ -456,23 +455,42 @@ check_migration_heads() {
 }
 
 # ---------------------------------------------------------------------------
-# 2. this branch has not stamped a release number somebody else already took
+# 2. this branch has not edited a file the release job generates
 # ---------------------------------------------------------------------------
-# The complement of the `stamped` CI job, which runs on push-to-main only and is right to:
-# an unstamped `## vNEXT` is the CORRECT state of every branch in flight, so a pull_request
-# version of that check would fire on every release PR and be switched off within a week.
-# It catches LANDED-UNSTAMPED. It structurally cannot catch BRANCH-PRE-STAMPED-ITSELF, which
-# is this one, and the only reason this one can be asked without crying wolf is that it is
-# FORK-RELATIVE: the merge base is what separates "this branch claimed the number" from "this
-# branch is merely behind and inherited it". A branch that never touched the file passes, and
-# has to — the merge takes the base's value cleanly, there being no competing edit.
+# `CHANGELOG.md` and the README's release list are OUTPUT. The release number is applied on
+# the integration branch after the merge, by `release.py run`, against the commit that
+# actually exists — so a branch that writes either of them is writing a file every other
+# branch also has to write, at the same offset, and N such branches in flight is N-choose-2
+# conflicts by construction. On 2026-08-23 that was three of six open PRs, all `CONFLICTING`,
+# while the three that wrote no release entry were all `MERGEABLE` and merged clean (#122).
 #
-# Every branch push, not just protected ones. In this fleet's workflow the merge to main is
-# performed by GitHub, so a check that only ran on push-to-main would never run at all.
-check_release_number() {
-    local branch="$1" sha="$2" stamper py out base base_label
+# The files stay in git — decision (a) on #122 — so `git log CHANGELOG.md` keeps working and
+# a reader offline keeps the history. The guard is the mechanism, not the file's absence:
+# "exists but is refused" is enforceable here and in CI, where "does not exist" is
+# enforceable nowhere, because nothing stops a branch creating a file.
+#
+# FORK-RELATIVE, which is what lets this run on every push. A branch that is merely behind
+# has inherited whatever release the base cut and has touched nothing; comparing against the
+# base itself would refuse every branch that was open while a release landed, and that gate
+# is switched off within a week.
+check_generated_files() {
+    local branch="$1" sha="$2" tool py out base base_label rc
 
-    stamper=$(find_tool QB_RELEASE_STAMP qb.releaseStamp scripts/release_stamp.py) || return 0
+    tool=$(find_tool QB_RELEASE qb.release scripts/release.py) || return 0
+
+    # THE INTEGRATION BRANCH IS WHERE THESE FILES ARE WRITTEN, so a push of it is the one
+    # push this must never refuse. `release.py run` commits the release on `main` and pushes
+    # it, and that push runs this hook — a guard that refused it would make cutting a release
+    # impossible from any checkout with hooks installed, which is every checkout `qb-hooks`
+    # has touched. It would also be asking a question with no answer: on the integration
+    # branch the fork point with its own remote is HEAD, so there is nothing to compare.
+    #
+    # What still covers a direct push to `main` is check 2b, which compares the TEXT of
+    # released entries against `origin/main` while it is still behind. Appending a release is
+    # not something it can see; rewriting one is.
+    if [[ "$branch" == "$BASE_BRANCH" ]]; then
+        return 0
+    fi
 
     base="$BASE_REF"
     base_label="${BASE_REF#refs/remotes/}"
@@ -481,25 +499,26 @@ check_release_number() {
         base_label="$BASE_BRANCH (as this push would leave it)"
     fi
 
-    # No base to collide with, no CHANGELOG at either end, or a repo that does not ship the
-    # stamper: the convention this guards is not in use here. Silent.
+    # No base to be judged against, or a repo with no CHANGELOG at the base: the convention
+    # this guards is not in use here. Silent, like every check in this file where the
+    # question does not apply.
     #
     # Silent, that is, unless the operator NAMED a base. Then its absence is a check that was
     # asked for and cannot run, which is the one thing this hook must never do quietly.
     #
     # `-z "$BASE_IN_PUSH"` is load-bearing: when the configured base is itself part of this
     # push — its own first push, into a remote that has never had it — `base` is empty for
-    # that ref by construction (it is not compared with itself), and refusing there would
-    # refuse the one push that creates the branch the refusal asks you to fetch.
+    # that ref by construction, and refusing there would refuse the one push that creates the
+    # branch the refusal asks you to fetch.
     if [[ -z "$base" ]]; then
         if [[ -n "$BASE_CONFIGURED" && -z "$BASE_IN_PUSH" ]] \
             && git cat-file -e "$sha:$CHANGELOG" 2>/dev/null; then
             refuse \
                 "REFUSE: qb.baseBranch names '$BASE_CONFIGURED', and neither" \
                 "        refs/remotes/$remote/$BASE_CONFIGURED nor a push of that branch is" \
-                "        here, so a pre-stamped release cannot be checked for. An unrunnable" \
-                "        gate is not a passing gate — and silently checking against some" \
-                "        other branch would be worse still." \
+                "        here, so an edit to a generated release file cannot be checked for." \
+                "        An unrunnable gate is not a passing gate — and silently checking" \
+                "        against some other branch would be worse still." \
                 "" \
                 "        Fetch it:  git fetch $remote $BASE_CONFIGURED" \
                 "        Or bypass this one push:  git push --no-verify"
@@ -508,83 +527,77 @@ check_release_number() {
         return 0
     fi
 
-    git cat-file -e "$sha:$CHANGELOG" 2>/dev/null || return 0
     git cat-file -e "$base:$CHANGELOG" 2>/dev/null || return 0
 
     if ! py=$(find_python); then
         refuse \
-            "REFUSE: this repo stamps release numbers ($stamper) and no Python interpreter is" \
-            "        on PATH, so a pre-stamped release cannot be checked for. An unrunnable" \
-            "        gate is not a passing gate." \
+            "REFUSE: this repo generates its release notes ($tool) and no Python interpreter" \
+            "        is on PATH, so an edit to a generated file cannot be checked for. An" \
+            "        unrunnable gate is not a passing gate." \
             "        Install python3, or bypass this one push: git push --no-verify"
         return 1
     fi
 
-    # Same split as the graph check, and for the same reason. 2 is the stamper's documented
-    # "stop" and its message is the substance — it says WHICH of the collision shapes this is
-    # and names the next free number. Anything else is the tool failing to answer, and
-    # reporting that as a confirmed collision would send the reader to unstamp an entry that
-    # was never the problem.
-    local rc
-    out=$("$py" "$stamper" collision --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
+    # 2 is the tool's documented STOP and its message IS the substance — it names which file
+    # was edited, the fragment path to write instead, and the `git checkout` that undoes it.
+    # Printed rather than paraphrased for that reason: a refusal a reader has to translate is
+    # a refusal they route around.
+    out=$("$py" "$tool" guard --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
     rc=$?
     if (( rc == 2 )); then
         refuse \
-            "REFUSE: the release number $branch carries is one the stamper refuses against" \
+            "REFUSE: $branch edits a file the release job generates, judged against" \
             "        $base_label:" \
             "" \
             "$(printf '%s\n' "$out" | sed 's/^/          /')" \
-            "" \
-            "        Where that is a number this branch stamped and the base has since taken," \
-            "        the repair is two tokens: put THIS branch's entry back to the" \
-            "        placeholder and re-stamp." \
-            "            $py $stamper apply --onto ${BASE_REF:+${BASE_REF#refs/remotes/}}" \
             "" \
             "        Deliberate? git push --no-verify"
         return 1
     elif (( rc != 0 )); then
         refuse \
-            "REFUSE: the release-number check could not run (exit $rc), so this push of" \
+            "REFUSE: the generated-file check could not run (exit $rc), so this push of" \
             "        $branch is unverified rather than clean. An unrunnable gate is not a" \
             "        passing gate." \
             "" \
             "$(printf '%s\n' "$out" | sed 's/^/          /')" \
             "" \
             "        The command that failed:" \
-            "            $py $stamper collision --onto $base --branch $sha" \
+            "            $py $tool guard --onto $base --branch $sha" \
             "" \
             "        Deliberate? git push --no-verify"
         return 1
     fi
 
-    # The stamper says `limited:` when it could not read the fork point, and a check that
-    # covered less than it advertises has to say which. Silence would report the strong
-    # answer for the weak one.
+    # The tool says `limited:` when it could not read the fork point, and a check that covered
+    # less than it advertises has to say which. Silence would report the strong answer for the
+    # weak one.
     if [[ "$out" == limited:* || "$out" == *$'\n'limited:* ]]; then
-        notes+=("release-number check LIMITED against $base_label — no merge base, so only \
-duplicate headings were checked")
+        notes+=("generated-file check LIMITED against $base_label — no merge base, so \
+nothing was compared")
     else
-        notes+=("no release-number collision with $base_label")
+        notes+=("no generated release file edited since $base_label")
     fi
     return 0
 }
 
+
 # ---------------------------------------------------------------------------
 # 3. this branch has not rewritten or deleted a release that already shipped
 # ---------------------------------------------------------------------------
-# The half neither check above can do. Both of them read the CHANGELOG as a LIST OF NUMBERS —
-# is one missing, is one repeated, did this branch claim one somebody took — and the failure
-# this catches leaves the numbers perfect: a conflict resolved by relocating a body under an
-# existing heading, which deleted a shipped release's notes and passed every guard in the
-# repo for two days on an open PR (#325).
+# The half check 2 could miss. That one asks WHETHER the file was touched; this one asks what
+# the touch DID, and the two answer differently in the one place it matters: a repo that has
+# turned check 2 off, or a base whose fork point check 2 could not read, still has released
+# prose to protect. The failure it catches leaves every heading perfect — a conflict resolved
+# by relocating a body under an existing heading, which deleted a shipped release's notes and
+# passed every guard in the repo for two days on an open PR (#325).
 #
 # Same base as the number check, same fork-relative reasoning, and the same "silent where it
 # does not apply". A branch that never opens CHANGELOG.md passes by construction, which is
 # what lets this run on every push rather than on the protected ones.
 check_release_bodies() {
-    local branch="$1" sha="$2" stamper py out base base_label rc
+    local branch="$1" sha="$2" reltool py out base base_label rc
 
-    stamper=$(find_tool QB_RELEASE_STAMP qb.releaseStamp scripts/release_stamp.py) || return 0
+    reltool=$(find_tool QB_RELEASE qb.release scripts/release.py) || return 0
 
     base="$BASE_REF"
     base_label="${BASE_REF#refs/remotes/}"
@@ -595,8 +608,8 @@ check_release_bodies() {
 
     # No base, no CHANGELOG at either end: there is no shipped text to compare against, so
     # there is no question here to ask. Unlike the number check this stays quiet even when a
-    # base was NAMED and is missing — that refusal already fires from check_release_number on
-    # the identical condition, and a second copy of it would refuse one push with two
+    # base was NAMED and is missing — that refusal already fires from check_generated_files
+    # on the identical condition, and a second copy of it would refuse one push with two
     # paragraphs saying the same thing.
     [[ -n "$base" ]] || return 0
     # The BASE is what decides whether this applies, and only the base. Asking the pushed
@@ -615,7 +628,7 @@ check_release_bodies() {
         return 1
     fi
 
-    out=$("$py" "$stamper" frozen --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
+    out=$("$py" "$reltool" frozen --repo "$TOPLEVEL" --onto "$base" --branch "$sha" 2>&1)
     rc=$?
     if (( rc == 2 )); then
         refuse \
@@ -625,8 +638,9 @@ check_release_bodies() {
             "$(printf '%s\n' "$out" | sed 's/^/          /')" \
             "" \
             "        This is almost always a CHANGELOG conflict resolved by moving a body" \
-            "        under the wrong heading. Restore the shipped entry from the base and" \
-            "        put your own entry back above it." \
+            "        under the wrong heading. Restore the shipped entry from the base — and" \
+            "        note that a branch has no entry of its own to put back above it: write" \
+            "        changelog.d/<issue>.<kind>.md instead." \
             "" \
             "        Deliberate? git push --no-verify"
         return 1
@@ -639,13 +653,13 @@ check_release_bodies() {
             "$(printf '%s\n' "$out" | sed 's/^/          /')" \
             "" \
             "        The command that failed:" \
-            "            $py $stamper frozen --onto $base --branch $sha" \
+            "            $py $reltool frozen --onto $base --branch $sha" \
             "" \
             "        Deliberate? git push --no-verify"
         return 1
     fi
 
-    # `limited:` is the stamper saying it had no fork point and therefore compared nothing.
+    # `limited:` is the release tool saying it had no fork point and therefore compared nothing.
     # Reported for the same reason the number check reports it: a gate that covered less than
     # it advertises has to say so, or the weak answer reads as the strong one.
     if [[ "$out" == limited:* || "$out" == *$'\n'limited:* ]]; then
@@ -660,78 +674,6 @@ shipped text to compare with")
 }
 
 # ---------------------------------------------------------------------------
-# 4. this branch's release number is TAKEN, on the remote, atomically
-# ---------------------------------------------------------------------------
-# The only step in this hook that changes anything, and the only one that is a lock rather
-# than a check. `release_stamp.py` hands out `max(headings at the base) + 1`, which is a
-# READING of a shared file — two landers seconds apart read the same answer, which is the
-# collision the three checks above can only report afterwards. `git push <remote>
-# <sha>:refs/tags/v2.96` is compare-and-swap: one caller creates it, everybody else is
-# rejected, and nothing has to be remembered for that to hold.
-#
-# `--onto` is what makes this safe on EVERY push rather than on release pushes only: a
-# branch whose newest heading is one it INHERITED reserves nothing and says so. So a repo's
-# ordinary feature-branch pushes are one subprocess and no network write.
-#
-# NOT A REFUSAL WHEN IT CANNOT RUN, which is the one place this file departs from "an
-# unrunnable gate is not a passing gate" — and the exception is principled rather than
-# convenient. That rule is about a CHECK reporting clean over a question it never asked.
-# This asks nothing. A reservation that could not be made leaves the repository in exactly
-# the state the three checks above found and passed it in, so there is nothing to be wrong
-# about; what there is instead is a number still unlocked, and that is reported as a note on
-# the push rather than hidden. Refusing here would mean a remote that is briefly unreachable
-# blocks a push that is provably fine.
-reserve_release_number() {
-    local branch="$1" sha="$2" tagger py out rc base
-
-    tagger=$(find_tool QB_RELEASE_TAG qb.releaseTag scripts/release_tag.py) || return 0
-
-    base="$BASE_REF"
-    if [[ -n "$BASE_IN_PUSH" && "$branch" != "$BASE_BRANCH" ]]; then
-        base="$BASE_IN_PUSH"
-    fi
-    # No base to be "new relative to", or no CHANGELOG at either end: this repo either does
-    # not use the convention or there is nothing here to reserve. Silent, like every other
-    # check in this file where the question does not apply.
-    [[ -n "$base" ]] || return 0
-    git cat-file -e "$sha:$CHANGELOG" 2>/dev/null || return 0
-    git cat-file -e "$base:$CHANGELOG" 2>/dev/null || return 0
-
-    if ! py=$(find_python); then
-        notes+=("release number NOT reserved — no Python interpreter on PATH")
-        return 0
-    fi
-
-    out=$("$py" "$tagger" reserve --repo "$TOPLEVEL" --remote "$remote" --commit "$sha" \
-        --onto "$base" 2>&1)
-    rc=$?
-
-    # 2 is the tagger's documented STOP and it means one thing here: somebody else holds this
-    # number. That IS a refusal — pushing anyway lands a second branch on a number a tag says
-    # is taken, which is the exact state this whole mechanism exists to prevent, and it is
-    # cheaper to fix now than after the merge turns main red.
-    if (( rc == 2 )); then
-        refuse \
-            "REFUSE: the release number $branch carries has already been reserved by another" \
-            "        branch, on $remote:" \
-            "" \
-            "$(printf '%s\n' "$out" | sed 's/^/          /')" \
-            "" \
-            "        A release tag can only be created once, so that number is theirs and" \
-            "        this branch needs the next one." \
-            "" \
-            "        Deliberate? git push --no-verify"
-        return 1
-    fi
-    if (( rc != 0 )); then
-        notes+=("release number NOT reserved on $remote — $(printf '%s' "$out" | head -n1)")
-        return 0
-    fi
-    notes+=("$(printf '%s' "$out" | head -n1)")
-    return 0
-}
-
-# ---------------------------------------------------------------------------
 for index in "${!push_branches[@]}"; do
     branch="${push_branches[$index]}"
     sha="${push_shas[$index]}"
@@ -739,27 +681,13 @@ for index in "${!push_branches[@]}"; do
     if is_protected "$branch" && enabled qb.prePush.migrationHeads; then
         check_migration_heads "$branch" "$sha"
     fi
-    if enabled qb.prePush.releaseNumber; then
-        check_release_number "$branch" "$sha"
+    if enabled qb.prePush.generatedFiles; then
+        check_generated_files "$branch" "$sha"
     fi
     if enabled qb.prePush.releaseBodies; then
         check_release_bodies "$branch" "$sha"
     fi
 done
-
-# A SECOND pass, and only when the first one found nothing. A tag is permanent — the whole
-# reason it can be a lock — so taking one for a branch that is about to be refused burns a
-# release number nobody can ever use, on a push that never happened.
-if (( refusals == 0 )) && enabled qb.prePush.reserveRelease; then
-    for index in "${!push_branches[@]}"; do
-        # STOP at the first refusal. Once one ref of a multi-ref push is refused the whole
-        # push is aborted, so every number taken after that point is taken for a push that
-        # will not happen. It cannot be made all-or-nothing — a tag already created is not
-        # something this file will delete, for the same reason it never moves one — so the
-        # window is narrowed to the refs already done rather than left open across the rest.
-        reserve_release_number "${push_branches[$index]}" "${push_shas[$index]}" || break
-    done
-fi
 
 if (( refusals > 0 )); then
     printf '\n%s\n\n' "Nothing was pushed." >&2

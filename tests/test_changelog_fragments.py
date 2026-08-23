@@ -228,16 +228,36 @@ def test_one_untitled_fragment_with_no_title_given_is_refused(repo):
 
 
 # ---------------------------------------------------------------------------
-# assembly
+# assembly, which only the release job calls
+#
+# `assemble` used to be a subcommand and every brief in the repo told a worker to run it —
+# which is how a branch came to carry a release entry, and then a number, and then a conflict
+# with every sibling doing the same (#122). The functions stayed; the door out of them is now
+# `release.py run`, on `main`, after the merge. So these call them directly.
 # ---------------------------------------------------------------------------
+
+
+def assemble(repo: Path, title: str | None = None, version: str = "v2.2") -> None:
+    """What `release.py run` does with these four functions, in the order it does it."""
+    fragments = cf.load(repo)
+    heading = cf.release_title(fragments, title)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    readme = (repo / "README.md").read_text(encoding="utf-8")
+    changelog = cf.insert_entry(changelog, cf.entry(fragments, heading, version))
+    (repo / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    (repo / "README.md").write_text(
+        cf.insert_bullet(readme, changelog, heading, version), encoding="utf-8")
+    for f in fragments:
+        f.path.unlink()
+
 
 def test_one_fragment_becomes_the_entry_and_lends_it_its_title(repo):
     fragment(repo, "296.feat.md", BODY)
-    assert cf.main(["assemble", "--repo", str(repo)]) == 0
+    assemble(repo)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
     assert changelog.startswith(
         "# Version history\n\nEntries are newest first.\n\n"
-        "## vNEXT — a branch stops guessing\n\n"
+        "## v2.2 — a branch stops guessing\n\n"
         "What was broken before this: the thing.\n\n"
         "## v2.1 — dev context\n")
 
@@ -245,76 +265,47 @@ def test_one_fragment_becomes_the_entry_and_lends_it_its_title(repo):
 def test_several_fragments_become_sub_sections_of_one_entry(repo):
     fragment(repo, "296.feat.md", "# the renderer\n\nWhy the renderer.\n")
     fragment(repo, "298.fix.md", "# the seats\n\nWhy the seats.\n")
-    assert cf.main(["assemble", "--repo", str(repo), "--title", "two things"]) == 0
+    assemble(repo, "two things")
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert "## vNEXT — two things\n\n### the renderer\n\nWhy the renderer.\n" in changelog
+    assert "## v2.2 — two things\n\n### the renderer\n\nWhy the renderer.\n" in changelog
     assert "### the seats\n\nWhy the seats.\n" in changelog
 
 
 def test_the_bullet_lands_where_the_renderer_puts_it(repo):
-    """The README bullet and the CHANGELOG entry are written by one command, so they cannot
-    disagree about whether this release exists — which is what
-    `test_the_changelog_and_the_readme_are_unstamped_together` asserts after the fact."""
+    """The README bullet and the CHANGELOG entry are written in one pass, so they cannot
+    disagree about whether this release exists."""
     fragment(repo, "296.feat.md", BODY)
-    cf.main(["assemble", "--repo", str(repo)])
+    assemble(repo)
     readme = (repo / "README.md").read_text(encoding="utf-8")
     assert ("- **v2.1** — dev context.\n"
-            "- **vNEXT** — a branch stops guessing.\n"
+            "- **v2.2** — a branch stops guessing.\n"
             "- **Not yet numbered** — a roadmap item.\n") in readme
 
 
 def test_assembly_consumes_the_fragments(repo):
     fragment(repo, "296.feat.md", BODY)
-    cf.main(["assemble", "--repo", str(repo)])
+    assemble(repo)
     assert list((repo / cf.FRAGMENT_DIR).iterdir()) == []
 
 
-def test_keep_leaves_them_alone(repo):
-    fragment(repo, "296.feat.md", BODY)
-    cf.main(["assemble", "--repo", str(repo), "--keep"])
-    assert [p.name for p in (repo / cf.FRAGMENT_DIR).iterdir()] == ["296.feat.md"]
-
-
-def test_a_dry_run_writes_nothing(repo):
-    fragment(repo, "296.feat.md", BODY)
-    assert cf.main(["assemble", "--repo", str(repo), "--dry-run"]) == 0
-    assert (repo / "CHANGELOG.md").read_text(encoding="utf-8") == CHANGELOG
-    assert (repo / "README.md").read_text(encoding="utf-8") == README
-    assert [p.name for p in (repo / cf.FRAGMENT_DIR).iterdir()] == ["296.feat.md"]
-
-
-def test_assembling_nothing_is_a_noop_and_not_a_refusal(repo):
-    """`assemble` is meant to be safe to run unconditionally before landing, beside
-    `release_stamp.py apply`, and most branches ship no release."""
-    assert cf.main(["assemble", "--repo", str(repo)]) == 0
-    assert (repo / "CHANGELOG.md").read_text(encoding="utf-8") == CHANGELOG
-
-
-def test_assembling_twice_is_refused_rather_than_writing_a_second_entry(repo, capsys):
-    """Two `## vNEXT` headings is a state `release_stamp.py apply` resolves by stamping BOTH
-    with the same number — one release documented twice, which is the collision the
-    placeholder exists to prevent. Refused here, before the commit, rather than by
-    `test_at_most_one_release_is_unstamped` after it.
-
-    The MESSAGE is asserted, not just the exit code. Delete this refusal and the run still
-    ends at 2 with one heading in the file, because the README renderer then refuses the
-    second `vNEXT` bullet as a release covered twice — a correct outcome reached from the
-    wrong file, with advice about the README for a defect in the CHANGELOG."""
-    fragment(repo, "296.feat.md", BODY)
-    cf.main(["assemble", "--repo", str(repo)])
-    capsys.readouterr()
-    fragment(repo, "298.fix.md", BODY)
-    assert cf.main(["assemble", "--repo", str(repo)]) == 2
-    assert "CHANGELOG.md already carries an unstamped" in capsys.readouterr().err
-    assert (repo / "CHANGELOG.md").read_text(encoding="utf-8").count("## vNEXT") == 1
-
-
 def test_a_changelog_with_no_entries_is_refused(tmp_path):
-    (tmp_path / "CHANGELOG.md").write_text("# Version history\n\nNothing yet.\n", encoding="utf-8")
+    """There is no list to put a release at the top of, and inventing the first entry from a
+    fragment would be this tool guessing what the file is."""
+    (tmp_path / "CHANGELOG.md").write_text("# Version history\n\nNothing yet.\n",
+                                           encoding="utf-8")
     (tmp_path / "README.md").write_text(README, encoding="utf-8")
     (tmp_path / cf.FRAGMENT_DIR).mkdir()
     fragment(tmp_path, "296.feat.md", BODY)
-    assert cf.main(["assemble", "--repo", str(tmp_path)]) == 2
+    with pytest.raises(cf.FragmentError) as e:
+        assemble(tmp_path)
+    assert "no `## ` release entry" in str(e.value)
+
+
+def test_there_is_no_assemble_subcommand_left(repo, capsys):
+    """A stale brief gets `invalid choice`, which is the loudest thing a removal can say."""
+    with pytest.raises(SystemExit):
+        cf.main(["assemble", "--repo", str(repo)])
+    assert "invalid choice" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -555,46 +546,28 @@ def test_a_fragment_the_base_already_carries_is_not_this_branchs_entry(branched)
     assert required(branched) == 2
 
 
-def test_a_hand_written_release_entry_satisfies_it(branched, capsys):
-    """The CHANGELOG's own convention paragraph still allows one, and it is also what a
-    branch looks like after `assemble` has run on it at land time."""
+def test_a_hand_written_release_entry_does_not_satisfy_it(branched, capsys):
+    """It used to, and it must not now (#122). `release.py guard` refuses a branch that edits
+    `CHANGELOG.md` at all, so an entry written there is not a second way to pass this check —
+    it is a separate refusal with its own remedy. Crediting it here would let a branch satisfy
+    the note requirement by doing the one thing the guard exists to stop, and the two gates
+    would then disagree about the same commit."""
     write(branched, "app/main.py", "VERSION = '2.2'\n")
     write(branched, "CHANGELOG.md", BASE_CHANGELOG.replace(
-        "## v2.1", "## vNEXT — a thing\n\nIt was missing.\n\n## v2.1", 1))
+        "## v2.1", "## v2.2 — a thing\n\nIt was missing.\n\n## v2.1", 1))
     commit(branched, "feat(app): something")
-    assert required(branched) == 0
-    assert "vNEXT" in capsys.readouterr().out
+    assert required(branched) == 2
+    assert f"{cf.FRAGMENT_DIR}/<issue>.<kind>.md" in capsys.readouterr().err
 
 
-def test_an_unstamped_entry_on_the_base_does_not_hide_this_branchs_own(branched):
-    """A base may legitimately carry a `## vNEXT` — a stacked PR onto an epic branch, and
-    main itself did on 2026-08-21. Comparing placeholders by NAME made that base's entry
-    swallow the branch's, which is how #302 read as entry-less when it had assembled one."""
-    git(branched, "checkout", "-q", "main")
-    write(branched, "CHANGELOG.md", BASE_CHANGELOG.replace(
-        "## v2.1", "## vNEXT — theirs\n\nTheir body.\n\n## v2.1", 1))
-    commit(branched, "docs(changelog): an entry in flight on the base")
-    git(branched, "checkout", "-q", "work")
+def test_an_unrelated_changelog_edit_is_no_substitute_for_a_fragment(branched):
+    """A branch that touched `CHANGELOG.md` for some other reason — a typo in the preamble, a
+    `Release-Body-Edit` correction — has still written no release note, and the file it edited
+    is one `guard` will refuse it for separately."""
     write(branched, "app/main.py", "VERSION = '2.2'\n")
-    write(branched, "CHANGELOG.md", BASE_CHANGELOG.replace(
-        "## v2.1", "## vNEXT — mine\n\nMy body.\n\n## v2.1", 1))
-    commit(branched, "feat(app): something")
-    assert required(branched) == 0
-
-
-def test_an_unrelated_changelog_edit_does_not_borrow_the_bases_unstamped_entry(branched):
-    """The placeholder cannot be credited by NAME. A base carrying a `## vNEXT` of its own and
-    a branch that touched `CHANGELOG.md` for some other reason — a typo in the preamble, a
-    `Release-Body-Edit` correction — would otherwise pass on the base's in-flight entry."""
-    git(branched, "checkout", "-q", "main")
-    write(branched, "CHANGELOG.md", BASE_CHANGELOG.replace(
-        "## v2.1", "## vNEXT — theirs\n\nTheir body.\n\n## v2.1", 1))
-    commit(branched, "docs(changelog): an entry in flight on the base")
-    git(branched, "checkout", "-q", "work")
-    git(branched, "merge", "-q", "--no-edit", "main")
-    write(branched, "app/main.py", "VERSION = '2.2'\n")
-    write(branched, "CHANGELOG.md", (branched / "CHANGELOG.md").read_text(encoding="utf-8")
-          .replace("Entries are newest first.", "Entries are newest first (oldest last)."))
+    write(branched, "CHANGELOG.md",
+          BASE_CHANGELOG.replace("Entries are newest first.",
+                                 "Entries are newest first (oldest last)."))
     commit(branched, "feat(app): something, and a preamble typo")
     assert required(branched) == 2
 
@@ -680,7 +653,7 @@ def test_the_verdict_is_available_as_json(branched, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["ok"] is False
     assert payload["ships"] == ["app/main.py"]
-    assert payload["fragments"] == [] and payload["headings"] == []
+    assert payload["fragments"] == []
     assert cf._EXEMPT_KEY in payload["refusal"]
 
 

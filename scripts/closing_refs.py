@@ -44,7 +44,7 @@ conflict. Only `Refs` with no `Fixes`/`Closes` anywhere is a contradiction.
 
 Silence is not free, though, and it is not nothing: an OPEN issue the merge would close that
 no commit on the branch mentions is reported as `unclaimed:` and the job raises a
-`::warning::` for it — the third state `changelog_fragments.required` and `release_stamp.py
+`::warning::` for it — the third state `changelog_fragments.required` and `release.py
 frozen` already use for "passed, and say so out loud". Refusing it was considered: #207
 closed #174 on a body keyword alone and was right to, and across eighty merged pull requests
 that is one of two, so the rule would be correct most of the time — which is exactly how the
@@ -93,7 +93,7 @@ has that shape today — every PR here is opened from a branch its author can am
 ## Exit codes
 
 0 = go · 2 = STOP, a human decides. The same scheme as `scripts/migration_reconcile.py` and
-`scripts/release_stamp.py`, and for their reason: a caller reading 0/2 takes Python's
+`scripts/release.py`, and for their reason: a caller reading 0/2 takes Python's
 uncaught-exception 1 as "unknown", so every refusal here is an explicit 2 with a sentence.
 
 Usage:
@@ -145,7 +145,7 @@ def _line(keywords: str, indent: str) -> re.Pattern[str]:
 #: The indentation rule is ASYMMETRIC, and deliberately: a closing line must start at column
 #: zero, a reference line may be indented. Which side is strict follows from which direction
 #: costs an issue. A match on the closing side is what makes this check PASS, so a `Fixes #N`
-#: found inside quoted text would be consent granted by a paste — `release_stamp.py`'s
+#: found inside quoted text would be consent granted by a paste — `release.py`'s
 #: `Release-Body-Edit` comment is about exactly that, and the refusal below is the likeliest
 #: text this branch will ever quote. A match on the referencing side only ever refuses, so
 #: reading an indented one costs a red check that a `Fixes #N` at column zero clears.
@@ -273,7 +273,7 @@ def unclaimed(message: str, closing: list[tuple[int, str]]) -> list[int]:
     """Open issues the merge would close that NO commit on this branch mentions at all.
 
     Not a refusal, and not silence either — the third thing `changelog_fragments.required`
-    and `release_stamp.py frozen` both already do with a `waived:` line: report it, pass, and
+    and `release.py frozen` both already do with a `waived:` line: report it, pass, and
     make the job say it out loud. The job turns this into a `::warning::`, which is read in
     the checks panel where a green log is not.
 
@@ -374,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
     ck.add_argument(
         "--branch", default="HEAD",
         help="the ref being judged (default: HEAD). A commit, not a worktree — the same "
-        "reason as `release_stamp.py frozen`: a gate judges what is being merged.")
+        "reason as `release.py frozen`: a gate judges what is being merged.")
     ck.add_argument(
         "--closes", default="-",
         help="GitHub's GraphQL answer for this PR's closingIssuesReferences; `-` is stdin")

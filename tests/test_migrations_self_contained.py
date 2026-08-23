@@ -322,8 +322,8 @@ def _probe(tmp_path: Path, source: str) -> Path:
             id="module-level-from-import-aliased",
         ),
         pytest.param(
-            "import scripts.release_stamp\n",
-            "import scripts.release_stamp",
+            "import scripts.release\n",
+            "import scripts.release",
             id="another-first-party-package",
         ),
         pytest.param(

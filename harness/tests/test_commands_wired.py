@@ -176,46 +176,81 @@ def _fenced(text: str) -> str:
         re.findall(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", text, re.DOTALL | re.MULTILINE))
 
 
-def test_fix_and_review_does_not_stamp_the_release_number():
-    """`apply` resolves `vNEXT` against the base as it stands NOW, and this command hands the PR to
-    a human who merges later — so a number stamped here can be taken in the meantime, leaving
-    `apply` refusing with a hand-edit as the repair. `preflight` asks the same question and spends
-    nothing."""
+def test_no_brief_tells_an_agent_to_stamp_a_release():
+    """The most important assertion in this file, and the one #122 is a report about.
+
+    Five agents stamped in one night and every one of them was following a document. A
+    mechanism removed from the code and left in the brief has not been removed — the code
+    refuses, the agent retries or works around it, and the refusal is what looks broken. So
+    this pins the CODE BLOCKS of every brief the harness ships: prose may explain what used to
+    happen and why it does not any more, and a fence may not carry the command.
+    """
+    forbidden = (
+        r"release_stamp\.py",                       # the tool itself, gone since #122
+        r"changelog_fragments\.py\"?\s+assemble",    # the branch-side entry builder
+        r"release_tag\.py\"?\s+reserve",             # the push-time number reservation
+        r"release\.py\"?\s+run",                     # the release job — `main` only, never a brief
+    )
+    for name in sorted(_shipped()):
+        runnable = _fenced(command(name))
+        for pattern in forbidden:
+            assert not re.search(pattern, runnable), (
+                f"{name}.md has a code block running `{pattern}`. A branch names no version and "
+                "cuts no release; the number is applied on the base after the merge (#122). "
+                "Explain it in prose if it needs explaining — do not hand an agent the command.")
+
+
+def test_the_briefs_that_land_say_where_a_branch_writes_instead():
+    """A refusal that names no alternative gets retried or worked around, and a brief that
+    removes a step without naming the replacement is the same failure a document earlier. Both
+    landing briefs have to carry the fragment path."""
+    for name in ("fix-and-land", "fix-and-review", "panel-review-pr"):
+        assert "changelog.d/<issue>.<kind>.md" in command(name), (
+            f"{name}.md no longer tells an agent where a release note goes")
+
+
+def test_fix_and_review_asks_whether_the_branch_carries_a_release_note():
+    """The cheap question that survived: finding out here costs a commit, and finding out at
+    the merge costs a cycle."""
     runnable = _fenced(command("fix-and-review"))
     assert runnable.strip(), "no code blocks were read out of the file — the fence pattern is wrong"
-    # Matched by regex, not substring: the script is invoked by a `$WT_DIR`-relative path that has
-    # to be quoted (`"$WT_DIR/scripts/release_stamp.py" preflight`), because `--repo` chooses which
-    # repo the plan is built against and NOT where the script is loaded from. Asserting the bare
-    # unquoted spelling pinned the invocation to a form that pairs one checkout's tool with another
-    # checkout's files.
-    assert re.search(r'release_stamp\.py"?\s+preflight', runnable), (
-        "the merge-prep step no longer asks whether the release could be stamped")
-    assert not re.search(r'release_stamp\.py"?\s+apply', runnable), (
-        "prep must not stamp the number — that belongs to whoever merges. The paragraph explaining "
-        "why may name `apply`; a code block may not.")
+    # Matched by regex, not substring: the script is invoked by a `$WT_DIR`-relative path that
+    # has to be quoted, because `--repo` chooses which repo the answer is computed against and
+    # NOT where the script is loaded from.
+    assert re.search(r'changelog_fragments\.py"?\s+required', runnable), (
+        "the merge-prep step no longer asks whether this branch carries its release note")
+    # 216-F06, kept: `--repo` chooses which repo the answer is computed AGAINST; it does not
+    # change where the script is loaded FROM. A cwd-relative invocation pairs one checkout's
+    # tool with another checkout's files.
+    for ln in (l for l in runnable.splitlines() if "changelog_fragments.py" in l):
+        assert "$WT_DIR/scripts/changelog_fragments.py" in ln, (
+            f"changelog_fragments.py is loaded from a cwd-relative path: {ln.strip()!r}")
 
 
-def test_fix_and_land_assembles_the_changelog_before_it_stamps():
-    """A fragment names no version, so there is nothing for `apply` to rewrite until `assemble`
-    has built the entry. In that order and no other: run the other way round, `apply` sees a
-    branch with no placeholder and no release, returns 0, and the fragments land unassembled
-    with the release silently unnumbered — a green landing that shipped no entry.
+def test_the_panel_offer_asks_whether_the_branch_carries_a_release_note():
+    """preland has no check for it and never returns RECONCILE for it, so this step asks or
+    nobody does. What it must NOT do is anything about a number: the release is cut on the base
+    after the merge, once per batch, and never from a review (#122)."""
+    step = _panel_review_verdict_step()
+    runnable = _fenced(step)
+    assert runnable.strip(), "no code blocks were read out of step 7 — the fence pattern is wrong"
+    assert re.search(r"changelog_fragments\.py\s+required", runnable), (
+        "step 7 never asks whether the branch carries its release note, so the offer is made "
+        "without the one fact #365 is about")
 
-    Both invocations asserted in a code BLOCK, not in prose. A step nobody runs is exactly what
-    this file's sibling assertions exist to catch, and a mechanism the landing loop does not
-    invoke is a mechanism this repo has documented rather than adopted."""
-    runnable = _fenced(command("fix-and-land"))
-    assert runnable.strip(), "no code blocks were read out of the file — the fence pattern is wrong"
-    assemble = runnable.find("changelog_fragments.py")
-    stamp = runnable.find("release_stamp.py")
-    assert assemble >= 0, (
-        "fix-and-land no longer assembles changelog fragments, so a branch that wrote one lands "
-        "with its release entry still sitting in changelog.d/")
-    assert stamp >= 0, "the release-number step is gone"
-    assert assemble < stamp, (
-        "`release_stamp.py apply` runs before `changelog_fragments.py assemble`, so it stamps a "
-        "tree whose release entry has not been written yet and reports success having done "
-        "nothing")
+
+def test_the_panel_merge_sequence_pushes_nothing_between_the_gate_and_the_merge():
+    """What the release step's removal bought, and it has to be said rather than left to be
+    noticed. The stamp commit used to be pushed after the last verification of the cycle, which
+    moved the head past the round §5 had read — so the gate had just verified a commit that was
+    no longer the head, and a re-run HOLDed about a commit two tools wrote. Nothing is pushed
+    there now, so the READY describes the commit that actually lands."""
+    merging = _section(_panel_review_verdict_step(), "Merging, once the user has said yes")
+    runnable = _fenced(merging)
+    assert "gh pr merge" in runnable, "the merge sequence lost its merge"
+    assert "git commit" not in runnable and "git push" not in runnable, (
+        "the merge sequence pushes a commit between the gate and the merge again, so the READY "
+        "above it describes a commit that is no longer the head (#122)")
 
 
 def test_the_two_end_to_end_commands_point_at_each_other():
@@ -256,19 +291,6 @@ def test_fix_and_review_asks_harness_rules_about_the_repo_it_was_given():
     assert any("--repo" in ln for ln in rules), (
         "harness_rules.py is invoked without --repo, so it answers about the cwd while the command "
         "claims to answer about the named repo")
-
-
-def test_fix_and_review_loads_release_stamp_from_the_worktree_it_asks_about():
-    """216-F06. `--repo` chooses which repo the plan is built AGAINST; it does not change where the
-    script is loaded FROM. A cwd-relative `python3 scripts/release_stamp.py` therefore pairs one
-    checkout's tool with another checkout's files — the exact failure the `preland.py` paragraph
-    above it spends five lines refusing."""
-    runnable = _fenced(command("fix-and-review"))
-    stamp = [ln for ln in runnable.splitlines() if "release_stamp.py" in ln]
-    assert stamp, "the release-number question is no longer asked"
-    for ln in stamp:
-        assert "$WT_DIR/scripts/release_stamp.py" in ln, (
-            f"release_stamp.py is loaded from a cwd-relative path: {ln.strip()!r}")
 
 
 def test_fix_and_reviews_escalation_citation_resolves():
@@ -394,57 +416,6 @@ def test_reconcile_does_the_mechanical_work_and_re_runs_the_gate_before_offering
         "RECONCILE pushes a commit and then re-runs the gate with nothing re-reading the new "
         "head, so preland HOLDs on `head_sha` and this path can never reach the offer it "
         "promises")
-
-
-def test_the_release_entry_is_built_before_it_is_numbered_and_only_after_a_yes():
-    """#168, the mechanical step most reviews need: two of the last three releases landed
-    unstamped and needed repair PRs (#289, #291). preland has no check for it and never returns
-    RECONCILE for it, so this step asks or nobody does.
-
-    Three orderings, and each one is a way of getting it wrong. `preflight` before the offer,
-    because `apply` resolves the placeholder against the base as it stands NOW and a number taken
-    while the user is deciding can be taken from under them — `/fix-and-review` stops at
-    `preflight` for that exact reason. `assemble` before `apply`, or `apply` sees a branch with no
-    placeholder, returns 0, and the fragments land unassembled with the release silently
-    unnumbered. And `apply` before the merge, or the release ships without its number."""
-    step = _panel_review_verdict_step()
-    runnable = _fenced(step)
-    assert runnable.strip(), "no code blocks were read out of step 7 — the fence pattern is wrong"
-    preflight = runnable.find("release_stamp.py preflight")
-    assemble = runnable.find("changelog_fragments.py assemble")
-    apply_ = runnable.find("release_stamp.py apply")
-    merge = runnable.find("gh pr merge")
-    assert preflight >= 0, (
-        "step 7 never asks whether the release could be stamped, so the offer is made without the "
-        "one fact #168 is about")
-    assert assemble >= 0, (
-        "step 7 never assembles changelog fragments, so a branch that wrote one lands with its "
-        "release entry still sitting in changelog.d/")
-    assert apply_ >= 0, "the release-number step is gone — this is #168 in the loop that ships it"
-    assert preflight < apply_, (
-        "the branch is stamped before the user has agreed to land it, so a number taken here can "
-        "be taken by another branch while they decide and the repair is a hand-edit")
-    assert assemble < apply_, (
-        "`release_stamp.py apply` runs before `changelog_fragments.py assemble`, so it stamps a "
-        "tree whose release entry has not been written yet and reports success having done "
-        "nothing")
-    assert apply_ < merge, "the PR is merged before the release is numbered"
-
-
-def test_the_stamp_commit_is_bounded_because_nothing_re_verifies_after_it():
-    """The consequence of stamping last, stated rather than left for the reader. That push moves
-    the head past the round §5 reviewed, so a gate re-run after it HOLDs on `head_sha` — correctly,
-    and about a commit two tools wrote. The verification is therefore the run above it, and what
-    makes that safe is a bound on what the commit may contain. Without the bound this step is
-    "push something unreviewed and merge"."""
-    merging = _section(_panel_review_verdict_step(), "Merging, once the user has said yes")
-    assert "head_sha" in merging, (
-        "the merge sequence does not say that the stamp commit moves the head past the reviewed "
-        "round, so a reader re-runs the gate, gets a HOLD, and has no way to tell whether it is "
-        "about the PR or about the commit they just made")
-    assert re.search(r"git diff --stat", merging), (
-        "nothing bounds what the stamp commit may contain, and it is pushed after the last "
-        "verification of the cycle")
 
 
 def test_an_unearned_stop_blocks_the_offer_even_when_the_gate_would_otherwise_pass():

@@ -161,9 +161,11 @@ REF_KINDS = ("issue", "pr", "branch", "plan", "item")
 #: one the board *did* own, whose writer was deleted on purpose, and whose rows
 #: are the thing the deletion was for.
 #:
-#: ``release`` is the one. #172 deleted the allocator because ``release_stamp.py``
-#: has taken ``max+1`` at land since v2.34 — nine releases in a day, no
-#: collisions — while the allocator's own rows went stale for every open PR. The
+#: ``release`` is the one. #172 deleted the allocator because the number was
+#: already being taken at land from the ref being merged into — nine releases in a
+#: day, no collisions — while the allocator's own rows went stale for every open
+#: PR. (#122 moved that further still: the number is now applied on ``main`` after
+#: the merge by ``scripts/release.py``, and no branch names one at all.) The
 #: argument is that *a stale record is worse than none: it is a second answer to
 #: a question that has one.* A path that still writes new ones concedes the
 #: argument. The endpoints went; ``POST /claim {kind: 'release'}`` did not, and
@@ -171,10 +173,11 @@ REF_KINDS = ("issue", "pr", "branch", "plan", "item")
 RETIRED_KINDS: dict[str, str] = {
     "release": (
         "`release` is not a kind this board keys any more (#172). The allocator "
-        "was deleted because release_stamp.py takes max+1 from the ref being "
-        "merged into at land, and the allocator's records went stale for every "
-        "PR that stayed open — a stale record is a second answer to a question "
-        "that has one. Stamp the version at land instead; nothing needs claiming."
+        "was deleted because the number is taken from the CHANGELOG at the ref, "
+        "and the allocator's records went stale for every PR that stayed open — a "
+        "stale record is a second answer to a question that has one. Since #122 "
+        "the number is applied on `main` after the merge, by scripts/release.py, "
+        "and no branch names one: there is no race left to claim against."
     ),
 }
 

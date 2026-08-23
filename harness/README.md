@@ -332,11 +332,11 @@ a review needs not to have, and `/review-pr` says in its own description that fr
 it is for. It is #40's constraint one level up: an agent reviewing its own work is grading itself,
 and the board cannot tell a fixer from a reviewer.
 
-What it deliberately does **not** do as prep is stamp the release number.
-`scripts/release_stamp.py apply` resolves `vNEXT` against the base **as it stands now**, so a
-command that stamps and then leaves the PR for a human has spent a number another branch may take
-in the meantime — after which `apply` refuses, correctly, with a hand-edit as the repair. It runs
-`preflight` instead: the same question, no number spent, and `apply` belongs to whoever merges.
+There is no release-number step in its prep, and there is none anywhere on a branch (#122). A
+branch writes `changelog.d/<issue>.<kind>.md` and names no version; the number is applied on the
+base after the merge, by `scripts/release.py run`, once per batch. What prep does ask is the
+cheaper question — `changelog_fragments.py required`, does this branch carry the note it owes —
+because finding that out here costs a commit and finding it out at the merge costs a cycle.
 
 ### `/epic` and `/lander` — the long-running loops
 
@@ -458,12 +458,12 @@ last time, not a judgement about this merge.** rerere matches on the conflict te
 the same hunks get the same answer even when the right answer has changed. The example
 this used to give — a CHANGELOG version narrative, whose correct resolution depends on
 which releases happen to be in flight — has stopped being one, and it is worth saying why
-rather than quietly swapping it: quarterback's branches no longer write a release number
-at all (`scripts/release_stamp.py`, #122), so the CHANGELOG conflict that remains is two
-`vNEXT` headings whose answer is always keep-both, and the README narrative that had to be
-*rewritten* by hand is deleted. (Keep-both on two already-STAMPED entries is the one case where it
-is still wrong, and `release_stamp.py check` refuses on the duplicate number rather than leaving it
-to a replayed resolution.) That removes the case; it does not remove the class. A
+rather than quietly swapping it: quarterback's branches no longer write in `CHANGELOG.md` at
+all (#122), so there is no CHANGELOG conflict left to replay an answer to. A branch writes one
+fragment, in a path no other branch opens, and `release.py guard` refuses it if it reaches for
+the file anyway. The README narrative that had to be *rewritten* by hand is deleted, and the
+release list is written on the base by the release job. That removes the case; it does not
+remove the class. A
 replayed resolution is still last time's answer, and the merge that made this rule worth
 having had three prose conflicts where keep-both was right and a fourth, in `panel.py`,
 where it was not. `rerere.autoUpdate` is therefore pinned to
@@ -547,7 +547,7 @@ hand, `qb-hooks uninstall` to take it off. `install` is idempotent, and re-runni
 repo that was set up before a new guard existed picks it up — `create-worktree` runs it on the
 main checkout every time it makes a worktree, so that normally happens on its own.
 
-### The pre-push guard — a two-headed graph, a pre-stamped release, a rewritten one, and the release number itself
+### The pre-push guard — a two-headed graph, a branch writing in a generated file, and a rewritten release
 
 The other hook `qb-hooks` installs, and the reason it exists is that on 2026-08-22 four
 branches each minted migration `0029`. Every one of those authors ran
@@ -571,21 +571,27 @@ refusal names both heads and the `preflight`/`apply` pair that resolves them. Pr
 branches are `main`, `master` and `test` unless the repo says otherwise
 (`git config --add qb.protectedBranch <name>`).
 
-**A branch that has stamped a release number the base already carries.** This is the half the
-`stamped` CI job structurally cannot do, and that job is right not to try: it runs on
-push-to-main only because an unstamped `## vNEXT` is the *correct* state of every branch in
-flight, so a `pull_request` version would fire on every release PR and be switched off within
-a week. It catches *landed unstamped*. It cannot catch *branch pre-stamped itself* — #287,
-where a branch took v2.60 while it sat, main took v2.60 for something else meanwhile, and the
-collision hit four files without git conflicting on any of them.
+**A branch that has edited a file the release job generates.** `CHANGELOG.md`'s release
+entries and the README's release list are written on the integration branch after the merge,
+by `scripts/release.py run`, and by nothing else. A branch that writes either of them is
+writing a file every other branch also has to write, at the same offset, so N such branches in
+flight is N-choose-2 conflicts **by construction** — over nothing, since both entries are right
+and both belong. On 2026-08-23 that was three of six open pull requests, all `CONFLICTING`,
+while the three that wrote no release entry all merged clean; PR #398 landed both ways and
+settled it (#122).
 
-That second question is answerable without crying wolf **only because it is fork-relative**.
-The merge base is a third reference point, and it is what separates "this branch claimed the
-number" from "this branch is merely behind and inherited it". A branch that never touched the
-CHANGELOG passes, and has to: the merge takes the base's entries cleanly, there being no
-competing edit. Only a branch that actively set a value trips it, and the refusal names
-`max(base, head) + 1` — computed by `release_stamp.py collision`, which is `preflight`'s
-refusal asked of two refs instead of the working tree.
+`release.py guard` answers it, and **the refusal names `changelog.d/<issue>.<kind>.md`** — a
+worker told only "no" retries or works around it, and both are worse than the original mistake.
+This is half a guard on purpose: a local hook cannot see `gh pr merge`, and a hook is
+per-checkout and best-effort, so the `generated release files are output` CI job on
+`pull_request` is the other half and neither is sufficient alone (#343, #169).
+
+It is answerable without crying wolf **only because it is fork-relative**. The merge base is a
+third reference point, and it separates "this branch wrote it" from "this branch is merely
+behind a release somebody else cut". A branch that never touched the file passes, and has to:
+the merge takes the base's entries cleanly, there being no competing edit. The CHANGELOG's
+preamble is outside the guard for the same reason `frozen` leaves it alone — it documents the
+convention the file follows, and a branch changing the convention has to be able to change it.
 
 **A branch that has rewritten or deleted a release entry that already shipped.** A released
 entry is immutable: it records what was broken or missing before that release, which is the
@@ -593,11 +599,11 @@ one part of a release no diff recovers. On 2026-08-20 a CHANGELOG conflict was r
 relocating the branch's own 133-line entry **under `## v2.59`**, on top of that release's
 notes, and the branch sat on an open PR for two days with every guard in the repo green —
 because they all read the file as a list of headings, and the headings were present, unique
-and correctly ordered (#325). `release_stamp.py frozen` compares the TEXT instead: every
+and correctly ordered (#325). `release.py frozen` compares the TEXT instead: every
 `## vX[.Y]` entry present at both the merge base and the pushed commit has to be identical,
 byte for byte, and one that has vanished is a refusal too.
 
-Fork-relative for the same reason as the number check, and it needs no stored state — the
+Fork-relative for the same reason as the check above, and it needs no stored state — the
 shipped text lives in git, where a bad merge resolution cannot reach it. A branch that does
 not touch a released entry passes by construction, which is what lets it run on every push.
 Editing a shipped entry deliberately — fixing a typo in one — is done by saying so on a
@@ -612,29 +618,22 @@ in the message: the refusal ends with a pasteable copy of that line, and a commi
 the refusal is not consent to it. It is scoped to `base..HEAD`, so the exemption expires with
 the merge it was written for.
 
-**And the one step here that takes something rather than checking it: the release number.**
-Where the pushed commit adds a release number the base does not have, `release_tag.py reserve`
-creates `refs/tags/vX.Y` on the remote. A ref create is compare-and-swap — it succeeds for
-exactly one caller and is rejected for every other, forever — which is the lock #296 says the
-release number has never had. Everything above is a *reading* of a shared CHANGELOG, and two
-landers who read it seconds apart read the same free number; the second one is refused here
-instead of merging and turning `main` red.
+**Nothing here takes a release number any more.** A fourth step used to: where the pushed
+commit added a release number the base did not have, `release_tag.py reserve` created
+`refs/tags/vX.Y` on the remote as a compare-and-swap, so the second of two landers was refused
+rather than merged (#296). It existed because a branch could stamp, and the number a branch
+stamped was a *reading* of a shared CHANGELOG rather than a lock. Branches do not stamp; the
+number is applied on the integration branch after the merge, where there is no race; there is
+nothing to reserve.
 
-Push time is the only moment it can be taken, and that is the substance rather than a detail.
-At stamp time the number is still fork-relative — `apply` runs in one worktree and a tag
-created there is a note to self. At merge time there is no local hook at all: this fleet lands
-through `gh pr merge` on the GitHub API, which is what #351 is about. At push time the release
-commit exists, the remote is right there, and the create wins or loses cleanly.
-
-It is safe on every push because it is scoped the same way the number check is: a branch whose
-newest heading is one it *inherited* has taken nothing and says so. And it is the one place
-this file departs from *"an unrunnable gate is not a passing gate"* — a reservation that could
-not be made leaves the repository exactly as the three checks above found and passed it, so
-there is nothing to be wrong about. It is reported as a note on the push rather than hidden,
-and a remote that is briefly unreachable does not block a push that is provably fine.
+It also cost #406. The reserved tag named the branch's `chore(release)` commit, and a squash
+merge discarded that commit while the release's entry landed perfectly — leaving
+`refs/tags/v3.8` addressing history nobody could reach, with every check green because a tag of
+that name resolved. There is no branch-side release commit now, so a rewriting merge has
+nothing to lose (#122).
 
 **Where a check does not apply, it says nothing at all.** No `migrations/versions/` at the
-pushed commit, no `CHANGELOG.md`, no reconciler or stamper in the repo: silence, not a
+pushed commit, no `CHANGELOG.md`, no reconciler or release tool in the repo: silence, not a
 warning. This harness installs into repos that are neither quarterback nor lexray, and a hook
 that greets every push in an unrelated repo with a line about Alembic is a hook that gets
 uninstalled — after which it is protecting neither repo.
@@ -646,37 +645,34 @@ worse than no hook, because it reads as protection.
 
 **Bypassable deliberately, never accidentally.** `git push --no-verify` is the express opt-out
 for one push. A repo that genuinely does not want a check records it —
-`git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.releaseNumber`, or
-`qb.prePush.releaseBodies`, or `qb.prePush.reserveRelease` — and
+`git config --bool qb.prePush.migrationHeads false`, or `qb.prePush.generatedFiles`, or
+`qb.prePush.releaseBodies` — and
 `qb-hooks status` reports it, so a guard that has been switched off cannot look like one
 quietly passing.
 
-The tools are found at `scripts/migration_reconcile.py`, `scripts/release_stamp.py` and
-`scripts/release_tag.py`, overridable per repo with `qb.migrationReconcile` / `qb.releaseStamp`
-/ `qb.releaseTag` (or the `QB_MIGRATION_RECONCILE` / `QB_RELEASE_STAMP` / `QB_RELEASE_TAG` env
-vars for a one-off). The base ref comes from
+The tools are found at `scripts/migration_reconcile.py` and `scripts/release.py`, overridable
+per repo with `qb.migrationReconcile` / `qb.release` (or the `QB_MIGRATION_RECONCILE` /
+`QB_RELEASE` env vars for a one-off). The base ref comes from
 `refs/remotes/<remote>/HEAD`, falling back to `main`, `master`, `test`, and overridable with
 `qb.baseBranch` — which, when set, gets no fallback: an operator who named a base meant that
 base, so a `qb.baseBranch` that is not fetched is a refusal with `git fetch` as the remedy
 rather than a quiet swap to `main`. When the base branch is part of the same push — `git push origin main topic`
 — the other refs are judged against the commit `main` is bringing, not against the
 remote-tracking ref it is about to replace; otherwise a base and a branch claiming the same
-number could land together with the guard reporting green.
+release entry could land together with the guard reporting green.
 
-The CHANGELOG path is *not* configurable, and that is the point: `release_stamp.py` reads and
-writes `CHANGELOG.md` by name, so a knob here would only decide which file the hook checks for
+The CHANGELOG path is *not* configurable, and that is the point: `release.py` reads and writes
+`CHANGELOG.md` by name, so a knob here would only decide which file the hook checks for
 existence before handing the question to a tool looking somewhere else.
 
-When the fork point cannot be read at all — a shallow clone, unrelated histories — the
-release check says `LIMITED` and passes: without a merge base, a number this branch *claimed*
-is indistinguishable from one it inherited, and refusing every branch that shares a number
-with its base would stop correct ones. It says so rather than reporting the strong answer for
-the weak one.
+When the fork point cannot be read at all — a shallow clone, unrelated histories — the release
+checks say `LIMITED` and pass: without a merge base, a file this branch *wrote* is
+indistinguishable from one it inherited, and refusing every branch on a base it cannot see
+would stop correct ones. They say so rather than reporting the strong answer for the weak one.
 
 One limit, stated rather than discovered: the base ref is read from **this checkout**. A
-checkout whose `origin/main` is a week stale judges the release number against a week-old
-base and can miss a collision that landed since. Fetch freshness is CI's job — this is the
-cheap guard that catches it at the keyboard. `harness/tests/test_pre_push_hook.py` drives all
+checkout whose `origin/main` is a week stale judges a branch against a week-old base. Fetch
+freshness is CI's job — this is the cheap guard that catches it at the keyboard. `harness/tests/test_pre_push_hook.py` drives all
 of the above through real `git push` against real remotes.
 
 ### `qb-stash` — a stash that belongs to one worktree

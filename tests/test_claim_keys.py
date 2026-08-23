@@ -539,11 +539,11 @@ async def test_a_release_claim_cannot_be_taken_any_more(client):
     r = await client.post("/claim", json={"kind": "release", "key": "acme/rel:2.31"},
                           headers=LAPTOP)
     assert r.status_code == 422, r.text
-    assert "release_stamp" in r.text, "a refusal has to name what to do instead"
+    assert "release.py" in r.text, "a refusal has to name what to do instead"
 
     # The refusal is in the primitive, so the read path says the same thing.
     q = await client.get("/claims", params={"kind": "release"}, headers=LAPTOP)
-    assert q.status_code == 422 and "release_stamp" in q.text
+    assert q.status_code == 422 and "release.py" in q.text
 
 
 async def test_a_LEGACY_release_row_does_not_break_the_gate(client):
