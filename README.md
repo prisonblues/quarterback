@@ -1071,7 +1071,8 @@ A reservation can also outlive the push it was taken for. A hook runs *before* t
 push git then fails to deliver leaves the tag behind, as does a pull request that is
 abandoned. Both cost a skipped release number and nothing else: `check` lists a tag that is
 not on the integration ref as a reservation rather than a defect, because that is also
-exactly what every release in flight looks like.
+exactly what every release in flight looks like — unless the ref declares that release, in
+which case it is not in flight at all. See below.
 
 ### Every release has a tag, and every tag has a release
 
@@ -1102,6 +1103,33 @@ the **record** and not the lock — by the time it runs the merge has happened, 
 number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
+
+#### A tag that is off the ref, and is not a reservation (#406)
+
+For five months that job's name was a claim it did not test. It asked whether a tag of that
+**name** resolved. `v3.8` was squash-merged — the squash discarded the `chore(release)`
+commit the tag had been reserved against — so `refs/tags/v3.8` resolved perfectly to a commit
+that is not in main's history at all, and the job was green. The entry landed correctly and
+was correctly ordered; only the tag was wrong, which is the version of this that nobody
+notices until `git diff v3.7..v3.8` starts comparing main to an off-history commit.
+
+So the job now runs `check` after `backfill`, and `check` asks whether each tag is an
+**ancestor** of the ref — one `git merge-base --is-ancestor` per release. The subtlety is
+that being off the ref is two opposite things wearing one face, and the discriminator is not
+the tag but the CHANGELOG at the ref:
+
+- the ref does **not** declare `vX.Y` — it has not landed, so a tag off the ref is a
+  **reservation**. Listed, never a finding. On the night #406 was filed, `v3.9`, `v3.10` and
+  `v3.12` were all legitimately off main, held by three open pull requests. A check that
+  flagged those would have trained everybody to ignore it.
+- the ref **does** declare `vX.Y` — it has shipped, so its tag must be reachable from the
+  commit that landed it. Off the ref, it is **orphaned**, and the report names the commit it
+  actually landed at and the `--force-with-lease` that re-points it atomically.
+
+Fixing the tag afterwards is a repair, not a policy. The policy half is
+`qb-doctor`'s `merges` row, which fails a repo that allows squash or rebase merges while
+reserving release tags at push time — because the merge that rewrites the commit is the
+thing that made the tag wrong.
 
 The tags are annotated, so writing one means writing an object, and git will not write an
 object without a tagger. `backfill` supplies one itself where the environment cannot name

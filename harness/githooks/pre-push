@@ -40,6 +40,10 @@
 #      lists a tag that is not on the integration ref as a reservation rather than a defect,
 #      because that is also what every release still in flight looks like. The alternative is
 #      deleting a tag, which this file will not do for the same reason it never moves one.
+#      A tag off the integration ref for a release that ref DOES declare is a different
+#      animal — the release shipped and a history-rewriting merge orphaned its tag (#406) —
+#      and `release_tag.py check` tells the two apart. Nothing in this hook can: the rewrite
+#      happens at merge time, in GitHub, long after the last local hook has run.
 #
 # WHY A HOOK AND NOT A RUNBOOK. On 2026-08-22 four branches each minted migration `0029`.
 # Each author ran the reconciler's `preflight`, each got a TRUTHFUL answer, and each

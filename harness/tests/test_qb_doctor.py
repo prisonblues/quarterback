@@ -69,6 +69,10 @@ def _hermetic_git(monkeypatch, tmp_path):
     """
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitconfig-system"))
+    # And no developer's environment either. `release_tagger` reads QB_RELEASE_TAG
+    # first, exactly as the pre-push hook does, so a shell that has it set would put
+    # every repo below in scope for the merges row whatever the fixture built.
+    monkeypatch.delenv("QB_RELEASE_TAG", raising=False)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -969,8 +973,9 @@ def test_a_check_that_raises_becomes_an_unknown_naming_the_exception(monkeypatch
     def boom(_host):
         raise RuntimeError("the host is very odd")
 
-    monkeypatch.setattr(qd, "CHECKS", (("boom", boom), ("fine", lambda _h: qd.Check(
-        "fine", "-", "", "ok"))))
+    monkeypatch.setattr(qd, "CHECKS", (("boom", "host", boom),
+                                       ("fine", "host", lambda _h: qd.Check(
+                                           "fine", "-", "", "ok"))))
     out = qd.run_checks(host_for(repo))
     assert [c.verdict for c in out] == ["unknown", "ok"]
     assert "RuntimeError: the host is very odd" in out[0].detail
@@ -1033,8 +1038,10 @@ def test_a_directory_that_is_not_a_repository_exits_three(tmp_path, capsys):
 
 def test_every_check_name_is_offered_by_only(capsys):
     """The `--only` help lists the registry, so a check added without a name in
-    `CHECKS` cannot be selected and a name in the help with no check cannot run."""
-    names = [n for n, _ in qd.CHECKS]
+    `CHECKS` cannot be selected and a name in the help with no check cannot run.
+    Group names too, for the same reason: `--only landing` is only discoverable if
+    the help says the word."""
+    names = [n for n, _g, _fn in qd.CHECKS] + list(qd.GROUPS)
     assert len(set(names)) == len(names)
     with pytest.raises(SystemExit):
         qd.main(["--help"])
@@ -1082,3 +1089,281 @@ def test_the_readme_documents_every_verdict_in_the_section_about_them():
     for verdict in qd.VERDICTS:
         assert verdict in section, f"the README's qb-doctor section never mentions {verdict!r}"
     assert "could not be made" in section
+
+
+# --------------------------------------------------------------------------- #
+# merges — can a merge here rewrite the commit a release tag was reserved against?
+# --------------------------------------------------------------------------- #
+
+#: What GitHub answers for a repo configured the way #406 concluded this one should be.
+MERGE_COMMITS_ONLY = {"allow_merge_commit": True, "allow_squash_merge": False,
+                      "allow_rebase_merge": False, "push": True}
+
+
+@pytest.fixture
+def landing_repo(repo: Path) -> Path:
+    """A repo in scope for the merges row: a GitHub remote and a tag allocator."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text("# a tag allocator lives here\n")
+    return repo
+
+
+def _gh_says(monkeypatch, *, out: str = "", rc: int = 0, err: str = "") -> None:
+    """Answer for `gh` and let every other subprocess through.
+
+    Real git, faked GitHub. The row's git half — which remote, is it GitHub, is there an
+    allocator — is most of what can be wrong with it, and a fixture that stubbed that too
+    would be asserting the stub.
+    """
+    real = qd.run_cmd
+
+    def fake(argv, **kwargs):
+        if argv and argv[0] == "gh":
+            return rc, out, err
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+
+
+def test_a_repo_that_allows_squash_merges_fails_and_says_what_to_switch_off(
+        monkeypatch, landing_repo):
+    """#406 itself. `v3.8` was squash-merged, the squash discarded the `chore(release)`
+    commit `refs/tags/v3.8` had been reserved against, and the tag spent the night
+    addressing a commit that is not in main's history while every check was green."""
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert "allows squash merges" in check.detail
+    assert "reserves release tags at push time" in check.detail
+    assert "allow_squash_merge=false" in check.manual
+    assert "acme/thing" in check.manual
+
+
+def test_rebase_merges_are_the_same_defect_and_are_not_left_waiting(
+        monkeypatch, landing_repo):
+    """A rebase replays the branch onto new parents, so the sha that reserved the tag is
+    not the sha that lands — the identical failure. Disabling only the one that happened
+    to bite would leave the other in place for whoever clicks it next."""
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_rebase_merge": True}))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert "allows rebase merges" in check.detail
+    assert "allow_rebase_merge=false" in check.manual
+
+
+def test_merge_commits_only_is_the_pass(monkeypatch, landing_repo):
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "ok"
+    assert "merge commits only" in check.detail
+
+
+def test_a_repo_that_allows_no_preserving_strategy_fails_too(monkeypatch, landing_repo):
+    """The property the row states is "every landing preserves the pushed commit", which
+    needs both halves. Asserting only that squash is off would pass a repo where the sole
+    remaining strategy also rewrites."""
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_merge_commit": False}))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert "no merge strategy that preserves" in check.detail
+
+
+def test_a_repo_with_no_tag_allocator_is_not_asked_and_is_not_failed(monkeypatch, repo):
+    """The scope rule. A repo that reserves no release tags has nothing for a merge to
+    orphan, and a FAIL a reader cannot act on is how a row gets ignored."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "ok"
+    assert "reserves no release tags" in check.detail
+
+
+def test_the_allocator_is_found_the_way_the_pre_push_hook_finds_it(monkeypatch, repo):
+    """`QB_RELEASE_TAG`, then `qb.releaseTag`, then `scripts/release_tag.py`. Read from the
+    same three places as `harness/githooks/pre-push` rather than by a rule of qb-doctor's
+    own: the two have to agree about which repos are in scope, and a second predicate would
+    agree right up until somebody moved the script."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    elsewhere = repo / "tools" / "tagger.py"
+    elsewhere.parent.mkdir()
+    elsewhere.write_text("# a tag allocator lives here\n")
+    _git(repo, "config", "qb.releaseTag", "tools/tagger.py")
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
+
+    assert qd.check_merges(host_for(repo)).verdict == "fail"
+
+    monkeypatch.setenv("QB_RELEASE_TAG", str(elsewhere))
+    _git(repo, "config", "--unset", "qb.releaseTag")
+    assert qd.check_merges(host_for(repo)).verdict == "fail"
+
+
+@pytest.mark.parametrize("url", [
+    "git@gitlab.com:acme/thing.git",
+    "https://git.example.com/acme/thing.git",
+    "https://gitlab.com/github.com/acme/thing.git",
+])
+def test_a_remote_that_is_not_github_is_unknown_rather_than_ok(monkeypatch, repo, url):
+    """The honest-unknown rule, and the third URL is why the pattern is anchored: a slug
+    guessed off a host this tool cannot query would make the row an `unknown` about the
+    wrong repository, which reads as an answer."""
+    _git(repo, "remote", "add", "origin", url)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text("# a tag allocator lives here\n")
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert "not a github.com remote" in check.detail
+
+
+@pytest.mark.parametrize("url", [
+    "git@github.com:acme/thing.git",
+    "https://github.com/acme/thing",
+    "https://token@github.com/acme/thing.git",
+    "ssh://git@github.com/acme/thing.git",
+])
+def test_every_shape_a_github_remote_is_written_in_resolves_to_the_same_slug(repo, url):
+    _git(repo, "remote", "add", "origin", url)
+    assert qd.github_slug(host_for(repo)) == "acme/thing"
+
+
+def test_no_gh_on_this_host_is_unknown_and_never_a_pass(monkeypatch, landing_repo):
+    monkeypatch.setattr(qd.shutil, "which", lambda _n: None)
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "no gh on this host" in check.detail
+
+
+def test_a_gh_that_cannot_answer_is_unknown_and_quotes_what_it_said(
+        monkeypatch, landing_repo):
+    _gh_says(monkeypatch, rc=1, err="gh: not authenticated\nrun gh auth login")
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "gh: not authenticated" in check.detail
+
+
+@pytest.mark.parametrize("body", ["<html>rate limited</html>", "null", "[]", '"nope"'])
+def test_a_gh_that_answers_something_other_than_an_object_is_unknown(
+        monkeypatch, landing_repo, body):
+    """Codex's finding on this change. Parsing is not the test — `null` and `[]` are valid
+    JSON, and reading `.get` off either raises. The row still came out `unknown`, but via
+    `run_checks` catching an AttributeError, so it reported "the check itself raised"
+    instead of the remedy this branch exists to print."""
+    _gh_says(monkeypatch, out=body)
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "did not answer an object" in check.detail
+    assert check.manual
+
+
+def test_a_token_with_no_push_access_is_unknown_and_says_which_silence_it_is(
+        monkeypatch, landing_repo):
+    """GitHub returns the merge-strategy fields ONLY to a token with push access; without
+    one the answer is three nulls and no explanation. Reading those as `false` would report
+    "merge commits only" about a repo nobody here can see the settings of — the #324
+    collapse, in the row whose whole job is to notice a switch is on."""
+    _gh_says(monkeypatch, out=json.dumps({"allow_merge_commit": None,
+                                          "allow_squash_merge": None,
+                                          "allow_rebase_merge": None, "push": False}))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "no push access" in check.detail
+    assert "somebody with push access" in check.manual
+
+
+def test_a_field_missing_despite_push_access_is_still_unknown(monkeypatch, landing_repo):
+    """The other silence: a forge old enough to omit the field, or a `--jq` that stopped
+    matching. Different remedy, same refusal to read absence as `false`."""
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": None}))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "did not say whether" in check.detail
+    assert "allow_squash_merge" in check.detail
+
+
+@pytest.mark.parametrize("settings", [
+    {**MERGE_COMMITS_ONLY, "allow_squash_merge": True},
+    {**MERGE_COMMITS_ONLY, "allow_merge_commit": False},
+])
+def test_the_merges_row_never_offers_to_fix_itself(monkeypatch, landing_repo, settings):
+    """DETECT, DO NOT SET. Every `fix` this tool runs writes to THIS host — a hooks
+    directory, a systemd unit, a venv. This one would write a setting every contributor and
+    every other machine shares, from whichever checkout somebody typed `--fix` in, and it
+    needs admin rights a read-only token does not have. So it is `manual`, like the edge
+    secret: the remedy is printed in full and run by a person."""
+    _gh_says(monkeypatch, out=json.dumps(settings))
+
+    check = qd.check_merges(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert check.fix is None, "a doctor must not silently change a shared repository setting"
+    assert check.manual
+
+
+# --------------------------------------------------------------------------- #
+# groups — the category #407 extends, not a row it has to retrofit one around
+# --------------------------------------------------------------------------- #
+
+def test_every_check_belongs_to_a_group_this_file_declares():
+    for name, group, _fn in qd.CHECKS:
+        assert group in qd.GROUPS, f"{name} is filed under {group!r}, which is not a group"
+
+
+def test_the_landing_group_holds_the_merges_row():
+    assert qd.selectable()["landing"] == {"merges"}
+
+
+def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
+    """`--only landing` is `--only merges` today and stays correct as #407 adds to it,
+    which is the point of naming the group at all."""
+    seen: list[set[str] | None] = []
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: object())
+    monkeypatch.setattr(qd, "run_checks",
+                        lambda _h, only=None: (seen.append(only),
+                                               [qd.Check("merges", "-", "x", "ok")])[1])
+
+    qd.main(["--only", "landing"])
+
+    assert seen == [{"merges"}]
+
+
+def test_a_group_name_that_does_not_exist_is_refused_before_anything_runs(capsys):
+    assert qd.main(["--only", "nosuchgroup"]) == 3
+    assert "no such check or group" in capsys.readouterr().err
+
+
+def test_a_rows_group_comes_from_the_registration_not_from_the_check(monkeypatch, repo):
+    """Assigned by `run_checks` rather than passed at every construction site, so a check
+    function cannot file itself under a group its registration disagrees with — including
+    the synthetic row `run_checks` builds when a check raises."""
+    def boom(_host):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(qd, "CHECKS", (("merges", "landing", boom),))
+    rows = qd.run_checks(host_for(repo))
+
+    assert rows[0].group == "landing"
+    assert rows[0].verdict == "unknown"
+    assert rows[0].as_dict()["group"] == "landing"
