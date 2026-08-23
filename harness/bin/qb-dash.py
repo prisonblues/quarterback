@@ -52,7 +52,8 @@ from qbdata import (  # noqa: E402
     claim_label, claim_repo, clip, elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan,
     fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells, plan_counts,
     plan_ref, plan_state, plan_who, queue_cell, queue_oldest, repo_arg, repo_colour,
-    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, until, waited,
+    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, sort_plan, stage_cell, until,
+    waited,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -74,6 +75,11 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
     t.add_column(width=7, no_wrap=True)           # state
+    # Next to `state`, and narrow: `state` says whether the pane is moving, this
+    # says where it has got to, and they are read together (#262). Six, because a
+    # stage IS six characters at most — the shape qb-stage and the board both
+    # enforce — so nothing here is ever truncated to make it fit.
+    t.add_column(width=6, no_wrap=True)           # stage
     if show_repo:
         t.add_column(width=11, no_wrap=True)      # repo
     t.add_column(ratio=1, no_wrap=True)           # what
@@ -81,7 +87,11 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
 
     # The cell's width plus its padding goes back to `what`, which is the column
     # a reader is actually reading: what the agent in this seat is doing.
-    body = max(18, width - (45 if show_repo else 33))
+    # The stage column costs `what` its width plus padding. That is a real cost on
+    # a narrow pane and it is paid deliberately: `what` is already clipped on every
+    # row and reads the same at every stage of a PR's life, so eight characters of
+    # title buy the one column that changes as the work progresses.
+    body = max(18, width - (53 if show_repo else 41))
     for a in agents:
         who = (a.get("holder") or "?").split("/", 1)[-1]
         repo = a.get("repo") or "—"
@@ -91,6 +101,7 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         cells = [
             Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
             Text(word or "—", style=style),
+            Text(*stage_cell(a)),
         ]
         if show_repo:
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
@@ -104,7 +115,7 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
         ]
         t.add_row(*cells)
     if not agents:
-        t.add_row(Text("nobody home", style="grey50"), *[""] * (4 if show_repo else 3))
+        t.add_row(Text("nobody home", style="grey50"), *[""] * (5 if show_repo else 4))
 
     subs = len(data.get("subagents") or [])
     head = f"[bold]FLEET[/] [grey50]{len(agents)} live"

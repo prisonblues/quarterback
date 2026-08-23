@@ -472,6 +472,42 @@ def agent_state(agent: dict) -> tuple[str, str]:
             "input": ("input", "bold magenta")}.get(state, (state, "grey50"))
 
 
+#: What a lease that never reported a workflow stage renders as.
+#:
+#: The word is **unreported** — the fleet page's own vocabulary for a fact nobody
+#: said (`live | ended | unclear | unreported`), spelled out in full there because
+#: a browser has the width. This cell is six characters wide, so it uses the glyph
+#: these panels already use for every unsaid value: `repo`, `state` and `title` all
+#: render one this way, and `mcp/mcp_server/board/views.py` renders this same field
+#: this same way for `qb-board`.
+#:
+#: **It cannot be misread as a stage.** A stage is 1-6 alphanumerics by
+#: construction (`app.api.leases.STAGE_RE`, and `qb-stage`'s own check before it),
+#: so a non-alphanumeric glyph is outside the value space. An empty cell is not: it
+#: reads equally as a rendering bug, a clipped column, or an agent that has no
+#: stage — and "those agents have no stage" is the lie #262 is about.
+STAGE_UNREPORTED = "—"
+
+
+def stage_cell(agent: dict) -> tuple[str, str]:
+    """(text, style) for how far along a live agent's work is — `F0`, `R1F`, `R2`.
+
+    Beside `state`, never instead of it, and they answer different questions:
+    `state` says whether the pane is moving, `stage` says where it has got to. The
+    other columns — repo, branch, what — read identically at every stage of a PR's
+    life, which is why a fleet view without this one cannot answer "how far along
+    is it" about any row on it.
+
+    Reported by `qb-stage` and by nothing else, so most rows will not have one for
+    a while. That is not a defect and the dash says so honestly rather than
+    leaving a blank that reads like a stage.
+    """
+    stage = (agent.get("stage") or "").strip()
+    if not stage:
+        return STAGE_UNREPORTED, "grey50"
+    return clip(stage, 6), "bold cyan"
+
+
 def short_key(key: str) -> str:
     """'prisonblues/quarterback:2.40' → 'quarterback:2.40'.
 

@@ -100,6 +100,15 @@ POST  /lease             { session, device, ttl=300, cwd?, repo?, branch?, title
                           two are read together: `stalled` is what a reader concludes
                           from an old `working`, never something a holder reports.)
 POST  /lease/renew       { lease_id }
+POST  /lease/stage       { session, stage? }            -> {session, stage, changed}
+                         (stage = F0|R1|R1F|R2… — how far along the work is. Reported by
+                          `qb-stage`, the only thing in the system that is TOLD one; the
+                          SHAPE is checked, 1-6 alphanumerics, and never the vocabulary,
+                          so a skill inventing `R4F` needs no server edit. Null clears it.
+                          Rides the lease to /active, /overlap and /fleet, and emits one
+                          `status` post when it CHANGES so the live stream carries the
+                          transition. Null there means nobody said — not `F0`, and not
+                          finished.)
 POST  /lease/release     { lease_id }
 POST  /handoff           { session, blob, cwd?, title?, recap?, model? }
                                                         (record latest blob + release)
@@ -2257,7 +2266,7 @@ app/          FastAPI service
   api/posts.py     POST /post, GET /board, GET /post/{id}
   api/stream.py    GET /stream (SSE via LISTEN/NOTIFY), event_stream() generator
   api/blobs.py     PUT/GET /blob/{sha} (content-addressed)
-  api/leases.py    POST /lease[/renew,/release], POST /session/end, POST /handoff,
+  api/leases.py    POST /lease[/renew,/stage,/release], POST /session/end, POST /handoff,
                    POST /snapshot,
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap

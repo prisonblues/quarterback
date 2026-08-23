@@ -43,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PAGE = REPO_ROOT / "app/static/fleet.html"
 RECONCILE = REPO_ROOT / "harness/bin/qb-reconcile"
 QBDATA = REPO_ROOT / "harness/bin/qbdata.py"
+BOARD_VIEWS = REPO_ROOT / "mcp/mcp_server/board/views.py"
 
 #: A person, as the edge proves one: the identity header AND the secret only the
 #: auth proxy knows. Both halves, every time — that is the whole boundary.
@@ -554,3 +555,71 @@ def test_the_widening_query_filters_on_the_condition_it_names():
     assert "Lease.session.not_in(select(SessionRecord.session))" in src, \
         "the widening query must exclude every session that HAS a record, not "\
         "merely the ones this page happens to hold"
+
+
+# ---- how far along, and the one word for "nobody said" (#262) ----------------
+
+
+def test_the_page_shows_how_far_along_each_live_agent_is(page):
+    """The question repo, branch and title cannot answer.
+
+    Those three read identically writing the first cut and coming out of the
+    third review round; `stage` is what `qb-stage` reports and nothing else can
+    derive, so a page without it can say what an agent is on and not how far
+    along it is.
+    """
+    assert "stageChip" in page, "the page must render a stage"
+    assert re.search(r"l\.stage", page), "and it must read it off the lease"
+    assert re.search(r"\$\{stageChip\(l\)\}", page), \
+        "the chip belongs beside the verdict, where `state` is already read"
+
+
+def test_a_live_lease_that_reported_no_stage_says_unreported(page):
+    """The majority case, in the page's own word for silence.
+
+    `unreported` is already what this page calls a session nobody ended, and one
+    vocabulary for silence is the whole point — a blank chip, or no chip, would
+    read as "this agent has no stage", which is the class of lie #261 named.
+    """
+    assert re.search(r'class="stage unreported"[^>]*>?[^<]*unreported', page, re.S), \
+        "an unreported stage must say so in the page's own word"
+    # And the word must be one of the four this page already uses for silence,
+    # not a fifth invented beside them.
+    words = set(re.findall(r'v:"(\w+)"', page))
+    assert "unreported" in words
+
+
+def test_the_chip_only_exists_where_a_lease_does(page):
+    """A stage lives on the lease, so a row with no live lease has no field to be
+    silent about. Printing `unreported` there would invent a third state out of a
+    question that does not arise."""
+    assert re.search(r"function stageChip\(l\)\{\s*\n?\s*if\(!l\) return \"\";", page), \
+        "no lease, no chip"
+
+
+def test_every_surface_spells_an_unreported_stage_the_same_way():
+    """A terminal that quietly draws an empty cell where the browser says
+    `unreported` is two vocabularies for one fact.
+
+    The browser has the width for the word and the panels have six characters, so
+    the terminals use the glyph they already use for every unsaid value. What is
+    pinned here is that there is exactly ONE such glyph across the two client
+    codebases, and that it cannot be mistaken for a stage: a stage is 1-6
+    alphanumerics (`app.api.leases.STAGE_RE`), and this is not alphanumeric.
+    """
+    glyphs = {}
+    for path in (QBDATA, BOARD_VIEWS):
+        # Read, not imported: `mcp_server` is a second installable package with
+        # its own venv and `qbdata.py` is a script beside a bin/, so neither is on
+        # this suite's path — the same reason STALL_AFTER is grepped above.
+        found = re.search(r'^STAGE_UNREPORTED = "(.+)"', path.read_text(encoding="utf-8"), re.M)
+        assert found, f"could not find STAGE_UNREPORTED in {path}"
+        glyphs[path.name] = found.group(1)
+
+    assert len(set(glyphs.values())) == 1, \
+        f"qb-dash and qb-board must render an unreported stage the same way: {glyphs}"
+    glyph = next(iter(glyphs.values()))
+    assert not glyph.isalnum(), \
+        "the unreported glyph must sit outside the value space a stage can occupy"
+    assert re.search(r"^STAGE_RE = ", (REPO_ROOT / "app/api/leases.py").read_text(), re.M), \
+        "and that value space has to still be the thing STAGE_RE describes"
