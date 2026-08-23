@@ -1904,9 +1904,9 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
 
-### `qb-doctor` — is this host wired up?
+### `qb-doctor` — is this host wired up, and can work land from it?
 
-Two questions nothing else on the box can answer, in one report.
+Three questions nothing else on the box can answer, in one report.
 
 **The first is the one #204 was filed for.** Three independently versioned things have to
 agree — the board image, the harness on PATH, the Python client's venv — and no component
@@ -1928,12 +1928,21 @@ popped another worktree's work. `HUMAN_EDGE_SECRET` was documented in `DEPLOY.md
 checklist and never deployed, so every human-only endpoint has 403'd since v2.39. Not one of
 them announced itself.
 
+**The third is whether work can actually LAND** (#406, and the `landing` group #407 fills
+out). The first two are both about this machine, and on the night #406 was filed they were
+both satisfied: 9 ok, 1 unknown, nothing broken. In the same minute the merge queue held
+seven green pull requests with none ready, main had not moved in three hours,
+`refs/tags/v3.8` pointed at a commit that is not in main's history, and three branches were
+conflicting on the one file `changelog.d/` exists to keep them out of. Every row was correct
+and not one of them was about the pipeline the work has to travel down.
+
 ```bash
 qb-doctor                     # every check against this host
 qb-doctor --fix               # also run the installers that are safe to re-run
 qb-doctor --json              # the whole report as JSON
 qb-doctor --repo DIR          # check that checkout instead of the cwd's
 qb-doctor --only hooks,edge   # just those rows
+qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
 ```
@@ -1949,7 +1958,13 @@ stash      refs/stash                      guard active, 4 pre-guard entries rem
 reconcile  qb-reconcile.timer              enabled, active, last run 12:26:55                ok
 edge       https://quarterback.fo.ls       302 — forward-auth, and this host has no session   ?
 tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
+merges     prisonblues/quarterback         merge commits only — squash and rebase are off    ok
 ```
+
+Rows are grouped by which question they answer, and `--only` takes a group name as well as a
+row name. `host` is the first two questions; `landing` is the third. The group is what #407
+extends — it should be adding rows to a category, not retrofitting one around a single
+check.
 
 #### Look where the mechanism runs, not where its source lives
 
@@ -2003,6 +2018,44 @@ can run a command the author did not mark runnable:
   generated into 1Password *and* sops and two separate deploys; a tool that tried would
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
+
+#### The `merges` row — a squash merge orphans the release tag (#406)
+
+The tag allocator takes `refs/tags/vX.Y` on the remote at **push** time, against the
+branch's stamped `chore(release)` commit. That placement is what makes the number
+un-stealable (#296) and it is also what a squash breaks: the squash discards that commit, so
+the tag ends up addressing a commit that is not in the history it claims to tag. `v3.8`
+landed that way while every other pull request that night used a merge commit, and the CI
+job called `every release on main has a tag` stayed green — it checked that a tag of that
+*name* resolved, and `v3.8` did. Rebase-merge has the identical defect for the identical
+reason, so both are checked.
+
+The row asks GitHub what this repo allows and fails when either rewriting strategy is on:
+
+```
+merges  prisonblues/selfhost  this repo allows rebase and squash merges, and reserves     FAIL
+                              release tags at push time — a rewriting merge discards the
+                              commit the tag was reserved against (#406, v3.8)
+        -> gh api -X PATCH repos/prisonblues/selfhost -F allow_squash_merge=false …
+```
+
+**It does not ask where the question does not apply.** The scope is a repo that reserves
+release tags, found the way `harness/githooks/pre-push` finds it — `QB_RELEASE_TAG`, then
+`qb.releaseTag`, then `scripts/release_tag.py`. A repo with no allocator has no reservation
+for a merge to orphan, and a `FAIL` a reader cannot act on is how a row gets ignored.
+
+**It detects; it does not set.** Every `fix` this tool runs writes to *this host* — a hooks
+directory, a systemd unit, a venv. This one would write a setting every contributor and
+every other machine in the fleet shares, from whichever checkout somebody happened to type
+`--fix` in, and it needs repository-admin rights a read-only token does not have. So it is a
+`manual`, like the edge secret: the exact one-line `gh api -X PATCH` is printed and a person
+runs it.
+
+**And it says `unknown` rather than `ok` when it cannot look.** GitHub returns the
+merge-strategy fields *only* to a token with push access; a read-only one gets three nulls
+and no explanation, which read as `false` would report "merge commits only" about a repo
+nobody here can see the settings of. A non-GitHub remote, an absent `gh`, an unauthenticated
+`gh` and a null field are each their own `?` with their own remedy.
 
 #### The edge row, and why it currently says `?`
 
