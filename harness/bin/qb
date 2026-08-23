@@ -32,6 +32,12 @@ QB_ENV="$(qb_env_path "$0")" \
 # shellcheck source=./qb-env
 . "$QB_ENV"
 qb_load_config
+# Same shim as qb-hook's, for the same reason: this file and qb-env are separately
+# pinned store paths (#204), and a library that predates `qb_requested_name` (#156)
+# must cost a cosmetic name rather than a stderr line on every recorded run.
+if ! command -v qb_requested_name >/dev/null 2>&1; then
+  qb_requested_name() { :; }
+fi
 qb_require_base_url || exit 1
 qb_resolve_token || { echo "qb: no token (set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in $QB_CONFIG)" >&2; exit 1; }
 
@@ -111,11 +117,24 @@ case "${1:-sessions}" in
     # session-id prefix — so a run recorded here is attributed to the same agent
     # its posts and leases are. Written out rather than nested because `set -u`
     # makes ${A:-${B:0:8}} an error when B is unset, which is the common case.
+    #
+    # The 8 belongs to the SESSION ID and to nothing else (#156). Applied to an
+    # explicit label as well, it recorded `seat-lexray-9`'s panel runs under the
+    # key `seat-lex` — a different row on the board from the one its hook and its
+    # MCP server register, so the agent that ran the review is not the agent the
+    # review is filed against. Every seat `qb-seats` builds has a label longer
+    # than eight characters.
     inst="${QUARTERBACK_INSTANCE:-}"
-    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
-    [ -n "$inst" ] && inst="${inst:0:8}"
+    if [ -z "$inst" ]; then
+      inst="${CLAUDE_CODE_SESSION_ID:-}"
+      [ -n "$inst" ] && inst="${inst:0:8}"
+    fi
     hdr=()
-    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    [ -n "$inst" ] && hdr+=(-H "X-Agent-Instance: $inst")
+    # …and the name request that makes an explicit label the spelling peers see
+    # rather than an alias nobody is shown. qb-env decides it; see there.
+    reqname=$(qb_requested_name)
+    [ -n "$reqname" ] && hdr+=(-H "X-Agent-Name: $reqname")
     out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
             -H 'Content-Type: application/json' --data-binary @- \
             --max-time 15 "$BASE/review" 2>&1) \
@@ -144,12 +163,17 @@ case "${1:-sessions}" in
     # The same instance rule as `record-review` above, deliberately duplicated
     # rather than factored out: that arm is a working path in the one command
     # every panel run goes through, and four lines is a cheaper price than
-    # touching it.
+    # touching it. The name request is NOT duplicated — `qb_requested_name` in
+    # qb-env is the one place that decides what an agent is called.
     inst="${QUARTERBACK_INSTANCE:-}"
-    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
-    [ -n "$inst" ] && inst="${inst:0:8}"
+    if [ -z "$inst" ]; then
+      inst="${CLAUDE_CODE_SESSION_ID:-}"
+      [ -n "$inst" ] && inst="${inst:0:8}"
+    fi
     hdr=()
-    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    [ -n "$inst" ] && hdr+=(-H "X-Agent-Instance: $inst")
+    reqname=$(qb_requested_name)
+    [ -n "$reqname" ] && hdr+=(-H "X-Agent-Name: $reqname")
     out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
             -H 'Content-Type: application/json' --data-binary @- \
             --max-time 15 "$BASE/review/outcomes" 2>&1) \
