@@ -108,14 +108,26 @@ POST  /session/end       { session, reason }            -> {ended, lease, lease_
                          (reason = finished|killed|timed_out|context_reset|superseded.
                           Releases the lease AND every live claim that session took,
                           and stamps the lease with why. Idempotent: `ended` says
-                          whether THIS call was the one that ended a live session.)
+                          whether THIS call was the one that ended a live session.
+                          An agent by token, authorised by machine; a PERSON by the
+                          edge, authorised by being one — the fleet page's one verb.
+                          A lease that merely LAPSED can be told what happened to it
+                          too, stamped at its own expiry rather than at now; a lease
+                          already released is left alone — #378)
 GET   /session/{session}                                (latest_blob + active_lease +
                                                          ended)
 
 # session registry (v2.2 → v2.5)
 POST  /snapshot          { session, blob, cwd?, title?, recap?, model? }
                                                         (latest blob, lease NOT released)
-GET   /sessions          ?limit=                        (live + resumable, freshness + size)
+GET   /sessions          ?limit=&include_ended=          (live + resumable, freshness + size.
+                          Each row carries `last_lease` — when this key's newest lease
+                          stopped being valid, which is the clock a SILENCE is measured
+                          against; `updated_at` is the transcript's and a lease outlives
+                          its last push. include_ended widens it to sessions whose last
+                          lease was ended but which never pushed a transcript: an ending
+                          with no row behind it. Off by default because this list is
+                          paged — #378)
 
 # dev context (v2.1)
 GET   /                                                 (browser board — read the stream,
@@ -129,6 +141,8 @@ GET   /worktrees         ?device=&repo=&branch=&has_commit=   (cross-worktree di
 # coordination: collision index + sub-agents (v2.6)
 GET   /active            ?cwd=&repo=&device=&holder=&mine=&peers_only=
                                                  -> {agents:[…leases…], subagents:[…]}
+GET   /fleet             (browser view — what every agent is doing, from a phone,
+                          and how much of that reading is actually known: #378)
 POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=900 }
 POST  /subagent/end      { parent_session, agent_id }
 
@@ -146,7 +160,7 @@ GET   /sync              ?repo=&branch=&device=&path=          (registered workt
 
 # reviewer-panel stats (v2.10, accounts v2.11, rounds + coverage v2.15, cost v2.19,
 #                        changed files v2.23, provenance v2.26, outcomes v2.37,
-#                        needs-a-human #279)
+#                        needs-a-human #279, recurrence #67)
 POST  /review            (panel.py --json payload)              -> {id, recorded, findings,
                                                                     accounts, changed_files
                                                                     [, changed_files_dropped]
@@ -154,6 +168,10 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, head_sha_dropped]
                                                                     [, provenance_unknown]
                                                                     [, provenance_counts_unusable]
+                                                                    [, recurrence_unknown]
+                                                                    [, recurrence_counts_unusable]
+                                                                    [, premise_verdict_unknown]
+                                                                    [, premise_counts_unusable]
                                                                     [, needs_human_unknown]
                                                                     [, needs_human_refused]
                                                                     [, unreadable_fields]}
@@ -163,7 +181,8 @@ GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scoreca
                                                                   unread_files as a count)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
-                                                                 + head_sha/unread_files/provenance)
+                                                                 + head_sha/unread_files/provenance
+                                                                 + recurrence/premise_verdict)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -177,7 +196,8 @@ POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,             
                           `attested_by` is a CLAIM the caller makes, not a signature — the
                           board authenticates `set_by` and cannot authenticate a human
 GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, by_agent,
-                                                                     by_provenance, by_outcome,
+                                                                     by_provenance, by_recurrence,
+                                                                     by_premise, by_outcome,
                                                                      by_outcome_attested}
                           by_model rows carry precision (the judge's) beside precision_after
                           (what survived the fix) — the GAP is the measurement. Read it
@@ -660,6 +680,63 @@ work, it does not operate the machine"* — is about **dispatch**, and nothing h
 moves it: what an agent works on is still its own choice, self-selected and claimed
 atomically.
 
+**`GET /fleet` is what every agent is doing, from a phone** (#378), and the whole of
+its design is in what it refuses to conclude. Rich wanted four things off a phone —
+*"see the plan, state of each agent, drag them up and down if needed, and then the
+seats pick things up"* — and three of them existed. The data for the fourth was all
+already served (`/active`, `/sessions`, `/claims`); what was missing was a page.
+
+The naive render of that data lies in both directions, and the page is built around
+saying so instead. `/active` lists only leases inside their TTL; a lease is renewed
+once per **prompt** and runs thirty minutes against a claim's hour, so a single long
+autonomous turn drops a *working* agent out of `/active` (#252). So a row gets one of
+four readings, and only two of them are things somebody reported: `live` (a lease is
+being renewed), `ended` (somebody called `/session/end` and said why), `unclear`
+(there is no lease, nothing reported an ending, and either a claim is still standing
+or the silence is too young for the board's own passive expiry to have settled it)
+and `unreported` (old enough that expiry has had its say, and still nobody ever said
+what happened). **None of them is "dead."** The ambiguity is shown, in
+`qb-reconcile`'s own wording for the same ambiguity, rather than resolved — and a
+`working` older than `qbdata.py`'s `STALL_AFTER` is remarked on without being called
+stalled, because on a phone the row is all the reader has.
+
+One verb reaches it, `POST /session/end`, because that is what a person needs from a
+phone when something has gone wrong. Two things had to change for it to be reachable
+and useful. It depended on `app.auth.identify`, which wants a bearer token no browser
+holds, so it now goes through `app.auth.author` — an agent by token, authorised by
+machine exactly as before, or a person by an edge-proved `Remote-User`. And it only
+ever stamped a reason onto an **active** lease, so the one case somebody opens this
+page for — an agent that went quiet twenty minutes ago and never came back — was the
+one case the verb could not record: the only window in which anything could be said
+had already closed. A lapsed lease can now be told what happened to it, stamped at
+its own `expires_at` (the last moment the board knows the session was alive) rather
+than at the moment somebody got round to saying so. A lease already **released** is
+still left alone: a handoff is not an ending, and an ending already recorded belongs
+to whoever saw it first.
+
+`GET /sessions` gained two things. Every row now carries `last_lease` — when this
+key's newest lease stopped being valid — because **that is the clock a silence has to
+be measured against and `updated_at` is not it**. `updated_at` belongs to the
+transcript and moves on `/snapshot`; the lease moves on every prompt. Where the two
+diverge the gap runs the wrong way: a session that pushed at ten, kept renewing until
+noon and then died is two minutes quiet at 12:02 and two *hours* quiet by the
+transcript, so a fleet view reading the wrong one calls a working agent long gone —
+the exact misreading the page exists to prevent, arriving through the field it
+trusted.
+
+And `?include_ended=` widens the list to a session whose last lease was ended but
+which never pushed a transcript. Without it such a session is visible exactly while it
+holds a lease and vanishes the moment it ends — the one transition a fleet view most
+needs to show, and the same hole #277 fixed in `GET /session/{key}` and left in the
+list. It is a flag rather than the default because this list is paged, and folding an
+unbounded second population in would spend an existing caller's page on rows it never
+asked for. A lease that merely *lapsed* still gets no row either way: inventing one
+for a silence would be this page's own failure mode written into the endpoint.
+
+There is deliberately **no spawn button**: `qb-start` is off by default per machine
+(#360), a phone is the worst place to reason about whether a box opted in, and #371
+is where that argument belongs.
+
 `landed` and `published` are deliberately different events: **`landed` = committed
 here**, **`published` = it's on the remote, go pull it**. Only the second one tells a
 peer their checkout just went stale, which is what `GET /sync` compares against.
@@ -729,6 +806,25 @@ round already raised — and is never the `unknown` bucket, which means the ques
 the answer could not be placed. `provenance_runs` says how much of a window could attribute at all,
 and counts only judged runs: the per-member counters are tallied over confirmed findings, so an
 unjudged run can only contribute zeros to the sums it annotates.
+
+**Is the loop making progress, or patching the same wrong assumption?** A fix that patches a wrong
+assumption produces the next round's findings; a fix that removes it does not — and a round cap
+fires at the same point either way. #67 adds the measurement, and deliberately not the gate. Each
+finding records where it stands relative to the fix pass before it (`recurrence`: `revisited` where
+the previous round complained about that file, the fixer wrote in it and this finding is on top of
+what it wrote; `fix-site` where nobody had complained; `elsewhere`; `unknown`), the earlier finding
+it stands on (`recurs_of`), and — asked of the **judge**, as one more key on the verdict it is
+already writing — whether it invalidates the premise of that fix or is a separate defect
+(`premise_verdict`). `GET /review/stats` splits both across a window (`by_recurrence`, `by_premise`).
+
+The mechanical half was replayed over 36 rounds from 26 pull requests before it shipped, and it
+**does not discriminate**: `revisited` fires on ~80% of a round's new findings, at the same rate on
+the three cycles #67 calls circling as on every other cycle, at every radius tried. Under increment
+scope (#41) a later round *reads the fix commit*, so its findings are normally at the fix's site.
+That negative result is why the bucket is named for a position rather than for a verdict, why the
+judge is asked the sharper question separately, and why nothing stops on either — a heuristic that
+triggers redesigns cheaply is worse than the round cap it would replace. The rate is kept because it
+is the baseline any later rule has to beat.
 
 **"A human has to look at this" is a class, not a sentence.** Some findings no fix round can
 settle: which of these product options, whether that name is the right word, whether the pane
@@ -997,6 +1093,12 @@ the **record** and not the lock — by the time it runs the merge has happened, 
 number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
 release that landed through a `--no-verify` push, so the tags do not quietly drift out of
 step with the file they are supposed to be about.
+
+The tags are annotated, so writing one means writing an object, and git will not write an
+object without a tagger. `backfill` supplies one itself where the environment cannot name
+anybody — a CI runner has no `user.name` and no GECOS field to guess from, which is how #379
+cost `v2.99` and `v3` their tags. A resolvable identity is never overridden: where `git var
+GIT_COMMITTER_IDENT` answers, the tag is from whoever ran the command.
 
 ### A released entry is immutable
 
@@ -1639,6 +1741,11 @@ full — including what was broken before it, which is the part no diff recovers
 - **v2.98** — two branches can no longer mint the same migration id.
 - **v2.99** — something acts on a stale harness, and stops one step short of your password.
 - **v3** — the release number gets an allocator, and it is a git tag.
+- **v3.1** — the review loop starts measuring whether its fixes are getting anywhere.
+- **v3.2** — a release gets its tag on a machine that has never been told who it is.
+- **v3.3** — the landing procedure now says what goes wrong, not only what to decide.
+- **v3.4** — a PR body saying "this does not close #N" no longer closes #N.
+- **v3.5** — a page that says what every agent is doing, and how much of that is actually known.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -2097,8 +2204,12 @@ app/          FastAPI service
   sync.py          pure staleness reasoning (no I/O), like overlap.py
   needs_human.py   the closed "a human has to look at this" vocabulary (#279) and the
                    needs-human/* GitHub labels it projects onto (no model, no I/O)
-  api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard);
-                   static/board.html, static/reviews.html
+  api/board_view.py GET / (browser board — read and answer) + GET /panel (leaderboard)
+                   + GET /plan/view (the plan, and where a human reorders it)
+                   + GET /fleet (what every agent is doing, and how much of that is
+                   known rather than inferred — #378);
+                   static/board.html, static/reviews.html, static/plan.html,
+                   static/fleet.html
 migrations/   Alembic (async), one linear chain under two naming schemes: 0001 → 0034
               hand-numbered and frozen, everything above it an opaque `m<8 hex>` id
               minted by env.py's process_revision_directives hook (#341). 0001-0013:

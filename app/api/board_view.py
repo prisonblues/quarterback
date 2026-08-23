@@ -16,6 +16,7 @@ _STATIC = Path(__file__).parent.parent / "static"
 _BOARD_HTML = (_STATIC / "board.html").read_text(encoding="utf-8")
 _REVIEWS_HTML = (_STATIC / "reviews.html").read_text(encoding="utf-8")
 _PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
+_FLEET_HTML = (_STATIC / "fleet.html").read_text(encoding="utf-8")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -60,3 +61,30 @@ async def plan_view(_reader: str = Depends(reader)) -> HTMLResponse:
     person's decision.
     """
     return HTMLResponse(_PLAN_HTML)
+
+
+@router.get("/fleet", response_class=HTMLResponse)
+async def fleet_view(_reader: str = Depends(reader)) -> HTMLResponse:
+    """What every agent is doing, from a phone (#378) — and how much of it is known.
+
+    At ``/fleet`` rather than under one of the endpoints it reads, because it
+    reads three: ``GET /active`` for who holds a lease, ``GET /sessions`` for who
+    ever pushed a transcript and how their last lease ended, and ``GET /claims``
+    for what is still spoken for. No one of those paths is the page's, so none of
+    them can be its parent the way ``/plan`` is ``/plan/view``'s.
+
+    **It never concludes "gone" from an absent lease.** ``/active`` lists only
+    leases inside their TTL, a lease is renewed once per *prompt*, and one prompt
+    can be an hour of autonomous work — so a busy agent leaves ``/active``
+    precisely while it is busiest (#252). Where the board cannot separate a long
+    turn from a stall, the row says which two readings it cannot separate, in the
+    wording ``qb-reconcile`` already uses for the same ambiguity. Where somebody
+    *reported* an ending (#277) it says so, and that row is a different one.
+
+    One write reaches it, and it is ``POST /session/end``: the verb a person
+    actually needs from a phone when something has gone wrong. There is
+    deliberately no spawn button — ``qb-start`` is off by default per machine
+    (#360), and a phone is the worst place to reason about whether a box opted
+    in.
+    """
+    return HTMLResponse(_FLEET_HTML)

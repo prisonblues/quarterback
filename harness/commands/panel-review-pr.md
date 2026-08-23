@@ -889,6 +889,14 @@ for a verdict you dislike.
 
 ### Merging, once the user has said yes
 
+**`fix-and-land.md`'s *The hazards* section is what to read when a step here reads as
+a failure** — one copy of it, deliberately, rather than a second that drifts. It covers
+`--delete-branch` failing its cleanup from a worktree after the merge has already
+landed, a PR body whose "does not close #N" closes #N, impossible test failures that
+are a concurrent pytest rather than the PR, the two refusals that meet a lander trying
+to undo a change, and which of those already have a guard. None of it is specific to
+the autonomous loop: the worktree, the box and the GitHub are the same.
+
 Claim the base, re-verify, stamp the release, merge. In that order:
 
 ```bash

@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>quarterback fleet</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+    --muted:#8b93a3; --accent:#6ea8fe; --chip:#232936; --person:#e8c07d;
+    --live:#35c48a; --unclear:#f0b429; --ended:#8fb4e8; --unreported:#8b93a3;
+    /* One safe-area token per edge, so every rule that needs one reads the same
+       value. A phone in landscape has a notch on the SIDE, which is the case a
+       page that only pads the bottom loses text off the left of. */
+    --sat:env(safe-area-inset-top); --sab:env(safe-area-inset-bottom);
+    --sal:env(safe-area-inset-left); --sar:env(safe-area-inset-right);
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-text-size-adjust:100%; }
+  a { color:var(--accent); }
+
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+    border-bottom:1px solid var(--line);
+    padding:calc(8px + var(--sat)) calc(12px + var(--sar)) 8px calc(12px + var(--sal));
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .spacer { flex:1; }
+  header a { font-size:13px; text-decoration:none; }
+  /* 44px of tappable height on the toggle, without 44px of visible chrome */
+  .toggle { display:flex; align-items:center; gap:6px; min-height:44px;
+    color:var(--muted); font-size:13px; cursor:pointer; }
+  .toggle input { width:20px; height:20px; accent-color:var(--accent); }
+  .counts { color:var(--muted); font-size:13px; width:100%; }
+  .counts b { font-weight:600; color:var(--fg); }
+  #err { color:#e5484d; font-size:13px; width:100%; }
+
+  main { max-width:720px; margin:0 auto;
+    padding:10px calc(12px + var(--sar)) calc(28px + var(--sab)) calc(12px + var(--sal)); }
+  .empty { color:var(--muted); text-align:center; padding:36px 12px; }
+
+  /* who is looking, and therefore whether the one verb on this page will work */
+  .banner { border:1px solid #5c4a1e; background:#1c1810; border-radius:10px;
+    padding:10px 12px; margin:8px 0 12px; color:#f0b429; font-size:13px;
+    white-space:pre-wrap; word-break:break-word; }
+
+  .agent { border:1px solid var(--line); border-left-width:3px; border-radius:10px;
+    background:var(--panel); padding:10px 12px; margin:10px 0; }
+  .agent.live { border-left-color:var(--live); }
+  .agent.unclear { border-left-color:var(--unclear); }
+  .agent.ended { border-left-color:var(--ended); opacity:.72; }
+  .agent.unreported { border-left-color:var(--unreported); opacity:.6; }
+
+  .top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .name { font-weight:600; word-break:break-all; }
+  .name .inst { font-weight:400; color:#a9b4c6; }
+  .verdict { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+    border-radius:999px; padding:2px 9px; border:1px solid var(--line);
+    background:var(--chip); white-space:nowrap; }
+  .verdict.live { color:var(--live); border-color:#2f6f52; }
+  .verdict.unclear { color:var(--unclear); border-color:#5c4a1e; }
+  .verdict.ended { color:var(--ended); border-color:#31435c; }
+  .verdict.unreported { color:var(--unreported); }
+
+  .title { margin-top:5px; font-size:15px; word-break:break-word; }
+  .title.untitled { color:var(--muted); font-style:italic; }
+  .where, .doing { color:var(--muted); font-size:13px; margin-top:3px;
+    word-break:break-word; }
+  .doing { color:#aeb6c2; }
+  .claims { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  .claim { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--chip);
+    border:1px solid var(--line); color:#9fddc7; }
+  .subs { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  .sub { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--chip);
+    border:1px solid var(--line); color:var(--accent); }
+  /* The caveat is the point of the page, not a footnote: same size as the row it
+     qualifies, and never collapsed behind a tap. */
+  .caveat { margin-top:7px; padding:7px 9px; border-radius:8px; font-size:13px;
+    background:#1c1810; border:1px solid #5c4a1e; color:#f0b429;
+    white-space:pre-wrap; word-break:break-word; }
+  .caveat.settled { background:#141821; border-color:#31435c; color:#9fb4d0; }
+
+  button { font:inherit; }
+  .end { min-height:44px; min-width:64px; padding:0 14px; margin-left:auto;
+    font-size:14px; cursor:pointer; background:#2a1c1e; color:#f2999c;
+    border:1px solid #5c2626; border-radius:8px; }
+  .end:disabled { opacity:.35; cursor:default; }
+
+  /* end sheet — bottom-anchored, because this page is read on a phone one-handed */
+  .scrim { position:fixed; inset:0; background:#0009; z-index:25; }
+  .sheet { position:fixed; left:0; right:0; bottom:0; z-index:30; background:var(--panel);
+    border-top:1px solid var(--line); border-radius:14px 14px 0 0;
+    padding:12px calc(14px + var(--sar)) calc(16px + var(--sab)) calc(14px + var(--sal));
+    max-height:88vh; overflow-y:auto; display:flex; flex-direction:column; gap:10px;
+    max-width:720px; margin:0 auto; box-shadow:0 -8px 30px #000a; }
+  .sheet-head { display:flex; align-items:flex-start; gap:8px; }
+  .sheet-ctx { font-size:13px; color:var(--muted); flex:1; min-width:0;
+    word-break:break-word; }
+  .sheet-x { background:none; border:none; color:var(--muted); font-size:20px;
+    cursor:pointer; min-width:44px; min-height:44px; }
+  .sheet h2 { font-size:14px; margin:0; font-weight:600; }
+  .reasons { display:flex; flex-direction:column; gap:8px; }
+  /* 16px, not 14: below 16 iOS zooms the viewport on focus and the sheet jumps. */
+  .reasons button { min-height:44px; font-size:16px; text-align:left; padding:8px 12px;
+    cursor:pointer; background:var(--chip); color:var(--fg);
+    border:1px solid var(--line); border-radius:8px; }
+  .reasons button.on { border-color:var(--accent); color:var(--accent);
+    background:#182233; }
+  .reasons .gloss { display:block; font-size:12px; color:var(--muted); margin-top:1px; }
+  .reasons button.on .gloss { color:#7f97bb; }
+  .confirm { min-height:48px; font-size:16px; font-weight:600; cursor:pointer;
+    background:#5c2626; color:#ffd9da; border:1px solid #7a3333; border-radius:8px; }
+  .confirm:disabled { opacity:.5; cursor:default; }
+  .sheet-err { color:#e5484d; font-size:13px; white-space:pre-wrap; word-break:break-word; }
+  .sheet-note { color:var(--muted); font-size:12px; }
+
+  .unattributed { border:1px dashed var(--line); border-radius:10px; padding:9px 12px;
+    margin:16px 0 0; color:var(--muted); font-size:13px; }
+  .unattributed button { background:none; border:none; color:var(--accent);
+    font-size:13px; cursor:pointer; min-height:44px; padding:0; }
+  .unattributed ul { margin:6px 0 0; padding-left:18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>fleet</h1>
+  <label class="toggle"><input type="checkbox" id="showSettled" /> show settled</label>
+  <span class="spacer"></span>
+  <a href="/">board</a>
+  <a href="/plan/view">plan</a>
+  <span id="counts" class="counts"></span>
+  <span id="err"></span>
+</header>
+<main>
+  <div id="banner"></div>
+  <div id="list"></div>
+  <div id="unattributed"></div>
+  <div id="empty" class="empty">nothing on the board — no lease, no session, no claim</div>
+</main>
+
+<div id="scrim" class="scrim" hidden></div>
+<section id="sheet" class="sheet" hidden aria-label="end a session">
+  <div class="sheet-head">
+    <span id="sheetCtx" class="sheet-ctx"></span>
+    <button id="sheetClose" class="sheet-x" aria-label="close">&#10005;</button>
+  </div>
+  <h2>why did it stop?</h2>
+  <div id="reasons" class="reasons"></div>
+  <div class="sheet-note">This records that the session stopped. It does not close a
+    pane, signal a process or operate the machine — the board coordinates work, it
+    does not run it.</div>
+  <div id="sheetErr" class="sheet-err"></div>
+  <button id="sheetSend" class="confirm">end session</button>
+</section>
+
+<script>
+// What is every agent doing — and, on every row, whether that reading can be
+// trusted. The two things this page exists to keep apart are:
+//
+//   1. A stale agent must not read as a working one, and a working one must not
+//      read as dead. `/active` lists only leases with `expires_at > now`, a
+//      lease is renewed once per PROMPT, and one prompt can be an hour of
+//      autonomous work — so a busy agent leaves `/active` while it is busiest
+//      (#252). This page therefore never concludes "gone" from an absent lease.
+//      Where it cannot tell, it says which two readings it cannot separate.
+//
+//   2. A finished session and a slow one are different rows. `qb-end` records a
+//      reason (#277) and `GET /sessions` carries an `ended` block that is null
+//      for a lease nobody ended. A view that collapsed those would throw away
+//      the one fact that distinguishes them.
+
+// ---- constants that belong to somebody else --------------------------------
+
+// Verbatim from `harness/bin/qb-reconcile`'s `_LEASE_ASYMMETRY`. Two readers of
+// one ambiguity wording it two ways is how an operator learns to believe
+// whichever one they read first; `tests/test_fleet_page.py` pins this to the
+// harness's own sentence.
+const LEASE_ASYMMETRY = "a lease is renewed per prompt and runs 30 minutes " +
+  "against a claim's hour, so a single long autonomous turn drops a working " +
+  "agent out of /active";
+
+// How long a `working` may stand before it is worth remarking on, in seconds —
+// `harness/bin/qbdata.py`'s STALL_AFTER, which the pane's own footer also uses.
+// Three readers of one beacon disagreeing about when it goes quiet is worse than
+// the threshold being wrong, because nothing outside can say which to believe.
+//
+// The page does NOT conclude `stalled` from it, and that is the difference from
+// the dashboard: on a phone the row is all you have, so it names both readings
+// rather than picking one.
+const STALL_AFTER = 480;
+
+// `app/api/claims.py`'s default claim TTL, in ms. It is the window inside which
+// an absent lease proves nothing at all: below it the board's own passive expiry
+// has not yet had time to settle the question either way.
+const CLAIM_TTL_MS = 3600 * 1000;
+
+// How many SETTLED rows to draw. Three months of this fleet is a few hundred
+// sessions nobody ever ended, and a phone scrolling all of them is a page that
+// does not open. Unsettled rows are never capped — see `render`.
+const SETTLED_CAP = 40;
+
+// The closed vocabulary from `app.api.leases.EndReason`. Each names a different
+// OBSERVER, which is why the sheet glosses them rather than listing five words.
+// `stalled` and `crashed` are deliberately absent: both are conclusions a reader
+// draws from silence, never a report anybody makes, and a lease carrying no
+// reason already IS that report.
+const END_REASONS = [
+  ["killed", "something closed it from outside — you, here, or a ✕ on the seat bar"],
+  ["finished", "it got there; the work is done"],
+  ["timed_out", "a bounded run hit its ceiling"],
+  ["context_reset", "/clear or /new — the pane lives on, this conversation does not"],
+  ["superseded", "another session took the work over"],
+];
+
+const HUMAN = "human";
+
+const listEl = document.getElementById("list");
+const emptyEl = document.getElementById("empty");
+const countsEl = document.getElementById("counts");
+const errEl = document.getElementById("err");
+const bannerEl = document.getElementById("banner");
+const unattEl = document.getElementById("unattributed");
+const showSettled = document.getElementById("showSettled");
+const scrim = document.getElementById("scrim");
+const sheet = document.getElementById("sheet");
+const sheetCtx = document.getElementById("sheetCtx");
+const sheetErr = document.getElementById("sheetErr");
+const sheetSend = document.getElementById("sheetSend");
+const sheetClose = document.getElementById("sheetClose");
+const reasonsEl = document.getElementById("reasons");
+
+let rows = [];          // one per session, newest activity first
+let orphanClaims = [];  // live claims that name no session — they belong to a box
+let orphansOpen = false;
+let gen = 0;            // read generation — a superseded read is discarded
+let busy = false;       // a write is in flight; the tick must not read over it
+let ending = null;      // {session, label, reason} while the sheet is open
+
+// ---- helpers (house style, shared with plan.html / board.html) --------------
+
+// Safe in an ATTRIBUTE as well as in text: textContent→innerHTML escapes & < >
+// and leaves quotes alone, and every value here (title, repo, branch, note) is
+// agent-supplied.
+function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
+  return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+function who(name){ const i=(name??"").indexOf("/");
+  if(i<0) return esc(name||"?");
+  const machine = name.slice(0,i), rest = name.slice(i+1);
+  if(machine===HUMAN) return `<span style="color:var(--person);font-weight:600">${
+    esc(machine)}/${esc(rest)}</span>`;
+  return `${esc(machine)}<span class="inst">/${esc(rest)}</span>`; }
+function span(s){ if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m";
+  if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
+function secsSince(iso){ const t=Date.parse(iso); return isNaN(t) ? null
+  : Math.max(0,(Date.now()-t)/1000); }
+function ago(iso){ const s=secsSince(iso); return s===null ? "an unreadable time" : span(s); }
+// An expiry is in the FUTURE — running it through `ago` clamps it to zero and
+// every live lease reads "expires 0s", which is precisely the lease that lapsed.
+function until(iso){ const s=(Date.parse(iso)-Date.now())/1000;
+  return isNaN(s) ? "an unreadable time" : s<=0 ? "lapsed" : "in "+span(s); }
+function say(msg){ errEl.textContent = msg||""; }
+// `GET /claims` already excludes released and expired rows, so everything it
+// returns is live as far as the board is concerned. This re-check is the second
+// opinion for the seconds a page sits between ticks — and an expiry it cannot
+// PARSE is not an expiry that has passed, so it counts as held. Reading an
+// unreadable field as "gone" is the same collapse this whole page exists to
+// avoid, one field down.
+// **The clock a silence is measured against, and it is the LEASE's.**
+// `updated_at` belongs to the transcript and moves on /snapshot; the lease moves
+// on every prompt, and it is the lease's absence this page is reading. They
+// usually track each other, and where they do not the gap runs the wrong way — a
+// session that pushed at ten, renewed until noon and then died is two minutes
+// quiet at 12:02 and two HOURS quiet by the transcript. Judging off the wrong one
+// reads a working agent as long gone, which is precisely the misreading this page
+// exists to prevent, arriving through the field it trusted. `updated_at` is the
+// fallback for a row built from a claim alone, where there is no lease to ask.
+function heardAt(r){
+  return (r.last_lease && (r.last_lease.released || r.last_lease.expires))
+      || r.updated_at || null;
+}
+function claimLive(c){ const t = Date.parse(c && c.expires); return isNaN(t) || t > Date.now(); }
+// `prisonblues/quarterback#378` → `quarterback#378`. The owner is the same for
+// every repo this fleet touches, so it is 12 columns that separate nothing.
+function shortKey(k){ const s=String(k||""); const i=s.indexOf("/");
+  return i<0 ? s : s.slice(i+1); }
+function lastPath(p){ const parts=String(p||"").split("/").filter(Boolean);
+  return parts.length ? parts[parts.length-1] : null; }
+
+// FastAPI's `detail` is a string for our own errors and a list/object for a
+// validation failure, so nothing here may assume its shape.
+function detailText(payload){
+  const det = payload && payload.detail;
+  if(typeof det === "string") return det;
+  if(det && typeof det === "object" && !Array.isArray(det) && det.error)
+    return det.error + (det.hint ? " — " + det.hint : "");
+  return det ? JSON.stringify(det) : null;
+}
+
+// ---- the reading, and how much of it is a guess ----------------------------
+
+// What a LIVE agent is doing. Never "stalled": that word is a conclusion, and on
+// this page the two readings it collapses are both still open.
+function activity(a){
+  if(!a.state) return {text: "it has not said what it is doing",
+    caveat: "the lease is live but carries no `state` — an older hook, or one "
+          + "that never set one. That the agent is here is known; what it is "
+          + "doing is not."};
+  const quiet = secsSince(a.state_at);
+  if(a.state !== "working")
+    return {text: `${a.state} · said so ${quiet===null?"at an unreadable time":span(quiet)+" ago"}`};
+  if(quiet === null || quiet < STALL_AFTER)
+    return {text: `working · said so ${quiet===null?"at an unreadable time":span(quiet)+" ago"}`};
+  return {text: `working · said so ${span(quiet)} ago`,
+    caveat: `it last reported “working” ${span(quiet)} ago. Past `
+          + `${span(STALL_AFTER)} a long turn and a stall look identical from `
+          + `out here — the board holds one report and nothing that separates `
+          + `them, so this row is not calling it stalled.`};
+}
+
+// The one judgement on the page, and it is three-valued on purpose. `live` and
+// `ended` are things somebody REPORTED. `unclear` and `unreported` are the two
+// shapes of silence, and neither of them is "gone".
+function verdict(r){
+  if(r.lease){
+    const act = activity(r.lease);
+    return {v:"live", doing: act.text, caveat: act.caveat || null, settled:false};
+  }
+  if(r.ended){
+    const at = r.ended.at ? `${ago(r.ended.at)} ago` : "at an unrecorded time";
+    return {v:"ended", doing: `${r.ended.reason} · ${at}`, settled:true,
+      caveat: `reported by ${r.ended.holder||"somebody"} — a report of what `
+            + `happened, not an inference from silence.`};
+  }
+  const held = (r.claims||[]).filter(claimLive);
+  const heard = heardAt(r);
+  const what = r.last_lease ? "its lease lapsed" : "last heard from";
+  const seen = heard ? `${what} ${ago(heard)} ago` : `${what} at an unrecorded time`;
+  if(held.length)
+    return {v:"unclear", settled:false, doing: seen,
+      caveat: `no lease in /active, and nothing reported an ending — but it `
+            + `still holds ${held.length===1?"a claim":held.length+" claims"} `
+            + `inside ${held.length===1?"its":"their"} own TTL: `
+            + `${LEASE_ASYMMETRY}; the board's own passive expiry settles this `
+            + `at the claim's own TTL. Working and gone are both consistent `
+            + `with this row.`};
+  const quiet = secsSince(heard);
+  if(quiet === null)
+    return {v:"unclear", settled:false, doing: `${what} at an unreadable time`,
+      caveat: `no lease in /active, nothing reported an ending, and the one `
+            + `timestamp that would say how long ago that was does not parse `
+            + `(${heard ?? "absent"}). The silence cannot even be measured, so `
+            + `it certainly cannot be interpreted.`};
+  if(quiet * 1000 < CLAIM_TTL_MS)
+    return {v:"unclear", settled:false, doing: seen,
+      caveat: `nothing has renewed its lease since then and nothing reported an `
+            + `ending — ${LEASE_ASYMMETRY}. So a busy agent and a dead one are `
+            + `the same row here, and this one is too recent for the board's `
+            + `passive expiry to have settled it either way.`};
+  return {v:"unreported", settled:true, doing: seen,
+    caveat: `nothing ever reported an ending — a lease running out says only `
+          + `that nobody renewed it, so whether this got where it was going is `
+          + `not on the board.`};
+}
+
+// ---- render ----------------------------------------------------------------
+
+function claimChips(r){
+  const held = (r.claims||[]).filter(claimLive);
+  if(!held.length) return "";
+  return `<div class="claims">${held.map(c =>
+    `<span class="claim" title="${esc(c.note || c.kind)} · expires ${esc(until(c.expires))}"
+      >${esc(shortKey(c.key))}</span>`).join("")}</div>`;
+}
+
+function agentRow(r){
+  const d = verdict(r);
+  const el = document.createElement("article");
+  el.className = "agent " + d.v;
+  const l = r.lease;
+  // Where it is. `repo`/`branch` come off the lease, so a row with no live lease
+  // falls back to the session's cwd — which is a path, and says less, and is
+  // shown as the lesser thing it is rather than dressed up as the same fact.
+  const where = l
+    ? [l.repo || lastPath(l.cwd), l.branch, l.device,
+       (l.model||"").replace(/^claude-/,"")].filter(Boolean)
+    : [lastPath(r.cwd), r.device, (r.model||"").replace(/^claude-/,"")].filter(Boolean);
+  const age = l ? ` · up ${ago(l.since)} · lease ${until(l.expires)}` : "";
+  el.innerHTML = `
+    <div class="top">
+      <span class="name">${who(r.holder)}</span>
+      <span class="verdict ${d.v}">${esc(d.v)}</span>
+      <button class="end" data-end="${esc(r.session)}"
+        ${d.v==="ended"?`disabled title="already ended — ${esc(r.ended.reason)}"`
+                       :`title="record that this session stopped"`}>end</button>
+    </div>
+    <div class="title${r.title?"":" untitled"}">${
+      esc(r.title || "no title — the session never reported one")}</div>
+    <div class="where">${where.map(esc).join(" · ")||"—"}</div>
+    <div class="doing">${esc(d.doing)}${esc(age)}</div>
+    ${claimChips(r)}
+    ${(r.subagents&&r.subagents.length)?`<div class="subs">${r.subagents.map(s =>
+      `<span class="sub">⤷ ${esc(s.label||s.agent_id)}</span>`).join("")}</div>`:""}
+    ${d.caveat?`<div class="caveat${d.settled?" settled":""}">${
+      d.settled?"":"⚠ "}${esc(d.caveat)}</div>`:""}`;
+  return el;
+}
+
+function render(){
+  const settled = showSettled.checked;
+  const counts = {live:0, unclear:0, ended:0, unreported:0};
+  const shown = [];
+  for(const r of rows){
+    const d = verdict(r);
+    counts[d.v]++;
+    // Live and unclear are ALWAYS on screen: those are the rows nobody has
+    // settled, and hiding one behind a toggle is the false-clean this page is
+    // about. A settled row is one somebody reported, or one old enough that the
+    // board's own expiry has had its say — one tap away, and counted either way.
+    if(!d.settled || settled) shown.push(r);
+  }
+  // Every unsettled row, then as much of the settled tail as is worth scrolling.
+  // The cap is on the tail alone: a `live` or `unclear` row dropped by a page
+  // limit is the failure this whole page is about, and there is no number of
+  // them that makes cutting one right.
+  const unsettled = shown.filter(r => !verdict(r).settled);
+  const capped = shown.slice(0, unsettled.length + SETTLED_CAP);
+  listEl.innerHTML = "";
+  for(const r of capped) listEl.appendChild(agentRow(r));
+
+  const hidden = rows.length - capped.length;
+  countsEl.innerHTML =
+    `<b>${counts.live}</b> live · <b>${counts.unclear}</b> unclear · ` +
+    `<b>${counts.ended}</b> ended · <b>${counts.unreported}</b> unreported` +
+    (hidden ? ` · ${hidden} settled not shown` : "");
+  emptyEl.style.display = capped.length ? "none" : "block";
+  renderOrphans();
+}
+
+// A live claim that names no session belongs to the BOX, not to any agent here —
+// `create-worktree` takes one before the agent that will use the tree exists. It
+// cannot be a row, because there is no agent to put on one. Left off the page
+// entirely it would be work in flight that the page whose job is "what is every
+// agent doing" shows nothing of, which is the same false-clean by omission.
+function renderOrphans(){
+  if(!orphanClaims.length){ unattEl.innerHTML = ""; return; }
+  const n = orphanClaims.length;
+  unattEl.innerHTML =
+    `<button data-orphans>${n} live claim${n===1?"":"s"} name${n===1?"s":""} no `
+    + `session ${orphansOpen?"▴":"▾"}</button>
+     <div>held by a machine rather than by an agent — a worktree's claim, taken
+     before the agent that will use it exists. Nothing on this page can say
+     whether anybody is working them.</div>
+     ${orphansOpen?`<ul>${orphanClaims.map(c =>
+       `<li>${esc(shortKey(c.key))} — ${who(c.holder)} · expires ${esc(until(c.expires))}${
+         c.note?` · “${esc(c.note)}”`:""}</li>`).join("")}</ul>`:""}`;
+}
+
+unattEl.addEventListener("click", (e) => {
+  if(e.target.closest("button[data-orphans]")){ orphansOpen = !orphansOpen; renderOrphans(); }
+});
+
+// ---- data ------------------------------------------------------------------
+
+// Three reads, one paint. They have to agree with each other — a row's verdict is
+// a JOIN of "is there a lease" and "did anybody report an ending" and "is a claim
+// still standing" — so a page built from them arriving one at a time would show
+// a row as `unclear` and then as `live` half a second later, on every tick.
+async function load(){
+  const my = ++gen;
+  let active, sessions, claims;
+  try {
+    const [a, s, c] = await Promise.all([
+      fetch("/active", {headers:{Accept:"application/json"}}),
+      // include_ended: an ending with no transcript behind it has no `sessions`
+      // row of its own, so without this a session that ends without ever having
+      // pushed anything simply vanishes from the page — which is the transition
+      // this page most needs to show. Off by default there, because it widens a
+      // list every other reader pages through.
+      fetch("/sessions?limit=200&include_ended=true", {headers:{Accept:"application/json"}}),
+      fetch("/claims?limit=500", {headers:{Accept:"application/json"}}),
+    ]);
+    if(!a.ok || !s.ok || !c.ok){
+      if(my===gen) say(`the board would not answer (${[a,s,c].map(r=>r.status).join("/")})`);
+      return;
+    }
+    [active, sessions, claims] = await Promise.all([a.json(), s.json(), c.json()]);
+  } catch(err) {
+    // Without this the last good page stays on screen, looking live, with
+    // nothing to say it stopped refreshing — which is this page's own failure
+    // mode reproduced in the page itself.
+    if(my===gen) say("the board is unreachable — " + ((err && err.message) || "network error"));
+    return;
+  }
+  if(my !== gen) return;   // a slower earlier read must not paint over a newer one
+
+  const leases = new Map((active.agents||[]).map(a => [a.session, a]));
+  const subs = new Map();
+  for(const s of (active.subagents||[])){
+    if(!subs.has(s.parent_session)) subs.set(s.parent_session, []);
+    subs.get(s.parent_session).push(s);
+  }
+  const byClaim = new Map();
+  orphanClaims = [];
+  for(const c of (claims.claims||[])){
+    if(!claimLive(c)) continue;
+    if(!c.session){ orphanClaims.push(c); continue; }
+    if(!byClaim.has(c.session)) byClaim.set(c.session, []);
+    byClaim.get(c.session).push(c);
+  }
+
+  const merged = new Map();
+  for(const s of (sessions||[])) merged.set(s.session, {...s, lease:null, claims:[]});
+  // A lease with no `sessions` row is a session that has never pushed a
+  // transcript. It is live, it is holding work, and it is the one an absent row
+  // would drop off the page altogether.
+  for(const [key, lease] of leases){
+    const row = merged.get(key) || {session:key, holder:lease.holder, title:lease.title,
+      cwd:lease.cwd, device:lease.device, model:lease.model, updated_at:lease.since,
+      ended:null, subagents:[]};
+    row.lease = lease;
+    row.holder = lease.holder || row.holder;
+    row.title = lease.title || row.title;
+    merged.set(key, row);
+  }
+  for(const [key, cs] of byClaim){
+    // A claim can name a session the board has no other record of at all — no
+    // lease, no transcript. That is exactly the row this page must not lose.
+    const row = merged.get(key) || {session:key, holder:cs[0].holder, title:null,
+      cwd:null, device:null, model:null, updated_at:cs[0].acquired, ended:null,
+      subagents:[]};
+    row.claims = cs;
+    merged.set(key, row);
+  }
+  for(const row of merged.values())
+    if(subs.has(row.session)) row.subagents = subs.get(row.session);
+
+  const rank = {live:0, unclear:1, ended:2, unreported:3};
+  rows = [...merged.values()].sort((a,b) =>
+    rank[verdict(a).v] - rank[verdict(b).v] ||
+    (Date.parse(heardAt(b)) || 0) - (Date.parse(heardAt(a)) || 0));
+  say("");
+  render();
+}
+
+// ---- who is looking --------------------------------------------------------
+
+// Identity is a QUESTION, never an assumption — the same page is served to an
+// agent's token, to a person the edge vouched for, and to a browser nobody
+// vouched for. Ending a session is a person's call (app.auth.author routes a
+// person through the edge), so the page asks and says what it was told rather
+// than presenting a button whose refusal would arrive as a bare 403.
+async function loadMe(){
+  let r;
+  try { r = await fetch("/whoami", {headers:{Accept:"application/json"}}); }
+  catch(err){ return; }   // offline: the list read reports the connection
+  const body = await r.json().catch(()=>null);
+  if(r.ok && body && body.kind === HUMAN) return;   // a person — nothing to warn about
+  let msg;
+  if(r.ok && body)
+    // Not "it will be refused": an agent may end a session on its OWN machine
+    // (app.auth.author authorises one by token, the leases table by machine), and
+    // a banner that overstated the refusal would send somebody looking for a
+    // permissions bug that is not there.
+    msg = `the board says you are looking as ${who(body.agent)} — an agent, not a `
+        + `person. Ending a session from here will work only for sessions on `
+        + `${esc(body.machine || "that machine")}; a person the edge vouches for `
+        + `may end any of them.`;
+  else if(r.ok)
+    msg = `the board answered /whoami with something this page could not read, so `
+        + `whether ending a session will work is unknown until you try it.`;
+  else
+    msg = `the board will not say who you are (${r.status}), so ending a session `
+        + `will be refused. What it said:` + (detailText(body) ? "\n\n" + esc(detailText(body)) : "");
+  bannerEl.innerHTML = `<div class="banner">${msg}</div>`;
+}
+
+// ---- the one verb ----------------------------------------------------------
+
+function openEnd(sessionKey){
+  const row = rows.find(x => x.session === sessionKey);
+  if(!row) return;
+  ending = {session: sessionKey, reason: END_REASONS[0][0]};
+  const d = verdict(row);
+  sheetCtx.innerHTML = `end <b>${who(row.holder)}</b><br>${esc(row.title || sessionKey)}
+    <br><span style="color:var(--${d.v})">${esc(d.v)}</span> · ${esc(d.doing)}`;
+  sheetErr.textContent = "";
+  renderReasons();
+  scrim.hidden = false; sheet.hidden = false;
+}
+function closeEnd(){ sheet.hidden = true; scrim.hidden = true; ending = null; }
+
+function renderReasons(){
+  reasonsEl.innerHTML = END_REASONS.map(([r, gloss]) =>
+    `<button data-reason="${esc(r)}" class="${ending&&ending.reason===r?"on":""}">${
+      esc(r)}<span class="gloss">${esc(gloss)}</span></button>`).join("");
+}
+reasonsEl.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-reason]");
+  if(!b || !ending) return;
+  ending.reason = b.dataset.reason;
+  renderReasons();
+});
+
+listEl.addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-end]");
+  if(b && !b.disabled) openEnd(b.dataset.end);
+});
+
+async function endSession(){
+  if(!ending) return;
+  const body = {session: ending.session, reason: ending.reason};
+  sheetSend.disabled = true; sheetErr.textContent = "";
+  busy = true;
+  try {
+    const r = await fetch("/session/end", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    const payload = await r.json().catch(()=>null);
+    if(!r.ok){ sheetErr.textContent = detailText(payload) || `failed (${r.status})`; return; }
+    // `ended: false` is a truthful answer, not a failure: somebody else got
+    // there first, or there was no lease left to stamp. Saying which — and
+    // saying it BESIDE the claims, which are released either way — beats a
+    // silent success on a page whose whole subject is the difference between
+    // what was reported and what was assumed.
+    const freed = (payload && payload.released_claims || []).length;
+    const claims = freed ? ` · ${freed} claim${freed===1?"":"s"} handed back` : "";
+    say((payload && payload.ended === false
+      ? `not this call's ending (${payload.lease_was || "no lease found"})`
+      : "ended") + claims);
+    closeEnd();
+  } catch(err) {
+    sheetErr.textContent = "could not reach the board — " + ((err && err.message) || "network error");
+    return;
+  } finally { sheetSend.disabled = false; busy = false; }
+  load();
+}
+
+sheetSend.onclick = endSession;
+sheetClose.onclick = closeEnd;
+scrim.onclick = closeEnd;
+sheet.addEventListener("keydown", (e) => { if(e.key === "Escape") closeEnd(); });
+showSettled.onchange = render;
+
+loadMe();
+load();
+setInterval(() => { if(!busy && sheet.hidden) load(); }, 15000);
+</script>
+</body>
+</html>

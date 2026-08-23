@@ -312,6 +312,21 @@ class Canonical:
     reported_by: list[Finding] = field(default_factory=list)
     related: list[str] = field(default_factory=list)
     rationale: str = ""
+    #: The judge's answer to #67's question: does this finding show the fix that
+    #: preceded it was built on a wrong assumption (``invalidates``), is it a
+    #: different defect (``separate``), or can it not be told (``unclear``)?
+    #: ``""`` when the question was not put — a round 1, or a round with no
+    #: readable earlier round — which is a different state from ``unclear`` and
+    #: must stay one.
+    #:
+    #: On the record rather than added at serialisation time, where
+    #: ``new_this_round`` and ``provenance`` ride: those two are facts about this
+    #: run's comparison against a baseline, so a ``Canonical`` carrying them would
+    #: have to be told about a baseline to know its own shape. This is not — it is
+    #: what the judge SAID about this finding, arriving in the same reply as the
+    #: severity and the synthesis, and dropping it here would mean parsing the
+    #: judge's answer twice.
+    premise_verdict: str = ""
 
     @property
     def reviewers(self) -> list[str]:
@@ -399,6 +414,7 @@ class Canonical:
             "needs_human_by": self.needs_human_by,
             "related": self.related,
             "rationale": self.rationale,
+            "premise_verdict": self.premise_verdict,
         }
 
 
@@ -466,7 +482,8 @@ def _judge_listing(clusters: list[list[Finding]],
     return "\n".join(lines), flat
 
 
-def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonical]:
+def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
+                    asked: bool = False) -> list[Canonical]:
     """Turn the judge's reply into canonical findings.
 
     Defensive in one direction only: a malformed reply must never SUPPRESS a
@@ -481,6 +498,13 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
     answers with `"members": ["F01"]` — its own issue labels where report numbers
     belong — loses every merge it made, and without a word about it the run reads
     exactly like one where the judge found no duplicates.
+
+    ``asked`` is whether #67's recurrence brief was in the prompt. A `premise` key
+    on a reply to a prompt that never put the question is not an answer to it: the
+    model volunteered a word, about a fix pass it was shown nothing of, and
+    recording it would put a fabricated verdict in the one column whose value is
+    that `unclear` and "not asked" stay apart. Default False, so a caller that has
+    not thought about it records nothing rather than something.
     """
     out: list[Canonical] = []
     claimed: set[int] = set()
@@ -521,6 +545,10 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
             detail=rep.detail,
             reported_by=accounts,
             rationale=str(v.get("reason") or v.get("rationale") or "").strip(),
+            # #67, and only ever present when the recurrence brief was in the
+            # prompt — a judge that was never asked cannot answer, and a stray key
+            # on a round-1 reply normalises to "" like any other unreadable value.
+            premise_verdict=_premise_verdict(v.get("premise")) if asked else "",
         )
         out.append(c)
         rel = v.get("related")
@@ -561,12 +589,48 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int) -> list[Canonica
     return out
 
 
+#: How many of the previous round's findings the recurrence brief lists, and how
+#: much of each one's title. The brief is a QUESTION about the round, not a second
+#: copy of it: past a couple of dozen complaints the judge is being asked to hold
+#: two whole reviews at once, and the tail buys nothing the head did not. Cut is
+#: SAID, for the reason every other cut in this file is said — a judge that is
+#: shown fifteen of forty complaints and told so can answer `unclear`; one that is
+#: shown fifteen and told nothing answers `separate` about a premise it never saw.
+MAX_RECURRENCE_FINDINGS = 25
+RECURRENCE_TITLE_CHARS = 200
+
+
+def recurrence_brief(fixed: list[tuple[str, str, str, int | None, str]],
+                     round_no: int | None) -> str:
+    """#67's extra question for the judge, or ``""`` when there is nothing to ask.
+
+    Empty whenever the previous round asked its fixer for nothing this can name —
+    a round 1, a cycle whose baseline could not be read, a round that reviewed
+    nothing. The caller then swaps :data:`panel_core.JUDGE_RECURRENCE_SLOT` for
+    the empty string and the prompt is byte-identical to the one every round has
+    always been given.
+    """
+    if not fixed:
+        return ""
+    shown = fixed[:MAX_RECURRENCE_FINDINGS]
+    lines = [f"- [{sev}] {file}{f':{line}' if line else ''} — "
+             f"{title[:RECURRENCE_TITLE_CHARS]}{'…' if len(title) > RECURRENCE_TITLE_CHARS else ''}"
+             for _key, sev, file, line, title in shown]
+    if len(fixed) > len(shown):
+        lines.append(f"- (+{len(fixed) - len(shown)} more, not listed — if the assumption you "
+                     "are looking for might be among them, answer `unclear`)")
+    return RECURRENCE_BRIEF.format(
+        prior_round=f"round {round_no}" if round_no else "the previous round",
+        prior_findings="\n".join(lines))
+
+
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
                coverage: dict[str, list[str]] | None = None,
                ci: str = "",
                code_tree: Path | None = None,
-               budget_usd: float | None = None
+               budget_usd: float | None = None,
+               recurrence: str = ""
                ) -> tuple[list[Canonical], str | None, str]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
@@ -584,6 +648,13 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     so it costs no additional model call — and its own reply may still be the
     bare verdict array an earlier judge returned, in which case there is simply
     no coverage note.
+
+    ``recurrence`` is #67's question, rendered by :func:`recurrence_brief` and
+    empty on every round with no earlier round to ask it about. It rides in on the
+    same terms as the coverage ruling and for the same reason — one more key on a
+    verdict the judge is already writing, so the sharper half of the measurement
+    costs no second model call. An empty string leaves the prompt byte-identical
+    to the one every round was given before this existed.
 
     Declarations with no findings still run the judge: that is the round where
     "clean versus could-not-tell" most needs adjudicating — two members saying
@@ -674,6 +745,11 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
             prompt = prompt.replace(JUDGE_CODE_SLOT, CODE_ACCESS_BRIEF)
         else:
             prompt = prompt.replace(JUDGE_CODE_SLOT, "")
+        # #67's question, and the empty string on every round that has no earlier
+        # round to ask it about — which keeps a round-1 prompt byte-identical to
+        # the one it has always been. Replaced unconditionally, like the slot
+        # above: an unswapped token would travel to the model as literal text.
+        prompt = prompt.replace(JUDGE_RECURRENCE_SLOT, recurrence)
         args = panel_seats.claude_args(model, str(uuid.uuid4()), reads_code=reads_code,
                                       budget_usd=budget_usd if reads_code else None)
         out, err = panel_seats.run_cli(args, "judge", stdin_text=prompt, cwd=sandbox)
@@ -720,7 +796,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         if not flat and answered:
             return [], None, note
         return unruled("judge: no JSON verdict in output (unparseable)", note)
-    return _parse_verdicts(parsed, flat, pr), None, note
+    return _parse_verdicts(parsed, flat, pr, asked=bool(recurrence)), None, note
 
 
 # ----------------------------------------------------------------------------- rounds
@@ -825,6 +901,29 @@ class Baseline:
     #: see above — and the briefs name that round to the reviewers, so it has to
     #: travel with the sha rather than being guessed from this run's round number.
     head_round: int | None = None
+    #: What the round that supplied ``head_sha`` asked its fixer to fix — file
+    #: spelling -> the finding keys raised against it. #67's other end of the
+    #: recurrence chain (:func:`panel_scope._recurrence`): a new finding standing
+    #: where the fix pass was working is only *circling* if that pass was working
+    #: there in answer to a complaint, and this is the complaint.
+    #:
+    #: **From the anchor round alone**, not a union over every earlier round, and
+    #: the reason is the same one ``head_sha`` gives for taking the latest rather
+    #: than the earliest: the fix range under attribution is one round wide, so the
+    #: only complaints it can have been answering are that round's. A union would
+    #: read round 1's finding, round 3's finding and round 2's unrelated edit as a
+    #: circle.
+    #:
+    #: **Never the dismissed bucket.** The master ruled those not real, no fixer was
+    #: sent to them, and a fix pass cannot have been built on the premise of work
+    #: nobody did.
+    fixed_here: dict[str, set[str]] = field(default_factory=dict)
+    #: The same findings as records, for the judge's brief — ``(key, severity,
+    #: file, line, title)``, ordered as the payload listed them. Kept beside
+    #: ``fixed_here`` rather than derived from it because the two are read by
+    #: different consumers at different grains: the mechanical test wants a file
+    #: index, and the judge wants sentences it can recognise the fix in.
+    fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
     #: When the LATEST prior round that recorded one FINISHED, as epoch seconds
     #: (#192). The left-hand end of the fix phase: this round's own start is the
     #: right-hand end, and the span between them is the fixer, the verification
@@ -1415,6 +1514,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # back to the whole PR. An older commit we CAN diff against is worth more
         # than no increment and no attribution at all, and the fallbacks are still
         # there if nothing in the set names one.
+        anchor_payload: dict | None = None
         for was, path, payload in ordered:
             sha = payload.get("head_sha") or None
             if sha is None:
@@ -1432,7 +1532,33 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                                   "anchored no increment and provenance reads `unknown` "
                                   "rather than attributing against whatever that names")
                 continue
-            b.head_sha, b.head_round = sha, was
+            b.head_sha, b.head_round, anchor_payload = sha, was, payload
+        # What that anchor round asked its fixer to fix (#67). Read off the SAME
+        # payload the anchor came from and no other: the fix range this round
+        # attributes against runs from that commit, so those are the complaints
+        # the pass in between can have been answering. `to_fix` and
+        # `sonar_findings` are the two buckets a fixer's brief is built from —
+        # `dismissed` is deliberately absent, since a finding the master ruled
+        # not real is nobody's premise.
+        if anchor_payload is not None:
+            for bucket in ("to_fix", "sonar_findings"):
+                for f in anchor_payload.get(bucket) or []:
+                    if not isinstance(f, dict):
+                        continue
+                    file = str(f.get("file") or "")
+                    key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
+                    if not file or not key:
+                        # A finding nothing can place is not evidence that the
+                        # fixer was working anywhere. Dropped rather than filed
+                        # under "" — which `_same_file` would suffix-match against
+                        # every path there is.
+                        continue
+                    b.fixed_here.setdefault(file, set()).add(key)
+                    line = f.get("line")
+                    b.fixed_findings.append(
+                        (key, str(f.get("severity") or "?"), file,
+                         line if isinstance(line, int) and not isinstance(line, bool) else None,
+                         str(f.get("synthesis") or _baseline_title(f) or "")))
         # The fix phase's earlier end (#192), on its own pass rather than folded
         # into the loop above: a round can record a head and no finish (a payload
         # from before the field) or a finish and no head (a round whose PR read
@@ -2452,6 +2578,7 @@ __all__ = [
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
     "_KEY_RE", "_key_norm", "_is_key", "_key_gist",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
+    "MAX_RECURRENCE_FINDINGS", "RECURRENCE_TITLE_CHARS", "recurrence_brief",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
     "_positive_int", "_whole_pr_chars",

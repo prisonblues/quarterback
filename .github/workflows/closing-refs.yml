@@ -1,0 +1,105 @@
+name: Closing refs
+
+# A separate file from `tests.yml`, and the reason is the trigger rather than tidiness.
+#
+# What this job reads — `closingIssuesReferences` — is derived from the pull request BODY, so
+# the moment the body changes the answer changes. The default `pull_request` types are
+# `opened`, `synchronize` and `reopened`; a body edit is none of them. Without `edited` here,
+# one of the two remedies this check names (reword the body until GitHub stops linking the
+# issue, which is what the landing agent did on #372) would leave the job red forever with
+# nothing able to re-run it, and a gate that stays red after the correct fix is a gate
+# somebody switches off within the week.
+#
+# `tests.yml` cannot simply grow `types:` — it applies to the whole `on:` block, so every
+# body edit would re-run the app suite, the harness suites and `nix flake check`, three
+# fifteen-minute jobs, for a question none of them are asking. Splitting the file is what
+# lets this one job have the trigger it needs and no other job pay for it.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+# Top level, so it covers the job rather than being one job's property. `pull-requests: read`
+# is what the GraphQL query below needs and is the only thing added over the default
+# `contents: read`; nothing here writes anything.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  closing-refs:
+    name: no issue is closed that the branch says stays open
+    runs-on: ubuntu-latest
+    # The same five minutes as `frozen`, `migration-heads` and `changelog`: one API call and
+    # a `git log` over a branch's own commits. A run still going after five minutes is wedged
+    # rather than slow.
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0`, load-bearing exactly as it is on `frozen`, `migration-heads` and
+      # `changelog`: the commits judged here are `origin/<base>..HEAD`, and at the default
+      # depth of 1 the base branch is not in the clone at all. The script refuses rather than
+      # going quietly green if that regresses — an empty commit range and a branch that
+      # referenced nothing are the same shape, and this check reads the second as consent.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ask GitHub what this pull request would close
+        # Through the environment, never interpolated into the script body: the same reason
+        # as the three jobs in `tests.yml`. `${{ }}` substitution happens before bash sees
+        # the line, so a value spliced in that way is whoever opened the pull request
+        # executing text on this runner. As env vars they are data.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.event.repository.owner.login }}
+          NAME: ${{ github.event.repository.name }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # `-F` for the number and `-f` for the strings, so every value crosses as a typed
+          # GraphQL variable rather than as text pasted into a query string.
+          gh api graphql \
+            -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
+            -f query='query($owner:String!,$name:String!,$pr:Int!){
+              repository(owner:$owner,name:$name){
+                pullRequest(number:$pr){
+                  closingIssuesReferences(first:50){totalCount nodes{number state}}}}}' \
+            > closing-refs.json
+          cat closing-refs.json
+
+      - name: Check no closed issue is one this branch only references
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          OWNER: ${{ github.event.repository.owner.login }}
+          NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          # HEAD on a `pull_request` checkout is the merge commit GitHub builds, so the range
+          # is the commits that would land. `--closes` is the answer from the step above,
+          # whole: the file the landing procedure documents and the file this reads are one
+          # artefact and cannot drift.
+          #
+          # stdout and stderr kept APART rather than merged with 2>&1, for the reason the
+          # `migration-heads` job's comment gives: the verdict is on stdout and the
+          # `unclaimed:` note on stderr, and a merged capture interleaves them by whichever
+          # flushed first.
+          rc=0
+          python3 scripts/closing_refs.py check \
+            --onto "origin/$BASE_REF" --branch HEAD \
+            --owner "$OWNER" --name "$NAME" \
+            --closes closing-refs.json >check.out 2>check.err || rc=$?
+          cat check.out
+          cat check.err >&2
+
+          # A `::warning::` rather than a line in a green log, because the checks panel is
+          # where this gets read. An issue the merge will close that no commit on the branch
+          # names is not a refusal — #207 closed #174 on a body keyword alone and was right
+          # to — but it is the gap this check has, and the body that trips it is the body
+          # most likely to be written here: one arguing about an issue it must not close.
+          if grep -q '^unclaimed: ' check.err; then
+            echo "::warning::$(head -n1 check.err)"
+          fi
+
+          if (( rc != 0 )); then
+            echo "::error::this pull request would close an issue its own commits only reference"
+            exit 1
+          fi

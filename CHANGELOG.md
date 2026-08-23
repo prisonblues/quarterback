@@ -17,6 +17,189 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.5 — a page that says what every agent is doing, and how much of that is actually known
+
+Rich, describing what he wants off a phone: *"see the plan, state of each agent, drag them up and down if needed, and then the seats pick things up."* Three of those four were built. The state-of-each-agent half had no page at all — `board.html` renders `/sessions` beside the feed, but nothing existed whose job was the fleet — and the data it needed (`GET /active`, `GET /sessions`, `GET /claims`) had all been served for months.
+
+`GET /fleet` is that page: mobile-first, one row per agent, on the same footing as `/plan/view`.
+
+### It shows the ambiguity rather than resolving it
+
+The reason this was never just a render is that the naive one lies in both directions. `/active` lists only leases inside their TTL, a lease is renewed once per **prompt**, and one prompt can be an hour of autonomous work — so a busy agent leaves `/active` precisely while it is busiest. Read as "who is alive", the endpoint reports a working agent as gone and a lapsed one as merely quiet.
+
+So a row gets one of four readings, and only two of them are things somebody reported. `live`: a lease is being renewed. `ended`: somebody called `/session/end` and said why. `unclear`: no lease, no reported ending, and either a claim still standing or a silence too young for the board's own passive expiry to have settled it. `unreported`: old enough that expiry has had its say, and still nobody ever said what happened. None of the four asserts a death, and the two shapes of silence are named as silence — in `qb-reconcile`'s own wording for the same ambiguity, because two readers wording it two ways teaches an operator to believe whichever they read first.
+
+A `working` that has stood longer than `qbdata.py`'s `STALL_AFTER` is remarked on and deliberately not called stalled: the dashboard concludes a stall from the same beacon, but on a phone the row is all the reader has, so this one names both readings.
+
+A finished session and a slow one stay different rows. `GET /sessions` carries an `ended` block that is null for a lease nobody ended, and that null is the whole distinction.
+
+### One verb, and it reaches the browser for the first time
+
+Ending a session is the thing a person actually needs from a phone when something has gone wrong. `POST /session/end` already existed but depended on `app.auth.identify`, which wants a bearer token no browser holds — so the one verb a person needed was the one they could not reach. It now goes through `app.auth.author`: an agent by token, authorised by machine exactly as before, or a person by an edge-proved `Remote-User` with the secret only the auth proxy knows.
+
+The machine check is skipped for a person and only for a person, because the question it asks has no answer for one: `human/rich` shares a machine with nothing on the fleet. For the same reason a person's ending releases the claims stamped with that session — the ordinary ownership rule asks which box the caller is and would refuse every row, returning 200 having done none of the job. A claim naming no session still belongs to its machine and is left alone.
+
+There is deliberately **no spawn button**. `qb-start` is off by default per machine, a phone is the worst place to reason about whether a box has opted in, and that argument belongs elsewhere.
+
+### And two things that had to change for that verb to be worth pressing
+
+`/session/end` only ever stamped a reason onto an **active** lease. So the one case somebody opens this page for — an agent that went quiet twenty minutes ago and never came back — was the one case the verb could not record: the only window in which anything could be said had already closed, and the row stayed "nobody ever said" permanently. A lapsed lease can now be told what happened to it, stamped at its own `expires_at` rather than at the moment somebody got round to saying so, because a lease that lapsed on Tuesday did not end on Thursday. A lease already *released* is still left alone — a handoff is not an ending, and an ending already recorded belongs to whoever saw it first — and reaching that path now writes something, so it is authorised by machine like every other write on the leases table.
+
+`GET /sessions` gained two things, and the first is the more important. Every row now carries `last_lease` — when this key's newest lease stopped being valid — because that is the clock a silence has to be measured against, and `updated_at` is not it. `updated_at` belongs to the transcript and moves on `/snapshot`; the lease moves on every prompt. Where the two diverge the gap runs the wrong way: a session that pushed at ten, kept renewing until noon and then died is two minutes quiet at 12:02 and two *hours* quiet by the transcript, so a view reading the wrong one calls a working agent long gone. That is the exact misreading this page exists to prevent, arriving through the field it trusted.
+
+Second, `?include_ended=` widens the list to a session whose last lease was ended but which never pushed a transcript. Without it such a session is visible exactly while it holds a lease and vanishes the moment it ends. It is a flag rather than the default because this list is paged, and folding an unbounded second population in would spend an existing caller's page on rows it never asked for. A lease that merely lapsed still gets no row either way: inventing one for a silence would be this page's own failure mode written into the endpoint.
+
+### Pending the edge secret
+
+Like the plan's reorder buttons, the end verb is inert in production until `HUMAN_EDGE_SECRET` is deployed: with no secret configured, nobody is a person and every human write is refused. The page asks `/whoami` and prints the server's own explanation at the top rather than presenting a button whose refusal arrives as a bare 403.
+
+## v3.4 — a PR body saying "this does not close #N" no longer closes #N
+
+GitHub's closing-keyword parser does not understand negation. PR #372 opened with **"This
+does not close #371 — see the bottom"**, the parser matched the literal `close #371`, and
+`closingIssuesReferences` listed the issue the PR existed to keep open; a keyword grep over
+that body returned exactly one hit and it read, to a human, as a disclaimer. PR #363 nearly
+did the same to #63 the same day. PR #243 had already done it to #165 two days earlier, at
+02:06:11 on 2026-08-20, one second after it landed, and nobody noticed until the survey
+written for this change went looking.
+
+A new `closing-refs` job compares two facts a machine can see, neither of them prose: the
+issues GitHub says the merge will close, read from `closingIssuesReferences`, against the
+reference lines in the branch's own commits. A branch whose commit says `Refs #N` and whose
+pull request would close #N is refused; a closing keyword anywhere in the range settles it;
+a branch that never mentions the issue is not refused, which is most of them.
+
+An issue the merge would close that no commit on the branch names at all is not refused —
+#207 closed #174 on a body keyword alone and was right to — but it is reported as
+`unclaimed:` and the job raises a `::warning::` for it. That gap is not theoretical: the
+first body of the pull request adding this check closed three issues it did not mean to,
+because it was a body about closing keywords and quoted them next to real numbers.
+
+It has no waiver trailer, deliberately. The remedy is to make the branch and the pull
+request agree — `Fixes #N` on a commit, or a body reworded until GitHub stops linking the
+issue — and both are one line and both re-trigger the check, which is why the job carries the
+`edited` trigger and lives in its own workflow file rather than in `tests.yml`.
+
+What it cannot see is stated in the script rather than left to be discovered: #363's original
+state, where the commit said `Fixes #63` and GitHub agreed, so the contradiction existed only
+against the PR's prose. `harness/commands/fix-and-land.md` now carries the GraphQL query for
+that case, where the landing agent reads.
+
+## v3.3 — the landing procedure now says what goes wrong, not only what to decide
+
+`fix-and-land.md` was 320 lines about decisions — the merge queue, `kind=merge`, the confidence
+gate, the escalation path — and said nothing about the hazards. So the hazards travelled by
+prompt. Nine PRs were landed by agents on 2026-08-22 and every one of them was briefed by hand
+with the same warnings; by the fifth the same paragraphs were being pasted with the issue numbers
+swapped. A grep for any of them across every command brief on this fleet returned nothing.
+
+The brief now carries a **The hazards** section, written from the symptom rather than the cause,
+because a landing that has gone wrong announces itself as an error message. `gh pr merge
+--delete-branch` from a worktree fails its cleanup and reads like a failed merge, when the merge
+has in fact landed and the remote branch is what survived (#260). A PR body saying "this does not
+close #371" closes #371, because GitHub's parser ignores negation and a keyword grep reads the
+sentence as a disclaimer — the check that works is `closingIssuesReferences`, and it is written
+out (#374). Impossible test failures that move between runs are a second pytest against the same
+worktree database, not the PR (#366). `git stash push` and `git checkout HEAD -- <path>` are both
+refused, and each one's advice is the other. And "served version unchanged" is the correct answer
+for a harness-only release, not a failed deploy.
+
+The four traps that have since been mechanised get one line each naming the guard and quoting
+what it says when it fires — `frozen` (#325), `changelog` (#365), `migration-heads` (#351) and
+the `blocked` CI state (#324) — rather than a paragraph restating a trap nobody has to catch by
+hand any more.
+
+Permanent and host-specific are kept apart, which is the half that decides whether the page is
+still trusted next year: everything above is a property of the tools, and the one failing test
+that is a property of *this box's* `PATH` sits under its own dated heading at the bottom.
+`review-pr.md` and `panel-review-pr.md` point at the section rather than copying it.
+
+`test_commands_wired.py` holds the pointers to their targets: a guard named in the page must
+still be a job in `tests.yml` under the id and display name quoted, preland must still refuse a
+gated run in the words the page quotes, the host-specific trap must stay below the host heading,
+and the in-file link must slug to the heading it names. A pointer at a renamed guard reads
+exactly like a pointer at something.
+
+## v3.2 — a release gets its tag on a machine that has never been told who it is
+
+The job that records a tag for every release on `main` failed the first time it ran, and
+`v2.99` and `v3` landed with no tag at all. `release_tag.py backfill` writes **annotated**
+tags, an annotated tag is an object, and an object has a tagger — so git refuses to write one
+where it cannot name anybody. A CI runner is the one place that is always true: no
+`user.name`, and no GECOS field to guess a name from. Every other place the command runs — a
+developer's machine, this suite's fixtures — has an identity already, which is why nothing
+caught it before it was live.
+
+`backfill` now supplies a tagger itself when the environment cannot name one, so the command
+works wherever it is run rather than only where its caller remembered to run `git config`
+first. Whatever git can already work out still wins: the gate is `git var
+GIT_COMMITTER_IDENT`, the same question git asks itself before writing an object, and where it
+answers, the tag carries the caller's own name exactly as before. Where it refuses, a
+configured half is still preferred over the fallback — a set `user.name` with no resolvable
+email is a real shape, and only the missing half is invented.
+
+## v3.1 — the review loop starts measuring whether its fixes are getting anywhere
+
+A fix that patches a wrong assumption produces the next round's findings. A fix that removes the
+assumption does not. The loop could not tell those two rounds apart: it stopped on a round count,
+which fires at the same point whether the rounds are converging or circling — and that is the point
+in a cycle where the spend is highest and a human is least likely to be asked.
+
+Every round past the first now records, per finding, where that finding stands relative to the fix
+pass before it, and what the judge says when asked directly whether that fix's premise still holds.
+**Nothing stops on either.** #67 asks for the instrument before the gate, and the first calibration
+below is the reason that is right rather than merely cautious.
+
+### What is recorded
+
+`recurrence` places a finding against the last fix pass. `revisited` is the conjunction of three
+things — the previous round raised a finding in this file, that round's fixer wrote lines in it, and
+this finding sits within about twenty lines of them; `fix-site` is the fixer having worked here on
+something nobody complained about; then `elsewhere`, and `unknown` for a finding with no line, no
+file, or a path that could name two changed files. `recurs_of` names the earlier finding, so a label
+can be traced back to the record it came from. NULL is *not recorded* throughout, and never "does
+not recur": a round 1, a run outside a cycle and a repeat all leave it unset, which is a different
+statement from `unknown`.
+
+`premise_verdict` is the judge's own answer — `invalidates`, `separate`, `unclear` — asked as one
+extra key on a verdict it is already writing, so the sharper question costs no second model call.
+The brief carrying it is spliced into the judge prompt at a slot swapped for the empty string
+whenever there is no earlier round, so a round-1 prompt is byte-identical to the one it has always
+been given. It spends most of its length pushing *away* from `invalidates`: a second bug in a file
+somebody just edited is a second bug.
+
+Both tallies ride the run (`recurrence_counts`, `premise_counts`), both reach the board, and
+`GET /review/stats` splits both across a window.
+
+### The first calibration says the mechanical half does not discriminate
+
+Replayed over 36 rounds from 26 pull requests — every multi-round cycle the board holds — against
+the three cycles #67 identifies as circling (#61, #29, #88) with every other cycle as the control:
+
+| narrowing | #61 / #29 / #88 | every other PR |
+|---|---|---|
+| same file + within 20 lines | 83% | 69% |
+| same file + within 5 lines | 79% | 64% |
+| same file + exactly on a written line | 65% | 52% |
+| …and the earlier finding within 20 lines | 29% | 27% |
+
+There is no radius at which it separates them, and tightening lowers both columns together. The
+reason is legible in the runs: since #41 a later round *reviews the fix commit*, so a new finding at
+the fix's site is the ordinary case rather than the exceptional one.
+
+So the bucket is named for a position (`revisited`) rather than for a verdict (`circling`), the
+report prints the count with no recommendation attached, and the judge is asked the question the
+position cannot answer. The rate is kept because a measurement that saturates is itself a fact about
+the loop, and it is the baseline any later rule has to beat. This is also what #67's own note on
+PR #88 predicted: the grouping key needed is "not 'same file' but 'same way of being wrong'".
+
+### Two premises, and they are not the same premise
+
+#84's premise register is a **fixer's declaration** of what it is about to fix on, and it brakes a
+repeat. This is an **adjudication of a finding**, and it brakes nothing. #67's record of PR #88 is
+the argument for keeping the two apart: the agent that wrote round 1's fix wrote round 2's
+regression of the same shape, in the same commit as a docstring stating the invariant it broke.
+
 ## v3 — the release number gets an allocator, and it is a git tag
 
 The number was handed out by reading a file. `release_stamp.py apply` computes

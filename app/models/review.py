@@ -146,6 +146,19 @@ class ReviewRun(Base):
     #: not the same as all-zero, which says attribution ran and found nothing.
     #: NULL is the third state: nobody said.
     provenance_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: #67's two tallies over the same population, on the same terms as
+    #: ``provenance_counts`` directly above: stored rather than derived (the panel
+    #: counts over the findings the cycle must clear, these rows also carry the
+    #: dismissed ones), and ``{}`` means the question does not arise, which is not
+    #: all-zero.
+    #:
+    #: Two objects rather than one, because the whole point of asking twice is
+    #: that they can disagree: ``recurrence_counts`` is what the panel MEASURED
+    #: and ``premise_counts`` is what the judge SAID. ``premise_counts`` carries a
+    #: ``not-said`` bucket, which is the commonest value and would otherwise have
+    #: to be inferred from a shortfall against a denominator stored elsewhere.
+    recurrence_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    premise_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     changed_lines: Mapped[int | None] = mapped_column(Integer)
     #: GitHub's own count of the PR's changed files (v2.23), stored beside the
     #: rows in :class:`ReviewRunFile` rather than derived from them. When the two
@@ -582,6 +595,70 @@ class ReviewFinding(Base):
     #: reviewer line-drift both land in ``missed``: read the ``introduced`` count
     #: as a floor. #41 (review the increment) is what makes it exact.
     provenance: Mapped[str | None] = mapped_column(Text)
+    #: Is this finding standing where the last fix pass was WORKING, on a
+    #: complaint that pass was sent to answer (#67)? One of
+    #: :data:`app.api.reviews.RECURRENCE`.
+    #:
+    #: The question after ``provenance``, and a different one. That column asks
+    #: whether the fix wrote the line this sits on — an accusation about
+    #: authorship, so it demands exact membership and reads low. This asks whether
+    #: the fixes are making PROGRESS on the defect, so it takes a neighbourhood:
+    #: the drift ``provenance`` must refuse (a reviewer naming the top of the
+    #: enclosing function) is the drift this has to absorb.
+    #:
+    #: ``revisited`` is the conjunction of three things — the previous round raised
+    #: a finding in this file, the fixer wrote lines in it, and this finding is
+    #: near them. ``fix-site`` is two of the three: the fixer was here, nobody had
+    #: complained here.
+    #:
+    #: **A position, not a verdict, and the names say so on the strength of a
+    #: measurement.** Replayed over 36 rounds of this board's own history,
+    #: ``revisited`` fires on roughly four new findings in five and does NOT
+    #: separate the cycles #67 identifies as circling from the rest — because under
+    #: #41's increment scope a later round is reading the fix commit, so a finding
+    #: at the fix's site is the ordinary case. Read this column as context and as a
+    #: denominator; ``premise_verdict`` below is the half that can see whether one
+    #: premise is being patched twice.
+    #:
+    #: NULL where the question does not arise (round 1, outside a cycle, a defect
+    #: an earlier round already raised, a run recorded before the column existed).
+    #: ``"unknown"`` is the opposite state — asked, unplaceable — and the two must
+    #: never collapse.
+    #:
+    #: **Nothing stops on it.** #67 asks for the instrument before the gate: its
+    #: whole evidence base is a handful of pull requests, so this is measured,
+    #: reported and read by no stop rule.
+    recurrence: Mapped[str | None] = mapped_column(Text)
+    #: WHICH earlier finding this one stands on, as that finding's own
+    #: ``finding_key`` — set only under ``revisited`` (the CHECK enforces it).
+    #:
+    #: A pointer, not a copy, and it is what makes the bucket auditable. A signal
+    #: nobody has calibrated is worth exactly as much as the ability to go back and
+    #: check its labels against the record they were computed from, and "which
+    #: premise did it think was being circled" is that check.
+    recurs_of: Mapped[str | None] = mapped_column(Text)
+    #: What the JUDGE said when asked #67's sharper question directly: does this
+    #: finding invalidate the premise of the fix that preceded it, or is it a
+    #: separate defect? One of :data:`app.api.reviews.PREMISE_VERDICTS`.
+    #:
+    #: Asked of the judge because the mechanical column above cannot answer it.
+    #: ``recurrence`` can see that a fixer was working where this finding stands;
+    #: it cannot see whether the finding says that fixer's ASSUMPTION was wrong,
+    #: which is the distinction the whole issue turns on. The judge is the only
+    #: party in the round already holding both the earlier round's complaints and
+    #: the commit that answered them, so it costs one extra key on a verdict it is
+    #: already writing rather than a second model call.
+    #:
+    #: Stored BESIDE the mechanical bucket and never folded into it. Two
+    #: witnesses, one mechanical and one adjudicated; the rounds where they
+    #: disagree are the rows worth reading, and a blended number would hide them.
+    #:
+    #: NOT the fixer's declared premise (#84's register), which is the other thing
+    #: called a premise in this system and is a self-report. #67's record of PR #88
+    #: is why both exist: the agent that wrote round 1's fix wrote round 2's
+    #: regression of the same shape in the same commit as a docstring stating the
+    #: invariant it broke.
+    premise_verdict: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
@@ -619,6 +696,34 @@ class ReviewFinding(Base):
             r"OR (NOT needs_human AND needs_human_class IS NULL "
             r"AND needs_human_reason IS NULL)",
             name="ck_review_findings_needs_human_evidence",
+        ),
+        # #67's two vocabularies, at the boundary and not only in the API — the
+        # rule `ck_review_findings_needs_human_class` follows above. `provenance`
+        # carries no such CHECK and predates the convention; both of these are
+        # COUNTED, and a value outside the vocabulary would leave the numerator
+        # while still counting as coverage.
+        CheckConstraint(
+            "recurrence IS NULL OR recurrence IN "
+            "('revisited', 'fix-site', 'elsewhere', 'unknown')",
+            name="ck_review_findings_recurrence",
+        ),
+        CheckConstraint(
+            "premise_verdict IS NULL OR premise_verdict IN "
+            "('invalidates', 'separate', 'unclear')",
+            name="ck_review_findings_premise_verdict",
+        ),
+        # One-directional on purpose. A `recurs_of` under any other bucket names a
+        # circle the measurement did not find — evidence for a judgement nobody
+        # made. The other way round is left open: a `revisited` naming no earlier
+        # key is incomplete, not false, and a producer too old to send the pointer
+        # should still be able to send the bucket.
+        # `IS NOT DISTINCT FROM` and never `=`: a CHECK passes on NULL as well as
+        # on true, and `recurrence = 'revisited'` is NULL for every row whose
+        # `recurrence` is NULL — which is the very row this refuses. Spelled with
+        # `=` it accepted a pointer attached to no measurement at all.
+        CheckConstraint(
+            "recurs_of IS NULL OR recurrence IS NOT DISTINCT FROM 'revisited'",
+            name="ck_review_findings_recurs_of_revisited",
         ),
     )
 
