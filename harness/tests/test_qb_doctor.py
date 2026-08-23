@@ -1100,12 +1100,36 @@ MERGE_COMMITS_ONLY = {"allow_merge_commit": True, "allow_squash_merge": False,
                       "allow_rebase_merge": False, "push": True}
 
 
+#: A tag allocator that RESERVES — the pre-#122 shape, and the only thing that puts a
+#: repo in scope for this row. Written as argparse registers a subcommand rather than as
+#: prose, because the whole correction is that the row asks what a tool DOES and not
+#: whether a file of that name exists.
+RESERVING_TAGGER = (
+    "# release_tag.py — take refs/tags/vX.Y on the remote at push time.\n"
+    'sub.add_parser("reserve", help="the compare-and-swap one lander wins")\n'
+    'sub.add_parser("check")\n'
+)
+
+#: A tag allocator that does not. This is quarterback's own shape since #122: the file is
+#: still there, with the same name and three subcommands, and `reserve` survives only in
+#: the paragraph explaining that it is gone.
+TAGGER_THAT_RESERVES_NOTHING = (
+    "# release_tag.py — every release has a tag.\n"
+    "#\n"
+    "# `reserve` is deleted (#122). It existed to take refs/tags/vX.Y on the remote at\n"
+    "# PUSH time; branches do not stamp, so there is nothing to reserve.\n"
+    'sub.add_parser("backfill")\n'
+    'sub.add_parser("taken")\n'
+    'sub.add_parser("check")\n'
+)
+
+
 @pytest.fixture
 def landing_repo(repo: Path) -> Path:
-    """A repo in scope for the merges row: a GitHub remote and a tag allocator."""
+    """A repo in scope for the merges row: a GitHub remote and a tagger that reserves."""
     _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
     (repo / "scripts").mkdir()
-    (repo / "scripts" / "release_tag.py").write_text("# a tag allocator lives here\n")
+    (repo / "scripts" / "release_tag.py").write_text(RESERVING_TAGGER)
     return repo
 
 
@@ -1146,7 +1170,7 @@ def test_a_repo_that_allows_squash_merges_fails_and_says_what_to_switch_off(
 
     assert check.verdict == "fail"
     assert "allows squash merges" in check.detail
-    assert "reserves release tags at push time" in check.detail
+    assert "exposes a reserve subcommand" in check.detail
     assert "allow_squash_merge=false" in check.manual
     assert "acme/thing" in check.manual
 
@@ -1195,7 +1219,343 @@ def test_a_repo_with_no_tag_allocator_is_not_asked_and_is_not_failed(monkeypatch
     check = qd.check_merges(host_for(repo))
 
     assert check.verdict == "ok"
-    assert "reserves no release tags" in check.detail
+    assert "nothing here reserves a release tag at push time" in check.detail
+
+
+def test_a_tagger_that_exists_and_reserves_nothing_is_out_of_scope(monkeypatch, repo):
+    """The defect this row landed with, and the reason the predicate had to change.
+
+    #406 shipped a row that asked whether `scripts/release_tag.py` EXISTS, and #122
+    removed push-time reservation twelve hours later while leaving that file in place
+    with `backfill`, `taken` and `check`. The row went on firing and reporting `ok` for a
+    reason that had stopped being true — right by accident, which is a check nobody
+    notices going wrong — and its `fail` text would have told a reader to switch off
+    squash merges to protect a reservation nothing takes.
+    """
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text(TAGGER_THAT_RESERVES_NOTHING)
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "ok"
+    assert "nothing here reserves" in check.detail
+    assert "reserved at push time" not in check.detail
+
+
+def test_the_word_reserve_in_the_prose_that_says_it_is_gone_is_not_a_reservation(repo):
+    """Read against THIS repo's real files, not a fixture's paraphrase of them.
+
+    `scripts/release_tag.py` opens with "`reserve` is deleted" and
+    `harness/githooks/pre-push` explains the removed mechanism in a comment block naming
+    `release_tag.py reserve` in full. A predicate that searched for the word would put
+    the repository that REMOVED the reservation in scope on the strength of the
+    paragraph saying so — so the two files that would break it are the two this asserts
+    against.
+    """
+    tagger = HARNESS.parent / "scripts" / "release_tag.py"
+    hook = HARNESS / "githooks" / "pre-push"
+    assert tagger.is_file() and hook.is_file(), "this test is about this repo's own files"
+    assert "reserve" in tagger.read_text() and "reserve" in hook.read_text()
+
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text(tagger.read_text())
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text(hook.read_text())
+    _git(repo, "config", "core.hooksPath", str(hooks))
+
+    assert qd.reservation_sites(host_for(repo)) == ([], [])
+
+
+def test_a_pre_push_hook_that_reserves_puts_the_repo_in_scope_with_no_tagger_at_all(
+        monkeypatch, repo):
+    """The second half of "does anything here reserve a tag at push time".
+
+    A reservation happens on a push, and the hook is where a push happens. A repo that
+    reserves from the hook directly, or whose tagger was renamed out of the three places
+    `release_tagger` looks, has the #406 hazard in full — and asking only about the
+    tagger would report it as having nothing to orphan.
+    """
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text('#!/bin/sh\n# a pre-push hook\nqb-tag reserve "$1"\n')
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "fail"
+    assert "pre-push hook installed here has a reservation step" in check.detail
+
+
+def test_the_hook_that_is_read_is_the_one_git_would_run(repo):
+    """The rule that decides every check in this file: look where the mechanism RUNS.
+
+    A `pre-push` sitting in a directory `core.hooksPath` does not name reserves nothing,
+    because git never executes it — the same sentence as `ls
+    harness/githooks/reference-transaction` succeeding on a host with no guard at all.
+    """
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    (common / "elsewhere").mkdir()
+    (common / "elsewhere" / "pre-push").write_text("#!/bin/sh\nqb-tag reserve\n")
+    _git(repo, "config", "core.hooksPath", str(common / "hooks"))
+
+    assert qd.reservation_sites(host_for(repo)) == ([], [])
+
+
+def test_a_relative_hooks_path_is_resolved_against_the_worktree_git_runs_hooks_from(
+        repo, tmp_path, monkeypatch):
+    """`core.hooksPath=githooks` means the worktree's `githooks/`, not this process's.
+
+    `qb-hooks`' own `effective_delegate` states the rule in full and had to, for the
+    same reason: resolved against wherever the tool happened to be invoked from, the
+    path names a directory that usually does not exist — and a hook nobody could find
+    reads as a repo with no hook at all, which here would be a false `ok` on a repo
+    that reserves on every push.
+    """
+    (repo / "githooks").mkdir()
+    (repo / "githooks" / "pre-push").write_text("#!/bin/sh\nrelease_tag.py reserve\n")
+    _git(repo, "config", "core.hooksPath", "githooks")
+    monkeypatch.chdir(tmp_path)
+
+    found, unreadable = qd.reservation_sites(host_for(repo))
+
+    assert unreadable == []
+    assert found == ["the pre-push hook installed here has a reservation step"]
+
+
+def test_a_reservation_in_the_delegate_the_hook_chains_to_is_still_a_reservation(repo):
+    """`qb-hooks install` leaves a `pre-push.delegate` symlink whenever the machine
+    already had a `pre-push` to keep running, and the managed hook pipes the push into
+    it. A reservation performed there happens on exactly the pushes this row is about,
+    and reading only the top file would report the repo as having nothing to orphan."""
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text("#!/bin/sh\n# the managed hook, which chains\nexit 0\n")
+    (hooks / "pre-push.delegate").write_text("#!/bin/sh\nqb-tag reserve \"$1\"\n")
+    _git(repo, "config", "core.hooksPath", str(hooks))
+
+    found, unreadable = qd.reservation_sites(host_for(repo))
+
+    assert unreadable == []
+    assert found == ["pre-push.delegate, which the pre-push hook here runs has a "
+                     "reservation step"]
+
+
+def test_a_hook_that_sources_a_file_this_can_find_is_read_through_to_it(repo):
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text("#!/bin/sh\n. ./release-hooks.sh\n")
+    (repo / "release-hooks.sh").write_text("#!/bin/sh\nrelease_tag.py reserve\n")
+    _git(repo, "config", "core.hooksPath", str(hooks))
+
+    found, unreadable = qd.reservation_sites(host_for(repo))
+
+    assert unreadable == []
+    assert found == ["release-hooks.sh, which the pre-push hook here runs has a "
+                     "reservation step"]
+
+
+@pytest.mark.parametrize("body,phrase", [
+    ('#!/bin/sh\nexec "$HOOK_DIR/pre-push.local" "$@"\n', "cannot resolve"),
+    ("#!/bin/sh\nlefthook run pre-push\n", "lefthook"),
+    ("#!/bin/sh\nhusky\n", "husky"),
+])
+def test_a_hook_that_hands_its_work_somewhere_unread_is_unknown_and_not_a_pass(
+        monkeypatch, repo, body, phrase):
+    """Codex's first finding, and the one that mattered most.
+
+    A hook whose real work happens in a delegate spelled with a variable, or in a
+    runner with its own configuration file, has NOT been read by reading it. Reporting
+    "nothing here reserves" on the strength of the part that was read is the exact
+    collapse this file forbids: a check that could not be made rendering as one that
+    passed.
+    """
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text(body)
+    _git(repo, "config", "core.hooksPath", str(hooks))
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+@pytest.mark.parametrize("noise", [
+    'echo "reserve"\n',
+    'reason="reserve"\n',
+    'cat <<EOF\nrun release_tag.py reserve to take a number\nEOF\n',
+    'git push origin main   # this used to reserve a tag\n',
+])
+def test_the_word_in_a_string_a_heredoc_or_a_trailing_comment_is_not_a_reservation(
+        repo, noise):
+    """A false positive here is not a wasted question — it is a `FAIL` recommending a
+    change to a setting every contributor and every other machine in the fleet shares.
+    So the word has to appear as a command argument: comments, heredoc bodies and the
+    insides of quoted spans are all taken out before it is looked for."""
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text("#!/bin/sh\n" + noise)
+    _git(repo, "config", "core.hooksPath", str(hooks))
+
+    assert qd.reservation_sites(host_for(repo)) == ([], [])
+
+
+def test_a_here_string_does_not_swallow_the_rest_of_the_hook(repo):
+    """`<<<` is a here-STRING, not a heredoc, and this repo's own `pre-push` uses two of
+    them. A heredoc scanner that took `<<<"$lines"` for an opener would skip everything
+    after it, and every hook in the fleet would read as reserving nothing."""
+    hooks = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "h"
+    hooks.mkdir()
+    (hooks / "pre-push").write_text(
+        '#!/bin/bash\nread -r x <<<"$lines"\nqb-tag reserve\n')
+    _git(repo, "config", "core.hooksPath", str(hooks))
+
+    found, _unreadable = qd.reservation_sites(host_for(repo))
+
+    assert found == ["the pre-push hook installed here has a reservation step"]
+
+
+@pytest.mark.parametrize("source,reserves", [
+    ('sub.add_parser("reserve")\n', True),
+    ('@click.command()\ndef reserve():\n    pass\n', True),
+    ('@cli.command("reserve")\ndef take():\n    pass\n', True),
+    ('app.command()(reserve)\nsub.add_parser("check")\n', True),
+    ('sub.add_parser("check")\nsub.add_parser("backfill")\n', False),
+])
+def test_the_command_set_is_enumerated_out_of_the_parse_tree(repo, source, reserves):
+    """Every shape that genuinely registers a `reserve` command, and one that does not.
+
+    Codex found four of these missing from the pattern that preceded the parse tree:
+    click's default, which names the FUNCTION and not a string, and the applied-by-hand
+    decorator among them. Each was a real `reserve` command reported as no reservation
+    at all.
+    """
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text("import x\n" + source)
+
+    found, unreadable = qd.reservation_sites(host_for(repo))
+
+    assert unreadable == []
+    assert bool(found) is reserves
+
+
+@pytest.mark.parametrize("source", [
+    '"""Run `add_parser("reserve")` to take a number."""\nsub.add_parser("check")\n',
+    '# sub.add_parser("reserve")  — deleted in #122\nsub.add_parser("check")\n',
+    'HELP = \'sub.add_parser("reserve")\'\nsub.add_parser("check")\n',
+])
+def test_registration_shaped_text_that_is_not_a_registration_is_not_one(repo, source):
+    """The reason the enumeration is a parse and not a search. A docstring, a comment
+    and a string constant can all carry the exact call this looks for, and this repo's
+    own tagger opens with a paragraph about the `reserve` it no longer has."""
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text(source)
+
+    assert qd.reservation_sites(host_for(repo)) == ([], [])
+
+
+@pytest.mark.parametrize("source,why", [
+    ("sub = p.add_subparsers()\nsub.add_parser(COMMAND_RESERVE)\n", "a name in a variable"),
+    ("sub = p.add_subparsers()\nregister(sub)\nsub.add_parser('check')\n",
+     "the subparser filled in elsewhere"),
+    ("def f(:\n", "a file that does not parse"),
+    ("import fire\n\nclass Tag:\n    pass\n", "a CLI in no shape this reads"),
+])
+def test_a_command_set_that_was_not_enumerated_is_unknown_and_never_a_pass(
+        monkeypatch, repo, source, why):
+    """The contract :func:`_python_subcommands` keeps: a set means THESE are the
+    subcommands, and None means somebody has to look. An empty result for a file whose
+    commands are named by a variable, or registered by a function in another module, is
+    a check that could not be made — and rendering it as `ok` is what this whole file
+    exists to refuse."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text(source)
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown", why
+    assert "does not declare its subcommands" in check.detail
+
+
+def test_a_tagger_that_is_not_python_is_unknown_unless_it_names_the_reservation(
+        monkeypatch, repo):
+    """A shell wrapper's command set is wherever it forwards to. Finding the word is
+    evidence; not finding it is not evidence of the opposite, so the absent case is an
+    `unknown` with a remedy rather than a pass. Codex's fifth finding: `exec python -m
+    company.release_cli "$@"` reserves or does not, and this cannot tell which."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    wrapper = repo / "tools" / "tagger"
+    wrapper.parent.mkdir()
+    wrapper.write_text('#!/bin/sh\nexec python -m company.release_cli "$@"\n')
+    _git(repo, "config", "qb.releaseTag", "tools/tagger")
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert "is not Python" in check.detail
+
+    wrapper.write_text('#!/bin/sh\nexec qb-release reserve "$@"\n')
+    named = qd.check_merges(host_for(repo))
+    assert named.verdict == "ok"                    # this repo allows merge commits only
+    assert "tools/tagger has a reserve step" in named.detail
+
+
+@pytest.mark.parametrize("key", ["qb.releaseTag", "core.hooksPath"])
+def test_a_git_config_this_cannot_read_is_unknown_rather_than_unset(
+        monkeypatch, repo, key):
+    """"The key is not set" and "the configuration could not be read" are different
+    answers, and `git config --get` gives them different exit codes for that reason.
+    Collapsed together, an unparsable include reads as "no tagger configured here",
+    which falls back to the conventional filename and answers confidently about the
+    wrong file — or as "hooks live in .git/hooks", which reads a hook that never
+    runs."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    real = qd.run_cmd
+
+    def fake(argv, **kw):
+        if argv[:2] == ["git", "-C"] and "config" in argv and key in argv:
+            return 128, "", "fatal: bad config line 3 in file .git/config"
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+    monkeypatch.setattr(qd, "run_cmd", fake)
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert f"`{key}`" in check.detail
+
+
+def test_a_tagger_whose_cli_cannot_be_parsed_is_unknown_rather_than_out_of_scope(
+        monkeypatch, repo):
+    """The honest-unknown rule, applied to this row's own predicate.
+
+    The pattern reads argparse, a dispatch table's key, an `argv[1]` compare and a named
+    click command. A Python tagger written in some fifth style is a file this cannot
+    parse, and "the pattern did not match" is not evidence about what the tool does. An
+    `ok` there would be a check that could not be made rendering as one that passed.
+    """
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release_tag.py").write_text("import fire\n\nclass Tag:\n    pass\n")
+    _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
+
+    check = qd.check_merges(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert "does not declare its subcommands" in check.detail
+    assert check.manual
 
 
 def test_the_allocator_is_found_the_way_the_pre_push_hook_finds_it(monkeypatch, repo):
@@ -1206,7 +1566,7 @@ def test_the_allocator_is_found_the_way_the_pre_push_hook_finds_it(monkeypatch, 
     _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
     elsewhere = repo / "tools" / "tagger.py"
     elsewhere.parent.mkdir()
-    elsewhere.write_text("# a tag allocator lives here\n")
+    elsewhere.write_text(RESERVING_TAGGER)
     _git(repo, "config", "qb.releaseTag", "tools/tagger.py")
     _gh_says(monkeypatch, out=json.dumps({**MERGE_COMMITS_ONLY, "allow_squash_merge": True}))
 
@@ -1228,7 +1588,7 @@ def test_a_remote_that_is_not_github_is_unknown_rather_than_ok(monkeypatch, repo
     wrong repository, which reads as an answer."""
     _git(repo, "remote", "add", "origin", url)
     (repo / "scripts").mkdir()
-    (repo / "scripts" / "release_tag.py").write_text("# a tag allocator lives here\n")
+    (repo / "scripts" / "release_tag.py").write_text(RESERVING_TAGGER)
     _gh_says(monkeypatch, out=json.dumps(MERGE_COMMITS_ONLY))
 
     check = qd.check_merges(host_for(repo))

@@ -1977,7 +1977,7 @@ stash      refs/stash                      guard active, 4 pre-guard entries rem
 reconcile  qb-reconcile.timer              enabled, active, last run 12:26:55                ok
 edge       https://quarterback.fo.ls       302 — forward-auth, and this host has no session   ?
 tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
-merges     prisonblues/quarterback         merge commits only — squash and rebase are off    ok
+merges     ~/source/quarterback            nothing here reserves a tag at push time (#122)    ok
 ```
 
 Rows are grouped by which question they answer, and `--only` takes a group name as well as a
@@ -2038,30 +2038,86 @@ can run a command the author did not mark runnable:
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
 
-#### The `merges` row — a squash merge orphans the release tag (#406)
+#### The `merges` row — a squash merge orphans a tag reserved at push time (#406)
 
-The tag allocator takes `refs/tags/vX.Y` on the remote at **push** time, against the
-branch's stamped `chore(release)` commit. That placement is what makes the number
-un-stealable (#296) and it is also what a squash breaks: the squash discards that commit, so
-the tag ends up addressing a commit that is not in the history it claims to tag. `v3.8`
-landed that way while every other pull request that night used a merge commit, and the CI
-job called `every release on main has a tag` stayed green — it checked that a tag of that
-*name* resolved, and `v3.8` did. Rebase-merge has the identical defect for the identical
-reason, so both are checked.
+A tag reserved at **push** time names the commit that was pushed, and a squash discards
+it: the squash collapses the branch into a fresh commit, so the tag ends up addressing a
+commit that is not in the history it claims to tag. `v3.8` landed that way while every
+other pull request that night used a merge commit, and the CI job called `every release on
+main has a tag` stayed green — it checked that a tag of that *name* resolved, and `v3.8`
+did. Rebase-merge has the identical defect for the identical reason, so both are checked.
 
-The row asks GitHub what this repo allows and fails when either rewriting strategy is on:
+**The row asks whether anything here reserves — not whether a file exists.** As it first
+landed it asked whether `scripts/release_tag.py` was present, and #122 removed push-time
+reservation from this repo twelve hours later while leaving that file in place with
+`backfill`, `taken` and `check`. The row went on firing and reporting `ok` for a reason
+that had stopped being true, and its `FAIL` text would have told a reader to switch off
+squash merges to protect a reservation nothing takes. A check that is right by accident is
+a check nobody notices going wrong.
+
+So the predicate is two questions with one answer — does the repo's tag allocator expose a
+`reserve` subcommand, and does the hook git actually runs on a push carry a reservation
+step:
 
 ```
-merges  prisonblues/selfhost  this repo allows rebase and squash merges, and reserves     FAIL
-                              release tags at push time — a rewriting merge discards the
-                              commit the tag was reserved against (#406, v3.8)
+merges  prisonblues/selfhost  this repo allows rebase and squash merges, and              FAIL
+                              scripts/release_tag.py exposes a reserve subcommand — a
+                              rewriting merge discards the commit the tag was reserved
+                              against (#406, v3.8)
         -> gh api -X PATCH repos/prisonblues/selfhost -F allow_squash_merge=false …
 ```
 
-**It does not ask where the question does not apply.** The scope is a repo that reserves
-release tags, found the way `harness/githooks/pre-push` finds it — `QB_RELEASE_TAG`, then
-`qb.releaseTag`, then `scripts/release_tag.py`. A repo with no allocator has no reservation
-for a merge to orphan, and a `FAIL` a reader cannot act on is how a row gets ignored.
+That keeps the row **useful rather than deleted**. The harness installs into repos that are
+not quarterback, and one still carrying a pre-#122 `release_tag.py` has the original defect
+exactly as written — this finds that repo and stays quiet here:
+
+```
+merges  ~/source/quarterback  nothing here reserves a release tag at push time, so a        ok
+                              rewriting merge has no reservation to orphan
+```
+
+That verdict stops where the evidence does. *Where* the release number is applied instead
+is a true and useful sentence, and it is not one this row established — saying it here
+would be the second premise, arriving in the prose rather than in the predicate.
+
+**It reads; it never runs.** Asking `release_tag.py --help` would answer more exactly than
+any parse can, and it would mean a diagnostic executing an unreviewed program out of
+whatever checkout somebody typed it in — the line `load_site_config` already draws about
+the site config.
+
+Reading has to be done properly to be worth anything, and the whole cost of not executing
+is paid in saying so when it could not be:
+
+- A Python tagger's command set is enumerated **out of the parse tree**, never searched for
+  in the text. A docstring, a comment or a string constant can all carry
+  `add_parser("reserve")`, and this repo's own tagger opens with a paragraph about the
+  `reserve` it no longer has. The contract is that a set means *these are the subcommands*
+  — so a name spelled with a variable, a subparser handed to another module to fill in, or
+  a CLI in a shape this does not recognise all come back as *not enumerated*, and the row
+  says `?`.
+- A tagger that is **not** Python is a wrapper around something, and its command set is
+  wherever that something is. Naming `reserve` is evidence; not naming it is not evidence
+  of the opposite, so that case is `?` too.
+- The hook read is **the one git would run** — `core.hooksPath` when set, resolved against
+  the worktree git runs hooks from when it is relative, and the common git dir's `hooks/`
+  otherwise. Whatever that hook chains to is read as well: `qb-hooks` installs a
+  `pre-push.delegate` whenever the machine already had a hook to keep running, and a
+  reservation performed there happens on exactly the pushes this row is about. A delegate
+  spelled with a variable, or a runner like husky or lefthook that keeps its configuration
+  somewhere this does not read, is `?` rather than a pass.
+- Hook text is reduced to the words a shell would run — full-line comments, heredoc bodies,
+  quoted spans and trailing comments all removed — before the word is looked for. A false
+  positive here is not a wasted question: it is a `FAIL` recommending a change to a setting
+  every contributor and every other machine in the fleet shares.
+- "The key is not set" and "the configuration could not be read" are different answers, and
+  `git config` gives them different exit codes. Collapsed together, an unparsable include
+  reads as *no tagger configured here* and this would answer confidently about the
+  conventional filename instead.
+
+**It does not grow a second premise.** Whether the release number is applied in the right
+*place* is #122's question and belongs to #122's rows; whether a squash should discard a
+branch's reviewed history at all is a policy about review rather than about tags, and wants
+its own row and its own argument. One row with two reasons to fire is how this one drifted.
 
 **It detects; it does not set.** Every `fix` this tool runs writes to *this host* — a hooks
 directory, a systemd unit, a venv. This one would write a setting every contributor and
