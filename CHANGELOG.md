@@ -63,6 +63,56 @@ planning the renumber from the two refs the files came from.
 commit GitHub builds for a pull request in order to see the post-merge graph, so taking that
 merge apart would blind the check.
 
+## v3.8 — QUARTERBACK_INSTANCE finally names something
+
+`QUARTERBACK_INSTANCE=seat-3` was documented as the way to give an agent a name a human can
+type. It was not: it named nothing. The board took it as an opaque **key**, designated a
+two-word name against it anyway, and `zeus/cotton-indigo` was what every peer saw, what
+history recorded, and what the status line showed. The typeable string survived only as an
+alias nobody is shown.
+
+The header that would have done it has worked server-side since v2.12 — `app/identity.py`
+even documents `X-Agent-Name` as "the `QUARTERBACK_INSTANCE=deploy` escape hatch". The client
+half was never written. The MCP server started sending it; the lifecycle hook, which fires on
+`SessionStart` and therefore usually reaches the board *first*, did not. Allocation is
+first-contact-wins, so the seat that was meant to be `zeus/seat-3` came up as two random
+words about as often as not — which `qb-seat` worked around by registering its own name
+before exec, and nothing else could.
+
+`qb-env` now owns the rule, and it is the only thing that does: `qb`, `qb-hook` and the MCP
+server all send the request. Two properties are load-bearing.
+
+**Only an explicit label.** With `QUARTERBACK_INSTANCE` unset the clients send no name request
+at all, because the instance they fall back to is a session-id hex fragment — asking for that
+as a name would put `zeus/a4f81c2e` back on every status bar in the fleet, which is what
+moving naming server-side existed to stop. Unset behaviour is unchanged.
+
+**The name shape is stricter than the key shape.** `^[a-z0-9]+(?:-[a-z0-9]+)*$`: no upper
+case, no `.`, `_` or `~`. `Deploy_1` is a perfectly good key and a 400 as a name, and both
+clients swallow a 400 in silence — `qb-hook` by contract. So the label gets its own
+sanitiser rather than reusing the key's, and a label with nothing usable in it asks for no
+name instead of asking for `-`. `tests/test_designated_names.py` runs the real shell function
+over a corpus of labels and puts every answer through this board, so a rule tightened on the
+server can no longer silently unname the fleet.
+
+### The key `qb` was sending
+
+`qb record-review` and `qb record-outcome` truncated their agent key to eight characters —
+including an explicit label. So `seat-quarterback-1` filed its panel runs under the key
+`seat-qua`, a different row on the board from the one its own hook and MCP server register:
+the agent that ran the review was not the agent the review was recorded against. Every seat
+`qb-seats` builds has a label longer than eight characters. The 8 now applies to the session
+id alone, which is what the comment beside it always claimed.
+
+And it never shaped that key at all, so `sea t 3` — or any label over the board's forty
+characters — was a 400 that `record-review` swallows by design, and the review simply
+vanished. It shapes the key the way the lifecycle hook does now. That rule stays deliberately
+duplicated rather than moving into `qb-env` beside the name one: the hook derives its whole
+*identity* from it on every event, and a hook paired with an older library would post as the
+bare machine name, which is also the broadcast address. Two copies that disagree are how one
+session becomes two agents, so a test pins them byte-for-byte equal over a corpus of awkward
+labels instead.
+
 ## v3.7 — the one judgement in the release mechanism stops being a flag anything can pass
 
 `scripts/release_stamp.py` derives a release number from the CHANGELOG at `origin/main` and

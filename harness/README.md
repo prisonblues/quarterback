@@ -1216,23 +1216,27 @@ name nobody could type.
 
 **Why it registers that name itself, before starting anything.** Since v2.12 the board
 *designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
-**request** (`X-Agent-Name`) — one the MCP server makes and the lifecycle hook does not.
-Allocation is first-contact-wins, and the hook fires on `SessionStart`, so it usually wins.
-Measured against a live board:
+**request** (`X-Agent-Name`). Allocation is first-contact-wins. Measured against a live board:
 
 | First contact | Later request | Board says |
 |---|---|---|
-| key only, no name (the hook) | — | `zeus/meadow-russet` |
-| key only, no name (the hook) | `seat-lexray-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
+| key only, no name | — | `zeus/meadow-russet` |
+| key only, no name | `seat-lexray-9` | `zeus/meadow-russet` — **the request is ignored** |
 | key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
 
-So a seat that does not ask up front comes up as two random words about as often as not,
-losing the one property the numbering was for. `qb-seat` makes a single `GET /whoami`
-carrying both headers before it execs, which settles the row; every process that follows
-resolves to it. It reads back what the board actually said and warns if that is not the name
-it asked for, which happens when the key was bound to a designated name on some earlier run
-— allocation hands a returning key the name it already had, and a request cannot displace
-one that exists.
+When this was written the MCP server was the only client that made the request and the
+lifecycle hook was not, so the hook's `SessionStart` usually got there first and a seat came
+up as two random words about as often as not — losing the one property the numbering was for.
+**Every client asks now (#156)**, so the row is settled correctly whichever one reaches the
+board first.
+
+`qb-seat` still makes a single `GET /whoami` carrying both headers before it execs, and the
+reason is the read-back rather than the request: a name is granted only when it is *free*, so
+a second pane started as the same seat is quietly given something else, and it is worth being
+told that at the one moment a human is looking. It warns when the board's answer is not the
+name it asked for — which also happens when the key was bound to a designated name on some
+earlier run, since allocation hands a returning key the name it already had and a request
+cannot displace one that exists.
 
 *Addressing was never at risk either way*, and that is worth knowing before someone
 re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
@@ -2638,6 +2642,18 @@ and the board client work whether or not the CLI is installed. Under home-manage
 `board.url` renders that file for you; set it to `null` (the default) to keep rendering it
 yourself. There is deliberately **no default board URL**: unset means this machine has not
 been told which board it belongs to, and guessing would point the query at somebody else's.
+
+**`QUARTERBACK_INSTANCE` is the exception, and it is per session rather than per site.**
+Everything above says which board this *machine* talks to; this says which agent *this
+session* is on it. Unset — the normal case — the clients send the session-id prefix as an
+opaque key and the board designates a name against it, which is where `zeus/glacier-amber`
+comes from. Set, it does two things: it is the key, so two sessions sharing one value are
+**one agent** on the board (one history, one lease, one set of claims — never export it
+host-wide), and `qb-env`'s `qb_requested_name` turns it into an `X-Agent-Name` request, which
+is what makes `zeus/seat-3` the spelling peers actually see. `qb`, `qb-hook` and the MCP
+server all send that request (#156); before they did, the label was a key nobody was shown.
+The name shape is stricter than the key shape — `^[a-z0-9]+(?:-[a-z0-9]+)*$` — so `Deploy_1`
+is asked for as `deploy-1`, and a label with nothing usable in it asks for no name at all.
 
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy

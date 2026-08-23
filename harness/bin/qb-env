@@ -100,3 +100,36 @@ qb_refresh_token() {
   QUARTERBACK_TOKEN="$fresh"; export QUARTERBACK_TOKEN
   return 0
 }
+
+# The name an operator asked this agent to answer to, printed on stdout, or
+# nothing. Sourced by both clients that talk HTTP — `qb` and `qb-hook` — so there
+# is exactly ONE place in the shell that decides what an agent is called.
+#
+# WHY IT EXISTS (#156). Since v2.12 the board DESIGNATES the name half of an
+# identity: `X-Agent-Instance` is an opaque KEY, and `zeus/glacier-amber` is the
+# spelling every peer sees. `X-Agent-Name` is the one way to ask for something
+# typeable instead — it has worked server-side since v2.12 and no client sent it,
+# so `QUARTERBACK_INSTANCE=deploy` named nothing at all. It keyed a two-word
+# allocation and survived only as an alias nobody is shown.
+#
+# ONLY FROM AN EXPLICIT QUARTERBACK_INSTANCE, which is why this reads the variable
+# itself rather than taking the caller's already-derived instance. That instance
+# falls back to the session-id prefix — a hex fragment — and asking for THAT as a
+# name would put `zeus/a4f81c2e` back on every status bar in the fleet, which is
+# the exact thing moving naming server-side existed to stop.
+#
+# ITS OWN SANITISER, not the key's. The board's name shape is stricter than its key
+# shape: `^[a-z0-9]+(?:-[a-z0-9]+)*$`, lower case, no `.`, `_` or `~`. So `Deploy_1`
+# is a perfectly good key and a 400 as a name — and both callers swallow a 400 in
+# silence, `qb-hook` by contract. A label that sanitises away to nothing (`___`)
+# asks for no name at all rather than for `-`.
+qb_requested_name() {
+  local n="${QUARTERBACK_INSTANCE:-}"
+  [ -n "$n" ] || return 0
+  # Truncate before the final trim: cutting to the board's 40 can itself leave the
+  # trailing hyphen that the shape forbids.
+  n=$(printf '%s' "$n" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '-' \
+      | sed -E 's/-+/-/g; s/^-//; s/-$//' | cut -c1-40 | sed -E 's/-$//')
+  [ -n "$n" ] && printf '%s' "$n"
+  return 0
+}
