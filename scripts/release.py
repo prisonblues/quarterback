@@ -46,7 +46,13 @@ the loudest thing a removal can say.
 4. Writes the entry at the top of `CHANGELOG.md`, adds the README bullet and re-renders that
    list into CHANGELOG order, bumps the served version if the release touched `app/` or
    `migrations/`, and deletes the fragments it consumed.
-5. Commits `chore(release): vX.Y — <title>`, tags the commit it just made, and pushes both.
+5. Commits `chore(release): vX.Y — <title>`, tags the commit it just made, and pushes both
+   in ONE atomic push, so a release never reaches `main` without its tag.
+
+Anything that fails between step 4 and the commit puts back every file this run had written
+and every fragment it had consumed, from text it is still holding. What it does not undo is a
+tag or a push that has already succeeded — a tag is never moved or deleted here, for the same
+reason `release_tag.py` never moves one.
 
 The tag names a commit on `main` by construction, so #406 cannot recur: there is no separate
 branch-side stamp commit for a squash merge to discard and no tag left pointing at a commit
@@ -161,6 +167,7 @@ here is an explicit 2 with a sentence, never a traceback.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import os
@@ -203,6 +210,10 @@ _HEADING = re.compile(rf"^##[ \t]+{_V}", re.MULTILINE)
 #: only at the next NUMBERED heading would swallow anything written above it, so the newest
 #: released entry's body would change every time a release was appended.
 _SECTION = re.compile(r"^\#{1,2}[ \t]", re.MULTILINE)
+
+#: Where the part of CHANGELOG.md that no branch writes BEGINS: the first second-level
+#: heading, whatever it says. Deliberately not `_HEADING` — see `_entries_from`.
+_ANY_SECTION = re.compile(r"^\#\#[ \t]", re.MULTILINE)
 
 #: `Release-Body-Edit: v2.59` — the one sanctioned way to edit a shipped entry, written as a
 #: git TRAILER on a commit of the branch making the edit. It lives in a commit message rather
@@ -1217,8 +1228,14 @@ def confirm_major(version: Release, instead_of: Release, onto_newest: Release,
     release workflow's `workflow_dispatch` form collects — the same "type the number"
     discipline, in the one place a person is already deciding to cut a release; a wrong or
     absent answer there refuses exactly as a wrong answer at the terminal does. Otherwise the
-    CONTROLLING TERMINAL is asked. `HARNESS_UNATTENDED=1` grants neither: it is a declaration
-    that nobody is watching, which is precisely when this must not proceed.
+    CONTROLLING TERMINAL is asked.
+
+    `HARNESS_UNATTENDED=1` refuses BEFORE either, and that ordering is the whole point rather
+    than an accident of layout. The environment variable is a declaration that nobody is
+    watching, and a typed answer produced by a run that has declared that is a number an agent
+    worked out, not a judgement a person made. Read after the confirmation it would be
+    unreachable — `--major --major-confirm v4` would carry an unattended loop straight past
+    the gate, which is #386 with an extra flag on it.
 
     A fragment field and a PR label were both considered and rejected. Either would put the
     judgement back on a branch — a worker deciding what the release MEANS while writing one
@@ -1236,14 +1253,14 @@ def confirm_major(version: Release, instead_of: Release, onto_newest: Release,
             f"{fmt(version)} in its `major` field"
         )
 
+    if os.environ.get(UNATTENDED_ENV) == "1":
+        raise refuse(f"{UNATTENDED_ENV}=1")
     if typed is not None:
         if typed.strip() not in {fmt(version), fmt(version).lstrip("v")}:
             raise refuse(f"--major-confirm asked for {fmt(version)} and read {typed!r}")
         print(f"confirmed by --major-confirm: {fmt(version)}, not {fmt(instead_of)}",
               file=sys.stderr)
         return
-    if os.environ.get(UNATTENDED_ENV) == "1":
-        raise refuse(f"{UNATTENDED_ENV}=1")
     prompt = (
         f"\n  {fmt(version)}, NOT {fmt(instead_of)}.\n"
         f"  The newest release at the base is {fmt(onto_newest)}, and `major.minor` here is "
@@ -1690,10 +1707,35 @@ def cmd_run(args: argparse.Namespace) -> int:
         edits.append(("app/main.py", main_py,
                       text[: served.start(1)] + cut.served_to + text[served.end(1):]))
 
+    # The rollback runs to the COMMIT, not to `_write_all`'s last line. That helper puts back
+    # the files it wrote and stops there, so a failure at the fragment unlink or at `git
+    # commit` left the release written and its fragments consumed — a finished-looking release
+    # nobody can find, and the one state harder to notice than either half alone (Codex).
+    #
+    # Restored from held text rather than from git. `git checkout --` would do it, and would
+    # be a bigger hammer than this needs: these are files this function wrote seconds ago and
+    # it still has both sides of every one.
+    originals = [(f.path, f.path.read_text(encoding="utf-8")) for f in fragments]
+
+    def undo() -> None:
+        for path, text in originals:
+            with contextlib.suppress(OSError):
+                path.write_text(text, encoding="utf-8")
+        for name, full, _ in edits:
+            with contextlib.suppress(OSError, ReleaseError):
+                _write(full, _read_before[name], name)
+
+    _read_before = {name: _read(full, name) for name, full, _ in edits}
     written = _write_all(edits)
-    for f in fragments:
-        f.path.unlink()
     consumed = [f"changelog.d/{name}" for name in cut.fragments]
+    try:
+        for f in fragments:
+            f.path.unlink()
+    except OSError as e:
+        undo()
+        raise ReleaseError(
+            f"could not consume {e.filename}: {e.strerror}. Nothing was committed, and the "
+            "files this run had already written have been put back") from e
 
     if args.no_commit:
         if args.json:
@@ -1705,16 +1747,28 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("--no-commit: nothing was committed or tagged.")
         return 0
 
-    _git(repo, "add", "--", *[path for path, _, _ in edits], "changelog.d")
     message = f"chore(release): {version} — {cut.title}"
-    _git(repo, "commit", "--no-verify", "-m", message)
+    try:
+        _git(repo, "add", "--", *[path for path, _, _ in edits], "changelog.d")
+        # `--no-verify`: this commit is entirely this tool's own output, already checked by
+        # everything above it, and the commit hooks in this fleet are for hand-written work.
+        _git(repo, "commit", "--no-verify", "-m", message)
+    except ReleaseError:
+        _git_ok(repo, "reset", "--quiet", "--", ".")
+        undo()
+        raise
+
     sha = resolve(repo, "HEAD")
     _git(repo, "tag", "-a", version, "-m", message, sha)
 
     pushed = False
     if args.push:
-        _git(repo, "push", "origin", f"{sha}:refs/heads/{branch}")
-        _git(repo, "push", "origin", f"refs/tags/{version}")
+        # ONE push, `--atomic`, so the commit and its tag arrive together or not at all.
+        # Pushed separately, a tag push that failed left the release on `main` untagged — and
+        # the `every release on main has a tag` job that would normally repair that does NOT
+        # run here, because a push made with `GITHUB_TOKEN` triggers no workflows (Codex).
+        _git(repo, "push", "--atomic", "origin",
+             f"{sha}:refs/heads/{branch}", f"refs/tags/{version}")
         pushed = True
 
     if args.json:
@@ -1743,9 +1797,16 @@ def _entries_from(text: str, where: str = "CHANGELOG.md") -> str:
     Inserting a release still lands INSIDE this region: the new entry sits above what used
     to be the first heading, so the region at the branch begins with text the base's does
     not have.
+
+    ANY second-level heading opens it, not just a parseable `## vX.Y`. Anchoring on a release
+    heading left a hole with a version number in it: `## v9.9.9` is three components, which
+    `_HEADING` deliberately does not match, so a branch could prepend one and have the whole
+    thing read as preamble. Codex found it. The preamble in this repo's CHANGELOG is a `#`
+    heading and prose, so "the first `##`" is the same boundary for a correct file and a
+    closed door for that one.
     """
     masked = mask_code(text, where)
-    first = _HEADING.search(masked)
+    first = _ANY_SECTION.search(masked)
     return text[first.start():] if first else ""
 
 
@@ -1817,7 +1878,13 @@ def cmd_guard(args: argparse.Namespace) -> int:
         # Only the release LIST. The README is 900 lines of prose a branch is meant to edit,
         # and refusing the whole file would make the guard a tax on documentation — which is
         # how a guard stops being installed.
-        if before is not None and after is not None and before != after:
+        #
+        # `before is not None and after is None` is the branch having BROKEN the list — the
+        # heading removed, or every bullet gone — and it is a finding rather than a pass.
+        # Reading it as "cannot tell" made deleting the block the one edit that got through,
+        # which is the largest version of the defect wearing the smallest diff (Codex).
+        # Neither side parsing is a repo that does not keep a release list, and stays silent.
+        if before is not None and (after is None or before != after):
             edited.append("README.md § Releases")
 
     payload |= {"ok": not edited, "fork_point": base, "edited": edited}

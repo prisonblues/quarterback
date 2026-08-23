@@ -540,6 +540,50 @@ def test_no_commit_writes_the_files_and_stops(repo, capsys):
     assert "nothing was committed or tagged" in capsys.readouterr().out
 
 
+def test_a_commit_that_fails_leaves_neither_the_files_nor_the_fragments_consumed(
+        repo, capsys, monkeypatch):
+    """The window Codex found. `_write_all` puts back the files IT wrote and stops there, so a
+    failure while consuming the fragments, or at `git commit`, left the release written and
+    its fragments gone — a finished-looking release nobody can find, which is harder to notice
+    than either half alone."""
+    before = {p: p.read_text() for p in (repo / "CHANGELOG.md", repo / "README.md")}
+    real = rs._git
+
+    def fail_on_commit(repo_, *args):
+        if args and args[0] == "commit":
+            raise rs.ReleaseError("the commit hook said no")
+        return real(repo_, *args)
+
+    monkeypatch.setattr(rs, "_git", fail_on_commit)
+    assert cut(repo) == 2
+
+    assert "the commit hook said no" in capsys.readouterr().err
+    assert (repo / "changelog.d/+thing.feat.md").exists(), "the fragment was consumed anyway"
+    assert {p: p.read_text() for p in before} == before
+    assert git(repo, "status", "--porcelain").strip() == "", "and the index was left staged"
+
+
+def test_the_commit_and_its_tag_are_pushed_atomically(repo, monkeypatch):
+    """Pushed separately, a tag push that failed left the release on `main` untagged — and the
+    job that would normally repair that does not run, because a push made with `GITHUB_TOKEN`
+    triggers no workflows (Codex). One push, all or nothing."""
+    pushes: list[tuple[str, ...]] = []
+    real = rs._git
+
+    def record(repo_, *args):
+        if args and args[0] == "push":
+            pushes.append(args)
+        return real(repo_, *args)
+
+    monkeypatch.setattr(rs, "_git", record)
+    assert cut(repo) == 0
+
+    assert len(pushes) == 1, f"the release was pushed in {len(pushes)} goes: {pushes}"
+    assert "--atomic" in pushes[0]
+    assert any(a.endswith(":refs/heads/main") for a in pushes[0])
+    assert "refs/tags/v2.34" in pushes[0]
+
+
 def test_a_release_cannot_rewrite_an_entry_that_already_shipped(repo, capsys, monkeypatch):
     """`guard` refuses a branch that touches CHANGELOG.md at all, which leaves exactly one
     writer — and an unwatched sole writer is how #325 happened. So the release job is held to
@@ -574,6 +618,36 @@ def test_guard_refuses_a_branch_that_edits_the_changelog(repo, capsys):
     assert "edits CHANGELOG.md" in err
     assert "changelog.d/<issue>.<kind>.md" in err
     assert "git checkout" in err  # and how to undo what is already committed
+
+
+def test_guard_refuses_a_release_entry_written_above_the_ones_it_can_parse(repo, capsys):
+    """Codex found the hole. `## v9.9.9` is three components, which the release-heading
+    pattern deliberately does not match — so anchoring the guarded region on the first
+    PARSEABLE heading let a branch prepend a release entry and have the whole thing read as
+    preamble. The region starts at the first `##` of any kind, which is the same boundary for
+    a correct file and a closed door for that one."""
+    branch(repo)
+    text = (repo / "CHANGELOG.md").read_text()
+    at = text.index("## v2.33")
+    write(repo, "CHANGELOG.md",
+          text[:at] + "## v9.9.9 — what this branch shipped\n\nSomething.\n\n" + text[at:])
+    commit(repo, "a release entry the parser does not recognise")
+
+    assert run(repo, "guard", "--onto", "main", "--branch", "HEAD") == 2
+    assert "edits CHANGELOG.md" in capsys.readouterr().err
+
+
+def test_guard_refuses_a_branch_that_removed_the_readmes_release_list(repo, capsys):
+    """The other half Codex found: a release list that stops PARSING on the branch used to
+    read as "cannot tell" and pass, which made deleting the block the one edit that got
+    through — the largest version of the defect wearing the smallest diff."""
+    branch(repo)
+    text = (repo / "README.md").read_text()
+    write(repo, "README.md", text[:text.index("### Every release, oldest first")])
+    commit(repo, "docs: drop the release list")
+
+    assert run(repo, "guard", "--onto", "main", "--branch", "HEAD") == 2
+    assert "README.md § Releases" in capsys.readouterr().err
 
 
 def test_guard_refuses_a_branch_that_edits_the_readmes_release_list(repo, capsys):
@@ -1221,14 +1295,26 @@ def test_major_confirm_is_the_unattended_door_and_it_wants_the_number(repo, caps
     assert "confirmed by --major-confirm: v3, not v2.34" in capsys.readouterr().err
 
 
-def test_major_confirm_does_not_need_a_terminal_and_unattended_does_not_grant_it(
-        repo, capsys, monkeypatch):
-    """`HARNESS_UNATTENDED=1` is a declaration that nobody is watching, which is precisely
-    when this must not proceed — but a typed confirmation is a person, wherever it arrives
-    from, so it is read before the environment is consulted."""
-    monkeypatch.setenv("HARNESS_UNATTENDED", "1")
+def test_major_confirm_needs_no_terminal(repo, capsys):
+    """The dispatch form has no terminal to ask at, which is the whole reason the flag
+    exists — the autouse fixture makes every test here look like that."""
     assert cut(repo, "--no-push", "--major", "--major-confirm", "v3") == 0
     assert "## v3 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_an_unattended_run_is_refused_even_carrying_a_typed_confirmation(
+        repo, capsys, monkeypatch):
+    """The ordering is the point, and Codex found it the other way round. A number typed by a
+    run that has declared nobody is watching is a number an agent worked out, not a judgement
+    a person made — so `--major --major-confirm v3` under `HARNESS_UNATTENDED=1` would have
+    carried a loop straight past the gate, which is #386 with an extra flag on it."""
+    monkeypatch.setenv("HARNESS_UNATTENDED", "1")
+    before = (repo / "CHANGELOG.md").read_text()
+
+    assert cut(repo, "--no-push", "--major", "--major-confirm", "v3") == 2
+
+    assert (repo / "CHANGELOG.md").read_text() == before
+    assert "HARNESS_UNATTENDED=1" in capsys.readouterr().err
 
 
 def test_the_answer_comes_from_the_terminal_and_never_from_stdin(repo, monkeypatch):
