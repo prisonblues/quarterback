@@ -271,7 +271,10 @@ function roundCell(r){
     return {k:"round", v:"none in this window", unknown:true,
       asof:`no panel run for this PR is among the newest ${RUN_WINDOW} this page `
          + `reads, and nothing here can say whether an older one exists`};
-  const cycle = r.run.cycle ? ` · cycle ${esc(r.run.cycle).slice(0,8)}` : "";
+  // Sliced RAW, not escaped-then-sliced: cutting an escaped string at eight
+  // characters can cut an entity in half, and `factEl` escapes this anyway — so
+  // escaping here would render `&amp;` in the cell as well.
+  const cycle = r.run.cycle ? ` · cycle ${String(r.run.cycle).slice(0,8)}` : "";
   return {k:"round", v:`${r.run.round}`,
     asof:`ran ${ago(r.run.ts)} ago by ${r.run.author || "somebody"}${cycle}`};
 }
