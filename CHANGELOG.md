@@ -17,6 +17,52 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.12 — the reconciler stops caring what order you work in
+
+`scripts/migration_reconcile.py` computes everything from migration files at a git ref — that
+is its stated design principle, and the point of it is that the answer does not depend on
+where you happen to be standing. `apply` broke the promise in one place: it refused unless
+`HEAD` was the same commit as `--branch`. So merging `origin/main` into your branch first,
+which is what you are there to do when `CHANGELOG.md` conflicts on every branch in the queue,
+turned a correct plan into a refusal on the same repo in the same state — and the refusal
+named the only recovery that cannot work, since checking out the pre-merge commit discards
+the resolution the merge carries. Landing #153 hit all of it: a bare `preflight` could not
+plan at all, explicit refs planned perfectly, and `apply` then declined the plan it had just
+produced. The renumber was done by hand.
+
+Three things change, and none of them is the guard being deleted.
+
+A merge commit is no longer read as a feature branch. If `--branch` names one, the feature
+side is read off it — and by evidence rather than by convention: git's first-parent order
+says which branch the merge was made *on*, so the parent `--onto` already contains is the
+integration side and the other one is yours. Exactly one contained parent gives an answer;
+an octopus merge, or two feature branches merged together, gives none, and that is reported
+as "I cannot tell which of these is your branch" with the explicit invocation that works,
+rather than by picking one. Whichever two refs the plan used are printed with it and carried
+in the JSON.
+
+`apply`'s guard now checks the property it always meant. Commit identity was never it: what
+matters is that the tree it edits is the tree the plan describes, and since the plan is a
+function of two refs that is exactly checkable. HEAD must contain `--branch`; every migration
+at `--branch` must be at HEAD byte-for-byte; and every migration at HEAD must be at one of the
+two refs byte-for-byte. Nothing else may be in that directory. Checking only the files the
+rewrite opens is not enough and the case is ordinary rather than exotic: HEAD picks up `0090`
+from a third branch, the plan renumbers against two refs that never saw it, every touched blob
+still matches, and the applied tree has two heads while the plan that produced it said one.
+Mode counts as part of the bytes, because git stores a symlink as a blob holding its target,
+so a file containing `x.py` and a link pointing at `x.py` share an object id — and `apply`
+writes through the link. A conflict resolved inside a migration file fails all of this and is
+refused, which is deliberate.
+
+The duplicate-id STOP stops advising hand work. "Renumber one of each pair" reads as an
+instruction to the operator to do by hand the exact thing this tool exists to do, and a
+message whose only suggestion is manual work is how a tool gets bypassed. It now points at
+planning the renumber from the two refs the files came from.
+
+`heads --ref` is untouched and still reads the ref it was pointed at. CI runs it on the merge
+commit GitHub builds for a pull request in order to see the post-merge graph, so taking that
+merge apart would blind the check.
+
 ## v3.7 — the one judgement in the release mechanism stops being a flag anything can pass
 
 `scripts/release_stamp.py` derives a release number from the CHANGELOG at `origin/main` and
