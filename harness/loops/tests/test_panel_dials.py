@@ -1479,7 +1479,7 @@ def test_only_a_copy_counts_as_supplying_a_file():
     having that file where this suite reads it. Running a script or naming one in a comment
     both interpolate a path, and neither is a copy."""
     block = ("          # cp ${./harness/README.md} repo/harness/README.md\n"
-             "          bash ${./scripts/release_stamp.py} check\n"
+             "          bash ${./scripts/release.py} preview\n"
              "          cp -r ${./harness/commands} repo/harness/commands\n"
              "          install -Dm644 ${./.harness-rules.sample} repo/.harness-rules.sample\n")
     assert set(_FLAKE_COPY.findall(block)) == {"harness/commands", ".harness-rules.sample"}

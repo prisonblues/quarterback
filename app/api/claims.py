@@ -26,17 +26,19 @@ on ``main``. If a skill ever calls this "the merge lock", the skill is wrong.
 
 **There is no release allocator here any more (#172).** ``kind='release'`` shipped
 in #46 to stop two branches picking the same version. What actually stopped it was
-``scripts/release_stamp.py`` (v2.34), which takes ``max+1`` at land from the ref
-being merged into — nine releases landed that way in a day with no collisions,
-while the allocator's own rows went stale for every PR still open. A namespace
-nobody claims in does not need an allocator, and a stale record of it is worse
-than none: it is the second spelling this module is now built to prevent.
+taking the number from the CHANGELOG at the ref being merged into — nine releases
+landed that way in a day with no collisions, while the allocator's own rows went
+stale for every PR still open. #122 finished the argument: the number is applied
+on ``main`` after the merge, by ``scripts/release.py``, so no branch names one and
+there is no race left to allocate against. A namespace nobody claims in does not
+need an allocator, and a stale record of it is worse than none: it is the second
+spelling this module is now built to prevent.
 
 The endpoints went; the KIND could still be written, because canonicalisation
 passes an unrecognised kind through and the ``RESERVED_KINDS`` guard was deleted
 with the allocator. So ``release`` is now a *retired* kind rather than an unknown
 one (:data:`app.claimkey.RETIRED_KINDS`) and ``POST /claim`` refuses it with 422,
-naming ``release_stamp.py``. A deletion that leaves one path able to write the
+naming ``release.py``. A deletion that leaves one path able to write the
 rows is not a deletion.
 """
 

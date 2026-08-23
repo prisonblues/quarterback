@@ -1,12 +1,6 @@
-# changelog.d — one file per change, so the CHANGELOG stops conflicting
+# changelog.d — the whole contract, in four lines
 
-Every branch that ships something used to edit the same lines at the top of
-[`../CHANGELOG.md`](../CHANGELOG.md), so every pair of concurrent branches conflicted there.
-That conflict is not a disagreement about anything: both entries are right and both belong,
-and git cannot know that two insertions at one offset are independent.
-
-Write a **fragment** instead. One file, named after your issue, that no other branch will
-ever open:
+**Write one file. Name no version. Touch nothing else. That is all of it.**
 
 ```
 changelog.d/296.feat.md
@@ -17,7 +11,7 @@ changelog.d/296.feat.md
 vocabulary to learn. Use `+<short-slug>.<kind>.md` when there is genuinely no issue; a made-up
 issue number in a filename reads as a real one forever after.
 
-The file is the CHANGELOG entry, with a title on the first line:
+The file **is** the changelog entry, with a title on the first line:
 
 ```markdown
 # a branch stops guessing which release it will be
@@ -28,52 +22,41 @@ what every entry in CHANGELOG.md leads with.
 ### A sub-heading, if the entry is long
 
 `###` and below only. A `#` or `##` heading would split the release this fragment is folded
-into, and `release_stamp.py` would read the split as a second release.
+into, and the release tool would read the split as a second release.
 ```
 
-**Name no version.** Not `v2.67`, not `vNEXT`. That is the whole reason two branches can each
-write a fragment without racing for a number — the number is decided at land time, by
-`release_stamp.py`, against the ref you are merging into.
+## Name no version
 
-## At land time
+Not `v3.13`, and not `vNEXT` either — the placeholder is retired and a fragment carrying it is
+refused. There is no number to name: the release is numbered on `main`, after the merge, by
+`scripts/release.py`, against the commit that actually exists.
 
-```bash
-git fetch origin --tags                                  # a sibling's reserved number too
-scripts/changelog_fragments.py check                     # do the fragments parse?
-scripts/changelog_fragments.py assemble --title "<what this release does>"
-scripts/release_stamp.py apply --onto origin/main        # vNEXT -> the next free number
-git commit -a                                            # and then push
-```
+## Do not open CHANGELOG.md or the README's release list
 
-The **push** is what takes the number: `harness/githooks/pre-push` creates `refs/tags/vX.Y`
-on the remote, which succeeds for exactly one caller and is rejected for every other. Until
-then `apply` has only read a shared file, and two landers reading it seconds apart read the
-same answer (#296).
+Those are **output**. `scripts/release.py run` writes them and nothing else does, and a branch
+that edits either is refused — by `harness/githooks/pre-push` at the moment you would go wrong,
+and by the `generated release files are output` CI job on the pull request.
 
-`assemble` folds every fragment present into one `## vNEXT — <title>` entry at the top of
-`CHANGELOG.md`, adds the matching `- **vNEXT** — …` bullet to the README's release list, and
-deletes the fragments it consumed. With exactly one fragment, `--title` is optional: the
-fragment's own title becomes the release's.
-
-A fragment that lands unassembled is not lost and is not an error — the next `assemble` sweeps
-it into that release's entry, which is what a release IS: everything since the last one.
-
-Hand-writing `## vNEXT — <title>` in `CHANGELOG.md` still works and is still what that file's
-convention paragraph describes. Fragments are how you avoid the conflict, not a new
-requirement.
+The refusal is not a formality. Every branch that shipped anything used to edit the same lines
+at the top of the same file, so N such branches in flight was N-choose-2 conflicts **by
+construction** — over nothing, since both entries are right and both belong, and git cannot
+know that two insertions at one offset are independent. On 2026-08-23 six pull requests were
+open: the three that had written a release entry were all `CONFLICTING`, the three that had not
+were all `MERGEABLE`. PR #398 landed both ways and settles it — unmergeable with the entry,
+zero conflicts without it, same branch, same work, same base (#122).
 
 ## Something checks that you wrote one
 
 ```bash
+scripts/changelog_fragments.py check                          # do the fragments parse?
 scripts/changelog_fragments.py required --onto origin/main --branch HEAD
 ```
 
-The `a change that ships carries a release note` CI job runs this on every pull request. A
-branch that changes something that ships and carries neither a fragment nor a release entry is
-refused — because nothing else could notice. `release_stamp.py check` asks whether a `vNEXT` is
-unstamped and `frozen` guards the entries that exist, so an entry nobody wrote is the same
-shape to both as a correct one, which is how #363 landed with this directory holding only the
-file you are reading (#365).
+The `a change that ships carries a release note` CI job runs `required` on every pull request.
+A branch that changes something that ships and carries no fragment is refused — because nothing
+else could notice. `frozen` guards the entries that exist and `guard` refuses a branch that
+touches them, so to both of them an entry nobody wrote is the same shape as a correct one,
+which is how #363 landed with this directory holding only the file you are reading (#365).
 
 A branch confined to documentation or tests passes in silence: `changelog.d/`, `CHANGELOG.md`,
 any `README.md`, and anything under a `tests/` directory or named like a test are exempt.
@@ -84,3 +67,16 @@ Genuinely nothing to tell a reader? Say so on a commit of the branch, where a re
 ```
 Changelog-Exempt: a comment typo, no behaviour changed
 ```
+
+## What happens to it afterwards
+
+Nothing you have to do. A fragment that sits here unassembled is not lost and is not an error —
+the next release sweeps it in, which is what a release IS: everything since the last one. Six
+fragments from six merges become one release, not six.
+
+Cutting one is a deliberate act, once per batch, by whoever decides the batch is done — the
+**Cut a release** workflow (`Actions → Cut a release`), or `scripts/release.py run --title "…"`
+on `main` at a keyboard. It assembles every fragment here, derives the number, writes
+`CHANGELOG.md` and the README's list, bumps the served version if the release touched `app/` or
+`migrations/`, deletes the fragments it consumed, commits and tags. `scripts/release.py preview`
+says what it would do and changes nothing; it is safe to run from anywhere, including a branch.

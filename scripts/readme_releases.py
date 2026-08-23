@@ -40,12 +40,16 @@ endpoints leave a gap is reported as the releases that have no bullet.
 
 `- **Not yet numbered** — …` names no release and is rendered last, after every version
 bullet. It is deliberately unnumbered — a roadmap bullet naming `v3` would collide with the
-real `v3` the day `apply --major` stamps it — so it has no position in the CHANGELOG's order
+real `v3` the day the release job issues it — so it has no position in the CHANGELOG's order
 and this tool gives it the one place that cannot go stale.
 
-`vNEXT` is the in-flight entry. It sits at the TOP of the CHANGELOG, so oldest-first puts it
-last among the version bullets, which is exactly where the convention already says to write
-it. Nothing special-cases it here.
+## Who calls `write`
+
+`scripts/release.py run`, on `main`, and a person repairing an order that has drifted. Not a
+branch: the release list is one of the two files `release.py guard` refuses a branch for
+editing, because it was the expensive half of every landing conflict — a bullet appended at
+the end of the block by two branches at once is the same insertion-at-one-offset that made
+`CHANGELOG.md` conflict (#122).
 """
 
 from __future__ import annotations
@@ -62,13 +66,18 @@ from pathlib import Path
 _SCRIPTS = Path(__file__).resolve().parent
 
 # `scripts/` is a directory of standalone tools rather than an importable package, so the
-# stamper is loaded by path — and registered in sys.modules before it executes, because
-# @dataclass resolves annotations through sys.modules[cls.__module__].
-_SPEC = importlib.util.spec_from_file_location("release_stamp", _SCRIPTS / "release_stamp.py")
-assert _SPEC and _SPEC.loader
-rs = importlib.util.module_from_spec(_SPEC)
-sys.modules[_SPEC.name] = rs
-_SPEC.loader.exec_module(rs)
+# release tool is loaded by path — and registered in sys.modules before it executes, because
+# @dataclass resolves annotations through sys.modules[cls.__module__]. An already-loaded
+# module is reused rather than re-executed: `release.py` loads this file back, and a second
+# module object would mean two `ReleaseError` classes that do not catch each other.
+if "release" in sys.modules:
+    rs = sys.modules["release"]
+else:
+    _SPEC = importlib.util.spec_from_file_location("release", _SCRIPTS / "release.py")
+    assert _SPEC and _SPEC.loader
+    rs = importlib.util.module_from_spec(_SPEC)
+    sys.modules[_SPEC.name] = rs
+    _SPEC.loader.exec_module(rs)
 
 #: The README heading the list lives under. The list is found by this heading rather than by
 #: scanning for `- **v…**` bullets anywhere in the file, because the README has other bold-run
@@ -119,8 +128,8 @@ class Bullet:
 
 
 def _is_entry(label: str) -> bool:
-    """Whether `label` is spelled like a release entry — `v2.34`, `v3`, or the placeholder."""
-    return bool(re.fullmatch(rf"v\d+(?:\.\d+)?|{rs.PLACEHOLDER}", label))
+    """Whether `label` is spelled like a release entry — `v2.34` or `v3`."""
+    return bool(re.fullmatch(r"v\d+(?:\.\d+)?", label))
 
 
 def changelog_order(changelog: str, where: str = "CHANGELOG.md") -> list[str]:
@@ -318,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     try:
         return args.func(args)
-    except (ListError, rs.StampError) as e:
+    except (ListError, rs.ReleaseError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

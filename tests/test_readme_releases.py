@@ -1,7 +1,7 @@
 """Tests for `scripts/readme_releases.py`.
 
 Nothing here reads this checkout's own README or CHANGELOG, for the reason
-`tests/test_release_stamp.py` gives about the stamper: a suite asserting about the real files
+`tests/test_release.py` gives about the release tool: a suite asserting about the real files
 goes red on the day somebody lands a release, which is the day it is needed. The real files
 ARE asserted, once, in
 `harness/tests/test_release_numbers.py::test_the_readme_release_list_is_in_changelog_order` —
@@ -156,13 +156,13 @@ def test_a_bullet_naming_no_release_is_rendered_last():
         IN_ORDER + "- **Not yet numbered** — a roadmap item.\n")
 
 
-def test_the_unstamped_entry_is_rendered_last_among_the_releases():
-    """`vNEXT` sits at the TOP of the CHANGELOG, so oldest-first puts it at the END of the
-    README list — which is exactly where the convention already says to write it. Nothing
-    special-cases it: it is an entry name like any other."""
-    listed = IN_ORDER + "- **vNEXT** — the one in flight.\n- **Not yet numbered** — later.\n"
-    scrambled = "- **vNEXT** — the one in flight.\n" + IN_ORDER + "- **Not yet numbered** — later.\n"
-    assert rr.render(readme(scrambled), changelog("vNEXT", "v2.1", "v2", "v1")) == readme(listed)
+def test_the_newest_release_is_rendered_last_among_the_releases():
+    """The CHANGELOG is newest first, so oldest-first puts the release just cut at the END of
+    the README list. Nothing special-cases it: it is an entry name like any other."""
+    listed = IN_ORDER + "- **v2.2** — the one just cut.\n- **Not yet numbered** — later.\n"
+    scrambled = ("- **v2.2** — the one just cut.\n" + IN_ORDER
+                 + "- **Not yet numbered** — later.\n")
+    assert rr.render(readme(scrambled), changelog("v2.2", "v2.1", "v2", "v1")) == readme(listed)
 
 
 def test_bold_bullets_outside_the_release_list_are_not_touched():
@@ -174,11 +174,11 @@ def test_bold_bullets_outside_the_release_list_are_not_touched():
 
 def test_a_fenced_example_is_not_part_of_the_list():
     """The README documents this convention by showing it, and the example sits above the
-    list. Read as data, the fenced `- **vNEXT** — …` would be a bullet for a release the
+    list. Read as data, the fenced `- **v9.9** — …` would be a bullet for a release the
     CHANGELOG does not have, and the render would refuse a correct file."""
     text = readme(IN_ORDER).replace(
         f"{rr.LIST_HEADING}\n",
-        "```md\n- **vNEXT** — <title>\n```\n\n" + rr.LIST_HEADING + "\n")
+        "```md\n- **v9.9** — <title>\n```\n\n" + rr.LIST_HEADING + "\n")
     assert rr.render(text, THREE) == text
 
 
@@ -236,7 +236,7 @@ def test_an_unclosed_fence_is_the_stampers_refusal_and_not_a_silent_empty_list()
     """`mask_code` is shared with the stamper, and it refuses an unterminated fence rather
     than blanking the rest of the file — which here would blank the whole release list."""
     text = readme(IN_ORDER).replace(rr.LIST_HEADING, "```\n" + rr.LIST_HEADING)
-    with pytest.raises(rr.rs.StampError):
+    with pytest.raises(rr.rs.ReleaseError):
         rr.render(text, THREE)
 
 

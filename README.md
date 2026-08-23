@@ -933,200 +933,100 @@ redeploys, with no diff to catch it — which is why the sentence that used to n
 own version has gone too. It was a fourth copy of a number that already lives in
 `pyproject.toml` and `app/main.py`, and it drifted exactly like the others.
 
-### A branch never writes in CHANGELOG.md
-
-Write a fragment instead — one file, named after your issue, that no other branch will ever
-open ([changelog.d/README.md](changelog.d/README.md) has the format):
+### A branch writes one file, and it is not this one
 
 ```
 changelog.d/296.feat.md
 ```
 
-Every branch that shipped anything used to edit the same lines at the top of
-[CHANGELOG.md](CHANGELOG.md), so every pair of concurrent branches conflicted there — over
-nothing, since both entries are right and both belong, and git cannot know that two insertions
-at one offset are independent. Under fragments that conflict has nowhere to occur. A fragment
-names **no version at all**, not even the placeholder, which is what takes the branch out of the
-race for a number entirely rather than deferring it.
+One file per change, named after your issue, that no other branch will ever open.
+[changelog.d/README.md](changelog.d/README.md) has the format and is the whole contract: write
+one fragment, name no version, touch nothing else.
 
-At land time the fragments become one release entry, and then that entry gets its number:
+**No branch opens `CHANGELOG.md` or the release list below.** They are output. Every branch
+that shipped anything used to edit the same lines at the top of the same file, so N such
+branches in flight was N-choose-2 conflicts **by construction** — over nothing, since both
+entries are right and both belong, and git cannot know that two insertions at one offset are
+independent. On 2026-08-23 six pull requests were open: the three carrying a release entry were
+all `CONFLICTING`, the three without were all `MERGEABLE`, and `main` did not move for three
+hours with seven green PRs queued behind it. PR #398 landed both ways and settles the argument
+— unmergeable with the entry, zero conflicts once it was reverted, same branch, same work,
+same base (#122).
 
-```bash
-git fetch origin --tags
-scripts/changelog_fragments.py check                    # do the fragments parse?
-scripts/changelog_fragments.py assemble --title "…"     # -> `## vNEXT — …` + the README bullet
-scripts/release_stamp.py preflight        # what it would take, read-only
-scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
-scripts/release_stamp.py apply --major    # …as v3 rather than v2.34 (asks you, at a terminal)
-scripts/release_stamp.py check            # nothing unstamped, no number used twice
-scripts/release_stamp.py frozen           # no shipped entry's text was rewritten
-```
+A fragment names **no version at all**, not even a placeholder. That is what takes the branch
+out of the race for a number entirely rather than deferring it.
 
-Then commit and push, and the push is what **takes** the number — `harness/githooks/pre-push`
-creates `refs/tags/vX.Y` on the remote for you. `--tags` on that first fetch is not a detail:
-a number somebody has reserved and not yet merged lives on a tag pointing at their branch, and
-a plain `git fetch` follows tags only into history it fetched.
+### The number is applied on `main`, after the merge
 
-`assemble` needs `--title` only past one fragment; a lone fragment lends the release its own
-title. A fragment that lands unassembled is not lost — the next `assemble` sweeps it into that
-release, which is what a release IS: everything since the last one.
-
-### A branch never picks its own number
-
-Hand-writing `## vNEXT — <title>` at the top of [CHANGELOG.md](CHANGELOG.md) and
-`- **vNEXT** — …` at the end of the list below still works, and is what `assemble` writes for
-you. Name no number, in either file. Whoever lands first gets the next one.
-
-`apply` reads the highest `## vX.Y` heading in the CHANGELOG **at the ref you are merging into**,
-adds one, and writes it into every heading and bold run carrying the placeholder — across all
-tracked markdown, so `harness/loops/README.md` is stamped by the same pass and cannot be the file
-somebody forgets. It moves `pyproject.toml` and `app/main.py` as well, but only when the branch
-changed `app/` or `migrations/`: most releases here are harness-side and correctly leave the served
-version where it was, and `--serve` / `--no-serve` override the inference for the release that
-proves it wrong.
-
-Whether v2.34 or v3 follows v2.33 is the one thing no ref can answer, so `--major` is a flag and
-never an inference: `apply --major` stamps `v3`, and the plan says which kind of bump it made.
-
-**And it asks you first.** A major is a statement about what the release MEANS, so `apply
---major` prints `v3, NOT v2.34` on your terminal and will not proceed until you type the
-number. With no terminal to ask — an agent, a loop, CI, `HARNESS_UNATTENDED=1` — it refuses and
-writes nothing. That is #386: the number itself is a reading of a ref and no agent picks it,
-but the one judgement in the mechanism was a flag anything could pass, and v2.99 went to v3
-instead of v2.100 because `major.minor` is two integers and a prompt had treated it as a
-decimal. `preflight --major` is not gated: it reports `would stamp v3 (--major, NOT v2.34)`
-without deciding anything, which is the line that makes the slip visible before it ships.
-
-Two branches that stamp in the same minute get the same number — the stamp itself is a file
-read, and a read reserves nothing. What stops the second one landing is the tag the push takes
-(the next section); what the stamper does is make the collision impossible to miss when the tag
-was never taken. Once `apply` has run the placeholder is gone, so there is no automatic
-re-stamp and none is claimed; what there is instead is a refusal on each of the shapes the
-collision takes. `preflight` and `apply` refuse on both: the duplicate
-number a "keep both sides" merge leaves behind, and a number this branch *added* which already
-exists at `origin/main`. `check` sees the first only — it deliberately takes no base ref, so there
-is no `origin/main` for it to compare against, and it reads CHANGELOG headings and README bullets
-for a repeated number. The repair is in the message: put *your* entry back to `## vNEXT` and its
-bullet back to `- **vNEXT** — …`, then run `apply` again.
-
-**A branch that hard-codes a number ABOVE the next free one is refused too, and used to not be.**
-Both that check and the one below sat under an early return taken whenever the branch has no
-`vNEXT` left to rewrite — and "no placeholder" is not "ships no release": a branch that writes
-`## v2.40` by hand ships one and has no placeholder, so it met neither. It is judged on the number
-rather than on who typed it, because once `apply` has run there is no placeholder left either, and
-a branch it stamped is byte-identical to one that hard-coded the same number. So a branch with
-nothing left to stamp may carry one newly-issued number — the next minor or the next major, not
-both — and a branch that still has a placeholder may carry none at all, since stamping would then
-write the number in twice.
-
-What that cannot catch by reading the CHANGELOG alone, and does not claim to: a hand-written
-`max+1`, which is the same bytes `apply` writes and is what somebody numbering by hand off the
-top of `main` actually picks. From the headings the guard catches the number that overshoots and
-the number already taken at the base; a lucky guess still lands. It is caught anyway when the
-number has been reserved, because a **tag** is not a guess and the check that reads them does not
-care who typed the heading — but that is the tag doing it, not this. Write the placeholder: it is
-still the only thing here that makes the number unguessable in the first place.
-
-**An unstamped `vNEXT` at the base stops the branches that need a number, and only those.** It is
-still a refusal when this branch ships a release — you cannot hand out `max+1` while the base holds
-an entry that is going to want a number — and it is a warning for a branch that ships none, which
-would otherwise be held over somebody else's skipped step in a file it does not touch. A branch
-that has already pulled the broken `main` is refused whatever it ships, because the unstamped entry
-is now in its own worktree and `apply` would stamp somebody else's release with this branch's
-number. So the relief is for branches that have not taken that merge; repairing `main` is still the
-fix. The refusal names the ref to repair from rather than describing how to find one — every other
-use of this tool passes `--onto origin/main`, and this is the one case where `origin/main` is the
-broken thing — and `check`, which is the guard that runs on `main` itself, prints the same
-resolved line.
-
-"A number this branch added" is asked of the fork point, not of the heading text, and of the refs
-this branch merged rather than wrote. Editing a released entry — fixing a typo, rewrapping a long
-title — is not a collision, and two branches that both wrote the same boilerplate title are one
-even though the titles match. Putting an entry back to the placeholder is two tokens, because
-nothing else on the branch was ever written in terms of the number — which is what "cheap to redo"
-actually buys. PR #90 was renumbered three times without one line of its behaviour changing, which
-is the cost this removes.
-
-Ten collisions in two days made the case, and the tenth landed an hour after the board's allocator
-shipped and worked — two agents simply did not call it, because a lock that has to be remembered is
-a lock that will be forgotten. **That allocator is gone (#172).** `POST /release/claim`,
-`POST /release/reclaim`, `GET /releases` and `kind='release'` were deleted along with the
-`claim_release_number` / `reclaim_release_number` / `releases` tools: this flow never read them, so a
-claim on v2.34 never kept v2.34 free, and what it left instead was a table of numbers going stale
-for every PR still open. A namespace nobody claims in does not need an allocator, and a stale record
-of one is worse than none — it is a second answer to a question that has one, which is exactly the
-defect #172 is about. Nine releases landed in a day off `apply` alone, with no collisions.
-
-**A git tag is not that, and the difference is the whole of #296.** `POST /release/claim`
-recorded an intention; `refs/tags/v2.96` *is* the number, and after the create succeeds nobody
-can be issued it again whether or not they look. That is the property the board claim never had
-and could not have, and it is why the next section adds an allocator to a mechanism this
-paragraph spent a page arguing did not need one.
-
-### The number is taken, not merely written down
-
-Everything above is a **reading** of a shared file. `apply` computes `max(headings at
-origin/main) + 1`, which is the right answer to the question it asks and is not a lock: two
-landers who ask seconds apart get the same answer, because reading a file cannot reserve
-anything. [scripts/release_stamp.py](scripts/release_stamp.py) says so in its first
-paragraph — *"a release number is a shared namespace with no lock on it"* — and the three
-guards above are all responses to that sentence rather than fixes for it.
-
-The lock was in git the whole time, and this repo had **zero tags** until #296. Creating a
-ref on a remote is compare-and-swap:
+Once per batch, by one caller, against the commit that actually exists:
 
 ```bash
-scripts/release_tag.py reserve      # git push origin <sha>:refs/tags/v2.96
+scripts/release.py preview --title "…"    # what it would issue; changes nothing, runs anywhere
+scripts/release.py run --title "…"        # assemble, number, write, commit, tag, push
+scripts/release.py run --title "…" --major   # …as v4 rather than v3.13 (asks you, at a terminal)
 ```
 
-It succeeds for exactly one caller and is rejected for every other, forever. No server, no
-table of numbers going stale for every PR still open — which is what #172 deleted, and it was
-right to: that allocator recorded an *intention* to take a number, which nothing read. This
-one **is** the number.
+or the **Cut a release** workflow (`Actions → Cut a release`), which is the same command with
+its inputs collected from a form. `run` assembles every fragment in `changelog.d/`, reads the
+highest `## vX.Y` heading in `CHANGELOG.md` and adds one, writes the entry and the README
+bullet, bumps the served version if the release touched `app/` or `migrations/`, deletes the
+fragments it consumed, commits `chore(release): vX.Y — <title>` and tags that commit.
 
-**It is taken at push time**, by [harness/githooks/pre-push](harness/githooks/pre-push), and
-that placement is the substance rather than a detail. At stamp time the tag would be
-fork-relative like everything else — `apply` runs in one worktree, and a tag created there is
-a note to self until it is pushed. At merge time there is no local hook to run at all: this
-fleet lands through `gh pr merge` on the GitHub API, which is #351's finding one domain over.
-At push time the release commit exists, the remote is right there, and the create either wins
-or loses cleanly. Nobody has to remember it, which matters more here than anywhere: ten
-collisions in two days made the original case, and the tenth landed an hour after the board's
-allocator shipped and worked, because two agents did not call it.
+**There is nowhere else to do it, and that is the mechanism rather than a rule about it.**
+`run` refuses unless the checkout is on the default branch, clean, and level with its remote —
+so a branch cannot cut a release, a work-in-progress tree cannot be swept into one, and a
+checkout missing a merge cannot issue a number that merge is going to want. A worker following
+a stale document gets a refusal naming `changelog.d/<issue>.<kind>.md`, not a half-done
+release.
 
-`--onto` is what makes it safe to run on every push rather than on release pushes only. A
-branch whose newest heading is one it *inherited* has taken nothing and says so, in one
-subprocess and no network write.
+That is deliberate, and it is the second attempt. The first moved the number to land time
+behind a `## vNEXT` placeholder, which fixed the *collision* — no branch picked a number again
+— and left `apply` runnable on a branch. Every brief in the repo then told workers to run it,
+so they did, correctly, as instructed. The affordance was the bug; this repo had already
+settled that argument elsewhere (#85: *"if agents can both apply a label and act on it, the
+gate is decorative"*). So `apply`, `preflight`, `check` and `collision` are **deleted**, along
+with the push-time tag reservation that only existed because a branch could stamp. A stale
+brief now gets `No such file or directory`, which is the loudest thing a removal can say.
 
-**What the tag then does for everybody else.** `release_stamp.py` reads
-`refs/tags/vX[.Y]` as well as the CHANGELOG:
+**Whether v4 or v3.13 follows v3.12 is the one thing no ref can answer**, so `--major` is a
+flag and never an inference — and a flag is not authority for what the flag does (#386). `run
+--major` prints `v4, NOT v3.13` on your terminal and will not proceed until you type the
+number; with no terminal to ask — an agent, a loop, CI, `HARNESS_UNATTENDED=1` — it refuses and
+writes nothing. The release workflow's `major` field is the same discipline for an unattended
+run: type the number it would issue, or it refuses. A fragment field and a PR label were both
+considered and rejected, because either puts the judgement back on a branch. `preview --major`
+is not gated: it reports `would issue v4 — … (--major, NOT v3.13)` and decides nothing.
 
-- `next_release` folds tags into the same `max`, so a number a sibling has reserved and not
-  yet merged is skipped rather than handed out a second time;
-- `collision` refuses a number this branch added that a tag holds **on a commit this branch
-  does not contain**. Both halves are required: "this branch added it" keeps a branch that
-  merely inherited a released heading out of it, and "not contained here" is what tells a
-  sibling's live reservation from a backfilled tag for a release already in this history.
-  A tag on `main` is an ancestor of every branch off `main`, so this is silent for all of
-  them, which is the property that lets it run on every push.
+### The consolidated files stay in git, and a branch that edits them is refused
 
-That closes the window the README used to describe as unclosable: *"two branches that stamp
-in the same minute get the same number, and nothing can prevent that"*. Something can now,
-and it is refused at the second **push** rather than reported after the second **merge** —
-the difference between one branch being told to re-stamp and `main` going red for everybody.
+`CHANGELOG.md` is present in every checkout — `git log CHANGELOG.md` keeps working and a reader
+offline keeps the history — and a branch that edits its release entries is refused rather than
+merged. The guard is the mechanism, not the file's absence: *exists but is refused* is
+enforceable, where *does not exist* is enforceable nowhere, because nothing stops a branch
+creating a file.
 
-**What it does not close, since a guard whose blind spot is undocumented is how the last one
-survived.** `git push --no-verify` skips the hook, as does a push from a checkout where the
-hook was never installed; neither can be closed from inside a hook. If **neither** lander
-reserves, nothing here helps — both stamp the same number and `release_stamp.py check` turns
-main red at the second merge, exactly as before.
+```bash
+scripts/release.py guard --onto origin/main --branch HEAD
+```
 
-A reservation can also outlive the push it was taken for. A hook runs *before* the push, so a
-push git then fails to deliver leaves the tag behind, as does a pull request that is
-abandoned. Both cost a skipped release number and nothing else: `check` lists a tag that is
-not on the integration ref as a reservation rather than a defect, because that is also
-exactly what every release in flight looks like — unless the ref declares that release, in
-which case it is not in flight at all. See below.
+It runs in **both** places, and neither is sufficient alone (#343, #169): in
+[harness/githooks/pre-push](harness/githooks/pre-push), so a worker is told at the moment it
+would go wrong, in the terminal, with the remedy; and in the `generated release files are
+output` CI job on `pull_request`, because the hook is per-checkout and best-effort — `qb-hooks`
+has to have been run, and this is exactly the class of mechanism that ships uninstalled. A
+local hook cannot see `gh pr merge`; a CI job cannot stop a bad push.
+
+**The refusal names the fragment path.** A worker that is refused and not told where to write
+instead will retry, work around it, or stop, and the first two are worse than the original
+mistake.
+
+Two things are deliberately outside it. The CHANGELOG's **preamble** documents the convention
+the file follows and is edited when the convention changes — the same line `frozen` draws, and
+drawing it differently in two places would mean one edit refused by one guard and cleared by
+the other. And the rest of **README.md** is nine hundred lines of prose a branch is meant to
+edit; only the release list below is guarded. A guard that taxed documentation is a guard that
+stops being installed. The check is also fork-relative, so a branch that is merely *behind* a
+release has inherited it and passes by construction.
 
 ### Every release has a tag, and every tag has a release
 
@@ -1136,157 +1036,114 @@ scripts/release_tag.py check              # reconcile the tags against CHANGELOG
 scripts/release_tag.py taken              # which numbers this checkout's tags hold
 ```
 
-Ninety-seven releases shipped here before any of this, so `backfill` reads the CHANGELOG at
-each commit along `main`'s first-parent line and tags every release at the commit that first
-declared it — which is the merge that landed it, not the branch commit that wrote it. The
-invariant it maintains and `check` verifies is one line: **a tag `vX.Y` points at a commit
-whose `CHANGELOG.md` declares `## vX.Y`.**
+The invariant is one line: **a tag `vX.Y` points at a commit whose `CHANGELOG.md` declares
+`## vX.Y`.** `run` maintains it by construction — it tags the commit it just made — and
+`backfill` is the repair for a release that landed without one, plus how the ninety-seven
+releases that shipped before any of this got theirs.
 
-**It never moves a tag.** One in the wrong place is reported and left there, for a human to
-decide whether the tag or the entry is wrong. Everything downstream of a tag — a `git
-describe`, a deploy that pinned it, somebody's bookmark — quietly changes meaning when tags
-move, and a moved tag is worse than an absent one: absent, everybody knows to look it up.
+**It never moves a tag.** A tag pointing somewhere the invariant does not hold is REPORTED, not
+corrected. A moved tag is worse than an absent one: absent, everybody knows to look it up;
+moved, everybody trusts the wrong answer.
 
-`check` reports one condition per line rather than one verdict, and has a third answer that
-is not a lesser second — **0** clean, **1** checked but something could not be checked, **2**
-stop. That is `qb-reconcile`'s shape from #255, and the reason for it is the same: a doctor
-that cannot reach the remote must say so, not report a tidy repo.
+The `every release on main has a tag` CI job runs `backfill --push` after every merge and then
+`check --ref HEAD`, which is the half that turns a silent inconsistency into a red job. For
+five months the job's name was a claim it did not test: `backfill` says nothing about a tag that
+already exists, and "already exists" was the whole of what it meant.
 
-The `every release on main has a tag` CI job runs `backfill --push` after every merge. It is
-the **record** and not the lock — by the time it runs the merge has happened, so a duplicate
-number is already `stamped`'s red job and there is nothing here to fix. What it catches is the
-release that landed through a `--no-verify` push, so the tags do not quietly drift out of
-step with the file they are supposed to be about.
+#### The tag that is off the ref, and what it means now
 
-#### A tag that is off the ref, and is not a reservation (#406)
+Being off `main` is two opposite things wearing one face, and the CHANGELOG at the ref is what
+separates them:
 
-For five months that job's name was a claim it did not test. It asked whether a tag of that
-**name** resolved. `v3.8` was squash-merged — the squash discarded the `chore(release)`
-commit the tag had been reserved against — so `refs/tags/v3.8` resolved perfectly to a commit
-that is not in main's history at all, and the job was green. The entry landed correctly and
-was correctly ordered; only the tag was wrong, which is the version of this that nobody
-notices until `git diff v3.7..v3.8` starts comparing main to an off-history commit.
+- the ref does **not** declare `vX.Y` — it has not landed. Since #122 that is a release cut
+  locally and not yet pushed, or a tag left over from the reservation era. Listed, never a
+  finding.
+- the ref **does** declare `vX.Y` — it has shipped, so its tag has to be reachable from the
+  commit that landed it. Off the ref, it is **orphaned**, and that is a finding.
 
-So the job now runs `check` after `backfill`, and `check` asks whether each tag is an
-**ancestor** of the ref — one `git merge-base --is-ancestor` per release. The subtlety is
-that being off the ref is two opposite things wearing one face, and the discriminator is not
-the tag but the CHANGELOG at the ref:
-
-- the ref does **not** declare `vX.Y` — it has not landed, so a tag off the ref is a
-  **reservation**. Listed, never a finding. On the night #406 was filed, `v3.9`, `v3.10` and
-  `v3.12` were all legitimately off main, held by three open pull requests. A check that
-  flagged those would have trained everybody to ignore it.
-- the ref **does** declare `vX.Y` — it has shipped, so its tag must be reachable from the
-  commit that landed it. Off the ref, it is **orphaned**, and the report names the commit it
-  actually landed at and the `--force-with-lease` that re-points it atomically.
-
-Fixing the tag afterwards is a repair, not a policy. The policy half is
-`qb-doctor`'s `merges` row, which fails a repo that allows squash or rebase merges while
-reserving release tags at push time — because the merge that rewrites the commit is the
-thing that made the tag wrong.
-
-The tags are annotated, so writing one means writing an object, and git will not write an
-object without a tagger. `backfill` supplies one itself where the environment cannot name
-anybody — a CI runner has no `user.name` and no GECOS field to guess from, which is how #379
-cost `v2.99` and `v3` their tags. A resolvable identity is never overridden: where `git var
-GIT_COMMITTER_IDENT` answers, the tag is from whoever ran the command.
+`v3.8` shipped that way and every check the repo had reported it as fully tagged, because they
+asked whether a tag of that NAME resolved (#406). It was squash-merged, and the squash discarded
+the branch-side `chore(release)` commit its tag had been reserved against. **That class is gone
+rather than detected:** the tag now names a commit created on `main`, so there is no separate
+commit for a rewrite to lose. `check` keeps the discriminator because the repo still has to be
+able to tell the two apart, and because nothing here deletes a tag.
 
 ### A released entry is immutable
 
-Once a number is stamped and merged, that entry is finished. It says what was broken or
-missing before that release, which is the part no diff recovers, so a branch rewriting it is
-destroying the only copy — and doing it behind headings that still read perfectly.
+Once a number is issued, that entry is finished. It records what was broken or missing before
+that release, which is the one part of a release not recoverable from the diff — so rewriting
+it destroys the only copy, behind headings that all still read correctly. That happened on
+`feat/issue-232`: a CHANGELOG conflict was resolved by moving the branch's own 133-line entry
+under `## v2.59`, on top of that release's notes. Every check in the repo read the file as a
+LIST OF HEADINGS, and all the headings were present, unique and correctly ordered (#325).
 
-That is not hypothetical. A CHANGELOG conflict on `feat/issue-232` was resolved by moving the
-branch's own 133-line entry **under `## v2.59`**, on top of that release's notes. It was
-pushed, and sat on an open PR for two days, and every guard here was green: they all read this
-file as a list of headings, and every heading was present, unique and in the right order. A
-landing agent caught it by diffing the bodies by hand (#325).
+```bash
+scripts/release.py frozen --onto origin/main --branch HEAD
+```
 
-`scripts/release_stamp.py frozen` asks it as a machine question. For every `## vX[.Y]` entry
-present at both the **merge base** and the commit being judged, the whole slab — heading line
-and body — must be byte-identical; an entry that has vanished is a refusal too. The merge base
-is the same third reference point the collision check uses and for the same reason: it
-separates what this branch did from what it merely inherited, so a branch that is behind is
-never asked about releases that landed while it was open. There is no stored digest to
-maintain and nothing extra for a merge to conflict over — the shipped text is in git already,
-where a bad resolution cannot reach it.
+For every `## vX[.Y]` entry present at both the **merge base** and the commit being judged, the
+whole slab — heading line and body — must be byte-identical; an entry that has vanished is a
+refusal too. It runs in `harness/githooks/pre-push` on every push and in the `frozen` CI job on
+every pull request.
 
-It runs in `harness/githooks/pre-push` on every push and in the `frozen` CI job on every pull
-request. Both are safe to require, because a branch that does not touch a released entry
-passes by construction and `## vNEXT` carries no number and is invisible to it. What it does
-**not** see: a corruption that has already landed on `main` (the merge base moves with it, so
-the window is the one PR carrying it), a commit pushed straight to `main` after the fact, and
-anything outside a numbered entry — the file's preamble is living documentation and is edited
-on purpose.
+`guard` subsumes it on a pull request — a branch that edits the entries is refused there first,
+with the fragment path named — and it is kept anyway, pointed at the one writer that remains:
+`run` asserts it before it commits, so the release job cannot corrupt the history it is
+appending to. A guard deleted because another guard covers it is how a repo ends up with
+neither.
 
-Fixing a typo in a shipped entry is legitimate and rare, so it is declared rather than
-bypassed. Put a trailer on a commit of the branch, where a reviewer sees it:
+Fixing a typo in a shipped entry is legitimate and rare, so it is declared rather than bypassed
+— a commit trailer on the branch making the edit, scoped to the range so it expires with the
+merge it was written for:
 
 ```
 Release-Body-Edit: v2.59
 ```
 
-A real git trailer, in the block at the end of the message — the refusal prints a pasteable
-copy of that line, and a commit body quoting the refusal is not consent to it. It is read from
-`base..HEAD` only, so it expires with the merge it was written for; nothing carries a
-permanent exemption forward.
-
-For the same reason **test files are named after what they test, not after the release that shipped
-them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A version in a filename is a
-number that has to be guessed before landing, and two branches guessing the same one add the same
-PATH, which git cannot resolve by keeping both sides the way it can a conflicting heading.
+For the same reason **test files are named after what they test, not after the release that
+shipped them** — `tests/test_resource_claims.py`, never `tests/test_v231.py`. A name chosen for
+a reason unrelated to what it names hides a collision until something reorders it, and
+`test_no_test_file_is_named_after_a_release` keeps them that way.
 
 ### Something asks whether an entry should have existed
 
-Every guard above verifies that what is **present** is correct. `release_stamp.py check` asks
-whether a `## vNEXT` is unstamped; `frozen` asks whether a shipped entry still says what it
-said. To both of them a branch that never wrote an entry at all looks exactly like one that
-wrote a correct one — so PR #363 landed a new module, sixty-seven tests and two public helpers
-with `changelog.d/` holding nothing but its README, and every job was green (#365).
+Every guard above verifies that what is **present** is correct. `frozen` asks whether a shipped
+entry still says what it said; `guard` asks whether a branch touched one. To all of them, a
+branch that never wrote an entry looks exactly like one that wrote a correct one — and #363
+landed a new module, sixty-seven tests and two public helpers with `changelog.d/` holding
+nothing but its README, every CI job green (#365).
 
 ```bash
+scripts/changelog_fragments.py check                          # do the fragments parse?
 scripts/changelog_fragments.py required --onto origin/main --branch HEAD
 ```
 
-It runs as the `a change that ships carries a release note` CI job on every pull request, and
-refuses one that changes something that ships and carries neither a fragment nor a release
-entry. Safe to require, for `frozen`'s reason rather than `stamped`'s: it reports on every pull
-request. `fetch-depth: 0` on the checkout is load-bearing — what changed is measured from the
-fork point — and with no fork point to find it **refuses** rather than reporting the empty diff
-as a clean bill.
+The `a change that ships carries a release note` CI job runs both on every pull request. It is
+an **exempt** list rather than a list of source directories, so a new top-level directory is in
+scope from the moment it exists: exempt are `changelog.d/`, `CHANGELOG.md`, any `README.md`,
+and anything under a `tests/` directory or named like a test. Everything else ships. Run against
+every pull request merged since fragments existed, it refuses exactly one — #363, the branch
+that prompted the issue.
 
-The scoping rule is the feature, because a check that fires on every PR and is usually wrong is
-switched off within a week. It is an **exempt** list rather than a list of source directories,
-which is deliberate: an allowlist of `app/`, `harness/`, `mcp/`, `scripts/` reproduces the
-defect one level up, since the day somebody adds a top-level `worker/` every branch confined to
-it passes forever and nothing notices. Exempt are `changelog.d/`, `CHANGELOG.md`, any
-`README.md`, and tests — anything under a `tests/` directory or named like a test. Everything
-else ships, `.github/` and `harness/commands/*.md` included: `ci` is one of the fragment kinds,
-and the command briefs are prose an agent executes rather than documentation about code. Run
-against every pull request merged since fragments existed, it refuses exactly one, and that one
-is #363.
-
-Genuinely nothing for a reader of the release notes — a comment, a rename, a revert of
-something unlanded? Declare it, the same shape and for the same reason as `Release-Body-Edit:`:
+Genuinely nothing for a reader of the release notes? Say so where a reviewer sees it:
 
 ```
 Changelog-Exempt: a comment typo, no behaviour changed
 ```
 
-Read with git's own trailer parser from `base..HEAD`, so it expires with the merge it was
-written for, a commit body quoting the refusal is not consent to it, and a value still wearing
-the refusal's `<angle brackets>` waives nothing. The waiver is printed on the job's own output:
-a change that ships with no entry is still that, and the place it has to be unmissable is the
-run that let it through.
 
 ### Every release, oldest first
 
-**The ORDER of this list is rendered from [CHANGELOG.md](CHANGELOG.md)** by
-`scripts/readme_releases.py write`, and
+**This list is written by the release job and by no branch.** `scripts/release.py run` appends
+the bullet for the release it is cutting and re-renders the order from
+[CHANGELOG.md](CHANGELOG.md) through `scripts/readme_releases.py`;
 `harness/tests/test_release_numbers.py::test_the_readme_release_list_is_in_changelog_order`
-fails if it has drifted. It used to be hand-kept, so it drifted — `v2.61, v2.59, v2.60, …` sat
-in the file for three releases, and correcting it was a commit somebody had to think to make.
+fails if it has drifted, and `release.py guard` refuses a branch that edits it. It used to be
+hand-kept, so it drifted — `v2.61, v2.59, v2.60, …` sat in the file for three releases — and
+then it was the expensive half of every landing conflict, since a bullet appended at the end of
+the block by two branches at once is the same insertion-at-one-offset that made `CHANGELOG.md`
+conflict.
+
 The bullets themselves are hand-written and are only ever MOVED: a bullet is a summary somebody
 chose, not a copy of the CHANGELOG heading, so a release with no bullet is a refusal rather than
 a sentence this tool invents.

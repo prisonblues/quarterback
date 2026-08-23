@@ -1,14 +1,17 @@
-"""Tests for `scripts/release_tag.py` — the thing that actually allocates a release number.
+"""Tests for `scripts/release_tag.py` — the record that every release has a tag on it.
 
-Every test builds throwaway git repos, and most of them build TWO plus a bare remote. That
-is not ceremony: the whole subject is what happens when a ref create races another ref
-create, and a fixture that stands in for the remote would only ever assert the stand-in.
-`release_stamp.py`'s suite can get away with one repo because its subject is "what does this
-file say at that ref"; this one's subject is "who wins".
+Every test builds throwaway git repos. The invariant is one line — a tag `vX.Y` points at a
+commit whose CHANGELOG.md declares `## vX.Y` — and every question about it is a question
+about what a file says at a ref, which a fixture string cannot answer.
 
-The test this file exists for is
-`test_the_second_lander_of_two_is_refused_by_the_remote`. Everything else here is a
-supporting property.
+The test this file exists for is now
+`test_a_reservation_and_an_orphan_in_one_repo_are_told_apart`: a tag off the integration ref
+is two opposite things wearing one face, and telling them apart is what stopped #406's
+orphaned `v3.8` reading as an ordinary release in flight.
+
+`reserve` is gone (#122). It took `refs/tags/vX.Y` on the remote at push time as the lock a
+branch-side stamp needed; branches do not stamp, there is no race on `main`, and there is
+nothing left to reserve.
 """
 
 from __future__ import annotations
@@ -23,7 +26,7 @@ from pathlib import Path
 import pytest
 
 # `scripts/` is a directory of standalone tools rather than a package, so the module is
-# loaded by path. `release_tag` loads `release_stamp` from beside itself on import, which is
+# loaded by path. `release_tag` loads `release.py` from beside itself on import, which is
 # why the fixtures below never have to do it here.
 _SPEC = importlib.util.spec_from_file_location(
     "release_tag",
@@ -153,131 +156,6 @@ def remote_tags(repo: Path) -> dict[str, str]:
         else:
             plain[name] = sha.strip()
     return {name: peeled.get(name, sha) for name, sha in plain.items()}
-
-
-# ---------------------------------------------------------------------------
-# reserve — the lock
-# ---------------------------------------------------------------------------
-
-
-def test_reserving_creates_the_tag_on_the_remote_at_the_release_commit(repo, capsys):
-    sha = stamp(repo, "v2.34")
-
-    assert run(repo, "reserve") == 0
-
-    assert remote_tags(repo) == {"v2.34": sha}
-    assert "reserved v2.34" in capsys.readouterr().out
-
-
-def test_the_second_lander_of_two_is_refused_by_the_remote(tmp_path, remote, repo, capsys):
-    """The window nothing else can close, reconstructed at the level of the tool.
-
-    Both landers fork at v2.33, both read v2.33 as the newest, and `release_stamp.py apply`
-    correctly hands each of them v2.34 — because at the moment each one asked, v2.34WAS
-    free. Their branches conflict on nothing. Under headings alone both merge and `main`
-    ends up declaring v2.34 twice.
-
-    A ref create is compare-and-swap, so exactly one of them gets the tag, and the other is
-    told so before its branch is anywhere near `main`.
-    """
-    other = clone(remote, tmp_path / "other")
-
-    first = stamp(repo, "v2.34", "what lander A shipped")
-    stamp(other, "v2.34", "what lander B shipped")
-
-    assert run(repo, "reserve") == 0
-    capsys.readouterr()
-
-    assert run(other, "reserve") == 2
-
-    err = capsys.readouterr().err
-    assert "already reserved" in err
-    assert "v2.34" in err
-    assert "vNEXT" in err, "and the repair is named, not left to be worked out"
-    assert remote_tags(repo) == {"v2.34": first}, "still one holder, and it is the first"
-
-
-def test_a_reservation_this_branch_already_holds_is_not_a_refusal(repo, capsys):
-    """`reserve` has to be safe to run twice. A pre-push hook runs it on every push of the
-    branch, and a second push after a review fix must not be refused by the first push's own
-    tag."""
-    stamp(repo, "v2.34")
-    assert run(repo, "reserve") == 0
-    capsys.readouterr()
-
-    write(repo, "notes.md", "a review fix\n")
-    commit(repo, "address review")
-
-    assert run(repo, "reserve") == 0
-    assert "already tagged" in capsys.readouterr().out
-
-
-def test_a_commit_still_carrying_the_placeholder_has_no_number_to_reserve(repo, capsys):
-    """`## vNEXT` names no number — that is the whole reason a branch writes it. Inventing
-    one here would be picking the number at exactly the moment the placeholder exists to
-    stop it being picked."""
-    text = (repo / "CHANGELOG.md").read_text()
-    at = text.index("## ")
-    write(repo, "CHANGELOG.md", text[:at] + entry("vNEXT") + text[at:])
-    commit(repo, "an entry in flight")
-
-    # The newest NUMBERED release is still v2.33 and it is already at the base, so with the
-    # base named there is nothing to take and that is not an error.
-    assert run(repo, "reserve", "--onto", "origin/main") == 0
-    assert "nothing to reserve" in capsys.readouterr().out
-
-
-def test_reserving_a_number_the_commit_does_not_declare_is_refused(repo, capsys):
-    """The invariant, enforced at the one place it can be broken deliberately. A tag names a
-    release the commit it points at carries; a `--version` naming anything else would put a
-    number in the repository that no document explains."""
-    stamp(repo, "v2.34")
-
-    assert run(repo, "reserve", "--version", "v2.99") == 2
-
-    assert "does not declare" in capsys.readouterr().err
-    assert remote_tags(repo) == {}
-
-
-def test_a_version_that_is_not_a_release_number_is_refused(repo, capsys):
-    stamp(repo, "v2.34")
-    assert run(repo, "reserve", "--version", "2.34.0") == 2
-    assert "not a release number" in capsys.readouterr().err
-
-
-def test_onto_makes_reserve_a_noop_for_a_branch_that_stamped_nothing(repo, capsys):
-    """What makes the command safe to run on every push. An ordinary branch's newest heading
-    is one it INHERITED, and reserving that would take a tag for somebody else's release on
-    every push in the repo."""
-    write(repo, "notes.md", "work with no release in it\n")
-    commit(repo, "ordinary work")
-
-    assert run(repo, "reserve", "--onto", "origin/main") == 0
-
-    assert "nothing to reserve" in capsys.readouterr().out
-    assert remote_tags(repo) == {}
-
-
-def test_no_remote_is_reported_as_unavailable_and_not_as_a_collision(tmp_path, capsys):
-    """Exit 1, the third answer. A tag that exists only locally reserves nothing, and saying
-    "reserved" over one would be the reassuring wrong answer this repo keeps finding."""
-    root = init(tmp_path / "solo")
-    write(root, "CHANGELOG.md", CHANGELOG_HEAD + entry("v2.33"))
-    commit(root, "v2.33")
-
-    assert run(root, "reserve") == 1
-
-    assert "no remote" in capsys.readouterr().err
-
-
-def test_a_repo_with_no_changelog_is_a_stop_not_a_traceback(tmp_path, capsys):
-    root = init(tmp_path / "empty")
-    write(root, "README.md", "# nothing here\n")
-    commit(root, "initial")
-
-    assert run(root, "reserve") == 2
-
-    assert "STOP:" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +414,10 @@ def test_check_names_a_release_with_no_tag(repo, capsys):
 
 
 def test_a_reservation_that_has_not_merged_is_listed_and_is_not_a_finding(repo, capsys):
-    """The correct state of every release in flight. A reservation points at a branch commit
-    and is not on `main` until that branch merges — reporting it as a defect would make the
-    check red for the entire duration of every release."""
+    """A release cut locally and not yet pushed, or a tag left from before #122 deleted
+    push-time reservation. Either way it holds a number nothing else will hand out, and
+    reporting it as a defect would accuse a repo of something nobody can fix — this file
+    never deletes a tag, for the same reason it never moves one."""
     assert run(repo, "backfill") == 0
     capsys.readouterr()
     git(repo, "switch", "-q", "-c", "work")
@@ -550,7 +429,7 @@ def test_a_reservation_that_has_not_merged_is_listed_and_is_not_a_finding(repo, 
 
     out = capsys.readouterr().out
     assert "1 tag(s) not on HEAD" in out
-    assert "v2.34 reserved at" in out
+    assert "v2.34 tagged at" in out
 
 
 def test_check_reports_a_tag_whose_commit_does_not_declare_it(repo, capsys):
@@ -701,7 +580,9 @@ def test_a_reservation_and_an_orphan_in_one_repo_are_told_apart(repo, capsys):
     """The constraint that makes this row usable at all, and the one a naive
     `merge-base --is-ancestor` gets wrong. On the night #406 was filed FOUR release tags were
     off main: v3.8 (squashed, a defect) and v3.9, v3.10, v3.12 (open pull requests holding
-    their numbers). Flagging the three would have trained everybody to ignore the row.
+    their numbers). Flagging the three would have trained everybody to ignore the row — and
+    though nothing reserves a number on a branch any more, a release cut and not yet pushed
+    has exactly the same shape.
 
     The discriminator is not the tag. It is whether the CHANGELOG at the ref declares that
     release — which is what "has it landed" means."""
@@ -716,9 +597,9 @@ def test_a_reservation_and_an_orphan_in_one_repo_are_told_apart(repo, capsys):
     assert run(repo, "check") == 2
 
     out, err = capsys.readouterr()
-    assert "v2.35 reserved at" in out, "an open branch's tag is listed, not accused"
+    assert "v2.35 tagged at" in out, "an unlanded release's tag is listed, not accused"
     assert "1 landed release(s) whose tag is not on HEAD" in out
-    assert "v2.35" not in err, "the reservation is not a finding"
+    assert "v2.35" not in err, "an unlanded release's tag is not a finding"
     assert "v2.34 is tagged at" in err
 
 

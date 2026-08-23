@@ -1,26 +1,35 @@
 #!/usr/bin/env python3
-"""A branch writes `changelog.d/<issue>.<kind>.md`, and the release assembles them.
+"""A branch writes `changelog.d/<issue>.<kind>.md`, and the release job assembles them.
 
-Every branch that shipped anything edited the SAME lines at the top of `CHANGELOG.md`, so
-every pair of concurrent branches conflicted there — PR #268 hit it in the same session three
-PRs were open. That conflict is not a disagreement about anything: both sides are right, both
-entries belong, and git cannot know that two insertions at one offset are independent.
+It writes nothing else. Not a version, not a placeholder, not a line of `CHANGELOG.md` — the
+number is applied on `main` after the merge, by `scripts/release.py`, against the commit that
+actually exists. A branch that edits a consolidated file is refused (`release.py guard`), and
+the refusal names the path above.
 
-A fragment is one file per change, named after the issue, so no two branches ever touch the
-same path and the conflict has nowhere to occur. It is the towncrier model:
+Every branch that shipped anything used to edit the SAME lines at the top of `CHANGELOG.md`,
+so every pair of concurrent branches conflicted there. That conflict is not a disagreement
+about anything: both sides are right, both entries belong, and git cannot know that two
+insertions at one offset are independent. A fragment is one file per change, named after the
+issue, so no two branches ever touch the same path and the conflict has nowhere to occur. It
+is the towncrier model:
 
     changelog.d/296.feat.md      # this branch's entry, naming no version
     changelog.d/298.fix.md       # a sibling branch's, in a file this one never opens
 
     changelog_fragments.py check      # are the fragments well formed?
-    changelog_fragments.py assemble   # fold them into a `## vNEXT` entry and delete them
     changelog_fragments.py required   # did a branch that changes something WRITE one?
+
+Assembly is not a subcommand here any more. `assemble` was runnable on a branch, every brief
+in the repo told a worker to run it, and running it is what put the release entry — and then
+its number — on the branch, which is where the conflicts came from (#122). The functions it
+used are still here, exported for the one caller that has any business folding fragments into
+a release: `release.py run`, on `main`.
 
 ## Why `required` is here rather than left to the landing
 
 Because nothing else could ask it. Every other guard in this repo verifies that what is
-PRESENT is correct — `release_stamp.py check` asks whether a `## vNEXT` is unstamped,
-`frozen` asks whether a shipped entry still says what it said — and to all of them a branch
+PRESENT is correct — `release.py frozen` asks whether a shipped entry still says what it
+said, `guard` asks whether a branch touched a generated file — and to all of them a branch
 that never wrote an entry looks exactly like one that wrote a correct one. #363 landed a new
 module, sixty-seven tests and two public helpers with `changelog.d/` holding nothing but its
 README, and every CI job was green; a landing agent noticed by hand (#365).
@@ -33,31 +42,18 @@ week. `_exempt` is where that scoping lives and is the part to read.
 
 Judged rather than assumed, and the answer is this file, at a third of towncrier's config
 surface. Towncrier renders an entry for a version it is TOLD; here the number is not known
-until `release_stamp.py apply` resolves `vNEXT` against the ref being merged into, which is
-after assembly. So towncrier would have to be driven with a placeholder version and its
-`--draft`/`build` split reinterpreted, and this repo would own a second grammar for release
-entries beside the one `release_stamp.py` already parses — two answers to "what is a release
-entry", which is the defect this repo keeps writing changelog entries about. It also renders
-one file, and half of what drifts here is the README's release list.
+until the release job reads `CHANGELOG.md` on `main`, which is after assembly. So towncrier
+would have to be driven with a placeholder version and its `--draft`/`build` split
+reinterpreted, and this repo would own a second grammar for release entries beside the one
+`release.py` already parses — two answers to "what is a release entry", which is the defect
+this repo keeps writing changelog entries about. It also renders one file, and half of what
+drifts here is the README's release list.
 
-## What `vNEXT` means once fragments exist
+## A fragment that lands unassembled is not lost
 
-Unchanged, and deliberately so: `## vNEXT — <title>` at the top of `CHANGELOG.md` is still
-the unstamped release, still the only thing `release_stamp.py apply` rewrites, and still what
-`harness/tests/test_release_numbers.py` asserts about. What changes is WHEN it appears. A
-branch in flight writes a fragment and no CHANGELOG entry at all; `assemble` creates the
-`vNEXT` entry at land time, out of every fragment present; `apply` then resolves it. Two
-branches can both be in flight with no entry between them to conflict over.
-
-A fragment that lands unassembled is not lost and is not an error — it is swept into the next
-release's entry, which is what a release IS: everything since the last one. The state to
-avoid is assembling twice, so `assemble` refuses when `CHANGELOG.md` already carries an
-unstamped entry rather than writing a second one, which would trip
-`test_at_most_one_release_is_unstamped` after the commit rather than before it.
-
-Hand-writing the `## vNEXT` entry still works and is still what the CHANGELOG's own
-convention paragraph describes. Fragments are the way to avoid the conflict, not a new
-requirement — nothing here refuses a branch that edits `CHANGELOG.md` directly.
+It is swept into the next release's entry, which is what a release IS: everything since the
+last one. There is no state to keep in step and nothing to remember: `ls changelog.d/` is
+what is in flight, and cutting a release empties it.
 """
 
 from __future__ import annotations
@@ -79,6 +75,11 @@ _SCRIPTS = Path(__file__).resolve().parent
 # loaded by path. Both are imported for the same reason: the shapes of a release entry and of
 # the README's list are defined once, where they are already defined.
 def _sibling(name: str):
+    # An already-loaded module is handed back rather than re-executed. `release.py` loads
+    # THIS file lazily and this file loads it back; a second module object would mean two
+    # `ReleaseError` classes, and the `except` in one would not catch the raise in the other.
+    if name in sys.modules:
+        return sys.modules[name]
     spec = importlib.util.spec_from_file_location(name, _SCRIPTS / f"{name}.py")
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
@@ -87,7 +88,7 @@ def _sibling(name: str):
     return mod
 
 
-rs = _sibling("release_stamp")
+rs = _sibling("release")
 rr = _sibling("readme_releases")
 
 #: Where fragments live. One directory, so "what is in flight" is `ls`.
@@ -112,15 +113,20 @@ _TITLE = re.compile(r"^#[ \t]+(?P<title>\S.*?)[ \t]*$")
 
 #: A heading a fragment may not contain. `#` opens a document and `##` opens a RELEASE — an
 #: assembled fragment carrying one would split the release it was folded into, and the split
-#: would look like a second release to `release_stamp.py`. `###` and below are how the
-#: CHANGELOG already sections a long entry and are left alone.
+#: would look like a second release to `release.py`. `###` and below are how the CHANGELOG
+#: already sections a long entry and are left alone.
 _TOP_HEADING = re.compile(r"^#{1,2}[ \t]+\S", re.MULTILINE)
 
-#: The placeholder, in a file whose whole argument is that it names no version. Matched on
-#: MASKED text, so a fragment may still write `` `vNEXT` `` while discussing the convention —
-#: which entries in this repo do, at length. That is the stamper's own distinction: a token
-#: inside a code span is documentation of the placeholder, not a use of it.
-_PLACEHOLDER_MENTION = re.compile(rf"(?<![0-9A-Za-z]){rs.PLACEHOLDER}(?![0-9A-Za-z])")
+#: The retired placeholder. It meant "a release entry whose number is not decided yet" and
+#: there are no undecided entries any more — a fragment IS the entry until the release job
+#: numbers it. A fragment that writes `vNEXT` is a worker following a document that has not
+#: caught up, so it is refused with the current contract rather than accepted and folded in.
+#:
+#: Matched on MASKED text, so a fragment may still write `` `vNEXT` `` while discussing the
+#: history — which the entry for this very change does, at length. A token inside a code span
+#: is documentation of a convention, not a use of it.
+_RETIRED_PLACEHOLDER = "vNEXT"
+_PLACEHOLDER_MENTION = re.compile(rf"(?<![0-9A-Za-z]){_RETIRED_PLACEHOLDER}(?![0-9A-Za-z])")
 
 #: The README wraps its release list at 100 columns with a two-space hanging indent.
 _WRAP, _INDENT = 100, "  "
@@ -185,13 +191,15 @@ def parse_fragment(path: Path, text: str) -> Fragment:
         raise FragmentError(
             f"{FRAGMENT_DIR}/{path.name} contains a `#` or `##` heading in its body. Folded "
             "into CHANGELOG.md a `##` opens a RELEASE, so the entry would split in two and "
-            "`release_stamp.py` would see a second one. Use `###` and below, which is how "
-            "the CHANGELOG already sections a long entry")
+            "`release.py` would see a second one. Use `###` and below, which is how the "
+            "CHANGELOG already sections a long entry")
     if _PLACEHOLDER_MENTION.search(masked):
         raise FragmentError(
-            f"{FRAGMENT_DIR}/{path.name} mentions `{rs.PLACEHOLDER}`. A fragment names no "
-            "version at all — that is the whole reason two branches can write one each "
-            "without racing for a number. `assemble` writes the placeholder")
+            f"{FRAGMENT_DIR}/{path.name} mentions `{_RETIRED_PLACEHOLDER}`, which is retired "
+            "(#122). A fragment names no version at all — not a number, not a placeholder — "
+            "and that is the whole reason two branches can write one each without racing for "
+            "anything. The release job numbers the entry on `main` after the merge. If you "
+            "are reading a document that told you to write it, that document is stale")
     return Fragment(path=path, issue=m.group("issue"), kind=kind, title=title, body=body)
 
 
@@ -233,14 +241,14 @@ def release_title(fragments: list[Fragment], given: str | None) -> str:
         "is the line a reader scans, and nothing here can write it")
 
 
-def entry(fragments: list[Fragment], title: str) -> str:
-    """The `## vNEXT` entry, ready to sit at the top of CHANGELOG.md.
+def entry(fragments: list[Fragment], title: str, version: str) -> str:
+    """The `## vX.Y` entry, ready to sit at the top of CHANGELOG.md.
 
     One fragment becomes the entry body directly. Several become `###` subsections under it,
     each keeping its own title, because this file's entries already section that way and
     running three unrelated changes together as one wall of prose loses which is which.
     """
-    parts = [f"## {rs.PLACEHOLDER} — {title}\n"]
+    parts = [f"## {version} — {title}\n"]
     if len(fragments) == 1:
         parts.append(f"\n{fragments[0].body}\n")
     else:
@@ -253,18 +261,10 @@ def entry(fragments: list[Fragment], title: str) -> str:
 def insert_entry(changelog: str, text: str, where: str = "CHANGELOG.md") -> str:
     """`changelog` with `text` above its first release entry.
 
-    Refuses an unstamped entry already present rather than writing a second one: two `##
-    vNEXT` headings is a state `release_stamp.py` cannot resolve — it would stamp both with
-    the same number — and `test_at_most_one_release_is_unstamped` reports it after the commit
-    rather than here, before it.
+    Called by `release.py run` and by nothing else. The file is newest first, so a new
+    release goes above every existing one; the caller has already refused a CHANGELOG whose
+    highest number it cannot read, and checks afterwards that no existing entry moved.
     """
-    names = rs.entry_names(changelog, where)
-    if rs.PLACEHOLDER in names:
-        raise FragmentError(
-            f"{where} already carries an unstamped `## {rs.PLACEHOLDER}` entry. Assembling "
-            "would add a second, and a release cannot have two. Either stamp that one "
-            f"(`scripts/release_stamp.py apply`) first, or fold these fragments into it by "
-            "hand and delete them")
     masked = rs.mask_code(changelog, where)
     first = re.search(r"^##[ \t]", masked, flags=re.MULTILINE)
     if first is None:
@@ -275,15 +275,20 @@ def insert_entry(changelog: str, text: str, where: str = "CHANGELOG.md") -> str:
     return changelog[:at] + text + "\n" + changelog[at:]
 
 
-def insert_bullet(readme: str, changelog: str, title: str) -> str:
-    """`readme` with a `- **vNEXT** — <title>.` bullet, placed by the list renderer.
+def insert_bullet(readme: str, changelog: str, title: str, version: str) -> str:
+    """`readme` with a `- **vX.Y** — <title>.` bullet, placed by the list renderer.
 
     Appended to the end of the block and then rendered, rather than positioned here: where a
     bullet goes is `readme_releases.render`'s question, it answers it from the CHANGELOG that
     was just written, and a second placement rule here could disagree with it.
+
+    The README's release list is generated in exactly this sense — ordered by the renderer,
+    extended only by the release job, and never by a branch. The bullets themselves stay
+    hand-written, because a bullet is a summary somebody chose rather than a copy of the
+    CHANGELOG heading; what a branch no longer does is write one.
     """
     lead = title if title.endswith((".", "!", "?", ":")) else title + "."
-    bullet = textwrap.fill(f"- **{rs.PLACEHOLDER}** — {lead}", width=_WRAP,
+    bullet = textwrap.fill(f"- **{version}** — {lead}", width=_WRAP,
                            subsequent_indent=_INDENT, break_long_words=False,
                            break_on_hyphens=False) + "\n"
     _, end = rr.find_list(readme)
@@ -335,8 +340,8 @@ def _exempt(path: str) -> str | None:
       a fragment.
     * `CHANGELOG.md` — the assembled notes, which is what a release commit consists of.
     * any `README.md` — description of the code rather than the code, and the root one's
-      release list is written by `assemble`, so requiring an entry for touching it would be
-      circular.
+      release list is written by the release job, so requiring an entry for touching it
+      would be circular.
     * anything under a `tests/` directory, plus test files by name — a test asserts about
       behaviour that already shipped, and the release notes have nothing to say about it.
       `test` is one of `KINDS` all the same: a test-only branch MAY write a fragment, it is
@@ -383,8 +388,8 @@ def _git(repo: Path, *args: str) -> str:
 def changed_between(repo: Path, base: str, ref: str) -> list[str]:
     """Every path `ref` changes relative to `base`, from the trees and nothing else.
 
-    Deliberately not `release_stamp.changed_paths`, which folds in the working tree and
-    untracked files because `apply` runs on a branch that is not finished being written. A
+    Deliberately not `release.changed_paths`, which folds in the working tree and untracked
+    files because the release job reads a checkout rather than a pushed commit. A
     gate judges a COMMIT — the one being pushed, or the merge commit a pull request would
     land — and whatever happens to be lying around the runner's checkout is not part of it.
 
@@ -431,7 +436,7 @@ def waivers(repo: Path, base: str, branch: str) -> list[str]:
     """Reasons a commit in `base..branch` gives for owing no entry, in order, deduplicated.
 
     Read from the RANGE, so the waiver expires with the merge it was written for — the same
-    property, for the same reason, as `release_stamp._body_edit_exemptions`.
+    property, for the same reason, as `release._body_edit_exemptions`.
 
     Fails CLOSED. A range git will not walk yields no waivers, which is the same answer as a
     branch that declared none: the entry is still required and the refusal still names the
@@ -454,14 +459,14 @@ def cmd_required(args: argparse.Namespace) -> int:
     """Refuse a branch that changes something that ships and writes no changelog entry.
 
     The gap #365 names: every other guard here verifies that what is PRESENT is correct.
-    `release_stamp.py check` asks whether a `vNEXT` is unstamped, `frozen` asks whether a
-    shipped entry still says what it said — and to both of them a branch that never wrote an
-    entry at all looks exactly like one that wrote a correct one. #363 landed a new module,
+    `release.py frozen` asks whether a shipped entry still says what it said, `guard` asks
+    whether a branch touched a generated file — and to both of them a branch that never wrote
+    an entry at all looks exactly like one that wrote a correct one. #363 landed a new module,
     sixty-seven tests and two public helpers with `changelog.d/` holding only its README, and
     every job was green.
 
-    Two refs, like `frozen` and `collision`, and for the same reason: what is judged is a
-    commit, which need not be checked out anywhere.
+    Two refs, like `release.py frozen` and `guard`, and for the same reason: what is judged
+    is a commit, which need not be checked out anywhere.
 
     The two questions are asked of two different bases, deliberately:
 
@@ -480,7 +485,7 @@ def cmd_required(args: argparse.Namespace) -> int:
     branch_sha = rs.resolve(repo, args.branch)
     try:
         base = rs.merge_base(repo, onto_sha, branch_sha)
-    except rs.StampError as e:
+    except rs.ReleaseError as e:
         # Fail CLOSED, and this is the one place it is worth spelling out. Without a fork
         # point there is no set of changed paths, so the honest answer is "cannot tell" — and
         # the shape a CI job takes when it cannot tell must not be the shape it takes when
@@ -499,40 +504,21 @@ def cmd_required(args: argparse.Namespace) -> int:
     at_branch, at_onto = fragments_at(repo, branch_sha), fragments_at(repo, onto_sha)
     carried = sorted(p for p, blob in at_branch.items() if at_onto.get(p) != blob)
 
-    # A hand-written release entry, which the CHANGELOG's own convention paragraph still
-    # allows and which is also what a branch looks like AFTER `assemble` has run on it.
+    # A hand-written release entry used to count here: the CHANGELOG's own convention
+    # paragraph allowed one, and it was also what a branch looked like after `assemble` had
+    # run on it. Neither is true any more. `release.py guard` refuses a branch that edits
+    # `CHANGELOG.md` at all, so an entry written there is not a second way to satisfy this
+    # check — it is a separate refusal with its own remedy, and crediting it here would let a
+    # branch pass the note requirement by doing the one thing the guard exists to stop.
     #
-    # Considered only when this branch edited `CHANGELOG.md` ITSELF — read from the fork
-    # point, so merging the base in is not an edit. Without that clause a branch that merely
-    # merged main inherits main's release headings and passes on somebody else's entry, which
-    # is exactly the shape of #363's own head: it merged three releases in and wrote nothing.
-    #
-    # A NUMBER the base does not carry is this branch's, by name: numbered entries are only
-    # ever added, and one the base lacks came from here.
-    #
-    # The PLACEHOLDER cannot be judged by name, because a base may legitimately carry a `##
-    # vNEXT` of its own — a stacked PR onto an epic integration branch, and main itself did on
-    # 2026-08-21, which is what made #302 read as entry-less. So its TEXT is compared across
-    # the two refs. By name alone, a branch that edited CHANGELOG.md for some unrelated reason
-    # — a typo in the preamble, a `Release-Body-Edit` correction — would be credited with the
-    # base's own in-flight entry and ship with no note of its own.
-    headings: list[str] = []
-    if "CHANGELOG.md" in changed:
-        branch_text = _changelog_at(repo, branch_sha)
-        onto_text = _changelog_at(repo, onto_sha)
-        onto_where = f"{args.onto}:CHANGELOG.md"
-        mine = rs.unstamped_entry(branch_text, "CHANGELOG.md")
-        if mine is not None and mine != rs.unstamped_entry(onto_text, onto_where):
-            headings.append(rs.PLACEHOLDER)
-        onto_names = set(rs.entry_names(onto_text, onto_where))
-        headings += [n for n in rs.entry_names(branch_text, "CHANGELOG.md")
-                     if n != rs.PLACEHOLDER and n not in onto_names]
+    # A fragment is therefore the only answer, which is what #122 means by "strictly easier
+    # to check and harder to get wrong": one question, one shape, one place to look.
 
     payload: dict[str, object] = {
         "onto": args.onto, "onto_sha": onto_sha,
         "branch": args.branch, "branch_sha": branch_sha,
         "base": base, "changed_paths": len(changed), "ships": ships,
-        "fragments": carried, "headings": headings, "waivers": [],
+        "fragments": carried, "waivers": [],
     }
 
     def report(ok: bool, note: str, waived: list[str] | None = None) -> int:
@@ -555,9 +541,9 @@ def cmd_required(args: argparse.Namespace) -> int:
         # A check that nags them is a check somebody deletes.
         return report(True, f"ok: nothing that ships changed ({len(changed)} path(s), all "
                             "documentation, tests or release bookkeeping)")
-    if carried or headings:
+    if carried:
         return report(True, f"ok: {len(ships)} path(s) that ship changed, and this branch "
-                            "carries " + ", ".join([*carried, *headings]))
+                            "carries " + ", ".join(carried))
     waived = waivers(repo, base, branch_sha)
     if waived:
         return report(True, f"ok: {len(ships)} path(s) that ship changed and no entry was "
@@ -570,14 +556,14 @@ def cmd_required(args: argparse.Namespace) -> int:
     return report(False, (
         f"{args.branch} changes {len(ships)} path(s) that ship and carries no changelog "
         f"entry:\n{listing}\n"
-        "Nothing else here can notice that. `release_stamp.py check` asks whether a `vNEXT` "
-        "is unstamped and `frozen` guards the entries that exist, so an entry that was never "
+        "Nothing else here can notice that. `release.py frozen` guards the entries that "
+        "exist and `guard` refuses a branch that touches them, so an entry that was never "
         "written is the same shape to both as a correct one (#365).\n"
         "Write one file, named after the issue, that no other branch will ever open:\n"
         f"    {FRAGMENT_DIR}/<issue>.<kind>.md      kinds: " + ", ".join(KINDS) + "\n"
         f"    # <what was broken or missing before this change>\n"
-        f"{FRAGMENT_DIR}/README.md has the shape. Name no version in it — `assemble` and "
-        "`release_stamp.py apply` decide that at land time, against the ref you merge into.\n"
+        f"{FRAGMENT_DIR}/README.md has the shape. Name no version in it, and edit no other "
+        "file for this: the release job numbers the entry on `main` after the merge.\n"
         "Genuinely nothing for a reader of the release notes (a comment, a rename, a revert "
         "of something unlanded)? Say so on a commit of this branch, where a reviewer sees "
         f"it:\n    {_EXEMPT_KEY}: <one line saying why>"))
@@ -593,39 +579,6 @@ def cmd_check(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_assemble(args: argparse.Namespace) -> int:
-    repo = Path(args.repo)
-    fragments = load(repo)
-    if not fragments:
-        # Exit 0, not a refusal. `assemble` is meant to be safe to run unconditionally before
-        # landing, next to `release_stamp.py apply`, and most branches ship no release.
-        print(f"no fragments in {FRAGMENT_DIR}/, nothing to assemble")
-        return 0
-
-    changelog_path, readme_path = repo / "CHANGELOG.md", repo / "README.md"
-    changelog = changelog_path.read_text(encoding="utf-8")
-    readme = readme_path.read_text(encoding="utf-8")
-
-    title = release_title(fragments, args.title)
-    new_changelog = insert_entry(changelog, entry(fragments, title))
-    new_readme = insert_bullet(readme, new_changelog, title)
-
-    if args.dry_run:
-        print(entry(fragments, title))
-        return 0
-
-    changelog_path.write_text(new_changelog, encoding="utf-8")
-    readme_path.write_text(new_readme, encoding="utf-8")
-    consumed = [f.path.name for f in fragments]
-    if not args.keep:
-        for f in fragments:
-            f.path.unlink()
-    print(f"assembled {len(fragments)} fragment(s) into `## {rs.PLACEHOLDER} — {title}`: "
-          + ", ".join(consumed))
-    print("next: scripts/release_stamp.py apply --onto origin/main")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -634,14 +587,6 @@ def main(argv: list[str] | None = None) -> int:
     ck = sub.add_parser("check", help="parse every fragment; exit 2 on a bad one")
     ck.add_argument("--repo", default=".", help="repo dir (default: cwd)")
     ck.set_defaults(func=cmd_check)
-
-    asm = sub.add_parser("assemble", help="fold the fragments into a vNEXT entry")
-    asm.add_argument("--repo", default=".", help="repo dir (default: cwd)")
-    asm.add_argument("--title", default=None, help="the release heading (required past one "
-                                                   "fragment)")
-    asm.add_argument("--keep", action="store_true", help="do not delete the fragments")
-    asm.add_argument("--dry-run", action="store_true", help="print the entry, write nothing")
-    asm.set_defaults(func=cmd_assemble)
 
     rq = sub.add_parser(
         "required",
@@ -654,14 +599,14 @@ def main(argv: list[str] | None = None) -> int:
         "--branch",
         default="HEAD",
         help="the ref being judged (default: HEAD). A commit, not a worktree — the same "
-        "reason as `release_stamp.py frozen`: a gate judges what is being merged.",
+        "reason as `release.py frozen`: a gate judges what is being merged.",
     )
     rq.set_defaults(func=cmd_required)
 
     args = p.parse_args(argv)
     try:
         return args.func(args)
-    except (FragmentError, rr.ListError, rs.StampError) as e:
+    except (FragmentError, rr.ListError, rs.ReleaseError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

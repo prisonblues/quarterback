@@ -34,9 +34,9 @@ class ResourceLease(Base):
     ``key="<repo>:<version>"`` used to be listed above as a thing this table
     carried, and it was the one documented kind nothing could write: the
     allocator, ``POST /release/claim``, ``POST /release/reclaim``, ``GET
-    /releases`` and their tools are all deleted. ``scripts/release_stamp.py``
-    (v2.34) is the whole mechanism — it takes ``max+1`` at land from the ref being
-    merged into, which is a question a git ref answers on its own. Nine releases
+    /releases`` and their tools are all deleted. ``scripts/release.py`` is the
+    whole mechanism — it takes ``max+1`` from the CHANGELOG on ``main`` after the
+    merge, which is a question a git ref answers on its own. Nine releases
     landed that way in a day with no collisions while the allocator's own rows
     went stale for every PR still open, and a stale record of a claim nobody takes
     is worse than no record: it is a second answer to a question that has one.
