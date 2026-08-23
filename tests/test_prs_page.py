@@ -301,7 +301,7 @@ def test_a_queue_that_could_not_be_read_is_not_an_empty_queue(script):
 def test_a_zero_on_the_human_count_says_what_it_covers(script):
     """Only a panel round raises a needs-human defect, so a PR nothing has panelled
     contributes nothing. Without that said, the zero reads as "nothing needs you"."""
-    assert "only a panel round raises one of these" in script
+    assert "Only a panel round raises one of these" in script
     assert "NEEDS_HUMAN_SCOPE" in body(script, "load")
 
 
