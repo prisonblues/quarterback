@@ -24,6 +24,7 @@
     display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
   header .spacer { flex:1; }
+  header a { font-size:13px; text-decoration:none; }
   /* 16px, not 12: below 16 Safari zooms the viewport when a control takes focus,
      and the scope picker is the control this page now tells people to go and use.
      44px is the floor below which a control is missed rather than pressed. */
@@ -38,7 +39,7 @@
   main { max-width:940px; margin:0 auto;
     padding:12px calc(16px + var(--sar)) calc(60px + var(--sab)) calc(16px + var(--sal)); }
   .empty { color:var(--muted); text-align:center; padding:40px 12px; }
-  .counts { color:var(--muted); font-size:12px; width:100%; }
+  .counts { color:var(--muted); font-size:12px; width:100%; margin-top:-2px; }
   .next { border:1px solid #2f6f52; background:#141d19; border-radius:10px;
     padding:10px 12px; margin:10px 0 16px; }
   .next .lbl { color:#35c48a; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
@@ -99,6 +100,10 @@
     min-height:44px; }
   #err { color:#e5484d; font-size:12px; width:100%; }
   #note { color:#9fb4d0; font-size:12px; width:100%; word-break:break-word; }
+  /* Both take a whole line so a long sentence is not squeezed between two
+     controls — which means an EMPTY one takes a whole line too, and this header is
+     sticky: two blank rows would cost 40px of every screen for the rest of time. */
+  #err:empty, #note:empty { display:none; }
 </style>
 </head>
 <body>
@@ -108,8 +113,8 @@
   <button id="newScope" title="declare a scope with no repo behind it — house work, admin, anything with no forge">+ scope</button>
   <label class="toggle"><input type="checkbox" id="showDone" /> show done</label>
   <span class="spacer"></span>
-  <a href="/fleet" style="font-size:13px;text-decoration:none">fleet →</a>
-  <a href="/" style="font-size:13px;text-decoration:none">← board</a>
+  <a href="/fleet">fleet</a>
+  <a href="/">board</a>
   <span id="counts" class="counts"></span>
   <!-- A failure and an explanation are different things and get different lines.
        Both live in the STICKY header: a tap thirty rows down has to be answered
