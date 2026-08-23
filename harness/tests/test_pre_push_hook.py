@@ -688,7 +688,7 @@ def test_a_repo_with_migrations_but_no_changelog_is_silent_about_releases(tmp_pa
 
 def test_a_repo_with_a_changelog_but_no_stamper_is_silent_about_releases(tmp_path, home):
     """Absence of the stamper is absence of the CONVENTION, not an unrunnable gate: a repo
-    that does not ship `release.py` does not write `## vNEXT`, so there is no claim to
+    that does not ship `release.py` has no generated release files, so there is no claim to
     adjudicate. This is the one place the "unrunnable is not passing" rule does not apply,
     and it is worth pinning so nobody tightens it into a refusal on every unrelated repo
     that happens to keep a CHANGELOG."""

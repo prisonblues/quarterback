@@ -818,20 +818,22 @@ State, before the offer and in this order:
 - **Anything in `warnings`.** A READY with warnings is still a READY; a READY
   reported as though it had none is a different PR from the one on screen.
 
-- **Whether the release entry is ready to be numbered.** preland has no check for
-  this and never returns RECONCILE for it, so it is asked here or it is not asked:
+- **Whether the branch carries its release note.** preland has no check for this
+  and never returns RECONCILE for it, so it is asked here or it is not asked:
 
   ```bash
-  python3 scripts/release_stamp.py preflight
+  python3 scripts/changelog_fragments.py required --onto origin/<base> --branch HEAD
   ```
 
-  `preflight` asks the question and spends nothing — it does not stamp. That is
-  deliberate. `apply` resolves the placeholder against the base **as it stands
-  now**, so a number taken here could be taken by another branch while the user
-  is deciding, and the repair for that is a hand-edit. It is stamped in the merge
-  sequence below, once there is a yes. Forgetting it entirely is issue #168: two
-  of the last three releases landed unstamped and needed repair PRs (#289, #291),
-  which is why it is in the sentence the offer is made with.
+  A branch that ships something writes `changelog.d/<issue>.<kind>.md` and nothing
+  else. There is no number to ask about and nothing here to stamp: the number is
+  applied on the base after the merge, by `scripts/release.py run`, once per batch
+  (#122). `scripts/release_stamp.py` no longer exists, and a document that tells
+  you to run it is stale.
+
+  The repair for an exit 2 is to write the fragment — never to write in
+  `CHANGELOG.md`, which no longer counts for this check and is refused separately
+  by `pre-push` and by CI.
 
 Then **offer, and stop**. `Land it?` — and wait for an answer. A verdict is not
 consent: the user asked for a review, and the merge is a second decision that is
@@ -897,17 +899,12 @@ are a concurrent pytest rather than the PR, the two refusals that meet a lander 
 to undo a change, and which of those already have a guard. None of it is specific to
 the autonomous loop: the worktree, the box and the GitHub are the same.
 
-Claim the base, re-verify, stamp the release, merge. In that order:
+Claim the base, re-verify, merge. In that order:
 
 ```bash
 qb-claim branch <base> --ttl 1800 --note "landing PR #<pr>" --json  # exit 1 = held
 python3 ~/.claude/loops/preland.py --pr <pr> --require-earned-stop --json \
     --claim-holder "<the holder from that answer>"                 # must be READY
-python3 scripts/changelog_fragments.py assemble
-python3 scripts/release_stamp.py apply --onto origin/<base>
-git diff --stat                                                    # read this before committing
-git add -A CHANGELOG.md README.md changelog.d
-git commit -m "chore(release): stamp vNEXT" && git push
 gh pr merge <pr> --merge --delete-branch
 qb-release issue <n>                                               # the issue the PR closes
 ```
@@ -934,25 +931,20 @@ qb-release issue <n>                                               # the issue t
   as somebody else's. Anything but READY here ends the sequence: report the new
   verdict, and say that you hold the claim and did not merge, so nobody reads a
   live claim as a landing in progress. It carries a TTL and lapses on its own.
-- **The release entry, then its number, in that order and no other.** A fragment
-  names no version, so there is nothing for `apply` to rewrite until `assemble`
-  has built the entry; run it the other way round and `apply` sees a branch with
-  no placeholder, returns 0, and the fragments land unassembled with the release
-  silently unnumbered. Both are noops on a branch that ships no release, so run
-  them rather than guessing whether this one does. Exit 2 from either is a
-  refusal carrying the sentence that repairs it — read the message rather than
-  matching it against a list of causes.
-- **That commit is the last thing before the merge, and it is bounded.** Pushing
-  it moves the head past the round §5 read, so a gate run after it would HOLD on
-  `head_sha` — correctly, and about a commit two tools wrote rather than about the
-  PR. The RECONCILE path answers that by re-anchoring with another round; this one
-  cannot, because it is the terminal action and there is nothing after it to
-  verify. So the verification is the run *above* it, and what makes that sound is
-  a bound: read `git diff --stat` before committing and confirm that what moved is
-  `CHANGELOG.md`, `README.md` and the fragments those two tools consumed, and
-  nothing else — which is also why the commit stages those paths by name rather
-  than with `-a`. If anything else moved, that is not a mechanical commit: stop,
-  say so, and put it back through §4.
+- **There is no release step here, and its absence is the fix.** This sequence
+  used to assemble the fragments and stamp a number before the merge, and the
+  commit that produced moved the head past the round §5 read — so the gate had
+  just verified a commit that was no longer the head, and every other branch in
+  flight now conflicted with this one on the same two files. Three of six open
+  pull requests were `CONFLICTING` that way on 2026-08-23; PR #398 landed both
+  ways and settled it (#122). Nothing is pushed between the gate and the merge
+  now, so the READY above describes the commit that actually lands.
+- **Cutting the release is a separate, later act.** When a batch is done, on the
+  base branch: `scripts/release.py run --title "<what this release does>"`, or the
+  **Cut a release** workflow. It assembles every fragment, derives the number,
+  writes both files and tags the commit — once per batch, not once per PR. It
+  refuses anywhere but the base branch, so there is no version of this you can do
+  from here.
 - **If the PR was in the merge queue, stand its entry down once the merge lands**:
   `merge_queue_leave(pr=<pr>, base="<base>", reason="merged")`. This command does not enqueue —
   `/fix-and-land` does — so there is usually nothing to leave, and the call is a no-op that says

@@ -136,66 +136,38 @@ turns the merge off.
      make on its own, and it is a HOLD that leaves the line.
    - **READY** → step 5.
 
-   **Once READY, before you push: the release entry, then its number.** A branch that ships a
-   release writes a `changelog.d/<issue>.<kind>.md` fragment and names no version at all, so the
-   entry is BUILT here — and then numbered against `$BASE` **as it stands now**, which is the only
-   moment the answer is knowable.
+   **Once READY, there is no release step here.** A branch that ships something writes
+   `changelog.d/<issue>.<kind>.md` — one file, named after the issue, that no other branch will
+   ever open — and that is the whole of it. It names no version, not even a placeholder, and it
+   does not open `CHANGELOG.md` or the README's release list.
 
-   ```bash
-   rc=0
-   python3 scripts/changelog_fragments.py assemble || rc=$?
-   [[ $rc -eq 0 ]] || { echo "HOLD: read the error above"; exit "$rc"; }
-   python3 scripts/release_stamp.py apply --onto origin/$BASE || rc=$?
-   [[ $rc -eq 2 ]] && echo "HOLD: read the STOP above"
-   [[ $rc -eq 0 ]] || exit "$rc"
-   ```
+   That fragment belongs with the work, back in step 3, not here. If the branch changed
+   something that ships and carries none, the `a change that ships carries a release note` CI
+   job is already red and preland is already reporting HOLD; the repair is to write the
+   fragment, not to build a release entry.
 
-   `assemble` folds every fragment present into one `## vNEXT — <title>` entry and adds the
-   matching README bullet, then deletes what it consumed. It is a noop with no fragments, so it
-   runs unconditionally like the stamp below it. Past ONE fragment it refuses without `--title`,
-   and that refusal is a HOLD rather than something to work around: the release heading is the
-   line a reader scans, several fragments have no shared title anywhere to derive one from, and
-   picking one is a judgement about what the release MEANS — the same class as `--major`, which
-   this loop also does not make on its own. Since #386 it *cannot*: `apply --major` asks for the
-   number at a terminal and refuses where there is none, so a loop that reached for it gets a
-   STOP rather than a major release. If a release genuinely needs one, that is a HOLD for a
-   person to run by hand — never something to route around.
+   **Do not assemble, number, stamp or tag anything.** There is nothing to run: the number is
+   applied on `$BASE` after the merge, by `scripts/release.py run`, against the commit that
+   actually exists — once per batch, by whoever decides the batch is done, and never by this
+   loop. `scripts/release_stamp.py` no longer exists; if you are reading a document that tells
+   you to run it, that document is stale and this paragraph is the correction.
 
-   The `|| rc=$?` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
-   under a `set -e` wrapper a bare invocation terminates the surrounding script before anything
-   reads the message — so the one output that makes a HOLD actionable is the one output that gets
-   lost. Capture the status once, because `$?` is gone the moment anything else runs, and exit with
-   it rather than a flat 1: same 0/2 scheme as `migration_reconcile.py`, and for the same reason —
-   a caller consuming it reads Python's uncaught-exception 1 as "unknown" rather than as "stop".
+   This is not a style preference and the cost of getting it wrong is measured. Every stamped
+   branch wrote the same two files, so N of them in flight was N-choose-2 conflicts **by
+   construction** — over nothing, since both entries are right and both belong. On 2026-08-23
+   three of six open pull requests had stamped and all three were `CONFLICTING`; the three that
+   had not were all `MERGEABLE`. PR #398 landed both ways: unmergeable stamped, zero conflicts
+   once the stamp was reverted, same branch, same work, same base (#122). It also cost that PR
+   a full extra CI cycle and its place in the queue, purely to undo something that should never
+   have been on the branch.
 
-   It is a noop on a branch that ships no release, so run it unconditionally rather than guessing
-   whether this one does. Every refusal names its own repair, so read the message rather than
-   matching it against a list of causes. Most are a release entry in a shape the tool will not
-   guess about — two unstamped entries, an entry below a released one, a placeholder somewhere
-   nothing rewrites, a number written by hand that `$BASE` has not reached, or one already taken
-   there — but it also refuses on things that are not the entry at all: an unclosed code fence or
-   non-UTF-8 in the markdown it scans, a missing or symlinked `pyproject.toml` or `app/main.py`, an
-   `--onto` it cannot resolve or that carries no CHANGELOG.md.
+   If you write to `CHANGELOG.md` or the README's release list anyway, `harness/githooks/pre-push`
+   refuses the push and names `changelog.d/<issue>.<kind>.md` in the refusal, and the `generated
+   release files are output` CI job refuses the pull request. Both are the answer, not an
+   obstacle: obey the refusal, do not route around it.
 
-   **If the branch was already stamped and `$BASE` has since taken that number**, `apply` refuses
-   rather than re-stamping — the placeholder is gone, so there is nothing left for it to rewrite.
-   The message names the repair and it is two tokens: put this branch's entry back to
-   `## vNEXT — …` and its README bullet back to `- **vNEXT** — …`, then run this step again.
-   Nothing else on the branch was ever written in terms of the number, which is what makes that an
-   edit rather than a rewrite.
-
-   `apply` writes and does not commit, so commit what it produced and push it. That commit is
-   mechanical — a release number the tool chose — and needs no re-review.
-
-   Re-running after the push is not optional, and neither is re-enqueueing at the commit it
-   produced. The push restarts CI, so the `ci` check's earlier green is a statement about a commit
-   that is no longer the head — and preland is what re-reads it, along with everything else the
-   push may have staled. The queue entry is staled by exactly the same push, and the board cannot
-   see it happen:
-
-   ```
-   merge_queue_enqueue(pr=<pr>, base="$BASE", head="<the stamp commit's oid>", verdict="queued")
-   ```
+   So step 4 ends at READY. Nothing is pushed here that was not already pushed, nothing is
+   re-enqueued, and the head preland read is still the head.
 
 5. **Confidence gate — MERGE only if BOTH hold:**
    - preland's **last** run, after the final push, came out **READY**, and
@@ -371,9 +343,12 @@ re-derive it, and do not go looking for the trap by hand.
   relocated *under* `## v2.59` on top of that release's notes and every heading-based check read
   the file as correct: the headings were all present, unique and correctly ordered.
 - **A PR that ships something and writes no release note** — the `changelog` job, *"a change that
-  ships carries a release note"* (#365, v2.95). It parses the fragments too, which nothing in CI
-  did before it; a malformed fragment used to surface at `assemble` time, one merge queue away
-  from the release entry coming out wrong.
+  ships carries a release note"* (#365, v2.95). It parses the fragments too, and since #122 it
+  is the only place a malformed one is caught before the release job reads it.
+- **A branch that writes to a file the release job generates** — the `generated release files
+  are output` job (#122). `CHANGELOG.md` and the README's release list are written on `$BASE`
+  after the merge and by nothing else; a branch that edits either is refused here and by
+  `pre-push`, with `changelog.d/<issue>.<kind>.md` named in the refusal.
 - **A merge that would leave two migration heads** — the `migration-heads` job, *"one migration
   head after the merge"* (#351, v2.88). The `pre-push` hook asks the same question and never gets
   to answer it on the path this fleet lands by: the merge is an API call, and no push carries the
@@ -531,15 +506,15 @@ After a harness-side land, `qb-doctor` reports the board serving the number it s
 it reads as a failed deploy every time. It is not one.
 
 `pyproject.toml` and `app/main.py` carry the version `GET /openapi.json` reports, and
-`release_stamp.py` moves it only when the branch changed `app/` or `migrations/` — `BOARD_PATHS`
+`scripts/release.py` moves it only when the release changed `app/` or `migrations/` — `BOARD_PATHS`
 is exactly those two, and `harness/`, `scripts/`, docs and tests are deliberately outside it.
 Most releases here are harness-side and correctly leave the served version alone. The release
 **number** moves, in CHANGELOG.md and README.md; the served version does not, and `qb-doctor` then
 says *"matching this checkout"* because the checkout did not move either.
 
-The bump is inferred rather than declared, and `apply` always reports which way it went, so read
-that line rather than guessing. `--serve` / `--no-serve` override the inference for the release it
-gets wrong.
+The bump is inferred rather than declared, measured from the previous release's tag, and the
+release job always reports which way it went — read that line rather than guessing. This is not
+something a landing loop sees or decides: it happens on `$BASE`, after the merge.
 
 ### One thing that is true of this box and not of the tools — checked 2026-08-22
 

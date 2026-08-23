@@ -152,35 +152,41 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
      genuinely lack a guardrail, not for a verdict you dislike.
    - **READY (exit 0)** → preland is satisfied, but **prep is not done**. Do 4a and 4b below, in
      that order, and only then go to step 5. They are part of this step, not optional trailing
-     prose: step 5 asks you to report what `preflight` said, and the closing-keyword check is the
-     one piece of prep that is load-bearing on a non-default `$BASE`.
+     prose: step 5 asks you to report what 4a found, and the closing-keyword check is the one
+     piece of prep that is load-bearing on a non-default `$BASE`.
 
-   **4a. Ask the release-number question without spending the answer.** `release_stamp.py apply`
-   resolves `vNEXT` against `$BASE` **as it stands now**, and this command hands the PR to a human
-   who merges later — by which time another branch may have taken that number, leaving `apply`
-   refusing with nothing left to rewrite and a hand-edit as the repair (`fix-and-land.md` step 4
-   documents it). A number is only knowable at the moment of the merge, so ask the cheaper question
-   and leave the number alone:
+   **4a. Check that the branch carries its release note.** There is no release-number question
+   to ask any more, and that is the point of #122: a branch writes
+   `changelog.d/<issue>.<kind>.md` and names no version at all, and the number is applied on
+   `$BASE` after the merge by `scripts/release.py run`. Nothing here stamps, assembles or
+   reserves anything, and `scripts/release_stamp.py` no longer exists — a document that tells
+   you to run it is stale.
+
+   What is worth asking early is the cheaper question the CI job asks anyway, because finding
+   out here costs a commit and finding out at the merge costs a cycle:
+
    ```bash
-   python3 "$WT_DIR/scripts/release_stamp.py" preflight --repo "$WT_DIR" --onto origin/$BASE
+   python3 "$WT_DIR/scripts/changelog_fragments.py" required --repo "$WT_DIR" \
+       --onto origin/$BASE --branch HEAD
    ```
-   **The script path is `$WT_DIR`-relative, not cwd-relative** — `--repo` only chooses which repo
-   the plan is built *against*, not where the script is loaded *from*, so a bare
-   `python3 scripts/release_stamp.py` pairs one checkout's tool with another checkout's files, which
-   is the same defect the `preland.py` paragraph above spends five lines refusing.
 
-   **This script is per-repo, so detect it rather than assuming it.** `scripts/release_stamp.py`
-   does not exist in every repo this command runs against (lexray has no such file). If it is
-   absent, **skip 4a with a stated reason** and say so in step 5 — this is `preland.py`'s own
-   `_detected()` discipline, which skips a guardrail that is not on the branch instead of failing
-   on it. A bare `python3: No such file or directory` at exit 2 is **not** "a refusal carrying the
-   sentence that repairs it"; reading it as one reports a missing tool as a release-number problem.
+   **The script path is `$WT_DIR`-relative, not cwd-relative** — `--repo` only chooses which
+   repo the answer is computed *against*, not where the script is loaded *from*, so a bare
+   `python3 scripts/changelog_fragments.py` pairs one checkout's tool with another checkout's
+   files, which is the same defect the `preland.py` paragraph above spends five lines refusing.
 
-   Where the script *is* present: report what it said. Exit 2 is a genuine refusal carrying the
-   sentence that repairs it — quote that sentence rather than paraphrasing it, because it is the
-   whole value of running this early. On a branch that ships no release it is a noop, so run it
-   unconditionally once you know the file is there. Whoever merges runs `apply` then (a human, or
-   `/fix-and-land`).
+   **This script is per-repo, so detect it rather than assuming it.** It does not exist in every
+   repo this command runs against (lexray has no such file). If it is absent, **skip 4a with a
+   stated reason** and say so in step 5 — this is `preland.py`'s own `_detected()` discipline,
+   which skips a guardrail that is not on the branch instead of failing on it. A bare `python3:
+   No such file or directory` at exit 2 is **not** "a refusal carrying the sentence that repairs
+   it"; reading it as one reports a missing tool as a missing release note.
+
+   Where the script *is* present: exit 2 names the paths that ship and the fragment to write,
+   and the repair is to write it — one file, named after the issue, naming no version. Do not
+   satisfy it by writing in `CHANGELOG.md`: that no longer counts, and it is refused separately
+   by `pre-push` and by the `generated release files are output` CI job. A branch confined to
+   docs or tests passes in silence.
 
    **4b. Check the closing keyword.** If `$BASE` is not the repo's default branch, a `Closes #N` in
    the PR body fires on nothing: the keyword has to be in a commit message that lands on the default
@@ -209,9 +215,10 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
      disagreement between them, which is more informative than either verdict alone.
    - **preland:** the verdict, quoted, plus anything a RECONCILE did and the fact that preland was
      re-run after it.
-   - **Release number:** what `preflight` said, and that `apply` is deliberately left to the merge —
-     or that 4a was skipped because this repo ships no `scripts/release_stamp.py`, which is a fact
-     about the repo and not a step that failed.
+   - **Release note:** whether the branch carries a fragment, or why it owes none — or that 4a
+     was skipped because this repo ships no `scripts/changelog_fragments.py`, which is a fact
+     about the repo and not a step that failed. There is no release NUMBER to report: nothing
+     on a branch has one, and the number is applied on `$BASE` after the merge (#122).
    - **The PR, the issue, and `WT_DIR`** — the worktree stays up so review findings can be
      addressed on the same branch and DB (`/drop-worktree` when the PR merges).
    - **One sentence: the merge is yours.** Say what it would be — `gh pr merge <pr> --merge` for a

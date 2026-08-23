@@ -614,14 +614,14 @@ def next_release(text: str, major_bump: bool = False, where: str = "",
 #: than normalised to three characters, because the length is load-bearing: a four-backtick
 #: fence exists precisely to wrap a three-backtick one, and a closer that matched on the first
 #: three characters would end the outer block at the inner block's first line, leaving
-#: everything after it unmasked and a real `## vNEXT` invisible to every check here at once.
+#: everything after it unmasked and a real release heading invisible to every check at once.
 #:
 #: Indentation is not bounded to CommonMark's three spaces: this repo's command docs put
 #: fenced blocks inside numbered list items, where they are legitimately indented further,
 #: and reading one of those as prose is a worse error than reading a four-space indented
 #: block's stray backticks as a fence. The corollary, and it is a real limitation: an
-#: INDENTED code block (four spaces, no fence) is not masked, so a `**vNEXT**` inside one is
-#: a rewritable site. Masking those instead would unstamp every nested list bullet in this
+#: INDENTED code block (four spaces, no fence) is not masked, so a `## v9.9` inside one reads
+#: as a real heading. Masking those instead would swallow every nested list bullet in this
 #: repo's docs, which is the larger error — write fenced blocks, not indented ones.
 #:
 #: A fence may also carry a container prefix: `> ``` ` inside a blockquote, or `- ``` ` as the
@@ -644,7 +644,7 @@ def mask_code(text: str, where: str = "") -> str:
     An unterminated fence is a refusal rather than a best effort. CommonMark says such a
     block runs to the end of the document, and honouring that here would blank every
     remaining line of the file: `scan`, `stamp_text` and `check` all mask through this one
-    function, so a real `## vNEXT` below a stray ``` would be invisible to all three at
+    function, so a real release heading below a stray ``` would be invisible to all three at
     once and the literal string would ship with nobody's check having failed. That is the
     largest silent blast radius in this file, and the only honest end for it is loud.
     """
@@ -689,9 +689,9 @@ def mask_code(text: str, where: str = "") -> str:
     # CommonMark's own rule and, here, the thing that bounds the damage. An unbalanced
     # backtick with no such bound pairs with the next one anywhere in the file and blanks
     # everything between, and what it blanks is a placeholder site: the stamper would then
-    # walk past a real `## vNEXT`, and `check` would agree with it, since both mask the same
-    # way. That is the one failure mode here with no loud end, so it is bounded to a
-    # paragraph rather than left to the file.
+    # walk past a real release heading, and every check reading this file would agree with it,
+    # since they all mask the same way. That is the one failure mode here with no loud end, so it
+    # is bounded to a paragraph rather than left to the file.
     def blank(m: re.Match[str]) -> str:
         return "\0" * len(m.group(0))
 
@@ -942,8 +942,8 @@ def cmd_frozen(args: argparse.Namespace) -> int:
     released part of the file passes by construction, which is what lets this one run on
     every pull request without ever crying wolf.
 
-    An unstamped `## vNEXT` is invisible here — it carries no number, so it is in neither
-    map. So is the entry this branch is shipping. There is nothing to switch off.
+    The entry a release is APPENDING is invisible here: it exists at one ref and not the other,
+    so it is in neither map's intersection. There is nothing to switch off.
     """
     repo = Path(args.repo).resolve()
     onto_sha = resolve(repo, args.onto)
