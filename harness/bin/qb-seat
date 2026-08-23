@@ -85,14 +85,18 @@ set -uo pipefail
 # WHY IT REGISTERS THE NAME ITSELF, BEFORE STARTING ANYTHING. Since v2.12 the
 # board DESIGNATES the name half of an identity: a client sends an opaque key and
 # is allocated two words. `QUARTERBACK_INSTANCE=seat-3` is honoured as a *request*
-# (`X-Agent-Name`) — but only by the MCP server, and only if it is the first
-# thing to touch the board for this key. The lifecycle hook sends the same value
-# as a bare key with no name request, it fires on SessionStart, and allocation is
-# first-contact-wins: whoever gets there first fixes the name for the whole
-# session. So the seat that was meant to be `zeus/seat-3` comes up as
-# `zeus/glacier-mist` about as often as not, which loses exactly the property the
-# per-seat instance was for. One HTTP call before exec settles it: the row is
-# created with the requested name, and every process that follows resolves to it.
+# (`X-Agent-Name`), and only if it is the first thing to touch the board for this
+# key — allocation is first-contact-wins. Every client sends that request now
+# (#156); when this was written only the MCP server did, so a seat that lost the
+# race to the lifecycle hook came up as `zeus/glacier-mist` about as often as not.
+#
+# THAT FIX DOES NOT RETIRE THIS CALL, and the reason is the read-back rather than
+# the request. A name is granted only when it is free, so a second pane started as
+# the same seat is silently given something else — and it is worth being TOLD that
+# before the agent starts, at the one moment a human is looking. One HTTP call
+# settles the row and reports what the board actually said; every process that
+# follows resolves to it. It also still covers the runtimes that have neither hook
+# nor MCP server, since QB_SEAT_AGENT need not be Claude Code.
 #
 # Addressing is unaffected either way and always was — the board resolves
 # `machine/key` as a permanent alias, so an ask sent to `zeus/seat-3` arrives even

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""qb-doctor — is this host actually wired up?
+"""qb-doctor — is this host actually wired up, and can work land from it?
 
-Two questions, one command, one report.
+Three questions, one command, one report.
 
 THE FIRST QUESTION (#204's original thesis). Three independently versioned things
 have to agree — the board image, the harness on PATH, the Python client's venv —
@@ -23,6 +23,17 @@ worktree's work. `HUMAN_EDGE_SECRET` was documented in DEPLOY.md with a checklis
 and never deployed, so every human-only endpoint has 403'd since v2.39. Not one
 announced itself; each was found by tripping over a downstream symptom, which is
 the pattern this file's first paragraph is about.
+
+THE THIRD QUESTION (#406, and the `landing` group #407 fills out). Can work
+actually LAND from here? The first two are both about this machine, and on the
+night #406 was filed they were both satisfied: 9 ok, 1 unknown, nothing broken.
+In the same minute the merge queue held seven green pull requests with none
+ready, main had not moved in three hours, `refs/tags/v3.8` pointed at a commit
+that is not in main's history, and three branches were conflicting on the one
+file `changelog.d/` exists to keep them out of. Every row was correct and not one
+of them was about the pipeline the work has to travel down. `merges` is the first
+row of that group; it asks whether a merge into this repo can rewrite the commit a
+release tag was reserved against.
 
 THE RULE THAT DECIDES THE SHAPE OF EVERY CHECK BELOW: look where the mechanism
 RUNS, never where its source lives. `ls harness/githooks/reference-transaction`
@@ -53,6 +64,7 @@ Usage:
     qb-doctor --json              the whole report as JSON
     qb-doctor --repo DIR          check that checkout instead of the cwd's
     qb-doctor --only hooks,edge   just those rows
+    qb-doctor --only landing      a whole group of them
     qb-doctor --human-url URL     the browser vhost, for the edge check
     qb-doctor --quiet             print only the rows that are not ok
 """
@@ -152,14 +164,18 @@ class Check:
     manual: str | None = None
     fix: list[str] | None = None
     extra: dict = field(default_factory=dict)
+    #: Which question this row answers. Assigned by `run_checks` from `CHECKS` rather
+    #: than passed at every construction site, so a check function cannot file itself
+    #: under a group its registration disagrees with.
+    group: str = "host"
 
     def __post_init__(self) -> None:
         assert self.verdict in VERDICTS, f"{self.verdict!r} is not one of {VERDICTS}"
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "subject": self.subject, "detail": self.detail,
-                "verdict": self.verdict, "manual": self.manual, "fix": self.fix,
-                **({"extra": self.extra} if self.extra else {})}
+        return {"name": self.name, "group": self.group, "subject": self.subject,
+                "detail": self.detail, "verdict": self.verdict, "manual": self.manual,
+                "fix": self.fix, **({"extra": self.extra} if self.extra else {})}
 
 
 #: How systemd says it could not be asked. Matched FIRST, before anything is read as
@@ -1169,21 +1185,215 @@ def check_tools(host: Host) -> Check:
                  "ok", extra={"optional": have_opt})
 
 
+# --------------------------------------------------------------------------- #
+# can work land? (#406, and the group #407 extends)
+# --------------------------------------------------------------------------- #
+
+#: `owner/name` out of the shapes a GitHub remote is written in. Anchored at the end
+#: so `github.company.com` and `gitlab.com/github/…` are not GitHub — a slug guessed
+#: off a host this tool cannot query would make the whole row an `unknown` about the
+#: wrong repository.
+_GITHUB_REMOTE = re.compile(
+    r"^(?:git@github\.com:|ssh://git@github\.com/|https?://(?:[^@/]+@)?github\.com/)"
+    r"([^/]+/[^/]+?)(?:\.git)?/?$")
+
+#: The two merge strategies that REWRITE, and the field each is spelled with. Both
+#: replace the commits that were pushed with new ones: squash collapses the branch
+#: into a fresh commit, rebase replays it onto new parents. Either way the sha that
+#: reserved `refs/tags/vX.Y` at push time is not the sha that lands.
+_REWRITING = {"allow_squash_merge": "squash", "allow_rebase_merge": "rebase"}
+
+
+def release_tagger(host: Host) -> Path | None:
+    """The tag allocator this repo reserves release numbers with, or None.
+
+    Read the way `harness/githooks/pre-push` reads it — `QB_RELEASE_TAG`, then
+    `qb.releaseTag`, then `scripts/release_tag.py` — rather than by a rule of this
+    file's own. The two have to agree about which repos are in scope, and a second
+    predicate here would agree until somebody moved the script.
+    """
+    from_env = os.environ.get("QB_RELEASE_TAG")
+    if from_env:
+        return Path(from_env)
+    rc, cfg, _ = run_cmd(["git", "-C", str(host.repo), "config", "--get", "qb.releaseTag"])
+    if rc == 0 and cfg:
+        return Path(cfg) if cfg.startswith("/") else host.repo / cfg
+    default = host.repo / "scripts" / "release_tag.py"
+    return default if default.is_file() else None
+
+
+def github_slug(host: Host) -> str | None:
+    """`owner/name` for this checkout's remote, or None when it is not GitHub."""
+    rc, url, _ = run_cmd(["git", "-C", str(host.repo), "remote", "get-url", host.remote])
+    if rc != 0 or not url:
+        return None
+    m = _GITHUB_REMOTE.match(url.strip())
+    return m.group(1) if m else None
+
+
+def check_merges(host: Host) -> Check:
+    """Can a merge into this repo rewrite the commit a release tag was reserved against?
+
+    #406. `v3.8` was squash-merged while every other landing that night used a merge
+    commit. The tag allocator takes `refs/tags/vX.Y` at PUSH time, against the
+    branch's stamped `chore(release)` commit (#296) — that placement is what makes
+    the number un-stealable, and it is also what a squash breaks: the squash discards
+    that commit, so `refs/tags/v3.8` addressed a commit that is not in main's history
+    while the v3.8 entry landed on main perfectly. Rebase-merge has the identical
+    defect for the identical reason; both are checked, because disabling only the one
+    that happened to bite would leave the other waiting.
+
+    NOT ASKED WHERE IT DOES NOT APPLY. A repo with no tag allocator has no reservation
+    for a merge to orphan, and a `FAIL` a reader cannot act on is how a row gets
+    ignored. The narrower question — whether a squash should discard a branch's
+    reviewed history at all — is a real one and is deliberately not this row's.
+
+    DETECT, DO NOT SET, and that is a decision rather than the easier half. Every
+    `fix` this tool runs writes to THIS host: a hooks directory, a systemd unit,
+    a venv. This one would write to a setting every contributor and every other
+    machine in the fleet shares, from whichever checkout somebody happened to type
+    `--fix` in, and it needs repository-admin rights a read-only token does not have.
+    It is `manual` for the reason the edge secret is: the remedy belongs to a person,
+    so this prints the exact one-line command and runs nothing.
+    """
+    tagger = release_tagger(host)
+    if tagger is None:
+        return Check("merges", str(host.repo),
+                     "this repo reserves no release tags (no release_tag.py), so no merge "
+                     "here can orphan one", "ok")
+    slug = github_slug(host)
+    if slug is None:
+        return Check("merges", host.remote,
+                     f"{host.remote} is not a github.com remote, so the merge strategies "
+                     "this repo allows cannot be read from here", "unknown",
+                     manual="check the forge's merge settings by hand: a squash or rebase "
+                            "merge orphans the tag reserved at push time")
+    if shutil.which("gh") is None:
+        return Check("merges", slug, "no gh on this host, so nothing can ask GitHub which "
+                     "merge strategies this repo allows", "unknown",
+                     manual="install gh and `gh auth login` (see the tools row)")
+    # `push` comes back in the same call because it is what makes the absent case
+    # legible: GitHub sends the merge-strategy fields ONLY to a token with push
+    # access, so a read-only token gets three nulls and no explanation. Asking for
+    # both means the row can say which of the two silences it is looking at.
+    rc, out, err = run_cmd(
+        ["gh", "api", f"repos/{slug}", "--jq",
+         "{allow_merge_commit, allow_squash_merge, allow_rebase_merge, "
+         "push: .permissions.push}"], timeout=15)
+    if rc != 0:
+        return Check("merges", slug, f"gh could not read the repo settings: "
+                     f"{clip_line(err) or f'exit {rc}'}", "unknown",
+                     manual=f"gh auth status, then `gh api repos/{slug}`")
+    try:
+        settings = json.loads(out)
+    except ValueError:
+        settings = None
+    # `null`, `[]` and `"rate limited"` are all valid JSON, so parsing is not the test —
+    # an object with the fields in it is. Codex found this: without the isinstance the
+    # row still came out `unknown`, but through `run_checks` catching an AttributeError,
+    # which reports "the check itself raised" instead of the remedy this branch prints.
+    if not isinstance(settings, dict):
+        return Check("merges", slug, "gh did not answer an object describing the repo "
+                     "settings", "unknown", manual=f"gh api repos/{slug}")
+    return _merge_verdict(slug, settings)
+
+
+def _merge_verdict(slug: str, settings: dict) -> Check:
+    """The four answers, given what GitHub said about one repo.
+
+    A field GitHub did not send is `unknown` and never `ok`. A read-only token, a
+    GHES old enough to omit one, or a `--jq` that stopped matching would otherwise
+    read as the setting being off — the #324 collapse, in the row whose whole job is
+    to notice that a switch is on.
+    """
+    absent = [k for k in ("allow_merge_commit", *_REWRITING) if settings.get(k) is None]
+    if absent and not settings.get("push"):
+        # The common one, and it is not a defect in the repo. GitHub returns these
+        # fields only to a token with push access; without it the answer is three
+        # nulls, which is why the remedy is somebody else's token rather than another
+        # run of the same command.
+        return Check("merges", slug,
+                     f"this token has no push access to {slug}, and GitHub states the merge "
+                     "strategies only to one that does — so nothing here can say whether a "
+                     "squash merge is allowed", "unknown",
+                     manual=f"ask somebody with push access on {slug} to run `gh api "
+                            f"repos/{slug} --jq '.allow_squash_merge, .allow_rebase_merge'`")
+    if absent:
+        return Check("merges", slug,
+                     f"GitHub did not say whether this repo allows {', '.join(absent)}, so "
+                     "the merge strategy is untested", "unknown",
+                     manual=f"gh api repos/{slug} --jq '{{{', '.join(absent)}}}'")
+    fix_cmd = (f"gh api -X PATCH repos/{slug} -F allow_squash_merge=false "
+               "-F allow_rebase_merge=false -F allow_merge_commit=true")
+    allowed = sorted(word for key, word in _REWRITING.items() if settings[key])
+    if allowed:
+        return Check("merges", slug,
+                     f"this repo allows {' and '.join(allowed)} merges, and reserves release "
+                     "tags at push time — a rewriting merge discards the commit the tag was "
+                     "reserved against (#406, v3.8)", "fail", manual=fix_cmd,
+                     extra={"allows": allowed, "settings": settings})
+    # The property is "every landing preserves the commit that was pushed", which needs
+    # both halves: the rewriting strategies off, AND one left that does not rewrite.
+    # GitHub will not currently let all three be false, so this branch is a guard rather
+    # than a case anybody has hit — and it is here because the row states the property,
+    # not the two settings it happens to have looked at.
+    if not settings["allow_merge_commit"]:
+        return Check("merges", slug,
+                     "this repo allows no merge strategy that preserves the pushed commits, "
+                     "so every landing rewrites the release commit its tag names", "fail",
+                     manual=fix_cmd, extra={"settings": settings})
+    return Check("merges", slug, "merge commits only — squash and rebase are both off, so a "
+                 "landing cannot orphan the release tag reserved at push time", "ok",
+                 extra={"settings": settings})
+
+
+#: The questions this tool asks, as opposed to the rows that answer them. Two, and
+#: they are separate because a row's group decides what a reader does with a `FAIL`:
+#: a broken `host` row is fixed on this machine, and a broken `landing` row is fixed
+#: in a repository setting or a queue that everybody shares.
+#:
+#: ``landing`` arrived with #406 and is deliberately a GROUP holding one row rather
+#: than a one-off. On the night #406 was filed this tool reported 9 ok / 1 unknown
+#: while the merge queue held seven green pull requests with none ready, main had
+#: not moved in three hours, a release tag pointed off main's history and three
+#: branches were conflicting on the one file `changelog.d/` exists to keep them out
+#: of. Every row was correct; not one of them was about whether work could land.
+#: #407 is the rest of that group, and it should be extending a category rather
+#: than retrofitting one around a single check.
+GROUPS = {
+    "host": "is this host wired up (#204)",
+    "landing": "can work actually land (#406, #407)",
+}
+
 #: Every check, in the order the report prints them: the three version lines and
-#: what they depend on first, then the guards. A tuple rather than a registry
-#: decorator so `--only` can validate a name against it before anything runs.
+#: what they depend on first, then the guards, then the landing group. A tuple
+#: rather than a registry decorator so `--only` can validate a name against it
+#: before anything runs.
 CHECKS = (
-    ("checkout", check_checkout),
-    ("board", check_board),
-    ("harness", check_harness),
-    ("client", check_client),
-    ("token", check_token),
-    ("hooks", check_hooks),
-    ("stash", check_stash),
-    ("reconcile", check_reconcile),
-    ("edge", check_edge),
-    ("tools", check_tools),
+    ("checkout", "host", check_checkout),
+    ("board", "host", check_board),
+    ("harness", "host", check_harness),
+    ("client", "host", check_client),
+    ("token", "host", check_token),
+    ("hooks", "host", check_hooks),
+    ("stash", "host", check_stash),
+    ("reconcile", "host", check_reconcile),
+    ("edge", "host", check_edge),
+    ("tools", "host", check_tools),
+    ("merges", "landing", check_merges),
 )
+
+
+def selectable() -> dict[str, set[str]]:
+    """What `--only` accepts: every check name, and every group name as a shorthand.
+
+    A group expands to its rows, so `--only landing` is `--only merges` today and
+    stays correct as #407 adds to it — which is the point of naming the group at all.
+    """
+    names = {name: {name} for name, _g, _fn in CHECKS}
+    for group in GROUPS:
+        names[group] = {name for name, g, _fn in CHECKS if g == group}
+    return names
 
 
 def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
@@ -1194,14 +1404,16 @@ def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
     is already odd, so "one row could not be computed" has to be a row.
     """
     out: list[Check] = []
-    for name, fn in CHECKS:
+    for name, group, fn in CHECKS:
         if only is not None and name not in only:
             continue
         try:
-            out.append(fn(host))
+            check = fn(host)
         except Exception as exc:                              # noqa: BLE001 — it IS the report
-            out.append(Check(name, "-", f"the check itself raised {type(exc).__name__}: {exc}",
-                             "unknown"))
+            check = Check(name, "-", f"the check itself raised {type(exc).__name__}: {exc}",
+                          "unknown")
+        check.group = group
+        out.append(check)
     return out
 
 
@@ -1355,7 +1567,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", dest="as_json",
                         help="the whole report as JSON")
     parser.add_argument("--only", metavar="NAMES",
-                        help="comma-separated check names (" + ",".join(n for n, _ in CHECKS) + ")")
+                        help="comma-separated check names ("
+                             + ",".join(n for n, _g, _fn in CHECKS)
+                             + ") or group names (" + ",".join(GROUPS) + ")")
     parser.add_argument("--human-url", metavar="URL", dest="human_url",
                         help="the browser vhost, for the edge check (else QUARTERBACK_HUMAN_URL)")
     parser.add_argument("--quiet", action="store_true",
@@ -1364,11 +1578,14 @@ def main(argv: list[str] | None = None) -> int:
 
     only = None
     if args.only:
-        only = {n.strip() for n in args.only.split(",") if n.strip()}
-        unknown_names = only - {n for n, _ in CHECKS}
+        asked = {n.strip() for n in args.only.split(",") if n.strip()}
+        expand = selectable()
+        unknown_names = asked - set(expand)
         if unknown_names:
-            print(f"qb-doctor: no such check: {', '.join(sorted(unknown_names))}", file=sys.stderr)
+            print(f"qb-doctor: no such check or group: {', '.join(sorted(unknown_names))}",
+                  file=sys.stderr)
             return 3
+        only = {name for asked_name in asked for name in expand[asked_name]}
 
     host = survey(args.repo, args.human_url, __file__)
     checks = run_checks(host, only)

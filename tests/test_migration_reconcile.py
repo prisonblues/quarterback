@@ -816,6 +816,290 @@ def test_heads_at_a_ref_come_out_of_git(collided_repo: Path):
 
 
 # ---------------------------------------------------------------------------
+# a branch that has already merged its base (#166)
+# ---------------------------------------------------------------------------
+#
+# Every test above checks the branch out first, which is why the gap survived. The
+# tool computes the plan from two git refs and used to gate the rewrite on commit
+# identity with HEAD, so merging the integration ref into the branch — which is what
+# you are there to do when `CHANGELOG.md` conflicts on every branch in the queue —
+# turned a correct plan into a refusal, on the same repo in the same state.
+
+
+@pytest.fixture
+def merged_repo(collided_repo: Path) -> Path:
+    """`collided_repo`, with `main` merged into the feature branch.
+
+    Both `0018`s are now in one tree, which is a graph Alembic will not load — and it
+    is the tree the rename actually has to operate on.
+    """
+    _git(collided_repo, "merge", "-q", "--no-edit", "main")
+    return collided_repo
+
+
+def test_a_merged_in_base_still_plans_from_the_two_refs(merged_repo: Path):
+    """Symptom 1: the duplicate-id check fired before anything could be planned, and
+    the bare invocation had no way past it."""
+    plan, _onto, _branch = mr._plan_for(_args(merged_repo))
+
+    assert plan.action == "renumber" and plan.collisions == ["0018"]
+    # the feature side of the merge, not the merge itself
+    assert plan.branch_sha == _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    assert plan.branch_derivation and "feature side" in plan.branch_derivation
+
+
+def test_the_derived_refs_are_named_in_the_record_not_assumed(merged_repo: Path, capsys):
+    """Which two refs the plan is a function of is the whole contract, so a plan that
+    silently swapped one of them out would be worse than the refusal it replaces."""
+    assert mr.main(["preflight", "--repo", str(merged_repo), "--onto", "main"]) == 0
+
+    out = capsys.readouterr().out
+    assert "is a merge" in out and _git(merged_repo, "rev-parse", "HEAD^1").strip()[:12] in out
+
+
+def test_apply_performs_the_rename_it_planned_after_the_base_was_merged_in(merged_repo: Path):
+    """Symptom 3, and the one that cost an evening: `apply` refused the plan `preflight`
+    had just produced, advising a checkout that would have discarded the merge."""
+    assert mr.cmd_apply(_args(merged_repo)) == 0
+
+    versions = merged_repo / "migrations" / "versions"
+    assert not (versions / "0018_base_sha.py").exists()
+    moved = mr.parse_migration((versions / "0019_base_sha.py").read_text())
+    assert (moved.id, moved.down) == ("0019", ("0018",))
+    # and the tree it wrote into is the resolved one: single head, no duplicate left
+    _commit(merged_repo, "renumber")
+    assert mr.heads(mr.revs_at_ref(str(merged_repo), "HEAD")) == ["0019"]
+
+
+def test_a_relink_is_reached_through_a_merged_in_base_too(behind_repo: Path):
+    """The order-dependence was in the guard, not in the renumber, so the other
+    resolution has to survive the same journey."""
+    _git(behind_repo, "merge", "-q", "--no-edit", "main")
+
+    assert mr.cmd_apply(_args(behind_repo)) == 0
+
+    relinked = mr.parse_migration(
+        (behind_repo / "migrations" / "versions" / "0019_mine.py").read_text()
+    )
+    assert relinked.down == ("0018",)
+
+
+def test_the_feature_side_is_read_off_containment_not_off_first_parent(collided_repo: Path):
+    """`git merge feature` run ON main puts the feature side SECOND, so first-parent
+    order is not the signal. What identifies the integration side is that `--onto`
+    already contains it."""
+    _git(collided_repo, "checkout", "-q", "main")
+    _git(collided_repo, "merge", "-q", "--no-edit", "feature")
+    merge_sha = _git(collided_repo, "rev-parse", "HEAD").strip()
+    _git(collided_repo, "branch", "-f", "integration", "HEAD^1")
+
+    derived, note = mr._branch_side_of_merge(str(collided_repo), merge_sha, "integration")
+
+    assert derived == _git(collided_repo, "rev-parse", "HEAD^2").strip()
+    assert note and "feature side" in note
+
+
+def test_a_merge_of_two_feature_branches_is_refused_rather_than_guessed(collided_repo: Path):
+    """Neither parent has landed, so neither is the integration side and there is no
+    answer to read off the merge. Saying so is the fix; picking one is the bug."""
+    _git(collided_repo, "checkout", "-q", "-b", "other", "main~1")
+    _write(collided_repo, "0020_other.py", "0020", "0017", "other")
+    _commit(collided_repo, "other: 0020")
+    _git(collided_repo, "checkout", "-q", "feature")
+    _git(collided_repo, "merge", "-q", "--no-edit", "other")
+
+    derived, note = mr._branch_side_of_merge(
+        str(collided_repo), _git(collided_repo, "rev-parse", "HEAD").strip(), "main"
+    )
+
+    assert derived is None
+    assert note and "neither parent" in note and "--branch" in note
+
+
+def test_a_merge_it_cannot_take_apart_says_so_in_the_duplicate_stop(collided_repo: Path):
+    """The duplicate STOP used to advise "renumber one of each pair" and nothing else —
+    a message whose only suggestion is the hand work this tool exists to replace."""
+    _git(collided_repo, "checkout", "-q", "-b", "other", "main~1")
+    _write(collided_repo, "0018_third.py", "0018", "0017", "third")
+    _commit(collided_repo, "other: a third 0018")
+    _git(collided_repo, "checkout", "-q", "feature")
+    _git(collided_repo, "merge", "-q", "--no-edit", "other")
+
+    with pytest.raises(mr.DuplicateRevisionError) as e:
+        mr._plan_for(_args(collided_repo))
+
+    assert "--onto <integration ref> --branch <feature ref>" in str(e.value)
+    assert "neither parent" in str(e.value)
+
+
+def test_heads_still_reads_the_merge_commit_it_was_pointed_at(merged_repo: Path, capsys):
+    """`heads --ref` must NOT take a merge apart. CI runs it on the merge commit
+    GitHub builds for a pull request precisely to see the post-merge graph, and a
+    duplicate landing there is the thing it is looking for (#338)."""
+    assert mr.main(["heads", "--repo", str(merged_repo)]) == 2
+    assert "0018" in capsys.readouterr().err
+
+
+def test_apply_still_refuses_a_head_that_does_not_contain_the_branch(collided_repo: Path):
+    """The guard is right in general and is not being deleted: an unrelated HEAD still
+    means the plan was computed from text that is not on disk, and there "check out
+    that branch first" IS the recovery."""
+    _git(collided_repo, "checkout", "-q", "main")
+
+    assert mr.cmd_apply(_args(collided_repo, branch="feature")) == 2
+    assert (collided_repo / "migrations" / "versions" / "0018_run_files.py").exists()
+
+
+def test_apply_runs_a_plan_for_a_ref_head_has_merely_moved_past(merged_repo: Path):
+    """The general rule the merge case is one instance of, and the invocation the issue
+    reports as refused: `--branch <the pre-merge tip>`, run from a HEAD that contains
+    it. Nothing the extra commits did touched a migration, so the plan still describes
+    the tree."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    (merged_repo / "CHANGELOG.md").write_text("unrelated work on top of the merge\n")
+    _commit(merged_repo, "unrelated commit after the merge")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 0
+    assert (merged_repo / "migrations" / "versions" / "0019_base_sha.py").exists()
+
+
+def test_apply_refuses_when_head_rewrote_the_migration_it_planned_to_edit(
+    merged_repo: Path, capsys
+):
+    """Containment is not enough. A conflict resolved inside a migration file leaves
+    HEAD carrying text the plan never read, and rewriting that is the sibling failure
+    #166 was filed alongside — `git checkout --theirs` silently dropping a change."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    _write(merged_repo, "0018_base_sha.py", "0018", "0017", "resolved_by_hand")
+    _commit(merged_repo, "resolve the conflict inside the migration")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    err = capsys.readouterr().err
+    assert "0018_base_sha.py" in err and "differs" in err
+    assert "Check out that branch first" not in err
+    assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
+
+
+def test_apply_refuses_when_head_already_declares_the_id_the_renumber_would_mint(
+    merged_repo: Path, capsys
+):
+    """HEAD may legitimately have moved past `--branch`, so it may also have picked up
+    a migration the plan never saw. Writing 0019 on top of somebody else's 0019 is the
+    duplicate this tool exists to prevent, arriving through its own apply."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    _write(merged_repo, "0019_someone_else.py", "0019", "0018", "later")
+    _commit(merged_repo, "a third branch landed 0019 while we were merging")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    err = capsys.readouterr().err
+    assert "0019" in err and "0019_someone_else.py" in err
+    assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
+
+
+def test_apply_refuses_a_head_migration_that_is_at_neither_ref(merged_repo: Path, capsys):
+    """The hole a touched-files-only check leaves open, and it is ordinary rather than
+    exotic. HEAD picks up `0090` from a third branch; the plan renumbers 0018 -> 0019
+    against two refs that never saw it; every blob the rewrite touches still matches.
+    Applying would leave heads 0019 AND 0090 while the plan that produced it said one
+    — the reassuring wrong answer, arriving through the tool's own apply."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    _write(merged_repo, "0090_extra.py", "0090", "0017", "extra")
+    _commit(merged_repo, "a third branch's migration, at neither ref")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0090_extra.py" in capsys.readouterr().err
+    assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
+
+
+def test_a_relink_is_held_to_the_same_account(behind_repo: Path, capsys):
+    """Relink touches exactly one file, so a touched-files-only check would have
+    nothing to look at and would wave anything else through."""
+    _git(behind_repo, "merge", "-q", "--no-edit", "main")
+    feature = _git(behind_repo, "rev-parse", "HEAD^1").strip()
+    _write(behind_repo, "0090_extra.py", "0090", "0017", "extra")
+    _commit(behind_repo, "a third branch's migration, at neither ref")
+
+    assert mr.cmd_apply(_args(behind_repo, branch=feature)) == 2
+    assert "0090_extra.py" in capsys.readouterr().err
+    relinked = mr.parse_migration(
+        (behind_repo / "migrations" / "versions" / "0019_mine.py").read_text()
+    )
+    assert relinked.down == ("0017",), "and it wrote nothing"
+
+
+def test_a_migration_replaced_by_a_symlink_is_not_the_same_file(merged_repo: Path, capsys):
+    """Git stores a symlink as a blob holding its target, so a file whose whole content
+    is `x.py` and a link pointing at `x.py` share an object id. Comparing ids alone
+    calls them identical, and `apply` writes through the link — editing a file nobody
+    named. The mode is the other half of the identity."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    versions = merged_repo / "migrations" / "versions"
+    entry = mr._versions_entries_at(
+        str(merged_repo), feature, "migrations/versions"
+    )["migrations/versions/0018_base_sha.py"]
+    (versions / "0018_base_sha.py").unlink()
+    (versions / "0018_base_sha.py").symlink_to("0017_b.py")
+    _commit(merged_repo, "0018 is now a symlink")
+    after = mr._versions_entries_at(
+        str(merged_repo), "HEAD", "migrations/versions"
+    )["migrations/versions/0018_base_sha.py"]
+
+    assert entry[0] == "100644" and after[0] == "120000", "the mode is what differs"
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0018_base_sha.py" in capsys.readouterr().err
+
+
+def test_deleting_an_untouched_migration_at_head_is_refused_too(merged_repo: Path, capsys):
+    """Every migration at --branch has to still be at HEAD, not only the ones the edit
+    opens. Dropping one takes a node out of the graph the plan reasoned about."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    (merged_repo / "migrations" / "versions" / "0016_a.py").unlink()
+    _commit(merged_repo, "drop a migration the plan never touches")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0016_a.py" in capsys.readouterr().err
+
+
+def test_a_commit_on_top_of_the_merge_is_refused_rather_than_planned_from_the_merge(
+    merged_repo: Path, capsys
+):
+    """Derivation reads the tip, and only the tip. Once a commit sits on top of the
+    merge the mixed tree is HEAD's own, and reaching back to the merge would plan from
+    a ref that no longer describes the branch — a migration added since would simply be
+    missing from it. So it stops, and the stop names the invocation that works."""
+    _write(merged_repo, "0020_added_after_the_merge.py", "0020", "0018", "after")
+    _commit(merged_repo, "a migration added after the merge")
+
+    assert mr.main(["apply", "--repo", str(merged_repo), "--onto", "main"]) == 2
+    err = capsys.readouterr().err
+    assert "--onto <integration ref> --branch <feature ref>" in err
+    assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
+
+
+def test_an_octopus_merge_is_not_taken_apart(collided_repo: Path):
+    _git(collided_repo, "checkout", "-q", "-b", "third", "main~1")
+    _write(collided_repo, "0021_third.py", "0021", "0017", "third")
+    _commit(collided_repo, "third: 0021")
+    _git(collided_repo, "checkout", "-q", "feature")
+    _git(collided_repo, "merge", "-q", "--no-edit", "main", "third")
+
+    derived, note = mr._branch_side_of_merge(
+        str(collided_repo), _git(collided_repo, "rev-parse", "HEAD").strip(), "main"
+    )
+
+    assert derived is None
+    assert note and "octopus" in note
+
+
+def test_an_ordinary_single_parent_head_derives_nothing_and_says_nothing(collided_repo: Path):
+    derived, note = mr._branch_side_of_merge(
+        str(collided_repo), _git(collided_repo, "rev-parse", "HEAD").strip(), "main"
+    )
+
+    assert (derived, note) == (None, None)
+
+
+# ---------------------------------------------------------------------------
 # the duplicate this tool's own graph could not see
 # ---------------------------------------------------------------------------
 

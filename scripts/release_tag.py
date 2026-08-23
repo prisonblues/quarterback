@@ -61,6 +61,28 @@ cost a skipped release number and nothing else: `check` lists a tag that is not 
 integration ref as a reservation rather than a defect, because that is also exactly what
 every release still in flight looks like.
 
+## The tag that is off the ref and is NOT a reservation (#406)
+
+Being off the integration ref is therefore two opposite things wearing one face, and for
+five months this file could only see the harmless one. A release merged with a SQUASH (or a
+rebase) leaves the same shape behind: the stamped commit the tag was reserved against is
+discarded by the rewrite, so the tag addresses a commit that is not in the history it
+claims to tag, while the release's CHANGELOG entry lands perfectly. `v3.8` shipped that way
+and every check the repo had reported it as fully tagged, because they asked whether a tag
+of that NAME resolved.
+
+What separates the two is not the tag. It is the CHANGELOG at the ref:
+
+  * the ref does not declare `vX.Y` — the release has not landed, so a tag off the ref is a
+    RESERVATION. Listed, never a finding.
+  * the ref does declare `vX.Y` — the release HAS landed, so its tag must be reachable from
+    the commit that landed it. Off the ref, it is ORPHANED, and that is a finding.
+
+One `git merge-base --is-ancestor` cannot make that call on its own; it needs the file to
+say which releases have landed. `reconcile` below is the one place either question is
+answered, because two implementations of "defect or reservation" agree right up until the
+morning one of them is asked about a squash.
+
 ## Commands
 
     release_tag.py reserve  [--repo DIR] [--remote NAME] [--commit REF] [--version vX.Y]
@@ -232,6 +254,7 @@ def resolve(repo: Path, ref: str) -> str:
 
 def is_ancestor(repo: Path, older: str, newer: str) -> bool:
     return _git_ok(repo, "merge-base", "--is-ancestor", older, newer)
+
 
 
 def changelog_at(repo: Path, rev: str) -> str | None:
@@ -598,6 +621,69 @@ def cmd_taken(args: argparse.Namespace) -> int:
     return 0
 
 
+def reconcile(repo: Path, ref: str) -> dict:
+    """Every release tag judged against an integration ref, one condition per key.
+
+    The one place either "is this tag a defect" question is answered, and public so that
+    it stays that way: `cmd_check` renders it, the `tagged` CI job exits on it, and
+    `qb-doctor` reads it back out of `--json` (#406). The discriminator between an orphan
+    and a reservation is subtle enough that a second implementation would get it wrong,
+    and would do so silently — both look like "tag not on the ref".
+
+    The keys, and none of them is a summary of another:
+
+    ``untagged``      releases the ref declares that no tag holds. The number is unlocked.
+    ``misplaced``     a tag whose own commit's CHANGELOG does not declare it. The invariant
+                      this whole file maintains, broken.
+    ``orphaned``      a tag for a release the ref DOES declare, pointing off the ref. #406:
+                      the release landed, so its tag has to be reachable from where it
+                      landed. A squash or rebase merge is how this happens.
+    ``reserved``      a tag for a release the ref does NOT declare, pointing off the ref.
+                      Every release in flight looks exactly like this. Never a finding.
+
+    ``findings`` is the subset that means something is wrong: `untagged`, `misplaced`,
+    `orphaned`. `reserved` is deliberately outside it.
+    """
+    ref_sha = resolve(repo, ref)
+    declared = releases_at(repo, ref_sha)
+    if not declared:
+        raise TagError(
+            f"{CHANGELOG} at {ref} declares no releases, so there is nothing for the "
+            "tags to be reconciled against"
+        )
+    have = local_tags(repo)
+
+    untagged = sorted(declared - set(have))
+    misplaced: list[tuple[rs.Release, str]] = []
+    orphaned: list[tuple[rs.Release, str]] = []
+    reserved: list[tuple[rs.Release, str]] = []
+    for r in sorted(have):
+        sha = have[r]
+        if r not in releases_at(repo, sha):
+            misplaced.append((r, sha))
+        elif is_ancestor(repo, sha, ref_sha):
+            continue
+        elif r in declared:
+            orphaned.append((r, sha))
+        else:
+            reserved.append((r, sha))
+
+    return {"ref": ref, "ref_sha": ref_sha, "declared": sorted(declared), "tags": have,
+            "untagged": untagged, "misplaced": misplaced, "orphaned": orphaned,
+            "reserved": reserved, "findings": bool(untagged or misplaced or orphaned)}
+
+
+def _ref_oid(repo: Path, r: rs.Release) -> str:
+    """What `refs/tags/vX.Y` itself holds, unpeeled — the value a lease has to expect.
+
+    NOT the peeled commit `tag_releases` reports. A tag `reserve` created is lightweight and
+    the two are the same sha; one `backfill` created is annotated and they are not, and a
+    `--force-with-lease` quoting the commit against an annotated tag is refused. Refused
+    safely, but the printed remedy is somebody's starting point and it should work.
+    """
+    return _git(repo, "rev-parse", f"refs/tags/{rs.fmt(r)}").strip()
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Reconcile the tags against the CHANGELOG. One condition per line, never one verdict.
 
@@ -606,65 +692,79 @@ def cmd_check(args: argparse.Namespace) -> int:
     run. So each condition reports for itself, and "could not be checked" is its own exit
     code rather than a lesser version of "clean".
 
-    An UNREACHABLE tag is not a finding. A reservation points at a branch commit, and until
-    that branch merges the tag is correctly not on `--ref` — that is the state of every
-    release in flight. It is listed, because an abandoned one means a skipped number and
-    somebody should be able to see why v2.96 has no entry.
+    A RESERVED tag is not a finding. It points at a branch commit, and until that branch
+    merges the tag is correctly not on `--ref` — that is the state of every release in
+    flight. It is listed, because an abandoned one means a skipped number and somebody
+    should be able to see why v2.96 has no entry.
+
+    An ORPHANED one is (#406), and telling the two apart is `reconcile`'s subject. The
+    remedy is deliberately a sentence rather than a command this tool runs: nothing here
+    moves a tag, and a release tag that has to move is a person's call.
     """
     repo = Path(args.repo).resolve()
-    ref = resolve(repo, args.ref)
-    declared = releases_at(repo, ref)
-    if not declared:
-        raise TagError(
-            f"{CHANGELOG} at {args.ref} declares no releases, so there is nothing for the "
-            "tags to be reconciled against"
-        )
-    have = local_tags(repo)
-
-    untagged = sorted(declared - set(have))
-    unreachable: list[tuple[rs.Release, str]] = []
-    wrong: list[tuple[rs.Release, str]] = []
-    for r in sorted(have):
-        sha = have[r]
-        if r not in releases_at(repo, sha):
-            wrong.append((r, sha))
-        elif not is_ancestor(repo, sha, ref):
-            unreachable.append((r, sha))
+    r = reconcile(repo, args.ref)
+    untagged, misplaced = r["untagged"], r["misplaced"]
+    orphaned, reserved = r["orphaned"], r["reserved"]
+    declared, have = r["declared"], r["tags"]
+    sound = len(have) - len(misplaced)
 
     lines = [
         f"{len(declared) - len(untagged)}/{len(declared)} release(s) at {args.ref} have a tag",
-        f"{len(have) - len(wrong)}/{len(have)} tag(s) point at a commit that declares them",
-        f"{len(unreachable)} tag(s) not on {args.ref} (a release in flight, or abandoned)",
+        f"{sound}/{len(have)} tag(s) point at a commit that declares them",
+        f"{len(orphaned)} landed release(s) whose tag is not on {args.ref}",
+        f"{len(reserved)} tag(s) not on {args.ref} (a release in flight, or abandoned)",
     ]
-    findings = bool(untagged or wrong)
 
     if args.json:
         print(json.dumps({
-            "clean": not findings,
+            "clean": not r["findings"],
             "ref": args.ref,
-            "untagged": [rs.fmt(r) for r in untagged],
-            "misplaced": {rs.fmt(r): sha for r, sha in wrong},
-            "unreachable": {rs.fmt(r): sha for r, sha in unreachable},
+            "untagged": [rs.fmt(x) for x in untagged],
+            "misplaced": {rs.fmt(x): sha for x, sha in misplaced},
+            "orphaned": {rs.fmt(x): sha for x, sha in orphaned},
+            "reserved": {rs.fmt(x): sha for x, sha in reserved},
         }, indent=2))
-        return 2 if findings else 0
+        return 2 if r["findings"] else 0
 
     for line in lines:
         print(line)
-    for r, sha in unreachable:
-        print(f"  {rs.fmt(r)} reserved at {sha[:12]}, not merged into {args.ref}")
+    for x, sha in reserved:
+        print(f"  {rs.fmt(x)} reserved at {sha[:12]}, not merged into {args.ref}")
     if untagged:
-        print(f"\nSTOP: no tag for {', '.join(rs.fmt(r) for r in untagged)}. That number is "
+        print(f"\nSTOP: no tag for {', '.join(rs.fmt(x) for x in untagged)}. That number is "
               "not locked, so nothing stops it being issued twice.\n"
               f"    scripts/release_tag.py backfill --ref {args.ref} --push",
               file=sys.stderr)
-    if wrong:
-        for r, sha in wrong:
-            print(f"STOP: {rs.fmt(r)} is tagged at {sha[:12]}, whose {CHANGELOG} does not "
+    if orphaned:
+        # Where each of them actually landed, computed only when there is an orphan to
+        # repair: `landings` walks every commit that ever touched the CHANGELOG, which is a
+        # hundred blob reads on this repo and nothing at all to a clean run.
+        where = landings(repo, r["ref_sha"])
+        for x, sha in orphaned:
+            landed = where.get(x)
+            print(f"STOP: {rs.fmt(x)} is tagged at {sha[:12]}, which is NOT on {args.ref} — "
+                  f"but {args.ref} declares {rs.fmt(x)}, so it shipped. A squash or rebase "
+                  "merge discards the commit the tag was reserved against and leaves the "
+                  "tag addressing history nobody can reach.\n"
+                  + (f"    It landed at {landed[:12]}. Re-point it deliberately, with a "
+                     f"lease so it is atomic:\n"
+                     f"        git tag -f {rs.fmt(x)} {landed[:12]}\n"
+                     f"        git push --force-with-lease={rs.fmt(x)}:{_ref_oid(repo, x)} "
+                     f"origin refs/tags/{rs.fmt(x)}\n"
+                     if landed else
+                     f"    Nothing on {args.ref}'s first-parent line declares it, so where "
+                     "it landed is a person's question.\n")
+                  + "    Then stop the next one: allow merge commits only "
+                    "(qb-doctor's `merges` row).", file=sys.stderr)
+    if misplaced:
+        for x, sha in misplaced:
+            print(f"STOP: {rs.fmt(x)} is tagged at {sha[:12]}, whose {CHANGELOG} does not "
                   "declare it. Tags are not moved by this tool — a human decides whether "
                   "that tag or that entry is the wrong one.", file=sys.stderr)
-    if findings:
+    if r["findings"]:
         return 2
-    print("clean: every release is tagged and every tag names a release that commit carries.")
+    print("clean: every release is tagged, every tag names a release that commit carries, "
+          f"and every landed release's tag is on {args.ref}.")
     return 0
 
 

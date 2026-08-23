@@ -60,18 +60,167 @@ jobs:
           DEPLOY_WEBHOOK_URL: ${{ secrets.DEPLOY_WEBHOOK_URL }}
           DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         run: |
-          [ -n "$DEPLOY_WEBHOOK_URL" ] || { echo "no deploy webhook configured; skipping"; exit 0; }
-          # --max-time because the hook returns as soon as it has queued the
-          # deploy, so this call is milliseconds when the edge is reachable and
-          # hung when it isn't. Without a cap an unreachable edge burned two
-          # minutes of CI before failing with the same message it gives instantly.
-          curl -sf --max-time 30 -X POST \
-            -H "Content-Type: application/json" \
-            -H "Authorization: $DEPLOY_TOKEN" \
-            -d '{}' \
-            "$DEPLOY_WEBHOOK_URL" \
-            || { echo "Failed to trigger deploy"; exit 1; }
-          echo "Deploy triggered successfully"
+          set -euo pipefail
+          if [ -z "${DEPLOY_WEBHOOK_URL:-}" ]; then
+            echo "no deploy webhook configured; skipping"
+            exit 0
+          fi
+
+          # Nothing here prints the URL or the token, and that is a requirement
+          # rather than tidiness: Actions masks a secret only where the whole
+          # value appears, so curl's own "Could not resolve host: <edge>" would
+          # go to the log unmasked. Hence `2>/dev/null` on every call and no
+          # `set -x` anywhere. What replaces it is the exit code plus `-w`
+          # timings, which say more about *why* than curl's prose did.
+          curl_reason() {
+            case "$1" in
+              6)  echo "DNS lookup failed" ;;
+              7)  echo "could not connect" ;;
+              22) echo "the server answered with an HTTP error" ;;
+              28) echo "timed out at the ${MAX_TIME}s cap" ;;
+              35) echo "TLS handshake failed" ;;
+              52) echo "empty reply from the server" ;;
+              56) echo "failure receiving data" ;;
+              *)  echo "see the EXIT CODES section of curl(1)" ;;
+            esac
+          }
+
+          # --max-time stays at 30, deliberately. The hook returns as soon as it
+          # has queued the deploy, so a healthy call is milliseconds: across 25
+          # runs on main this step took 0-2s twenty-three times and exactly 30s
+          # the other two. That is bimodal, with nothing in between, which is not
+          # what a slow server looks like - it is what a call that never got an
+          # answer at all looks like. Raising the cap would buy waiting; the -w
+          # timings below are what will actually say which half of the call went
+          # dark, because `tcp 0.000s` and a full-cap total mean the connection
+          # was never established, while a completed handshake and a full-cap
+          # total mean the edge accepted us and never replied.
+          MAX_TIME=30
+          ATTEMPTS=3
+
+          for n in $(seq 1 "$ATTEMPTS"); do
+            rc=0
+            timings=$(curl -sf -o /dev/null --max-time "$MAX_TIME" \
+              -w 'HTTP %{http_code} in %{time_total}s (dns %{time_namelookup}s, tcp %{time_connect}s, tls %{time_appconnect}s)' \
+              -X POST \
+              -H 'Content-Type: application/json' \
+              -H "Authorization: $DEPLOY_TOKEN" \
+              -d '{}' \
+              "$DEPLOY_WEBHOOK_URL" 2>/dev/null) || rc=$?
+
+            if [ "$rc" -eq 0 ]; then
+              echo "Deploy triggered successfully on attempt $n/$ATTEMPTS - $timings"
+              exit 0
+            fi
+
+            echo "attempt $n/$ATTEMPTS failed: curl exit $rc ($(curl_reason "$rc")); $timings"
+            # Retry, because the observed failures are isolated - two runs in
+            # twenty-five, each with successes either side - so a second attempt
+            # very probably lands. It is NOT a way of not failing: exhausting the attempts
+            # still exits non-zero below, since a loop that ends in `|| true`
+            # would trade an occasional silent miss for a permanent one. The
+            # backoff is short on purpose; a path that stays dark for longer
+            # than ~45s is a real outage and should cost CI a red job, not more
+            # waiting. Worst case here is 105s, still inside the two minutes the
+            # cap above was introduced to stop.
+            #
+            # Retrying CAN fire the deploy twice, and that is a deliberate trade
+            # rather than an oversight: a timeout is ambiguous, so an attempt the
+            # edge accepted and then failed to answer is indistinguishable from
+            # one it never saw. The hook is "pull the latest image and recreate
+            # the stack", which converges on the same state however many times it
+            # runs, so the cost of the ambiguous case is one extra restart. The
+            # cost of not retrying is a release that never rolls out at all and
+            # says nothing - the whole of #392.
+            if [ "$n" -lt "$ATTEMPTS" ]; then
+              backoff=$(( n * 5 ))
+              echo "retrying in ${backoff}s"
+              sleep "$backoff"
+            fi
+          done
+
+          # Carry the diagnosis to the board step. Single-line values only, and
+          # neither one contains any part of the URL or the token.
+          echo "DEPLOY_CURL_EXIT=$rc" >> "${GITHUB_ENV:-/dev/null}"
+          echo "DEPLOY_CURL_REASON=$(curl_reason "$rc")" >> "${GITHUB_ENV:-/dev/null}"
+          echo "DEPLOY_CURL_TIMINGS=$timings" >> "${GITHUB_ENV:-/dev/null}"
+
+          # An annotation and a run summary, so the reason is on the run page
+          # rather than three clicks inside a collapsed log group.
+          {
+            echo "### Deploy webhook never fired"
+            echo
+            echo "The image built and was pushed to GHCR. The edge was never told to pull it,"
+            echo "so whatever is deployed is still the previous image."
+            echo
+            echo "- attempts: $ATTEMPTS, each capped at ${MAX_TIME}s"
+            echo "- last failure: curl exit $rc ($(curl_reason "$rc"))"
+            echo "- last timings: $timings"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          # One line: an annotation is terminated by the newline, so a wrapped
+          # message loses everything after the first one.
+          reason=$(curl_reason "$rc")
+          echo "::error title=Deploy webhook never fired::$ATTEMPTS attempts all failed, last was curl exit $rc ($reason). The image is in GHCR and the edge was never told to pull it."
+          exit 1
+
+      # A red X on a workflow whose other two jobs are green is not somewhere
+      # anybody looks - the two timeouts in #392 were noticed because somebody
+      # happened to be landing a release at the time, not because anything told
+      # them. So the miss goes on the board, where /fleet shows it and the next
+      # agent to orient reads it.
+      #
+      # Same mechanism as the `announce` job and deliberately not a second one:
+      # the same two secrets, the same POST to /post, the same
+      # skip-when-unconfigured guard inside the script rather than in a step-level
+      # `if:` (the `secrets` context is unavailable there and referencing it fails
+      # the whole workflow at validation time). It is a step here rather than a
+      # call into announce-board.yml because that workflow's job is to say main
+      # moved, which is true regardless of the image, and this one's is to say the
+      # image did not roll out - and a `workflow_call` cannot see whether a step
+      # in its caller failed.
+      #
+      # No `continue-on-error` here, unlike `announce`: that flag exists there so
+      # a board outage never fails somebody's merge, and this step only ever runs
+      # in a job that has already failed. Adding it would only hide a broken token.
+      - name: Report the failed deploy on the board
+        if: failure()
+        env:
+          QUARTERBACK_TOKEN: ${{ secrets.QUARTERBACK_TOKEN }}
+          QUARTERBACK_BASE_URL: ${{ secrets.QUARTERBACK_BASE_URL }}
+          COMMIT_SHA: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${QUARTERBACK_TOKEN:-}" ] || [ -z "${QUARTERBACK_BASE_URL:-}" ]; then
+            echo "board not configured; skipping"
+            exit 0
+          fi
+          # `stuck` rather than `finding`: nothing here needs a code change, a
+          # rollout needs a person. It is also one of the types the human board
+          # renders, which is the whole point of posting it.
+          summary="deploy did NOT fire for ${COMMIT_SHA:0:7} on ${BRANCH} - image is in GHCR, the edge was never told to pull it"
+          detail=$(printf '%s\n' \
+            "The deploy webhook failed on every attempt, so ${REPO}@${COMMIT_SHA:0:7} built, was pushed to GHCR, and never rolled out." \
+            "Whatever is running on the edge is the previous image and every other signal on this release is green." \
+            "" \
+            "last curl exit: ${DEPLOY_CURL_EXIT:-unknown} (${DEPLOY_CURL_REASON:-unknown})" \
+            "last timings:   ${DEPLOY_CURL_TIMINGS:-unknown}" \
+            "run:            ${RUN_URL}" \
+            "" \
+            "Re-running the deploy job is the fix; the image is already built.")
+          body=$(jq -nc \
+            --arg s "$summary" --arg d "$detail" \
+            --arg c "$COMMIT_SHA" --arg b "$BRANCH" --arg r "$REPO" \
+            '{type:"stuck", summary:$s, detail:$d,
+              refs:[{kind:"commit", value:$c, repo:$r},
+                    {kind:"repo", value:($r|split("/")|last)},
+                    {kind:"branch", value:$b}]}')
+          curl -sf --max-time 10 -X POST "${QUARTERBACK_BASE_URL%/}/post" \
+            -H "Authorization: Bearer $QUARTERBACK_TOKEN" \
+            -H "Content-Type: application/json" -d "$body"
+          echo "Reported the failed deploy of ${COMMIT_SHA:0:7} on the board"
 
   # Deliberately NOT `needs: build-and-push`. Whether main moved is a fact about
   # git, not about whether an image built — and coupling the two lost a real
