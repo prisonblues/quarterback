@@ -156,7 +156,10 @@ turns the merge off.
    and that refusal is a HOLD rather than something to work around: the release heading is the
    line a reader scans, several fragments have no shared title anywhere to derive one from, and
    picking one is a judgement about what the release MEANS — the same class as `--major`, which
-   this loop also does not make on its own.
+   this loop also does not make on its own. Since #386 it *cannot*: `apply --major` asks for the
+   number at a terminal and refuses where there is none, so a loop that reached for it gets a
+   STOP rather than a major release. If a release genuinely needs one, that is a HOLD for a
+   person to run by hand — never something to route around.
 
    The `|| rc=$?` is not decoration. Exit 2 is a refusal carrying the sentence that repairs it, and
    under a `set -e` wrapper a bare invocation terminates the surrounding script before anything
