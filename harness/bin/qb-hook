@@ -11,13 +11,18 @@
 # op-resolved combined token list (/run/op-secrets/quarterback-tokens, one
 # `name:token` per machine). Agent name = QUARTERBACK_AGENT or the hostname.
 #
-# Identity (quarterback v2.9): the token proves the MACHINE, and every session on
-# it shares that token — so without more, all of them post as "zeus" and none can
-# be addressed individually. The X-Agent-Instance header names this session; the
-# board records the author as machine/instance. The instance is a prefix of the
-# Claude Code session id because qb-mcp derives the same value from
-# CLAUDE_CODE_SESSION_ID — that's what keeps a session's tool calls and its
+# Identity: the token proves the MACHINE, and every session on it shares that
+# token — so without more, all of them post as "zeus" and none can be addressed
+# individually. The X-Agent-Instance header distinguishes this session. Its value
+# is a prefix of the Claude Code session id because qb-mcp derives the same value
+# from CLAUDE_CODE_SESSION_ID — that's what keeps a session's tool calls and its
 # presence/leases under ONE identity instead of two.
+#
+# Since v2.12 that header is only an opaque KEY: the board DESIGNATES the name it
+# is known by (`zeus/glacier-amber`) and the key survives as a permanent alias. An
+# operator who wants a typeable name instead sets QUARTERBACK_INSTANCE, which this
+# hook forwards as an X-Agent-Name *request* — see the _auth block below for why
+# only an explicit one, and qb-env for the rule that shapes it.
 
 set -uo pipefail   # NOT -e: never abort a session on a curl/jq hiccup
 
@@ -101,6 +106,14 @@ QB_ENV="$(qb_env_path "$0")" || qb_broken "no qb-env found next to this script"
 command -v qb_load_config >/dev/null 2>&1 \
   || qb_broken "qb-env at $QB_ENV loaded but defines no qb_load_config"
 qb_load_config
+# This file and qb-env are separately pinned store paths (#204), so a half-migrated
+# install can pair a current hook with a library that predates `qb_requested_name`
+# (#156). A shim, not a `qb_broken`: losing a requested name costs a cosmetic
+# spelling for one session, and taking that session's presence and leases with it
+# would cost incomparably more.
+if ! command -v qb_requested_name >/dev/null 2>&1; then
+  qb_requested_name() { :; }
+fi
 [ -n "${QUARTERBACK_BASE_URL:-}" ] || exit 0   # unconfigured → no-op, never a guess
 qb_resolve_token || exit 0                     # no token → no-op
 
@@ -281,6 +294,18 @@ IDENT="$AGENT${INSTANCE:+/$INSTANCE}"
 
 _auth=(-H "Authorization: Bearer $TOK")
 [ -n "$INSTANCE" ] && _auth+=(-H "X-Agent-Instance: $INSTANCE")
+# …and the NAME to go with it, when an operator asked for one (#156). The header
+# above is only a key; the board designates the name it allocates against that key,
+# allocation is first-contact-wins, and this hook fires on SessionStart — so
+# whatever it sends is what the whole session is called. Until this line it sent no
+# name request at all, which is why `QUARTERBACK_INSTANCE=seat-3` came up as
+# `zeus/cotton-indigo`: the label was a key nobody was ever shown.
+#
+# qb-env decides the name, and it is the only thing that does — see the reasoning
+# there, including why an unset QUARTERBACK_INSTANCE must send nothing rather than
+# ask for the hex fragment INSTANCE falls back to.
+_name_req=$(qb_requested_name)
+[ -n "$_name_req" ] && _auth+=(-H "X-Agent-Name: $_name_req")
 _json=(-H 'Content-Type: application/json')
 
 _refs() {   # emit the refs array for a post (repo + branch when known)
