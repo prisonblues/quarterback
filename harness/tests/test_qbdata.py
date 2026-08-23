@@ -160,6 +160,11 @@ def test_the_first_claim_on_an_issue_is_the_one_shown():
 
 # ---- the plan ----------------------------------------------------------------
 
+def _in(seconds: int) -> str:
+    """An ISO timestamp `seconds` from now, for a claim that has not lapsed."""
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
 def item(title: str = "do the thing", repo: str | None = qd.REPO, ref: int | None = None,
          holder: str | None = None, blocked: list[dict] | None = None, **extra) -> dict:
     """A /plan item, shaped the way the board returns one."""
@@ -185,33 +190,76 @@ def covered(title: str = "a line of a held plan", holder: str = "zeus/two",
                 plan={"label": "stage one"}, **extra)
 
 
-def test_running_items_come_first_and_blocked_ones_last():
-    """The panel's whole order: what is happening, what is free, what is stuck."""
-    items = [item("free-a"), item("blocked", blocked=[{"ref": "9"}]),
-             item("running", holder="zeus/one"), item("free-b")]
-    assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == [
-        "running", "free-a", "free-b", "blocked"]
+def test_the_envelope_survives_the_fetch_and_not_just_the_items(monkeypatch):
+    """RED/GREEN: `fetch_plan` kept `data["items"]` and dropped everything the
+    board had CONCLUDED about that list — what is next, how much of the order
+    anybody chose, whether the page was all of it, and the board's own counts.
+    Six answers, none of them obtainable by a second call, thrown away on every
+    four-second refresh."""
+    body = json.dumps({
+        "items": [item("one")], "next": {"item_id": "id-one", "caveat": "watch out"},
+        "order_trust": {"trusted": False, "unchosen": 3}, "truncated": True,
+        "counts": {"open": 9, "claimed": 2, "covered": 1, "blocked": 1, "stale": 4},
+    }).encode()
+    client, _ = _client(monkeypatch, body)
+    plan, err = qd.fetch_plan(client)
+    assert err is None
+    assert [i["title"] for i in qd.plan_items(plan)] == ["one"]
+    assert plan["next"]["caveat"] == "watch out"
+    assert plan["order_trust"]["unchosen"] == 3
+    assert plan["truncated"] is True
+    assert plan["counts"]["covered"] == 1
 
 
-def test_an_item_in_somebody_elses_held_plan_does_not_sort_into_the_free_band():
-    """The free band has one job — the rows a seat can pick up — and an item the
-    plan's holder has reserved is the band failing at it."""
-    items = [item("free"), item("running", holder="zeus/one"), covered("covered")]
-    assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == [
-        "running", "covered", "free"]
+def test_the_plan_read_says_which_session_is_asking(monkeypatch):
+    """RED/GREEN, and the defect is a wrong answer rather than a missing one.
+    `GET /plan` resolves `covered_by` by MACHINE when the caller does not say
+    which session it is, and this machine runs seven agents at once — so a plan
+    held by the agent in the next pane came back as the reader's own and the panel
+    drew every item of it with the cyan "free to take" glyph."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc-123")
+    client, sent = _client(monkeypatch, b'{"items": []}')
+    qd.fetch_plan(client)
+    assert "session=abc-123" in sent[0].full_url
+    assert f"limit={qd.PLAN_LIMIT}" in sent[0].full_url
 
 
-def test_the_boards_own_order_survives_inside_a_band():
-    """A plan is an ordered list; re-sorting it by anything else loses the point."""
-    items = [item("first"), item("second"), item("third")]
-    assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == ["first", "second", "third"]
+def test_a_dashboard_outside_a_session_still_reads_as_somebody(monkeypatch):
+    """A dashboard holds no claims, so a session of its own that matches nothing
+    is the honest answer — every co-tenant's plan claim is then somebody else's,
+    which is what it is. Reading with no session at all is what restored the
+    duplicated work on the read path."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    client, sent = _client(monkeypatch, b'{"items": []}')
+    qd.fetch_plan(client)
+    assert f"session=qb-dash%3A{os.getpid()}" in sent[0].full_url
 
 
-def test_a_watched_repos_items_come_before_a_repo_we_only_overhear():
-    items = [item("theirs", repo="someone/other"), item("ours"),
-             item("fleet-wide", repo=None)]
-    assert [i["title"] for i in qd.sort_plan(items, [qd.REPO])] == [
-        "ours", "fleet-wide", "theirs"]
+def test_a_caller_may_name_the_session_it_reads_as(monkeypatch):
+    client, sent = _client(monkeypatch, b'{"items": []}')
+    qd.fetch_plan(client, session="explicit")
+    assert "session=explicit" in sent[0].full_url
+
+
+def test_a_dead_board_answers_with_the_shape_a_renderer_reads(monkeypatch):
+    """The error path returns an envelope, not a bare list: a panel asking a dead
+    board what is next gets "nothing", rather than a KeyError three panels on."""
+    def boom(*a, **k):
+        raise OSError("connection refused")
+    monkeypatch.setattr(qd.urllib.request, "urlopen", boom)
+    client = qd.BoardClient(qd.BoardConfig("https://board.example", "t", "host"))
+    plan, err = qd.fetch_plan(client)
+    assert "connection refused" in err
+    assert qd.plan_items(plan) == [] and plan["next"] is None
+    assert plan["counts"] == {} and plan["truncated"] is False
+
+
+def test_a_key_the_board_sent_as_null_reads_as_the_empty_one(monkeypatch):
+    """A key present and null is the same to a renderer as a key that is absent,
+    and only one of the two survives a dict merge."""
+    client, _ = _client(monkeypatch, b'{"items": null, "counts": null, "order_trust": null}')
+    plan, _ = qd.fetch_plan(client)
+    assert qd.plan_items(plan) == [] and plan["counts"] == {} and plan["order_trust"] == {}
 
 
 def test_an_item_that_points_at_no_issue_offers_nothing_to_fix():
@@ -242,6 +290,42 @@ def test_the_state_glyph_says_running_blocked_or_free():
     assert qd.plan_state(item())[0] == "○"
 
 
+def test_the_board_s_own_next_is_the_one_row_marked_as_next():
+    """`next` is by definition open, unclaimed, unblocked and uncovered, so it can
+    only ever be a row this would otherwise draw ○ — and the panel could not point
+    at it at all, which is why both dashboards re-derived one for themselves."""
+    glyph, colour = qd.plan_state(item("take me"), next_id="id-take me")
+    assert glyph == "◉" and "cyan" in colour
+    assert qd.plan_state(item("not me"), next_id="id-take me")[0] == "○"
+
+
+def test_nothing_but_the_next_row_wears_the_mark():
+    """A held or blocked row cannot be next, so the state it already has wins."""
+    assert qd.plan_state(item("x", holder="zeus/one"), next_id="id-x")[0] == "▶"
+    assert qd.plan_state(item("x", blocked=[{"ref": "9"}]), next_id="id-x")[0] == "⊘"
+
+
+def test_a_pr_backed_item_does_not_render_as_an_issue():
+    """RED/GREEN: `ref.kind` was never read, so an item pointing at a PR and one
+    pointing at an issue both drew `#123` — while `plan_issue` DID read the kind
+    and refused the PR, leaving a dim ⚒ with nothing on the row explaining why the
+    item beside it was takeable and this one was not."""
+    row = item("land it", ref=12)
+    row["ref"]["kind"] = "pr"
+    assert qd.plan_ref(row) == "PR#12"
+    assert qd.plan_ref(item("fix it", ref=12)) == "#12"
+    assert qd.plan_ref(item("a line of plan")) == ""
+
+
+def test_a_rank_nobody_chose_is_marked_as_one():
+    """#183: a rank that was merely where the add landed and a rank somebody chose
+    are different facts, and the terminal presented both as row position."""
+    assert qd.plan_rank({"rank": 12, "rank_source": "ordered"})[0] == "12"
+    assert qd.plan_rank({"rank": 12, "rank_source": "appended"})[0] == "~12"
+    assert qd.plan_rank({"rank": 12})[0] == "~12", "no source is not a chosen one"
+    assert qd.plan_rank({})[0] == ""
+
+
 def test_a_covered_item_does_not_get_the_free_to_take_glyph():
     """The reported failure. The cyan ○ is the panel's invitation to pick something
     up, and it was drawn over every item of somebody else's held plan — the exact
@@ -261,38 +345,141 @@ def test_an_items_own_claim_still_outranks_the_plans_glyph():
 
 
 def test_the_right_hand_column_holds_whichever_fact_is_true():
-    assert qd.plan_who(item(holder="zeus/badger-ember"))[0] == "badger-ember"
+    assert qd.plan_who(item(holder="zeus/badger-ember"))[0] == "zeus/badger-ember"
     assert qd.plan_who(item(blocked=[{"ref": "9"}]))[0] == "waits #9"
     assert qd.plan_who(item(blocked=[{"ref": None}, {"ref": None}]))[0] == "waits ×2"
+
+
+def test_the_holder_keeps_the_machine_it_is_on():
+    """RED/GREEN: the machine half was dropped, and a name alone is not an
+    identity — names are short, memorable and RECYCLED when an agent finishes, so
+    two agents on two boxes read as one agent working twice."""
+    assert qd.plan_who(item(holder="zeus/badger-ember"))[0] != \
+        qd.plan_who(item(holder="laptop/badger-ember"))[0]
+
+
+def test_a_held_row_that_also_waits_on_something_says_both():
+    """The premise was that only one of the three facts is ever true of a row, and
+    it is false for exactly this pair: an agent holding an item that waits on
+    something else is stuck, which is the combination worth acting on."""
+    assert qd.plan_who(item(holder="zeus/one", blocked=[{"ref": "9"}]))[0] == "⊘zeus/one"
 
 
 def test_a_covered_item_shows_its_plans_holder_and_not_an_idle_age():
     """An age in that column is the strongest invitation on the pane — "nobody has
     touched this for four days" — and it was printed over work another agent had
     reserved as a unit. Who to talk to is what a reader needs there."""
-    assert qd.plan_who(covered(holder="zeus/badger-ember"))[0] == "badger-ember"
+    assert qd.plan_who(covered(holder="zeus/badger-ember"))[0] == "zeus/badger-ember"
 
 
-def test_a_blocked_item_is_not_also_counted_as_running():
-    items = [item(holder="zeus/one"), item("b", blocked=[{"ref": "9"}]),
-             item("c", holder="zeus/two", blocked=[{"ref": "9"}])]
-    assert qd.plan_counts(items) == (2, 1)
+def _envelope(items, **over) -> dict:
+    """A `/plan` answer around some items, defaulted the way the board sends one."""
+    return {**qd.EMPTY_PLAN, "items": items, **over}
 
 
-def test_a_covered_item_counts_as_running_rather_than_as_nothing():
-    """The title is the number a reader takes in without reading the rows, and it
-    counted a covered item as neither running nor blocked — which in a panel whose
-    other number is "open" is the same as calling it free."""
-    items = [item("running", holder="zeus/one"), covered("covered"),
-             item("free"), item("blocked", blocked=[{"ref": "9"}])]
-    assert qd.plan_counts(items) == (2, 1)
+def test_the_title_reports_the_boards_own_counts(monkeypatch):
+    """RED/GREEN: the title recounted the page locally and folded covered into
+    running, so the pane could not make the distinction the board keeps those two
+    numbers apart to make — a blocked item needs work finishing, a covered one
+    needs a word with its holder. `stale` it could not report at all."""
+    plan = _envelope([item("one")],
+                     counts={"open": 30, "claimed": 4, "covered": 2, "blocked": 1,
+                             "stale": 5, "done": 12, "dropped": 3})
+    assert qd.plan_tally(plan, qd.plan_items(plan)) == {
+        "open": 30, "claimed": 4, "covered": 2, "blocked": 1, "stale": 5}
 
 
-def test_a_covered_item_that_is_also_blocked_is_counted_once():
-    """Both bands would otherwise claim it. Taken is the stronger fact — a blocked
-    item is something a reader can do nothing about; a covered one is somebody to
-    talk to."""
-    assert qd.plan_counts([covered("both", blocked=[{"ref": "9"}])]) == (1, 0)
+def test_a_scope_that_hid_rows_counts_the_rows_it_is_showing():
+    """The board's counts are over the whole open set, and a title that counts
+    rows the pane refuses to draw is a title lying about the pane."""
+    items = [item("mine", holder="zeus/one"), covered("covered"),
+             item("blocked", blocked=[{"ref": "9"}]), item("old", stale=True)]
+    plan = _envelope(items, counts={"open": 99, "claimed": 99, "covered": 99,
+                                    "blocked": 99, "stale": 99})
+    assert qd.plan_tally(plan, items, hidden=7) == {
+        "open": 4, "claimed": 1, "covered": 1, "blocked": 1, "stale": 1}
+
+
+def test_the_recount_overlaps_exactly_where_the_boards_counts_do():
+    """An item both held and blocked is in both of the board's numbers. A local
+    recount that quietly deduplicated would be a third answer about the plan."""
+    both = item("both", holder="zeus/one", blocked=[{"ref": "9"}])
+    got = qd.plan_tally(_envelope([both]), [both], hidden=1)
+    assert got["claimed"] == 1 and got["blocked"] == 1
+
+
+def test_the_title_carries_what_the_board_says_is_next():
+    plan = _envelope([item("one")], counts={"open": 1},
+                     next={"item_id": "id-one", "ref": {"kind": "issue", "value": "78"}})
+    assert ("next #78", "cyan") in qd.plan_head_bits(plan, qd.plan_items(plan))
+
+
+def test_a_next_the_scope_has_hidden_is_named_by_its_repo():
+    """"next #78" over a list that does not contain #78 reads as a rendering fault
+    rather than as an answer about the whole plan."""
+    plan = _envelope([item("one")], counts={"open": 1},
+                     next={"item_id": "elsewhere", "repo": "prisonblues/nix-fleet",
+                           "ref": {"kind": "issue", "value": "3"}})
+    assert ("next nix-fleet #3", "cyan") in qd.plan_head_bits(plan, qd.plan_items(plan), 1)
+
+
+def test_the_title_says_how_much_of_the_order_nobody_chose():
+    """#183's minimum fix, on the surface that could not show it: the terminal
+    had no way to tell a chosen priority from where an add happened to land."""
+    plan = _envelope([item("one")], counts={"open": 1},
+                     order_trust={"trusted": False, "unchosen": 5})
+    assert ("~5 unchosen", None) in qd.plan_head_bits(plan, qd.plan_items(plan))
+
+
+def test_a_trusted_order_says_nothing_about_being_trusted():
+    plan = _envelope([item("one")], counts={"open": 1},
+                     order_trust={"trusted": True, "unchosen": 0})
+    assert not any("unchosen" in text for text, _ in
+                   qd.plan_head_bits(plan, qd.plan_items(plan)))
+
+
+def test_a_title_with_no_room_drops_the_tally_before_the_answer():
+    """A panel title is clipped at the border and clipped from the END, so an
+    overflowing title loses `next` and `truncated` — the two answers the line
+    exists to carry — without saying so. Dropping a segment nobody would miss says
+    the same thing in less room; being cut off mid-word does not."""
+    plan = _envelope([item("one")], truncated=True,
+                     counts={"open": 40, "claimed": 1, "covered": 2, "blocked": 1,
+                             "stale": 4},
+                     order_trust={"trusted": False, "unchosen": 2},
+                     next={"item_id": "id-one", "ref": {"kind": "issue", "value": "394"}})
+    texts = [text for text, _ in qd.plan_head_bits(plan, qd.plan_items(plan), room=50)]
+    assert texts == ["40 open", "~2 unchosen", "next #394", "truncated at 1"]
+    texts = [text for text, _ in qd.plan_head_bits(plan, qd.plan_items(plan), room=40)]
+    assert texts == ["40 open", "next #394", "truncated at 1"]
+    # Tighter still: the count of what was truncated is detail, the fact is not.
+    texts = [text for text, _ in qd.plan_head_bits(plan, qd.plan_items(plan), room=31)]
+    assert texts == ["40 open", "next #394", "truncated"]
+    # And a pane too narrow even for that gives up whole segments rather than
+    # having the last one cut off in the middle of a word.
+    texts = [text for text, _ in qd.plan_head_bits(plan, qd.plan_items(plan), room=25)]
+    assert texts == ["40 open", "next #394"]
+    assert [text for text, _ in qd.plan_head_bits(plan, qd.plan_items(plan),
+                                                  room=12)] == ["next #394"]
+
+
+def test_a_scoped_title_counts_the_unchosen_positions_it_is_showing():
+    """The board's `unchosen` is about the whole plan. A title claiming five
+    unchosen positions over two tildes on screen sends a reader looking for three
+    rows that are not there — the same rule the counts beside it follow."""
+    items = [item("chosen", rank=1, rank_source="ordered"),
+             item("landed there", rank=2, rank_source="appended")]
+    plan = _envelope(items, counts={"open": 2}, order_trust={"unchosen": 5})
+    assert ("~5 unchosen", None) in qd.plan_head_bits(plan, items)
+    assert ("~1 unchosen", None) in qd.plan_head_bits(plan, items, hidden=3)
+
+
+def test_a_truncated_plan_says_so_rather_than_ending_quietly():
+    """`PLAN_LIMIT` is 200 and a truncated plan rendered silently in both
+    dashboards — the board says it out loud precisely so it need not be worked
+    out by comparing lengths."""
+    plan = _envelope([item("one")], counts={"open": 400}, truncated=True)
+    assert ("truncated at 1", "red") in qd.plan_head_bits(plan, qd.plan_items(plan))
 
 
 def test_the_detail_line_carries_the_note_the_panel_cannot_fit():
@@ -301,6 +488,32 @@ def test_the_detail_line_carries_the_note_the_panel_cannot_fit():
                                note="because the order matters"))
     assert "#8" in line and "stage one" in line
     assert "zeus/one" in line and "because the order matters" in line
+
+
+def test_the_detail_line_carries_the_provenance_a_row_has_no_room_for():
+    """Where the item sits, who put it there, how long it has sat and when the
+    claim on it lapses — fifteen fields do not fit a 45-column pane, and the
+    argument is about which get promoted onto the row, not about cramming them
+    all on. These are the ones that belong behind a click."""
+    line = qd.plan_detail(item("a line", rank=4, rank_source="placed",
+                               placed_for="after #7", stale=True, idle_days=9.5,
+                               added_by="zeus/one",
+                               claim={"holder": "zeus/two", "expires": _in(90)}))
+    assert "rank 4 (placed after #7)" in line
+    assert "stale, idle 9.5d" in line and "added by zeus/one" in line
+    assert "left" in line, "a claim with no time on it is one nobody need chase"
+
+
+def test_the_caveat_rides_on_the_row_the_board_named_next():
+    """The board's own statement of how much its recommendation is worth. It is a
+    sentence, so the title gets the count and this gets the argument — and it is
+    pinned to `next` alone, because on any other row it would read as a warning
+    about that row."""
+    plan = {**qd.EMPTY_PLAN, "items": [item("one")],
+            "next": {"item_id": "id-one", "caveat": "nobody chose this order"}}
+    assert "nobody chose this order" in qd.plan_detail(item("one"), plan)
+    assert "nobody chose this order" not in qd.plan_detail(item("two"), plan)
+    assert "nobody chose this order" not in qd.plan_detail(item("one"))
 
 
 def test_an_item_covered_by_somebody_elses_PLAN_claim_says_so():
