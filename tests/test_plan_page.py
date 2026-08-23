@@ -135,3 +135,200 @@ def test_declaring_a_scope_is_on_the_page_because_it_is_a_human_decision(page):
     control the endpoint ships unreachable by the person it is for."""
     assert 'id="newScope"' in page, "the page needs a way to declare a scope"
     assert '"/plan/scope"' in page, "and it has to call the human-only endpoint"
+
+
+# ---- the page is read on a phone, where nothing hovers (#387) ---------------
+#
+# The move gate is correct and stays: order is per exact scope, so a reorder of one
+# repo's list must not be able to renumber the fleet band. What was wrong is that
+# its reason lived in a `title=` attribute — and a phone has no hover, so on first
+# load a reader got three dead glyphs and no text anywhere. Three different states
+# looked identical from a thumb: "pick a scope", "this row is ordered in another
+# list", and "the edge refused your write". These pin each one to its own surface.
+
+
+def test_the_page_is_built_for_a_phone(page):
+    """Same floor `fleet.html` set: a viewport meta, and room for the notch on
+    every edge — a phone in landscape has it on the side, not along the bottom."""
+    assert re.search(r'<meta name="viewport"[^>]*width=device-width', page), \
+        "no viewport meta — the page renders at desktop width on a phone"
+    assert "viewport-fit=cover" in page, "safe-area insets are all zero without it"
+    assert "env(safe-area-inset-bottom)" in page and "env(safe-area-inset-left)" in page, \
+        "a notch is on the side in landscape, not only along the bottom"
+
+
+def test_every_touch_target_the_page_declares_is_big_enough_to_hit(page):
+    """44px is the floor below which a control is missed rather than pressed.
+
+    Written as "every one it declares" on purpose: the ▲▼ themselves are still the
+    size they always were, and #388 rebuilds that row's controls entirely. This is
+    the guard against a half-measure creeping into what IS declared."""
+    heights = [int(n) for n in re.findall(r"min-height:(\d+)px", page)]
+    assert heights, "no min-height on any control — nothing is guaranteed tappable"
+    assert min(heights) >= 44, f"a control is only {min(heights)}px tall"
+
+
+def test_the_scope_picker_does_not_zoom_the_viewport_when_it_is_tapped(page):
+    """Safari zooms the page when a control under 16px takes focus, and the header
+    jumps out from under the thumb. The picker is the control this page now tells
+    a reader to go and use, so it is the one that must not do that."""
+    rule = re.search(r"select, input \{[^}]*\}", page)
+    assert rule, "could not find the select/input rule"
+    size = re.search(r"font-size:(\d+)px", rule.group(0))
+    assert size and int(size.group(1)) >= 16, \
+        "a picker under 16px zooms the viewport when it is focused"
+
+
+def test_the_gate_itself_is_unchanged(page):
+    """The fix is not "enable the buttons". A reorder posts the whole scope's order,
+    so a row of another list in that payload is a 422 at best and a renumbered fleet
+    band at worst. Only an OPEN row of the EXACT scope on screen may move."""
+    gate = re.search(r"const canMove = ([^;]+);", page)
+    assert gate, "could not find the move gate"
+    assert 'it.state==="open"' in gate.group(1), "a done row carries no order"
+    assert "s!==undefined" in gate.group(1), "(all) is several lists at once"
+    assert "it.repo===s" in gate.group(1), "the scope being reordered is exact"
+
+
+def test_a_control_that_will_not_act_still_answers_a_tap(page):
+    """`disabled` takes no events and no focus, so the reason it is dead cannot be
+    asked for — which on a desktop was fine (the `title` answered a hover) and on a
+    phone left the button indistinguishable from a broken page. It stays visibly
+    dead, and it answers."""
+    dead = re.search(r"function dead\(ok, why\)\{[^}]*\}", page)
+    assert dead, "could not find the dead() helper"
+    assert "disabled" not in dead.group(0).replace("aria-disabled", ""), \
+        "a `disabled` control cannot be asked why it is disabled"
+    assert 'aria-disabled="true"' in dead.group(0), \
+        "assistive tech still has to be told the control is unavailable"
+    assert "data-why" in dead.group(0), "and the reason has to travel with it"
+    # The tap is answered, and answered FIRST: a dead move button carries
+    # `data-move` too, and must not fall through to the reorder the gate refused.
+    handler = re.search(r'listEl\.addEventListener\("click".{0,400}', page, re.S)
+    assert handler and 'closest("[data-why]")' in handler.group(0), \
+        "the click handler must read the reason before it reads the verb"
+
+
+def test_no_explanation_on_a_row_is_reachable_only_by_hovering(page):
+    """The defect, generalised. `title=` is a desktop-only answer, so every one of
+    them inside a row — the move gate, the drop button, the rank's provenance
+    (#183), the ref with no repo to link to — carries a `data-why` beside it that a
+    tap can reach."""
+    body = page[page.index("function row(it, s)"):page.index("// The one invariant")]
+    titles = [m.start() for m in re.finditer(r'title="', body)]
+    assert titles, "the row template carries no titles at all — has it been rewritten?"
+    for at in titles:
+        # same tag: back to the opening `<`/`` ` ``, forward to the closing `>`
+        start = max(body.rfind("<", 0, at), body.rfind("`", 0, at))
+        tag = body[start:body.index(">", at)]
+        # Either spelled out, or emitted by `dead()` — which the test above pins
+        # to writing one.
+        assert "data-why" in tag or "dead(" in tag, \
+            f"a title with no tap-reachable form: {tag[:90]!r}"
+
+
+def test_the_reason_every_row_is_dead_in_all_is_said_once_and_visibly(page):
+    """In `(all)` the reason is the same for every row, and a forty-times-repeated
+    banner is worse than the tooltip it replaces. So it is one line, above the list,
+    present exactly when the page is in that state."""
+    hint = re.search(r"hintEl\.innerHTML = s===undefined\s*\?([^:]+):", page, re.S)
+    assert hint, "the scope hint must be keyed off the same `undefined` the gate is"
+    assert "(all)" in hint.group(1) and "scope" in hint.group(1), \
+        "the line has to name the state and what to do about it"
+    assert "picker" in hint.group(1), "and point at the control that fixes it"
+    # ...and it is not ALSO on every row.
+    assert page.count("hintEl.innerHTML") == 1, "said once means written once"
+
+
+def test_the_page_says_who_is_looking_before_a_write_is_refused(page):
+    """Every write here — reorder, drop, declare a scope — is behind
+    `app.auth.human`. A 403 arriving under a thumb looks exactly like a dead button,
+    so the page asks `/whoami` first and says what it was told, the way `fleet.html`
+    does about the one verb on that page."""
+    assert '"/whoami"' in page, "the page must ask who is looking"
+    assert "bannerEl.innerHTML" in page, "and say so where it can be read"
+    assert 'body.kind === HUMAN' in page, "a person is the case with nothing to warn about"
+    banner = page[page.index("async function loadMe()"):page.index("// ---- the picker")]
+    assert "refused" in banner, "an agent has to be told the writes will not land"
+
+
+def test_a_refusal_and_an_explanation_do_not_share_one_line(page):
+    """The three states are three surfaces, or they are the same ambiguity again:
+    the banner is who you are, the hint is which list you are in, and the note is
+    this row. A failed write keeps the red line to itself."""
+    for el in ('id="banner"', 'id="hint"', 'id="note"', 'id="err"'):
+        assert el in page, f"missing surface: {el}"
+    assert re.search(r"function note\(msg\)\{ noteEl", page), \
+        "an explanation is not an error and does not go in errEl"
+    assert re.search(r"function say\(msg\)\{ errEl", page), \
+        "a refusal is not an explanation and does not go in noteEl"
+
+
+def test_an_explanation_outlives_the_refresh_tick(page):
+    """The list re-reads every 20 seconds. An answer that vanished half a second
+    after the tap that asked for it would be worse than the tooltip it replaced, so
+    nothing on the read path clears the note or the banner."""
+    load = page[page.index("async function load()"):page.index("function buildRepoOptions")]
+    assert "note(" not in load and "bannerEl" not in load, \
+        "the 20s read path must not wipe an explanation the reader asked for"
+
+
+# ---- rank provenance, on a page with no hover (#183 on a phone) -------------
+
+
+def test_a_position_somebody_chose_is_legible_without_reading_the_sentence(page):
+    """#183 landed provenance so a reader could tell ranks 1-17 (a real sequence)
+    from 18-28 (the order the adds arrived in). In a `title` that distinction is
+    unreachable on a phone — so it is weight, not only colour, plus the sentence on
+    a tap."""
+    chosen = re.search(r"const RANK_CHOSEN = new Set\(\[([^\]]*)\]\)", page)
+    assert chosen, "the page must say which sources mean somebody chose the position"
+    assert "ordered" in chosen.group(1) and "placed" in chosen.group(1), \
+        "a human ordering and an agent placing are both choices"
+    assert "appended" not in chosen.group(1), "an append is precisely nobody choosing"
+    rule = re.search(r"\.rank\.chosen \{[^}]*\}", page)
+    assert rule and "font-weight" in rule.group(0), \
+        "colour alone is not a distinction every reader can see"
+
+
+def test_every_rank_source_the_server_sends_has_a_reason_on_the_page():
+    """A source the page has no sentence for renders as an empty explanation, which
+    reads exactly like a rank with no provenance at all."""
+    tree = ast.parse(API.read_text())
+    sent = {c.value for node in ast.walk(tree)
+            if isinstance(node, ast.keyword) and node.arg == "rank_source"
+            for c in ast.walk(node.value)
+            if isinstance(c, ast.Constant) and isinstance(c.value, str)}
+    # `reorder` writes it through a local, so it is not a keyword anywhere.
+    sent.add("ordered")
+    known = set(re.findall(r"^  (\w+):", re.search(
+        r"const RANK_WHY = \{(.*?)\n\};", PAGE.read_text(), re.S).group(1), re.M))
+    assert sent, "could not find any rank_source the endpoint writes"
+    assert sent <= known, f"the page has no reason for: {sent - known}"
+
+
+# ---- the picker remembers, so (all) is not where every visit starts ---------
+
+
+def test_the_scope_the_reader_last_chose_survives_a_page_load(page):
+    """Every load landing in `(all)` is every load landing in the one state where
+    nothing can be moved. Restored BEFORE the first read, so that read is already
+    the reader's scope rather than `(all)` followed by a second fetch."""
+    assert 'const SCOPE_KEY = "qb.plan.scope"' in page, "the key must be namespaced"
+    assert "rememberScope(repoSel.value)" in page, "a change to the picker is remembered"
+    tail = page[page.index("const saved = rememberedScope();"):]
+    assert tail.index("repoSel.value = saved") < tail.index("load();"), \
+        "restoring after the first read makes the first read the wrong one"
+    assert re.search(r"function rememberedScope\(\)\{\s*try", page), \
+        "Safari throws on localStorage in private browsing; the page must still render"
+
+
+def test_nothing_shadows_the_function_that_puts_an_explanation_on_screen(page):
+    """`note` is a function and `note` is also what a scope's one-line description
+    is called. A local of that name shadows the function for its whole enclosing
+    handler — the temporal dead zone above the declaration included — so calling it
+    there throws, and everything after the call in the successful path is skipped.
+    That is a runtime error no `node --check` and no grep of the shipped page would
+    otherwise see."""
+    shadows = re.findall(r"\b(?:const|let|var)\s+note\b", page)
+    assert not shadows, "a local named `note` shadows note() for its whole scope"

@@ -2,38 +2,71 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>quarterback plan</title>
 <style>
   :root {
     --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
     --muted:#8b93a3; --accent:#6ea8fe; --chip:#232936;
+    /* One safe-area token per edge, the same set fleet.html defines. A phone in
+       landscape has the notch on the SIDE, which is the case a page that pads
+       only the bottom loses text off the left of. */
+    --sat:env(safe-area-inset-top); --sab:env(safe-area-inset-bottom);
+    --sal:env(safe-area-inset-left); --sar:env(safe-area-inset-right);
   }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg);
-    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-text-size-adjust:100%; }
   header { position:sticky; top:0; z-index:5; background:var(--panel);
-    border-bottom:1px solid var(--line); padding:10px 16px;
+    border-bottom:1px solid var(--line);
+    padding:calc(8px + var(--sat)) calc(16px + var(--sar)) 8px calc(16px + var(--sal));
     display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
   header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
   header .spacer { flex:1; }
+  /* 16px, not 12: below 16 Safari zooms the viewport when a control takes focus,
+     and the scope picker is the control this page now tells people to go and use.
+     44px is the floor below which a control is missed rather than pressed. */
   select, input { background:var(--chip); color:var(--fg); border:1px solid var(--line);
-    border-radius:6px; padding:4px 8px; font:inherit; font-size:12px; }
+    border-radius:6px; padding:4px 8px; font:inherit; font-size:16px; }
+  select { min-height:44px; max-width:60vw; }
+  /* 44px of tappable height on the toggle, without 44px of visible chrome */
+  .toggle { display:flex; align-items:center; gap:6px; min-height:44px;
+    color:var(--muted); font-size:13px; cursor:pointer; }
+  .toggle input { width:20px; height:20px; accent-color:var(--accent); }
   a { color:var(--accent); }
-  main { max-width:940px; margin:0 auto; padding:12px 16px 60px; }
-  .empty { color:var(--muted); text-align:center; padding:40px; }
-  .counts { color:var(--muted); font-size:12px; }
+  main { max-width:940px; margin:0 auto;
+    padding:12px calc(16px + var(--sar)) calc(60px + var(--sab)) calc(16px + var(--sal)); }
+  .empty { color:var(--muted); text-align:center; padding:40px 12px; }
+  .counts { color:var(--muted); font-size:12px; width:100%; }
   .next { border:1px solid #2f6f52; background:#141d19; border-radius:10px;
     padding:10px 12px; margin:10px 0 16px; }
   .next .lbl { color:#35c48a; font-size:11px; text-transform:uppercase; letter-spacing:.5px; }
   .next .caveat { color:#f0b429; font-size:12px; margin-top:5px; }
+
+  /* Who is looking, and therefore whether the three verbs on this page will work
+     at all — fleet.html's banner, in its colours, saying the same kind of thing.
+     A refusal a reader can see coming is not the same event as a dead button. */
+  .banner { border:1px solid #5c4a1e; background:#1c1810; border-radius:10px;
+    padding:10px 12px; margin:8px 0 12px; color:#f0b429; font-size:13px;
+    white-space:pre-wrap; word-break:break-word; }
+  /* The scope gate is a STATE, not a warning: fleet.html's settled-caveat tone,
+     because "you have not picked a list yet" is not something going wrong. */
+  .hint { border:1px solid #31435c; background:#141821; border-radius:10px;
+    padding:10px 12px; margin:8px 0 12px; color:#9fb4d0; font-size:13px;
+    word-break:break-word; }
 
   .item { border:1px solid var(--line); border-radius:10px; background:var(--panel);
     padding:9px 12px; margin:8px 0; display:flex; gap:10px; align-items:flex-start; }
   .item.claimed { border-color:#3a4658; }
   .item.blocked { opacity:.72; }
   .item.done, .item.dropped { opacity:.5; }
-  .rank { color:var(--muted); font-size:12px; min-width:2.2em; text-align:right; padding-top:1px; }
+  /* A rank somebody CHOSE, against one that was merely appended (#183). The
+     provenance used to live in a `title`, which on a phone is nowhere: the
+     weight carries it at a glance and the tap carries the sentence. */
+  .rank { color:var(--muted); font-size:12px; min-width:2.4em; text-align:right;
+    padding-top:1px; min-height:44px; }
+  .rank.chosen { color:var(--fg); font-weight:600; }
   .body { flex:1; min-width:0; }
   .row1 { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .title { font-weight:600; }
@@ -52,10 +85,20 @@
   .acts { display:flex; gap:4px; }
   .acts button { font:inherit; font-size:11px; cursor:pointer; background:#222831;
     color:#9fddc7; border:1px solid #2e3742; border-radius:5px; padding:1px 7px; }
+  /* Dead, and still worth pressing: a `.dead` button is not `disabled`, so a tap
+     reaches the page and is answered in the header rather than swallowed. */
+  .acts button.dead { opacity:.4; cursor:help; }
   .acts button:disabled { opacity:.35; cursor:default; }
-  header button { font:inherit; font-size:12px; cursor:pointer; background:var(--chip);
-    color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 8px; }
-  #err { color:#e5484d; font-size:12px; }
+  /* Anything carrying its own reason. `title` alone is a desktop-only answer —
+     these all answer a tap too, in #note, which is inside the sticky header and
+     so is on screen wherever in the list the tap happened. */
+  [data-why] { cursor:help; }
+  .rank[data-why] { text-decoration:underline dotted var(--line); text-underline-offset:2px; }
+  header button { font:inherit; font-size:13px; cursor:pointer; background:var(--chip);
+    color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 10px;
+    min-height:44px; }
+  #err { color:#e5484d; font-size:12px; width:100%; }
+  #note { color:#9fb4d0; font-size:12px; width:100%; word-break:break-word; }
 </style>
 </head>
 <body>
@@ -63,14 +106,20 @@
   <h1>plan</h1>
   <select id="repo"></select>
   <button id="newScope" title="declare a scope with no repo behind it — house work, admin, anything with no forge">+ scope</button>
-  <label class="counts"><input type="checkbox" id="showDone" /> show done</label>
-  <span id="counts" class="counts"></span>
+  <label class="toggle"><input type="checkbox" id="showDone" /> show done</label>
   <span class="spacer"></span>
+  <a href="/fleet" style="font-size:13px;text-decoration:none">fleet →</a>
+  <a href="/" style="font-size:13px;text-decoration:none">← board</a>
+  <span id="counts" class="counts"></span>
+  <!-- A failure and an explanation are different things and get different lines.
+       Both live in the STICKY header: a tap thirty rows down has to be answered
+       somewhere the thumb can still see. -->
   <span id="err"></span>
-  <a href="/fleet" style="font-size:12px;text-decoration:none">fleet →</a>
-  <a href="/" style="font-size:12px;text-decoration:none">← board</a>
+  <span id="note"></span>
 </header>
 <main>
+  <div id="banner"></div>
+  <div id="hint"></div>
   <div id="next"></div>
   <div id="list"></div>
   <div id="empty" class="empty">nothing in the plan yet</div>
@@ -84,8 +133,19 @@ const nextEl = document.getElementById("next");
 const emptyEl = document.getElementById("empty");
 const countsEl = document.getElementById("counts");
 const errEl = document.getElementById("err");
+const noteEl = document.getElementById("note");
+const bannerEl = document.getElementById("banner");
+const hintEl = document.getElementById("hint");
 const repoSel = document.getElementById("repo");
 const showDone = document.getElementById("showDone");
+
+// `human/<user>` is what the edge mints for a person; every write on this page is
+// behind it. See app.auth.human.
+const HUMAN = "human";
+// Where the scope picker's last setting is remembered, so a reader who picked a
+// list once is not returned to (all) — the state where nothing moves — by every
+// page load. Namespaced because the board serves several pages from one origin.
+const SCOPE_KEY = "qb.plan.scope";
 
 // Everything the last read returned, kept together: the rows in plan order, plus the
 // counts and the `next` the SERVER computed over the whole scope. They travel as one
@@ -134,10 +194,29 @@ function isProject(s){ return typeof s === "string" && s.toLowerCase().startsWit
 // What a scope is CALLED. The sigil is load-bearing on the wire and noise on screen.
 function scopeLabel(s){ return s===null||s===undefined ? "fleet"
   : isProject(s) ? s.slice(PROJECT_SIGIL.length) : s; }
+// What the PICKER calls it, which is not always what the scope is called: an
+// instruction to go and choose something has to name the thing on screen.
+function optionLabel(s){ return s===null ? "(fleet)" : scopeLabel(s); }
 function refUrl(it){ return (it.repo && !isProject(it.repo) && it.ref && it.ref.kind)
   ? `https://github.com/${it.repo}/${it.ref.kind==="pr"?"pull":"issues"}/${it.ref.value}` : null; }
 function refLabel(it){ return it.ref ? (it.ref.kind==="pr"?"PR #":"#")+it.ref.value : null; }
 function say(msg){ errEl.textContent = msg||""; }
+// An EXPLANATION, not a failure — a separate line and a separate colour, because
+// "this row is ordered in another list" and "the write was refused" are two of the
+// three states this page has to keep apart. Cleared by anything that changes what
+// is on screen; never by the 20s tick, which would wipe an answer half a second
+// after the tap that asked for it.
+function note(msg){ noteEl.textContent = msg||""; }
+// A FastAPI detail is a string for an HTTPException, {error,hint} for the plan
+// endpoints, and a list for a pydantic validation error — so nothing may assume
+// the shape. Shared by the write path and by `loadMe`, which read it two ways.
+function detailText(payload){
+  const det = payload && payload.detail;
+  if(typeof det === "string") return det;
+  if(det && typeof det === "object" && !Array.isArray(det) && det.error)
+    return det.error + (det.hint ? " — " + det.hint : "");
+  return det ? JSON.stringify(det) : null;
+}
 
 // An item whose scope names no repository has no GitHub URL to build from its ref —
 // show the ref it does carry, and say why it is not a link, rather than dropping it.
@@ -147,7 +226,7 @@ function refHtml(it){
   const why = it.repo ? "a project scope — no repo behind it to link the ref to"
                       : "fleet-wide item — it names no repo to link the ref to";
   return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">${lbl}</a>`
-             : `<span class="refless" title="${why}">${lbl}</span>`;
+             : `<span class="refless" data-why="${esc(why)}" title="${esc(why)}">${lbl}</span>`;
 }
 
 // The scope being reordered is EXACT — fleet items are their own list, so a
@@ -170,6 +249,23 @@ function rankWhy(it){
   const why = RANK_WHY[it.rank_source] || "";
   return it.placed_for ? `${why} — for ${it.placed_for}` : why;
 }
+// The half of the provenance that has to be legible WITHOUT reading the sentence:
+// did anybody choose this position, or is it just where the row landed? That is
+// the whole distinction #183 exists to draw, and a `title` draws it for a mouse
+// only. Weight, not colour alone, so it survives a reader who cannot see the
+// colour and a phone screen in daylight.
+const RANK_CHOSEN = new Set(["ordered", "placed"]);
+function rankChosen(it){ return RANK_CHOSEN.has(it.rank_source); }
+
+// A control that will not act, without `disabled`. The gate is the same one it
+// always was — the difference is that the browser still delivers the tap, so the
+// button can say why instead of only looking like it might be broken. Announced
+// to assistive tech as unavailable (`aria-disabled`), which `disabled` would do
+// at the cost of the explanation, since a disabled control takes no events and
+// no focus.
+function dead(ok, why){
+  return ok ? "" : `class="dead" aria-disabled="true" data-why="${esc(why)}"`;
+}
 
 function row(it, s){
   const el = document.createElement("div");
@@ -181,10 +277,20 @@ function row(it, s){
   // refused. The buttons say that by being dead, instead of accepting the click and
   // quietly doing nothing with it.
   const canMove = it.state==="open" && s!==undefined && it.repo===s;
+  // The gate is unchanged — what changed is that its reason is reachable without a
+  // hover. Every branch names the list the row IS ordered in, because "not here"
+  // and "nowhere" are different answers and only one of them is worth acting on.
   const why = canMove ? null
-    : it.state!=="open" ? "only open items carry an order"
-    : s===undefined ? "pick a scope (or the fleet list) to reorder — order is per scope"
-    : "ordered in its own list, not this one";
+    : it.state!=="open" ? `a ${it.state} row carries no order — only open items are ranked`
+    : s===undefined ? "order is per scope, and (all) is several of them at once — "
+                    + "pick one in the picker above"
+    : `this row is ordered in ${scopeLabel(it.repo)}, not in ${scopeLabel(s)} — `
+      + `pick ${optionLabel(it.repo)} in the picker above to move it`;
+  // Said on the row as well as on the tap, for the one case a reader cannot infer
+  // from anything already on screen: an OPEN row riding along from another list,
+  // sitting among rows that do move. A done row is faded and chipped `done`, and
+  // in (all) the reason is the same for every row and is stated once, above.
+  const elsewhere = it.state==="open" && s!==undefined && it.repo!==s;
   // A done row exists FOR its completion record, so dropping it would destroy the one
   // thing it is there to hold (the server refuses too). Present-but-dead, because a
   // missing button reads as a bug rather than as "not applicable here".
@@ -192,7 +298,9 @@ function row(it, s){
   const dropWhy = dropTo==="open" ? "put it back"
     : dropTo ? "drop it" : "done stays done — its completion record is the point";
   el.innerHTML = `
-    <div class="rank" title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
+    <div class="rank${rankChosen(it)?" chosen":""}"${rankWhy(it)
+        ? ` data-why="${esc(rankWhy(it))}" title="${esc(rankWhy(it))}"` : ""
+      }>${it.state==="open"?it.rank:"·"}</div>
     <div class="body">
       <div class="row1">
         ${refHtml(it)}
@@ -207,17 +315,18 @@ function row(it, s){
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
       ${it.note?`<div class="note">${esc(it.note)}</div>`:""}
-      <div class="meta">${esc(scopeLabel(it.repo))} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
+      <div class="meta">${esc(scopeLabel(it.repo))}${
+        elsewhere?" · ordered there, not here":""} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
         held&&held.note?` · “${esc(held.note)}”`:""}${
         !held&&it.covered_by&&it.covered_by.note?` · “${esc(it.covered_by.note)}”`:""}</div>
     </div>
     <div class="acts">
-      <button data-move="up" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
+      <button data-move="up" data-id="${esc(it.item_id)}" ${dead(canMove, why)}
         title="${esc(why||"move up")}">▲</button>
-      <button data-move="down" data-id="${esc(it.item_id)}" ${canMove?"":"disabled"}
+      <button data-move="down" data-id="${esc(it.item_id)}" ${dead(canMove, why)}
         title="${esc(why||"move down")}">▼</button>
-      <button data-id="${esc(it.item_id)}" ${dropTo?`data-state="${dropTo}"`:"disabled"}
-        title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>
+      <button data-id="${esc(it.item_id)}" ${dropTo?`data-state="${dropTo}"`
+        :dead(false, dropWhy)} title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>
     </div>`;
   return el;
 }
@@ -233,6 +342,15 @@ function render(){
   const s = scope();
   const shown = plan.items, counts = plan.counts || {}, next = plan.next;
 
+  // Said ONCE, above the list, rather than forty times inside it: in (all) every
+  // row is dead for the same reason, and that reason is the page's default state.
+  // A per-row repeat of one fact is the noise the tooltip was avoiding; a line
+  // that is simply on the page costs nothing to read and nothing to reach.
+  hintEl.innerHTML = s===undefined
+    ? `<div class="hint">nothing here can be reordered yet — <b>(all)</b> is several
+        lists at once, and an order only means something inside one. Pick a scope in
+        the picker above (or <b>(fleet)</b>) and the ▲▼ on its rows go live.</div>`
+    : "";
   listEl.innerHTML = "";
   for(const it of shown) listEl.appendChild(row(it, s));
   // `covered` is in the header for the same reason it is in `counts` at all: an item
@@ -262,6 +380,10 @@ function render(){
     // nothing on the page claimed and nothing waiting.
     : (counts.open ? `<div class="next" style="border-color:#5c4a1e"><div class="lbl" style="color:#f0b429">next</div>
         <div>nothing is free — everything open is claimed, waiting, or inside a plan somebody else holds</div></div>` : "");
+  // Naming the scope matters now the picker remembers one: an empty list under a
+  // filter a previous visit set reads as an empty PLAN otherwise.
+  emptyEl.textContent = s===undefined ? "nothing in the plan yet"
+    : `nothing in ${scopeLabel(s)}`;
   emptyEl.style.display = shown.length ? "none" : "block";
 }
 
@@ -327,15 +449,19 @@ document.getElementById("newScope").onclick = async ()=>{
   const name = (prompt("Name a scope with no repo behind it — house work, admin, "
     + "anything with no forge.\n\nLetters, digits, . - _ (e.g. 65lowther)") || "").trim();
   if(!name) return;
-  const note = (prompt(`What is “${name}”? One line, for whoever reads the plan next.`) || "").trim();
+  // NOT `note` — that is the function that puts an explanation in the header, and a
+  // local of the same name shadows it for this whole handler, TDZ included.
+  const blurb = (prompt(`What is “${name}”? One line, for whoever reads the plan next.`) || "").trim();
   busy = true;
   let made;
-  try { made = await post("/plan/scope", {name, note: note || null}); } finally { busy = false; }
+  try { made = await post("/plan/scope", {name, note: blurb || null}); } finally { busy = false; }
   if(!made) return;
+  note("");
   say(made.created ? `declared ${made.scope}` : `${made.scope} was already declared`);
   declared = [...new Set([...declared, made.scope])];
   buildRepoOptions();
   repoSel.value = made.scope;
+  rememberScope(made.scope);
   load();
 };
 
@@ -349,12 +475,12 @@ async function post(path, body){
     return null;
   }
   if(!r.ok){
-    // Plan errors are {detail:{error,hint}}, but a pydantic validation error keeps
-    // detail a bare string or a list — so nothing here may assume the object shape.
-    const payload = await r.json().catch(()=>null), det = payload && payload.detail;
-    say(typeof det === "string" ? det
-      : (det && det.error) ? det.error + (det.hint ? " — " + det.hint : "")
-      : "failed: "+r.status);
+    // A 403 from `app.auth.human` arrives here as a sentence naming the boundary,
+    // and it is shown verbatim: "the edge refused this write" is one of the three
+    // states this page has to be able to tell apart, and the server's own words
+    // are the only ones that distinguish it.
+    const payload = await r.json().catch(()=>null);
+    say(detailText(payload) || "failed: "+r.status);
     return null;
   }
   say("");
@@ -363,6 +489,13 @@ async function post(path, body){
 }
 
 listEl.addEventListener("click", async (e)=>{
+  // Anything carrying its own reason answers the tap with it, in the sticky
+  // header. This is FIRST because a dead move button carries `data-move` as well
+  // — saying why is the whole of what it can do, and the click must not fall
+  // through to a reorder the gate has already refused.
+  const why = e.target.closest("[data-why]");
+  if(why){ note(why.dataset.why); return; }
+  note("");
   const move = e.target.closest("button[data-move]");
   const state = e.target.closest("button[data-state]");
   let path, body;
@@ -394,9 +527,69 @@ listEl.addEventListener("click", async (e)=>{
   if(ok) load();  // a failed write keeps its message up — load() would wipe it
 });
 
-repoSel.onchange = load;
-showDone.onchange = load;
+// ---- who is looking, and therefore whether any of this will be accepted -----
+
+// Identity is a QUESTION, never an assumption — the same page is served to an
+// agent's token, to a person the edge vouched for, and to a browser nobody
+// vouched for. All three writes here (reorder, drop, declare a scope) are behind
+// `app.auth.human`, so the page asks and says what it was told rather than
+// leaving the refusal to arrive as a bare 403 under a thumb. Same banner, same
+// colours and the same reasoning as fleet.html — one vocabulary for "the verb on
+// this page may not be yours", not two.
+async function loadMe(){
+  let r;
+  try { r = await fetch("/whoami", {headers:{Accept:"application/json"}}); }
+  catch(err){ return; }   // offline: the list read reports the connection
+  const body = await r.json().catch(()=>null);
+  if(r.ok && body && body.kind === HUMAN) return;   // a person — nothing to warn about
+  let msg;
+  if(r.ok && body)
+    // Flatly, because here it IS flat: unlike ending a session on your own machine,
+    // there is no agent path into the plan's order at all. An agent that reads this
+    // and tries anyway gets the same sentence back from the server.
+    msg = `the board says you are looking as ${who(body.agent)} — an agent, not a `
+        + `person. Ordering the plan, dropping a row and declaring a scope are a `
+        + `person's calls, so all three will be refused here; a person the edge `
+        + `vouches for may make them.`;
+  else if(r.ok)
+    msg = `the board answered /whoami with something this page could not read, so `
+        + `whether a reorder will be accepted is unknown until you try it.`;
+  else
+    msg = `the board will not say who you are (${r.status}), so reordering, dropping `
+        + `a row and declaring a scope will be refused. What it said:`
+        + (detailText(body) ? "\n\n" + esc(detailText(body)) : "");
+  bannerEl.innerHTML = `<div class="banner">${msg}</div>`;
+}
+
+// ---- the picker remembers -------------------------------------------------
+
+// Every load landing in (all) is every load landing in the one state where nothing
+// can be moved. A reader who has chosen a list has said which list they are working
+// in; there is no reason to ask again on the next page load. Wrapped because Safari
+// throws on localStorage in private browsing, and a page that cannot remember a
+// filter must still render.
+function rememberedScope(){
+  try { return localStorage.getItem(SCOPE_KEY); } catch(err){ return null; }
+}
+function rememberScope(v){ try { localStorage.setItem(SCOPE_KEY, v); } catch(err){} }
+
+// Injected BEFORE the first read, so that read is already the reader's scope
+// rather than (all) followed by a second fetch. `buildRepoOptions` keeps whatever
+// the picker holds, so a scope whose items have all gone still offers its way out.
+const saved = rememberedScope();
+if(saved && saved !== "(all)"){
+  repoSel.innerHTML = `<option value="${esc(saved)}">${
+    esc(saved==="(fleet)" ? saved : scopeLabel(saved))}</option>`;
+  repoSel.value = saved;
+}
+
+repoSel.onchange = ()=>{ rememberScope(repoSel.value); note(""); load(); };
+showDone.onchange = ()=>{ note(""); load(); };
+loadMe();
 load();
+// The tick deliberately touches neither the note nor the banner: an explanation
+// that vanished half a second after the tap that asked for it would be worse than
+// the tooltip it replaces.
 setInterval(()=>{ if(!busy) load(); }, 20000);
 </script>
 </body>
