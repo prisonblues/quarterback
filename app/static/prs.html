@@ -1,0 +1,661 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>quarterback prs</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+    --muted:#8b93a3; --accent:#6ea8fe; --chip:#232936; --person:#e8c07d;
+    --waiting:#f0b429; --landing:#35c48a; --queued:#6ea8fe;
+    --unclear:#f0b429; --noround:#8b93a3;
+    --sat:env(safe-area-inset-top); --sab:env(safe-area-inset-bottom);
+    --sal:env(safe-area-inset-left); --sar:env(safe-area-inset-right);
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:15px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-text-size-adjust:100%; }
+  a { color:var(--accent); }
+
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+    border-bottom:1px solid var(--line);
+    padding:calc(8px + var(--sat)) calc(12px + var(--sar)) 8px calc(12px + var(--sal));
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .spacer { flex:1; }
+  header a { font-size:13px; text-decoration:none; }
+  .toggle { display:flex; align-items:center; gap:6px; min-height:44px;
+    color:var(--muted); font-size:13px; cursor:pointer; }
+  .toggle input { width:20px; height:20px; accent-color:var(--accent); }
+  .counts { color:var(--muted); font-size:13px; width:100%; }
+  .counts b { font-weight:600; color:var(--fg); }
+  #err { color:#e5484d; font-size:13px; width:100%; }
+  /* Numbers that stopped being refreshed have to say so where the numbers are.
+     An error message elsewhere on the page leaves a reader no way to tell a
+     current reading from a frozen one. */
+  .stale { color:#f0b429; }
+
+  main { max-width:720px; margin:0 auto;
+    padding:10px calc(12px + var(--sar)) calc(28px + var(--sab)) calc(12px + var(--sal)); }
+  .empty { color:var(--muted); text-align:center; padding:36px 12px; }
+
+  .pr { border:1px solid var(--line); border-left-width:3px; border-radius:10px;
+    background:var(--panel); padding:10px 12px; margin:10px 0; }
+  .pr.waiting { border-left-color:var(--waiting); }
+  .pr.landing { border-left-color:var(--landing); }
+  .pr.queued { border-left-color:var(--queued); }
+  .pr.unclear { border-left-color:var(--unclear); }
+  .pr.noround { border-left-color:var(--noround); opacity:.82; }
+
+  .top { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .num { font-weight:600; }
+  .num .repo { font-weight:400; color:#a9b4c6; }
+  .verdict { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+    border-radius:999px; padding:2px 9px; border:1px solid var(--line);
+    background:var(--chip); white-space:nowrap; }
+  .verdict.waiting { color:var(--waiting); border-color:#5c4a1e; }
+  .verdict.landing { color:var(--landing); border-color:#2f6f52; }
+  .verdict.queued { color:var(--queued); border-color:#31435c; }
+  .verdict.unclear { color:var(--unclear); border-color:#5c4a1e; }
+  .verdict.noround { color:var(--noround); }
+  .top .gh { margin-left:auto; min-height:44px; display:flex; align-items:center;
+    font-size:13px; text-decoration:none; }
+
+  .title { margin-top:5px; font-size:15px; word-break:break-word; }
+  .title.untitled { color:var(--muted); font-style:italic; }
+  /* What the agent that enqueued it said it was doing. Often the only sentence on
+     the row a person wrote, and on a PR the board holds no title for it is the
+     only thing that says what the PR is. */
+  .note { margin-top:3px; color:#aeb6c2; font-size:13px; word-break:break-word; }
+
+  /* Each fact gets its own labelled cell. Two facts sharing one column is how a
+     blank comes to mean either of them — see the `round` / `stage` note below. */
+  .facts { margin-top:7px; display:grid; gap:6px;
+    grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); }
+  .fact { border:1px solid var(--line); border-radius:8px; background:var(--chip);
+    padding:5px 8px; min-width:0; }
+  .fact .k { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+    color:var(--muted); }
+  .fact .v { font-size:14px; word-break:break-word; }
+  /* An absent fact is drawn, not omitted: a cell that says why it is blank is the
+     whole difference between "nothing is waiting" and "nobody has looked". */
+  .fact .v.unknown { color:var(--muted); font-style:italic; }
+  .fact .asof { font-size:12px; color:var(--muted); word-break:break-word; }
+
+  .classes { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  .cls { font-size:12px; padding:2px 8px; border-radius:999px; background:var(--chip);
+    border:1px solid #5c4a1e; color:var(--waiting); }
+
+  /* Same rule as /fleet: the caveat is the point of the page, not a footnote —
+     same size as the row it qualifies, never collapsed behind a tap. */
+  .caveat { margin-top:7px; padding:7px 9px; border-radius:8px; font-size:13px;
+    background:#1c1810; border:1px solid #5c4a1e; color:#f0b429;
+    white-space:pre-wrap; word-break:break-word; }
+  .caveat.settled { background:#141821; border-color:#31435c; color:#9fb4d0; }
+
+  .section { margin:18px 0 6px; font-size:13px; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.5px; }
+  .queue { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    padding:10px 12px; margin:8px 0; }
+  .queue h2 { font-size:14px; margin:0 0 4px; font-weight:600; word-break:break-all; }
+  .queue .sub { color:var(--muted); font-size:13px; }
+  .queue ol { margin:6px 0 0; padding-left:22px; }
+  .queue li { margin:3px 0; word-break:break-word; }
+  .queue li .note { color:var(--muted); }
+  .scope { margin-top:16px; border:1px dashed var(--line); border-radius:10px;
+    padding:9px 12px; color:var(--muted); font-size:13px; white-space:pre-wrap;
+    word-break:break-word; }
+</style>
+</head>
+<body>
+<header>
+  <h1>prs</h1>
+  <label class="toggle"><input type="checkbox" id="showQuiet" /> show quiet</label>
+  <span class="spacer"></span>
+  <a href="/">board</a>
+  <a href="/plan/view">plan</a>
+  <a href="/fleet">fleet</a>
+  <span id="counts" class="counts"></span>
+  <span id="err"></span>
+</header>
+<main>
+  <div id="list"></div>
+  <div id="empty" class="empty">no panel run in the window this page reads, and
+    no outstanding human judgement — so nothing named a pull request, and no line
+    was asked about. A queue on a base nothing here named would not be found from
+    this page.</div>
+  <div class="section">the line to land</div>
+  <div id="queues"></div>
+  <div id="scope" class="scope"></div>
+</main>
+
+<script>
+// Where each pull request has got to — from board reads only (#395).
+//
+// Three endpoints shipped, were tested, were documented, and were called by
+// nothing on any screen: `GET /reviews` (which carries `round`, `cycle`,
+// `stopped`, `stop_reason`, `pr_state`, `ci_status` per run since v2.15), `GET
+// /review/needs-human` (per-defect, with a class and the age of the QUESTION),
+// and `GET /merge-queue` (the line to land, with a real PR number on a real
+// board identity). Rich asked to see "the round" and "is it blocked by
+// anything"; both were already computed, already served, and reached no screen.
+//
+// Four things this page is careful about, each of which is a way it could lie:
+//
+//   1. **Round is not stage.** #262's `stage` is where a SESSION is in its own
+//      loop (F0/R1/R2), reported onto the lease. `ReviewRun.round` is how many
+//      panel rounds this PULL REQUEST has been through. Different objects,
+//      different questions. They are never drawn in one cell, and a PR with no
+//      round says which of the two it is — `none in this window`, or `outside
+//      this window` when a needs-human defect proves a round ran — rather than
+//      going blank. A blank that could be read as either fact is worse than two
+//      honest cells, and "never panelled" would be a third claim this page has no
+//      standing to make: it reads a window, not the whole table.
+//   2. **`pr_state` and `ci_status` are memories, not readings.**
+//      `app/models/review.py` is explicit: the board is told about panels, not
+//      about merges, so a PR merged after its final round still reads OPEN. Both
+//      are drawn with the round and the age they came from, always.
+//   3. **A verdict is pinned to a commit.** A merge-queue entry's `verdict` was
+//      recorded against `ready_sha`; if the head has moved since, the entry says
+//      so and `ready` is already false. The row names the commit that was judged.
+//   4. **An empty line is not a drained one.** Nothing enqueues automatically
+//      (#258 — preland is a gate nothing invokes), so a queue with no entries
+//      cannot be told apart from a queue nobody feeds. The board holds nothing
+//      that separates them, so this page names both readings instead of drawing
+//      a clean zero. That is `/fleet`'s rule for an absent lease, one contract
+//      over.
+
+// ---- constants that belong to somebody else --------------------------------
+
+// `ReviewRun.pr_state`'s own docstring, near enough to be recognisable as the
+// same sentence. Two readers of one caveat wording it two ways is how an
+// operator learns to believe whichever they read first.
+const PANEL_MEMORY = "the board is told about panels, not about merges, so a PR "
+  + "merged or closed since its last round still reads as it did then";
+
+// #258, in one line. This is the sentence that stops an empty queue reading as a
+// drained one, and `tests/test_prs_page.py` pins that it is on the page.
+const QUEUE_UNFED = "nothing enqueues automatically — preland is a gate nothing "
+  + "invokes (#258), so an empty line and a line nobody feeds are the same "
+  + "reading from here. The board holds nothing that separates them.";
+
+// Only a panel round can raise a needs-human defect, so the zero has a scope.
+const NEEDS_HUMAN_SCOPE = "Only a panel round raises one of these, so a pull "
+  + "request nothing has panelled contributes nothing here — zero means no round "
+  + "flagged a human judgement, not that nothing needs you.";
+
+// How stale a run has to be before the memory is worth remarking on, in seconds.
+// Not a threshold for BELIEVING it — the as-of is on every cell either way; this
+// only decides when the caveat is spelt out in full.
+const MEMORY_AFTER = 3600;
+
+// The newest N runs this page reads. A PR whose last round is older than that
+// window has no row of its own unless the queue or a needs-human defect puts one
+// there — and the footer says so rather than letting the list read as complete.
+const RUN_WINDOW = 200;
+
+// How many `(repo, base)` lines to ask about. `GET /merge-queue` takes exactly
+// one pair and there is no endpoint that enumerates them (#395 is a rendering
+// job; a new endpoint would mean it had drifted), so the pairs are derived from
+// the runs this page already has. Capped, and the cap announces itself.
+const QUEUE_CALLS = 8;
+
+// The base every repo is asked about even when no run in the window names it.
+// A queue on `main` that nothing has panelled against is exactly the case the
+// derivation would otherwise miss.
+const DEFAULT_BASE = "main";
+
+const listEl = document.getElementById("list");
+const emptyEl = document.getElementById("empty");
+const queuesEl = document.getElementById("queues");
+const countsEl = document.getElementById("counts");
+const errEl = document.getElementById("err");
+const scopeEl = document.getElementById("scope");
+const showQuiet = document.getElementById("showQuiet");
+
+let rows = [];        // one per (repo, pr)
+let queues = [];      // one per (repo, base) asked about
+let scopeNote = "";
+let gen = 0;          // read generation — a superseded read is discarded
+let readAt = null;    // when the rows on screen were read
+let waiting = null;   // /review/needs-human's own count, over everything it matched
+// A failed tick keeps the last good reading rather than blanking the page — but
+// the page then says how old it is, on every line, until a read succeeds. An
+// error message beside numbers that still look current is the same collapse this
+// page is about: the reader has no way to tell which of the two they are seeing.
+let staleSince = null;
+
+// ---- helpers (house style, shared with fleet.html / plan.html) --------------
+
+function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
+  return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+function who(name){ const i=(name??"").indexOf("/");
+  if(i<0) return esc(name||"?");
+  const machine = name.slice(0,i), rest = name.slice(i+1);
+  if(machine==="human") return `<span style="color:var(--person);font-weight:600">${
+    esc(machine)}/${esc(rest)}</span>`;
+  return `${esc(machine)}<span style="color:#a9b4c6">/${esc(rest)}</span>`; }
+function span(s){ if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m";
+  if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
+function secsSince(iso){ const t=Date.parse(iso); return isNaN(t) ? null
+  : Math.max(0,(Date.now()-t)/1000); }
+function ago(iso){ const s=secsSince(iso); return s===null ? "an unreadable time" : span(s); }
+function until(iso){ const s=(Date.parse(iso)-Date.now())/1000;
+  return isNaN(s) ? "an unreadable time" : s<=0 ? "lapsed" : "in "+span(s); }
+function say(msg){ errEl.textContent = msg||""; }
+// A read did not land. Say why, and mark everything already on screen as the
+// older reading it now is.
+function fell(msg){ say(msg); staleSince = staleSince || readAt || Date.now(); render(); }
+function shortRepo(r){ const s=String(r||""); const i=s.indexOf("/");
+  return i<0 ? s : s.slice(i+1); }
+function sha(s){ return String(s||"").slice(0,12); }
+
+// ---- the reading, and how much of it is a memory ---------------------------
+
+// The round, and only the round. Never a stage: #262's `stage` is a fact about a
+// SESSION and this is a fact about a PULL REQUEST, and the one thing that must
+// not happen is one of them rendering where the other is missing.
+function roundCell(r){
+  // Not "never panelled". This page reads a WINDOW of runs, so an absent round
+  // means absent from the window and nothing more — and where the row carries a
+  // needs-human defect it means less than that again, because only a panel round
+  // can raise one, so a round provably exists and is merely older. Saying
+  // "never" would be a conclusion drawn from the edge of a query.
+  if(!r.run && r.needs.length)
+    return {k:"round", v:"outside this window", unknown:true,
+      asof:`a round raised the judgement below, so one ran — it is older than the `
+         + `newest ${RUN_WINDOW} runs this page reads`};
+  if(!r.run)
+    return {k:"round", v:"none in this window", unknown:true,
+      asof:`no panel run for this PR is among the newest ${RUN_WINDOW} this page `
+         + `reads, and nothing here can say whether an older one exists`};
+  // Sliced RAW, not escaped-then-sliced: cutting an escaped string at eight
+  // characters can cut an entity in half, and `factEl` escapes this anyway — so
+  // escaping here would render `&amp;` in the cell as well.
+  const cycle = r.run.cycle ? ` · cycle ${String(r.run.cycle).slice(0,8)}` : "";
+  return {k:"round", v:`${r.run.round}`,
+    asof:`ran ${ago(r.run.ts)} ago by ${r.run.author || "somebody"}${cycle}`};
+}
+
+// What stopped the newest round, which is the closest the board comes to "did
+// anybody finish reading this". `stopped: null` is a run that never said.
+function stopCell(r){
+  if(!r.run) return null;
+  if(r.run.stopped === true)
+    return {k:"stopped", v:"yes", asof:r.run.stop_reason || "no reason recorded"};
+  if(r.run.stopped === false)
+    return {k:"stopped", v:"go again",
+      asof:r.run.stop_reason || "the round did not stop; another was expected"};
+  return {k:"stopped", v:"not said", unknown:true,
+    asof:"the run recorded no stop decision either way"};
+}
+
+// A memory with its date on it. `pr_state` and `ci_status` are what the panel
+// saw at run time and nothing has refreshed them since.
+function memoryCell(key, value, r){
+  if(!r.run) return null;
+  if(value === null || value === undefined || value === "")
+    return {k:key, v:"not recorded", unknown:true,
+      asof:`round ${r.run.round} did not record one`};
+  return {k:key, v:String(value),
+    asof:`as of round ${r.run.round}, ${ago(r.run.ts)} ago`};
+}
+
+// Where it is in the line, and against which commit the verdict was formed.
+//
+// An absent entry is NOT "not queued". `GET /merge-queue` answers about exactly
+// one `(repo, base)` and this page asks about a derived, capped handful of them,
+// so a missing entry means "not in a line this page read" and, when the PR's base
+// was never among them, not even that. Three cells, and only one of them is a
+// statement about the queue.
+function queueCell(r){
+  const e = r.entry;
+  if(e){
+    const stale = e.verdict === "ready" && e.ready === false;
+    const more = r.entries > 1
+      ? ` · in ${r.entries} of the lines this page read` : "";
+    return {k:"in line", v:`#${e.position} of ${r.queueDepth}`,
+      asof:`${e.verdict}${stale ? " (retired)" : ""} · `
+         + `${e.holder ? "held by " + e.holder : "holder not recorded"}`
+         + ` · expires ${until(e.expires)}${more}`};
+  }
+  if(r.lineRead)
+    return {k:"in line", v:"not in the line", unknown:true,
+      asof:`the line for ${shortRepo(r.repo)} → ${r.base} was read and does not `
+         + `name it`};
+  return {k:"in line", v:"line not read", unknown:true,
+    asof: r.base
+      ? `this page did not ask about the line for ${shortRepo(r.repo)} → ${r.base}`
+      : `nothing this page read names the base this PR would land on, so no line `
+        + `was asked about it`};
+}
+
+// How many human judgements this PR is holding, and of what kind.
+function humanCell(r){
+  // `truncated` says the endpoint's own cap trimmed the LIST while `waiting`
+  // still counts the whole of it — so an empty row under truncation means "none
+  // among the ones listed" and nothing more. Carried onto every row, because a
+  // footnote at the bottom of the page does not repair a false cell in the
+  // middle of it.
+  if(!r.needs.length) return {k:"waiting on a human",
+    v: r.listTrimmed ? "none listed" : "none flagged", unknown:true,
+    asof: r.listTrimmed
+      ? `the needs-human list was trimmed at its own cap, so this says only that `
+        + `none of the ones it returned are on this PR`
+      : "no outstanding needs-human defect on this PR"};
+  const oldest = Math.max(...r.needs.map(d => d.age_seconds || 0));
+  return {k:"waiting on a human", v:`${r.needs.length}${r.listTrimmed ? "+" : ""}`,
+    asof:`oldest asked ${span(oldest)} ago`
+       + (r.listTrimmed ? " · the list was trimmed; there may be more" : "")};
+}
+
+// The one summary judgement, and it is deliberately not a lifecycle. Each value
+// names a DIFFERENT thing the board was told; none of them is inferred from a
+// silence. `unclear` is `/fleet`'s own word for the same shape of gap and means
+// the same thing here: two readings the board cannot separate.
+function verdict(r){
+  if(r.needs.length) return "waiting";
+  if(r.entry && r.entry.position === 1 && r.entry.ready) return "landing";
+  if(r.entry) return "queued";
+  if(!r.run) return "noround";
+  // A round on the board and nothing that says where it is now: not queued, no
+  // human judgement outstanding, and a `pr_state` that is a memory. Working
+  // towards landing and long since landed are both consistent with this row, and
+  // `/fleet` already has the word for exactly that.
+  return "unclear";
+}
+
+// A row is QUIET when the board holds nothing outstanding about it: no human
+// judgement, no queue entry, and a last round that both stopped and is old
+// enough that its memory has stopped being news. Quiet rows are behind a toggle;
+// nothing else ever is — hiding a row somebody is waiting on is the false-clean
+// this page is about.
+function quiet(r){
+  if(r.needs.length || r.entry) return false;
+  if(!r.run) return false;
+  const s = secsSince(r.run.ts);
+  return r.run.stopped === true && s !== null && s > MEMORY_AFTER;
+}
+
+// The caveats a row carries, in the order they matter. Every one of them is a
+// statement about what the board CANNOT say, never a conclusion drawn from it.
+function caveats(r){
+  const out = [];
+  if(r.run){
+    const s = secsSince(r.run.ts);
+    const old = s === null || s > MEMORY_AFTER;
+    if(old && (r.run.pr_state || r.run.ci_status))
+      out.push({settled:false, text:
+        `its newest round ran ${ago(r.run.ts)} ago, and the state and CI above `
+        + `are what that round saw — ${PANEL_MEMORY}.`});
+  }
+  if(r.entry && r.entry.verdict === "ready" && r.entry.ready === false)
+    out.push({settled:false, text:
+      `its queue verdict is “ready” but it was recorded against `
+      + `${sha(r.entry.ready_sha) || "no commit"}, and the entry now names `
+      + `${sha(r.entry.head)}. The board has already retired it — this entry is `
+      + `in the line but may not land on this head.`});
+  if(r.entries > 1)
+    out.push({settled:false, text:
+      `it is standing in ${r.entries} of the lines this page read. The cell above `
+      + `shows the first of them; the board holds no rule that makes one of `
+      + `them the real one.`});
+  if(!r.run && r.entry)
+    out.push({settled:false, text:
+      `it is in the line to land and no panel round for it is among the newest `
+      + `${RUN_WINDOW} this page reads. Where it stands in the queue is known; `
+      + `whether anybody has read it is not.`});
+  return out;
+}
+
+// ---- render ----------------------------------------------------------------
+
+function factEl(f){
+  if(!f) return "";
+  return `<div class="fact"><div class="k">${esc(f.k)}</div>`
+       + `<div class="v${f.unknown?" unknown":""}">${esc(f.v)}</div>`
+       + (f.asof ? `<div class="asof">${esc(f.asof)}</div>` : "") + `</div>`;
+}
+
+function prRow(r){
+  const v = verdict(r);
+  const el = document.createElement("article");
+  el.className = "pr " + v;
+  const url = `https://github.com/${r.repo}/pull/${r.pr}`;
+  const facts = [roundCell(r), humanCell(r), queueCell(r), stopCell(r),
+                 memoryCell("pr state", r.run && r.run.pr_state, r),
+                 memoryCell("ci", r.run && r.run.ci_status, r)];
+  el.innerHTML = `
+    <div class="top">
+      <span class="num">#${esc(r.pr)}<span class="repo"> ${esc(shortRepo(r.repo))}</span></span>
+      <span class="verdict ${v}">${esc(LABEL[v])}</span>
+      <a class="gh" href="${esc(url)}" target="_blank" rel="noopener">github &#8599;</a>
+    </div>
+    <div class="title${r.title?"":" untitled"}">${
+      esc(r.title || "no title — nothing that named this PR recorded one")}</div>
+    ${r.entry && r.entry.note ? `<div class="note">in the line as: “${
+      esc(r.entry.note)}”</div>` : ""}
+    <div class="facts">${facts.map(factEl).join("")}</div>
+    ${r.needs.length ? `<div class="classes">${r.needs.map(d =>
+      `<span class="cls" title="${esc(d.reason || d.title || "")}">${
+        esc(d.class || "unclassed")} · ${esc(span(d.age_seconds||0))}</span>`
+      ).join("")}</div>` : ""}
+    ${caveats(r).map(c => `<div class="caveat${c.settled?" settled":""}">${
+      c.settled?"":"⚠ "}${esc(c.text)}</div>`).join("")}`;
+  return el;
+}
+
+const RANK = {waiting:0, landing:1, queued:2, unclear:3, noround:4};
+// The chip's words. `noround` says what this page holds, not what happened to the
+// PR — the board may well hold a round outside the window it read.
+const LABEL = {waiting:"waiting", landing:"landing", queued:"queued",
+               unclear:"unclear", noround:"no round here"};
+
+function render(){
+  const counts = {waiting:0, landing:0, queued:0, unclear:0, noround:0};
+  const shown = [];
+  for(const r of rows){
+    counts[verdict(r)]++;
+    if(!quiet(r) || showQuiet.checked) shown.push(r);
+  }
+  shown.sort((a,b) => RANK[verdict(a)] - RANK[verdict(b)]
+    || ((a.entry && a.entry.position) || 99) - ((b.entry && b.entry.position) || 99)
+    || (Date.parse(b.run && b.run.ts) || 0) - (Date.parse(a.run && a.run.ts) || 0));
+  listEl.innerHTML = "";
+  for(const r of shown) listEl.appendChild(prRow(r));
+
+  const hidden = rows.length - shown.length;
+  // `waiting` is the endpoint's count over EVERYTHING it matched; `items` is the
+  // page of it that fits under its own cap. Summing the rows would report the
+  // trimmed number under the untrimmed label, which is the one figure on this
+  // page a person is meant to act on.
+  const drawn = rows.reduce((n, r) => n + r.needs.length, 0);
+  const human = waiting === null ? drawn : waiting;
+  countsEl.innerHTML =
+    `<b>${esc(human)}</b> waiting on a human · `
+    + `<b>${counts.queued + counts.landing}</b> in line · `
+    + `<b>${counts.unclear + counts.noround}</b> neither`
+    + (hidden ? ` · ${hidden} quiet not shown` : "")
+    + (waiting !== null && drawn !== waiting
+        ? ` · ${drawn} of the ${waiting} drawn on a row` : "")
+    + (staleSince ? `<span class="stale"> · not refreshed for ${
+        span((Date.now() - staleSince) / 1000)} — every figure above is that old`
+      : "");
+  emptyEl.style.display = rows.length ? "none" : "block";
+  renderQueues();
+  scopeEl.textContent = scopeNote;
+}
+
+// The line itself, per `(repo, base)`. Drawn even when it is empty, and
+// especially then: a queue that has never had an entry is indistinguishable from
+// one nobody enqueues to, and the only way that ever gets noticed is a surface
+// that shows the zero and says what it cannot rule out.
+function renderQueues(){
+  if(!queues.length){ queuesEl.innerHTML =
+    `<div class="queue"><div class="sub">no line was asked about — this page derives `
+    + `its (repo, base) pairs from the panel runs it read, and it read none.</div></div>`;
+    return; }
+  queuesEl.innerHTML = queues.map(q => {
+    if(q.error) return `<div class="queue"><h2>${esc(q.repo)} → ${esc(q.base)}</h2>`
+      + `<div class="caveat">⚠ the board would not answer for this line: ${
+        esc(q.error)}. That is not an empty queue; it is no queue reading at all.</div></div>`;
+    const n = (q.entries || []).length;
+    const claim = q.claim && q.claim.held
+      ? `merge claim held by ${who(q.claim.holder)}${q.claim.note
+          ? ` — “${esc(q.claim.note)}”` : ""} · expires ${esc(until(q.claim.expires))}`
+      : `no merge claim held — the queue orders around one, and nobody is holding it`;
+    return `<div class="queue">
+      <h2>${esc(q.repo)} → ${esc(q.base)}</h2>
+      <div class="sub">${n} in the line · ${esc(
+        (q.counts && q.counts.ready) || 0)} ready · ${esc(q.ordering || "fifo")}</div>
+      <div class="sub">${claim}</div>
+      ${n ? `<ol>${q.entries.map(e =>
+        `<li><b>#${esc(e.pr)}</b> · ${esc(e.verdict)}${
+          e.verdict==="ready" && e.ready===false ? " (retired — head moved)" : ""
+        } · ${who(e.holder)}<br>
+        <span class="note">${esc(e.note || "no note")}</span></li>`).join("")}</ol>`
+        : `<div class="caveat">⚠ ${esc(QUEUE_UNFED)}</div>`}
+    </div>`;
+  }).join("");
+}
+
+showQuiet.onchange = render;
+
+// ---- data ------------------------------------------------------------------
+
+// The runs and the human judgements first, then the lines they name. Two hops
+// rather than one, because `GET /merge-queue` answers about exactly one
+// `(repo, base)` and nothing enumerates them — the pairs come off the runs this
+// page has already read. A new endpoint to list them would mean #395 had drifted
+// from "render what is already served" into "serve something else".
+async function load(){
+  const my = ++gen;
+  let runs, needs;
+  try {
+    const [a, b] = await Promise.all([
+      fetch(`/reviews?limit=${RUN_WINDOW}`, {headers:{Accept:"application/json"}}),
+      // include_settled stays off: a defect somebody has already acted on is not
+      // waiting on anybody, and counting it would inflate the one number on this
+      // page a person is meant to act on.
+      fetch("/review/needs-human?limit=500", {headers:{Accept:"application/json"}}),
+    ]);
+    if(!a.ok || !b.ok){
+      if(my===gen) fell(`the board would not answer (${[a,b].map(r=>r.status).join("/")})`);
+      return;
+    }
+    [runs, needs] = await Promise.all([a.json(), b.json()]);
+  } catch(err) {
+    // Without this the last good page stays on screen looking live, with nothing
+    // to say it stopped refreshing — this page's own failure mode, in the page.
+    if(my===gen) fell("the board is unreachable — " + ((err && err.message) || "network error"));
+    return;
+  }
+  if(my !== gen) return;
+
+  // Newest run per PR. `/reviews` is ordered newest first, so the first one seen
+  // for a key is the newest and every later one is an earlier round.
+  const trimmed = !!(needs && needs.truncated);
+  waiting = (needs && typeof needs.waiting === "number") ? needs.waiting : null;
+  const byPr = new Map();
+  const seen = new Set();
+  const blank = (repo, pr, extra) => ({repo, pr, title:null, run:null, base:null,
+    needs:[], entry:null, entries:0, queueDepth:0, lineRead:false,
+    listTrimmed:trimmed, ...extra});
+  for(const run of (runs || [])){
+    const key = `${run.repo}#${run.pr}`;
+    if(seen.has(key)) continue;
+    seen.add(key);
+    byPr.set(key, blank(run.repo, run.pr,
+                        {title:run.pr_title, run, base:run.base}));
+  }
+
+  // A defect can name a PR whose last round fell outside the run window. That PR
+  // is the one somebody is most likely waiting on, so it gets a row with no run
+  // rather than no row at all.
+  for(const d of (needs && needs.items) || []){
+    const key = `${d.repo}#${d.pr}`;
+    if(!byPr.has(key)) byPr.set(key, blank(d.repo, d.pr, {}));
+    byPr.get(key).needs.push(d);
+  }
+
+  // Which lines to ask about: `main` for every repo seen FIRST, then every
+  // `(repo, base)` a run in the window named. The order is the point — derived
+  // bases are a long tail, and eight recent feature branches would otherwise
+  // consume the cap and drop the one line this page promises to ask about.
+  const pairs = new Map();
+  for(const rp of new Set([...(runs||[]).map(x => x.repo),
+                           ...(((needs&&needs.items)||[]).map(x => x.repo))]))
+    if(rp) pairs.set(`${rp}\u0001${DEFAULT_BASE}`, [rp, DEFAULT_BASE]);
+  for(const run of (runs || [])){
+    if(run.repo && run.base)
+      pairs.set(`${run.repo}\u0001${run.base}`, [run.repo, run.base]);
+  }
+  const asked = [...pairs.values()].slice(0, QUEUE_CALLS);
+  const askedKeys = new Set(asked.map(([rp, b]) => `${rp}\u0001${b}`));
+
+  const answers = await Promise.all(asked.map(async ([repo, base]) => {
+    try {
+      const r = await fetch(`/merge-queue?repo=${encodeURIComponent(repo)}`
+                          + `&base=${encodeURIComponent(base)}`,
+                            {headers:{Accept:"application/json"}});
+      if(!r.ok) return {repo, base, error:`HTTP ${r.status}`};
+      const q = await r.json();
+      return {...q, repo, base};
+    } catch(err) {
+      return {repo, base, error:(err && err.message) || "network error"};
+    }
+  }));
+  if(my !== gen) return;
+
+  for(const q of answers){
+    if(q.error) continue;      // a line nobody could read proves nothing about it
+    for(const e of (q.entries || [])){
+      const key = `${q.repo}#${e.pr}`;
+      if(!byPr.has(key)) byPr.set(key, blank(q.repo, e.pr, {base:q.base}));
+      const r = byPr.get(key);
+      // The FIRST line it was found in wins the cell, and `entries` says there
+      // were others. Overwriting would quietly report one membership and one
+      // depth for a PR standing in two of them.
+      r.entries += 1;
+      if(!r.entry){ r.entry = e; r.queueDepth = (q.entries || []).length;
+                    r.base = r.base || q.base; }
+    }
+  }
+  // Whether this page read the line a row would land in. That is what makes
+  // "not in the line" a statement about the queue rather than about the page.
+  const answered = new Set(answers.filter(q => !q.error)
+                                  .map(q => `${q.repo}\u0001${q.base}`));
+  for(const r of byPr.values())
+    r.lineRead = !!(r.base && askedKeys.has(`${r.repo}\u0001${r.base}`)
+                    && answered.has(`${r.repo}\u0001${r.base}`));
+
+  queues = answers;
+  rows = [...byPr.values()];
+  readAt = Date.now();
+  staleSince = null;
+  scopeNote =
+    `${(runs||[]).length} panel run${(runs||[]).length===1?"":"s"} read (the newest `
+    + `${RUN_WINDOW}) — a pull request whose last round is older than that has no row `
+    + `here unless the queue or an outstanding human judgement puts one there. `
+    + `${NEEDS_HUMAN_SCOPE}`
+    + (needs && needs.truncated ? ` The needs-human list was truncated at its own cap, `
+        + `so ${needs.waiting} are waiting and ${needs.listed} of them are drawn.` : "")
+    + ` ${asked.length} line${asked.length===1?"":"s"} asked about`
+    + (pairs.size > asked.length
+        ? `, ${pairs.size - asked.length} more derived and not asked (the page asks at `
+          + `most ${QUEUE_CALLS})` : "")
+    + `. A line is only asked about if something above named its base, so a queue `
+    + `on a base no run and no waiting defect mentions is not merely unasked — it `
+    + `is undiscoverable from here and the number just given cannot count it. `
+    + `${PANEL_MEMORY}.`;
+  say("");
+  render();
+}
+
+load();
+setInterval(load, 20000);
+</script>
+</body>
+</html>

@@ -236,6 +236,12 @@ async def list_active(
             # every heartbeat.
             "state": lease.state,
             "state_at": lease.state_at.isoformat() if lease.state_at else None,
+            # How far along, beside whether it is moving — the two are read
+            # together and answer different questions (#262). None means nobody
+            # reported one, which is most leases; a renderer that drew that as a
+            # blank cell would be spelling "unreported" the same way it spells a
+            # stage, so every one of them says so instead.
+            "stage": lease.stage,
             "since": lease.acquired_at.isoformat(),
             "expires": lease.expires_at.isoformat(),
             "own": mine is not None and lease.session == mine,
@@ -357,6 +363,13 @@ async def find_overlap(
             "recap": lease.recap,
             "state": lease.state,
             "state_at": lease.state_at.isoformat() if lease.state_at else None,
+            # The field that decides whether you pile on, wait, or take something
+            # else. `R2` on the PR you were about to review means the round you
+            # would be duplicating is already running; `F0` on the issue you were
+            # about to claim means the first cut is being written right now. Repo,
+            # branch and title — the rest of this payload — say the same thing at
+            # every stage of a PR's life (#262).
+            "stage": lease.stage,
             "since": lease.acquired_at.isoformat(),
             "score": round(score, 3) if score is not None else None,
             "last_post_id": last.id if last else None,

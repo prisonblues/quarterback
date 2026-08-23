@@ -576,7 +576,8 @@ def test_check_json_carries_every_condition_separately(repo, capsys):
     # state quarterback itself was in for ninety-five of them.
     assert payload["untagged"] == ["v2", "v2.32", "v2.33", "v2.34"]
     assert payload["misplaced"] == {}
-    assert payload["unreachable"] == {}
+    assert payload["orphaned"] == {}
+    assert payload["reserved"] == {}
 
 
 def test_a_repo_the_tool_cannot_read_is_a_stop_and_never_a_quiet_zero(tmp_path, capsys):
@@ -618,3 +619,174 @@ def test_the_script_is_executable_and_has_a_shebang():
     path = Path(rt.__file__)
     assert os.access(path, os.X_OK), "the docs invoke it as `scripts/release_tag.py …`"
     assert path.read_text(encoding="utf-8").startswith("#!/usr/bin/env python3")
+
+
+# ---------------------------------------------------------------------------
+# check — the tag that is off the ref and is NOT a reservation (#406)
+# ---------------------------------------------------------------------------
+
+
+def squash_merged(repo: Path, version: str) -> tuple[str, str]:
+    """Reconstruct v3.8's landing, which is the whole of #406.
+
+    A branch stamps the release and reserves `refs/tags/vX.Y` against that commit — which is
+    correct, and is what makes the number un-stealable (#296). `main` then takes the branch
+    as a SQUASH: a brand-new commit carrying the branch's tree and main as its only parent.
+    The entry lands perfectly and the commit the tag names is not in main's history at all.
+
+    Returns `(the commit the tag was reserved against, the commit that actually landed)`.
+    """
+    git(repo, "switch", "-q", "-c", f"work-{version}")
+    reserved = stamp(repo, version)
+    git(repo, "tag", version, reserved)
+    git(repo, "switch", "-q", "main")
+    git(repo, "merge", "-q", "--squash", f"work-{version}")
+    landed = commit(repo, f"{version} — squashed (#1)")
+    return reserved, landed
+
+
+def test_a_squash_merged_release_leaves_a_tag_off_the_ref_and_that_is_a_finding(repo, capsys):
+    """#406, in one test. Before this the check asked whether a tag of that NAME resolved,
+    `v3.8` did, and `every release on main has a tag` was green over a release tag addressing
+    a commit that is not in main's history."""
+    assert run(repo, "backfill") == 0
+    reserved, _landed = squash_merged(repo, "v2.34")
+    capsys.readouterr()
+
+    assert run(repo, "check") == 2
+
+    err = capsys.readouterr().err
+    assert "v2.34 is tagged at" in err and reserved[:12] in err
+    assert "NOT on HEAD" in err
+    assert "squash or rebase" in err
+
+
+def test_the_orphan_report_names_the_commit_the_release_actually_landed_at(repo, capsys):
+    """A remedy that says "a tag is wrong" and not which commit is right sends the reader
+    back to work out the one thing the tool already knows."""
+    assert run(repo, "backfill") == 0
+    reserved, landed = squash_merged(repo, "v2.34")
+    capsys.readouterr()
+
+    run(repo, "check")
+
+    err = capsys.readouterr().err
+    assert f"It landed at {landed[:12]}" in err
+    assert f"git tag -f v2.34 {landed[:12]}" in err
+    assert f"--force-with-lease=v2.34:{reserved}" in err, \
+        "the lease has to quote what the ref holds now, or the repair is not atomic"
+
+
+def test_the_lease_quotes_the_tag_object_not_the_commit_for_an_annotated_tag(repo, capsys):
+    """`reserve` writes a lightweight tag and `backfill` writes an annotated one, and for the
+    second the ref holds the tag object rather than the commit. A lease quoting the peeled
+    commit is refused — safely, but the printed remedy is somebody's starting point."""
+    assert run(repo, "backfill") == 0
+    git(repo, "switch", "-q", "-c", "work")
+    reserved = stamp(repo, "v2.34")
+    git(repo, "tag", "-a", "-m", "v2.34", "v2.34", reserved)
+    git(repo, "switch", "-q", "main")
+    git(repo, "merge", "-q", "--squash", "work")
+    commit(repo, "v2.34 — squashed")
+    obj = git(repo, "rev-parse", "refs/tags/v2.34").strip()
+    assert obj != reserved, "this test is only meaningful for an annotated tag"
+    capsys.readouterr()
+
+    run(repo, "check")
+
+    assert f"--force-with-lease=v2.34:{obj}" in capsys.readouterr().err
+
+
+def test_a_reservation_and_an_orphan_in_one_repo_are_told_apart(repo, capsys):
+    """The constraint that makes this row usable at all, and the one a naive
+    `merge-base --is-ancestor` gets wrong. On the night #406 was filed FOUR release tags were
+    off main: v3.8 (squashed, a defect) and v3.9, v3.10, v3.12 (open pull requests holding
+    their numbers). Flagging the three would have trained everybody to ignore the row.
+
+    The discriminator is not the tag. It is whether the CHANGELOG at the ref declares that
+    release — which is what "has it landed" means."""
+    assert run(repo, "backfill") == 0
+    _reserved, _landed = squash_merged(repo, "v2.34")
+    git(repo, "switch", "-q", "-c", "in-flight")
+    still_going = stamp(repo, "v2.35")
+    git(repo, "tag", "v2.35", still_going)
+    git(repo, "switch", "-q", "main")
+    capsys.readouterr()
+
+    assert run(repo, "check") == 2
+
+    out, err = capsys.readouterr()
+    assert "v2.35 reserved at" in out, "an open branch's tag is listed, not accused"
+    assert "1 landed release(s) whose tag is not on HEAD" in out
+    assert "v2.35" not in err, "the reservation is not a finding"
+    assert "v2.34 is tagged at" in err
+
+
+def test_check_json_separates_an_orphan_from_a_reservation(repo, capsys):
+    """Separate keys rather than one `unreachable`, because the two need opposite responses
+    and anything reading this — CI, `qb-doctor`, #407 — must not have to re-derive which is
+    which."""
+    assert run(repo, "backfill") == 0
+    reserved, _ = squash_merged(repo, "v2.34")
+    git(repo, "switch", "-q", "-c", "in-flight")
+    in_flight = stamp(repo, "v2.35")
+    git(repo, "tag", "v2.35", in_flight)
+    git(repo, "switch", "-q", "main")
+    capsys.readouterr()
+
+    payload, rc = out_json(repo, capsys, "check")
+
+    assert rc == 2
+    assert payload["clean"] is False
+    assert payload["orphaned"] == {"v2.34": reserved}
+    assert payload["reserved"] == {"v2.35": in_flight}
+    assert payload["misplaced"] == {}
+    assert payload["untagged"] == []
+
+
+# ---------------------------------------------------------------------------
+# the guard runs — #169's class, which is the class #406 belongs to
+# ---------------------------------------------------------------------------
+
+
+def _tagged_job() -> dict:
+    """The job that reconciles the tags, found by what it RUNS rather than by its name.
+
+    Its name — `every release on main has a tag` — was a claim it did not test for five
+    months, so matching on the name is precisely the mistake this file is about. The
+    assertion below is #169's: a mechanism that ships and whose running is never asserted
+    is a mechanism nobody will notice the absence of.
+    """
+    yaml = pytest.importorskip("yaml")
+    workflow = Path(__file__).resolve().parent.parent / ".github/workflows/tests.yml"
+    jobs = yaml.safe_load(workflow.read_text(encoding="utf-8"))["jobs"]
+    running = [
+        job for job in jobs.values()
+        if any("release_tag.py check" in "\n".join(
+            line for line in str(step.get("run", "")).splitlines()
+            if not line.lstrip().startswith("#"))
+            for step in job.get("steps", []))
+    ]
+    assert len(running) == 1, (
+        f"{len(running)} jobs in tests.yml run `release_tag.py check`; the guard that a "
+        "landed release's tag is on main has to run exactly once and has to run at all")
+    return running[0]
+
+
+def test_ci_reconciles_the_tags_after_it_records_them():
+    """Order matters and it is not arbitrary. `backfill`'s job is to make `untagged` empty,
+    so a `check` running first would go red on the very release this run is about to tag."""
+    steps = [str(s.get("run", "")) for s in _tagged_job()["steps"]]
+    backfill = next(i for i, s in enumerate(steps) if "release_tag.py backfill" in s)
+    check = next(i for i, s in enumerate(steps) if "release_tag.py check" in s)
+    assert backfill < check
+
+
+def test_the_tag_reconciliation_reads_the_whole_history():
+    """The one way this job can be wrong and look right. A release's tag names the commit
+    that first declared it, which is a question about all of history, and `merge-base
+    --is-ancestor` against a depth-1 checkout answers about one commit."""
+    checkouts = [s for s in _tagged_job()["steps"]
+                 if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkouts, "the job checks nothing out"
+    assert all(str(s.get("with", {}).get("fetch-depth")) == "0" for s in checkouts)

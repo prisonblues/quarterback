@@ -17,6 +17,7 @@ from app.db import get_session
 from app.identity import is_human, retire, same_machine
 from app.models.blob import Blob
 from app.models.lease import Lease
+from app.models.post import Post
 from app.models.session import SessionRecord
 from app.schemas import CWD_MAX
 
@@ -69,6 +70,24 @@ EndReason = Literal["finished", "killed", "timed_out", "context_reset", "superse
 #: second listing is a second answer to "which reasons exist", and it disagrees
 #: with the first the day somebody adds a sixth to one of them.
 END_REASONS: tuple[str, ...] = get_args(EndReason)
+
+#: The SHAPE of a workflow stage, and deliberately nothing about its vocabulary.
+#:
+#: ``F0``, ``R1``, ``R1F``, ``R2`` … is a convention between the skills and the
+#: reader, not a closed set like :data:`END_REASONS`, and the difference is which
+#: way the two failure modes cost. A closed set has to be edited by anyone adding
+#: a stage — a skill inventing ``R4F`` would need a server release — while an
+#: unknown-but-well-formed token renders as six harmless characters in a column
+#: and a rejected one stops a workflow to argue about a cosmetic field. So this
+#: defends the pixels and nothing else: something that fits a narrow column and
+#: cannot smuggle markup, control characters or a paragraph into a fleet view.
+#:
+#: **Byte-identical to the check ``harness/bin/qb-stage`` makes** before it
+#: writes its marker, and ``tests/test_lease_stage.py`` holds the two together.
+#: A board that accepted what the producer refuses (or the reverse) would put the
+#: local status bar and the fleet view into disagreement about the same session,
+#: which is the gap #262 exists to close.
+STAGE_RE = r"^[A-Za-z0-9]{1,6}$"
 
 
 async def _active_lease(session: AsyncSession, sess_key: str, now: datetime) -> Lease | None:
@@ -154,6 +173,28 @@ class LeaseIn(BaseModel):
     #: reader's conclusion from `state_at` — and accepting it would let a holder
     #: assert a state it cannot know it is in.
     state: Literal["working", "waiting", "input"] | None = None
+
+
+class StageIn(BaseModel):
+    """``qb-stage``'s report: this session has got to here.
+
+    Keyed by ``session`` and not by ``lease_id`` because the caller is a one-line
+    shell script that knows ``$CLAUDE_CODE_SESSION_ID`` and nothing else. Making
+    it look a lease id up first would be a second round trip on a fail-open path,
+    for an identifier it would then have to keep in step with a lease it can be
+    re-granted at any time.
+
+    ``stage`` absent or null is *clear it* — the shape ``qb-stage --clear`` and
+    ``/drop-worktree`` need, because a lease still advertising ``R2`` after the
+    work landed is worse than one that says nothing.
+    """
+
+    session: str = Field(min_length=1)
+    stage: str | None = Field(
+        default=None,
+        pattern=STAGE_RE,
+        description="1-6 alphanumerics (F0, R1, R1F, R2 …); null clears it",
+    )
 
 
 class RenewIn(BaseModel):
@@ -292,6 +333,77 @@ async def renew_lease(
     lease.expires_at = now + timedelta(seconds=lease.ttl_seconds)
     await session.commit()
     return _lease_view(lease)
+
+
+@router.post("/lease/stage")
+async def report_stage(
+    body: StageIn,
+    holder: str = Depends(identify),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Where this session has got to — ``F0``, ``R1``, ``R1F``, ``R2`` … (#262).
+
+    Its own endpoint rather than a field on ``POST /lease``, because the two are
+    reported by different things at different times. The lifecycle hook heartbeats
+    the lease and has never been told a stage; ``qb-stage`` is told one and is not
+    a heartbeat. A stage riding the heartbeat would have to be *re-sent* on every
+    beat by a caller that does not know it, and the first beat that forgot would
+    look exactly like a clear.
+
+    **The post is written here, not by the caller.** ``qb-stage`` fails open and
+    must stay one non-blocking call, so a second request to ``POST /post`` is a
+    second thing to get wrong on a path that is allowed to be dropped entirely.
+    And "on change" is a comparison only the board can make: the caller's marker
+    is its own machine's, and a session re-leased on another box has no marker at
+    all. So this compares against the stored value and emits exactly when it
+    moves — which is what keeps a low-volume, high-signal event low-volume when a
+    skill re-asserts the same stage twice.
+
+    404 when nothing holds this session. That is a real answer and not a shrug:
+    a stage belongs to a live lease, and there is nowhere to put one otherwise.
+    The caller treats it, and every other failure, as nothing — see ``qb-stage``.
+    """
+    now = _utcnow()
+    lease = await _active_lease(session, body.session, now)
+    if lease is None:
+        raise HTTPException(404, "no active lease on this session")
+    if not same_machine(lease.holder, holder):
+        raise HTTPException(403, "not your lease")
+    if lease.stage == body.stage:
+        return {"session": body.session, "stage": lease.stage, "changed": False}
+
+    lease.stage = body.stage
+    # Where, as well as what. A stage on its own is six characters with no subject
+    # — `R2` says nothing to a follower who cannot see which of eight sessions
+    # moved — and repo/branch are what the rest of the board threads on.
+    where = " · ".join(filter(None, (lease.repo, lease.branch)))
+    summary = f"stage {body.stage}" if body.stage else "stage cleared"
+    # The same two facts as structured context, so the board can group a stage
+    # post with the rest of that branch's traffic rather than only print it. A
+    # `repo` ref names the repo in `value`, so it carries no `repo` key of its
+    # own; a `branch` ref does, because a branch name means nothing without one.
+    refs: list[dict[str, str]] = []
+    if lease.repo:
+        refs.append({"kind": "repo", "value": lease.repo})
+    if lease.branch:
+        refs.append({"kind": "branch", "value": lease.branch,
+                     **({"repo": lease.repo} if lease.repo else {})})
+    session.add(
+        Post(
+            author=holder,
+            session=body.session,
+            # `status`, so it rides the default board read. `presence` is muted as
+            # volume and this is the opposite of volume: a handful per session per
+            # day, against the heartbeats that stream already carries, and the one
+            # event that tells a peer whether the round it was about to start is
+            # already running.
+            type="status",
+            summary=f"{summary} · {where}" if where else summary,
+            refs=refs or None,
+        )
+    )
+    await session.commit()
+    return {"session": body.session, "stage": lease.stage, "changed": True}
 
 
 @router.post("/lease/release")
