@@ -2425,16 +2425,21 @@ async def exempt_item(
     person = is_human(who)
     before = _exempt_view(item)
 
-    def _unchanged(why: str) -> dict:
+    async def _unchanged(why: str) -> dict:
         """Idempotent: the state is already what was asked for, so nothing moves.
 
         Not an error, and not a second board post. An agent that retries — or two
         agents on one PR — must cost the person reading the board one message,
         not one per attempt.
+
+        **The same shape as the acting path**, ``item`` included. A response that
+        loses a key on the branch a retry takes is a response a retry cannot read,
+        and the retry is exactly the case this branch exists for.
         """
         return {"item_id": str(item.id), "pr": item.ref_value, "repo": item.repo,
                 "by": who, "acted": False, "proposed": False, "announced": False,
-                "post": None, "why": why, **before}
+                "post": None, "why": why, **before,
+                "item": (await _view_items(session, [item], _utcnow(), mine=who))[0]}
 
     if person:
         if body.grant:
@@ -2447,9 +2452,10 @@ async def exempt_item(
             line = None
     elif body.grant:
         if before["exempted"]:
-            return _unchanged("a person has already exempted this PR")
+            return await _unchanged("a person has already exempted this PR")
         if before["requested"]:
-            return _unchanged("an exemption has already been asked for on this item")
+            return await _unchanged(
+                "an exemption has already been asked for on this item")
         line = request_line(who, reason)
     else:
         if before["exempted"]:

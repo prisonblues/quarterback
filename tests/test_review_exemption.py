@@ -357,6 +357,9 @@ async def test_asking_twice_is_one_request_and_one_message_to_read(client):
     assert again.status_code == 200, again.text
     assert again.json()["acted"] is False
     assert again.json()["proposed"] is False and again.json()["post"] is None
+    # The same shape as the acting path: a retry has to be able to read the reply
+    # it gets, and the retry is what this branch is for.
+    assert again.json()["item"]["item_id"] == item["item_id"]
     # The original request stands; a second agent does not overwrite the first.
     assert again.json()["requested"]["reason"] == "docs only"
 
