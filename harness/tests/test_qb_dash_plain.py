@@ -157,18 +157,44 @@ def _titles(panel) -> str:
 
 # ---- the column count, which is the whole risk -------------------------------
 
-@pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
+# who state stage [repo] what ttl — five narrow, six wide.
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
 def test_the_fleet_panel_builds_the_columns_it_declared(dash, scope, expected):
     panel = dash.panel_agents(BOARD, 78, scope)
     assert len(_table(panel).columns) == expected
 
 
-@pytest.mark.parametrize("scope,expected", [(NARROW, 4), (WIDE, 5)])
+@pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
 def test_an_empty_fleet_pads_to_the_same_width(dash, scope, expected):
     """"nobody home" is a hand-counted filler row, and a wrong count grows a
     column that every real row is then drawn against."""
     panel = dash.panel_agents({"agents": []}, 78, scope)
     assert len(_table(panel).columns) == expected
+
+
+# ---- how far along, which is the only column that moves (#262) ---------------
+
+def test_the_fleet_panel_shows_a_reported_stage(dash):
+    """`who state stage repo what ttl` — beside `state`, because the two are read
+    together and answer different questions: whether the pane is moving, and
+    where it has got to."""
+    board = {**BOARD, "agents": [{**BOARD["agents"][0], "stage": "R1F"}]}
+    assert "R1F" in [c for row in _cells(dash.panel_agents(board, 78, WIDE)) for c in row]
+
+
+def test_a_lease_that_reported_no_stage_is_not_drawn_as_one(dash):
+    """The majority case, and the one that must not lie.
+
+    Every agent in BOARD predates the field, exactly as most leases will for a
+    while. A cell that came out empty would read as a clipped column or a
+    rendering fault; `qbdata.STAGE_UNREPORTED` is not alphanumeric, so it cannot
+    be confused with a stage somebody actually said — a stage is 1-6
+    alphanumerics by construction, at the board's edge and in `qb-stage`.
+    """
+    rows = _cells(dash.panel_agents(BOARD, 78, WIDE))
+    stages = [row[2] for row in rows]
+    assert stages == [qd.STAGE_UNREPORTED] * len(BOARD["agents"])
+    assert not any(s.strip().isalnum() for s in stages)
 
 
 @pytest.mark.parametrize("scope,expected", [(NARROW, 5), (WIDE, 6)])
@@ -259,8 +285,8 @@ def test_the_claims_panel_keeps_its_three_columns_when_it_is_empty(dash):
 def test_the_printed_panels_narrow_and_say_what_they_hid(dash):
     fleet = dash.panel_agents(BOARD, 78, NARROW)
     # Sorted by repo, so the row nothing could attribute leads — wearing the mark
-    # that is all this view has left to say so.
-    assert [r[2] for r in _cells(fleet)] == ["? nowhere", "here"]
+    # that is all this view has left to say so. Column 3: who state stage what ttl.
+    assert [r[3] for r in _cells(fleet)] == ["? nowhere", "here"]
     assert "1 elsewhere" in _titles(fleet)
 
     claims = dash.panel_claims(BOARD, 78, NARROW)
@@ -323,9 +349,10 @@ def test_the_printed_panels_go_wide_and_claim_to_hide_nothing(dash):
     """Sorted by repo, so the unattributed row leads — and it needs no mark here,
     because the cell that says so is back."""
     fleet = dash.panel_agents(BOARD, 78, WIDE)
-    assert [r[3] for r in _cells(fleet)] == ["nowhere", "elsewhere", "here"]
+    # who state stage repo what ttl.
+    assert [r[4] for r in _cells(fleet)] == ["nowhere", "elsewhere", "here"]
     assert "1 elsewhere" not in _titles(fleet)
-    assert [r[2] for r in _cells(fleet)] == ["—", "prisonblue…", "quarterback"]
+    assert [r[3] for r in _cells(fleet)] == ["—", "prisonblue…", "quarterback"]
     assert "quarterback#261" in [r[1] for r in _cells(dash.panel_claims(BOARD, 78, WIDE))]
 
 

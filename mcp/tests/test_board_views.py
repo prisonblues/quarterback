@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from mcp_server.board.views import (
     NOT_RECORDED,
+    STAGE_UNREPORTED,
     age,
     answers_for,
     fleet_rows,
@@ -62,6 +63,49 @@ def test_fleet_lists_agents_before_their_fan_out_and_marks_your_own():
     # A sub-agent inherits its parent's checkout and the board records no repo for
     # it, so the column stays empty rather than being invented.
     assert rows[1]["repo"] == "" and rows[1]["title"] == "Explore" and rows[1]["ttl"] == "2m"
+
+
+def test_the_fleet_row_says_how_far_along_the_work_is():
+    """The one column that moves. `repo`, `branch` and `title` read identically
+    writing the first cut and coming out of the third review round (#262)."""
+    rows = fleet_rows({"agents": [
+        {"holder": "zeus/a", "repo": "quarterback", "branch": "feat/issue-262",
+         "title": "t", "expires": iso(minutes=4), "since": iso(minutes=-10),
+         "session": "s1", "stage": "R1F"},
+    ]}, NOW)
+    assert rows[0]["stage"] == "R1F"
+
+
+def test_a_lease_that_reported_no_stage_is_not_drawn_as_one():
+    """The majority case, and the one a column must not dress up.
+
+    An empty cell reads equally as a clipped column, a rendering fault, or an
+    agent with no stage — and "those agents have no stage" is precisely the lie
+    #262 is about. `STAGE_UNREPORTED` is not alphanumeric, and a stage is 1-6
+    alphanumerics by construction, so the two cannot be confused.
+    """
+    rows = fleet_rows({
+        "agents": [{"holder": "zeus/a", "expires": iso(minutes=4),
+                    "since": iso(minutes=-10), "session": "s1"}],
+        "subagents": [{"holder": "zeus/a", "label": "Explore", "expires": iso(minutes=2),
+                       "since": iso(minutes=-1), "parent_session": "s1"}],
+    }, NOW)
+    assert [r["stage"] for r in rows] == [STAGE_UNREPORTED, STAGE_UNREPORTED]
+    assert not STAGE_UNREPORTED.isalnum()
+
+
+def test_a_sub_agent_is_not_given_its_parents_stage():
+    """The same rule `repo` and `branch` follow. The fan-out of an `R1F` fix pass
+    is the clearest case for inheriting one, and it is still an invention —
+    nothing on the board said it about the sub-agent."""
+    rows = fleet_rows({
+        "agents": [{"holder": "zeus/a", "expires": iso(minutes=4), "session": "s1",
+                    "since": iso(minutes=-10), "stage": "R1F"}],
+        "subagents": [{"holder": "zeus/a", "label": "fix", "expires": iso(minutes=2),
+                       "since": iso(minutes=-1), "parent_session": "s1"}],
+    }, NOW)
+    assert rows[0]["stage"] == "R1F"
+    assert rows[1]["stage"] == STAGE_UNREPORTED
 
 
 def test_sessions_fall_back_to_the_directory_name_when_untitled():

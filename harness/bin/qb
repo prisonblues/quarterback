@@ -32,8 +32,33 @@ QB_ENV="$(qb_env_path "$0")" \
 # shellcheck source=./qb-env
 . "$QB_ENV"
 qb_load_config
+# Same shim as qb-hook's, for the same reason: this file and qb-env are separately
+# pinned store paths (#204), and a library that predates `qb_requested_name` (#156)
+# must cost a cosmetic name rather than a stderr line on every recorded run.
+if ! command -v qb_requested_name >/dev/null 2>&1; then
+  qb_requested_name() { :; }
+fi
 qb_require_base_url || exit 1
 qb_resolve_token || { echo "qb: no token (set QUARTERBACK_TOKEN or QUARTERBACK_TOKEN_CMD in $QB_CONFIG)" >&2; exit 1; }
+
+# The opaque KEY the board names this agent against: an explicit QUARTERBACK_INSTANCE
+# if there is one, else the caller's fallback, shaped to `KEY_RE`. This file used to
+# send the label raw, so `sea t 3` and anything over 40 characters were a 400 — which
+# `record-review` swallows by design, so the review simply vanished.
+#
+# A second copy of `qb-hook`'s rule rather than a `qb-env` function, and that is the
+# one place in #156 where duplication is the safer answer: the hook derives its whole
+# IDENTITY from this on every event, and a hook paired with an older qb-env would
+# then post as the bare machine name — which is also the broadcast address. The same
+# skew costs `qb_requested_name` a cosmetic spelling, which is why that one is shared
+# and shimmed. `harness/tests/test_requested_name.py` holds the two copies
+# byte-for-byte equal over a corpus, so the duplication cannot drift unnoticed.
+_agent_key() {   # _agent_key <fallback key>
+  local n="${QUARTERBACK_INSTANCE:-}"
+  [ -n "$n" ] || n="${1:-}"
+  [ -n "$n" ] || return 0
+  printf '%s' "$n" | tr -c 'A-Za-z0-9._~-' '-' | sed -E 's/^[._~-]+//' | cut -c1-40
+}
 
 BASE="$QUARTERBACK_BASE_URL"
 TOK="$QUARTERBACK_TOKEN"
@@ -109,13 +134,25 @@ case "${1:-sessions}" in
     [ -n "$payload" ] || { echo "qb: record-review reads a JSON payload on stdin" >&2; exit 2; }
     # Same instance rule as qb-mcp/qb-hook: an explicit label wins, else the
     # session-id prefix — so a run recorded here is attributed to the same agent
-    # its posts and leases are. Written out rather than nested because `set -u`
-    # makes ${A:-${B:0:8}} an error when B is unset, which is the common case.
-    inst="${QUARTERBACK_INSTANCE:-}"
-    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
-    [ -n "$inst" ] && inst="${inst:0:8}"
+    # its posts and leases are. The prefix is written out rather than nested
+    # because `set -u` makes ${A:-${B:0:8}} an error when B is unset, which is
+    # the common case.
+    #
+    # The 8 belongs to the SESSION ID and to nothing else (#156). Applied to an
+    # explicit label as well, it recorded `seat-lexray-9`'s panel runs under the
+    # key `seat-lex` — a different row on the board from the one its hook and its
+    # MCP server register, so the agent that ran the review is not the agent the
+    # review is filed against. Every seat `qb-seats` builds has a label longer
+    # than eight characters.
+    sidkey="${CLAUDE_CODE_SESSION_ID:-}"
+    [ -n "$sidkey" ] && sidkey="${sidkey:0:8}"
+    inst=$(_agent_key "$sidkey")
     hdr=()
-    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    [ -n "$inst" ] && hdr+=(-H "X-Agent-Instance: $inst")
+    # …and the name request that makes an explicit label the spelling peers see
+    # rather than an alias nobody is shown. qb-env decides it; see there.
+    reqname=$(qb_requested_name)
+    [ -n "$reqname" ] && hdr+=(-H "X-Agent-Name: $reqname")
     out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
             -H 'Content-Type: application/json' --data-binary @- \
             --max-time 15 "$BASE/review" 2>&1) \
@@ -141,15 +178,16 @@ case "${1:-sessions}" in
     # nowhere else — so the caller has to learn it did not land, and can retry.
     payload=$(cat)
     [ -n "$payload" ] || { echo "qb: record-outcome reads a JSON payload on stdin" >&2; exit 2; }
-    # The same instance rule as `record-review` above, deliberately duplicated
-    # rather than factored out: that arm is a working path in the one command
-    # every panel run goes through, and four lines is a cheaper price than
-    # touching it.
-    inst="${QUARTERBACK_INSTANCE:-}"
-    [ -n "$inst" ] || inst="${CLAUDE_CODE_SESSION_ID:-}"
-    [ -n "$inst" ] && inst="${inst:0:8}"
+    # The same instance rule as `record-review` above — three lines, not a copy
+    # of the rule: `_agent_key` shapes the key and `qb_requested_name` decides
+    # the name, and each of those lives in exactly one place.
+    sidkey="${CLAUDE_CODE_SESSION_ID:-}"
+    [ -n "$sidkey" ] && sidkey="${sidkey:0:8}"
+    inst=$(_agent_key "$sidkey")
     hdr=()
-    [ -n "$inst" ] && hdr=(-H "X-Agent-Instance: $inst")
+    [ -n "$inst" ] && hdr+=(-H "X-Agent-Instance: $inst")
+    reqname=$(qb_requested_name)
+    [ -n "$reqname" ] && hdr+=(-H "X-Agent-Name: $reqname")
     out=$(printf '%s' "$payload" | curl -fsS "${auth[@]}" "${hdr[@]}" \
             -H 'Content-Type: application/json' --data-binary @- \
             --max-time 15 "$BASE/review/outcomes" 2>&1) \

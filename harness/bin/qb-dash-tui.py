@@ -413,7 +413,12 @@ class Dash(App):
         """
         repo = ("repo",) if self.scope.column else ()
         for table_id, columns in (
-            ("#fleet", ("who", "state", *repo, "what", "ttl")),
+            # `stage` goes between `state` and the toggling repo cell: it is a
+            # fixed column, so it must sit ABOVE the one that comes and goes for
+            # the same reason the action icons do (#262). `rank` goes after the
+            # repo cell for the opposite reason: it is the plan's own column and
+            # nothing indexes past it.
+            ("#fleet", ("who", "state", "stage", *repo, "what", "ttl")),
             ("#plan", ("", "⚒", *repo, "rank", "ref", "title", "who")),
             ("#prs", ("", "⚖", *repo, "pr", "title", "age")),
             ("#issues", ("", "⚒", *repo, "issue", "title", "who")),
@@ -594,6 +599,10 @@ class Dash(App):
             key = table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
+                # What `state` cannot say: `working` reads the same writing the
+                # first cut and coming out of the third review round, and so do
+                # repo, branch and title. This is the cell that moves (#262).
+                Text(*qd.stage_cell(a)),
                 *self.repo_cell(a.get("repo") or "—"),
                 # The mark goes on the cell the dropped column widened, and marks
                 # the row the scope KEPT without being able to attribute it: with
