@@ -17,6 +17,37 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.10 — the plan page's reorder controls can say why they are dead
+
+On a phone `/plan/view` opened, drew every row, and would move none of them. The
+gate was right — order is per exact scope, and the picker defaults to `(all)`,
+which is several scopes at once — but its reason lived in a `title=` attribute,
+and a touch screen has no hover. Three different states looked identical from a
+thumb: *pick a scope*, *this row is ordered in another list*, and *the edge
+refused your write*.
+
+The gate is unchanged. What changed is that each of the three now has a surface a
+tap can reach.
+
+- **Which list you are in** — one line above the plan, present exactly when the
+  picker is on `(all)`, naming the state and the control that fixes it. Said once,
+  not repeated on every row.
+- **This row in particular** — an open row riding along from another list says so
+  on its own meta line, and every dead control answers a tap in the header rather
+  than swallowing it. `aria-disabled` rather than `disabled`, so the button is
+  still visibly dead but can be asked why.
+- **Who is looking** — the page asks `/whoami` and says, before anything is
+  tapped, whether the writes on it will be accepted; every one of them is behind
+  `app.auth.human`. Same banner and the same wording as the fleet page, which
+  answers the same question about its own one verb.
+
+The rank column's provenance (#183) came off the same tooltip: a position somebody
+chose now reads differently from one that was merely appended, and the sentence
+behind it is a tap away.
+
+The picker also remembers the scope you last chose, so `(all)` — the one state in
+which nothing moves — is no longer where every visit starts.
+
 ## v3.7 — the one judgement in the release mechanism stops being a flag anything can pass
 
 `scripts/release_stamp.py` derives a release number from the CHANGELOG at `origin/main` and
