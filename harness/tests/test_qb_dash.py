@@ -591,13 +591,14 @@ async def _drive_scope() -> list[str]:
 
         # NARROW: this project's rows, the unattributable row kept, no repo cell.
         # Asserted on the `what` cell, which is the one the dropped column widened.
-        shown = sorted(_cells(fleet, i)[2] for i in range(fleet.row_count))
+        # who state stage what ttl — `what` is index 3 since the stage column (#262).
+        shown = sorted(_cells(fleet, i)[3] for i in range(fleet.row_count))
         if shown != ["? nowhere", "here"]:
             failures.append(f"narrow FLEET holds {shown}, not this repo's row and the "
                             "one the board could not attribute — marked, because the "
                             "cell that used to say so is the cell this view drops")
-        if len(fleet.columns) != 4:
-            failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 4")
+        if len(fleet.columns) != 5:
+            failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 5")
         if "1 elsewhere" not in titles["fleet"]:
             failures.append(f"narrow FLEET does not say what it hid: {titles['fleet']!r}")
         if "1 elsewhere" not in titles["claims"]:
@@ -620,8 +621,8 @@ async def _drive_scope() -> list[str]:
         titles = _titles(app)
         if fleet.row_count != 3:
             failures.append(f"the wide view holds {fleet.row_count} agents, not 3")
-        if len(fleet.columns) != 5:
-            failures.append(f"the wide view has {len(fleet.columns)} columns, not 5")
+        if len(fleet.columns) != 6:
+            failures.append(f"the wide view has {len(fleet.columns)} columns, not 6")
         if "elsewhere" in titles["fleet"] or "elsewhere" in titles["plan"]:
             failures.append(f"the wide view still claims to hide rows: {titles}")
         if claims.row_count != 2 or _cells(claims, 0)[1] != "quarterback#261":
@@ -640,6 +641,42 @@ async def _drive_scope() -> list[str]:
             failures.append("narrowing again did not redraw from what the client had")
 
     return failures
+
+
+async def _drive_stage() -> list[str]:
+    """FLEET's stage cells, with the two shapes that matter side by side."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    board = {"agents": [
+        {"holder": "zeus/one", "repo": "quarterback", "title": "third round",
+         "branch": "main", "stage": "R2"},
+        {"holder": "zeus/two", "repo": "quarterback", "title": "said nothing",
+         "branch": "main"},
+    ]}
+    async with app.run_test(size=(80, 44)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_board(board)
+        await pilot.pause()
+        fleet = app.query_one("#fleet")
+        return [_cells(fleet, i)[2] for i in range(fleet.row_count)]
+
+
+def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
+    """#262: `who state stage what ttl`, and the stage cell is column 2.
+
+    `state` says whether the pane is moving; this says where it has got to. The
+    agent that reported nothing gets the fleet's glyph for an unsaid value, which
+    is not alphanumeric and so cannot be read as a stage — the value space is 1-6
+    alphanumerics, at the board's edge and in `qb-stage` before it.
+    """
+    stages = asyncio.run(_drive_stage())
+    assert stages == ["R2", _load_app().qd.STAGE_UNREPORTED]
 
 
 def test_the_scope_narrows_the_rows_and_drops_the_column_together():

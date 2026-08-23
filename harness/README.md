@@ -2220,8 +2220,9 @@ to the file that just ran, the name is what gets printed.
   it is absent. **Write both with `tee`, never `>`** — a `>` redirect anywhere under
   `$HOME` is refused by the `dcg` pre-tool guard, and an agent that hits that block leaves
   the bar pointing at the main checkout for the whole session.
-- **Workflow stage.** `qb-stage <stage>` records how far along the work is, in
-  `~/.cache/claude-code/session-stage/$CLAUDE_CODE_SESSION_ID`:
+- **Workflow stage.** `qb-stage <stage>` records how far along the work is — in
+  `~/.cache/claude-code/session-stage/$CLAUDE_CODE_SESSION_ID` for the bar, and on the
+  session's quarterback lease for everybody else:
 
   | Stage | Means | Written by |
   |---|---|---|
@@ -2238,6 +2239,31 @@ to the file that just ran, the name is what gets printed.
   would be worse than one that said less. `qb-stage` checks the *shape* (1–6 alphanumerics)
   and not the vocabulary, so a new stage needs no edit to it — and it exits 0 in silence
   when there is no session id, because a loop under systemd has nobody watching a bar.
+
+  **And it tells the board** (#262). A marker file answers the question for the pane it
+  is written on, which is half of what a fleet is: cross-machine it is not there to read,
+  and same-machine nothing read it. So the same call POSTs the stage to `/lease/stage`,
+  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`,
+  `qb-dash` and `qb-dash-tui` all show it — and emits one `status` post on the live stream
+  when it *changes*, so a follower hears about a transition rather than polling for it.
+  `qb-stage` is the right place to say it because it is the only thing in the system that
+  is *told* the stage; the lifecycle hook reading this marker on each heartbeat would need
+  no code here and would make a fact the fleet acts on arrive up to a heartbeat late.
+
+  The report is **fail-open and non-blocking**: a backgrounded `curl` with stdin closed and
+  its output discarded, with the board config resolved inside that same subshell so a
+  `QUARTERBACK_TOKEN_CMD` waiting on a passphrase cannot stall the caller either. An
+  unconfigured, unreachable or slow board costs the marker nothing and says nothing —
+  telemetry that can fail the thing it reports on is worse than none. Board URL and token
+  come from the per-host contract in `qb-env`, read directly rather than sourced, exactly
+  as `worktree-holder` reads it; there is no default URL, because guessing one points the
+  report at another island's board.
+
+  On the reading end a lease that never reported a stage says so rather than showing a
+  blank: `/fleet` calls it `unreported`, in the same vocabulary it already uses for a
+  session nobody ended, and the terminal panels use `—` because six columns have no room
+  for the word. A stage is 1–6 alphanumerics by construction, so the dash cannot be
+  mistaken for one.
 
 `/drop-worktree` clears all three.
 
