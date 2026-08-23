@@ -1822,6 +1822,14 @@ URL and its token are repository secrets (`DEPLOY_WEBHOOK_URL`, `DEPLOY_TOKEN`);
 and the deploy job skips, so a fork still builds. Migrations run on boot from the stack
 entrypoint (`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
 
+The webhook is attempted **three times**, 5s and then 10s apart, each capped at 30s (#392). A
+healthy call is milliseconds; the two failures on record took exactly the cap, which is a call
+that got no answer rather than a slow one, so the cap is not the thing to raise. Exhausting all
+three still fails the job — and now says so where somebody is: an `::error` annotation, a run
+summary, and a `stuck` post on the board carrying curl's exit code and its per-phase timings.
+A rollout that did not happen is the one failure that hides behind every other signal being
+green, because the *next* release's deploy pulls the image the skipped one built.
+
 Watch a rollout land with `.info.version` in `/openapi.json`. Note the image only contains
 `pyproject.toml`, `alembic.ini`, `migrations/` and `app/`: a change confined to `.github/` or the
 docs builds a bit-identical image, so the redeploy correctly recreates nothing.
