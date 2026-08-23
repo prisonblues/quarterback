@@ -1746,6 +1746,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.3** — the landing procedure now says what goes wrong, not only what to decide.
 - **v3.4** — a PR body saying "this does not close #N" no longer closes #N.
 - **v3.5** — a page that says what every agent is doing, and how much of that is actually known.
+- **v3.6** — two test runs in one worktree stop corrupting each other.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -2059,8 +2060,8 @@ fails, fix the migration.
 forward, never by stamping past a failure. The suite already treats them that way — the
 schema fixture creates the run's database empty and runs `alembic upgrade head` into it, and
 `create-worktree` gives each worktree its own copy precisely so throwing one away costs
-nothing. A worktree
-whose database is wedged is a `remove-worktree`/`create-worktree` away from correct.
+nothing. A worktree whose database is wedged is a `remove-worktree`/`create-worktree` away
+from correct.
 
 **A migration must not import live application code.** A migration is a frozen artefact
 running at a fixed point in schema history; `app/` is whatever the package says today. The
