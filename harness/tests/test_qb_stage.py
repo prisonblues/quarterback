@@ -16,8 +16,10 @@ board into anybody's problem.
 Run: pytest harness/tests
 """
 
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -384,31 +386,70 @@ def _stub_env(run, tmp_path, board_url, stub):
     return env
 
 
-def _stub_running(stub) -> bool:
-    return subprocess.run(["pgrep", "-f", str(stub)], capture_output=True).returncode == 0
+def _stub_pids(stub) -> list[int]:
+    """PIDs whose command line names `stub`, read straight out of `/proc`.
+
+    `/proc` and not `pgrep`, for the same class of reason as the shebang rule
+    above: the nix build sandbox that runs this suite ships no procps, and a test
+    that needs a binary the sandbox does not have fails for a reason that is not
+    the code. `psutil` is not a dependency here and is not worth becoming one for
+    two assertions.
+    """
+    pids = []
+    needle = str(stub).encode()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if needle in (entry / "cmdline").read_bytes():
+                pids.append(int(entry.name))
+        except OSError:
+            continue  # it exited between the listing and the read
+    return pids
 
 
+def _reap(stub) -> None:
+    for pid in _stub_pids(stub):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+needs_proc = pytest.mark.skipif(
+    not Path("/proc/self/cmdline").exists(),
+    reason="reads /proc to see whether the token command is still running",
+)
+
+
+@needs_proc
 def test_a_hanging_token_command_does_not_outlive_its_bound(run, board, tmp_path):
-    """The orphan the test above would otherwise leave behind.
+    """The orphan the test below would otherwise leave behind.
 
     `curl --max-time` bounds curl and nothing else, so an unbounded credential
     source leaves a detached subshell per call that nobody is watching — the one
-    failure mode a fail-open path can still accumulate. The bound is on the token
-    command because that is the part that can wait forever.
+    failure mode a fail-open path can still accumulate, because nothing about it
+    is visible to the caller. The bound goes on the token command because that is
+    the part that can wait forever.
+
+    What is asserted is the process `qb-stage` itself started, matched by the
+    stub's own path. A credential command that forks and leaves grandchildren of
+    its own is that command's business; `timeout` reaches the child it supervises,
+    which is what releases the report and is all this path can promise.
     """
     b = board()
     stub = _token_stub(tmp_path)
-    subprocess.run([str(QB_STAGE), "R1"], env=_stub_env(run, tmp_path, b.url, stub),
-                   capture_output=True, text=True, check=False)
-    assert _stub_running(stub), "the token command should have been started at all"
+    try:
+        subprocess.run([str(QB_STAGE), "R1"], env=_stub_env(run, tmp_path, b.url, stub),
+                       capture_output=True, text=True, check=False)
+        assert _stub_pids(stub), "the token command should have been started at all"
 
-    deadline = time.monotonic() + 25
-    while time.monotonic() < deadline:
-        if not _stub_running(stub):
-            return
-        time.sleep(0.25)
-    subprocess.run(["pkill", "-f", str(stub)], capture_output=True)
-    raise AssertionError("a hanging token command was left running past its bound")
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            if not _stub_pids(stub):
+                return
+            time.sleep(0.25)
+        raise AssertionError("a hanging token command was left running past its bound")
+    finally:
+        _reap(stub)
 
 
 def test_a_token_command_that_hangs_does_not_hang_the_caller(run, board, tmp_path):
@@ -430,4 +471,5 @@ def test_a_token_command_that_hangs_does_not_hang_the_caller(run, board, tmp_pat
     assert proc.returncode == 0
     assert elapsed < 2.0, f"qb-stage waited {elapsed:.1f}s on a token command"
     assert (run.dir / run.session).read_text() == "R1"
-    subprocess.run(["pkill", "-f", str(stub)], capture_output=True)
+    if Path("/proc/self/cmdline").exists():
+        _reap(stub)
