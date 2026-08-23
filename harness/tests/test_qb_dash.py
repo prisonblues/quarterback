@@ -297,7 +297,7 @@ async def _drive_plan() -> list[str]:
         # `scope.column` (#261), so column 4 is the title on a wide pane and the
         # holder on a narrow one — and a narrow pane is now the default. The `? `
         # mark on an unattributable row is part of the cell but not of the title.
-        title_at = 4 if app.scope.column else 3
+        title_at = 5 if app.scope.column else 4
         title = str(plan.get_row_at(plan.scroll_offset.y)[title_at]).removeprefix("? ") \
             .rstrip("…")
         if title and title not in app.detail_text:
@@ -309,7 +309,9 @@ async def _drive_plan() -> list[str]:
         # it should do is read off the row the table actually scrolled to, not
         # off the index asked for: scrolling near the end of a list stops short.
         import qbdata as qd
-        ordered = qd.sort_plan(app.plan)
+        # The board's order, narrowed the way the panel narrows it — the panel no
+        # longer re-derives an order of its own, so neither may this.
+        ordered, _ = qd.in_scope(qd.plan_items(app.plan), app.scope)
         wanted = next((n for n, i in enumerate(ordered)
                        if qd.plan_issue(i) and not i.get("claim")), None)
         if wanted is None:
@@ -534,12 +536,21 @@ SCOPED_BOARD = {
     ],
 }
 
-SCOPED_PLAN = [
-    {"item_id": "a", "repo": "prisonblues/quarterback", "title": "ours",
-     "ref": {"kind": "issue", "value": "261"}, "blocked_by": [], "claim": None},
-    {"item_id": "b", "repo": "prisonblues/nix-fleet", "title": "theirs",
-     "ref": None, "blocked_by": [], "claim": None},
-]
+SCOPED_PLAN = {
+    "items": [
+        {"item_id": "a", "repo": "prisonblues/quarterback", "title": "ours", "rank": 1,
+         "rank_source": "ordered",
+         "ref": {"kind": "issue", "value": "261"}, "blocked_by": [], "claim": None},
+        {"item_id": "b", "repo": "prisonblues/nix-fleet", "title": "theirs", "rank": 1,
+         "rank_source": "appended",
+         "ref": None, "blocked_by": [], "claim": None},
+    ],
+    "counts": {"open": 2, "claimed": 0, "covered": 0, "blocked": 0, "stale": 0},
+    "order_trust": {"trusted": False, "unchosen": 1},
+    "next": {"item_id": "a", "repo": "prisonblues/quarterback",
+             "ref": {"kind": "issue", "value": "261"}, "caveat": None},
+    "truncated": False,
+}
 
 
 def _text(widget) -> str:
@@ -1123,10 +1134,10 @@ async def _drive_duplicate_keys() -> list[str]:
     app.refresh_prs = lambda: None
     app.refresh_issues = lambda: None
 
-    nameless = [
+    nameless = {"items": [
         {"title": "first with no id", "repo": "prisonblues/quarterback"},
         {"title": "second with no id", "repo": "prisonblues/quarterback"},
-    ]
+    ]}
     failures: list[str] = []
     logged: list[str] = []
     with mock.patch.object(app_module.ClickTable, "log", _CapturedLog(logged)):
@@ -1159,6 +1170,99 @@ async def _drive_duplicate_keys() -> list[str]:
             f"PLAN: the duplicate was absorbed in silence — the log holds {logged}, "
             "so nothing about this row would ever reach anybody")
     return failures
+
+
+async def _drive_plan_fields() -> list[str]:
+    """What a plan row and the PLANS title say, on data that is a literal here.
+
+    The clickable renderer drew the same five cells as the printed one and none of
+    the response envelope, so at the desk a reader could not answer "who chose this
+    order", "did I get the whole list" or "what does the board say is next" — none
+    of which is a layout question, and all of which were already on the wire.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    for name in ("refresh_limits", "refresh_seats", "refresh_board", "refresh_plan",
+                 "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    plan = {
+        "items": [
+            {"item_id": "a", "repo": "prisonblues/quarterback", "title": "chosen",
+             "rank": 1, "rank_source": "ordered", "blocked_by": [], "claim": None,
+             "ref": {"kind": "issue", "value": "394"}},
+            {"item_id": "b", "repo": "prisonblues/quarterback", "title": "a pr to land",
+             "rank": 2, "rank_source": "appended", "blocked_by": [], "claim": None,
+             "ref": {"kind": "pr", "value": "397"}},
+            {"item_id": "c", "repo": "prisonblues/quarterback", "title": "stuck and held",
+             "rank": 3, "rank_source": "appended", "blocked_by": [{"ref": "9"}],
+             "ref": None, "claim": {"holder": "zeus/jasper-moss"}},
+        ],
+        "counts": {"open": 40, "claimed": 1, "covered": 2, "blocked": 1, "stale": 4},
+        "order_trust": {"trusted": False, "unchosen": 2},
+        "next": {"item_id": "a", "repo": "prisonblues/quarterback",
+                 "ref": {"kind": "issue", "value": "394"},
+                 "caveat": "two of 40 open items sit where they were appended"},
+        "truncated": True,
+    }
+    failures: list[str] = []
+    async with app.run_test(size=(120, 44)):
+        app.scope = app.scope.toggled() if not app.scope.column else app.scope
+        app.build_columns()
+        app.plan_sig = None
+        app.render_plan(plan, None)
+        table = app.query_one("#plan")
+        rows = [_cells(table, i) for i in range(table.row_count)]
+        if [r[3] for r in rows] != ["1", "~2", "~3"]:
+            failures.append(f"PLAN: the rank cells read {[r[3] for r in rows]} — the "
+                            "human's order reaches the pane as row position alone, "
+                            "with nothing saying which positions anybody chose")
+        if [r[4] for r in rows] != ["#394", "PR#397", ""]:
+            failures.append(f"PLAN: the ref cells read {[r[4] for r in rows]} — a PR "
+                            "and an issue render the same, so nothing on the row says "
+                            "why one ⚒ works and the other does not")
+        if rows[0][0] != "◉":
+            failures.append(f"PLAN: the board's own `next` is not marked: {rows[0]}")
+        if rows[2][6] != "⊘zeus/jasper-moss":
+            failures.append(f"PLAN: the who cell reads {rows[2][6]!r} — the machine or "
+                            "the wait is missing, and both are facts about the row")
+        title = _text(app.query_one("#t_plan"))
+        for wanted in ("40 open", "1 running", "2 covered", "1 blocked", "4 stale",
+                       "~2 unchosen", "next #394", "truncated"):
+            if wanted not in title:
+                failures.append(f"PLAN: the title does not say {wanted!r}: {title!r}")
+        # The click detail is where a sentence fits, and the caveat is a sentence.
+        app.dispatch_row("plan:a", column=99)
+        if "two of 40 open items" not in app.detail_text:
+            failures.append(f"PLAN: clicking `next` does not show the board's caveat "
+                            f"about it: {app.detail_text!r}")
+        if "rank 1 (ordered)" not in app.detail_text:
+            failures.append(f"PLAN: the detail line drops the provenance a row has no "
+                            f"room for: {app.detail_text!r}")
+        app.dispatch_row("plan:b", column=99)
+        if "two of 40 open items" in app.detail_text:
+            failures.append("PLAN: the caveat about `next` was shown on another row, "
+                            "where it reads as a warning about that row")
+
+        # A board that came back has to stop being reported as down. The redraw is
+        # skipped when nothing changed, and "nothing changed" was true of a plan
+        # whose rows did not move across the outage — so the error text outlived
+        # the error, in the one case where nothing else would ever clear it.
+        empty = {**plan, "items": [], "counts": {}, "next": None, "truncated": False}
+        app.render_plan(empty, "HTTPError: 502")
+        if "board:" not in _text(app.query_one("#t_plan")):
+            failures.append("PLAN: a dead board is not reported in the title")
+        app.render_plan(empty, None)
+        if "board:" in _text(app.query_one("#t_plan")):
+            failures.append("PLAN: the board came back and the title still says it "
+                            "is down — the error outlived the error")
+    return failures
+
+
+def test_the_plan_row_and_title_carry_what_the_board_sent():
+    """#394: `fetch_plan` kept five of a plan item's fields and none of the
+    response envelope, so the terminal could not say what the web page says."""
+    assert asyncio.run(_drive_plan_fields()) == []
 
 
 def test_an_unforeseen_duplicate_degrades_instead_of_taking_the_dash_down():

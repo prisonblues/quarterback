@@ -1559,16 +1559,39 @@ and the `⚒` is where the loop needed a beginning.
 
 **The plans panel is the one that says what the work is FOR.** FLEET says who is here and
 CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
-ordered list, plus the fleet-wide one — with the items somebody is running at the top, then
-the ones that are free, then the blocked ones, which are the band a reader can do nothing
-about. Inside each band the board's own order is kept, because the order is the point of a
-plan, and the repos this dashboard watches come before the ones it only overhears. A row
-shows `▶` running with its holder, `▷` inside a plan somebody else holds, `○` free with how
-long it has sat, or `⊘` blocked with what it waits on — the `▷` because an item covered by
-another agent's plan claim is not free work, and showing it as free is the outcome
-`covered_by` exists to prevent. Clicking one puts its plan, its claim note, its blockers and
-its own note on the detail line: that reasoning lives on the board and nowhere else — a plan item never
-restates its issue — and it does not fit in a title cell.
+ordered list, plus the fleet-wide one — **in the board's own order**, which is the point of a
+plan and a human decision. The panel used to re-band it locally (running, then free, then
+blocked) and that was a second answer about an ordered list computed against that list's own
+order, which is how this pane and `/plan/view` came to disagree about what was next. What the
+banding was reaching for, the board sends outright: `next` is the first item that is open,
+unclaimed, unblocked and inside nobody else's held plan, it is named in the title and its row
+wears a filled `◉`.
+
+A row shows `▶` running with its holder, `▷` inside a plan somebody else holds, `⊘` blocked
+with what it waits on, `◉` the board's own pick, or `○` free with how long it has sat — the
+`▷` because an item covered by another agent's plan claim is not free work, and showing it as
+free is the outcome `covered_by` exists to prevent. Beside the glyph it carries its **rank**,
+marked `~12` where that position is merely where the add landed and nobody chose it (#183),
+and its **ref** as `#78` for an issue or `PR#78` for a pull request — the kind used to be
+dropped, so a PR-backed row drew a dim `⚒` with nothing saying why the item beside it was
+takeable and it was not. The right-hand cell names the holder as `machine/name`, because a
+name alone is recycled and two boxes read as one agent; a held row that is also waiting wears
+the `⊘` in front of the holder, which is the one combination worth acting on.
+
+The title carries what the board concluded about the whole list, and it goes there rather
+than on rows of its own because rows are the scarce thing (#269): the board's own counts,
+which separate an item **covered** by a plan claim from one **claimed** outright and know
+which are **stale**; `~N unchosen` when part of the order is where the adds happened to land;
+what is **next**; and `truncated at N` when the page is not all of it. Clicking a row puts its
+plan, its claim note and expiry, its blockers, its rank and who chose it, how long it has been
+idle and its own note on the detail line — plus, on the `next` row alone, the board's caveat
+about how much that recommendation is worth. That reasoning lives on the board and nowhere
+else — a plan item never restates its issue — and it does not fit in a title cell.
+
+The read says which **session** is asking. `GET /plan` resolves "is this inside somebody
+else's held plan" by machine when the caller does not say, and a machine here runs several
+agents on one token — so a plan the agent in the next pane was holding came back as this
+reader's own, and every item of it was drawn free to take.
 
 A plan item that points at an issue carries a `⚒` like an issue row, so the shortest path
 from "what is next" to somebody doing it is one click. An item pointing at nothing, or one

@@ -1549,8 +1549,46 @@ def ci_counts(prs: list[dict]) -> dict[str, int]:
 PLAN_LIMIT = 200        # a plan is tens of rows by design; this is a backstop
 
 
-def fetch_plan(client) -> tuple[list[dict], str | None]:
-    """Every open plan item on the board, in the board's own order.
+#: The shape of an answer, so a caller that got an error still gets one it can
+#: read. Every key `GET /plan` always sends, defaulted to the empty version of
+#: itself — a renderer asking a dead board what is next gets "nothing", not a
+#: KeyError three panels later.
+EMPTY_PLAN: dict = {"items": [], "counts": {}, "order_trust": {}, "next": None,
+                    "truncated": False, "plans": [], "scopes": [], "plan": None,
+                    "repo": None, "exact": False, "generated": None}
+
+
+def viewer_session() -> str:
+    """The session id a dashboard reads the plan as. Never nothing, and never a lie.
+
+    `GET /plan` decides `covered_by` — "this item is inside a plan somebody ELSE
+    holds" — by machine when the caller does not say which session it is, because
+    a bearer token proves a machine and knows nothing finer. This machine runs
+    seven agents at once. So a read with no session came back with every plan
+    claim taken on this box resolved as the reader's own, the panel drew that work
+    with the cyan "free to take" glyph, and the duplicated work a plan claim
+    exists to prevent was restored on the read path (app/api/plan.py:_covered_by).
+
+    A dashboard holds no claims, so the honest session is one that is nobody
+    else's: this process. $CLAUDE_CODE_SESSION_ID when the dashboard was started
+    inside an agent's session, so that agent's own plan claim still reads as its
+    own; otherwise a per-process id, which matches no claim — which is the point,
+    not a shortcoming.
+    """
+    return ((os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+            or f"qb-dash:{os.getpid()}")
+
+
+def fetch_plan(client, session: str | None = None) -> tuple[dict, str | None]:
+    """The board's whole answer about the plan — the envelope, not just the items.
+
+    `items` is a page of a list; the envelope is what the board CONCLUDED about
+    that list, and it is all computed already: `next` (what to pick up) with its
+    own `caveat` (how much that is worth), `order_trust` (who chose this order),
+    `truncated` (whether you got all of it) and `counts` (how much of it is taken,
+    covered, blocked and stale). Keeping `items` alone threw away six answers a
+    second call could not have got back, and left both dashboards re-deriving the
+    plan's order against the plan's own order.
 
     No repo filter, deliberately: a repo read widens to the fleet-wide items but
     still hides the other repos' lists, and this panel is called PLANS because
@@ -1560,10 +1598,22 @@ def fetch_plan(client) -> tuple[list[dict], str | None]:
     :func:`fetch_board` treats it.
     """
     try:
-        data = client.get(f"/plan?limit={PLAN_LIMIT}")
+        data = client.get("/plan", {"limit": PLAN_LIMIT,
+                                    "session": session or viewer_session()})
     except Exception as exc:                      # noqa: BLE001 — display it, don't die
-        return [], f"{type(exc).__name__}: {exc}"
-    return data.get("items") or [], None
+        return dict(EMPTY_PLAN), f"{type(exc).__name__}: {exc}"
+    plan = {**EMPTY_PLAN, **(data or {})}
+    # A key present and null is the same to a renderer as a key that is absent,
+    # and only one of the two survives the merge above.
+    for key, empty in (("items", []), ("counts", {}), ("order_trust", {}),
+                       ("plans", []), ("scopes", [])):
+        plan[key] = plan.get(key) or empty
+    return plan, None
+
+
+def plan_items(plan: dict | None) -> list[dict]:
+    """The rows out of a `/plan` envelope. One reader, so nobody unwraps it by hand."""
+    return (plan or {}).get("items") or []
 
 
 def plan_holder(item: dict) -> dict | None:
@@ -1581,21 +1631,26 @@ def plan_holder(item: dict) -> dict | None:
 
     `covered_by` is already somebody ELSE's: the board resolves "mine" before it
     answers, and your own plan claim covers nothing from you — that is what lets
-    the holder work through its own list item by item. Note that
-    :func:`fetch_plan` sends no session, so on a multi-agent box the board answers
-    by machine and a co-tenant's hold reads as nobody's. That is the documented
-    coarse fallback and not this function's to fix; it means the dashboard
-    understates coverage there, never overstates it.
+    the holder work through its own list item by item. "Else" is decided per
+    SESSION now that :func:`fetch_plan` sends one (:func:`viewer_session`), so a
+    co-tenant's held plan on this machine reads as held rather than as nobody's;
+    reading by machine alone was the understatement this panel used to draw over.
     """
     return item.get("claim") or item.get("covered_by") or None
 
 
-def plan_state(item: dict) -> tuple[str, str]:
+def plan_state(item: dict, next_id: str | None = None) -> tuple[str, str]:
     """(glyph, colour) for a plan row: running, held via its plan, blocked, or free.
 
     ▷ rather than ▶ for a covered item, because the remedy is different: ▶ is an
     agent on this line, ▷ is an agent on the whole list this line is in, and what
     a reader does about it is talk to them rather than take one item out of it.
+
+    ◉ is the board's own `next` — the filled version of the free ○, because that
+    is exactly what it is: `next` is by definition open, unclaimed, unblocked and
+    uncovered, so it can only ever be a row this would otherwise draw ○. The panel
+    could not point at it before, and re-deriving which row it should be is how
+    the two surfaces came to disagree about the answer the board had already sent.
     """
     if item.get("claim"):
         return "▶", "green"
@@ -1603,17 +1658,49 @@ def plan_state(item: dict) -> tuple[str, str]:
         return "▷", "yellow"
     if item.get("blocked_by"):
         return "⊘", "grey50"
+    if next_id and item.get("item_id") == next_id:
+        return "◉", "bold cyan"
     return "○", "cyan"
 
 
 def plan_ref(item: dict) -> str:
-    """'#78' for an item that points at an issue or PR, '' for one that does not.
+    """'#78' for an issue-backed item, 'PR#78' for a PR-backed one, '' for neither.
 
     Most plan items are a line of plan and nothing else; the ref is the link to
     where the *what* and the *why* live.
+
+    **The kind is read rather than dropped.** :func:`plan_issue` refuses anything
+    but an issue, so a PR-backed row draws a dim ⚒ and does nothing when it is
+    clicked — and with both kinds rendered `#78` there was nothing on the row
+    saying why the item beside it was takeable and this one was not. The web page
+    had the same defect and answered it the same way (`refLabel`, plan.html).
     """
-    value = (item.get("ref") or {}).get("value")
-    return f"#{value}" if value else ""
+    ref = item.get("ref") or {}
+    value = ref.get("value")
+    if not value:
+        return ""
+    return f"PR#{value}" if ref.get("kind") == "pr" else f"#{value}"
+
+
+def plan_rank(item: dict) -> tuple[str, str]:
+    """(text, colour) for the rank cell — the item's place, and whether anybody chose it.
+
+    The human's order used to reach the terminal as row position and nothing else,
+    which is the one presentation that cannot distinguish a chosen priority from
+    the order the adds arrived in. That is #183's complaint exactly, and the data
+    to answer it (`rank`, `rank_source`) has been on every row all along.
+
+    `~12` means rank 12 is where the item landed because appending was all the
+    endpoint could do — nobody put it there. A bare `12` was placed, submitted or
+    ordered by somebody. The tilde is the same mark the panel title counts with,
+    so `~5 unchosen` in the title and five tildes down the column are one fact.
+    """
+    rank = item.get("rank")
+    if rank is None:
+        return "", "grey42"
+    if (item.get("rank_source") or "appended") == "appended":
+        return f"~{rank}", "grey42"
+    return f"{rank}", "grey70"
 
 
 def plan_repo(item: dict, repos: list[str] | None = None) -> str | None:
@@ -1651,45 +1738,154 @@ def plan_issue(item: dict, repos: list[str] | None = None) -> dict | None:
     return {"number": int(value), "repo": repo, "title": item.get("title")}
 
 
-def sort_plan(items: list[dict], repos: list[str] | None = None) -> list[dict]:
-    """Taken first, then what is free to take, then what is blocked.
+#: The states the board counts a plan in, and what the title calls each. The
+#: board's own categories, in the board's own order, because the title reports
+#: the board's own numbers — `covered` split out from `claimed` is the whole
+#: point of it: a blocked item needs work finishing, a covered one needs a word
+#: with its holder (app/api/plan.py).
+#:
+#: They OVERLAP, exactly as the board's do: an item both claimed and blocked is
+#: in both numbers. A local recount that quietly deduplicated would be a third
+#: answer about the plan, which is the thing this file has stopped giving.
+PLAN_TALLY = (("claimed", "running", "green"), ("covered", "covered", "yellow"),
+              ("blocked", "blocked", None), ("stale", "stale", None))
 
-    Inside each band the board's own order is kept — the plan is an ordered list
-    and the order is the point — with the repos this dashboard watches ahead of
-    the ones it only overhears. Blocked items sink because they are the one band
-    a reader can do nothing about.
 
-    The top band is :func:`plan_holder`, not `claim`: an item inside somebody
-    else's held plan is taken, and sorting it into the free band put it in the run
-    of rows a seat reads to find work nobody has. The free band has one job, and
-    an item that is not free is the list failing at it.
+def plan_tally(plan: dict, items: list[dict], hidden: int = 0) -> dict:
+    """How much of the plan is taken, covered, blocked and stale.
+
+    **The board's own counts whenever the panel is drawing the board's own list.**
+    They are computed over the whole open set rather than over the page, they
+    separate a covered item from a claimed one, and they know about `stale` — none
+    of which a client can work out from a truncated page of items. The local
+    recount this replaces folded covered into running, so the pane could not make
+    the distinction the board keeps those two numbers apart to make.
+
+    When a scope has hidden rows, those counts describe a list this panel is NOT
+    drawing, and a title that counts rows the pane refuses to show is a title
+    lying about the pane. So the same categories are recomputed over the rows that
+    are left — same words, same overlaps, narrower list, and `elsewhere(hidden)`
+    beside them saying so.
+
+    A recount can only see the page. Scoped AND truncated, it therefore counts the
+    rows that arrived rather than the rows that exist — which is why `truncated` is
+    the one segment of the title that is never dropped: the number is qualified
+    beside it rather than left to be taken for the whole.
     """
-    watched = {short_repo(r) for r in (repos if repos is not None else resolve_repos())}
-
-    def band(item: dict) -> int:
-        if plan_holder(item):
-            return 0
-        return 2 if item.get("blocked_by") else 1
-
-    def near(item: dict) -> int:
-        repo = item.get("repo")
-        return 0 if not repo or short_repo(repo) in watched else 1
-
-    return sorted(items, key=lambda i: (band(i), near(i)))
+    counts = plan.get("counts") or {}
+    if counts and not hidden:
+        return {"open": counts.get("open", 0),
+                **{key: counts.get(key, 0) for key, _, _ in PLAN_TALLY}}
+    return {"open": len(items),
+            "claimed": sum(1 for i in items if i.get("claim")),
+            "covered": sum(1 for i in items if i.get("covered_by")),
+            "blocked": sum(1 for i in items if i.get("blocked_by")),
+            "stale": sum(1 for i in items if i.get("stale"))}
 
 
-def plan_counts(items: list[dict]) -> tuple[int, int]:
-    """(running, blocked) — the two numbers both panel titles report.
+def plan_next_id(plan: dict) -> str | None:
+    """The item id the board says to pick up next, or None."""
+    return ((plan.get("next") or {}).get("item_id")) or None
 
-    An item covered by somebody else's plan claim counts as running. The title's
-    question is "how much of this list is already somebody's", and a plan claim
-    makes it somebody's — the glyph is what says whether the agent is on the line
-    or on the whole list. Counted as neither, it read as free work in the only
-    number a reader takes in without looking at the rows.
+
+def plan_next_label(plan: dict, visible: set[str] | None = None) -> str:
+    """How the title names `next`, or '' when the board offers nothing.
+
+    Repo-qualified when the row itself is not on the pane: a scope can hide the
+    item `next` names, and "next #78" over a list that does not contain #78 reads
+    as a rendering fault rather than as an answer about the whole plan.
     """
-    running = sum(1 for i in items if plan_holder(i))
-    blocked = sum(1 for i in items if not plan_holder(i) and i.get("blocked_by"))
-    return running, blocked
+    nxt = plan.get("next") or {}
+    if not nxt:
+        return ""
+    label = plan_ref(nxt) or clip(nxt.get("title"), 18)
+    if visible is not None and nxt.get("item_id") not in visible:
+        label = f"{short_repo(nxt.get('repo') or 'fleet')} {label}"
+    return label
+
+
+#: What the title gives up first when it does not fit, in the order it gives them
+#: up. The tally's detail goes before its total, and `next`, `truncated` and the
+#: open count never go: one is the answer a reader came for, one is a statement
+#: that the rows are not all of them, and the third is what the rows are.
+PLAN_HEAD_DROP = ("stale", "blocked", "covered", "running", "unchosen")
+
+
+def plan_head_bits(plan: dict, items: list[dict], hidden: int = 0,
+                   room: int | None = None) -> list[tuple[str, str | None]]:
+    """The PLANS title as (text, colour) segments — one title, two renderers.
+
+    Built here rather than twice, because the two panels had already drifted on
+    the two numbers they did share, and this adds five more: the split counts,
+    how much of the order nobody chose, what the board says is next, and whether
+    the page is all of it.
+
+    **The title is where the envelope goes, and that is a decision about rows.**
+    #269 measured 55 rows drawn into a 38-row pane with a whole panel below a fold
+    nothing can scroll to, so an answer worth a line of its own is an answer that
+    pushes another panel off the screen. Every one of these facts is about the
+    list as a whole, which is what a title is for; nothing here adds a row.
+    """
+    tally = plan_tally(plan, items, hidden)
+    bits: list[tuple[str, str | None]] = [(f"{tally['open']} open", None)]
+    bits += [(f"{tally[key]} {word}", colour)
+             for key, word, colour in PLAN_TALLY if tally.get(key)]
+    # #183's minimum fix, on the surface that could not show it: how many of these
+    # positions nobody chose. Silent when the whole order was chosen, because that
+    # is the state a reader needs no warning about — the per-row tilde is where
+    # "always present" lives.
+    #
+    # Recounted over the visible rows when a scope has hidden some, for the reason
+    # `plan_tally` recounts: the board's number is about the whole plan, and a
+    # title claiming five unchosen positions over two tildes on screen sends the
+    # reader looking for three rows that are not there.
+    unchosen = (plan.get("order_trust") or {}).get("unchosen") or 0
+    if hidden:
+        unchosen = sum(1 for i in items
+                       if (i.get("rank_source") or "appended") == "appended")
+    if unchosen:
+        bits.append((f"~{unchosen} unchosen", None))
+    label = plan_next_label(plan, {i.get("item_id") for i in items})
+    if label:
+        bits.append((f"next {label}", "cyan"))
+    if plan.get("truncated"):
+        bits.append((f"truncated at {len(plan_items(plan))}", "red"))
+    return _fit_head(bits, room)
+
+
+def _head_len(bits: list[tuple[str, str | None]]) -> int:
+    return len(" · ".join(text for text, _ in bits))
+
+
+def _fit_head(bits: list[tuple[str, str | None]],
+              room: int | None) -> list[tuple[str, str | None]]:
+    """Drop the least load-bearing segments until the title fits its panel.
+
+    A panel title is clipped at the border and clipped from the END — so a title
+    that overflows loses `next` and `truncated`, which are the two answers this
+    line exists to carry, and loses them without saying so. Dropping a segment
+    nobody would miss says the same thing in less room; being cut off mid-word at
+    "· trunca" does not.
+    """
+    if room is None:
+        return bits
+    for word in PLAN_HEAD_DROP:
+        if _head_len(bits) <= room:
+            return bits
+        bits = [(text, colour) for text, colour in bits if not text.endswith(word)]
+    # Then the count of what was truncated, which is the detail rather than the
+    # fact. "truncated" alone still says the rows are not the whole list.
+    if _head_len(bits) > room:
+        bits = [("truncated", colour) if text.startswith("truncated") else (text, colour)
+                for text, colour in bits]
+    # And a pane too narrow even for that gives up whole segments rather than
+    # having the last one cut off in the middle of a word. `next` is what survives
+    # to the end: on a pane with room for one answer, it is the one worth having.
+    for word in ("truncated", "open"):
+        if _head_len(bits) <= room:
+            break
+        bits = [(text, colour) for text, colour in bits if not text.endswith(word)]
+    return bits
 
 
 def plan_who(item: dict) -> tuple[str, str]:
@@ -1703,10 +1899,22 @@ def plan_who(item: dict) -> tuple[str, str]:
     the whole point of showing it: the column read as an idle age — "4d", the
     strongest possible invitation to pick something up — over work another agent
     had reserved.
+
+    **The machine stays on.** `machine/name` is the whole identity and the name
+    half alone is not unique: names are short, memorable and RECYCLED when an
+    agent finishes, so two agents on two boxes read as one agent — and the fleet
+    runs several boxes precisely so that they can work the same repo at once.
+
+    **A held row that is also blocked says both**, with the ⊘ the state column
+    uses for the same fact. Only one of the three could ever be true at a time was
+    the premise, and it is false for exactly this pair: an agent holding an item
+    that waits on something else is stuck, which is the one combination a reader
+    would want to do something about.
     """
     holder = plan_holder(item)
     if holder:
-        return (holder.get("holder") or "?").split("/", 1)[-1], "yellow"
+        waits = "⊘" if item.get("blocked_by") else ""
+        return waits + (holder.get("holder") or "?"), "yellow"
     blockers = item.get("blocked_by") or []
     if blockers:
         first = blockers[0].get("ref")
@@ -1791,21 +1999,35 @@ def _unprefixed(label: str, scope: Scope | None) -> str:
     return label
 
 
-def plan_detail(item: dict) -> str:
+def plan_detail(item: dict, envelope: dict | None = None) -> str:
     """The whole of a plan row, for the detail line under the tables.
 
     The note is why this is worth a click: it is the reasoning behind the item's
     place in the order, it exists nowhere else — not in the issue, not on the
     board tape — and it does not fit in a 44-column title cell.
+
+    The rest of what a row cannot carry goes here for the same reason: where the
+    item sits and who put it there, how long it has sat, when the claim on it
+    lapses, and — for the one row the board named `next` — the board's own caveat
+    about how much that recommendation is worth. `next.caveat` is a sentence; the
+    title has room for the count and this has room for the argument.
     """
     bits = [f"{short_repo(item.get('repo') or 'fleet')} {plan_ref(item)}".strip(),
             item.get("title") or "(untitled)"]
+    if item.get("rank") is not None:
+        source = item.get("rank_source") or "appended"
+        where = f"rank {item['rank']} ({source}"
+        if item.get("placed_for"):
+            where += f" {item['placed_for']}"
+        bits.append(where + ")")
     plan = item.get("plan") or {}
     if plan.get("label"):
         bits.append(f"[{plan['label']}]")
     claim = item.get("claim")
     if claim:
         held = f"held by {claim.get('holder') or '?'}"
+        if claim.get("expires"):
+            held += f", {until(claim['expires'])} left"
         if claim.get("note"):
             held += f" — {claim['note']}"
         bits.append(held)
@@ -1823,8 +2045,20 @@ def plan_detail(item: dict) -> str:
         bits.append("waits on " + ", ".join(
             f"{b.get('ref') and '#' + str(b['ref']) or ''} {b.get('title') or ''}".strip()
             for b in blockers))
+    if item.get("stale"):
+        bits.append(f"stale, idle {item.get('idle_days')}d")
+    if item.get("added_by"):
+        bits.append(f"added by {item['added_by']}")
     if item.get("note"):
         bits.append(item["note"])
+    # The caveat belongs to `next` and to no other row: it is the board's
+    # statement of how much ITS recommendation is worth, and pinning it to any
+    # other item would read as a warning about that item.
+    # `envelope` and not `plan`: the local `plan` here is the item's own plan ROW
+    # (the label it sits under), which is a different thing from the /plan answer.
+    caveat = ((envelope or {}).get("next") or {}).get("caveat")
+    if caveat and plan_next_id(envelope or {}) == item.get("item_id"):
+        bits.append(caveat)
     return clip(" · ".join(bits), 400)
 
 

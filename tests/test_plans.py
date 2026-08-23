@@ -519,6 +519,73 @@ async def test_a_CO_TENANT_sees_a_held_plan_as_somebody_elses_when_it_says_who_i
     assert mine["items"][0]["covered_by"] is None
 
 
+class _SyncBoard:
+    """qbdata's board client, answered by the app under test.
+
+    `fetch_plan` is the dashboards' one reader of this endpoint and it is sync, so
+    the assertion below runs it in a worker thread and hands the request back to
+    this loop. The point is to test the REAL function against the REAL endpoint:
+    the defect was a query parameter the client did not send, and a fake client
+    can only ever prove that the fake was asked for it.
+    """
+
+    def __init__(self, client, headers: dict) -> None:
+        self.client, self.headers = client, headers
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        import anyio.from_thread
+        return anyio.from_thread.run(self._get, path, params)
+
+    async def _get(self, path: str, params: dict | None) -> dict:
+        r = await self.client.get(
+            path, params={k: v for k, v in (params or {}).items() if v is not None},
+            headers=self.headers)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+
+async def test_the_DASHBOARD_reads_a_co_tenants_held_plan_as_held(client):
+    """#394, and it is the read path's half of #142's rule.
+
+    `qbdata.fetch_plan` sent no `session`, so `GET /plan` answered it by machine —
+    and this machine runs seven agents on one token. Every item of a plan the agent
+    in the next pane was holding came back with `covered_by: null`, the panel drew
+    it with the cyan "free to take" glyph and offered its ⚒, and `next` pointed
+    straight at it: the duplicated work a plan claim exists to prevent, restored on
+    the read path.
+
+    Two sessions, one token, because one session cannot tell the answers apart.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "harness" / "bin"))
+    import anyio
+    import qbdata as qd
+
+    repo = "acme/plandashcotenant"
+    await submitted(client, repo, "theirs", [item(254)], session="s-neighbour",
+                    headers=LAPTOP)
+    board = _SyncBoard(client, LAPTOP)
+
+    theirs, err = await anyio.to_thread.run_sync(
+        lambda: qd.fetch_plan(board, session="s-dashboard"))
+    assert err is None
+    held = next(i for i in qd.plan_items(theirs) if i["repo"] == repo)
+    assert held["covered_by"] is not None, \
+        "a co-tenant's held plan reads as free — the panel would offer it"
+    assert qd.plan_holder(held) is not None
+    assert qd.plan_state(held)[0] == "▷", "drawn as free to take"
+    assert (theirs["next"] or {}).get("item_id") != held["item_id"]
+
+    # ...and the holder's own dashboard still sees its own plan as its own, which
+    # is what lets it work through the list item by item.
+    mine, _ = await anyio.to_thread.run_sync(
+        lambda: qd.fetch_plan(board, session="s-neighbour"))
+    ours = next(i for i in qd.plan_items(mine) if i["repo"] == repo)
+    assert ours["covered_by"] is None
+    assert qd.plan_state(ours)[0] == "○"
+
+
 async def test_an_item_cannot_be_moved_into_a_CLOSED_plan(client):
     """A plan named by id used to skip every check the label lookup makes, so an
     item could be moved into a finished list — invisible to the plan it left and
