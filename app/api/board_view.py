@@ -17,6 +17,7 @@ _BOARD_HTML = (_STATIC / "board.html").read_text(encoding="utf-8")
 _REVIEWS_HTML = (_STATIC / "reviews.html").read_text(encoding="utf-8")
 _PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
 _FLEET_HTML = (_STATIC / "fleet.html").read_text(encoding="utf-8")
+_PRS_HTML = (_STATIC / "prs.html").read_text(encoding="utf-8")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -88,3 +89,42 @@ async def fleet_view(_reader: str = Depends(reader)) -> HTMLResponse:
     in.
     """
     return HTMLResponse(_FLEET_HTML)
+
+
+@router.get("/prs", response_class=HTMLResponse)
+async def prs_view(_reader: str = Depends(reader)) -> HTMLResponse:
+    """Where each pull request has got to: its round, what it waits on, its place in the line (#395).
+
+    At ``/prs`` because it reads three JSON paths and owns none of them: ``GET
+    /reviews`` for the newest panel round on each PR, ``GET /review/needs-human``
+    for the defects a person still owes an answer about, and ``GET /merge-queue``
+    for the line to land. All three have been served, tested and documented for
+    releases and **no page or pane had ever called one of them** — which is the
+    whole of #395: the board was holding the answers to "what round is it on" and
+    "is it blocked by anything" and no screen asked.
+
+    Not on ``/panel``. #57 argues that page is a research instrument answering
+    "which reviewer earns its cost", and that "what is running and what is it
+    waiting on" is a different question that should not dilute it. This is that
+    other page.
+
+    **Every number on it is a memory, and it says so.** ``pr_state`` and
+    ``ci_status`` are what the panel saw *at run time* — :class:`app.models.review.ReviewRun`
+    is explicit that a PR merged after its final round still reads ``OPEN`` — so
+    each is drawn with the round and the age it came from rather than as a live
+    reading. A merge-queue ``verdict`` is testimony pinned to a ``ready_sha``, and
+    a head that has moved since retires it; the row says which commit was judged.
+
+    **An empty line is not a drained one.** Nothing enqueues automatically
+    (#258), so a queue with no entries cannot be distinguished from a queue
+    nobody feeds — and the page names that ambiguity in place of a clean zero,
+    the way ``/fleet`` names the two readings of an absent lease rather than
+    picking one.
+
+    **``round`` is not a stage.** #262's ``stage`` is where a *session* is in its
+    own loop; ``ReviewRun.round`` is how many panel rounds this *pull request*
+    has been through. Different objects, different questions, and this page draws
+    only the second one — a blank cell that could be read as either is worse than
+    two honest columns.
+    """
+    return HTMLResponse(_PRS_HTML)

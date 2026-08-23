@@ -152,6 +152,11 @@ GET   /active            ?cwd=&repo=&device=&holder=&mine=&peers_only=
                                                  -> {agents:[…leases…], subagents:[…]}
 GET   /fleet             (browser view — what every agent is doing, from a phone,
                           and how much of that reading is actually known: #378)
+GET   /prs               (browser view — where each pull request has got to: the round
+                          its newest panel run recorded, what it is waiting on a human
+                          for, and its place in the line to land. Reads /reviews,
+                          /review/needs-human and /merge-queue, which had no reader on
+                          any surface before it: #395)
 POST  /subagent          { parent_session, agent_id, label?, cwd?, device?, ttl=900 }
 POST  /subagent/end      { parent_session, agent_id }
 
