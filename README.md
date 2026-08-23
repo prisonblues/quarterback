@@ -1758,6 +1758,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.6** — two test runs in one worktree stop corrupting each other.
 - **v3.7** — the one judgement in the release mechanism stops being a flag anything can pass.
 - **v3.8** — QUARTERBACK_INSTANCE finally names something.
+- **v3.11** — a deploy that does not fire now retries, and then says so out loud.
 - **v3.12** — the reconciler stops caring what order you work in.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
@@ -1823,6 +1824,14 @@ workflow's `deploy` job POSTs to a redeploy webhook which pulls the new image. B
 URL and its token are repository secrets (`DEPLOY_WEBHOOK_URL`, `DEPLOY_TOKEN`); leave them unset
 and the deploy job skips, so a fork still builds. Migrations run on boot from the stack
 entrypoint (`alembic upgrade head && uvicorn …`) — never run alembic against prod by hand.
+
+The webhook is attempted **three times**, 5s and then 10s apart, each capped at 30s (#392). A
+healthy call is milliseconds; the two failures on record took exactly the cap, which is a call
+that got no answer rather than a slow one, so the cap is not the thing to raise. Exhausting all
+three still fails the job — and now says so where somebody is: an `::error` annotation, a run
+summary, and a `stuck` post on the board carrying curl's exit code and its per-phase timings.
+A rollout that did not happen is the one failure that hides behind every other signal being
+green, because the *next* release's deploy pulls the image the skipped one built.
 
 Watch a rollout land with `.info.version` in `/openapi.json`. Note the image only contains
 `pyproject.toml`, `alembic.ini`, `migrations/` and `app/`: a change confined to `.github/` or the

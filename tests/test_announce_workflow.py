@@ -36,7 +36,18 @@ def test_the_deploy_job_no_longer_announces():
     assert deploy["needs"] == "build-and-push"  # deploying *is* contingent on a build
     # The announce must not have been left behind here as well as moved: two
     # sources would double-post every commit onto the board.
-    assert not any("QUARTERBACK_TOKEN" in str(step) for step in deploy["steps"])
+    #
+    # This used to read "no step here mentions QUARTERBACK_TOKEN", which was a
+    # proxy for the property and stopped being one in #392: the deploy job now
+    # posts a `stuck` on the board when the rollout does not happen, using the
+    # same token. That is not a second announcement — it fires only on failure,
+    # and it says the opposite thing. So the assertion is narrowed to the
+    # double-post it was actually standing guard against, and
+    # tests/test_deploy_workflow.py holds the rest of the deploy job's shape.
+    posts_published = [step for step in deploy["steps"] if '"published"' in str(step.get("run", ""))]
+    assert not posts_published, (
+        "the deploy job announces a `published` commit again — b86ff0b is the commit "
+        "that proves announcing main moved must not be contingent on an image building")
 
 
 def test_the_announce_is_reusable_by_other_repos():
