@@ -251,3 +251,56 @@ def test_with_no_label_the_key_is_still_the_session_prefix_and_no_name_is_asked(
     sent = recorder.run(CLAUDE_CODE_SESSION_ID="c9f3ff06-8af9-4ead-83a2-25aeb800ce88")
     assert "X-Agent-Instance: c9f3ff06" in sent
     assert "X-Agent-Name" not in sent
+
+
+# ----------------------------------------------------- the two copies of one rule
+
+#: The board's shape for a KEY, restated for the same reason `NAME_RE` is above.
+#: Wider than a name — upper case, `.`, `_` and `~` are all legal — which is exactly
+#: why the two need separate sanitisers.
+KEY_RE = r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,39}$"
+
+#: Labels chosen to hurt: over the 40-character cap, whitespace in the middle, a
+#: leading character that may not start a key, multibyte bytes, and a newline.
+HOSTILE = ["seat-3", "seat-quarterback-1", "Deploy_1", "sea t 3", "x" * 45,
+           "-lead", "café-3", "one\ntwo", "  padded"]
+
+
+def _instance_header(line: str) -> str | None:
+    marker = "-H X-Agent-Instance: "
+    if marker not in line:
+        return None
+    return line.split(marker, 1)[1].split(" -H ", 1)[0].split(" --", 1)[0].strip()
+
+
+@pytest.mark.parametrize("label", HOSTILE)
+def test_the_hook_and_the_cli_send_one_key_for_one_label(tmp_path, label):
+    """`qb-hook` and `qb` each hold their own copy of the key rule, and this is what
+    makes that safe. Sharing it through `qb-env` would hand the hook's whole identity
+    to a library it is pinned separately from (#204) — the shim that costs a
+    *requested name* nothing would cost the hook its key, and a keyless agent is the
+    bare machine name, which is also the broadcast address.
+
+    Two copies that disagree are the #146 failure — one session showing up as two
+    agents — so they are pinned equal here instead. `qb` sent the label raw until
+    #156, which made `sea t 3` and anything over 40 characters a 400 that
+    `record-review` swallows by design.
+    """
+    import re
+
+    (tmp_path / "h").mkdir()
+    (tmp_path / "c").mkdir()
+    h = Hooked(tmp_path / "h")
+    (h.bin / "qb-env").write_text(
+        f'. "{QB_ENV}"\n'
+        "qb_load_config() { QUARTERBACK_BASE_URL=http://board.test; QUARTERBACK_AGENT=testbox; }\n"
+        "qb_resolve_token() { QUARTERBACK_TOKEN=tok-test; return 0; }\n"
+    )
+    h.fire("SessionEnd", env=h.env(QUARTERBACK_INSTANCE=label), reason="other")
+    hook_key = _instance_header(h.to("/session/end")[0])
+
+    cli_key = _instance_header(Recorder(tmp_path / "c").run(QUARTERBACK_INSTANCE=label))
+
+    assert hook_key == cli_key, (label, hook_key, cli_key)
+    assert hook_key is not None, label
+    assert re.match(KEY_RE, hook_key), (label, hook_key)
