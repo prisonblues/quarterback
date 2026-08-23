@@ -1978,12 +1978,16 @@ reconcile  qb-reconcile.timer              enabled, active, last run 12:26:55   
 edge       https://quarterback.fo.ls       302 — forward-auth, and this host has no session   ?
 tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
 merges     ~/source/quarterback            nothing here reserves a tag at push time (#122)    ok
+queue      prisonblues/quarterback@main    nothing is queued to land on main                  ok
+landed     prisonblues/quarterback         2 PRs ready, tip of main committed 7h 20m ago    FAIL
+tags       origin/main                     every release on origin/main is tagged, on-ref     ok
+generated  ~/source/quarterback            none of 2 open PRs edits CHANGELOG.md              ok
+stamper    ~/source/quarterback            nothing lets a branch write a version number       ok
+briefs     …/share/quarterback-harness     fix-and-land.md runs a removed command           FAIL
 ```
 
 Rows are grouped by which question they answer, and `--only` takes a group name as well as a
-row name. `host` is the first two questions; `landing` is the third. The group is what #407
-extends — it should be adding rows to a category, not retrofitting one around a single
-check.
+row name. `host` is the first two questions; `landing` is the third.
 
 #### Look where the mechanism runs, not where its source lives
 
@@ -2037,6 +2041,159 @@ can run a command the author did not mark runnable:
   generated into 1Password *and* sops and two separate deploys; a tool that tried would
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
+
+#### The `landing` group — can work actually get out of here? (#407)
+
+The first ten rows all ask a variant of *"is this host wired up"*, and on the night of
+2026-08-22/23 every one of them was correct: **9 ok, 0 warn, 0 fail, 1 unknown**. In the
+same minute the merge queue held seven green pull requests with none ready, `main` had not
+moved in over three hours, `refs/tags/v3.8` pointed at a commit that is not in main's
+history, and three branches were conflicting on the one file `changelog.d/` exists to keep
+them out of. Nothing it checked was broken. Work simply could not land.
+
+| row | asks | fails when |
+|---|---|---|
+| `merges` | can a merge here rewrite the commit a release tag was reserved against | something reserves at push time *and* squash or rebase is on |
+| `queue` | is the line moving | `queued > 0 && ready == 0`, with the oldest entry waiting longer than a landing takes |
+| `landed` | has the integration branch moved, given what is ready to land on it | a pull request is `CLEAN` and the tip of `main` is two hours old |
+| `tags` | do the release tags point into the history they claim to tag | a landed release's tag is off the integration ref (#406) |
+| `generated` | is any open pull request editing a file the release job writes | one of them touches `CHANGELOG.md` (#122) |
+| `stamper` | can a branch in this repo write a version number itself | a branch-side stamper is reachable (#122) |
+| `briefs` | do the briefs *this host would open* still tell an agent to stamp | one of them runs a removed release command inside a fence (#122) |
+
+Three constraints bind all seven, and each was paid for before this group existed.
+
+**Honest `unknown`, following the `edge` row.** Most of these need the board or GitHub, and
+a landing group that went green having seen neither would be a worse version of the problem
+it exists to solve. Every row that could not reach what it needed says so and says which
+thing: no board configured, no token resolved on this machine, no `gh`, a `gh` that could
+not answer, a queue whose counts could not describe a real queue, a `mergeStateStatus`
+GitHub has not computed yet, a brief that could not be read, a tag report whose exit code
+and contents disagree. **Reaching the read cap is one of them** — a row that saw the first
+`PR_SAMPLE` open pull requests and found nothing has not established that there is nothing,
+so it says `unknown` rather than disclosing the cap and passing anyway. A *finding* among
+the ones it did read is still a finding, so the fail branches come first.
+
+`test_no_landing_row_goes_green_on_a_host_that_can_see_nothing` asserts this over the whole
+group rather than row by row, because the failure it guards against is a row *added later*
+without it: it builds a repo in scope for every row and a host that can answer none of
+them, and requires every row in the group to say `unknown`.
+
+**No failing on irrelevance.** An empty queue on a repo with no pull requests is the healthy
+state. A repo with no `changelog.d/` is not doing releases out of fragments, so neither
+`generated`, `stamper` nor `briefs` has anything to say about it. A repo with no release
+tagger has nothing here that can reconcile a tag against its history. The condition is
+always "this mechanism is in use *and* it is not working", never "this mechanism is not in
+use".
+
+**Diagnose, do not act.** Nothing here merges, re-points a tag, or evicts a queue entry.
+#405 argued the queue must stay advisory and the argument held up under measurement — the
+system was never wrong about who should land next, only about who was still there. So the
+stalled-queue row carries no `fix`; what it carries is the name of whoever holds the head,
+because a stalled queue is somebody to talk to.
+
+##### `queue` — the pair, and the clock
+
+`queued > 0 && ready == 0` is not a fault on its own: it is the normal state of a queue
+whose head is mid-preland. What is a fault is the oldest entry having sat in that line for
+longer than a landing takes. PR #398 was landed twice and timed at 5m37s and 12m59s from
+merge to green, so fifteen minutes sits inside the noise of one slow landing; the threshold
+is thirty, which is more than double the slowest measured landing and still turns a
+three-hour stall into a half-hour question.
+
+The clock is the entry's own arrival time, not how long `ready == 0` has held — the board
+states the former and nothing records the latter. An entry that arrived in the *future* is
+clock skew or bad data, so it is discarded rather than read as "just now".
+
+##### `landed` — both halves, and what "moved" honestly means
+
+A quiet `main` is not a fault and a green pull request is not a fault; together they are the
+definition of work that cannot land. Readiness is `mergeStateStatus == CLEAN` — GitHub's own
+answer to *"would a merge succeed right now"* — rather than a rollup of check conclusions,
+which would agree with it until somebody added a required review or a merge-queue rule and
+then disagree silently. GitHub computes it lazily, so `UNKNOWN` is counted as unknown and
+never as unready.
+
+The row says **"the tip of `main` was committed 4h 10m ago"**, and that wording is exact
+rather than modest: GitHub's REST API states no ref-update time for a branch, so what is
+read is the tip commit's committer date. For a repo that lands with merge commits the two
+are the same instant, which is what the `merges` row is about keeping true. Where they part
+is a fast-forward of an older commit, which reads as an older move than it was — so the row
+can ask its question early on a repo that fast-forwards, and cannot read late.
+
+##### `tags` — a reservation is not an orphan, and only one thing can tell them apart
+
+A tag off the integration ref is two things wearing one face: a release that has not landed
+there (a local cut not yet pushed, or a pre-#122 reservation), which holds a number nothing
+else will hand out and is fine; or a release that *has* landed and whose tag is elsewhere,
+which is #406. One `git merge-base --is-ancestor` cannot make that call — it needs the
+CHANGELOG at the ref to say which releases have landed. Reporting reservations as findings
+would train people to ignore the row.
+
+One row, because there is one invariant: *a tag `vX.Y` points at a commit whose CHANGELOG
+declares `vX.Y`*. That is `release_tag.py`'s own single sentence, and `untagged`, `misplaced`
+and `orphaned` are the three ways it can be false, not three separate questions.
+
+**This row executes a program out of the repository**, which `merges` deliberately does not.
+The two ask different questions: `merges` asks what a tool *is*, and running a program to
+find that out is the hazard itself; this asks what the repository's *tags are*, and the
+tagger is the only thing that can answer, because what counts as a release heading here is a
+masked-markdown question and this repo's CHANGELOG quotes `## vX.Y` inside examples. The
+parse that precedes the run is a **compatibility gate and not a sandbox** — module-level
+code runs before any argument is parsed — and what it buys is that an old or foreign tagger
+is never invoked with a subcommand it does not have. What makes running it acceptable is
+that this is the repository's own release tool, which its pre-push hook and its CI already
+run on every push. What is *not* trusted is the answer: the exit code, every field and every
+field's type are checked before a verdict is reached, and a report that exits `0` while
+naming findings is an `unknown` rather than a half-believed one.
+
+##### `generated` — asked before the conflict, not after
+
+#407 proposed this as *"are open pull requests conflicting on CHANGELOG.md"*, which is the
+same fault observed one step later. The **edit** is the fault; the conflict is only its
+commonest consequence, and a row that waits for the conflict cannot fire on the first branch
+to make it. The conflict count is reported beside the finding because it says how urgent it
+is, not because it is the test.
+
+Two things it does not see, both written down because a limit nobody wrote down is a limit
+nobody remembers. The README's release list is guarded by the same rule and is not asked
+about here: the guard exempts the rest of `README.md` so that documenting anything is not
+taxed, and a list of changed paths cannot tell an edit to the release list from an edit to
+the installation instructions. And a **rename away** from `CHANGELOG.md` is missed, because
+GitHub reports the resulting path — a different and much rarer fault than writing an entry
+into it.
+
+##### `stamper` and `briefs` — two sites, two rows
+
+They were one row for one commit, and Codex was right that they should not be: a stamper in
+the repository and a stale brief on this machine are two reasons to fire with two owners and
+two remedies, and the code was already choosing a different `manual` depending on which had
+happened. One row with two premises is exactly how the `merges` row drifted.
+
+`briefs` is the one that is not about the repository at all. Five agents stamped a release on
+the night of 2026-08-23 and every one of them was following a document — *a mechanism
+removed from the code and left in the brief has not been removed* — and the briefs on a host
+are the ones the **harness on PATH** ships, which is a different set from the repository's
+the moment that harness falls behind. `test_no_brief_tells_an_agent_to_stamp_a_release` pins
+what this repo *ships*; this row asks what this box *reads*, and on the machine it was
+written on the two disagreed:
+
+```
+briefs  …/share/quarterback-harness/commands  fix-and-land.md, fix-and-review.md,      FAIL
+                                              panel-review-pr.md run a release command
+                                              #122 removed, in a code block
+     -> qb-bump --host $(hostname)   # if …/commands is a stale harness
+```
+
+Code blocks only, the same line the test draws: prose may explain what used to happen and why
+it does not any more, and a fence may not carry the command. The fence scanner is
+CommonMark's rule rather than a regex over ``` — a `~~~` fence counts, a four-backtick block
+is not closed by the ``` inside it, and an indented fence is read, which matters because
+every fence in `fix-and-review.md` sits inside a numbered step. Inside a fence, whole comment
+lines and heredoc bodies are dropped; **quoted spans are kept**, which is the opposite of how
+the `merges` row reads a hook, because briefs quote the paths they run and emptying quoted
+spans stopped this seeing `python3 "$WT_DIR/scripts/release_stamp.py" preflight` — the very
+line it exists for.
 
 #### The `merges` row — a squash merge orphans a tag reserved at push time (#406)
 
