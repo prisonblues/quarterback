@@ -205,13 +205,16 @@ flight, and the whole reason the `stamped` CI job runs on main only.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
 import select
 import shlex
+import signal
 import subprocess
 import sys
+import time
 import tomllib
 from collections import Counter
 from collections.abc import Iterable
@@ -2267,46 +2270,69 @@ UNATTENDED_ENV = "HARNESS_UNATTENDED"
 def ask_the_terminal(prompt: str, timeout: float = CONFIRM_TIMEOUT) -> str:
     """Put `prompt` on the controlling terminal and read one line back from it.
 
-    Raises OSError where there is no controlling terminal, or where nobody answered inside
-    `timeout` — the two ways this refuses. Module-level and named without a leading
-    underscore because it is the seam the tests drive: a suite has no terminal either, and a
-    gate nobody could exercise would be a gate nobody could show working.
+    Raises OSError on every way this can fail to reach a person — no controlling terminal,
+    a run that is not the terminal's foreground job, nobody answering inside `timeout`, a
+    terminal that closed. Module-level and named without a leading underscore because it is
+    the seam the tests drive: a suite has no terminal either, and a gate nobody could
+    exercise would be a gate nobody could show working.
     """
-    # A file descriptor and not `open(..., "r+")`, which needs a seekable stream and a
-    # terminal is not one — that spelling raises `io.UnsupportedOperation` on every real tty,
-    # so the gate would have refused a person at a keyboard exactly as hard as it refuses a
-    # loop. Caught by the pty test rather than in production, which is the whole reason that
-    # test builds a real one instead of patching this function out.
+    # SIGTTIN ignored for the duration, and this is the guarantee rather than a belt to the
+    # braces below. A read from a terminal by a process that is not in its foreground group
+    # is answered by the kernel with SIGTTIN, whose default action STOPS the process — a hang
+    # no timeout can rescue, because the stop lands inside the read. Ignoring it turns that
+    # into EIO, which is an OSError, which is a refusal. The `tcgetpgrp` check below stays,
+    # because it fires BEFORE the prompt is printed and says something a person can act on;
+    # what it cannot do on its own is close the window between the check and the read, which
+    # shell job control can move through.
+    try:
+        previous = signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+    except (ValueError, OSError):
+        # Not the main thread, or a platform without the signal. Nothing to restore.
+        previous = None
     fd = os.open(TERMINAL, os.O_RDWR)
     try:
-        # A terminal this process is not in the FOREGROUND of is one it may not read from:
-        # the kernel answers a background read with SIGTTIN, whose default action is to STOP
-        # the process. The timeout below cannot rescue that, because the stop lands before
-        # anything starts waiting — `release_stamp.py apply --major &` would sit there until
-        # somebody fg'd it. Refuse instead, which is also the honest answer: a job in the
-        # background is one nobody is sitting in front of.
+        # A terminal this run is not the foreground job of is one nobody is sitting in front
+        # of, whatever else is true of it: `release_stamp.py apply --major &` is the way in.
+        # Only ENOTTY is read as "there is no job control here, so there is no background to
+        # be in" — every other errno is a descriptor this tool does not understand, and is
+        # left to propagate into the refusal rather than waved through as permission.
         try:
             foreground = os.tcgetpgrp(fd) == os.getpgrp()
-        except OSError:
-            # No job control on this terminal at all, so there is no background to be in.
+        except OSError as e:
+            if e.errno != errno.ENOTTY:
+                raise
             foreground = True
         if not foreground:
             raise OSError("this run is not the terminal's foreground job, so nobody is at it")
-        os.write(fd, prompt.encode("utf-8"))
-        ready, _, _ = select.select([fd], [], [], timeout)
-        if not ready:
-            os.write(fd, b"\n  no answer - refusing.\n")
-            raise OSError(f"nothing answered the terminal within {timeout:.0f}s")
-        # One read, because a terminal in its normal (canonical) mode hands over exactly one
-        # line at a time and there is no second line wanted here.
-        answer = os.read(fd, 4096)
+
+        # A loop, because `os.write` is allowed to write less than it was given — and the
+        # part left behind would be the tail, which is where the number to type is.
+        written, raw = 0, prompt.encode("utf-8")
+        while written < len(raw):
+            written += os.write(fd, raw[written:])
+
+        # Read until a newline or the deadline, rather than once. A terminal is USUALLY in
+        # canonical mode and hands over exactly one line, but the application that owns it
+        # may have left it in raw mode, where `select` goes ready on the first keystroke. One
+        # read there returns "v" and refuses a person who typed the right answer.
+        deadline = time.monotonic() + timeout
+        answer = b""
+        while b"\n" not in answer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+                os.write(fd, b"\n  no answer - refusing.\n")
+                raise OSError(f"nothing answered the terminal within {timeout:.0f}s")
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                # EOF on the terminal itself — a ^D at the prompt. Not an answer, and
+                # specifically not the empty string, which `confirm_major` would otherwise
+                # reject with a message about having typed the wrong number.
+                raise OSError("the terminal closed without answering")
+            answer += chunk
     finally:
         os.close(fd)
-    if not answer:
-        # EOF on the terminal itself — a ^D at the prompt. Not an answer, and specifically not
-        # the empty string, which `confirm_major` would otherwise reject with a message about
-        # having typed the wrong number.
-        raise OSError("the terminal closed without answering")
+        if previous is not None:
+            signal.signal(signal.SIGTTIN, previous)
     return answer.decode("utf-8", "replace").strip()
 
 
@@ -2346,7 +2372,10 @@ def confirm_major(version: Release, instead_of: Release, onto_newest: Release) -
         answer = ask_the_terminal(prompt)
     except OSError as e:
         raise refuse(str(e)) from e
-    if answer.lstrip("vV") != fmt(version).lstrip("v"):
+    # An exact match against the two spellings the prompt names, and not `lstrip("vV")` —
+    # that strips a prefix of any length, so `vvvV3` would confirm v3. Surrounding whitespace
+    # is forgiven because a person typing at a prompt is not a parser.
+    if answer not in {fmt(version), fmt(version).lstrip("v")}:
         raise refuse(f"it asked for {fmt(version)} at the terminal and read {answer!r}")
     print(f"confirmed at the terminal: {fmt(version)}, not {fmt(instead_of)}", file=sys.stderr)
 
@@ -2382,7 +2411,13 @@ def cmd_apply(args: argparse.Namespace) -> int:
     # decision is a gate people learn to get past.
     #
     # Last, too: everything that could still refuse this release has refused by now, so a
-    # person who confirms is not then told the branch was unlandable all along.
+    # person who confirms is not then told the branch was unlandable all along. That leaves a
+    # window — the plan was computed before the prompt, and a sibling can reserve a number
+    # while somebody is deciding — and the window is not closed here on purpose: the stamp has
+    # ALWAYS been a reading of a shared file rather than a lock, for the minor bump too, and
+    # what refuses the second lander is `release_tag.py reserve` creating the tag at push
+    # time (#296). A re-derivation here would only narrow a race the push already settles,
+    # and it could hand back a different number than the one the person just agreed to.
     if plan.major:
         confirm_major(plan.version, plan.instead_of, plan.onto_newest)  # type: ignore[arg-type]
 

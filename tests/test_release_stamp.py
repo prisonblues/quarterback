@@ -22,13 +22,18 @@ silently so:
 
 from __future__ import annotations
 
+import errno
 import importlib.util
+import io
 import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1081,6 +1086,16 @@ def test_the_answer_may_be_typed_without_the_v(repo, terminal):
     assert "## v3 — a release" in (repo / "CHANGELOG.md").read_text()
 
 
+@pytest.mark.parametrize("typed", ["vvv3", "vV3", "v3.0", "v30", "3.0", "V3", ""])
+def test_only_the_two_spellings_the_prompt_names_confirm(repo, terminal, typed):
+    """`answer.lstrip("vV")` would have taken `vvvV3`, because lstrip strips a prefix of any
+    length rather than one character. The prompt says "type v3", so v3 and 3 are the answers."""
+    place(repo)
+    terminal.answer = typed
+    assert run(repo, "apply", "--onto", "main", "--major") == 2
+    assert "## vNEXT" in (repo / "CHANGELOG.md").read_text()
+
+
 def test_an_unattended_run_is_refused_before_the_terminal_is_even_asked(
     repo, terminal, monkeypatch, capsys
 ):
@@ -1126,16 +1141,19 @@ def test_a_branch_with_nothing_to_stamp_is_never_asked(repo, terminal):
     assert terminal.prompts == []
 
 
-def test_the_terminal_is_the_controlling_terminal_and_not_stdin(repo, monkeypatch):
+def test_the_answer_comes_from_the_terminal_and_never_from_stdin(repo, monkeypatch):
     """A REAL pty, because the property under test is which file the answer comes from.
 
-    `sys.stdin.isatty()` asks what stdin happens to be plugged into, so a heredoc or `yes |`
-    satisfies it. `/dev/tty` is the controlling terminal, which a session that has none
-    cannot open however its stdin is arranged.
+    Named for what it proves and not for more: an `openpty` slave is a terminal but not this
+    process's CONTROLLING one, so this test is about `TERMINAL` being the file that is read
+    and stdin being ignored — which is the difference from `sys.stdin.isatty()`, where a
+    heredoc or `yes |` is an answer. That `/dev/tty` names the controlling terminal is the
+    kernel's job and is not restated here.
     """
     controller, terminal_fd = os.openpty()
     try:
         monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        monkeypatch.setattr(sys, "stdin", io.StringIO("v9\n"))  # what a pipe would supply
         os.write(controller, b"v3\n")
         assert ASK_THE_TERMINAL("pick a number: ") == "v3"
         assert b"pick a number:" in os.read(controller, 4096)
@@ -1155,6 +1173,85 @@ def test_a_terminal_nobody_answers_refuses_rather_than_hanging(repo, monkeypatch
     finally:
         os.close(controller)
         os.close(terminal_fd)
+
+
+def test_a_terminal_that_answers_a_letter_at_a_time_is_still_read_whole(repo, monkeypatch):
+    """A terminal is USUALLY in canonical mode and hands over one whole line, but the
+    application that owns it may have left it in raw mode, where `select` goes ready on the
+    first keystroke. One read there returns "v" and refuses a person who typed v3."""
+    controller, terminal_fd = os.openpty()
+    typed = threading.Thread(
+        target=lambda: [time.sleep(0.05), os.write(controller, b"3\n")],
+    )
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        os.write(controller, b"v")
+        typed.start()
+        assert ASK_THE_TERMINAL("pick a number: ", timeout=5) == "v3"
+    finally:
+        typed.join()
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_a_terminal_that_closes_at_the_prompt_is_not_an_empty_answer(repo, monkeypatch):
+    """^D. Distinguished from a wrong answer on purpose: "you typed '' " would be a lie
+    about what happened, and the repair for the two is not the same."""
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        os.write(controller, b"\x04")  # ^D at the start of a line: read returns nothing
+        with pytest.raises(OSError, match="closed without answering"):
+            ASK_THE_TERMINAL("pick a number: ", timeout=5)
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_a_tcgetpgrp_failure_that_is_not_enotty_is_a_refusal(repo, monkeypatch):
+    """ENOTTY means "there is no job control here, so there is no background to be in", and
+    is the only errno read that way. Anything else is a descriptor this tool does not
+    understand, and waving it through would be permission derived from an error."""
+    controller, terminal_fd = os.openpty()
+
+    def broken(fd):
+        raise OSError(errno.EBADF, "Bad file descriptor")
+
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        monkeypatch.setattr(rs.os, "tcgetpgrp", broken)
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            ASK_THE_TERMINAL("pick a number: ", timeout=0.05)
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_sigttin_is_ignored_for_the_read_and_restored_after(repo, monkeypatch):
+    """The `tcgetpgrp` check fires before the prompt and cannot close the window between
+    itself and the read — shell job control can move through it, and the kernel's answer to
+    a background read is SIGTTIN, which STOPS the process. Ignoring it makes that an EIO,
+    which is an OSError, which is a refusal. The handler is put back either way."""
+    before = signal.getsignal(signal.SIGTTIN)
+    seen = []
+    real = rs.os.read
+
+    def note_the_handler(fd, n):
+        seen.append(signal.getsignal(signal.SIGTTIN))
+        return real(fd, n)
+
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        monkeypatch.setattr(rs.os, "read", note_the_handler)
+        os.write(controller, b"v3\n")
+        assert ASK_THE_TERMINAL("pick a number: ", timeout=5) == "v3"
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+    assert seen == [signal.SIG_IGN]
+    assert signal.getsignal(signal.SIGTTIN) is before
 
 
 def test_a_terminal_this_run_is_not_the_foreground_of_refuses(repo, monkeypatch):
