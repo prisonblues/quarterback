@@ -44,6 +44,11 @@ rs = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = rs
 _SPEC.loader.exec_module(rs)
 
+#: The real terminal read, captured before the autouse `no_terminal` fixture can patch over
+#: it. Almost every test wants the seam; the two that exercise the terminal ITSELF want the
+#: function, and there is nowhere else to get it back from once the fixture has run.
+ASK_THE_TERMINAL = rs.ask_the_terminal
+
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -132,6 +137,45 @@ def hermetic_git(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(empty))
     monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_terminal(monkeypatch):
+    """Every test runs the way an unattended job does, whatever shell pytest was started from.
+
+    Autouse and not opt-in, for a reason that is not tidiness: `--major` reads the CONTROLLING
+    terminal, and a developer running this suite from their own shell HAS one. Without this
+    the `--major` tests would print a prompt into that terminal and block on it — a suite that
+    passes in CI and hangs on a laptop. Pinning the seam shut by default also means a test
+    that wants a person has to say so, which is the property being tested.
+    """
+    def no_such_device(prompt, timeout=None):
+        raise OSError("[Errno 6] No such device or address: '/dev/tty'")
+
+    monkeypatch.setattr(rs, "ask_the_terminal", no_such_device)
+    monkeypatch.delenv("HARNESS_UNATTENDED", raising=False)
+
+
+@pytest.fixture
+def terminal(no_terminal, monkeypatch):
+    """A person at a keyboard. `.answer` is what they type; `.prompts` is what they were shown.
+
+    Depends on `no_terminal` so it patches second and wins, rather than relying on the order
+    pytest happens to instantiate two fixtures in.
+    """
+    class Terminal:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+            #: The number the `repo` fixture's major bump asks for: main is at v2.33.
+            self.answer = "v3"
+
+        def __call__(self, prompt, timeout=None):
+            self.prompts.append(prompt)
+            return self.answer
+
+    person = Terminal()
+    monkeypatch.setattr(rs, "ask_the_terminal", person)
+    return person
 
 
 @pytest.fixture
@@ -947,7 +991,7 @@ def test_check_fails_on_a_number_declared_twice(repo, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_major_stamps_the_next_major_not_the_next_minor(repo):
+def test_major_stamps_the_next_major_not_the_next_minor(repo, terminal):
     """The one thing no ref can answer. Whether v2.34 or v3 follows v2.33 is a judgement
     about what the release MEANS — but the flag has to exist, because this repo's README
     lists v3 as what is next, and a tool that could not produce it would be opted out of by
@@ -958,7 +1002,7 @@ def test_major_stamps_the_next_major_not_the_next_minor(repo):
     assert "- **v3** — a release." in (repo / "README.md").read_text()
 
 
-def test_a_major_bump_moves_the_served_version_to_the_new_major(repo):
+def test_a_major_bump_moves_the_served_version_to_the_new_major(repo, terminal):
     place(repo)
     write(repo, "app/routes.py", "# a board change\n")
     assert run(repo, "apply", "--onto", "main", "--major") == 0
@@ -971,6 +1015,189 @@ def test_the_plan_says_which_kind_of_bump_it_is(repo, capsys):
     assert plan["version"] == "v3" and plan["major"] is True
     plan = plan_json(repo, "preflight", "--onto", "main", capsys=capsys)
     assert plan["version"] == "v2.34" and plan["major"] is False
+
+
+# ---------------------------------------------------------------------------
+# who may declare a major (#386)
+#
+# The number is a reading of a ref and `--major` is not: it is a statement about what the
+# release MEANS, which this file's subject has said since it was written and which nothing
+# enforced. v2.99 -> v3 happened because "v2.99, v3.00, v3.01" in a prompt reads as a
+# sequence, `major.minor` is two integers rather than a decimal, and the flag was available
+# to whoever typed it. These are the tests that it now refuses instead of advising.
+# ---------------------------------------------------------------------------
+
+
+def test_a_major_is_refused_where_there_is_no_terminal_to_ask(repo, capsys):
+    """The whole issue in one test. `apply --major` used to be a flag anything could pass."""
+    place(repo)
+    before = (repo / "CHANGELOG.md").read_text()
+
+    assert run(repo, "apply", "--onto", "main", "--major") == 2
+
+    assert (repo / "CHANGELOG.md").read_text() == before
+    assert "## vNEXT" in before  # nothing was half-stamped on the way out
+    err = capsys.readouterr().err
+    assert "STOP: --major would stamp v3 instead of v2.34" in err
+    # The refusal has to name the way FORWARD, or the next agent works around it.
+    assert "dropping --major" in err and "their own keyboard" in err
+
+
+def test_a_person_who_types_the_number_gets_the_major(repo, terminal, capsys):
+    place(repo)
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+    assert "## v3 — a release" in (repo / "CHANGELOG.md").read_text()
+    assert "confirmed at the terminal: v3, not v2.34" in capsys.readouterr().err
+
+
+def test_the_prompt_names_the_number_it_is_NOT(repo, terminal):
+    """The line that would have caught this one. A major is invisible in a prompt — "v2.99,
+    v3.00, v3.01" reads as a sequence — and unmissable in a sentence naming the alternative."""
+    place(repo)
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+
+    asked = terminal.prompts[0]
+    assert "v3, NOT v2.34" in asked
+    assert "two integers" in asked and "decimal" in asked
+    assert "Type v3 to confirm" in asked
+
+
+def test_typing_anything_else_aborts_and_writes_nothing(repo, terminal, capsys):
+    """`y` would answer "did you mean to pass the flag", and the flag was never the mistake."""
+    place(repo)
+    terminal.answer = "y"
+    before = (repo / "CHANGELOG.md").read_text()
+
+    assert run(repo, "apply", "--onto", "main", "--major") == 2
+
+    assert (repo / "CHANGELOG.md").read_text() == before
+    assert "it asked for v3 at the terminal and read 'y'" in capsys.readouterr().err
+
+
+def test_the_answer_may_be_typed_without_the_v(repo, terminal):
+    place(repo)
+    terminal.answer = "3"
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+    assert "## v3 — a release" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_an_unattended_run_is_refused_before_the_terminal_is_even_asked(
+    repo, terminal, monkeypatch, capsys
+):
+    """A controlling terminal is not proof of a person: this repo runs its loops in tmux
+    panes, and a pane has a tty whether or not anybody is watching it. `HARNESS_UNATTENDED`
+    is the harness's own word for that, so it is read before anything is printed — a prompt
+    into an unwatched pane is a wedged loop, which is worse than the refusal."""
+    place(repo)
+    monkeypatch.setenv("HARNESS_UNATTENDED", "1")
+
+    assert run(repo, "apply", "--onto", "main", "--major") == 2
+
+    assert terminal.prompts == []
+    assert "HARNESS_UNATTENDED=1" in capsys.readouterr().err
+    assert "## vNEXT" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_preflight_answers_the_question_without_asking_it(repo, capsys):
+    """`preflight` has to work where `apply` refuses. Asking what `--major` WOULD do decides
+    nothing, and the answer is exactly what a person needs in front of them before saying
+    yes — so the read-only path is not gated, and says the gate is there."""
+    place(repo)
+    assert run(repo, "preflight", "--onto", "main", "--major") == 0
+
+    out = capsys.readouterr().out
+    assert "would stamp v3 (--major, NOT v2.34)" in out
+    assert "asks for v3 at a terminal and refuses where there is none" in out
+    assert "## vNEXT" in (repo / "CHANGELOG.md").read_text()
+
+
+def test_the_plan_names_the_number_the_major_is_not(repo, capsys):
+    place(repo)
+    plan = plan_json(repo, "preflight", "--onto", "main", "--major", capsys=capsys)
+    assert plan["version"] == "v3" and plan["instead_of"] == "v2.34"
+    plan = plan_json(repo, "preflight", "--onto", "main", capsys=capsys)
+    assert plan["version"] == "v2.34" and plan["instead_of"] is None
+
+
+def test_a_branch_with_nothing_to_stamp_is_never_asked(repo, terminal):
+    """`--major` on a noop decides nothing, and a gate that fires where there is no decision
+    is a gate people learn to get past. `fix-and-land` runs `apply` unconditionally."""
+    assert run(repo, "apply", "--onto", "main", "--major") == 0
+    assert terminal.prompts == []
+
+
+def test_the_terminal_is_the_controlling_terminal_and_not_stdin(repo, monkeypatch):
+    """A REAL pty, because the property under test is which file the answer comes from.
+
+    `sys.stdin.isatty()` asks what stdin happens to be plugged into, so a heredoc or `yes |`
+    satisfies it. `/dev/tty` is the controlling terminal, which a session that has none
+    cannot open however its stdin is arranged.
+    """
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        os.write(controller, b"v3\n")
+        assert ASK_THE_TERMINAL("pick a number: ") == "v3"
+        assert b"pick a number:" in os.read(controller, 4096)
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_a_terminal_nobody_answers_refuses_rather_than_hanging(repo, monkeypatch):
+    """The tmux-pane case again, from the other side. Without the timeout the failure there
+    is not a wrong release but a `readline()` that never returns."""
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        with pytest.raises(OSError, match="nothing answered the terminal"):
+            ASK_THE_TERMINAL("pick a number: ", timeout=0.05)
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_a_terminal_this_run_is_not_the_foreground_of_refuses(repo, monkeypatch):
+    """`apply --major &` under a shell. A background read gets SIGTTIN, whose default action
+    stops the process — a hang the timeout cannot rescue, because the stop lands before
+    anything begins waiting. It is also the honest answer: a background job has nobody at it.
+    """
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        monkeypatch.setattr(rs.os, "tcgetpgrp", lambda fd: os.getpgrp() + 1)
+        with pytest.raises(OSError, match="not the terminal's foreground job"):
+            ASK_THE_TERMINAL("pick a number: ", timeout=0.05)
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_a_terminal_with_no_job_control_is_still_readable(repo, monkeypatch):
+    """The pty the two tests above build has no session attached, so `tcgetpgrp` answers
+    ENOTTY rather than a pgid. That is "there is no background to be in", not "you are in
+    it" — reading ENOTTY as a refusal would make the gate refuse every terminal it could
+    actually have used."""
+    controller, terminal_fd = os.openpty()
+    try:
+        monkeypatch.setattr(rs, "TERMINAL", os.ttyname(terminal_fd))
+        with pytest.raises(OSError, match="Inappropriate ioctl"):
+            os.tcgetpgrp(terminal_fd)  # the state this test is about, asserted not assumed
+        os.write(controller, b"v3\n")
+        assert ASK_THE_TERMINAL("pick a number: ") == "v3"
+    finally:
+        os.close(controller)
+        os.close(terminal_fd)
+
+
+def test_no_controlling_terminal_is_an_oserror_and_not_a_traceback(repo, monkeypatch, capsys):
+    """The path every agent harness takes, spelled as a missing device rather than mocked."""
+    monkeypatch.setattr(rs, "TERMINAL", str(repo / "no-such-tty"))
+    monkeypatch.setattr(rs, "ask_the_terminal", ASK_THE_TERMINAL)
+    place(repo)
+
+    assert run(repo, "apply", "--onto", "main", "--major") == 2
+    assert "no-such-tty" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -1726,7 +1953,7 @@ def test_the_repair_ref_is_the_last_commit_before_the_placeholder_arrived(repo, 
     assert clean[:12] in capsys.readouterr().err
 
 
-def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsys):
+def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsys, terminal):
     """`--major` is a flag and never an inference, and `fix-and-land` runs `apply` without it.
 
     So a branch stamped `v3` meets the "did somebody pick their own number" check again on the
@@ -1751,7 +1978,7 @@ def test_a_branch_stamped_as_a_major_is_not_refused_by_a_plain_rerun(repo, capsy
 # branch that ships nothing at all.
 
 
-def test_neither_already_stamped_branch_is_held_by_a_broken_base(repo, capsys):
+def test_neither_already_stamped_branch_is_held_by_a_broken_base(repo, capsys, terminal):
     """The two already-stamped branches agree — and it is the WARNING they agree on.
 
     This reverses a P1 from round 1 of the panel, deliberately. That finding was right that
@@ -2994,11 +3221,12 @@ def test_a_number_a_tag_already_holds_is_not_handed_out_again(repo):
     assert "## v2.35 — a release" in (repo / "CHANGELOG.md").read_text()
 
 
-def test_a_major_bump_starts_above_the_tags_too(repo):
+def test_a_major_bump_starts_above_the_tags_too(repo, terminal):
     """`--major` picks one of two answers rather than producing a third, so the floor the
     two are computed from has to be the same one."""
     reserved_elsewhere(repo, "v3")
     place(repo)
+    terminal.answer = "v4"  # the tag holds v3, so the major on offer is the one above it
 
     assert run(repo, "apply", "--onto", "main", "--major") == 0
 

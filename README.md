@@ -903,7 +903,7 @@ scripts/changelog_fragments.py check                    # do the fragments parse
 scripts/changelog_fragments.py assemble --title "…"     # -> `## vNEXT — …` + the README bullet
 scripts/release_stamp.py preflight        # what it would take, read-only
 scripts/release_stamp.py apply            # rewrites the placeholder; commits nothing
-scripts/release_stamp.py apply --major    # …as v3 rather than v2.34
+scripts/release_stamp.py apply --major    # …as v3 rather than v2.34 (asks you, at a terminal)
 scripts/release_stamp.py check            # nothing unstamped, no number used twice
 scripts/release_stamp.py frozen           # no shipped entry's text was rewritten
 ```
@@ -933,6 +933,15 @@ proves it wrong.
 
 Whether v2.34 or v3 follows v2.33 is the one thing no ref can answer, so `--major` is a flag and
 never an inference: `apply --major` stamps `v3`, and the plan says which kind of bump it made.
+
+**And it asks you first.** A major is a statement about what the release MEANS, so `apply
+--major` prints `v3, NOT v2.34` on your terminal and will not proceed until you type the
+number. With no terminal to ask — an agent, a loop, CI, `HARNESS_UNATTENDED=1` — it refuses and
+writes nothing. That is #386: the number itself is a reading of a ref and no agent picks it,
+but the one judgement in the mechanism was a flag anything could pass, and v2.99 went to v3
+instead of v2.100 because `major.minor` is two integers and a prompt had treated it as a
+decimal. `preflight --major` is not gated: it reports `would stamp v3 (--major, NOT v2.34)`
+without deciding anything, which is the line that makes the slip visible before it ships.
 
 Two branches that stamp in the same minute get the same number — the stamp itself is a file
 read, and a read reserves nothing. What stops the second one landing is the tag the push takes

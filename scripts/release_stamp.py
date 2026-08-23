@@ -31,6 +31,15 @@ about what the release MEANS, so it is an explicit flag and never an inference: 
 flag has to exist, or the next major gets hand-written outside this mechanism and the
 placeholder convention is quietly opted out of on the one release that most needs it.
 
+**And a flag is not authority for what that flag does (#386).** `apply --major` asks for the
+number at the CONTROLLING TERMINAL and refuses where there is none — no terminal, an
+unanswered prompt, `HARNESS_UNATTENDED=1`, or an answer that is not the number. It refuses
+rather than warns, because a warning in a log nobody reads turns an absent decision into a
+benign one, and that is how this repo went from v2.99 to v3 instead of v2.100: a version
+sequence written wrongly in a prompt, and nothing anywhere asking whether a person meant it.
+`preflight --major` is NOT gated — asking what the flag would do decides nothing, and its
+`would stamp v3 (--major, NOT v2.100)` line is the sentence that makes the slip visible.
+
 ## When two branches stamp the same number
 
 They can — the stamp itself is still a file read — and `scripts/release_tag.py` is what
@@ -197,7 +206,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -390,6 +401,11 @@ class Plan:
     #: branch would otherwise have taken.
     reserved_newest: Release | None = None
     major: bool = False
+    #: The number the OTHER bump would have issued, set only on a `--major` plan: v2.100
+    #: where this one says v3. Carried on the plan rather than worked out again at print
+    #: time, because the whole of #386 is that a major is invisible in a prompt and obvious
+    #: in a sentence naming what it is not.
+    instead_of: Release | None = None
     #: Things a caller should know that are not this branch's to fix, and must not
     #: stop it. A broken base is the one that matters (#168): it is a refusal for a
     #: branch that needs a number and noise for one that does not, and refusing both
@@ -405,6 +421,7 @@ class Plan:
             "stamping": self.stamping,
             "version": fmt(self.version) if self.version else None,
             "major": self.major,
+            "instead_of": fmt(self.instead_of) if self.instead_of else None,
             "onto_newest": fmt(self.onto_newest) if self.onto_newest else None,
             "reserved_newest": fmt(self.reserved_newest) if self.reserved_newest else None,
             "sites": [{"path": s.path, "line": s.line, "text": s.text} for s in self.sites],
@@ -1840,6 +1857,7 @@ def build_plan(repo: Path, onto: str, serve: bool | None, major: bool = False) -
     plan.version = next_version
     plan.onto_newest = onto_newest
     plan.major = major
+    plan.instead_of = minor_next if major else None
 
     if plan.loose:
         _refuse_loose(plan.loose)
@@ -2180,6 +2198,159 @@ def cmd_frozen(args: argparse.Namespace) -> int:
     return 0
 
 
+# ------------------------------------------------------------- the one human decision
+#
+# Everything else this file does is a reading. The number is `max(headings at --onto) + 1`,
+# the served-version move is inferred from the paths the branch touched, and both are
+# recomputed the same way by anybody who runs the tool. `--major` is the single input that is
+# not a reading of anything: whether v3 or v2.100 follows v2.99 is a statement about what the
+# release MEANS, and this file's docstring has said so since it was written.
+#
+# It said so and then took the flag from whoever typed it. On 2026-08-23 a prompt asked for
+# "v2.99, v3.00, v3.01" — `major.minor` here is two integers and not a decimal, so v2.99 is
+# followed by v2.100 and the sequence in that sentence does not exist. The lander flagged that
+# it had a choice, cited the instruction, took `--major`, and reported it plainly. It behaved
+# well. Nothing between a typo and six releases plus their pushed tags asked whether a person
+# had meant it, and #325/#341 are why the answer is not being rewritten now.
+#
+# So the flag is no longer sufficient authority for what the flag does. This is the shape #85
+# settled for labels ("the label that authorises work has to come from someone who is not the
+# worker") and #55/v2.96 settled for the panel's ceilings ("a repo cannot be allowed to raise
+# its own ceiling"): a dial that changes how thoroughly one repo is reviewed is human-gated,
+# and the major version of the software was a flag. That was the wrong way round.
+#
+# WHY A TERMINAL AND NOT THE BOARD. #386 lists a board authorisation behind `app.auth.human`
+# as the strongest option and it is — but `human()` needs HUMAN_EDGE_SECRET, whose deploy is
+# unconfirmed, and the deployed board answers 403 to it today (selfhost 160). A gate whose
+# only path is a call nobody can currently satisfy is not a strict gate, it is an outage: the
+# next genuine major would be hand-written outside this mechanism, which is the exact failure
+# the flag exists to prevent. The terminal is the gate that works today and refuses today, it
+# is the one "a live person is at the keyboard" test this repo already has (`qb-bump --apply`,
+# #267), and a board authorisation can be added beside it as a second path the day the secret
+# is confirmed without any of this changing.
+#
+# AND WHY IT REFUSES RATHER THAN WARNS. A warning printed into a log nothing reads renders an
+# absent decision as a benign one, which is the whole class of failure this is about.
+#
+# WHAT IT DOES NOT STOP, said out loud the way `appetite.py` says its own: a local process can
+# allocate a pty for itself and answer its own prompt (`printf 'v3\n' | script -qec ...`). Every
+# gate that lives in the same process as its caller has that hole, `qb-bump`'s included, and
+# closing it needs an authority outside the machine — which is what option 1 of #386 is for, the
+# day the edge secret is confirmed. What this gate is sized for is the failure that actually
+# happened: a version sequence mistyped in a prompt, a lander that read it as an instruction,
+# and no point anywhere between the two at which anybody was asked. Going around it takes a
+# deliberate act that no report survives; the thing it replaces took none at all.
+
+#: Opened directly, and that is the gate rather than a detail of it. `sys.stdin.isatty()` asks
+#: what this process's stdin happens to be plugged into, so a heredoc, a pipe or `yes |`
+#: answers it. `/dev/tty` is the process's CONTROLLING terminal: a session that has none — an
+#: agent harness, a CI runner, cron, `nohup` — cannot open it at all, whatever its stdin is.
+#: Measured rather than assumed: under the harness that took v3 it fails with ENXIO before any
+#: prompt is printed.
+TERMINAL = "/dev/tty"
+
+#: Seconds to wait for the answer before refusing. A controlling terminal is NOT proof of a
+#: person: this repo runs its loops in tmux panes (`harness/loops/run-loop.sh`, `qb-seats`),
+#: and a pane has a tty whether or not anybody is looking at it. Without this, the failure
+#: there is not a wrong release but a `readline()` that never returns — a loop wedged forever
+#: on a prompt nobody can see. A timeout turns that into the same refusal as no terminal at
+#: all, which is the direction this gate is allowed to fail in.
+CONFIRM_TIMEOUT = 120.0
+
+#: The harness's own word for "nothing is watching this run" (`harness_rules.unattended()`,
+#: exported by `run-loop.sh`). Read here rather than imported: `scripts/` is a directory of
+#: standalone tools with no harness on the path, and the string is the contract. Checked
+#: BEFORE the terminal, because that is the case where a tty exists and means nothing.
+UNATTENDED_ENV = "HARNESS_UNATTENDED"
+
+
+def ask_the_terminal(prompt: str, timeout: float = CONFIRM_TIMEOUT) -> str:
+    """Put `prompt` on the controlling terminal and read one line back from it.
+
+    Raises OSError where there is no controlling terminal, or where nobody answered inside
+    `timeout` — the two ways this refuses. Module-level and named without a leading
+    underscore because it is the seam the tests drive: a suite has no terminal either, and a
+    gate nobody could exercise would be a gate nobody could show working.
+    """
+    # A file descriptor and not `open(..., "r+")`, which needs a seekable stream and a
+    # terminal is not one — that spelling raises `io.UnsupportedOperation` on every real tty,
+    # so the gate would have refused a person at a keyboard exactly as hard as it refuses a
+    # loop. Caught by the pty test rather than in production, which is the whole reason that
+    # test builds a real one instead of patching this function out.
+    fd = os.open(TERMINAL, os.O_RDWR)
+    try:
+        # A terminal this process is not in the FOREGROUND of is one it may not read from:
+        # the kernel answers a background read with SIGTTIN, whose default action is to STOP
+        # the process. The timeout below cannot rescue that, because the stop lands before
+        # anything starts waiting — `release_stamp.py apply --major &` would sit there until
+        # somebody fg'd it. Refuse instead, which is also the honest answer: a job in the
+        # background is one nobody is sitting in front of.
+        try:
+            foreground = os.tcgetpgrp(fd) == os.getpgrp()
+        except OSError:
+            # No job control on this terminal at all, so there is no background to be in.
+            foreground = True
+        if not foreground:
+            raise OSError("this run is not the terminal's foreground job, so nobody is at it")
+        os.write(fd, prompt.encode("utf-8"))
+        ready, _, _ = select.select([fd], [], [], timeout)
+        if not ready:
+            os.write(fd, b"\n  no answer - refusing.\n")
+            raise OSError(f"nothing answered the terminal within {timeout:.0f}s")
+        # One read, because a terminal in its normal (canonical) mode hands over exactly one
+        # line at a time and there is no second line wanted here.
+        answer = os.read(fd, 4096)
+    finally:
+        os.close(fd)
+    if not answer:
+        # EOF on the terminal itself — a ^D at the prompt. Not an answer, and specifically not
+        # the empty string, which `confirm_major` would otherwise reject with a message about
+        # having typed the wrong number.
+        raise OSError("the terminal closed without answering")
+    return answer.decode("utf-8", "replace").strip()
+
+
+def confirm_major(version: Release, instead_of: Release, onto_newest: Release) -> None:
+    """Refuse `--major` unless a person at a terminal types the number out loud.
+
+    Typing the number rather than `y` is deliberate. `y` answers "did you mean to pass the
+    flag", and the flag was never the mistake — the mistake was a version sequence that read
+    correctly in a prompt. What has to be taken in is `v3, NOT v2.100`, and the only way to be
+    sure that sentence was read is to make the answer repeat the half of it being chosen.
+    """
+    def refuse(why: str) -> StampError:
+        return StampError(
+            f"--major would stamp {fmt(version)} instead of {fmt(instead_of)}, and no person "
+            f"confirmed it ({why}). Whether {fmt(version)} or {fmt(instead_of)} follows "
+            f"{fmt(onto_newest)} is a statement about what the release MEANS — the one input "
+            "to this tool no ref can answer, so it is a person's to make and not an "
+            "unattended run's to assume (#386). Nothing was written. Either land this as the "
+            f"minor by dropping --major, or have a person run `release_stamp.py apply "
+            f"--major` at their own keyboard and type {fmt(version)} when it asks"
+        )
+
+    if os.environ.get(UNATTENDED_ENV) == "1":
+        raise refuse(f"{UNATTENDED_ENV}=1")
+    prompt = (
+        f"\n  {fmt(version)}, NOT {fmt(instead_of)}.\n"
+        f"  The newest release at the base is {fmt(onto_newest)}, and `major.minor` here is "
+        "two integers\n"
+        f"  rather than a decimal — so the next MINOR after {fmt(onto_newest)} is "
+        f"{fmt(instead_of)}, not {fmt(version)}.\n"
+        "  A major says this release MEANS something different, and that is yours to say, "
+        "not the\n"
+        "  lander's (#386).\n"
+        f"\n  Type {fmt(version)} to confirm, anything else to abort: "
+    )
+    try:
+        answer = ask_the_terminal(prompt)
+    except OSError as e:
+        raise refuse(str(e)) from e
+    if answer.lstrip("vV") != fmt(version).lstrip("v"):
+        raise refuse(f"it asked for {fmt(version)} at the terminal and read {answer!r}")
+    print(f"confirmed at the terminal: {fmt(version)}, not {fmt(instead_of)}", file=sys.stderr)
+
+
 def cmd_preflight(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
     plan = build_plan(repo, args.onto, None, args.major)
@@ -2202,6 +2373,18 @@ def cmd_apply(args: argparse.Namespace) -> int:
         else:
             _report(plan, args.onto, applied=False)
         return 0
+
+    # Asked here and not in `build_plan`, for two reasons. `preflight` shares that function
+    # and has to stay read-only and answerable anywhere — asking "what would --major do" is
+    # not doing it, and the answer is what a person needs in front of them before they say
+    # yes. And this sits after the early return, so a branch with nothing to stamp never
+    # prompts: `--major` on a noop decides nothing, and a gate that fires where there is no
+    # decision is a gate people learn to get past.
+    #
+    # Last, too: everything that could still refuse this release has refused by now, so a
+    # person who confirms is not then told the branch was unlandable all along.
+    if plan.major:
+        confirm_major(plan.version, plan.instead_of, plan.onto_newest)  # type: ignore[arg-type]
 
     version = fmt(plan.version)  # type: ignore[arg-type]
 
@@ -2434,13 +2617,21 @@ def _report(plan: Plan, onto: str, *, applied: bool) -> None:
                   f"{s.path}:{s.line}  {s.text}", file=sys.stderr)
         return
     verb = "stamped" if applied else "would stamp"
-    how = " (--major)" if plan.major else ""
+    # The line that would have caught this. A major is invisible in a prompt — "v2.99, v3.00,
+    # v3.01" reads as a sequence — and unmissable in a sentence that names the number it is
+    # NOT. Printed by `preflight` as well as `apply`, because preflight is where a person
+    # looks before deciding (#386).
+    how = f" (--major, NOT {fmt(plan.instead_of)})" if plan.major else ""
     held = (f", newest tag: {fmt(plan.reserved_newest)}" if plan.reserved_newest else
             ", no release tags in this checkout")
     print(f"{verb} {fmt(plan.version)}{how}  (newest at {onto}: {fmt(plan.onto_newest)}"
           f"{held})")
     for s in plan.sites:
         print(f"  {s.path}:{s.line}  {s.text}")
+    if plan.major and not applied:
+        print(f"  a major is a statement about what the release MEANS, so `apply --major` "
+              f"asks for {fmt(plan.version)} at a terminal and refuses where there is none "
+              "(#386)")
     if plan.serves:
         print(f"\nserved version {plan.served_from} -> {plan.served_to}")
     else:
