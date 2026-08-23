@@ -1216,23 +1216,27 @@ name nobody could type.
 
 **Why it registers that name itself, before starting anything.** Since v2.12 the board
 *designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
-**request** (`X-Agent-Name`) — one the MCP server makes and the lifecycle hook does not.
-Allocation is first-contact-wins, and the hook fires on `SessionStart`, so it usually wins.
-Measured against a live board:
+**request** (`X-Agent-Name`). Allocation is first-contact-wins. Measured against a live board:
 
 | First contact | Later request | Board says |
 |---|---|---|
-| key only, no name (the hook) | — | `zeus/meadow-russet` |
-| key only, no name (the hook) | `seat-lexray-9` (the MCP server) | `zeus/meadow-russet` — **the request is ignored** |
+| key only, no name | — | `zeus/meadow-russet` |
+| key only, no name | `seat-lexray-9` | `zeus/meadow-russet` — **the request is ignored** |
 | key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
 
-So a seat that does not ask up front comes up as two random words about as often as not,
-losing the one property the numbering was for. `qb-seat` makes a single `GET /whoami`
-carrying both headers before it execs, which settles the row; every process that follows
-resolves to it. It reads back what the board actually said and warns if that is not the name
-it asked for, which happens when the key was bound to a designated name on some earlier run
-— allocation hands a returning key the name it already had, and a request cannot displace
-one that exists.
+When this was written the MCP server was the only client that made the request and the
+lifecycle hook was not, so the hook's `SessionStart` usually got there first and a seat came
+up as two random words about as often as not — losing the one property the numbering was for.
+**Every client asks now (#156)**, so the row is settled correctly whichever one reaches the
+board first.
+
+`qb-seat` still makes a single `GET /whoami` carrying both headers before it execs, and the
+reason is the read-back rather than the request: a name is granted only when it is *free*, so
+a second pane started as the same seat is quietly given something else, and it is worth being
+told that at the one moment a human is looking. It warns when the board's answer is not the
+name it asked for — which also happens when the key was bound to a designated name on some
+earlier run, since allocation hands a returning key the name it already had and a request
+cannot displace one that exists.
 
 *Addressing was never at risk either way*, and that is worth knowing before someone
 re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
@@ -1559,16 +1563,39 @@ and the `⚒` is where the loop needed a beginning.
 
 **The plans panel is the one that says what the work is FOR.** FLEET says who is here and
 CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
-ordered list, plus the fleet-wide one — with the items somebody is running at the top, then
-the ones that are free, then the blocked ones, which are the band a reader can do nothing
-about. Inside each band the board's own order is kept, because the order is the point of a
-plan, and the repos this dashboard watches come before the ones it only overhears. A row
-shows `▶` running with its holder, `▷` inside a plan somebody else holds, `○` free with how
-long it has sat, or `⊘` blocked with what it waits on — the `▷` because an item covered by
-another agent's plan claim is not free work, and showing it as free is the outcome
-`covered_by` exists to prevent. Clicking one puts its plan, its claim note, its blockers and
-its own note on the detail line: that reasoning lives on the board and nowhere else — a plan item never
-restates its issue — and it does not fit in a title cell.
+ordered list, plus the fleet-wide one — **in the board's own order**, which is the point of a
+plan and a human decision. The panel used to re-band it locally (running, then free, then
+blocked) and that was a second answer about an ordered list computed against that list's own
+order, which is how this pane and `/plan/view` came to disagree about what was next. What the
+banding was reaching for, the board sends outright: `next` is the first item that is open,
+unclaimed, unblocked and inside nobody else's held plan, it is named in the title and its row
+wears a filled `◉`.
+
+A row shows `▶` running with its holder, `▷` inside a plan somebody else holds, `⊘` blocked
+with what it waits on, `◉` the board's own pick, or `○` free with how long it has sat — the
+`▷` because an item covered by another agent's plan claim is not free work, and showing it as
+free is the outcome `covered_by` exists to prevent. Beside the glyph it carries its **rank**,
+marked `~12` where that position is merely where the add landed and nobody chose it (#183),
+and its **ref** as `#78` for an issue or `PR#78` for a pull request — the kind used to be
+dropped, so a PR-backed row drew a dim `⚒` with nothing saying why the item beside it was
+takeable and it was not. The right-hand cell names the holder as `machine/name`, because a
+name alone is recycled and two boxes read as one agent; a held row that is also waiting wears
+the `⊘` in front of the holder, which is the one combination worth acting on.
+
+The title carries what the board concluded about the whole list, and it goes there rather
+than on rows of its own because rows are the scarce thing (#269): the board's own counts,
+which separate an item **covered** by a plan claim from one **claimed** outright and know
+which are **stale**; `~N unchosen` when part of the order is where the adds happened to land;
+what is **next**; and `truncated at N` when the page is not all of it. Clicking a row puts its
+plan, its claim note and expiry, its blockers, its rank and who chose it, how long it has been
+idle and its own note on the detail line — plus, on the `next` row alone, the board's caveat
+about how much that recommendation is worth. That reasoning lives on the board and nowhere
+else — a plan item never restates its issue — and it does not fit in a title cell.
+
+The read says which **session** is asking. `GET /plan` resolves "is this inside somebody
+else's held plan" by machine when the caller does not say, and a machine here runs several
+agents on one token — so a plan the agent in the next pane was holding came back as this
+reader's own, and every item of it was drawn free to take.
 
 A plan item that points at an issue carries a `⚒` like an issue row, so the shortest path
 from "what is next" to somebody doing it is one click. An item pointing at nothing, or one
@@ -1900,9 +1927,9 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
 
-### `qb-doctor` — is this host wired up?
+### `qb-doctor` — is this host wired up, and can work land from it?
 
-Two questions nothing else on the box can answer, in one report.
+Three questions nothing else on the box can answer, in one report.
 
 **The first is the one #204 was filed for.** Three independently versioned things have to
 agree — the board image, the harness on PATH, the Python client's venv — and no component
@@ -1924,12 +1951,21 @@ popped another worktree's work. `HUMAN_EDGE_SECRET` was documented in `DEPLOY.md
 checklist and never deployed, so every human-only endpoint has 403'd since v2.39. Not one of
 them announced itself.
 
+**The third is whether work can actually LAND** (#406, and the `landing` group #407 fills
+out). The first two are both about this machine, and on the night #406 was filed they were
+both satisfied: 9 ok, 1 unknown, nothing broken. In the same minute the merge queue held
+seven green pull requests with none ready, main had not moved in three hours,
+`refs/tags/v3.8` pointed at a commit that is not in main's history, and three branches were
+conflicting on the one file `changelog.d/` exists to keep them out of. Every row was correct
+and not one of them was about the pipeline the work has to travel down.
+
 ```bash
 qb-doctor                     # every check against this host
 qb-doctor --fix               # also run the installers that are safe to re-run
 qb-doctor --json              # the whole report as JSON
 qb-doctor --repo DIR          # check that checkout instead of the cwd's
 qb-doctor --only hooks,edge   # just those rows
+qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
 ```
@@ -1945,7 +1981,13 @@ stash      refs/stash                      guard active, 4 pre-guard entries rem
 reconcile  qb-reconcile.timer              enabled, active, last run 12:26:55                ok
 edge       https://quarterback.fo.ls       302 — forward-auth, and this host has no session   ?
 tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
+merges     prisonblues/quarterback         merge commits only — squash and rebase are off    ok
 ```
+
+Rows are grouped by which question they answer, and `--only` takes a group name as well as a
+row name. `host` is the first two questions; `landing` is the third. The group is what #407
+extends — it should be adding rows to a category, not retrofitting one around a single
+check.
 
 #### Look where the mechanism runs, not where its source lives
 
@@ -1999,6 +2041,44 @@ can run a command the author did not mark runnable:
   generated into 1Password *and* sops and two separate deploys; a tool that tried would
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
+
+#### The `merges` row — a squash merge orphans the release tag (#406)
+
+The tag allocator takes `refs/tags/vX.Y` on the remote at **push** time, against the
+branch's stamped `chore(release)` commit. That placement is what makes the number
+un-stealable (#296) and it is also what a squash breaks: the squash discards that commit, so
+the tag ends up addressing a commit that is not in the history it claims to tag. `v3.8`
+landed that way while every other pull request that night used a merge commit, and the CI
+job called `every release on main has a tag` stayed green — it checked that a tag of that
+*name* resolved, and `v3.8` did. Rebase-merge has the identical defect for the identical
+reason, so both are checked.
+
+The row asks GitHub what this repo allows and fails when either rewriting strategy is on:
+
+```
+merges  prisonblues/selfhost  this repo allows rebase and squash merges, and reserves     FAIL
+                              release tags at push time — a rewriting merge discards the
+                              commit the tag was reserved against (#406, v3.8)
+        -> gh api -X PATCH repos/prisonblues/selfhost -F allow_squash_merge=false …
+```
+
+**It does not ask where the question does not apply.** The scope is a repo that reserves
+release tags, found the way `harness/githooks/pre-push` finds it — `QB_RELEASE_TAG`, then
+`qb.releaseTag`, then `scripts/release_tag.py`. A repo with no allocator has no reservation
+for a merge to orphan, and a `FAIL` a reader cannot act on is how a row gets ignored.
+
+**It detects; it does not set.** Every `fix` this tool runs writes to *this host* — a hooks
+directory, a systemd unit, a venv. This one would write a setting every contributor and
+every other machine in the fleet shares, from whichever checkout somebody happened to type
+`--fix` in, and it needs repository-admin rights a read-only token does not have. So it is a
+`manual`, like the edge secret: the exact one-line `gh api -X PATCH` is printed and a person
+runs it.
+
+**And it says `unknown` rather than `ok` when it cannot look.** GitHub returns the
+merge-strategy fields *only* to a token with push access; a read-only one gets three nulls
+and no explanation, which read as `false` would report "merge commits only" about a repo
+nobody here can see the settings of. A non-GitHub remote, an absent `gh`, an unauthenticated
+`gh` and a null field are each their own `?` with their own remedy.
 
 #### The edge row, and why it currently says `?`
 
@@ -2220,8 +2300,9 @@ to the file that just ran, the name is what gets printed.
   it is absent. **Write both with `tee`, never `>`** — a `>` redirect anywhere under
   `$HOME` is refused by the `dcg` pre-tool guard, and an agent that hits that block leaves
   the bar pointing at the main checkout for the whole session.
-- **Workflow stage.** `qb-stage <stage>` records how far along the work is, in
-  `~/.cache/claude-code/session-stage/$CLAUDE_CODE_SESSION_ID`:
+- **Workflow stage.** `qb-stage <stage>` records how far along the work is — in
+  `~/.cache/claude-code/session-stage/$CLAUDE_CODE_SESSION_ID` for the bar, and on the
+  session's quarterback lease for everybody else:
 
   | Stage | Means | Written by |
   |---|---|---|
@@ -2238,6 +2319,31 @@ to the file that just ran, the name is what gets printed.
   would be worse than one that said less. `qb-stage` checks the *shape* (1–6 alphanumerics)
   and not the vocabulary, so a new stage needs no edit to it — and it exits 0 in silence
   when there is no session id, because a loop under systemd has nobody watching a bar.
+
+  **And it tells the board** (#262). A marker file answers the question for the pane it
+  is written on, which is half of what a fleet is: cross-machine it is not there to read,
+  and same-machine nothing read it. So the same call POSTs the stage to `/lease/stage`,
+  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`,
+  `qb-dash` and `qb-dash-tui` all show it — and emits one `status` post on the live stream
+  when it *changes*, so a follower hears about a transition rather than polling for it.
+  `qb-stage` is the right place to say it because it is the only thing in the system that
+  is *told* the stage; the lifecycle hook reading this marker on each heartbeat would need
+  no code here and would make a fact the fleet acts on arrive up to a heartbeat late.
+
+  The report is **fail-open and non-blocking**: a backgrounded `curl` with stdin closed and
+  its output discarded, with the board config resolved inside that same subshell so a
+  `QUARTERBACK_TOKEN_CMD` waiting on a passphrase cannot stall the caller either. An
+  unconfigured, unreachable or slow board costs the marker nothing and says nothing —
+  telemetry that can fail the thing it reports on is worse than none. Board URL and token
+  come from the per-host contract in `qb-env`, read directly rather than sourced, exactly
+  as `worktree-holder` reads it; there is no default URL, because guessing one points the
+  report at another island's board.
+
+  On the reading end a lease that never reported a stage says so rather than showing a
+  blank: `/fleet` calls it `unreported`, in the same vocabulary it already uses for a
+  session nobody ended, and the terminal panels use `—` because six columns have no room
+  for the word. A stage is 1–6 alphanumerics by construction, so the dash cannot be
+  mistaken for one.
 
 `/drop-worktree` clears all three.
 
@@ -2638,6 +2744,18 @@ and the board client work whether or not the CLI is installed. Under home-manage
 `board.url` renders that file for you; set it to `null` (the default) to keep rendering it
 yourself. There is deliberately **no default board URL**: unset means this machine has not
 been told which board it belongs to, and guessing would point the query at somebody else's.
+
+**`QUARTERBACK_INSTANCE` is the exception, and it is per session rather than per site.**
+Everything above says which board this *machine* talks to; this says which agent *this
+session* is on it. Unset — the normal case — the clients send the session-id prefix as an
+opaque key and the board designates a name against it, which is where `zeus/glacier-amber`
+comes from. Set, it does two things: it is the key, so two sessions sharing one value are
+**one agent** on the board (one history, one lease, one set of claims — never export it
+host-wide), and `qb-env`'s `qb_requested_name` turns it into an `X-Agent-Name` request, which
+is what makes `zeus/seat-3` the spelling peers actually see. `qb`, `qb-hook` and the MCP
+server all send that request (#156); before they did, the label was a key nobody was shown.
+The name shape is stricter than the key shape — `^[a-z0-9]+(?:-[a-z0-9]+)*$` — so `Deploy_1`
+is asked for as `deploy-1`, and a label with nothing usable in it asks for no name at all.
 
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy

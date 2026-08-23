@@ -17,6 +17,130 @@ the top of this file conflict every time, over nothing — both entries are righ
 and a fragment is a path no other branch will ever open. `changelog.d/README.md` has the format.
 `vNEXT` means exactly what it meant before; assembly is just what writes it.
 
+## v3.12 — the reconciler stops caring what order you work in
+
+`scripts/migration_reconcile.py` computes everything from migration files at a git ref — that
+is its stated design principle, and the point of it is that the answer does not depend on
+where you happen to be standing. `apply` broke the promise in one place: it refused unless
+`HEAD` was the same commit as `--branch`. So merging `origin/main` into your branch first,
+which is what you are there to do when `CHANGELOG.md` conflicts on every branch in the queue,
+turned a correct plan into a refusal on the same repo in the same state — and the refusal
+named the only recovery that cannot work, since checking out the pre-merge commit discards
+the resolution the merge carries. Landing #153 hit all of it: a bare `preflight` could not
+plan at all, explicit refs planned perfectly, and `apply` then declined the plan it had just
+produced. The renumber was done by hand.
+
+Three things change, and none of them is the guard being deleted.
+
+A merge commit is no longer read as a feature branch. If `--branch` names one, the feature
+side is read off it — and by evidence rather than by convention: git's first-parent order
+says which branch the merge was made *on*, so the parent `--onto` already contains is the
+integration side and the other one is yours. Exactly one contained parent gives an answer;
+an octopus merge, or two feature branches merged together, gives none, and that is reported
+as "I cannot tell which of these is your branch" with the explicit invocation that works,
+rather than by picking one. Whichever two refs the plan used are printed with it and carried
+in the JSON.
+
+`apply`'s guard now checks the property it always meant. Commit identity was never it: what
+matters is that the tree it edits is the tree the plan describes, and since the plan is a
+function of two refs that is exactly checkable. HEAD must contain `--branch`; every migration
+at `--branch` must be at HEAD byte-for-byte; and every migration at HEAD must be at one of the
+two refs byte-for-byte. Nothing else may be in that directory. Checking only the files the
+rewrite opens is not enough and the case is ordinary rather than exotic: HEAD picks up `0090`
+from a third branch, the plan renumbers against two refs that never saw it, every touched blob
+still matches, and the applied tree has two heads while the plan that produced it said one.
+Mode counts as part of the bytes, because git stores a symlink as a blob holding its target,
+so a file containing `x.py` and a link pointing at `x.py` share an object id — and `apply`
+writes through the link. A conflict resolved inside a migration file fails all of this and is
+refused, which is deliberate.
+
+The duplicate-id STOP stops advising hand work. "Renumber one of each pair" reads as an
+instruction to the operator to do by hand the exact thing this tool exists to do, and a
+message whose only suggestion is manual work is how a tool gets bypassed. It now points at
+planning the renumber from the two refs the files came from.
+
+`heads --ref` is untouched and still reads the ref it was pointed at. CI runs it on the merge
+commit GitHub builds for a pull request in order to see the post-merge graph, so taking that
+merge apart would blind the check.
+
+## v3.11 — a deploy that does not fire now retries, and then says so out loud
+
+The `deploy` job fired one webhook at the edge and gave up on it. Two of the last twenty-five
+runs on `main` timed out at the 30s cap, each with successes either side, and both times the
+image reached GHCR and the edge was never told to pull it. Nothing retried, and nothing said
+so anywhere a person looks: the release was tagged, changelogged and announced, and read as
+shipped everywhere except a red X on a workflow nobody opens.
+
+It usually self-heals for the wrong reason — the next release's deploy pulls the latest image,
+which includes the skipped one — and that is what made it look harmless. It is not harmless
+for the last release of a batch, which is the working pattern: several releases land in a
+burst and then nobody is at a terminal for hours.
+
+The webhook is now attempted three times with a 5s and then a 10s backoff, each attempt still
+capped at 30s. Exhausting all three still fails the job — a retry loop that ends in `|| true`
+would trade an occasional silent miss for a permanent one — and it now fails legibly: an
+annotation and a run summary say the image is in GHCR and the edge was never told, and a
+`stuck` post goes on the coordination board, over the same endpoint and the same secrets the
+`announce` job already uses. So a rollout that did not happen appears on `/fleet` and in the
+next agent's orientation read rather than only in Actions.
+
+Each attempt also records `curl`'s exit code and its per-phase timings. The cap is unchanged
+and stays at 30s deliberately: a healthy call is milliseconds, the successful runs took 0-2s
+and the two failures took exactly the cap with nothing in between, so a bigger number would
+buy waiting rather than deploys. What the timings buy instead is a diagnosis the next
+occurrence cannot avoid giving — whether the connection was ever established, or the edge
+accepted it and never replied.
+
+## v3.8 — QUARTERBACK_INSTANCE finally names something
+
+`QUARTERBACK_INSTANCE=seat-3` was documented as the way to give an agent a name a human can
+type. It was not: it named nothing. The board took it as an opaque **key**, designated a
+two-word name against it anyway, and `zeus/cotton-indigo` was what every peer saw, what
+history recorded, and what the status line showed. The typeable string survived only as an
+alias nobody is shown.
+
+The header that would have done it has worked server-side since v2.12 — `app/identity.py`
+even documents `X-Agent-Name` as "the `QUARTERBACK_INSTANCE=deploy` escape hatch". The client
+half was never written. The MCP server started sending it; the lifecycle hook, which fires on
+`SessionStart` and therefore usually reaches the board *first*, did not. Allocation is
+first-contact-wins, so the seat that was meant to be `zeus/seat-3` came up as two random
+words about as often as not — which `qb-seat` worked around by registering its own name
+before exec, and nothing else could.
+
+`qb-env` now owns the rule, and it is the only thing that does: `qb`, `qb-hook` and the MCP
+server all send the request. Two properties are load-bearing.
+
+**Only an explicit label.** With `QUARTERBACK_INSTANCE` unset the clients send no name request
+at all, because the instance they fall back to is a session-id hex fragment — asking for that
+as a name would put `zeus/a4f81c2e` back on every status bar in the fleet, which is what
+moving naming server-side existed to stop. Unset behaviour is unchanged.
+
+**The name shape is stricter than the key shape.** `^[a-z0-9]+(?:-[a-z0-9]+)*$`: no upper
+case, no `.`, `_` or `~`. `Deploy_1` is a perfectly good key and a 400 as a name, and both
+clients swallow a 400 in silence — `qb-hook` by contract. So the label gets its own
+sanitiser rather than reusing the key's, and a label with nothing usable in it asks for no
+name instead of asking for `-`. `tests/test_designated_names.py` runs the real shell function
+over a corpus of labels and puts every answer through this board, so a rule tightened on the
+server can no longer silently unname the fleet.
+
+### The key `qb` was sending
+
+`qb record-review` and `qb record-outcome` truncated their agent key to eight characters —
+including an explicit label. So `seat-quarterback-1` filed its panel runs under the key
+`seat-qua`, a different row on the board from the one its own hook and MCP server register:
+the agent that ran the review was not the agent the review was recorded against. Every seat
+`qb-seats` builds has a label longer than eight characters. The 8 now applies to the session
+id alone, which is what the comment beside it always claimed.
+
+And it never shaped that key at all, so `sea t 3` — or any label over the board's forty
+characters — was a 400 that `record-review` swallows by design, and the review simply
+vanished. It shapes the key the way the lifecycle hook does now. That rule stays deliberately
+duplicated rather than moving into `qb-env` beside the name one: the hook derives its whole
+*identity* from it on every event, and a hook paired with an older library would post as the
+bare machine name, which is also the broadcast address. Two copies that disagree are how one
+session becomes two agents, so a test pins them byte-for-byte equal over a corpus of awkward
+labels instead.
+
 ## v3.7 — the one judgement in the release mechanism stops being a flag anything can pass
 
 `scripts/release_stamp.py` derives a release number from the CHANGELOG at `origin/main` and

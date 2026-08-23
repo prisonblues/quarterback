@@ -59,6 +59,7 @@ from app.review_queue import (
     ACTIONS,
     AGE_BASES,
     CLEARING_OUTCOMES,
+    EXEMPTABLE_REF_KIND,
     HOLDS,
     STATES,
     Exemption,
@@ -72,7 +73,9 @@ from app.review_queue import (
     classify,
     drainable,
     exempting,
+    granted_exemption,
     idle_reason,
+    requested_exemption,
     same_commit,
 )
 
@@ -286,7 +289,7 @@ async def _plan_items(session: AsyncSession, repo: str,
         select(PlanItem).where(
             PlanItem.repo == repo,
             PlanItem.state == "open",
-            PlanItem.ref_kind == "pr",
+            PlanItem.ref_kind == EXEMPTABLE_REF_KIND,
             PlanItem.ref_value.in_(sorted({str(n) for n in numbers})),
         )
     )).all())
@@ -407,6 +410,8 @@ def _entry(repo: str, pr: PullRequestIn, verdict: Verdict, run: LastRun | None,
            rounds: int, rounds_total: int, exemption: Exemption | None,
            human: NeedsHuman | None, item: PlanItem | None,
            held: Held | None, landing: Landing | None, now: datetime) -> dict:
+    note = None if item is None else item.note
+    pending, granted = requested_exemption(note), granted_exemption(note)
     return {
         "pr": pr.number,
         "title": pr.title,
@@ -461,12 +466,30 @@ def _entry(repo: str, pr: PullRequestIn, verdict: Verdict, run: LastRun | None,
             "updated": exemption.updated.isoformat(),
             "stale_seconds": max(0, int((now - exemption.updated).total_seconds())),
         },
+        # An exemption somebody has ASKED for and nobody has granted (#335). It
+        # changes NOTHING above it — not the state, not `drainable`, not a hold —
+        # and that is the design rather than an omission: a pending request that
+        # held its PR out of review would give the worker, by a longer route, the
+        # authority the refusal exists to withhold. It is reported so a person can
+        # see one waiting, and so it visibly ages.
+        "exemption_requested": None if pending is None else {
+            "item_id": str(item.id) if item is not None else None,
+            "by": pending.by,
+            "reason": pending.reason,
+            "since": item.updated_at.isoformat() if item is not None else None,
+        },
         "plan_item": None if item is None else {
             "item_id": str(item.id),
             "title": item.title,
             "rank": item.rank,
             "note": item.note,
             "exempts": exemption is not None,
+            # An exemption written through POST /plan/item/exempt names the person
+            # who granted it. `null` where the note carries the bare marker — a
+            # human write through POST /plan/item/update, which is still a human
+            # write and still exempts, but says less about itself.
+            "granted_by": None if granted is None else granted.by,
+            "exemption_requested": pending is not None,
         },
         "claim": None if held is None else {
             "holder": held.holder,

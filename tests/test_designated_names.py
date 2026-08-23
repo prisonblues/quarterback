@@ -17,7 +17,10 @@ the same agent, and exactly one of them appears in history.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 from sqlalchemy import update
 
@@ -136,6 +139,52 @@ async def test_nothing_is_ever_authored_under_a_key(client):
 async def test_a_requested_name_survives_allocation(client):
     """`QUARTERBACK_INSTANCE=deploy` still works — as a request, not an override."""
     assert (await whoami(client, NAMED))["name"] == "deploy"
+
+
+#: `qb-env`'s `qb_requested_name`, which is what actually fills `X-Agent-Name` on the
+#: fleet. Imported the way `test_dials.py` imports `harness_rules`: by path, because
+#: the harness is not a package and the skew this guards is between the two halves.
+QB_ENV = Path(__file__).resolve().parent.parent / "harness" / "bin" / "qb-env"
+
+#: Labels an operator might plausibly put in `QUARTERBACK_INSTANCE`, chosen for the
+#: gap this test exists to close: `Deploy_1` and `seat.lexray~9` are perfectly good
+#: *keys* — `KEY_RE` allows upper case, `.`, `_` and `~` — and none of them is a legal
+#: *name*. Sending one raw is a 400, and both clients swallow a 400 in silence.
+INSTANCE_LABELS = [
+    "seat-3", "deploy-two", "Deploy_1", "seat.lexray~9", "UPPER",
+    "-lead-and-trail-", "sea t 3", "café-3", "x" * 45, "9", "___", "",
+]
+
+
+def _requested_name(label: str) -> str:
+    """What the shell clients would ask for, run for real rather than reimplemented."""
+    env = {**os.environ, "QUARTERBACK_INSTANCE": label}
+    got = subprocess.run(
+        ["bash", "-c", 'set -uo pipefail; . "$1"; qb_requested_name', "_", str(QB_ENV)],
+        capture_output=True, text=True, env=env, timeout=30, check=True,
+    )
+    return got.stdout
+
+
+async def test_every_label_the_clients_may_send_is_a_name_this_board_takes(client):
+    """The escape hatch's two halves are in two languages (#156).
+
+    `qb-env` decides what `QUARTERBACK_INSTANCE=Deploy_1` is *asked* for and this
+    module decides what a name may *be*, and until #156 nothing joined them up
+    because no client sent the header at all. The clients cannot see a refusal —
+    `qb-hook` is fail-open by contract and `qb`'s recorder exits 0 on a dead board —
+    so a rule tightened on this side would silently unname every labelled agent on
+    the fleet. That failure has to land here, in the suite that owns the rule.
+    """
+    for i, label in enumerate(INSTANCE_LABELS):
+        asked = _requested_name(label)
+        if not asked:
+            continue  # nothing usable in the label: the client sends no header
+        assert valid_name(asked), f"{label!r} -> {asked!r} is not a name"
+        headers = {**DESKTOP, "X-Agent-Key": f"hatch{i}", "X-Agent-Name": asked}
+        r = await client.get("/whoami", headers=headers)
+        assert r.status_code == 200, (label, asked, r.text)
+        assert r.json()["name"] == asked
 
 
 async def test_a_malformed_requested_name_is_rejected_not_ignored(client):

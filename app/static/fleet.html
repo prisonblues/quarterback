@@ -63,6 +63,18 @@
   .verdict.ended { color:var(--ended); border-color:#31435c; }
   .verdict.unreported { color:var(--unreported); }
 
+  /* How far along, next to whether it is moving. Shaped like the verdict chip
+     because they are read in one glance and answer adjacent questions — and
+     coloured differently, because a stage is not a judgement about the row. */
+  .stage { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+    border-radius:999px; padding:2px 9px; border:1px solid #2f4f6f;
+    background:var(--chip); color:var(--accent); white-space:nowrap; }
+  /* The unreported case, and it must not read as a stage. Same word and same
+     grey the verdict chip uses for a session nobody ended — one vocabulary for
+     silence on this page, not two. */
+  .stage.unreported { color:var(--unreported); border-color:var(--line);
+    text-transform:none; letter-spacing:0; }
+
   .title { margin-top:5px; font-size:15px; word-break:break-word; }
   .title.untitled { color:var(--muted); font-style:italic; }
   .where, .doing { color:var(--muted); font-size:13px; margin-top:3px;
@@ -373,6 +385,28 @@ function claimChips(r){
       >${esc(shortKey(c.key))}</span>`).join("")}</div>`;
 }
 
+// How far along the work is — `F0`, `R1`, `R1F`, `R2` — reported by `qb-stage`
+// and by nothing else, because nothing else is told it (#262). The chip only
+// exists where a lease does: a stage lives on the lease, so a row with no live
+// lease has no field to be silent about, and printing "unreported" there would
+// invent a third state out of a question that does not arise.
+//
+// A live lease that never reported one says so IN THE PAGE'S OWN WORD. `state`
+// is the precedent one row down — "it has not said what it is doing" — and the
+// word is the same one the verdict chip uses for a session nobody ended. An
+// empty chip, or no chip at all, would read as "this agent has no stage", which
+// is the failure the whole field exists to remove.
+function stageChip(l){
+  if(!l) return "";
+  const s = (l.stage || "").trim();
+  return s
+    ? `<span class="stage" title="how far along: reported by qb-stage when it changed"
+        >${esc(s)}</span>`
+    : `<span class="stage unreported" title="nothing has reported a stage for this `
+      + `session — qb-stage is the only thing that says one, and most sessions never do"
+        >unreported</span>`;
+}
+
 function agentRow(r){
   const d = verdict(r);
   const el = document.createElement("article");
@@ -390,6 +424,7 @@ function agentRow(r){
     <div class="top">
       <span class="name">${who(r.holder)}</span>
       <span class="verdict ${d.v}">${esc(d.v)}</span>
+      ${stageChip(l)}
       <button class="end" data-end="${esc(r.session)}"
         ${d.v==="ended"?`disabled title="already ended — ${esc(r.ended.reason)}"`
                        :`title="record that this session stopped"`}>end</button>

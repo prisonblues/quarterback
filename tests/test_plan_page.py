@@ -209,6 +209,39 @@ def test_a_control_that_will_not_act_still_answers_a_tap(page):
         "the click handler must read the reason before it reads the verb"
 
 
+def test_explaining_a_live_control_is_not_a_way_of_disabling_it(page):
+    """#398's ⊘ is a live control that also needs a tap-reachable explanation — a
+    thumb has no other way to be told what tapping it will do. So the two cannot be
+    the same thing: what stops a tap falling through to the verb is the REFUSAL,
+    which only `dead()` writes and only as `aria-disabled`, not the mere presence of
+    a reason. Keyed off the reason instead, every control that learned to explain
+    itself would go dead in the act of learning."""
+    handler = page[page.index('listEl.addEventListener("click"'):]
+    handler = handler[: handler.index("let path, body;")]
+    assert 'aria-disabled' in handler, \
+        "the fall-through must be stopped by the refusal, not by the explanation"
+    assert not re.search(r'closest\("\[data-why\]"\);\s*if\(why\)\{[^}]*return;', handler), \
+        "a bare `data-why` return swallows every live control that carries a reason"
+    acts = page[page.index('<div class="acts">') : page.index("</div>`;")]
+    exempt = re.search(r"<button data-exempt=.*?>⊘</button>", acts, re.S)
+    assert exempt, "the ⊘ must still be in the row's controls (#335)"
+    assert "data-why" in exempt.group(0), "and its explanation must be tap-reachable"
+    assert "dead(" not in exempt.group(0) and "aria-disabled" not in exempt.group(0), \
+        "the ⊘ is rendered conditionally, never disabled — it is never a dead control"
+
+
+def test_a_review_marker_nobody_can_attribute_still_answers_a_tap(page):
+    """The other half of #398's own last fix. A request typed by hand carries no
+    author and no reason, and an empty `title` was invisible on a desktop and is a
+    tap that clears the header on a phone — silence rendered as an answer. Both
+    review chips resolve to a sentence before they are put on the page."""
+    for name in ("grantWhy", "askedWhy"):
+        why = re.search(rf"const {name} = ([^;]+);", page, re.S)
+        assert why, f"{name} must be one sentence, worked out once"
+        assert '""' not in why.group(1), \
+            f"{name} falls back to an empty string — an empty tap is not an answer"
+
+
 def test_no_explanation_on_a_row_is_reachable_only_by_hovering(page):
     """The defect, generalised. `title=` is a desktop-only answer, so every one of
     them inside a row — the move gate, the drop button, the rank's provenance
@@ -355,3 +388,28 @@ def test_nothing_shadows_the_function_that_puts_an_explanation_on_screen(page):
     otherwise see."""
     shadows = re.findall(r"\b(?:const|let|var)\s+note\b", page)
     assert not shadows, "a local named `note` shadows note() for its whole scope"
+
+
+def test_exempting_a_pr_from_review_is_on_the_page_because_only_a_person_may(page):
+    """The disposal half of #335, and the reason a refusal is not a dead end.
+
+    An agent may ask for an exemption and may not grant one, so the grant has to
+    be reachable by the person it is for — on a phone, in one tap. Without the
+    control the endpoint ships unwired, which is the pattern #169 is about: a
+    mechanism nobody can reach is not a control.
+    """
+    assert '"/plan/item/exempt"' in page, "the page has to call the endpoint"
+    assert "data-exempt" in page, "and offer it on the row"
+    # A reason in both directions. #279 refuses a bare flag at the API and at the
+    # database CHECK; a button that sent one would just move the refusal.
+    assert re.search(r"data-exempt.{0,600}reason", page, re.S), \
+        "the control must collect a reason, because the endpoint requires one"
+
+
+def test_the_page_never_re_derives_what_a_note_means_about_review(page):
+    """The marker is a token in free text, so a regex on this page is how the page
+    and the queue would come to disagree about the same row. `GET /plan` publishes
+    `review` on every PR item; the page reads that and nothing else."""
+    assert "it.review" in page, "the page reads the server's derivation"
+    for token in ("exempt-requested", "review: exempt", "review:exempt"):
+        assert token not in page, f"the page must not look for {token!r} itself"

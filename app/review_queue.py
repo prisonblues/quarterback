@@ -165,9 +165,160 @@ UNKNOWN = "UNKNOWN"
 MIN_SHA_PREFIX = 7
 
 
+#: The ref kind an exemption can be written against. The queue only ever reads
+#: a plan item that names a PR, so this is also the only kind on which the
+#: marker means anything — and it is a constant rather than a literal in two
+#: files because the reader (:mod:`app.api.review_queue`) and the writer
+#: (:mod:`app.api.plan`) have to agree about it or the refusal guards a kind
+#: nothing reads while the kind that is read stays open.
+EXEMPTABLE_REF_KIND = "pr"
+
+#: The token an agent writes when it wants an exemption it may not grant itself
+#: (#335). It is a hyphenated extension of the marker above, and the hyphen is
+#: load-bearing: :data:`EXEMPT_MARKER`'s trailing ``(?![\w-])`` refuses it, so a
+#: request cannot be read as an exemption by the queue, by a dashboard, or by
+#: anything else that greps a note. ``test_review_exemption.py`` asserts that
+#: property directly rather than trusting the two patterns to stay compatible.
+EXEMPT_REQUEST_MARKER = re.compile(
+    r"(?<![\w-])review\s*:\s*exempt-requested(?![\w-])", re.IGNORECASE)
+
+#: Written and read in one module, on purpose. An exemption is a token in free
+#: text, so the only thing keeping "what the endpoint writes" and "what the queue
+#: recognises" in step is that both live here and a round-trip test runs over the
+#: pair. Two modules agreeing today is how ``provenance`` drifted (#65).
+_REQUEST_LINE = re.compile(
+    r"^review\s*:\s*exempt-requested\s+by\s+(?P<by>\S+)\s+—\s+(?P<reason>.*)$",
+    re.IGNORECASE | re.MULTILINE)
+_GRANT_LINE = re.compile(
+    r"^review\s*:\s*exempt\s+—\s+granted\s+by\s+(?P<by>\S+)\s+—\s+(?P<reason>.*)$",
+    re.IGNORECASE | re.MULTILINE)
+
+
 def exempting(note: str | None) -> bool:
     """Does this plan-item note exempt its PR from review?"""
     return bool(note and EXEMPT_MARKER.search(note))
+
+
+def exempt_requested(note: str | None) -> bool:
+    """Has somebody ASKED for an exemption on this item, without granting one?"""
+    return bool(note and EXEMPT_REQUEST_MARKER.search(note))
+
+
+def one_line(text: str) -> str:
+    """A reason as it can be stored on one line of a note.
+
+    The markers are line-oriented — a note is prose a person wrote, and the only
+    way to take a control token back out of it without guessing is to drop the
+    line carrying it. A reason with a newline in it would put half of itself on a
+    line the parser never looks at and the other half beyond any removal.
+    """
+    return " ".join(text.split())
+
+
+@dataclass(frozen=True, slots=True)
+class ExemptionRequest:
+    """An exemption somebody has asked for and nobody has granted.
+
+    ``by`` and ``reason`` are ``None`` together when the marker is present but the
+    line was not written by :func:`request_line` — a person typing the token by
+    hand. Reported as a request with an unknown author rather than not reported,
+    because the marker is what a reader acts on and hiding one nobody can
+    attribute is the direction that loses information.
+    """
+
+    by: str | None = None
+    reason: str | None = None
+
+
+class MarkerInReason(ValueError):
+    """A reason that carries a marker of its own, and so cannot be stored as one.
+
+    The bug this exists to make impossible, found by the codex second opinion on
+    this change: the request line is ``review: exempt-requested by <agent> —
+    <reason>``, and :data:`EXEMPT_MARKER` is unanchored. A reason of literally
+    ``review: exempt`` therefore ends the line with a live exemption marker, and
+    an agent asking politely for an exemption would have granted itself one
+    through the very endpoint built to stop it — silently, and past every test
+    that only checked the endpoint an agent used to call.
+    """
+
+
+def safe_reason(reason: str) -> str:
+    """A reason as one line, refused if it carries a marker of its own.
+
+    The check is the same two patterns the queue reads with, so there is no
+    second opinion about what a marker looks like — a reason that would be read
+    as a control token cannot be stored in a field that is scanned for control
+    tokens, however it is spelled.
+    """
+    said = one_line(reason)
+    if EXEMPT_MARKER.search(said) or EXEMPT_REQUEST_MARKER.search(said):
+        raise MarkerInReason(
+            "a reason may not contain the exemption marker itself: the marker in "
+            "a note is what takes a PR out of the review queue, so a reason "
+            "carrying one would exempt the PR rather than ask for it. Say why in "
+            "words instead.")
+    return said
+
+
+def request_line(by: str, reason: str) -> str:
+    """The one spelling of "an exemption was asked for", for a note."""
+    line = f"review: exempt-requested by {by} — {safe_reason(reason)}"
+    if EXEMPT_MARKER.search(line):  # pragma: no cover - see below
+        # Belt and braces over `safe_reason`, because this is the assertion the
+        # whole change rests on and the cost of it being wrong is silent. The
+        # only remaining way in is `by`, which is a board identity and cannot
+        # contain a space; if that ever stops being true this raises rather than
+        # returning an exemption somebody asked for.
+        raise MarkerInReason(f"refusing to write a request that exempts: {line!r}")
+    return line
+
+
+def grant_line(by: str, reason: str) -> str:
+    """The one spelling of "a person granted an exemption", for a note."""
+    line = f"review: exempt — granted by {by} — {safe_reason(reason)}"
+    if EXEMPT_REQUEST_MARKER.search(line):  # pragma: no cover - see request_line
+        raise MarkerInReason(f"refusing to write a grant that reads as a request: {line!r}")
+    return line
+
+
+def requested_exemption(note: str | None) -> ExemptionRequest | None:
+    """The outstanding request on this note, or ``None`` if there is not one."""
+    if not exempt_requested(note):
+        return None
+    m = _REQUEST_LINE.search(note or "")
+    if m is None:
+        return ExemptionRequest()
+    return ExemptionRequest(by=m.group("by"), reason=m.group("reason").strip() or None)
+
+
+def granted_exemption(note: str | None) -> ExemptionRequest | None:
+    """Who granted this exemption and why, when the note says so in full.
+
+    ``None`` where :func:`exempting` is still true — a note carrying the bare
+    marker exempts, and always has. What this adds is the difference between an
+    exemption that names the person who granted it and one that does not, which
+    is exactly the question #335 is about.
+    """
+    m = _GRANT_LINE.search(note or "")
+    if m is None:
+        return None
+    return ExemptionRequest(by=m.group("by"), reason=m.group("reason").strip() or None)
+
+
+def strip_exemption_lines(note: str | None) -> tuple[str | None, int]:
+    """The note with every line carrying either marker removed, and how many went.
+
+    A whole line, not the token: a line that says ``review: exempt`` is a line
+    about the exemption, and excising the token alone would leave a dangling
+    reason that reads as though the exemption were still there.
+    """
+    if not note:
+        return note, 0
+    kept = [ln for ln in note.splitlines()
+            if not (EXEMPT_MARKER.search(ln) or EXEMPT_REQUEST_MARKER.search(ln))]
+    dropped = len(note.splitlines()) - len(kept)
+    return ("\n".join(kept).strip() or None), dropped
 
 
 def same_commit(a: str | None, b: str | None) -> bool | None:

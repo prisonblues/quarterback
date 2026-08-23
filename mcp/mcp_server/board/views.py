@@ -15,6 +15,25 @@ from datetime import UTC, datetime
 #: whether the expensive tier is worth it.
 NOT_RECORDED = "not recorded"
 
+#: What a lease that never reported a workflow stage renders as in a column.
+#:
+#: The word is **unreported**, and that is not a private choice: it is what
+#: ``/fleet`` says, in the same four-word vocabulary it uses for a session nobody
+#: ended (``live | ended | unclear | unreported``). The browser page spells it out
+#: because it has the width. This column is six characters wide, so it uses the
+#: glyph the fleet's terminals already use for an unsaid value — ``repo``,
+#: ``state`` and ``title`` all render one this way, and ``harness/bin/qbdata.py``
+#: renders this same field this same way for ``qb-dash``.
+#:
+#: **It cannot be misread as a stage**, which is the whole job. A stage is 1-6
+#: alphanumerics by construction — ``app.api.leases.STAGE_RE`` at the board's
+#: edge, and ``qb-stage``'s own check before that — so a non-alphanumeric glyph is
+#: outside the value space entirely. An *empty* cell is not: it is equally
+#: consistent with a rendering bug, a truncated column and a stage nobody said,
+#: and a column that fills in for some rows and is blank for others reads as
+#: "those agents have no stage" (#261, and the note on #262 about local markers).
+STAGE_UNREPORTED = "—"
+
 
 def _parse(ts: str | None) -> datetime | None:
     if not ts:
@@ -84,6 +103,10 @@ def fleet_rows(active: dict, now: datetime | None = None) -> list[dict]:
                 "device": a.get("device") or "?",
                 "repo": a.get("repo") or "",
                 "branch": a.get("branch") or "",
+                # The one field here that changes as the work progresses: repo,
+                # branch and title read identically from the first cut to the
+                # third review round (#262).
+                "stage": a.get("stage") or STAGE_UNREPORTED,
                 "title": a.get("title") or "",
                 "ttl": ttl(a.get("expires"), now),
                 "since": age(a.get("since"), now),
@@ -103,6 +126,11 @@ def fleet_rows(active: dict, now: datetime | None = None) -> list[dict]:
                 # the column that nothing on the board actually said.
                 "repo": "",
                 "branch": "",
+                # No stage of its own either, and the parent's is not borrowed —
+                # the same rule repo and branch follow above. The fan-out of an
+                # `R1F` fix pass is arguably the clearest case for inheriting one,
+                # and it is still an invention: nothing on the board said it.
+                "stage": STAGE_UNREPORTED,
                 "title": s.get("label") or "",
                 "ttl": ttl(s.get("expires"), now),
                 "since": age(s.get("since"), now),

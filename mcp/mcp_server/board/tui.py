@@ -180,7 +180,10 @@ class BoardApp(App):
     def on_mount(self) -> None:
         self.query_one("#board", DataTable).add_columns("time", "id", "from", "type", "summary")
         self.query_one("#fleet", DataTable).add_columns(
-            "kind", "holder", "device", "repo", "branch", "ttl", "age", "title"
+            # `stage` sits with `repo`/`branch` rather than out by `title`: those
+            # three are where the work is, and it is the only one of them that
+            # moves as the work progresses (#262).
+            "kind", "holder", "device", "repo", "branch", "stage", "ttl", "age", "title"
         )
         self.query_one("#sessions", DataTable).add_columns(
             "", "title", "holder", "device", "age", "size", "session"
@@ -536,7 +539,7 @@ class BoardApp(App):
         for row in fleet_rows(active):
             table.add_row(
                 _esc(row["kind"]), _esc(row["holder"]), _esc(row["device"]),
-                _esc(row["repo"]), _esc(row["branch"]),
+                _esc(row["repo"]), _esc(row["branch"]), _esc(row["stage"]),
                 _esc(row["ttl"]), _esc(row["since"]), _esc(row["title"][:60]),
             )
 

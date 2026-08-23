@@ -321,7 +321,7 @@ class Dash(App):
         self.prs: list[dict] = []
         self.issues: list[dict] = []
         self.issue_err: str | None = None
-        self.plan: list[dict] = []
+        self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None
         self.held: dict = {}                  # 'owner/repo#n' → the claim on it
@@ -413,8 +413,13 @@ class Dash(App):
         """
         repo = ("repo",) if self.scope.column else ()
         for table_id, columns in (
-            ("#fleet", ("who", "state", *repo, "what", "ttl")),
-            ("#plan", ("", "⚒", *repo, "ref", "title", "who")),
+            # `stage` goes between `state` and the toggling repo cell: it is a
+            # fixed column, so it must sit ABOVE the one that comes and goes for
+            # the same reason the action icons do (#262). `rank` goes after the
+            # repo cell for the opposite reason: it is the plan's own column and
+            # nothing indexes past it.
+            ("#fleet", ("who", "state", "stage", *repo, "what", "ttl")),
+            ("#plan", ("", "⚒", *repo, "rank", "ref", "title", "who")),
             ("#prs", ("", "⚖", *repo, "pr", "title", "age")),
             ("#issues", ("", "⚒", *repo, "issue", "title", "who")),
         ):
@@ -451,8 +456,8 @@ class Dash(App):
 
     @work(thread=True, exclusive=True, group="plan")
     def refresh_plan(self) -> None:
-        items, err = qd.fetch_plan(self.client)
-        self.call_from_thread(self.render_plan, items, err)
+        plan, err = qd.fetch_plan(self.client)
+        self.call_from_thread(self.render_plan, plan, err)
 
     @work(thread=True, exclusive=True, group="prs")
     def refresh_prs(self) -> None:
@@ -594,6 +599,10 @@ class Dash(App):
             key = table.add_row(
                 Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
                 Text(word or "—", style=style),
+                # What `state` cannot say: `working` reads the same writing the
+                # first cut and coming out of the third review round, and so do
+                # repo, branch and title. This is the cell that moves (#262).
+                Text(*qd.stage_cell(a)),
                 *self.repo_cell(a.get("repo") or "—"),
                 # The mark goes on the cell the dropped column widened, and marks
                 # the row the scope KEPT without being able to attribute it: with
@@ -634,13 +643,15 @@ class Dash(App):
         # item rather than a repo — hence the plan alongside it, and hence a claim
         # neither can attribute staying put (see qbdata.claim_repo).
         shown, claims_elsewhere = qd.in_scope(
-            claims, self.scope, lambda c: qd.claim_repo(c.get("key"), self.plan))
+            claims, self.scope,
+            lambda c: qd.claim_repo(c.get("key"), qd.plan_items(self.plan)))
         for i, c in enumerate(shown):
             key = f"claim:{i}"
             left = qd.minutes_left(c.get("expires"))
             key = ctable.add_row(
                 Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
-                Text(qd.clip(qd.claim_label(c.get("key") or "?", self.plan, self.scope), 34),
+                Text(qd.clip(qd.claim_label(c.get("key") or "?",
+                                            qd.plan_items(self.plan), self.scope), 34),
                      style="yellow" if c.get("kind") == "issue" else "grey70"),
                 Text(qd.until(c.get("expires")),
                      style="red" if left is not None and left < 10 else "grey50"),
@@ -662,22 +673,27 @@ class Dash(App):
             self.held = held
             self.render_issues(self.issues, self.issue_err)
 
-    def render_plan(self, items: list[dict], err: str | None) -> None:
-        """The board's plan — every repo's list — running items at the top.
+    def render_plan(self, plan: dict, err: str | None) -> None:
+        """The board's plan — every repo's list — in the board's own order.
 
         Rebuilt only when the plan actually changed. The other tables can be
         redrawn on a clock because their rows carry a countdown, but this one is
         the panel a reader dwells on, and a rebuild between the mouse going down
         and the click arriving moves the row out from under the pointer.
+
+        The rows arrive ranked and are drawn ranked. Re-banding them here — taken,
+        free, blocked — was a second answer about an ordered list, computed
+        against that list's own order; `next` is what the banding was reaching for
+        and the board sends it outright.
         """
-        # The WHOLE plan is kept, and the scope applied after: `self.plan` is what
-        # resolves a `plan:<uuid>` claim to a title and a repo, and a claim from
-        # another project must still resolve — otherwise widening the scope would
-        # show rows this client can no longer explain.
-        self.plan, self.plan_err = items, err
+        # The WHOLE envelope is kept, and the scope applied after: `self.plan` is
+        # what resolves a `plan:<uuid>` claim to a title and a repo, and a claim
+        # from another project must still resolve — otherwise widening the scope
+        # would show rows this client can no longer explain.
+        self.plan, self.plan_err = plan, err
         repos = qd.resolve_repos()
-        items, hidden = qd.in_scope(items, self.scope)
-        ordered = qd.sort_plan(items, repos)
+        items, hidden = qd.in_scope(qd.plan_items(plan), self.scope)
+        next_id = qd.plan_next_id(plan)
         # THE HIDDEN COUNT IS PART OF THE SIGNATURE, because it is part of the title.
         # Computed from the visible rows alone, the signature cannot see another
         # repo's items being added or removed, and the early return then leaves a
@@ -689,19 +705,36 @@ class Dash(App):
         # landing changes the glyph, the band and the whole right-hand column of
         # every item in that plan, and a signature blind to it would leave those
         # rows advertising free work until something else moved.
-        sig = (hidden, tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
-                              (i.get("covered_by") or {}).get("holder"),
-                              len(i.get("blocked_by") or []), i.get("updated"))
-                             for i in ordered))
-        if sig == self.plan_sig and not err:
+        #
+        # So is everything the title now reports that no row carries — `next`, the
+        # counts, the unchosen tally — for the same reason the hidden count is:
+        # the board's answer about what to pick up can move while every row on the
+        # pane stays exactly as it was.
+        #
+        # And the ERROR is in it rather than being an exemption from it. The guard
+        # used to read "unchanged and no error", which redraws while a board is
+        # down and then, on the refresh that succeeds, returns early and leaves
+        # `board: …` in the title of a panel that is no longer failing. It only
+        # shows on a plan whose rows did not change across the outage — an empty
+        # one, or a quiet minute — which is the case where nothing else will ever
+        # move to clear it.
+        sig = (hidden, next_id, err, tuple(sorted((plan.get("counts") or {}).items())),
+               (plan.get("order_trust") or {}).get("unchosen"), plan.get("truncated"),
+               tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
+                      (i.get("covered_by") or {}).get("holder"),
+                      len(i.get("blocked_by") or []), i.get("rank"),
+                      i.get("rank_source"), i.get("updated"))
+                     for i in items))
+        if sig == self.plan_sig:
             return
         self.plan_sig = sig
 
         table = self.query_one("#plan", DataTable)
         table.clear()
-        for item in ordered:
-            glyph, colour = qd.plan_state(item)
+        for item in items:
+            glyph, colour = qd.plan_state(item, next_id)
             who, who_colour = qd.plan_who(item)
+            rank, rank_colour = qd.plan_rank(item)
             issue = qd.plan_issue(item, repos)
             takeable = (issue is not None and not qd.plan_holder(item)
                         and self.wrong_repo(issue.get("repo"), "") is None)
@@ -709,22 +742,24 @@ class Dash(App):
                 Text(glyph, style=colour),
                 Text("⚒", style="bold cyan" if takeable else "grey30"),
                 *self.repo_cell(qd.short_repo(item.get("repo") or "fleet")),
+                Text(rank, style=rank_colour),
                 Text(qd.plan_ref(item), style="bold grey70"),
                 # A fleet-wide item has no repo to name, and with the column gone
                 # it would read as one of this project's (qbdata.scope_mark).
                 Text(qd.scope_mark(self.scope, item.get("repo"))
                      + qd.clip(item.get("title"), 42 if self.scope.column else 52),
                      style="grey50" if colour == "grey50" else "white"),
-                Text(qd.clip(who, 13), style=who_colour),
+                Text(qd.clip(who, 17), style=who_colour),
                 key=f"plan:{item.get('item_id')}",
             ).value
             self.rows[str(key)] = item
-        running, blocked = qd.plan_counts(items)
-        title = f"PLANS · {len(items)} open"
-        if running:
-            title += f" · {running} running"
-        if blocked:
-            title += f" · {blocked} blocked"
+        # The heading is one line and clips at the pane edge, so it is given the
+        # room it has — none of which is known before the first layout, where the
+        # width reads 0 and "no room" would drop every segment there is.
+        room = self.query_one("#t_plan", Static).size.width - 12 - len(qd.elsewhere(hidden))
+        title = "PLANS · " + " · ".join(
+            text for text, _ in qd.plan_head_bits(plan, items, hidden,
+                                                  room if room > 20 else None))
         title += qd.elsewhere(hidden)
         if err:
             title += f" · board: {qd.clip(err, 24)}"
@@ -845,7 +880,9 @@ class Dash(App):
             if column == self.FIX_COLUMN:
                 self.fix_plan_item(record)
             else:
-                self.say(qd.plan_detail(record))
+                # With the envelope, so the row the board named `next` can show the
+                # caveat the board attached to that recommendation.
+                self.say(qd.plan_detail(record, self.plan))
         elif kind == "issue":
             if column == self.FIX_COLUMN:
                 self.fix_issue(record)
