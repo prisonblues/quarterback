@@ -1106,7 +1106,16 @@ def revs_at_ref(
     `-z` stops `core.quotePath` C-quoting a non-ASCII filename into a spec that then
     resolves to nothing.
     """
-    revs = _revs_at_ref_unchecked(repo, ref, pathspec, skipped)
+    files = _versions_files_at(repo, ref, pathspec)
+    blobs = _cat_file_batch(repo, [f"{ref}:{f}" for f in files])
+    revs = []
+    for f in files:
+        raw = blobs[f"{ref}:{f}"]
+        try:
+            revs.append(parse_migration(raw.decode("utf-8", "replace"), path=f, raw=raw))
+        except ValueError:
+            if skipped is not None:
+                skipped.append(f)
     dupes = duplicate_ids(revs)
     if dupes:
         detail = "; ".join(
@@ -1122,36 +1131,37 @@ def revs_at_ref(
     return revs
 
 
-def _revs_at_ref_unchecked(
-    repo: str,
-    ref: str,
-    pathspec: str = _VERSIONS,
-    skipped: list[str] | None = None,
-) -> list[Rev]:
-    """`revs_at_ref` without the uniqueness check, so a caller that has already been
-    told about the duplicate can still look at the tree carrying it.
-
-    Everything downstream of `reconcile` keys on id and MUST NOT use this. The one
-    legitimate reader is `_refuse_apply`, which asks a question about a tree it is not
-    going to build a graph from: whether some file already declares an id the plan is
-    about to mint. A post-merge tree is duplicate-carrying by construction — that is
-    the state the renumber exists to resolve — so refusing to enumerate it would refuse
-    the very check.
-    """
+def _versions_files_at(repo: str, ref: str, pathspec: str) -> list[str]:
+    """Migration file paths under `pathspec` at `ref`, in git's order."""
     listing = _git(
         repo, "ls-tree", "-r", "--name-only", "-z", "--end-of-options", ref, "--", pathspec
     )
-    files = [f for f in listing.split("\0") if f.endswith(".py") and Path(f).name != "__init__.py"]
-    blobs = _cat_file_batch(repo, [f"{ref}:{f}" for f in files])
-    revs = []
-    for f in files:
-        raw = blobs[f"{ref}:{f}"]
-        try:
-            revs.append(parse_migration(raw.decode("utf-8", "replace"), path=f, raw=raw))
-        except ValueError:
-            if skipped is not None:
-                skipped.append(f)
-    return revs
+    return [f for f in listing.split("\0") if f.endswith(".py") and Path(f).name != "__init__.py"]
+
+
+def _versions_entries_at(repo: str, ref: str, pathspec: str) -> dict[str, tuple[str, str]]:
+    """`{path: (mode, object id)}` for every migration file under `pathspec` at `ref`.
+
+    The MODE is half the identity and not decoration. Git stores a symlink as a blob
+    holding its target, so a regular file whose whole content is `x.py` and a symlink
+    pointing at `x.py` have the same object id: comparing ids alone would call them the
+    same file, and `apply` writes through `Path.write_text`, which follows the link and
+    edits something else. A gitlink or a directory appearing at a migration path is the
+    same class of answer and is kept for the same reason — "not a blob" must not read
+    as "not there".
+    """
+    listing = _git(repo, "ls-tree", "-r", "-z", "--end-of-options", ref, "--", pathspec)
+    out: dict[str, tuple[str, str]] = {}
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        meta, _, path = entry.partition("\t")
+        if not path.endswith(".py") or Path(path).name == "__init__.py":
+            continue
+        bits = meta.split()
+        if len(bits) >= 3:
+            out[path] = (bits[0], bits[2])
+    return out
 
 
 def ancestor_ids_of(
@@ -1436,28 +1446,6 @@ def _is_ancestor(repo: str, earlier: str, later: str) -> bool:
         raise
 
 
-def _blob_ids_at(repo: str, ref: str, paths: list[str]) -> dict[str, str]:
-    """`{path: blob oid}` for those of `paths` that exist at `ref`; absent ones are
-    simply not in the mapping, which is the answer the caller wants rather than a
-    failure — a destination path is *supposed* to be missing.
-
-    Object ids, not content: git already hashes every blob, so comparing two refs'
-    copies of a file is a dict lookup and never a read.
-    """
-    if not paths:
-        return {}
-    listing = _git(repo, "ls-tree", "-z", "--end-of-options", ref, "--", *sorted(set(paths)))
-    out: dict[str, str] = {}
-    for entry in listing.split("\0"):
-        if not entry:
-            continue
-        meta, _, path = entry.partition("\t")
-        bits = meta.split()
-        if len(bits) >= 3 and bits[1] == "blob":
-            out[path] = bits[2]
-    return out
-
-
 def _branch_side_of_merge(
     repo: str, branch_sha: str, onto_sha: str
 ) -> tuple[str | None, str | None]:
@@ -1612,18 +1600,6 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return plan.exit_code
 
 
-def _touched_paths(plan: Plan) -> tuple[list[str], list[str]]:
-    """`(sources the apply reads and rewrites, destinations it creates)`."""
-    if plan.action == "relink":
-        return ([plan.base_path] if plan.base_path else []), []
-    if plan.action == "renumber":
-        return (
-            [rn.old_path for rn in plan.renames if rn.old_path],
-            [rn.new_path for rn in plan.renames if rn.new_path and rn.new_path != rn.old_path],
-        )
-    return [], []
-
-
 def _head_moved_past_branch(args: argparse.Namespace, plan: Plan, head_sha: str) -> str | None:
     """Why HEAD being a different commit from `--branch` is fatal here, or None.
 
@@ -1635,11 +1611,18 @@ def _head_moved_past_branch(args: argparse.Namespace, plan: Plan, head_sha: str)
     a refusal naming the one recovery that cannot work, since checking out the
     pre-merge commit discards the resolution the merge carries (#166).
 
-    What `apply` actually needs is that the text it rewrites is the text the plan read.
-    That is checkable, so it is checked directly: HEAD must contain `--branch`, every
-    file the edit touches must be byte-identical at the two, and no file at HEAD may
-    already claim an id the renumber is about to mint. A tree that passes those is one
-    the plan describes, whatever its commit is called.
+    What `apply` actually needs is that the tree it edits is the tree the plan
+    describes. The plan is a function of two refs, so that is exactly checkable, and it
+    is checked as content rather than as history — every migration at `--branch` must
+    be byte-for-byte at HEAD, and every migration at HEAD must be byte-for-byte at one
+    of the two refs. Nothing else is allowed to be there.
+
+    Checking only the files the rewrite touches is not enough, and the case is
+    ordinary rather than exotic: HEAD picks up `0090` from a third branch, the plan
+    renumbers `0018 -> 0019` against refs that never saw it, every touched blob still
+    matches, and the apply leaves a tree with two heads while the plan that produced it
+    said one. A resolution whose result is not the resolution that was blessed is the
+    reassuring wrong answer this tool exists to refuse.
     """
     branch_sha = plan.branch_sha or "?"
     if not _is_ancestor(args.repo, branch_sha, head_sha):
@@ -1649,10 +1632,11 @@ def _head_moved_past_branch(args: argparse.Namespace, plan: Plan, head_sha: str)
             "from content that is not on disk. Check out that branch first, then re-run "
             "apply."
         )
-    sources, destinations = _touched_paths(plan)
-    at_head = _blob_ids_at(args.repo, head_sha, sources + destinations)
-    at_branch = _blob_ids_at(args.repo, branch_sha, sources)
-    diverged = [f for f in sources if at_head.get(f) != at_branch.get(f)]
+    at_head = _versions_entries_at(args.repo, head_sha, args.versions_path)
+    at_branch = _versions_entries_at(args.repo, branch_sha, args.versions_path)
+    at_onto = _versions_entries_at(args.repo, plan.onto_sha or branch_sha, args.versions_path)
+
+    diverged = sorted(f for f, entry in at_branch.items() if at_head.get(f) != entry)
     if diverged:
         return (
             f"HEAD ({head_sha[:12]}) contains --branch ({branch_sha[:12]}) but its copy of "
@@ -1661,28 +1645,16 @@ def _head_moved_past_branch(args: argparse.Namespace, plan: Plan, head_sha: str)
             "can guess which version you meant: read those files, then re-run preflight "
             "against refs that carry the text you want reconciled."
         )
-    occupied = [f for f in destinations if f in at_head and f not in sources]
-    if occupied:
+    unaccounted = sorted(
+        f for f, entry in at_head.items() if entry not in (at_branch.get(f), at_onto.get(f))
+    )
+    if unaccounted:
         return (
-            f"HEAD ({head_sha[:12]}) already carries {occupied}, which this renumber would "
-            f"create; --branch ({branch_sha[:12]}) did not. Re-run preflight so the plan is "
-            "computed against a ref that has them."
+            f"HEAD ({head_sha[:12]}) carries {unaccounted}, which is at neither --onto "
+            f"({(plan.onto_sha or '?')[:12]}) nor --branch ({branch_sha[:12]}), so the plan "
+            "was computed without them and cannot say what the tree becomes once it is "
+            "applied. Re-run preflight against refs that account for the tree you are in."
         )
-    if plan.renames:
-        renamed = {rn.old_path for rn in plan.renames}
-        taken = {
-            r.id: r.path
-            for r in _revs_at_ref_unchecked(args.repo, head_sha, args.versions_path, [])
-            if r.path not in renamed
-        }
-        clash = sorted({rn.new_id for rn in plan.renames} & set(taken))
-        if clash:
-            return (
-                f"HEAD ({head_sha[:12]}) already declares revision id(s) {clash} in "
-                f"{[taken[i] for i in clash]}, so this renumber would write a duplicate into "
-                f"the tree it edits; --branch ({branch_sha[:12]}) did not carry them. Re-run "
-                "preflight so the plan is computed against a ref that does."
-            )
     return None
 
 

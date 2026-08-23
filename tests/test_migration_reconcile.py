@@ -996,6 +996,70 @@ def test_apply_refuses_when_head_already_declares_the_id_the_renumber_would_mint
     assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
 
 
+def test_apply_refuses_a_head_migration_that_is_at_neither_ref(merged_repo: Path, capsys):
+    """The hole a touched-files-only check leaves open, and it is ordinary rather than
+    exotic. HEAD picks up `0090` from a third branch; the plan renumbers 0018 -> 0019
+    against two refs that never saw it; every blob the rewrite touches still matches.
+    Applying would leave heads 0019 AND 0090 while the plan that produced it said one
+    — the reassuring wrong answer, arriving through the tool's own apply."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    _write(merged_repo, "0090_extra.py", "0090", "0017", "extra")
+    _commit(merged_repo, "a third branch's migration, at neither ref")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0090_extra.py" in capsys.readouterr().err
+    assert (merged_repo / "migrations" / "versions" / "0018_base_sha.py").exists()
+
+
+def test_a_relink_is_held_to_the_same_account(behind_repo: Path, capsys):
+    """Relink touches exactly one file, so a touched-files-only check would have
+    nothing to look at and would wave anything else through."""
+    _git(behind_repo, "merge", "-q", "--no-edit", "main")
+    feature = _git(behind_repo, "rev-parse", "HEAD^1").strip()
+    _write(behind_repo, "0090_extra.py", "0090", "0017", "extra")
+    _commit(behind_repo, "a third branch's migration, at neither ref")
+
+    assert mr.cmd_apply(_args(behind_repo, branch=feature)) == 2
+    assert "0090_extra.py" in capsys.readouterr().err
+    relinked = mr.parse_migration(
+        (behind_repo / "migrations" / "versions" / "0019_mine.py").read_text()
+    )
+    assert relinked.down == ("0017",), "and it wrote nothing"
+
+
+def test_a_migration_replaced_by_a_symlink_is_not_the_same_file(merged_repo: Path, capsys):
+    """Git stores a symlink as a blob holding its target, so a file whose whole content
+    is `x.py` and a link pointing at `x.py` share an object id. Comparing ids alone
+    calls them identical, and `apply` writes through the link — editing a file nobody
+    named. The mode is the other half of the identity."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    versions = merged_repo / "migrations" / "versions"
+    entry = mr._versions_entries_at(
+        str(merged_repo), feature, "migrations/versions"
+    )["migrations/versions/0018_base_sha.py"]
+    (versions / "0018_base_sha.py").unlink()
+    (versions / "0018_base_sha.py").symlink_to("0017_b.py")
+    _commit(merged_repo, "0018 is now a symlink")
+    after = mr._versions_entries_at(
+        str(merged_repo), "HEAD", "migrations/versions"
+    )["migrations/versions/0018_base_sha.py"]
+
+    assert entry[0] == "100644" and after[0] == "120000", "the mode is what differs"
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0018_base_sha.py" in capsys.readouterr().err
+
+
+def test_deleting_an_untouched_migration_at_head_is_refused_too(merged_repo: Path, capsys):
+    """Every migration at --branch has to still be at HEAD, not only the ones the edit
+    opens. Dropping one takes a node out of the graph the plan reasoned about."""
+    feature = _git(merged_repo, "rev-parse", "HEAD^1").strip()
+    (merged_repo / "migrations" / "versions" / "0016_a.py").unlink()
+    _commit(merged_repo, "drop a migration the plan never touches")
+
+    assert mr.cmd_apply(_args(merged_repo, branch=feature)) == 2
+    assert "0016_a.py" in capsys.readouterr().err
+
+
 def test_a_commit_on_top_of_the_merge_is_refused_rather_than_planned_from_the_merge(
     merged_repo: Path, capsys
 ):
