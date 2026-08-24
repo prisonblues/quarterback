@@ -102,8 +102,25 @@ turns the merge off.
      is noise on a PR whose only problem is its turn.
 
      **Do not leave the queue here.** This is the one stop that keeps your entry — it is a lease,
-     it is renewed by re-enqueueing, and it expires by itself if nobody comes back. Leaving would
-     re-join at the back, which starves the PR every time it is overtaken.
+     and it expires by itself if nobody comes back. Leaving would re-join at the back, which
+     starves the PR every time it is overtaken.
+
+     **While you wait, poll the queue — that is what holds your place** (#405):
+
+     ```
+     merge_queue(pr=<pr>, base="$BASE")
+     ```
+
+     Asking where you are renews your own entry, and it is the only thing you have to do. Until
+     this landed, the only act that renewed an entry was a push — the one act this very step
+     forbids — so the agents that obeyed the queue were the ones it retired, and a PR that had
+     waited politely for half an hour came back to the line at the BACK, behind PRs that had never
+     integrated. Check `renewal.renewed` in the answer: `false` with a reason naming another
+     holder means this session is not the one the entry is filed under, and a fresh
+     `merge_queue_enqueue` (idempotent, and `entered_at` never moves) puts that right.
+
+     If you are stopping rather than waiting, that is fine and the entry lapses on its own — which
+     is correct, because nobody is working it. Re-enqueue when you come back.
    - **HOLD for anything else** → stop, and **leave the line on the way out**:
 
      ```

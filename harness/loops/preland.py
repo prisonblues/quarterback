@@ -1066,7 +1066,8 @@ def check_queue(repo: str, pr: dict) -> Check:
     order = order if isinstance(order, list) else []
     c = Check("queue", "passed",
               detail={"base": base, "active_order": order, "you": you})
-    return _judge_place(c, you, order, pr, base)
+    c = _judge_place(c, you, order, pr, base)
+    return _note_renewal(c, body)
 
 
 def _queue_absent(base: str) -> Check:
@@ -1140,6 +1141,39 @@ def _judge_place(c: Check, you: dict, order: list, pr: dict, base: str) -> Check
     return c
 
 
+def _note_renewal(c: Check, body: object) -> Check:
+    """Say so when this read did NOT hold the entry's place (#405).
+
+    Reading the queue renews the reader's own entry, and that is what a waiting PR
+    now lives on. But this script authenticates with the bare machine token — it
+    sends no agent key, because it is a subprocess and has no session identity of
+    its own — so an entry enqueued through the MCP client is filed under
+    ``machine/agent`` and this read matches nothing. The renewal quietly does not
+    happen.
+
+    Quietly is the part that matters. #405 is a defect made entirely of true
+    statements nobody was told, so a mechanism that silently fails to fire for the
+    fleet's main polling path would be the same shape again. The board already says
+    which it did and why; this relays that sentence, as a warning rather than a
+    verdict, because a place in the line is not a guardrail and the remedy —
+    ``merge_queue_enqueue``, or a ``merge_queue`` call from the session that owns
+    the entry — belongs to the caller.
+
+    Silent when the board renewed, and silent on a board too old to answer at all:
+    an absent field is not a refusal.
+    """
+    renewal = body.get("renewal") if isinstance(body, dict) else None
+    if not isinstance(renewal, dict) or renewal.get("renewed") is not False:
+        return c
+    why = renewal.get("why") or "the board did not say why"
+    c.warnings.append(
+        f"this read did not renew your queue entry: {why}. Reading the line is "
+        "what keeps a place in it (#405), and this gate reads it as the machine "
+        "rather than as your session — so hold your place from the session that "
+        "enqueued (`merge_queue(pr=…)`), or re-enqueue, which keeps `entered_at`")
+    return c
+
+
 def _waiting_sentence(you: dict) -> str:
     """The board's refusal, plus who holds the place ahead — and the one thing a
     caller must NOT do about it.
@@ -1151,8 +1185,8 @@ def _waiting_sentence(you: dict) -> str:
     on = you.get("waiting_on") if isinstance(you.get("waiting_on"), dict) else {}
     who = on.get("holder") or "an agent the board could not name"
     return (f"{you.get('reason')} — #{on.get('pr')} is held by {who} "
-            f"({on.get('note') or 'no note'}). Stay queued: your place is kept "
-            "while your entry is renewed, and leaving would re-join at the back")
+            f"({on.get('note') or 'no note'}). Stay queued: asking where you are "
+            "is what keeps your place, and leaving would re-join at the back")
 
 
 def check_migrations(root: str, base: BaseRef, versions: str = "") -> Check:

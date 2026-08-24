@@ -766,6 +766,15 @@ def merge_queue(ctx: Context, base: str, repo_path: str = ".",
     PR has moved since it was last checked — a readiness that cannot expire is a
     permanent green light.
 
+    **Asking with `pr` is also what keeps your place in the line.** An entry
+    expires if nothing renews it, and until #405 the only thing that renewed one
+    was a push — which is the exact act this queue tells a waiter not to take, so
+    the agents that obeyed were the ones that lost their turn. So: while you are
+    waiting, call this. Not a rebase, not a CI re-run, not a comment on the PR —
+    this. The answer's `renewal` says whether it worked, and it renews **your own**
+    entry only: reading about somebody else's PR is not evidence that they are
+    still there, and it renews nothing.
+
     Being at the head is NOT the merge claim. It is permission to go and ask for
     one: take `kind='merge'` through `claim` before you merge, and expect `claim`
     here to sometimes name a holder who never enqueued at all — a human merging in

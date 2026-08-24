@@ -2723,6 +2723,165 @@ def exit_code(checks: list[Check]) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# --announce — the half of #405 that runs when nobody is watching
+# --------------------------------------------------------------------------- #
+
+#: What class of judgement a failing row is, in #279's closed vocabulary. One
+#: class for every row rather than a per-check mapping, because every question this
+#: tool can raise is the same kind of question: some piece of shared machinery — a
+#: hook, a token, a repository setting, a line to land in — is not working, and the
+#: fix is an act rather than a taste. `environment` is spelled "does it work on the
+#: box it has to work on", which is exact for the `host` group and the nearest true
+#: word for the `landing` one; `other` would be less informative and #279's list is
+#: closed on purpose.
+NEEDS_HUMAN_CLASS = "environment"
+
+#: What `--announce` puts on the board. `fail` only, and the omission is deliberate
+#: rather than an oversight: an `unknown` is a check that could NOT be made, and the
+#: ordinary causes — no network, no `gh`, no board token — hold for hours and would
+#: announce on every tick of a timer forever. A person typing `qb-doctor` sees every
+#: unknown in the report, which is where that distinction earns its keep; an
+#: unattended escalation is for an established finding.
+ANNOUNCED = ("fail",)
+
+#: `extra` fields that say HOW LONG or HOW MANY rather than WHICH. They move on every
+#: tick while the fault stays the same fault, so they are kept out of the dedupe key —
+#: otherwise a stall announces afresh every fifteen minutes because one minute has
+#: passed. Everything else in `extra` is what makes a fault *this* fault: which pull
+#: request holds the head, which tags are misplaced, which briefs still tell an agent to
+#: stamp a release. Codex found the first cut keying on `head_pr` alone, which read the
+#: rule the other way round and let a row with no head PR suppress its own successors
+#: for twelve hours.
+#:
+#: `ready` is conspicuously NOT here, and it is the one that has to be reasoned about
+#: rather than pattern-matched: the `queue` row spells it as a count (always 0 on the
+#: branch that fails, so it adds nothing and costs nothing) while `landed` spells it as
+#: the LIST of pull requests that are ready and cannot land — which is precisely what
+#: makes that finding this finding. One name, two meanings, and dropping it by name
+#: would have silenced the second for the sake of the first.
+VOLATILE = ("queued", "open", "entries", "behind", "read")
+
+
+def _instance(check: Check) -> str:
+    """What distinguishes THIS occurrence of a row's fault from the next one.
+
+    Sorted and JSON, so two runs that found the same thing produce the same string and
+    a dict's iteration order cannot make one fault look like two.
+    """
+    keeps = {k: v for k, v in check.extra.items()
+             if k not in VOLATILE and not k.endswith("_minutes")}
+    return json.dumps(keeps, sort_keys=True, default=str)
+
+
+def loops_dir(script: str) -> Path | None:
+    """`harness/loops`, in the two layouts there are — a checkout and the package.
+
+    The same two-place lookup :func:`commands_dir` and `qb-bump` do, for the same
+    reason: `bin/` and `share/quarterback-harness/loops` are siblings in the store
+    output, and `bin/` and `loops/` are siblings in a checkout.
+    """
+    here = Path(os.path.realpath(script)).parent
+    for cand in (os.environ.get("QB_LOOPS_DIR"),
+                 here.parent / "loops",
+                 here.parent / "share" / "quarterback-harness" / "loops"):
+        if cand and Path(cand, "needs_human.py").is_file():
+            return Path(cand)
+    return None
+
+
+def _escalation(check: Check, slug: str, base_url: str) -> tuple[str, str]:
+    """`(summary, detail)` for one failing row — what a person reads on the board."""
+    summary = f"{check.name}: {check.detail}"
+    lines = [f"row:     {check.name} ({check.group})",
+             f"subject: {check.subject}",
+             f"verdict: {check.verdict}",
+             "", check.detail]
+    if check.manual:
+        lines += ["", f"needs a person: {check.manual}"]
+    if check.fix:
+        lines += ["", f"or run: qb-doctor --fix --only {check.name}"]
+    if check.extra:
+        lines += ["", json.dumps(check.extra, indent=2, sort_keys=True)]
+    if base_url:
+        lines += ["", f"board: {base_url}"]
+    if slug:
+        lines += [f"repo:  {slug}"]
+    return summary, "\n".join(lines)
+
+
+def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]:
+    """Put every failing row on the board, through #274's one door. Never raises.
+
+    This is the whole of #405's second half, and the reason it is a flag on this
+    tool rather than a new checker somewhere else. #407 already landed the
+    predicate — :func:`check_queue` asks whether the line has stopped, and
+    :func:`check_landed` whether `main` has moved while something was ready to land
+    on it — and on the night #405 records, both would have been `fail` within
+    fifteen minutes. Nobody ran them. A doctor is a command a person types, and the
+    failure #405 is about is precisely that nobody was there to type anything: the
+    queue faithfully reported its state to anyone who asked, and for three hours
+    nobody asked.
+
+    So the missing piece was never a second predicate. It was a caller. With
+    `qb-doctor --announce --only landing` on a timer, the rows that already exist
+    reach a person by themselves, and a second implementation of "has the line
+    stopped" — which would be free to disagree with the first — is not written.
+
+    Nothing here evicts an entry, re-orders a line or merges anything. #405 and
+    #227 both settled that the queue stays advisory and the measurements held the
+    argument up: the system was never wrong about who should land next, only about
+    who was still there. This says so out loud and names somebody to ask.
+    """
+    where = loops_dir(script)
+    if where is None:
+        return ["qb-doctor: NOT announced — no harness/loops beside this script, so "
+                "#274's door is not reachable from here"]
+    sys.path.insert(0, str(where))
+    try:
+        import needs_human  # noqa: PLC0415 — resolved at call time, by design
+    except Exception as exc:  # noqa: BLE001 — an escalation must survive its courier
+        return [f"qb-doctor: NOT announced — {type(exc).__name__} importing needs_human"]
+    slug = github_slug(host) or ""
+    said: list[str] = []
+    for check in (c for c in checks if c.verdict in ANNOUNCED):
+        summary, detail = _escalation(check, slug, host.base_url or "")
+        refs = [{"kind": "repo", "value": slug}] if slug else []
+        pr = check.extra.get("head_pr")
+        if slug and isinstance(pr, int):
+            refs.append({"kind": "pr", "value": str(pr), "repo": slug})
+        try:
+            line = needs_human.announce(
+                cls=NEEDS_HUMAN_CLASS,
+                reason=check.manual or check.detail,
+                summary=summary,
+                repo=slug,
+                detail=detail,
+                # The row name, the subject, and whatever the row itself says
+                # identifies THIS instance of the fault. Without the last part a
+                # second stall behind a different PR is swallowed by the first for
+                # twelve hours, which is #274's dedupe protecting the fleet from
+                # noise by hiding the news.
+                key=needs_human.digest("qb-doctor", check.name, check.subject,
+                                       _instance(check)),
+                refs=refs or None)
+        except Exception as exc:  # noqa: BLE001 — the courier, not the news
+            # `announce` documents that it never raises, and this does not take its
+            # word for it. The harness on PATH goes stale — that is what the
+            # `harness` row is for — so the copy imported above may be older than
+            # the contract, and this runs unattended on a timer where an escape
+            # would take the whole report down with it. One row's courier failing
+            # must not silence the rows behind it.
+            said.append(f"qb-doctor: {check.name} NOT announced — "
+                        f"{type(exc).__name__} from needs_human.announce")
+            continue
+        if line:
+            said.append(line)
+    if not said:
+        return []
+    return said
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="qb-doctor",
@@ -2743,6 +2902,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="the browser vhost, for the edge check (else QUARTERBACK_HUMAN_URL)")
     parser.add_argument("--quiet", action="store_true",
                         help="print only the rows that are not ok")
+    parser.add_argument("--announce", action="store_true",
+                        help="put every FAILING row on the board through the "
+                             "needs-human door, so a timer can run this unattended "
+                             "(#405). `unknown` rows are printed, never announced")
     args = parser.parse_args(argv)
 
     only = None
@@ -2773,6 +2936,13 @@ def main(argv: list[str] | None = None) -> int:
             print("\nNeeds a person — nothing above ran these:")
             for c in manual:
                 print(f"  {c.name}: {c.manual}")
+    if args.announce:
+        # After the report, and to stderr, so `--json` stays a document: a caller
+        # piping this into `jq` must not have a courier's progress note spliced
+        # into it. Announcing is best-effort and never changes the exit code —
+        # the report is the finding whether or not the board took the post.
+        for line in announce_failures(checks, host, __file__):
+            print(line, file=sys.stderr)
     return exit_code(checks)
 
 

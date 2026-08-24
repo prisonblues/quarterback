@@ -82,6 +82,16 @@ class MergeQueueEntry(Base):
     intervening. No reaper — a wedged head would block everybody's landing, which
     is worse here than a wedged session lease is there.
 
+    **What renews an entry is asking about it** (#405). Reading
+    ``GET /merge-queue?pr=`` pushes that entry's expiry out when the caller is its
+    holder, and that is the whole mechanism. Before it, the only renewal was an
+    enqueue — in practice a push — and pushing is precisely what
+    :func:`app.api.merge_queue.decide` tells a waiter not to do, so the entries
+    that expired were the ones whose agents were following instructions. The TTL
+    was measuring "has anyone written recently", a proxy anti-correlated with good
+    behaviour here; it now measures the thing itself, and still lapses an agent
+    that has genuinely stopped asking, which was the only case it was ever for.
+
     **A head change invalidates readiness, and does not cost the slot.**
     ``ready_sha`` is the commit at which ``ready`` was asserted; ``head_sha`` is
     where the PR is now. Reporting a new head clears the first unless preland is

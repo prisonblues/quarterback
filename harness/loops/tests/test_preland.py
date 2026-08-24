@@ -1187,7 +1187,47 @@ def test_standing_down_never_tells_a_loop_to_leave_the_line(queue):
                        order=(9, 7), reason="queued behind #9",
                        waiting_on={"pr": 9, "holder": "zeus/x", "note": None}))
     said = preland.check_queue("o/r", pr()).reasons[0]
-    assert "Stay queued" in said and "your place is kept" in said
+    assert "Stay queued" in said and "keeps your place" in said
+    assert "asking where you are" in said, (
+        "and it must name the thing that renews the entry (#405) — the advice used "
+        "to leave a waiter nothing to do that would keep it in the line")
+
+
+def test_a_read_that_did_not_renew_the_entry_says_so_out_loud(queue):
+    """#405, and the shape it keeps taking. Reading the line is what holds a place
+    in it — but this gate authenticates as the bare machine, so an entry filed under
+    `machine/agent` is not renewed by this read. A mechanism that silently fails to
+    fire for the fleet's main polling path is #405 again in a new place, so the
+    board's own sentence is relayed."""
+    body = line(queued=True, position=2, is_head=False, may_merge=False,
+                order=(9, 7), reason="queued behind #9",
+                waiting_on={"pr": 9, "holder": "zeus/x", "note": None})
+    body["renewal"] = {"renewed": False, "expires": None,
+                       "why": "#7's entry is held by zeus/opal-kelp, and only its "
+                              "holder renews it"}
+    queued(queue, body)
+
+    c = preland.check_queue("o/r", pr())
+
+    said = " ".join(c.warnings)
+    assert "did not renew your queue entry" in said
+    assert "zeus/opal-kelp" in said, "relay the board's reason, do not paraphrase it"
+    assert "re-enqueue" in said, "a warning with no remedy is a complaint"
+
+
+def test_a_renewed_entry_and_an_old_board_are_both_silent(queue):
+    """Two different silences, and neither is a finding. A read that DID renew has
+    nothing to report, and a board too old to answer `renewal` at all has said
+    nothing — an absent field is not a refusal, which is the rule this whole file
+    is built on."""
+    renewed = line(order=(7, 9))
+    renewed["renewal"] = {"renewed": True, "expires": "2026-08-24T10:00:00+00:00",
+                          "why": "this read renewed #7's entry"}
+    queued(queue, renewed)
+    assert not preland.check_queue("o/r", pr()).warnings
+
+    queued(queue, line(order=(7, 9)))
+    assert not preland.check_queue("o/r", pr()).warnings
 
 
 def test_a_lone_pr_on_an_empty_line_sees_no_new_friction(queue):

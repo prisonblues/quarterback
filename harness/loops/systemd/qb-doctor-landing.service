@@ -1,0 +1,59 @@
+[Unit]
+Description=Escalate qb-doctor's landing rows when nothing can land (#405, #407)
+Documentation=file://%h/.claude/loops/README.md
+# Both the board and `gh` are network calls, and the first tick after boot wants a
+# route. `network-online.target` is a SYSTEM unit, so ordering a --user service
+# against it is inert; the timer's OnBootSec is what actually buys the delay. Kept
+# for the same reason the sibling qb-reconcile unit keeps it — a copy of this file
+# dropped into a system manager would then mean it.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# WHY THIS EXISTS. #407 landed the predicate — `queue` asks whether the line has
+# stopped, `landed` whether `main` has moved while something was ready to land on
+# it — and on the night #405 records, both would have been FAIL within fifteen
+# minutes. Nobody ran them, because a doctor is a command a person types and the
+# whole failure was that nobody was there to type anything: seven green pull
+# requests, zero ready, `main` unmoved for over three hours, every surface green.
+# The missing piece was never a second predicate. It was a caller.
+#
+# --only landing, not the whole report. The `host` rows describe THIS box and a
+# person fixes them at this keyboard; the landing rows describe a queue and a
+# repository everybody shares, which is what is worth waking somebody for.
+#
+# --announce puts every FAILING row on the board through the needs-human door
+# (#274). `unknown` rows are printed and never announced — an unknown is a check
+# that could not be made, and its ordinary causes (no network, no gh, no token)
+# hold for hours, so on a timer they would announce forever. #274 dedupes on a key
+# for twelve hours, and the key carries the head PR, so a second stall behind a
+# different pull request is still news.
+#
+# --quiet so a tick with nothing to say writes nothing.
+#
+# ADVISORY, and nothing here softens that. Nothing in this unit merges anything,
+# evicts a queue entry or re-orders a line: #405 and #227 both settled that the
+# queue stays advisory, and the measurements held the argument up — the system was
+# never wrong about who should land next, only about who was still there.
+#
+# ABSOLUTE PATH, for the reason the qb-reconcile unit gives: a bare executable
+# name in ExecStart= resolves against the MANAGER's $PATH, which a home-manager
+# profile's bin is not reliably on.
+#
+# WorkingDirectory, because qb-doctor checks the checkout it is standing in. Point
+# it at the repository whose line you want watched.
+WorkingDirectory=%h/source/quarterback
+ExecStart=%h/.nix-profile/bin/qb-doctor --only landing --announce --quiet
+# 0 healthy, 1 something could not be checked, 2 something failed. All three are
+# worth seeing in `systemctl --user status` and none is worth restarting for — the
+# next tick retries. A `fail` is the normal way this unit does its job, and it has
+# already announced by the time it exits, so 2 is kept out of the failed state
+# too: a red unit for a working escalation would train an operator to ignore it.
+SuccessExitStatus=0 1 2
+Nice=10
+
+# No [Install] section, deliberately, exactly as the two sibling units have none:
+# the TIMER is what starts this. Enabling the service would wire a oneshot into
+# default.target and run it at every login beside the timer's own OnBootSec, which
+# looks like a schedule and is not one. Enable qb-doctor-landing.timer.
