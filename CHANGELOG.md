@@ -17,6 +17,250 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.14 — the doctor learns whether work can land, and the plan can be dragged
+
+### dragging the plan into order, instead of one place per round trip
+
+Reordering the plan moved one row one place per tap, and each tap was its own
+request. Dragging an item from rank 20 to rank 3 was seventeen taps and seventeen
+POSTs — on a phone, which is where `/plan/view` is actually read. That is not a
+convenience problem: a human placing a row is the only thing the board treats as
+authoritative about priority (`rank_source: ordered`), and everything else —
+`appended`, `submitted`, `placed` — is a record that nobody chose. The one tool
+for fixing that was the slowest control on the page.
+
+`POST /plan/reorder` already took the **order** for one exact scope rather than a
+move instruction, so every control below is that same call with a differently
+computed array, and no endpoint changed.
+
+#### What the row looks like now
+
+The row keeps one permanent control — a 44px grip. Drag it to move the row; tap it
+for the rest, which appear on a bar under that row: send to top, up five, up, down,
+down five, send to bottom, and the exemption and drop buttons that used to be
+squeezed in beside the title. That is *fewer* permanent buttons than before, and
+the first time any of them is big enough to hit; eight controls at 44px do not fit
+beside a rank, a ref, a title and the chips on a 320px screen.
+
+⏫ and ⏬ are their own buttons rather than a double-tap gesture, because double-tap
+on mobile is claimed by zoom and a gesture that sometimes zooms and sometimes
+reorders is worse than no gesture. The jump is fixed at five, so it is one tap.
+Jumps clamp: down five on the third-from-last row goes to the bottom rather than
+reappearing at the top.
+
+#### The drag works on a phone, which is the hard part
+
+HTML5 drag-and-drop does not fire on touch at all, so the obvious implementation
+would have tested perfectly on a desktop and done nothing on the device this was
+asked for. The drag is SortableJS, vendored at a pinned version and served from
+`/vendor/sortable.min.js` — the first asset this app has ever served, as one more
+handler in `app/api/board_view.py` beside the pages, read at import so a file the
+build failed to ship is a startup crash rather than a page that quietly has no
+drag.
+
+Only rows the ▲▼ would move can be picked up, a row that refuses says why in the
+same tap-reachable way the buttons do, and a refused reorder puts the row back
+immediately with the server's own sentence in the header — rather than looking
+like it worked and reverting on the next twenty-second refresh.
+
+### qb-doctor gets rows for whether work can actually land
+
+Ten of `qb-doctor`'s rows ask a variant of *"is this host wired up"*, and on the night of
+2026-08-22/23 every one of them was correct: 9 ok, 0 warn, 0 fail, 1 unknown. In the same
+minute the merge queue held seven green pull requests with none ready, `main` had not moved
+in over three hours, `refs/tags/v3.8` pointed at a commit that is not in main's history, and
+three branches were conflicting on the one file `changelog.d/` exists to keep them out of.
+Nothing it checked was broken. Work simply could not land.
+
+The `landing` group now has a row for each of those, beside the `merges` row it arrived
+with:
+
+- **`queue`** — is the line moving. `queued > 0 && ready == 0` is the normal state of a
+  queue whose head is mid-preland, so the predicate carries a clock: PR #398 was landed
+  twice and timed at 5m37s and 12m59s from merge to green, and the threshold is thirty
+  minutes, which is more than double the slowest measured landing and still turns a
+  three-hour stall into a half-hour question.
+- **`landed`** — has the integration branch moved, given what is ready to land on it. Both
+  halves, or it fires every night on every quiet repo. Readiness is GitHub's own
+  `mergeStateStatus` rather than a rollup of check conclusions, which would agree with it
+  until somebody added a required review and then disagree silently. It says *the tip of
+  `main` was committed 4h ago* rather than *main last moved*, because GitHub states no
+  ref-update time for a branch and the two part company on a fast-forward.
+- **`tags`** — do the release tags point into the history they claim to tag (#406). A live
+  reservation is listed and is never a finding: a tag off the ref is either a release that
+  has not landed there or one that has and is tagged elsewhere, and only the CHANGELOG at
+  the ref tells them apart. This row runs the repo's own tagger for that reason, where
+  `merges` reads its tagger and will not run it — and it trusts nothing about the answer:
+  the exit code, every field and every field's type are checked, and a report that exits
+  clean while naming findings is `unknown` rather than half-believed.
+- **`generated`** — is any open pull request editing a file the release job writes (#122).
+  Asked before the conflict rather than after: the edit is the fault and the conflict is
+  only its commonest consequence, so this fires on the first branch to make it.
+- **`stamper`** and **`briefs`** — is a branch-side stamping affordance still reachable, in
+  the repository and on this host respectively. Two rows because they are two premises with
+  two owners and two remedies. `briefs` is the one that is not about the repository at all:
+  five agents stamped on the night of 2026-08-23 and every one was following a document, and
+  the briefs a host reads are the ones the harness on PATH ships — a different set from the
+  repository's the moment that harness falls behind. It found a live one on the machine it
+  was written on.
+
+Every row that needs the board or GitHub says `unknown` when it could not reach one, and
+says which thing — including when it read as far as the pull-request cap and stopped, which
+establishes nothing about the ones beyond it. That is asserted over the whole group rather
+than row by row, because the failure it guards against is a row added later without it: the
+test builds a repo in scope for every row and a host that can answer none of them, and
+requires every row in the group to say `unknown`.
+
+Nothing in the group fails a repo for not using the mechanism it is about, and nothing in it
+merges, re-points a tag or evicts a queue entry.
+
+Codex reviewed the first cut and found five false greens and a false claim: a truncated read
+of the open pull requests reported `ok`, a tag report with every field missing defaulted to
+a clean one, an unreadable brief was skipped and the rest went green, a declared-but-absent
+stamper read as no stamper, and a `tags` row with no resolvable integration ref quietly
+asked about `HEAD` instead. Each is fixed and each is a test.
+
+### a doctor row stops reporting `ok` for a reason that had stopped being true
+
+`qb-doctor`'s `merges` row asks whether a merge into this repo can rewrite the commit a
+release tag was reserved against. It shipped asking whether `scripts/release_tag.py`
+exists — and #122 removed push-time reservation twelve hours later, leaving that file in
+place with `backfill`, `taken` and `check` and no `reserve`. So the row went on firing and
+reporting `ok` for a premise that no longer held: every clause of its explanation was
+false, and its `FAIL` text would have told a reader to switch off squash merges to protect
+a reservation nothing takes. A check that is right by accident is a check nobody notices
+going wrong.
+
+It now asks whether anything here reserves a tag at push time — whether the repo's tag
+allocator exposes a `reserve` subcommand, or the hook git actually runs on a push carries a
+reservation step. That keeps the row useful rather than deleted: a repo still carrying a
+pre-#122 `release_tag.py` has the original defect exactly as written, and the row finds it
+there and stays quiet here.
+
+Both sites are read rather than run — a diagnostic that executes an unreviewed program out
+of whatever checkout somebody typed it in is the line `load_site_config` already draws
+about the site config — and every gap in what could be read comes back as `unknown` rather
+than as a pass. A Python tagger's command set is enumerated out of the parse tree, so a
+docstring or a comment carrying `add_parser("reserve")` is not a registration and a name
+spelled with a variable is not an enumeration; a tagger that is not Python is a wrapper
+whose commands are wherever it forwards to, so naming `reserve` is evidence and not naming
+it is not evidence of the opposite. The hook read is the one git would run, with a relative
+`core.hooksPath` resolved against the worktree git runs hooks from, and whatever that hook
+chains to is read as well: `qb-hooks` installs a `pre-push.delegate` whenever the machine
+already had a hook to keep running, and a reservation performed there happens on exactly
+the pushes this row is about. Hook text is reduced to the words a shell would run before
+the word is looked for, because a false positive here is a `FAIL` recommending a change to
+a setting the whole fleet shares.
+
+Codex reviewed the first cut and found five ways a repo that does reserve would have been
+read as not reserving — the delegate chain, a relative `core.hooksPath`, a git config that
+could not be read, four Python registration shapes the pattern missed, and a non-Python
+wrapper. Each is a test.
+
+### a fragment's own sections stop pretending to be its siblings
+
+The first release cut by fragment assembly folded seven of them at once, and that is the batch
+size at which a flaw nobody could have seen at one fragment became the whole shape of the
+entry. A fragment's title is written as a `###` when it is folded in under the release
+heading. A fragment's own internal sections are `###` too, because `changelog.d/README.md`
+requires `###`-or-deeper — a `##` would open a second release and split the entry in half.
+
+So the two collided in level, and the entry came out as twenty-one sibling `###` headings with
+the fragment boundaries invisible. `### nobody stamps anywhere…` and `### What was deleted`
+rendered as equals when the second is a subsection of the first, and a reader scanning the
+entry could not see where one change ended and the next began.
+
+#### What assembly does now
+
+A fragment's body is demoted one level when several fragments are folded into one release:
+its `###` sections become `####` and sit under its title rather than beside it. Every level
+moves, not just the first — a `####` under a `###` becomes `#####`, or the nesting would
+inevitably invert somewhere down the file.
+
+A release assembled from a **single** fragment is untouched, and that is not an oversight. A
+lone fragment's body goes in directly under the `##` release heading with no title of its own
+above it, so its `###` sections already sit exactly where their author put them.
+
+#### It rewrites masked text, which is the only reason it is safe to rewrite at all
+
+The entries in this repo are essays full of shell — `qb-doctor` output, `git` invocations,
+workflow YAML — and several of them legitimately open a line with `#`. A comment in a fenced
+block is not a heading. Neither is a `###` in a code span, nor one in a four-space indented
+block, which is markdown's own rule and the line `mask_code` already draws everywhere else in
+`release.py`. The demotion locates its matches on masked text and applies them to the
+original by offset, so this stays a sample and not a rewrite:
+
+```bash
+### three hashes, in a fenced block, meaning nothing to this pass
+git log --oneline -3
+```
+
+Getting that wrong would corrupt a released entry silently, and `release.py frozen` means it
+could not be corrected afterwards.
+
+#### Two shapes are refused rather than guessed at
+
+A `######` has no seventh level to be demoted to. Leaving it alone would invert the nesting it
+sits in and dropping it a level would lose a distinction its author drew, so it is a refusal
+at parse time, naming the file — `check` runs on the branch, where the author still has it
+open.
+
+Setext headings — a line underlined with `===` or `---` — are refused too. Markdown gives them
+levels one and two and nothing else, which are exactly the levels a fragment already may not
+contain, so this closes a spelling of a rule rather than adding one; there is no setext way to
+write a `###` for the demotion to reach. A `-` rule with a blank line above it is a horizontal
+break and is left alone, and so is one that follows a heading, a fence, a quote, a list item,
+an indented code block, a table row or a link definition, because CommonMark makes a setext
+heading out of a paragraph and out of nothing else. Everything doubtful is answered "not a
+heading", which leaves the line exactly where the parser left it before this change: a missed
+one is the status quo, and a false one refuses prose its author cannot rewrite to please it.
+
+### qb-bump stops reporting an all-clear about a checkout it never found
+
+`qb-bump` resolved the quarterback checkout it compares the installed harness against from the
+working directory, and said so nowhere. Run from a consumer's checkout — `~/source/nix-fleet`, say —
+it therefore asked `qb-doctor` about a repository with no `harness/` in it, and `qb-doctor` fell
+back to the tree beside itself, which for an *installed* `qb-doctor` is the installed harness. A
+directory is always identical to itself, so the verdict was `ok` and the answer was:
+
+```
+qb-bump: nothing to carry: the harness on PATH IS this checkout
+```
+
+The harness on that PATH was 74 commits and eleven releases behind. Run from `~/source/quarterback`
+seconds later, the same command got past that check to a real question. Same machine, same state,
+and the only difference was the directory the command was typed in.
+
+That is worse than a silent failure, because "nothing to carry" is a positive assertion of health: a
+person who reads one stops looking, which is what happened until `qb-doctor` — pointed at a real
+checkout — reported `FAIL — 10 differ` about the same box a minute later.
+
+#### The checkout is now resolved deliberately, and always named
+
+`--repo`, then the working directory when it is inside a checkout, then `QUARTERBACK_REPO` from the
+environment or `~/.config/quarterback/config` — the key `qb-env` already writes and `qb-mcp` and
+`qb-doctor` already read, so a fleet that declares its checkout once gets a `qb-bump` that answers
+correctly from anywhere. A `--repo` or a `QUARTERBACK_REPO` that does not name a checkout is a typo
+and is refused rather than fallen back from.
+
+With none of the three, it refuses: **cannot tell**, exit 1, with the three ways to say where the
+checkout is. That is the `unknown` this file's exit codes already had a word for, and it is the
+distinction `qb-reconcile` draws between could-not-check and nothing-to-report.
+
+Every report now names both directories it compared, the no-op included — `nothing to carry: the
+harness on PATH IS this checkout (/nix/store/…/bin, compared against /home/rich/source/quarterback,
+the working directory)` — because a reader who cannot see which pair cannot tell a true all-clear
+from this one.
+
+#### And only `ok` means there is nothing to carry
+
+A second instance of the same mistake, found by Codex reviewing the fix and living one function away
+from it: "nothing to carry" meant *not `fail`*, so a `harness` row of `unknown` exited 0 with an
+all-clear. The row that says `unknown` is the one that says "no harness on PATH (`create-worktree`
+not found), so nothing to compare this checkout against" — a machine with no harness installed at
+all, which is the most carrying-needed state there is. `ok` is now the only verdict that ends in
+exit 0; `fail` prepares a bump; anything else is `cannot tell`, and says which verdict it was.
+
 ## v3.13 — a release stops being something a branch does
 
 ### nobody stamps anywhere, because there is nowhere left to do it
