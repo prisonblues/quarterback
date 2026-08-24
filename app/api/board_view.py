@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import APIRouter, Depends
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 from app.auth import reader
 
@@ -18,6 +18,10 @@ _REVIEWS_HTML = (_STATIC / "reviews.html").read_text(encoding="utf-8")
 _PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
 _FLEET_HTML = (_STATIC / "fleet.html").read_text(encoding="utf-8")
 _PRS_HTML = (_STATIC / "prs.html").read_text(encoding="utf-8")
+# Read here for the same reason the pages are: an asset the build failed to ship
+# becomes a startup crash instead of a silent 404 on a page that would then just
+# quietly have no drag. See app/static/vendor/README.md for the pin.
+_SORTABLE_JS = (_STATIC / "vendor" / "sortable.min.js").read_text(encoding="utf-8")
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -62,6 +66,44 @@ async def plan_view(_reader: str = Depends(reader)) -> HTMLResponse:
     person's decision.
     """
     return HTMLResponse(_PLAN_HTML)
+
+
+@router.get("/vendor/sortable.min.js")
+async def sortable_js(_reader: str = Depends(reader)) -> Response:
+    """SortableJS, vendored — the drag half of reordering the plan (#388).
+
+    **This is the first served asset in the app**, and it is a route rather than a
+    ``StaticFiles`` mount on purpose. There was no static serving here at all: the
+    four pages above are ``read_text()`` at import and returned as strings, and a
+    mount would have introduced a second way in, with its own auth boundary to
+    reason about, for one file. This is one more handler in the shape of the ones
+    beside it, so ``Depends(reader)`` means here exactly what it means there — and
+    the browser sends the same edge identity for a ``<script src>`` as for the page
+    that asked for it.
+
+    Reading it at import is the load-bearing part. A vendored file the build failed
+    to ship would otherwise 404 at runtime and leave ``/plan/view`` looking healthy
+    with no drag on it — #169's pattern, and the reason the page's other assets are
+    read the same way. Here it is a startup crash instead.
+
+    ``/vendor/`` rather than ``/static/`` because the directory is what it is: code
+    fetched from somewhere else and checked in byte for byte. The version, source
+    URL and checksum are in ``app/static/vendor/README.md`` and pinned by
+    ``tests/test_plan_page.py``, so "which Sortable is this" has an answer.
+    """
+    # An hour: long enough that browsing the board does not re-fetch 45KB over a
+    # phone connection, short enough that a deploy is in force the same session.
+    # Not `immutable` — that wants a version in the path, and a version in the path
+    # is a second place the page and the route have to agree about.
+    #
+    # `private`, not `public`, although the bytes are a public MIT library: this
+    # response came back from behind `reader`, and a shared cache that kept it would
+    # be answering an unauthenticated request with something the edge had authorised.
+    # Nothing is leaked by this particular file, but the header is a rule about the
+    # response's provenance rather than about its contents, and the only cache that
+    # matters here is the phone's own.
+    return Response(_SORTABLE_JS, media_type="application/javascript",
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/fleet", response_class=HTMLResponse)
