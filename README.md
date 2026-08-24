@@ -1703,6 +1703,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.14** — the doctor learns whether work can land, and the plan can be dragged.
 - **v3.15** — obeying the merge queue is no longer what makes you lapse from it.
 - **v3.16** — a qb-doctor row now carries the fix, not only the fault.
+- **v3.17** — "get involved" is a command now, and three agents given it take three different items.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
