@@ -57,8 +57,11 @@
     padding:10px 12px; margin:8px 0 12px; color:#9fb4d0; font-size:13px;
     word-break:break-word; }
 
+  /* `flex-wrap` is what lets the action bar (#388) take a line of its own under the
+     row rather than being squeezed in beside a rank, a ref, a title and the chips. */
   .item { border:1px solid var(--line); border-radius:10px; background:var(--panel);
-    padding:9px 12px; margin:8px 0; display:flex; gap:10px; align-items:flex-start; }
+    padding:9px 12px; margin:8px 0; display:flex; gap:10px; align-items:flex-start;
+    flex-wrap:wrap; }
   .item.claimed { border-color:#3a4658; }
   .item.blocked { opacity:.72; }
   .item.done, .item.dropped { opacity:.5; }
@@ -95,6 +98,45 @@
      reaches the page and is answered in the header rather than swallowed. */
   .acts button.dead { opacity:.4; cursor:help; }
   .acts button:disabled { opacity:.35; cursor:default; }
+  /* The row's ONE permanent control (#388), and both halves of the gesture: drag it
+     to move the row, tap it for the controls. `touch-action:none` is the whole of
+     why a drag from here is not read as a scroll of the list — without it the
+     browser claims the move before any script sees it, which is the failure that
+     looks perfect on a desktop and does nothing at all on a phone. A dead grip
+     hands the gesture back, because a row that cannot be dragged should still
+     scroll under the thumb. */
+  .acts .grip { width:44px; min-height:44px; padding:0; font-size:16px; line-height:1;
+    color:var(--muted); background:#1c222b; border-color:#2e3742;
+    cursor:grab; touch-action:none; }
+  .acts .grip.open { color:var(--fg); border-color:var(--accent); }
+  .acts .grip.dead { opacity:.4; cursor:help; touch-action:auto; }
+  /* Being dragged, about to be dragged, and the thing under the finger. */
+  .item.sortable-ghost { opacity:.35; border-style:dashed; }
+  .item.sortable-chosen { border-color:var(--accent); }
+  .item.sortable-fallback { opacity:.9; }
+  /* The controls the row has no room for, on their own full-width line and only for
+     the row that asked for them. Eight controls at 44px do not fit beside a title on
+     a 320px screen, and 44px is the floor below which a control is missed rather
+     than pressed — so they wrap onto a second line instead of shrinking. */
+  .bar { display:none; }
+  .bar.open { display:flex; flex-basis:100%; flex-wrap:wrap; gap:6px;
+    margin-top:2px; padding-top:8px; border-top:1px solid var(--line); }
+  .bar button { font:inherit; font-size:15px; line-height:1; cursor:pointer;
+    min-width:44px; min-height:44px; padding:0 6px;
+    background:#222831; color:#9fddc7; border:1px solid #2e3742; border-radius:6px; }
+  .bar button.dead { opacity:.4; cursor:help; }
+  /* Three to a line at every width this page is read at, rather than six that fit
+     on one at 430px and split five-and-one at 320px — where the ⏬ that wrapped
+     ends up beside the ✕ instead of beside the ▼ it belongs with. Three also
+     reads as what it is: a row of ups above a row of downs, with the two biggest
+     moves at opposite corners. */
+  .bar button[data-move] { flex:1 1 30%; max-width:160px; }
+  /* The two that are not a move do not stretch to fill the line they wrapped onto:
+     a full-width ✕ is a very large target for the row's one destructive verb. */
+  .bar button:not([data-move]) { flex:0 0 auto; min-width:64px; }
+  /* The one destructive verb on the bar does not look like the five that only
+     change a number. */
+  .bar button.drop { color:#e8a0a3; border-color:#4a2b2d; }
   /* Anything carrying its own reason. `title` alone is a desktop-only answer —
      these all answer a tap too, in #note, which is inside the sticky header and
      so is on screen wherever in the list the tap happened. */
@@ -135,6 +177,11 @@
   <div id="empty" class="empty">nothing in the plan yet</div>
 </main>
 
+<!-- The one script this page loads from anywhere but itself. Vendored, pinned and
+     served by app/api/board_view.py; app/static/vendor/README.md says which build
+     and why it is a route rather than 45KB inlined into this file. Ordinary (not
+     `defer`), so `Sortable` is defined by the time the script below runs. -->
+<script src="/vendor/sortable.min.js"></script>
 <script>
 // The plan is ordered by a HUMAN — this page is the place that happens, which is
 // why it can reorder and an agent's API token cannot (see app.auth.human).
@@ -171,6 +218,44 @@ let repos = new Set(); // every scope seen, so the filter can be built from data
 let declared = [];
 let gen = 0;           // read generation — a reply from a superseded read is discarded
 let busy = false;      // a write is in flight — the 20s tick must not read back over it
+
+// ---- reordering by more than one place at a time (#388) --------------------
+//
+// `POST /plan/reorder` takes the ORDER for one exact scope, not a move instruction.
+// So drag, send-to-top, send-to-bottom and jump-5 are all the SAME server call with
+// a differently computed array — no new endpoint, and moving rank 20 to rank 3 is
+// one request rather than the seventeen ▲ taps and seventeen POSTs it used to be.
+// The human-only gate, the exact-scope rule and the optimistic-repaint guard are
+// untouched by any of it.
+const JUMP = 5;            // "a down 5", in the words this was asked for. Fixed, so it is one tap.
+let openRow = null;        // whose action bar is open — one at a time, and it survives the tick
+let moveIds = [];          // the order render() drew, so a row knows where it sits in it
+let dragging = false;      // a lift is in progress: the 20s tick must not repaint under it
+let suppressClick = false; // the click a finished drag leaves behind is not a tap on the grip
+
+// The rows this page may rewrite the order of, in the order it is showing them.
+// Defined once, because a row's controls and the request they send have to agree
+// about which list "position 3" is a position in.
+function movable(s){
+  return s === undefined ? []
+    : plan.items.filter(it => it.repo === s && it.state === "open").map(it => it.item_id);
+}
+
+// Where a row ends up, clamped and never wrapped: "down 5" on the third-from-last
+// row goes to the bottom, it does not reappear at the top. Returns null when the
+// move is a no-op — there is nothing to send, and sending it would stamp `ordered`
+// on a sequence nobody chose to change.
+function moved(ids, from, how){
+  const last = ids.length - 1;
+  const to = how==="top" ? 0 : how==="bottom" ? last
+    : how==="up" ? from - 1 : how==="down" ? from + 1
+    : how==="up5" ? from - JUMP : how==="down5" ? from + JUMP : from;
+  const at = Math.max(0, Math.min(last, to));
+  if(at === from) return null;
+  const out = ids.slice();
+  out.splice(at, 0, out.splice(from, 1)[0]);
+  return out;
+}
 
 // Safe in an ATTRIBUTE as well as in text: textContent→innerHTML escapes & < >
 // and leaves quotes alone, and every value here (repo, ref, title, note) is
@@ -295,6 +380,16 @@ function dead(ok, why){
   return ok ? "" : `class="dead" aria-disabled="true" data-why="${esc(why)}"`;
 }
 
+// The other half of the same idea, which #387 did not need because ▲▼ were the only
+// controls and the only thing they ever had to say was why they would not act. A bar
+// of eight glyphs has to answer "what does this one do?" too, and a thumb has no way
+// to ask but a tap. `dead()` is called verbatim for the refusal, so the vocabulary
+// still has exactly one definition.
+function ctl(ok, refusal, does){
+  return ok ? `data-why="${esc(does)}" title="${esc(does)}"`
+            : `${dead(false, refusal)} title="${esc(refusal)}"`;
+}
+
 // What the server says the note means about review — never re-derived here. The
 // marker is a token in free text, and a second regex on this page is how the page
 // and the queue would come to disagree about the same row.
@@ -303,13 +398,19 @@ function rv(it){ return it.review || {}; }
 function row(it, s){
   const el = document.createElement("div");
   const held = it.claim, blocked = (it.blocked_by||[]).length;
-  el.className = "item " + it.state + (held?" claimed":"") + (blocked?" blocked":"");
   // Only an OPEN row of the exact scope on screen has an order this page can rewrite:
   // the server orders open items alone, and per exact scope — so a done row, a fleet
   // row riding along in a repo read, or anything in the mixed (all) list would be
   // refused. The buttons say that by being dead, instead of accepting the click and
   // quietly doing nothing with it.
   const canMove = it.state==="open" && s!==undefined && it.repo===s;
+  // The class the drag reads, and it is the SAME gate: a row the ▲▼ refuse to move
+  // is a row a drag refuses to pick up, and — just as important — a row nobody
+  // else's drag can displace, which is what keeps the order read back off the DOM
+  // honest. `data-id` is how that read names the rows.
+  el.className = "item " + it.state + (held?" claimed":"") + (blocked?" blocked":"")
+    + (canMove?" movable":"");
+  el.dataset.id = it.item_id;
   // The gate is unchanged — what changed is that its reason is reachable without a
   // hover. Every branch names the list the row IS ordered in, because "not here"
   // and "nowhere" are different answers and only one of them is worth acting on.
@@ -350,6 +451,22 @@ function row(it, s){
     : rv(it).exempt ? "put this PR back in the review queue"
     : rv(it).requested ? `${rv(it).requested_by||"somebody"} asked: ${askedWhy}`
     : "take this PR out of the review queue";
+  // Where this row sits in the list the page may rewrite — the only list in which a
+  // position means anything. A control that would not change that position is dead
+  // for that reason rather than accepted and quietly dropped, which is the same
+  // rule the scope gate follows one line up.
+  const at = canMove ? moveIds.indexOf(it.item_id) : -1;
+  const upOk = canMove && at > 0, downOk = canMove && at >= 0 && at < moveIds.length - 1;
+  const upWhy = canMove ? `it is already first in ${scopeLabel(s)} — nothing is above it` : why;
+  const downWhy = canMove ? `it is already last in ${scopeLabel(s)} — nothing is below it` : why;
+  const open = it.item_id === openRow;
+  // The grip is not a write and it is never dead in the sense the move buttons are:
+  // even a row whose ORDER this page may not touch is a row a person may drop, and
+  // the drop button lives on the bar now. So it explains the refusal and still
+  // opens.
+  const gripWhy = !canMove ? why
+    : DRAG_OK ? "drag it to move it — or tap for the controls"
+    : "tap for the controls — the drag library did not load, so dragging is off";
   el.innerHTML = `
     <div class="rank${rankClass(it)}" data-why="${esc(rankWhy(it))}"
       title="${esc(rankWhy(it))}">${it.state==="open"?it.rank:"·"}</div>
@@ -378,15 +495,31 @@ function row(it, s){
         !held&&it.covered_by&&it.covered_by.note?` · “${esc(it.covered_by.note)}”`:""}</div>
     </div>
     <div class="acts">
-      <button data-move="up" data-id="${esc(it.item_id)}" ${dead(canMove, why)}
-        title="${esc(why||"move up")}">▲</button>
-      <button data-move="down" data-id="${esc(it.item_id)}" ${dead(canMove, why)}
-        title="${esc(why||"move down")}">▼</button>
+      <button class="grip${open?" open":""}${canMove?"":" dead"}" data-grip
+        data-id="${esc(it.item_id)}" aria-expanded="${open?"true":"false"}"
+        aria-controls="bar-${esc(it.item_id)}" ${canMove?"":`aria-disabled="true"`}
+        data-why="${esc(gripWhy)}" title="${esc(gripWhy)}">☰</button>
+    </div>
+    <div class="bar${open?" open":""}" id="bar-${esc(it.item_id)}" role="group"
+      aria-label="controls for ${esc(it.title)}">${open?`
+      <button data-move="top" data-id="${esc(it.item_id)}"
+        ${ctl(upOk, upWhy, `send it to the top of ${scopeLabel(s)}`)}>⏫</button>
+      <button data-move="up5" data-id="${esc(it.item_id)}"
+        ${ctl(upOk, upWhy, `move it up ${JUMP} places — or to the top, whichever comes first`)}>▲${JUMP}</button>
+      <button data-move="up" data-id="${esc(it.item_id)}"
+        ${ctl(upOk, upWhy, "move it up one place")}>▲</button>
+      <button data-move="down" data-id="${esc(it.item_id)}"
+        ${ctl(downOk, downWhy, "move it down one place")}>▼</button>
+      <button data-move="down5" data-id="${esc(it.item_id)}"
+        ${ctl(downOk, downWhy, `move it down ${JUMP} places — or to the bottom, whichever comes first`)}>▼${JUMP}</button>
+      <button data-move="bottom" data-id="${esc(it.item_id)}"
+        ${ctl(downOk, downWhy, `send it to the bottom of ${scopeLabel(s)}`)}>⏬</button>
       ${canExempt?`<button data-exempt="${rv(it).exempt?"false":"true"}"
         data-id="${esc(it.item_id)}" data-why="${esc(exemptWhy)}"
         title="${esc(exemptWhy)}">⊘</button>`:""}
-      <button data-id="${esc(it.item_id)}" ${dropTo?`data-state="${dropTo}"`
-        :dead(false, dropWhy)} title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>
+      <button data-id="${esc(it.item_id)}" ${dropTo?`class="drop" data-state="${dropTo}"
+        data-why="${esc(dropWhy)}"`:dead(false, dropWhy)}
+        title="${esc(dropWhy)}">${it.state==="dropped"?"↩":"✕"}</button>`:""}
     </div>`;
   return el;
 }
@@ -401,6 +534,12 @@ function row(it, s){
 function render(){
   const s = scope();
   const shown = plan.items, counts = plan.counts || {}, next = plan.next;
+  // Worked out once per paint, and read by every row: a control that sends the row
+  // to the top has to mean the same list the request will name.
+  moveIds = movable(s);
+  // An open bar belongs to a row. Change the scope, or drop the row, and the row is
+  // gone — a bar left open would reattach itself to whatever id happened to match.
+  if(openRow && !shown.some(it => it.item_id === openRow)) openRow = null;
 
   // Said ONCE, above the list, rather than forty times inside it: in (all) every
   // row is dead for the same reason, and that reason is the page's default state.
@@ -555,6 +694,23 @@ listEl.addEventListener("click", async (e)=>{
   // through to a reorder the gate has already refused.
   const why = e.target.closest("[data-why]");
   note(why ? why.dataset.why : "");
+  // A finished drag leaves a click behind on some browsers, and on the grip a click
+  // means "show me the controls" — so a drop would end by opening a bar nobody asked
+  // for, or worse, by landing on whatever button the finger came up over. Read after
+  // the reason above and before every verb below, which is the only place a stray
+  // click can be dropped without also swallowing the explanation it deserves.
+  if(suppressClick){ note(""); return; }
+  // The grip is the row's only permanent control and it writes nothing: drag it to
+  // move the row, tap it for the rest. Handled before the refusal below because it
+  // is answered even on a row that cannot be reordered — the drop button is on that
+  // bar too, and a row whose ORDER this page may not touch is still a row a person
+  // may drop.
+  const grip = e.target.closest("button[data-grip]");
+  if(grip){
+    openRow = openRow === grip.dataset.id ? null : grip.dataset.id;
+    render();
+    return;
+  }
   const move = e.target.closest("button[data-move]");
   const state = e.target.closest("button[data-state]");
   const exempt = e.target.closest("button[data-exempt]");
@@ -593,15 +749,19 @@ listEl.addEventListener("click", async (e)=>{
     // Reorder is a whole-scope rewrite: an item's rank is only meaningful beside its
     // neighbours', so the page sends the order it is showing rather than a delta. Only
     // OPEN items of the exact scope may be in it — anything else is a 422.
+    //
+    // Every button on the bar comes through here with a different array, which is why
+    // "down 5" is ONE request and not five: `moved()` computes the whole sequence and
+    // the endpoint takes the whole sequence.
     const s = scope();
     if(s === undefined){ say("pick a scope (or the fleet list) before reordering — order is per scope"); return; }
-    const ids = plan.items.filter(it => it.repo === s && it.state === "open").map(it => it.item_id);
+    const ids = movable(s);
     const i = ids.indexOf(move.dataset.id);
-    const j = move.dataset.move === "up" ? i-1 : i+1;
-    if(i < 0 || j < 0 || j >= ids.length) return;
-    [ids[i], ids[j]] = [ids[j], ids[i]];
+    if(i < 0) return;
+    const order = moved(ids, i, move.dataset.move);
+    if(!order) return;
     path = "/plan/reorder";
-    body = {repo: s, order: ids};
+    body = {repo: s, order};
   } else return;
   // A tick landing between the write and its read-back would paint the pre-write order.
   busy = true;
@@ -609,6 +769,67 @@ listEl.addEventListener("click", async (e)=>{
   try { ok = await post(path, body); } finally { busy = false; }
   if(ok) load();  // a failed write keeps its message up — load() would wipe it
 });
+
+// ---- the drag ---------------------------------------------------------------
+//
+// SortableJS, vendored at a pinned version and served from /vendor/sortable.min.js
+// (app/api/board_view.py; app/static/vendor/README.md for the pin). The reason it is
+// a library and not thirty lines here: HTML5 drag-and-drop — `draggable`,
+// `dragstart` — DOES NOT FIRE ON TOUCH, so the obvious implementation tests
+// perfectly on the desktop it was written on and does nothing whatsoever on the
+// phone this was asked for. What is left after that trap is avoided is autoscrolling
+// a list taller than the screen, telling a lift from a scroll, and handling
+// `pointercancel` when the OS decides the gesture was something else — which is
+// exactly the set a hand-rolled version gets subtly wrong on a phone.
+const DRAG_OK = typeof Sortable !== "undefined";
+if(DRAG_OK) Sortable.create(listEl, {
+  // A dedicated grip, not the whole row. Made the whole row draggable, a lift and a
+  // scroll are the same gesture and a long-press is the only way to separate them —
+  // and a long-press is a delay before anything happens, on every drag, for ever.
+  // With 44px of grip carrying `touch-action:none` the intent is in WHERE the finger
+  // landed, so the lift can be immediate and a swipe anywhere else still scrolls.
+  handle: ".grip",
+  // The same gate as the buttons: `.movable` is written by row() from `canMove`, so
+  // a drag refuses to pick up exactly the rows ▲▼ refuse to move. It also means a
+  // row of another list riding along in this one is never displaced by a drag, which
+  // is what lets the request be read straight off the DOM below.
+  draggable: ".item.movable",
+  // A dead grip must still deliver its tap, so the header can say why — swallowing
+  // it is #387's defect exactly, in the one place the reason matters most.
+  filter: ".grip.dead",
+  preventOnFilter: false,
+  // One code path on both. Left to itself Sortable uses native HTML5 dragging on a
+  // desktop and its own pointer handling on touch, and then the thing that was
+  // tested is not the thing that ships to the phone.
+  forceFallback: true,
+  animation: 150,
+  scroll: true, scrollSensitivity: 64, scrollSpeed: 14,
+  onStart(){ dragging = true; note(""); },
+  onEnd(evt){
+    dragging = false;
+    // Cleared on the next task: the click the browser synthesises after the drop has
+    // not been dispatched yet at this point.
+    suppressClick = true;
+    setTimeout(()=>{ suppressClick = false; }, 0);
+    const s = scope();
+    if(evt.oldIndex === evt.newIndex || s === undefined) return;
+    // Read off the DOM rather than recomputed from two indices: what the reader is
+    // looking at IS the request, so there is no arithmetic that can disagree with it.
+    postOrder(s, [...listEl.querySelectorAll(".item.movable")].map(el => el.dataset.id));
+  },
+});
+
+// One POST with the final array, whichever gesture produced it.
+async function postOrder(s, order){
+  busy = true;
+  let ok;
+  try { ok = await post("/plan/reorder", {repo: s, order}); } finally { busy = false; }
+  // A drag that visually succeeds and then silently reverts on the next 20s tick is
+  // worse than a button that never moved. On a refusal the server's own sentence is
+  // already in the header (post() put it there) and this puts the row back where the
+  // board still has it — now, not in twenty seconds.
+  if(ok) load(); else render();
+}
 
 // ---- who is looking, and therefore whether any of this will be accepted -----
 
@@ -673,7 +894,9 @@ load();
 // The tick deliberately touches neither the note nor the banner: an explanation
 // that vanished half a second after the tap that asked for it would be worse than
 // the tooltip it replaces.
-setInterval(()=>{ if(!busy) load(); }, 20000);
+// A lift counts as busy for the same reason a write does: repainting the list under
+// a finger mid-drag destroys the row being dragged.
+setInterval(()=>{ if(!busy && !dragging) load(); }, 20000);
 </script>
 </body>
 </html>

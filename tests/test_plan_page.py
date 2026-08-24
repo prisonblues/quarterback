@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from .conftest import LAPTOP
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PAGE = REPO_ROOT / "app/static/plan.html"
 API = REPO_ROOT / "app/api/plan.py"
@@ -413,3 +415,255 @@ def test_the_page_never_re_derives_what_a_note_means_about_review(page):
     assert "it.review" in page, "the page reads the server's derivation"
     for token in ("exempt-requested", "review: exempt", "review:exempt"):
         assert token not in page, f"the page must not look for {token!r} itself"
+
+
+# ---- reordering more than one place at a time (#388) ------------------------
+#
+# `POST /plan/reorder` takes the ORDER for one exact scope, not a move instruction,
+# so drag, send-to-top, send-to-bottom and jump-5 are all that one call with a
+# differently computed array — and no API change. What these guard is the three
+# ways that goes wrong: sending N requests where the whole point was one, wrapping
+# where the ask was to clamp, and a drag that picks up a row the buttons refuse.
+
+VENDOR = REPO_ROOT / "app/static/vendor/sortable.min.js"
+VENDOR_README = REPO_ROOT / "app/static/vendor/README.md"
+BOARD_VIEW = REPO_ROOT / "app/api/board_view.py"
+
+# The pin. A minified blob cannot say which version it is, so this is where the
+# question is answered — and where a silent swap is caught.
+SORTABLE_SHA256 = "6d0a831fc19b4bae851797ad3393157e861afb7862459c11226359b27e2c4337"
+SORTABLE_VERSION = "1.15.6"
+
+
+def test_moving_five_places_is_one_request_and_not_five(page):
+    """Seventeen taps and seventeen POSTs to drag rank 20 to rank 3 is the reason
+    the plan's order goes uncorrected, and a loop of single-place moves would be
+    the same defect wearing the new buttons. Every control computes the FINAL
+    array and one caller posts it once."""
+    fn = re.search(r"function moved\(ids, from, how\)\{(.*?)\n\}", page, re.S)
+    assert fn, "could not find the order computation"
+    body = fn.group(1)
+    for how in ("top", "bottom", "up", "down", "up5", "down5"):
+        assert f'"{how}"' in body, f"no computation for {how!r}"
+    assert "post(" not in body and "fetch(" not in body and "for(" not in body, \
+        "the whole order is computed here and sent once by the caller"
+    # The button path: one `moved()`, one body, and the existing single write below.
+    branch = re.search(r"\} else if\(move\)\{(.*?)\n  \} else return;", page, re.S)
+    assert branch, "could not find the move branch"
+    assert "const order = moved(ids, i, move.dataset.move);" in branch.group(1), \
+        "one computation per tap, whatever the distance"
+    assert "for(" not in branch.group(1) and "while(" not in branch.group(1), \
+        "a loop of single-place moves is the old defect wearing the new buttons"
+    assert "body = {repo: s, order}" in branch.group(1), \
+        "the request carries the whole order, not a delta"
+
+
+def test_a_jump_clamps_at_the_ends_instead_of_wrapping(page):
+    """"Down 5" on the third-from-last row goes to the bottom. It does not
+    reappear at the top, which on a list somebody is trying to put in order is not
+    a near miss — it is the opposite of what was asked for."""
+    fn = re.search(r"function moved\(ids, from, how\)\{(.*?)\n\}", page, re.S)
+    assert fn, "could not find the order computation"
+    body = fn.group(1)
+    assert "Math.max(0, Math.min(last" in body, "the destination has to be clamped"
+    assert "%" not in body, "a modulo is a wrap, and a wrap is the wrong answer here"
+    # A move that changes nothing is not a write: it would stamp `ordered` on a
+    # sequence nobody chose to change (#183 is what that value means).
+    assert "if(at === from) return null" in body, \
+        "a no-op must not be posted as a human's decision"
+
+
+def test_the_controls_asked_for_are_all_on_the_row(page):
+    """⏫/⏬ as their own buttons, not a double-tap gesture: double-tap on mobile is
+    claimed by zoom, and a gesture that sometimes zooms and sometimes reorders is
+    worse than no gesture at all."""
+    for glyph, verb in (("⏫", "top"), ("⏬", "bottom")):
+        assert re.search(rf'data-move="{verb}".*?>{glyph}', page, re.S), \
+            f"no {glyph} button for send-to-{verb}"
+    assert 'const JUMP = 5' in page, "the jump is fixed at five, so it is one tap"
+    assert 'data-move="up5"' in page and 'data-move="down5"' in page, \
+        "the jump has to be a control, not only a computation"
+    assert "data-grip" in page, "and the drag needs something to take hold of"
+
+
+def test_a_drag_refuses_exactly_the_rows_the_buttons_refuse(page):
+    """The `canMove` rule stands. A drag that could pick up a row of another list
+    would put that row in a payload naming this scope — a 422 at best, and at worst
+    the fleet band renumbered by a reorder that never mentioned it."""
+    assert 'draggable: ".item.movable"' in page, \
+        "only rows the page may reorder are draggable"
+    cls = re.search(r'el\.className = "item " \+ it\.state.*?;', page, re.S)
+    assert cls and "canMove" in cls.group(0), \
+        "the class the drag reads must be written from the same gate the buttons use"
+    # ...and a refusal still explains itself, in #387's vocabulary rather than a
+    # `disabled` that takes no events and so cannot be asked.
+    assert 'filter: ".grip.dead"' in page, "a dead grip cannot be lifted"
+    assert "preventOnFilter: false" in page, \
+        "and its tap must still reach the page, or the refusal is silent again"
+    grip = re.search(r'<button class="grip.*?>☰</button>', page, re.S)
+    assert grip, "could not find the grip"
+    assert "data-why" in grip.group(0) and "aria-disabled" in grip.group(0), \
+        "the grip says why it will not lift, and says it to assistive tech too"
+
+
+def test_the_drag_is_not_built_on_html5_drag_and_drop(page):
+    """The trap this feature exists inside. `draggable`/`dragstart` DO NOT FIRE ON
+    TOUCH — a drag written that way tests perfectly on the desktop it was written on
+    and does nothing whatsoever on the phone this was asked for."""
+    # Comments stripped: this page ARGUES about HTML5 dragging at some length, and
+    # a guard that cannot tell the warning from the mistake would fail on the
+    # warning.
+    code = re.sub(r"^\s*//.*$", "", page, flags=re.M)
+    for token in ("dragstart", "dragover", "ondrop", 'draggable="true"'):
+        assert token not in code, f"{token!r} is desktop-only and this page is a phone's"
+    assert "forceFallback: true" in page, \
+        "native HTML5 dragging on a desktop means the tested path is not the shipped one"
+    grip = re.search(r"\.acts \.grip \{[^}]*\}", page)
+    assert grip and "touch-action:none" in grip.group(0), \
+        "without touch-action the browser claims the gesture as a scroll"
+    assert "scroll: true" in page, \
+        "a list taller than the screen cannot be reordered without autoscroll"
+
+
+def test_a_drag_the_server_refuses_puts_the_row_back_at_once(page):
+    """A drag that visually succeeds and then silently reverts on the next 20s tick
+    is worse than a button that never moved: the reader has been shown a lie and
+    given twenty seconds to act on it."""
+    fn = re.search(r"async function postOrder\(s, order\)\{(.*?)\n\}", page, re.S)
+    assert fn, "could not find the one place an order is posted"
+    assert "if(ok) load(); else render();" in fn.group(1), \
+        "a refused reorder repaints from what the board still has"
+    # `post()` puts the server's own sentence in the header, and `render()` does not
+    # wipe it — so the row goes back AND the reason stays up.
+    assert "note(" not in fn.group(1), "the explanation outlives the repaint"
+
+
+def test_the_refresh_tick_does_not_repaint_under_a_finger(page):
+    """The 20s read rebuilds the list. Landing mid-drag it would destroy the row
+    being dragged — the same reason a write in flight already holds it off."""
+    assert "if(!busy && !dragging) load()" in page, "a lift counts as busy"
+    assert re.search(r"onStart\(\)\{ dragging = true", page), "and says so when it starts"
+
+
+def test_the_row_sheds_its_controls_rather_than_shrinking_them(page):
+    """Eight controls at 44px do not fit beside a rank, a ref, a title and the chips
+    on a 320px screen, and 44px is the floor below which a control is missed rather
+    than pressed. So the row keeps ONE permanent control — fewer than it had — and
+    the rest live on a bar that control opens."""
+    acts = re.search(r'<div class="acts">(.*?)</div>', page, re.S)
+    assert acts, "could not find the row's permanent controls"
+    assert acts.group(1).count("<button") == 1, \
+        "the row carries one permanent control; the rest are on the bar"
+    bar = re.search(r"\.bar button \{[^}]*\}", page)
+    assert bar, "could not find the bar's button rule"
+    for prop in ("min-height:44px", "min-width:44px"):
+        assert prop in bar.group(0), f"the bar's buttons need {prop}"
+    assert "flex-wrap:wrap" in re.search(r"\.bar\.open \{[^}]*\}", page).group(0), \
+        "eight controls wrap onto more lines rather than shrinking below 44px"
+    # Three to a line at every width, rather than six that split five-and-one at
+    # 320px and put the ⏬ that wrapped next to the ✕ instead of next to its ▼.
+    moves = re.search(r"\.bar button\[data-move\] \{[^}]*\}", page)
+    assert moves and "flex:1 1 30%" in moves.group(0), \
+        "the move set has to break into equal lines, not spill one control"
+    # ...and the row itself has to be able to give the bar a line.
+    assert "flex-wrap:wrap" in re.search(r"\.item \{[^}]*\}", page).group(0)
+
+
+def test_every_control_on_the_bar_says_what_it_does_before_it_is_pressed(page):
+    """#387's rule, applied to a bar of eight glyphs. A `title` is a desktop-only
+    answer and a thumb has no way to ask; `dead()` already writes the refusal, so
+    this is the other half — what pressing a LIVE one will do."""
+    fn = re.search(r"function ctl\(ok, refusal, does\)\{(.*?)\n\}", page, re.S)
+    assert fn, "a live control needs a sentence too"
+    assert "dead(false, refusal)" in fn.group(1), \
+        "the refusal keeps exactly one definition, and it is dead()"
+    assert "data-why" in fn.group(1), "a live control's sentence is reachable by a tap"
+    bar = page[page.index('<div class="bar'):page.index("</div>`;")]
+    moves = re.findall(r"<button data-move=.*?</button>", bar, re.S)
+    assert len(moves) == 6, f"expected six move controls on the bar, found {len(moves)}"
+    for button in moves:
+        assert "ctl(" in button, f"a move control with no sentence: {button[:60]!r}"
+
+
+def test_an_open_action_bar_survives_the_twenty_second_repaint(page):
+    """The list is rebuilt every 20s. A bar that closed itself on the tick would
+    take the drop button and the jump controls with it, mid-decision."""
+    assert "let openRow = null" in page, "which row is open has to outlive the paint"
+    assert "const open = it.item_id === openRow" in page, "and be re-read when it is drawn"
+    # ...and not outlive the row itself.
+    assert "if(openRow && !shown.some(it => it.item_id === openRow)) openRow = null" in page, \
+        "a bar left open would reattach to whatever id happened to match"
+
+
+# ---- the library: vendored, pinned, and actually served ---------------------
+
+
+def test_the_vendored_library_is_the_version_that_was_pinned():
+    """A minified blob cannot say which version it is. Without a checksum "which
+    Sortable is this" has no answer, and a swap is invisible in review."""
+    import hashlib
+
+    assert VENDOR.exists(), "the vendored library is missing"
+    got = hashlib.sha256(VENDOR.read_bytes()).hexdigest()
+    assert got == SORTABLE_SHA256, f"the vendored file is not the pinned one: {got}"
+    doc = VENDOR_README.read_text()
+    assert SORTABLE_SHA256 in doc and SORTABLE_VERSION in doc, \
+        "the pin has to be readable beside the file, not only in a test"
+    assert "https://" in doc, "and say where the bytes came from"
+
+
+def test_the_asset_is_read_at_import_so_a_missing_one_is_a_crash():
+    """The shape the four pages already use, and the reason for it: read at import,
+    a file the build failed to ship is a startup crash. Fetched lazily it would be a
+    silent 404 leaving `/plan/view` looking healthy with no drag on it — which is
+    #169's pattern, and this repo has closed several defects that were exactly it."""
+    src = BOARD_VIEW.read_text()
+    assert re.search(r'^_SORTABLE_JS = \(_STATIC / "vendor" / "sortable\.min\.js"\)'
+                     r'\.read_text\(', src, re.M), \
+        "the asset must be read at import, like every page beside it"
+    # And a route, not a mount: one served asset does not need a second way in,
+    # with an auth boundary of its own to reason about.
+    assert "from fastapi.staticfiles" not in src and ".mount(" not in src
+    route = re.search(r'@router\.get\("/vendor/[^"]+"\)\s*\nasync def \w+\((.*?)\) ->',
+                      src, re.S)
+    assert route and "Depends(reader)" in route.group(1), \
+        "the asset is read behind the same identity the page that asks for it is"
+
+
+def test_the_page_asks_for_the_path_the_route_serves():
+    """Two places have to agree and neither can see the other. A typo here is a
+    404 the page cannot report — it would simply have no drag."""
+    src = BOARD_VIEW.read_text()
+    served = re.search(r'@router\.get\("(/vendor/[^"]+\.js)"\)', src)
+    assert served, "no route serves the vendored script"
+    asked = re.search(r'<script src="([^"]+\.js)"></script>', PAGE.read_text())
+    assert asked, "the page does not load the library"
+    assert asked.group(1) == served.group(1), \
+        f"the page asks for {asked.group(1)} and the app serves {served.group(1)}"
+
+
+async def test_the_vendored_library_is_served_and_gated(client):
+    """#169 again, from the other end: a control nobody can reach is not a control,
+    and the way this one would fail is by 404ing in the deployed container while
+    every local test passed."""
+    r = await client.get("/vendor/sortable.min.js", headers=LAPTOP)
+    assert r.status_code == 200
+    assert "javascript" in r.headers["content-type"]
+    assert "Sortable" in r.text
+    assert r.headers.get("cache-control"), "45KB over a phone connection, every page load"
+    assert (await client.get("/vendor/sortable.min.js")).status_code == 401
+
+
+def test_the_container_ships_the_vendored_asset():
+    """The thing most likely to be missed. Nothing under `app/static/` had ever
+    needed to exist as a separately served file before, so that path was untested —
+    and the failure mode is a 404 in production under a page that looks healthy.
+
+    It works today because the image copies `app/` wholesale. This is the guard
+    against a later Dockerfile that enumerates what to copy and quietly leaves the
+    one directory out."""
+    docker = (REPO_ROOT / "Dockerfile").read_text()
+    assert re.search(r"^COPY app/ app/$", docker, re.M), \
+        "the image must copy app/ wholesale, or the vendor directory needs its own line"
+    assert not (REPO_ROOT / ".dockerignore").exists(), \
+        "a .dockerignore could exclude the vendored asset — check it if this is added"
