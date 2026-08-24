@@ -72,6 +72,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import json
 import os
@@ -1204,22 +1205,369 @@ _GITHUB_REMOTE = re.compile(
 _REWRITING = {"allow_squash_merge": "squash", "allow_rebase_merge": "rebase"}
 
 
-def release_tagger(host: Host) -> Path | None:
-    """The tag allocator this repo reserves release numbers with, or None.
+# --------------------------------------------------------------------------- #
+# does anything here reserve a release tag at push time?
+# --------------------------------------------------------------------------- #
+
+#: The call shapes a Python CLI registers a named subcommand with. Enumerated out of
+#: the PARSE TREE and never matched in the text, because a docstring, a comment or a
+#: dead branch that says `add_parser("reserve")` is not a subcommand — and this repo's
+#: own tagger opens with a paragraph explaining that `reserve` is deleted, so a text
+#: search would read the file that proves nothing reserves here as proof that something
+#: does.
+_REGISTRARS = ("add_parser", "add_command", "command")
+
+#: The subset where a first argument this cannot read means the command set was not
+#: enumerated. Narrower than `_REGISTRARS` on purpose: `add_parser(x)` is a subcommand
+#: named by something, but `.command(x)` is not necessarily a CLI call at all — and
+#: `.group(x)` certainly is not, since `m.group(1)` on a regex match is the commonest
+#: two-character method call in this repo. Treating those as opacity made
+#: `scripts/release_tag.py` unenumerable on the strength of a `re.Match`.
+_OPAQUE_IF_UNREADABLE = ("add_parser", "add_command")
+
+#: How a shell script hands its work to another file. A hook that does this has NOT
+#: been read by reading it, so either the target is read too or the answer is
+#: `unknown`: quarterback's own `pre-push` chains a `pre-push.delegate`, and a
+#: reservation performed there is a reservation performed on a push.
+_SOURCES = re.compile(r"""^\s*(?:\.|source)\s+(\S+)|(?<![\w-])exec\s+(\S+)""", re.M)
+
+#: Hook runners that keep their own configuration elsewhere. Naming one is enough to
+#: make a hook unreadable: what actually runs on a push then lives in `.husky/`,
+#: `lefthook.yml` or `.pre-commit-config.yaml`, and this reads none of them.
+_HOOK_DISPATCHERS = ("husky", "lefthook", "overcommit")
+
+#: The start of a heredoc, and `(?!<)` is what keeps `<<<"$lines"` — a here-STRING,
+#: which this repo's pre-push hook uses twice — from swallowing the rest of the file.
+_HEREDOC = re.compile(r"""<<-?\s*(?!<)['"]?(?P<tag>[A-Za-z_]\w*)['"]?""")
+
+#: The bare word, as a command argument. Applied to shell code with its comments,
+#: heredoc bodies and quoted spans removed, so `echo "reserve"` and `reason="reserve"`
+#: are not reservations. The comment strip is the load-bearing one: this repo's
+#: `pre-push` explains the mechanism it no longer has in a block naming
+#: `release_tag.py reserve` in full.
+_RESERVE_WORD = re.compile(r"(?<![\w.-])reserve(?![\w-])")
+
+
+def _read(path: Path) -> str | None:
+    """A file's text, or None when this host cannot have it."""
+    try:
+        return path.read_text(errors="replace")
+    except OSError:
+        return None
+
+
+def _is_python(path: Path, text: str) -> bool:
+    """`.py`, or a shebang naming an interpreter with `python` in it."""
+    return path.suffix == ".py" or "python" in text.split("\n", 1)[0]
+
+
+def _relative(path: Path, repo: Path) -> str:
+    """`scripts/release_tag.py` inside the checkout, the full path outside it."""
+    try:
+        return str(path.relative_to(repo))
+    except ValueError:
+        return str(path)
+
+
+def _shell_code(text: str) -> str:
+    """A script with its full-line comments and its heredoc bodies removed.
+
+    Whole-line comments only. Guessing where a trailing `#` starts means guessing
+    whether it is inside a quoted string, and the quoted spans are taken out
+    separately by :func:`_unquoted` anyway.
+    """
+    out: list[str] = []
+    terminator: str | None = None
+    for line in text.splitlines():
+        if terminator is not None:
+            if line.strip() == terminator:
+                terminator = None
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        out.append(line)
+        m = _HEREDOC.search(line)
+        if m:
+            terminator = m.group("tag")
+    return "\n".join(out)
+
+
+def _unquoted(code: str) -> str:
+    """Shell code reduced to the words a shell would RUN: no quoted insides, no comments.
+
+    Two removals, in this order, and the order is what makes the second one safe. With
+    the quoted spans already emptied, a `#` cannot be inside a string, so cutting from
+    the first one that follows whitespace is exact rather than a guess — and it leaves
+    `${var#pattern}` and `$#` alone, since neither `#` follows a space.
+
+    Both removals exist because a false positive on this row is not a wasted question:
+    it is a `FAIL` recommending a change to a setting every contributor and every other
+    machine in the fleet shares. `echo "reserve"`, `reason="reserve"` and
+    `git push  # this used to reserve a tag` are not reservations.
+
+    Only for the word test. Resolving what a script RUNS uses the code with its quotes
+    intact, because the file a hook chains to is spelled `"$HOOK_DIR/pre-push.delegate"`.
+    """
+    bare = re.sub(r"'[^']*'|\"[^\"]*\"", '""', code)
+    return re.sub(r"(?m)(?:(?<=\s)|^)#.*$", "", bare)
+
+
+def _called(node: ast.Call) -> str | None:
+    """The bare name of what a call calls — `sub.add_parser(…)` is `add_parser`."""
+    fn = node.func
+    if isinstance(fn, ast.Attribute):
+        return fn.attr
+    if isinstance(fn, ast.Name):
+        return fn.id
+    return None
+
+
+def _python_subcommands(text: str) -> set[str] | None:
+    """Every subcommand a Python file registers, or None when it cannot be told.
+
+    None is the answer to more than a syntax error, and that is the point. A file
+    that registers a name this cannot read — `add_parser(COMMAND_RESERVE)`, or a
+    subparser handed to some other function to fill in — has not been enumerated,
+    and an empty result there would be a check that could not be made rendering as
+    one that passed. So the contract is: a set means THESE are the subcommands, and
+    None means somebody has to look.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    holders = {t.id for node in ast.walk(tree)
+               if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+               and _called(node.value) == "add_subparsers"
+               for t in node.targets if isinstance(t, ast.Name)}
+    names: set[str] = set()
+    opaque = False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for dec in node.decorator_list:
+                d = dec.func if isinstance(dec, ast.Call) else dec
+                bare = d.attr if isinstance(d, ast.Attribute) else (
+                    d.id if isinstance(d, ast.Name) else None)
+                if bare in ("command", "group"):
+                    # `@click.command()` names the function; `@cli.command("reserve")`
+                    # names the string, and the Call branch below picks that up too.
+                    names.add(node.name)
+        if not isinstance(node, ast.Call):
+            continue
+        called = _called(node)
+        if called in _REGISTRARS:
+            first = node.args[0] if node.args else None
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                names.add(first.value)
+            elif first is not None and called in _OPAQUE_IF_UNREADABLE:
+                opaque = True                       # a subcommand named by something
+        elif isinstance(node.func, ast.Call) and _called(node.func) in ("command", "group"):
+            # `app.command()(reserve)` — the decorator applied by hand.
+            names.update(a.id for a in node.args if isinstance(a, ast.Name))
+        elif any(isinstance(a, ast.Name) and a.id in holders for a in node.args):
+            # The subparser handed to somebody else to fill in. Whatever it registers
+            # is not in this file, so this file does not know the command set.
+            opaque = True
+    return None if opaque or not names else names
+
+
+def release_tagger(host: Host) -> tuple[Path | None, str | None]:
+    """The tag allocator this repo would use, or why this cannot say.
 
     Read the way `harness/githooks/pre-push` reads it — `QB_RELEASE_TAG`, then
     `qb.releaseTag`, then `scripts/release_tag.py` — rather than by a rule of this
     file's own. The two have to agree about which repos are in scope, and a second
     predicate here would agree until somebody moved the script.
+
+    Finding one answers WHERE to look and nothing else. Whether it reserves is
+    :func:`reservation_sites`' question — the distinction #122 cost, since this repo's
+    tagger still exists, with `backfill`, `taken` and `check`, and reserves nothing.
+
+    `git config` exits 1 for a key that is not set and something else for a config it
+    could not read. Collapsing the two would turn an unparsable include into "no
+    `qb.releaseTag` here", which then falls back to the conventional filename and
+    answers confidently about the wrong file.
     """
     from_env = os.environ.get("QB_RELEASE_TAG")
     if from_env:
-        return Path(from_env)
-    rc, cfg, _ = run_cmd(["git", "-C", str(host.repo), "config", "--get", "qb.releaseTag"])
+        return Path(from_env), None
+    rc, cfg, err = run_cmd(["git", "-C", str(host.repo), "config", "--get", "qb.releaseTag"])
+    if rc not in (0, 1):
+        return None, ("this checkout will not say what `qb.releaseTag` is set to "
+                      f"({clip_line(err) or f'git config exit {rc}'})")
     if rc == 0 and cfg:
-        return Path(cfg) if cfg.startswith("/") else host.repo / cfg
+        return (Path(cfg) if cfg.startswith("/") else host.repo / cfg), None
     default = host.repo / "scripts" / "release_tag.py"
-    return default if default.is_file() else None
+    return (default if default.is_file() else None), None
+
+
+def effective_hooks_dir(host: Host) -> tuple[Path | None, str | None]:
+    """Where git will look for this repo's hooks, or why this cannot say.
+
+    `core.hooksPath` when it is set, the common git dir's `hooks/` otherwise — git's
+    own precedence, because the point is what RUNS on a push. A hook source sitting in
+    `harness/githooks/` reserves nothing.
+
+    A RELATIVE `core.hooksPath` is relative to the directory git runs hooks from, which
+    is the top of the working tree — the rule `qb-hooks`' own `effective_delegate`
+    states in full. Resolved against this process's cwd instead, it names a directory
+    that usually does not exist, and a hook nobody could find would read as a repo with
+    no hook at all.
+    """
+    rc, current, err = run_cmd(
+        ["git", "-C", str(host.repo), "config", "--type=path", "--get", "core.hooksPath"])
+    if rc not in (0, 1):
+        return None, ("this checkout will not say what `core.hooksPath` is set to "
+                      f"({clip_line(err) or f'git config exit {rc}'})")
+    if rc == 0 and current:
+        p = Path(current)
+        return (p if p.is_absolute() else host.repo / p), None
+    if host.common_git_dir is None:
+        return None, "this checkout will not say where git looks for its hooks"
+    return host.common_git_dir / "hooks", None
+
+
+def reservation_sites(host: Host) -> tuple[list[str], list[str]]:
+    """Does anything here take a release tag at PUSH time — and where?
+
+    Returns ``(what reserves, what could not be read)``. Empty both ways means nothing
+    here reserves, and that pair is the whole contract: a site this could not read goes
+    in the second list rather than being absent from the first. The row turns the
+    second list into `unknown`, so every gap in what can be read shows up as one.
+
+    That is the correction #122 forced. The row used to ask whether
+    `scripts/release_tag.py` EXISTS, and that file still does, with `backfill`, `taken`
+    and `check` and no `reserve` — so it went on reporting `ok` for a reason that had
+    stopped being true, which is the failure this whole file is about.
+
+    Two sites, one question. Either is enough for the hazard to be real:
+
+    * the repo's tag allocator exposing a `reserve` subcommand, and
+    * the hook git runs on a push carrying a reservation step — including whatever that
+      hook chains to, since a reservation in a delegate is a reservation on a push.
+
+    READ, NEVER RUN. Asking `release_tag.py --help` would answer more exactly than any
+    parse can, and it would mean a diagnostic executing an unreviewed program out of
+    whatever checkout somebody typed it in — the line :func:`load_site_config` already
+    draws about the site config. The cost is paid in the second list rather than
+    hidden.
+    """
+    found: list[str] = []
+    unreadable: list[str] = []
+
+    tagger, why = release_tagger(host)
+    if why:
+        unreadable.append(why)
+    elif tagger is not None:
+        _extend(_tagger_reserves(tagger, host.repo), found, unreadable)
+
+    hooks, why = effective_hooks_dir(host)
+    if why:
+        unreadable.append(why)
+    elif hooks is not None:
+        _extend(_hook_reserves(hooks, host.repo), found, unreadable)
+    return found, unreadable
+
+
+def _extend(pair: tuple[list[str], list[str]], found: list[str],
+            unreadable: list[str]) -> None:
+    found.extend(pair[0])
+    unreadable.extend(pair[1])
+
+
+def _tagger_reserves(tagger: Path, repo: Path) -> tuple[list[str], list[str]]:
+    """One tag allocator, read."""
+    rel = _relative(tagger, repo)
+    text = _read(tagger)
+    if text is None:
+        return [], [f"the tag allocator at {rel} could not be read"]
+    if _is_python(tagger, text):
+        names = _python_subcommands(text)
+        if names is None:
+            return [], [f"the tag allocator at {rel} does not declare its subcommands "
+                        "in a shape this can enumerate"]
+        return ([f"{rel} exposes a reserve subcommand"] if "reserve" in names else []), []
+    # Not Python, so it is a wrapper around something, and its command set is wherever
+    # that something is. Finding the word is evidence; not finding it is not evidence
+    # of the opposite, so the absent case is `unknown` and not a pass.
+    if _RESERVE_WORD.search(_unquoted(_shell_code(text))):
+        return [f"{rel} has a reserve step"], []
+    return [], [f"the tag allocator at {rel} is not Python, so what it exposes cannot be "
+                "enumerated from it"]
+
+
+def _hook_reserves(hooks: Path, repo: Path) -> tuple[list[str], list[str]]:
+    """The pre-push hook git would run here, and everything it hands work to.
+
+    `pre-push.delegate` is followed by name because that is the convention `qb-hooks`
+    installs — it symlinks one in whenever the machine already had a `pre-push` to keep
+    running, and the managed hook pipes the push into it. A reservation performed there
+    happens on exactly the pushes this row is about.
+    """
+    entry = hooks / "pre-push"
+    if not entry.is_file():
+        return [], []                     # git runs no pre-push here, so none reserves
+    queue = [entry]
+    delegate = hooks / "pre-push.delegate"
+    if delegate.is_file():
+        queue.append(delegate)
+    seen: set[Path] = set()
+    found: list[str] = []
+    unreadable: list[str] = []
+    while queue:
+        path = queue.pop()
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        where = ("the pre-push hook installed here" if path == entry
+                 else f"{path.name}, which the pre-push hook here runs,")
+        text = _read(path)
+        if text is None:
+            unreadable.append(f"{where} could not be read")
+            continue
+        code = _shell_code(text)
+        for runner in _HOOK_DISPATCHERS:
+            if re.search(rf"(?<![\w-]){runner}(?![\w-])", _unquoted(code)):
+                unreadable.append(f"{where} hands its work to {runner}, whose own "
+                                  "configuration this does not read")
+        for target in _runs(code):
+            if "$" in target or "`" in target:
+                # Spelled with a variable or a substitution: this script hands its work
+                # somewhere that was not read, and what it does there is not known.
+                unreadable.append(f"{where} runs `{target}`, which this cannot resolve "
+                                  "to a file to read")
+                continue
+            nxt = _resolve_run(target, hooks, repo)
+            if nxt is not None:
+                queue.append(nxt)
+        if _RESERVE_WORD.search(_unquoted(code)):
+            found.append(f"{where.rstrip(',')} has a reservation step")
+    return found, unreadable
+
+
+def _runs(code: str) -> list[str]:
+    """Every file a script sources or execs, as written."""
+    return [a or b for a, b in _SOURCES.findall(code) if (a or b)]
+
+
+def _resolve_run(target: str, hooks: Path, repo: Path) -> Path | None:
+    """The file a literal `source`/`exec` target names, or None when there is none.
+
+    A concrete path that is not there is not an unknown: nothing runs, so there is
+    nothing to read and nothing to report. Tried against the hooks dir and against the
+    top of the working tree, which are the two directories a hook's own relative paths
+    are written from.
+    """
+    word = target.strip("\"'")
+    if word.startswith("-") or ">" in word or "&" in word:
+        return None                        # `exec 3>&1` and friends name no file
+    if Path(word).is_absolute():
+        return Path(word) if Path(word).is_file() else None
+    for base in (hooks, repo):
+        if (base / word).is_file():
+            return base / word
+    return None
 
 
 def github_slug(host: Host) -> str | None:
@@ -1235,18 +1583,34 @@ def check_merges(host: Host) -> Check:
     """Can a merge into this repo rewrite the commit a release tag was reserved against?
 
     #406. `v3.8` was squash-merged while every other landing that night used a merge
-    commit. The tag allocator takes `refs/tags/vX.Y` at PUSH time, against the
-    branch's stamped `chore(release)` commit (#296) — that placement is what makes
-    the number un-stealable, and it is also what a squash breaks: the squash discards
-    that commit, so `refs/tags/v3.8` addressed a commit that is not in main's history
-    while the v3.8 entry landed on main perfectly. Rebase-merge has the identical
-    defect for the identical reason; both are checked, because disabling only the one
-    that happened to bite would leave the other waiting.
+    commit. A tag reserved at PUSH time names the commit that was pushed, and a squash
+    discards it — so `refs/tags/v3.8` addressed a commit that is not in main's history
+    while the v3.8 entry landed on main perfectly, and the guard called `every release
+    on main has a tag` stayed green because a tag of that name resolved. Rebase-merge
+    has the identical defect for the identical reason; both are checked, because
+    disabling only the one that happened to bite would leave the other waiting.
 
-    NOT ASKED WHERE IT DOES NOT APPLY. A repo with no tag allocator has no reservation
+    THE QUESTION IS WHETHER ANYTHING RESERVES, not whether a file exists. The row as it
+    first landed asked whether `scripts/release_tag.py` was there, and #122 removed
+    push-time reservation from this repo within twelve hours while leaving that file in
+    place with `backfill`, `taken` and `check`. So it went on reporting `ok` for a
+    reason that had stopped being true, and its `fail` text would have told a reader to
+    switch off squash merges to protect a reservation nothing takes. The predicate is
+    :func:`reservation_sites` now: a `reserve` subcommand on the tagger, or a
+    reservation step in the hook git runs on a push.
+
+    Which keeps the row USEFUL RATHER THAN DELETED. The harness installs into repos
+    that are not quarterback, and one still carrying a pre-#122 `release_tag.py` has
+    the original defect exactly as it was written. The row finds that repo and stays
+    quiet here.
+
+    NOT ASKED WHERE IT DOES NOT APPLY. A repo that reserves nothing has no reservation
     for a merge to orphan, and a `FAIL` a reader cannot act on is how a row gets
-    ignored. The narrower question — whether a squash should discard a branch's
-    reviewed history at all — is a real one and is deliberately not this row's.
+    ignored. Two things it deliberately does not grow into. Whether the release number
+    is applied in the right PLACE is #122's question and belongs to #122's rows — one
+    row with two premises is how this one drifted. And whether a squash should discard
+    a branch's reviewed history at all is a policy about review rather than about tags;
+    it is a real question and it wants its own row and its own argument.
 
     DETECT, DO NOT SET, and that is a decision rather than the easier half. Every
     `fix` this tool runs writes to THIS host: a hooks directory, a systemd unit,
@@ -1256,21 +1620,35 @@ def check_merges(host: Host) -> Check:
     It is `manual` for the reason the edge secret is: the remedy belongs to a person,
     so this prints the exact one-line command and runs nothing.
     """
-    tagger = release_tagger(host)
-    if tagger is None:
+    reserves, unreadable = reservation_sites(host)
+    if not reserves and unreadable:
         return Check("merges", str(host.repo),
-                     "this repo reserves no release tags (no release_tag.py), so no merge "
-                     "here can orphan one", "ok")
+                     f"{unreadable[0]}, so whether anything here takes a release tag at push "
+                     "time — the reservation a squash or rebase merge would orphan — could "
+                     "not be established", "unknown",
+                     manual="read the repo's release tagger and its installed pre-push hook "
+                            "by hand: if either reserves a tag at push time, the forge must "
+                            "allow merge commits only",
+                     extra={"unreadable": unreadable})
+    if not reserves:
+        # And it stops there. "Nothing reserves a tag at push time" is what was
+        # established; where the number IS applied is a different question with a
+        # different owner (#122's rows), and a verdict that asserted it would be this
+        # row growing the second premise it was just corrected for.
+        return Check("merges", str(host.repo),
+                     "nothing here reserves a release tag at push time, so a rewriting merge "
+                     "has no reservation to orphan", "ok", extra={"reserves": []})
+    because = " and ".join(reserves)
     slug = github_slug(host)
     if slug is None:
         return Check("merges", host.remote,
-                     f"{host.remote} is not a github.com remote, so the merge strategies "
-                     "this repo allows cannot be read from here", "unknown",
+                     f"{because}, and {host.remote} is not a github.com remote, so the merge "
+                     "strategies this repo allows cannot be read from here", "unknown",
                      manual="check the forge's merge settings by hand: a squash or rebase "
                             "merge orphans the tag reserved at push time")
     if shutil.which("gh") is None:
-        return Check("merges", slug, "no gh on this host, so nothing can ask GitHub which "
-                     "merge strategies this repo allows", "unknown",
+        return Check("merges", slug, f"{because}, and there is no gh on this host, so nothing "
+                     "can ask GitHub which merge strategies it allows", "unknown",
                      manual="install gh and `gh auth login` (see the tools row)")
     # `push` comes back in the same call because it is what makes the absent case
     # legible: GitHub sends the merge-strategy fields ONLY to a token with push
@@ -1295,11 +1673,15 @@ def check_merges(host: Host) -> Check:
     if not isinstance(settings, dict):
         return Check("merges", slug, "gh did not answer an object describing the repo "
                      "settings", "unknown", manual=f"gh api repos/{slug}")
-    return _merge_verdict(slug, settings)
+    return _merge_verdict(slug, settings, because)
 
 
-def _merge_verdict(slug: str, settings: dict) -> Check:
-    """The four answers, given what GitHub said about one repo.
+def _merge_verdict(slug: str, settings: dict, because: str) -> Check:
+    """The four answers, given what GitHub said about one repo that DOES reserve.
+
+    `because` names the reservation site this row already found, and every verdict
+    carries it, because the reader deciding whether to switch off a merge strategy is
+    entitled to see what the setting is protecting.
 
     A field GitHub did not send is `unknown` and never `ok`. A read-only token, a
     GHES old enough to omit one, or a `--jq` that stopped matching would otherwise
@@ -1328,10 +1710,10 @@ def _merge_verdict(slug: str, settings: dict) -> Check:
     allowed = sorted(word for key, word in _REWRITING.items() if settings[key])
     if allowed:
         return Check("merges", slug,
-                     f"this repo allows {' and '.join(allowed)} merges, and reserves release "
-                     "tags at push time — a rewriting merge discards the commit the tag was "
-                     "reserved against (#406, v3.8)", "fail", manual=fix_cmd,
-                     extra={"allows": allowed, "settings": settings})
+                     f"this repo allows {' and '.join(allowed)} merges, and {because} — a "
+                     "rewriting merge discards the commit the tag was reserved against "
+                     "(#406, v3.8)", "fail", manual=fix_cmd,
+                     extra={"allows": allowed, "settings": settings, "reserves": because})
     # The property is "every landing preserves the commit that was pushed", which needs
     # both halves: the rewriting strategies off, AND one left that does not rewrite.
     # GitHub will not currently let all three be false, so this branch is a guard rather
@@ -1342,9 +1724,9 @@ def _merge_verdict(slug: str, settings: dict) -> Check:
                      "this repo allows no merge strategy that preserves the pushed commits, "
                      "so every landing rewrites the release commit its tag names", "fail",
                      manual=fix_cmd, extra={"settings": settings})
-    return Check("merges", slug, "merge commits only — squash and rebase are both off, so a "
-                 "landing cannot orphan the release tag reserved at push time", "ok",
-                 extra={"settings": settings})
+    return Check("merges", slug, f"merge commits only — squash and rebase are both off, so a "
+                 f"landing cannot orphan the tag reserved at push time ({because})", "ok",
+                 extra={"settings": settings, "reserves": because})
 
 
 #: The questions this tool asks, as opposed to the rows that answer them. Two, and
