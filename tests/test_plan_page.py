@@ -447,15 +447,20 @@ def test_moving_five_places_is_one_request_and_not_five(page):
         assert f'"{how}"' in body, f"no computation for {how!r}"
     assert "post(" not in body and "fetch(" not in body and "for(" not in body, \
         "the whole order is computed here and sent once by the caller"
-    # The button path: one `moved()`, one body, and the existing single write below.
+    # The button path: one `moved()`, one body, and one shared write below.
     branch = re.search(r"\} else if\(move\)\{(.*?)\n  \} else return;", page, re.S)
     assert branch, "could not find the move branch"
     assert "const order = moved(ids, i, move.dataset.move);" in branch.group(1), \
         "one computation per tap, whatever the distance"
     assert "for(" not in branch.group(1) and "while(" not in branch.group(1), \
         "a loop of single-place moves is the old defect wearing the new buttons"
-    assert "body = {repo: s, order}" in branch.group(1), \
+    assert "return order && {repo: s, order}" in branch.group(1), \
         "the request carries the whole order, not a delta"
+    # ...and it is DEFERRED, because a sequence means something only relative to the
+    # list at the instant it is computed. Two taps 150ms apart used to be two
+    # requests worked out from the same list, the second made without the first.
+    assert "build = ()=>{" in branch.group(1), \
+        "a reorder body has to be computed after the write before it has landed"
 
 
 def test_a_jump_clamps_at_the_ends_instead_of_wrapping(page):
@@ -530,26 +535,68 @@ def test_the_drag_is_not_built_on_html5_drag_and_drop(page):
         "without touch-action the browser claims the gesture as a scroll"
     assert "scroll: true" in page, \
         "a list taller than the screen cannot be reordered without autoscroll"
+    # ...and the band that triggers it has to clear the STICKY header, or scrolling
+    # up means holding the finger where the header covers the row you are aiming at.
+    # The header wraps at 320px and grows a line when it has something to say, so it
+    # is measured per drag rather than guessed at once.
+    assert re.search(r'sorter\.option\("scrollSensitivity".*?'
+                     r'querySelector\("header"\)\.getBoundingClientRect\(\)\.height',
+                     page, re.S), \
+        "autoscroll's edge band must be sized from the header that covers it"
+    # And the controls a person taps repeatedly must not be held back to see whether
+    # the second tap was a zoom: the page is deliberately zoomable, so a fast double
+    # tap on ▼ moved the row one place and sent one request without this.
+    bar = re.search(r"\.bar button \{[^}]*\}", page)
+    assert bar and "touch-action:manipulation" in bar.group(0), \
+        "a second tap inside the double-tap window is a zoom gesture without this"
 
 
 def test_a_drag_the_server_refuses_puts_the_row_back_at_once(page):
     """A drag that visually succeeds and then silently reverts on the next 20s tick
     is worse than a button that never moved: the reader has been shown a lie and
     given twenty seconds to act on it."""
-    fn = re.search(r"async function postOrder\(s, order\)\{(.*?)\n\}", page, re.S)
-    assert fn, "could not find the one place an order is posted"
-    assert "if(ok) load(); else render();" in fn.group(1), \
+    fn = re.search(r"function write\(path, build\)\{(.*?)\n\}", page, re.S)
+    assert fn, "could not find the one place a write goes out"
+    assert "if(ok) await load(); else render();" in fn.group(1), \
         "a refused reorder repaints from what the board still has"
     # `post()` puts the server's own sentence in the header, and `render()` does not
     # wipe it — so the row goes back AND the reason stays up.
     assert "note(" not in fn.group(1), "the explanation outlives the repaint"
+    # And writes are serialised. Two overlapping reorders are two sequences computed
+    # from one list; the server takes them in whatever order they arrive, so the
+    # second silently undoes the first.
+    assert "let queue = Promise.resolve()" in page and "queue.then" in fn.group(1), \
+        "writes go out one at a time, in the order they were asked for"
 
 
 def test_the_refresh_tick_does_not_repaint_under_a_finger(page):
     """The 20s read rebuilds the list. Landing mid-drag it would destroy the row
     being dragged — the same reason a write in flight already holds it off."""
     assert "if(!busy && !dragging) load()" in page, "a lift counts as busy"
-    assert re.search(r"onStart\(\)\{ dragging = true", page), "and says so when it starts"
+    start = re.search(r"onStart\(\)\{(.*?)\n  \},", page, re.S)
+    assert start and "dragging = true" in start.group(1), "and says so when it starts"
+    # The flag only stops the tick STARTING a read. One already in flight was asked
+    # for before the lift, lands during it, and `render()`s the row out from under
+    # the finger — so the lift supersedes it, using the generation counter that
+    # already discards a read overtaken by a filter change.
+    assert "gen++" in start.group(1), \
+        "a read in flight when the lift begins must not be allowed to land"
+    write = re.search(r"function write\(path, build\)\{(.*?)\n\}", page, re.S)
+    assert write and "gen++" in write.group(1), "and the same for one in flight at a write"
+
+
+def test_the_click_a_drag_leaves_behind_is_not_a_tap(page):
+    """A drop ending in a synthesized click would open a bar nobody asked for, or
+    land on whatever button the finger came up over. Suppressed by consuming the
+    click itself rather than by a flag on a zero-delay timer, which assumes the
+    click is dispatched before the next task — not a promise any browser makes."""
+    fn = re.search(r"function eatTheClick\(\)\{(.*?)\n\}", page, re.S)
+    assert fn, "could not find the click suppression"
+    assert 'addEventListener("click", eat, true)' in fn.group(1), \
+        "the click is caught before it reaches the row, not filtered inside it"
+    assert "removeEventListener" in fn.group(1) and "setTimeout(stop" in fn.group(1), \
+        "exactly one click, and given up on if none arrives"
+    assert "suppressClick" not in page, "the timer-flag version must be gone"
 
 
 def test_the_row_sheds_its_controls_rather_than_shrinking_them(page):

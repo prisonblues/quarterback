@@ -121,8 +121,14 @@
   .bar { display:none; }
   .bar.open { display:flex; flex-basis:100%; flex-wrap:wrap; gap:6px;
     margin-top:2px; padding-top:8px; border-top:1px solid var(--line); }
+  /* `touch-action:manipulation` is load-bearing and was found the hard way: the page
+     is zoomable (deliberately — `user-scalable=no` is an accessibility failure), so a
+     second tap inside the double-tap window is a ZOOM gesture, and the browser holds
+     the click back to find out. Tapping ▼ twice quickly moved the row one place and
+     sent one request, because the second click never arrived. These are the controls
+     a person taps repeatedly; this is the property that lets them. */
   .bar button { font:inherit; font-size:15px; line-height:1; cursor:pointer;
-    min-width:44px; min-height:44px; padding:0 6px;
+    min-width:44px; min-height:44px; padding:0 6px; touch-action:manipulation;
     background:#222831; color:#9fddc7; border:1px solid #2e3742; border-radius:6px; }
   .bar button.dead { opacity:.4; cursor:help; }
   /* Three to a line at every width this page is read at, rather than six that fit
@@ -231,7 +237,6 @@ const JUMP = 5;            // "a down 5", in the words this was asked for. Fixed
 let openRow = null;        // whose action bar is open — one at a time, and it survives the tick
 let moveIds = [];          // the order render() drew, so a row knows where it sits in it
 let dragging = false;      // a lift is in progress: the 20s tick must not repaint under it
-let suppressClick = false; // the click a finished drag leaves behind is not a tap on the grip
 
 // The rows this page may rewrite the order of, in the order it is showing them.
 // Defined once, because a row's controls and the request they send have to agree
@@ -698,12 +703,6 @@ listEl.addEventListener("click", async (e)=>{
   // through to a reorder the gate has already refused.
   const why = e.target.closest("[data-why]");
   note(why ? why.dataset.why : "");
-  // A finished drag leaves a click behind on some browsers, and on the grip a click
-  // means "show me the controls" — so a drop would end by opening a bar nobody asked
-  // for, or worse, by landing on whatever button the finger came up over. Read after
-  // the reason above and before every verb below, which is the only place a stray
-  // click can be dropped without also swallowing the explanation it deserves.
-  if(suppressClick){ note(""); return; }
   // The grip is the row's only permanent control and it writes nothing: drag it to
   // move the row, tap it for the rest. Handled before the refusal below because it
   // is answered even on a row that cannot be reordered — the drop button is on that
@@ -728,6 +727,14 @@ listEl.addEventListener("click", async (e)=>{
   const act = exempt || state || move;
   if(act && act.matches('.dead, [aria-disabled="true"]')) return;
   let path, body;
+  // The one body that cannot be worked out here. A reorder is a whole SEQUENCE and
+  // means something only relative to the list at the instant it is computed;
+  // exempting or dropping names one row and means the same thing whenever it is
+  // sent. So the reorder is deferred to `write()`, which runs it after the writes
+  // ahead of it have landed and been read back — that is what makes a second tap
+  // 150ms after the first a second decision, rather than the same one sent twice
+  // with whichever the server saw last winning.
+  let build = null;
   if(exempt){
     const grant = exempt.dataset.exempt === "true";
     // A reason in both directions, and required by the server — an exemption with
@@ -757,22 +764,46 @@ listEl.addEventListener("click", async (e)=>{
     // Every button on the bar comes through here with a different array, which is why
     // "down 5" is ONE request and not five: `moved()` computes the whole sequence and
     // the endpoint takes the whole sequence.
-    const s = scope();
-    if(s === undefined){ say("pick a scope (or the fleet list) before reordering — order is per scope"); return; }
-    const ids = movable(s);
-    const i = ids.indexOf(move.dataset.id);
-    if(i < 0) return;
-    const order = moved(ids, i, move.dataset.move);
-    if(!order) return;
     path = "/plan/reorder";
-    body = {repo: s, order};
+    build = ()=>{
+      const s = scope();
+      if(s === undefined){ say("pick a scope (or the fleet list) before reordering — order is per scope"); return null; }
+      const ids = movable(s);
+      const i = ids.indexOf(move.dataset.id);
+      if(i < 0) return null;
+      const order = moved(ids, i, move.dataset.move);
+      return order && {repo: s, order};
+    };
   } else return;
-  // A tick landing between the write and its read-back would paint the pre-write order.
-  busy = true;
-  let ok;
-  try { ok = await post(path, body); } finally { busy = false; }
-  if(ok) load();  // a failed write keeps its message up — load() would wipe it
+  write(path, build || (()=>body));
 });
+
+// Every write this page makes goes out on this chain: one at a time, in the order it
+// was asked for, and with each body worked out only once the one before it has landed
+// and been read back. Without it, two taps 150ms apart were two requests computed from
+// the SAME list — the second a decision made without the first — and whichever the
+// server happened to see last won, so a quick double-tap on ▼ moved a row one place.
+let queue = Promise.resolve();
+function write(path, build){
+  const mine = queue.then(async ()=>{
+    const body = build();
+    if(!body) return;
+    // `busy` stops the tick STARTING a read; it does nothing about one already in
+    // flight, which was asked for before this write and would land afterwards and
+    // paint the list as it was. Superseding it is what `gen` is for — the same
+    // mechanism that already discards a read overtaken by a filter change.
+    busy = true; gen++;
+    let ok;
+    try { ok = await post(path, body); } finally { busy = false; }
+    // A refused write keeps the server's own sentence in the header — `render()`
+    // does not touch it — and puts the list back where the board still has it. That
+    // is what an optimistic drag needs, and what the buttons do not mind: they
+    // changed nothing on screen, so repainting from `plan` changes nothing back.
+    if(ok) await load(); else render();
+  });
+  queue = mine.catch(()=>{});
+  return mine;
+}
 
 // ---- the drag ---------------------------------------------------------------
 //
@@ -786,7 +817,7 @@ listEl.addEventListener("click", async (e)=>{
 // `pointercancel` when the OS decides the gesture was something else — which is
 // exactly the set a hand-rolled version gets subtly wrong on a phone.
 const DRAG_OK = typeof Sortable !== "undefined";
-if(DRAG_OK) Sortable.create(listEl, {
+const sorter = DRAG_OK && Sortable.create(listEl, {
   // A dedicated grip, not the whole row. Made the whole row draggable, a lift and a
   // scroll are the same gesture and a long-press is the only way to separate them —
   // and a long-press is a delay before anything happens, on every drag, for ever.
@@ -807,32 +838,49 @@ if(DRAG_OK) Sortable.create(listEl, {
   // tested is not the thing that ships to the phone.
   forceFallback: true,
   animation: 150,
-  scroll: true, scrollSensitivity: 64, scrollSpeed: 14,
-  onStart(){ dragging = true; note(""); },
+  // Sensitivity is set per drag in onStart, from the header — see there.
+  scroll: true, scrollSpeed: 14,
+  onStart(){
+    dragging = true;
+    // A read asked for before the lift must not be allowed to land during it:
+    // `render()` replaces the list's innerHTML, which would destroy the row under
+    // the finger. `busy`/`dragging` only stop the tick STARTING one.
+    gen++;
+    note("");
+    // The band that triggers autoscroll has to begin BELOW the sticky header, or the
+    // only way to scroll the list upward is to hold the finger where the header
+    // covers the row you are aiming at. The header's height is not a constant — it
+    // wraps at 320px and grows a line whenever there is something to say — so it is
+    // measured now, with the note above already cleared, rather than guessed at once.
+    sorter.option("scrollSensitivity", 24 +
+      Math.round(document.querySelector("header").getBoundingClientRect().height));
+  },
   onEnd(evt){
     dragging = false;
-    // Cleared on the next task: the click the browser synthesises after the drop has
-    // not been dispatched yet at this point.
-    suppressClick = true;
-    setTimeout(()=>{ suppressClick = false; }, 0);
+    eatTheClick();
     const s = scope();
     if(evt.oldIndex === evt.newIndex || s === undefined) return;
     // Read off the DOM rather than recomputed from two indices: what the reader is
     // looking at IS the request, so there is no arithmetic that can disagree with it.
-    postOrder(s, [...listEl.querySelectorAll(".item.movable")].map(el => el.dataset.id));
+    // Passed already computed, not deferred like the buttons': the drop's meaning is
+    // the arrangement the reader made, not whatever the list becomes while it queues.
+    const order = [...listEl.querySelectorAll(".item.movable")].map(el => el.dataset.id);
+    write("/plan/reorder", ()=>({repo: s, order}));
   },
 });
 
-// One POST with the final array, whichever gesture produced it.
-async function postOrder(s, order){
-  busy = true;
-  let ok;
-  try { ok = await post("/plan/reorder", {repo: s, order}); } finally { busy = false; }
-  // A drag that visually succeeds and then silently reverts on the next 20s tick is
-  // worse than a button that never moved. On a refusal the server's own sentence is
-  // already in the header (post() put it there) and this puts the row back where the
-  // board still has it — now, not in twenty seconds.
-  if(ok) load(); else render();
+// The compatibility click a drag leaves behind is not a tap, and on the grip a tap
+// means "open the controls" — so every drop would end by opening a bar nobody asked
+// for, or by landing on whatever button the finger came up over. Swallowed at the
+// capture phase, exactly once, and given up on after half a second. A flag cleared on
+// a zero-delay timer would be assuming the click is dispatched before the next task,
+// which is not a promise any browser makes and not one Safari keeps.
+function eatTheClick(){
+  let timer;
+  const stop = ()=>{ document.removeEventListener("click", eat, true); clearTimeout(timer); };
+  const eat = (ev)=>{ ev.stopPropagation(); ev.preventDefault(); stop(); };
+  timer = setTimeout(stop, 500);
+  document.addEventListener("click", eat, true);
 }
 
 // ---- who is looking, and therefore whether any of this will be accepted -----
