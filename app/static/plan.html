@@ -460,10 +460,13 @@ function row(it, s){
   const upWhy = canMove ? `it is already first in ${scopeLabel(s)} — nothing is above it` : why;
   const downWhy = canMove ? `it is already last in ${scopeLabel(s)} — nothing is below it` : why;
   const open = it.item_id === openRow;
-  // The grip is not a write and it is never dead in the sense the move buttons are:
-  // even a row whose ORDER this page may not touch is a row a person may drop, and
-  // the drop button lives on the bar now. So it explains the refusal and still
-  // opens.
+  // The grip carries the refusal but is never `aria-disabled`, and the difference is
+  // not a technicality. `dead()`'s vocabulary is for a control that WILL NOT ACT;
+  // this one always acts — even a row whose order this page may not touch is a row a
+  // person may drop, and the drop button lives on the bar the grip opens. Announcing
+  // it as unavailable would hide the only route to that button from the readers most
+  // likely to need it. It is dimmed, it is not liftable, and its accessible name is
+  // the sentence saying so.
   const gripWhy = !canMove ? why
     : DRAG_OK ? "drag it to move it — or tap for the controls"
     : "tap for the controls — the drag library did not load, so dragging is off";
@@ -497,8 +500,9 @@ function row(it, s){
     <div class="acts">
       <button class="grip${open?" open":""}${canMove?"":" dead"}" data-grip
         data-id="${esc(it.item_id)}" aria-expanded="${open?"true":"false"}"
-        aria-controls="bar-${esc(it.item_id)}" ${canMove?"":`aria-disabled="true"`}
-        data-why="${esc(gripWhy)}" title="${esc(gripWhy)}">☰</button>
+        aria-controls="bar-${esc(it.item_id)}"
+        aria-label="${esc(gripWhy)}" data-why="${esc(gripWhy)}"
+        title="${esc(gripWhy)}">☰</button>
     </div>
     <div class="bar${open?" open":""}" id="bar-${esc(it.item_id)}" role="group"
       aria-label="controls for ${esc(it.title)}">${open?`

@@ -502,8 +502,15 @@ def test_a_drag_refuses_exactly_the_rows_the_buttons_refuse(page):
         "and its tap must still reach the page, or the refusal is silent again"
     grip = re.search(r'<button class="grip.*?>☰</button>', page, re.S)
     assert grip, "could not find the grip"
-    assert "data-why" in grip.group(0) and "aria-disabled" in grip.group(0), \
-        "the grip says why it will not lift, and says it to assistive tech too"
+    assert "data-why" in grip.group(0), "the grip says why it will not lift"
+    # ...and it says it as its NAME, not as `aria-disabled`. The grip always acts —
+    # it opens the bar the drop button lives on, and that button is live on a row
+    # whose order this page may not touch. Announced as unavailable, the readers
+    # most likely to need that route would be told there is none.
+    assert "aria-disabled" not in grip.group(0), \
+        "the grip is not a control that will not act — it is one that will not LIFT"
+    assert "aria-label=" in grip.group(0), \
+        "☰ names nothing on its own; the sentence has to be the accessible name"
 
 
 def test_the_drag_is_not_built_on_html5_drag_and_drop(page):

@@ -95,8 +95,15 @@ async def sortable_js(_reader: str = Depends(reader)) -> Response:
     # phone connection, short enough that a deploy is in force the same session.
     # Not `immutable` — that wants a version in the path, and a version in the path
     # is a second place the page and the route have to agree about.
+    #
+    # `private`, not `public`, although the bytes are a public MIT library: this
+    # response came back from behind `reader`, and a shared cache that kept it would
+    # be answering an unauthenticated request with something the edge had authorised.
+    # Nothing is leaked by this particular file, but the header is a rule about the
+    # response's provenance rather than about its contents, and the only cache that
+    # matters here is the phone's own.
     return Response(_SORTABLE_JS, media_type="application/javascript",
-                    headers={"Cache-Control": "public, max-age=3600"})
+                    headers={"Cache-Control": "private, max-age=3600"})
 
 
 @router.get("/fleet", response_class=HTMLResponse)
