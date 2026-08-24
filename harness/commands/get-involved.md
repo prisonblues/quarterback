@@ -160,4 +160,9 @@ to a holder offering a hand and wait to be answered.
 - the item, its rank, and **what the order was worth** (step 2)
 - what you did with it, and how it ended
 - whether you released or completed the claim
+- **anything in `passed_over` or `closed_refs`.** These are things that happened to the plan on
+  the way to your item and nobody else will mention them: a peer took the row above yours (say
+  who, so the human knows two of you are working), or a row named an issue that had already been
+  closed and was recorded done. The second is `qb-reconcile`'s business and it is worth a line —
+  a plan that keeps growing stale rows is a plan somebody has stopped tending.
 - anything the next agent taking this plan should know
