@@ -2247,13 +2247,35 @@ tell that paragraph from an instruction. `instructions` is handed those same doc
 this prose still *direct* a worker to produce a release number? On the night of
 2026-08-23 five agents stamped a release and every one of them was following a document.
 The sentence that told them to need never have been inside a fence, and on the machine
-this was written on it was not:
+this was written on, against the harness that host was carrying at the time, it was not:
 
 ```
 instructions  …/quarterback-harness/commands  fix-and-land.md still tells an agent in
                                               prose to stamp or reserve a release      FAIL
     quote: **Once READY, before you push: the release entry, then its number.**
 ```
+
+That host was bumped an hour later and the row went `ok` against the new store path,
+whose `fix-and-land.md` does not carry the sentence — which is the row working, not the
+row wavering. It is worth saying plainly because the two answers look like a flake and
+are not one: the question is *what does this machine read*, and what this machine read
+changed.
+
+##### One document per question, and a `clean` said twice
+
+A model asked to find one sentence across thirteen documents is being asked a different
+and harder question than one asked about a single document, so the unit is one document.
+It costs no more — the same bytes are read either way and only the per-call overhead
+multiplies — and it buys two things beside reliability: a finding is scoped to the file
+it could have come from, so the citation check is tighter, and the cache is per document,
+so editing one brief re-asks about one brief.
+
+A `telling` answer is accepted on one reading, because it arrives carrying evidence: a
+filename from the manifest and a sentence the wrapper has already found in the text. A
+`clean` answer is asked again, under its own cache key, because it carries nothing at
+all — it is an assertion that something is not there, made by a process that cannot show
+its work, and that is the claim this whole file exists to distrust. Disagreement resolves
+toward the finding. Anything else is `unknown`.
 
 ##### Its honest `unknown` lives in Python, not in the model's answer
 

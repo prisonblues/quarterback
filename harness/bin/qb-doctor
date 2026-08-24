@@ -2693,6 +2693,11 @@ LLM_MODEL = "sonnet"
 LLM_BUDGET_USD = "1.00"
 LLM_TIMEOUT = 240
 
+#: The most model calls one run of one row may make. The byte ceiling bounds how much
+#: is read; this bounds how often it is asked, and the two are separate because the
+#: answer to "one document at a time" is more calls over the same bytes.
+LLM_MAX_CALLS = 40
+
 #: The evidence ceiling, in bytes. Reaching it is an `unknown` and NOT a disclosed
 #: pass — #417 closed exactly that hole in the GitHub-backed rows, where a truncated
 #: read said so in its detail and returned `ok` anyway. A corpus this could not read
@@ -2742,6 +2747,24 @@ class Evidence:
     def size(self) -> int:
         return sum(len(text) for _name, text in self.files)
 
+    def each(self) -> "list[Evidence]":
+        """This manifest as one Evidence per document — the unit a question is asked in.
+
+        A model asked to find one sentence in thirteen documents at once answered `clean`
+        about a corpus that visibly contained it, on the second run, over the same bytes
+        it had answered `telling` about on the first. That is the failure #408 names in
+        as many words: an LLM check returning the benign answer because it found nothing.
+        A needle in one document is a question a model reliably answers; a needle in a
+        corpus is a question it plausibly declines to.
+
+        It costs no more to ask this way — the same bytes are read either way and only
+        the per-call overhead multiplies — and it buys two things beside reliability. A
+        finding is scoped to the document it is in, so the citation check is over the one
+        file it could have come from. And the cache is per document, so editing one brief
+        re-asks about one brief.
+        """
+        return [Evidence(files=(one,), digest=_digest((one,))) for one in self.files]
+
 
 def gather_evidence(paths: list[Path], transform=None) -> Evidence:
     """The manifest, or why there is not one. Never partial, never truncated.
@@ -2765,9 +2788,12 @@ def gather_evidence(paths: list[Path], transform=None) -> Evidence:
         return Evidence(why=f"{len(out)} file(s) come to {size} bytes, over the "
                             f"{LLM_MAX_BYTES}-byte ceiling — a corpus this could not read "
                             "whole is one it cannot clear")
-    joined = "\0".join(f"{n}\0{t}" for n, t in out)
-    return Evidence(files=tuple(out),
-                    digest=hashlib.sha256(joined.encode()).hexdigest()[:16])
+    return Evidence(files=tuple(out), digest=_digest(tuple(out)))
+
+
+def _digest(files: tuple[tuple[str, str], ...]) -> str:
+    joined = "\0".join(f"{n}\0{t}" for n, t in files)
+    return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
 def llm_enabled() -> bool:
@@ -2779,7 +2805,7 @@ def _cache_path() -> Path:
     return Path(root) / "quarterback" / "doctor-llm.json"
 
 
-def _cache_key(row: str, question: str, evidence: Evidence) -> str:
+def _cache_key(row: str, question: str, evidence: Evidence, sample: int = 1) -> str:
     """Row, question, model, and the bytes that were read — all four, none by discipline.
 
     The question is hashed in rather than tracked by a version constant somebody has to
@@ -2787,7 +2813,7 @@ def _cache_key(row: str, question: str, evidence: Evidence) -> str:
     yesterday's answer to a different one, and a rule enforced by remembering is not one.
     """
     asked = hashlib.sha256(question.encode()).hexdigest()[:12]
-    return f"{row}:{asked}:{LLM_MODEL}:{evidence.digest}"
+    return f"{row}:{asked}:{LLM_MODEL}:{evidence.digest}:{sample}"
 
 
 def cache_get(key: str) -> dict | None:
@@ -2843,7 +2869,8 @@ def _prompt(question: str, evidence: Evidence) -> str:
     return "\n".join(parts)
 
 
-def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None, str]:
+def ask_model(row: str, question: str, evidence: Evidence,
+              sample: int = 1) -> tuple[dict | None, str]:
     """``(answer, why-there-is-none)``. The one place "could not be asked" is phrased.
 
     Everything that can go wrong between deciding to ask and having an answer comes
@@ -2866,7 +2893,7 @@ def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None,
         return None, f"model checks are switched off here ({LLM_ENV})"
     if shutil.which(LLM_CLI) is None:
         return None, f"no {LLM_CLI} on this host, so nothing here can ask the question"
-    key = _cache_key(row, question, evidence)
+    key = _cache_key(row, question, evidence, sample)
     cached = cache_get(key)
     if cached is not None:
         answer, why = validated(cached, evidence)
@@ -2959,42 +2986,106 @@ def unfenced(text: str) -> str:
     return "\n".join(out)
 
 
-STAMPING_QUESTION = """You are auditing agent-facing instructions for one removed mechanism.
+#: The question, and every word of it is load-bearing — this is the ONE piece of the
+#: honest-unknown that lives in the prompt rather than in Python, and it is third of
+#: three because it is the weakest.
+#:
+#: The clause that earns its place is "if you cannot tell whether a passage orders or
+#: describes, that is `cannot tell`". #408's requirement is that the check default to
+#: unknown when it cannot see enough, and the first cut read that as being about the
+#: amount of TEXT — so a passage the model found genuinely ambiguous came back `clean`,
+#: which is the benign default arriving by the only route left open to it. Not seeing
+#: enough and not being able to decide are the same failure to establish something, and
+#: they get the same answer.
+STAMPING_QUESTION = """You are auditing one agent-facing instruction document for one
+removed mechanism.
 
 BACKGROUND, which is settled fact and not something for you to weigh:
 Release version numbers in this project are assigned on the integration branch AFTER a
 merge, by a release tool a person runs. Issue #122 removed every branch-side way of doing
-it. A branch names no version, reserves no release number, edits no generated changelog,
-and cuts no release. A worker that stamps a version anyway produces a number that cannot
-be right, because a branch cannot know which release it will land in.
+it. A branch names no version, reserves no release number, assembles no release entry, and
+cuts no release. A worker that produces a version anyway produces a number that cannot be
+right, because a branch cannot know which release it will land in.
 
 YOUR QUESTION, and it is only this one:
-Does the prose below still DIRECT a worker to produce a release version number, to stamp
-or reserve one, or to cut a release from a branch?
+Does the prose below DIRECT a worker to make a release version number exist on a branch?
 
-Two things constrain the answer.
+That covers being told to name one, stamp one, bump one, reserve one, assemble a release
+entry, apply a version to one, or run a release step before the merge. It is the OUTCOME
+that matters, not the wording: a passage that tells the worker when to do it, or in what
+order, or what to do if it fails, is directing them to do it.
+
+Three things constrain the answer.
 
 PROSE ONLY. The fenced code blocks have been removed before you were given this, because a
-separate deterministic check already reads those. Do not reason about what a command
-would do; reason about what the text tells a worker to do.
+separate deterministic check already reads those and this one must not duplicate it. Do
+not reason about what a command would do. Reason about what the text tells a worker to do.
 
-INSTRUCTIONS, NOT DESCRIPTIONS. A passage explaining that stamping used to happen and no
-longer does is the removal working as intended, and it is CLEAN. A passage telling the
-worker to name a version, bump one, reserve one, or run a release is TELLING, wherever in
-the document it sits.
+INSTRUCTIONS, NOT DESCRIPTIONS. A passage explaining that this USED to happen and no
+longer does, or explaining why a branch names no version, is the removal working as
+intended, and it is CLEAN.
+
+AND IF YOU CANNOT TELL WHICH OF THOSE A PASSAGE IS, SAY SO. "cannot tell" is a real
+answer and it is the right one whenever you would otherwise be guessing — including when
+the text is there in front of you and you simply cannot decide whether it orders or
+describes. It is never a polite way of saying clean. Failing to see enough and failing to
+be able to decide are the same thing here and they get the same answer.
 
 ANSWER with one JSON object and nothing else, no prose around it:
   {"verdict": "clean"}
-  {"verdict": "telling", "file": "<exact filename from the list below>",
+  {"verdict": "telling", "file": "<the exact filename below>",
    "quote": "<the sentence, copied exactly from the text>"}
   {"verdict": "cannot tell", "reason": "<one line>"}
 
-"cannot tell" is a real answer and it is the right one whenever you would otherwise be
-guessing. It is never a polite way of saying clean. If the text you were given is not
-enough to judge, say so.
+The quote is checked against the text below and must be at least 24 characters. An answer
+whose quote is not found there is discarded rather than believed, so copy it exactly and
+do not paraphrase."""
 
-The quote is checked against the text below. An answer whose quote is not found there is
-discarded rather than believed, so copy it exactly and do not paraphrase."""
+
+def judge(one: Evidence) -> tuple[str, dict | str, int]:
+    """One document, judged — and `clean` has to be said twice.
+
+    THE ASYMMETRY IS THE POINT, and it is this repo's own rule about absence rather than
+    a hedge against a flaky model. A `telling` answer arrives carrying evidence: a
+    filename from the manifest and a sentence :func:`validated` has already found in the
+    text, so a reader can go and look, and one sample is enough to establish it. A `clean`
+    answer carries nothing at all. It is an assertion that something is not there, made by
+    a process that cannot show its work — the exact shape of claim this whole file exists
+    to distrust, and #408 names it: "an LLM check that returns `ok` because it found
+    nothing is the exact failure this tool exists to catch".
+
+    So a single `clean` is not an established absence, and this asks again — a second,
+    independent sample under its own cache key, because a cached first answer would
+    otherwise confirm itself. That is an argument from what the two answers ARE and not
+    from an observed flake: no run on the machine this was written on has yet disagreed
+    with itself, and the honest reason for the second reading is that a miss is the one
+    outcome this check must not produce, while a false finding is caught by a reader
+    following the quote. Paying twice on the path that claims nothing is there is the
+    cheap side of that trade.
+
+    It costs nothing on the path that finds something, and `readings` in the row's `extra`
+    says how many questions were actually asked.
+
+    Disagreement resolves toward the finding, which is the same order #417 settled for the
+    truncated reads: an answer that found nothing cannot make an answer that found
+    something stop having found it. Anything else — either sample unanswerable, the model
+    unable to tell — is `unknown`, never `clean`.
+
+    Returns the verdict, the answer or the reason there is none, and how many readings
+    it took.
+    """
+    first, why = ask_model("instructions", STAMPING_QUESTION, one, sample=1)
+    if first is None:
+        return "unknown", why, 1
+    if first["verdict"] == "telling":
+        return "telling", first, 1
+    second, why2 = ask_model("instructions", STAMPING_QUESTION, one, sample=2)
+    if second is None:
+        return "unknown", (f"one reading found nothing and the second could not be made, "
+                           f"so nothing was established: {why2}"), 2
+    if second["verdict"] == "telling":
+        return "telling", second, 2
+    return "clean", "", 2
 
 
 def check_instructions(host: Host) -> Check:
@@ -3007,10 +3098,17 @@ def check_instructions(host: Host) -> Check:
     that question, which is the one that would have prevented the night five agents
     stamped: every one of them was following a document.
 
-    Everything that could make the answer unsafe is decided in Python — see
-    :func:`gather_evidence` and :func:`ask_model`. What is left for the model is a
-    judgement about meaning over text it can see, and its `clean` is only ever accepted
-    over a manifest that was read whole.
+    ONE DOCUMENT PER CALL — see :meth:`Evidence.each` for why, and it is not an
+    optimisation. Everything else that could make the answer unsafe is decided in Python:
+    :func:`gather_evidence` refuses an incomplete manifest before anything is asked, and
+    :func:`ask_model` is the only place a verdict can come from.
+
+    THE READ-WHOLE RULE, applied across the calls rather than within one. A document that
+    could not be judged makes the row `unknown` even if the others came back clean —
+    "twelve of thirteen are fine" is not an answer to "do the briefs on this host tell an
+    agent to stamp". But a finding among the ones that WERE judged is still a finding, so
+    the fail branch comes first: an unanswerable thirteenth cannot make a telling third
+    stop telling.
     """
     if not fragments_in_use(host):
         return Check("instructions", str(host.repo),
@@ -3024,27 +3122,52 @@ def check_instructions(host: Host) -> Check:
                      "this host reads could not be found", "unknown",
                      manual="reinstall the harness (qb-bump), then re-run")
     evidence = gather_evidence(sorted(briefs.glob("*.md")), transform=unfenced)
-    answer, why = ask_model("instructions", STAMPING_QUESTION, evidence)
     seen = {"read": evidence.names, "bytes": evidence.size, "digest": evidence.digest,
             "model": LLM_MODEL}
-    if answer is None:
+    if evidence.why:
         return Check("instructions", str(briefs),
                      f"nothing here could judge what the prose in these briefs tells an "
-                     f"agent to do: {why}", "unknown", extra=seen)
-    seen["cached"] = answer.get("cached", False)
-    if answer["verdict"] == "telling":
+                     f"agent to do: {evidence.why}", "unknown", extra=seen)
+    # Two per document, because a `clean` has to be said twice — see :func:`judge`.
+    if len(evidence.files) * 2 > LLM_MAX_CALLS:
         return Check("instructions", str(briefs),
-                     f"{answer['file']} still tells an agent in prose to stamp or reserve a "
+                     f"{len(evidence.files)} documents at up to two readings each is more "
+                     f"than the {LLM_MAX_CALLS} questions one run of this row may ask, so "
+                     "it was not asked at all", "unknown", extra=seen)
+    telling: dict[str, str] = {}
+    unanswered: list[str] = []
+    cached = readings = 0
+    for one in evidence.each():
+        name = one.names[0]
+        verdict, said, asked = judge(one)
+        readings += asked
+        if verdict == "unknown":
+            unanswered.append(f"{name} ({said})")
+            continue
+        if verdict == "telling":
+            telling[name] = str(said.get("quote", ""))
+        cached += 1 if isinstance(said, dict) and said.get("cached") else 0
+    seen |= {"asked": len(evidence.files), "readings": readings, "cached": cached}
+    if telling:
+        named = ", ".join(sorted(telling))
+        return Check("instructions", str(briefs),
+                     f"{named} still tell(s) an agent in prose to stamp or reserve a "
                      "release — #122 removed every branch-side way of doing it, and a brief "
                      "is what an agent does", "fail",
-                     manual=f"read {briefs}/{answer['file']} and compare it against "
-                            f"{host.repo}/harness/commands/{answer['file']}",
-                     extra={**seen, "telling": answer["file"],
-                            "quote": answer.get("quote", "")})
+                     manual=f"read {briefs}/{sorted(telling)[0]} and compare it against "
+                            f"{host.repo}/harness/commands/{sorted(telling)[0]}",
+                     extra={**seen, "telling": sorted(telling), "quote": telling,
+                            "unanswered": unanswered})
+    if unanswered:
+        return Check("instructions", str(briefs),
+                     f"{len(unanswered)} of {len(evidence.files)} brief(s) could not be "
+                     f"judged, so what the prose on this host tells an agent is not known: "
+                     f"{'; '.join(unanswered[:2])}", "unknown",
+                     extra={**seen, "unanswered": unanswered})
     return Check("instructions", str(briefs),
                  f"the prose of all {len(evidence.names)} brief(s) this host reads was "
-                 "judged, and none of it directs an agent to stamp a release", "ok",
-                 extra=seen)
+                 "judged, one at a time and twice each, and none of it directs an agent to "
+                 "stamp a release", "ok", extra=seen)
 
 
 # --------------------------------------------------------------------------- #
@@ -3703,15 +3826,16 @@ CHECKS = (
         briefs={
             "fail": Brief(
                 audience="agent",
-                task=("A brief this host reads still tells an agent, in prose, to produce a "
-                      "release version number — {telling}, and the sentence is quoted in "
-                      "`quote` below. Establish which of the two causes it is before "
-                      "changing anything, exactly as the `briefs` row's own brief says: "
-                      "compare {telling} against `{repo}/harness/commands/{telling}`. If "
-                      "the checkout's copy no longer says it, this host is reading a stale "
-                      "harness and the fix is the `harness` row's. If it does, rewrite the "
-                      "sentence — say that the number is assigned on the integration branch "
-                      "after the merge, by a person, and that a branch names no version."),
+                task=("Brief(s) this host reads still tell an agent, in prose, to produce "
+                      "a release version number: {telling}. The sentence found in each is "
+                      "quoted under `quote` below. Establish which of the two causes it is "
+                      "before changing anything, exactly as the `briefs` row's own brief "
+                      "says: compare each named file against the checkout's copy in "
+                      "`{repo}/harness/commands/`. If the checkout's copy no longer says "
+                      "it, this host is reading a stale harness and the fix is the "
+                      "`harness` row's. If it does, rewrite the sentence — say that the "
+                      "number is assigned on the integration branch after the merge, by a "
+                      "person, and that a branch names no version."),
                 constraints=(
                     "This verdict came from a model and the evidence is in `quote`. Read "
                     "the sentence in place before you act on it: if the quote turns out to "
@@ -4022,7 +4146,8 @@ ANNOUNCED = ("fail",)
 #: read, so an unrelated edit to an unrelated brief would change it and re-announce a
 #: fault that has not changed. What makes a semantic finding this finding is the file
 #: and the sentence, which are `telling` and `quote`.
-VOLATILE = ("queued", "open", "entries", "behind", "read", "bytes", "digest", "cached")
+VOLATILE = ("queued", "open", "entries", "behind", "read", "bytes", "digest", "cached",
+            "asked", "readings")
 
 
 def _instance(check: Check) -> str:

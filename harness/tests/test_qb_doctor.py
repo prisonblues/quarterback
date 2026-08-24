@@ -3252,8 +3252,8 @@ def test_a_telling_verdict_is_the_finding_with_its_evidence(monkeypatch, tmp_pat
     check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
 
     assert check.verdict == "fail"
-    assert check.extra["telling"] == "fix-and-land.md"
-    assert "release entry" in check.extra["quote"]
+    assert check.extra["telling"] == ["fix-and-land.md"]
+    assert "release entry" in check.extra["quote"]["fix-and-land.md"]
     assert check.extra["read"] == ["fix-and-land.md"]
     assert check.extra["digest"] and check.extra["model"] == qd.LLM_MODEL
 
@@ -3267,7 +3267,8 @@ def test_a_row_that_could_not_ask_is_unknown_and_says_what_it_read(
     check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
 
     assert check.verdict == "unknown"
-    assert "nothing here could judge" in check.detail
+    assert "could not be judged" in check.detail
+    assert f"no {qd.LLM_CLI} on this host" in check.detail
     assert check.extra["read"] == ["fix-and-land.md"]
 
 
@@ -3395,3 +3396,189 @@ def test_a_corrupt_cache_with_a_full_table_does_not_raise(monkeypatch, tmp_path,
 
     assert why == "" and answer["verdict"] == "clean"
     assert json.loads(path.read_text())
+
+
+def test_one_document_that_could_not_be_judged_makes_the_whole_row_unknown(
+        monkeypatch, tmp_path, stamping_repo, no_cache):
+    """The read-whole rule, applied across the calls rather than within one. "Twelve of
+    thirteen are fine" is not an answer to "do the briefs on this host tell an agent to
+    stamp", and a row that said `ok` on the twelve would be the absent signal rendering as
+    the benign one — one call along from where #417 caught it."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "harmless prose", "review-pr": "also harmless"})
+    real = qd.run_cmd
+    seen: list[str] = []
+
+    def fake(argv, **kw):
+        if argv and argv[0] == qd.LLM_CLI:
+            sent = kw.get("stdin") or ""
+            seen.append(sent)
+            if "review-pr.md" in sent:
+                return 1, "", "the model fell over"
+            return 0, '{"verdict": "clean"}', ""
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which", lambda n: "/usr/bin/claude")
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert len(seen) == 3, "two readings for the clean one, one for the broken one"
+    assert check.verdict == "unknown"
+    assert "review-pr.md" in check.detail
+
+
+def test_a_finding_among_the_documents_that_were_judged_is_still_a_finding(
+        monkeypatch, tmp_path, stamping_repo, no_cache):
+    """The fail branch comes first, the same order #417 settled for the truncated reads:
+    an unanswerable thirteenth cannot make a telling third stop telling."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "before you push, write the release entry and its "
+                        "number", "review-pr": "harmless"})
+    real = qd.run_cmd
+
+    def fake(argv, **kw):
+        if argv and argv[0] == qd.LLM_CLI:
+            sent = kw.get("stdin") or ""
+            if "fix-and-land.md" in sent:
+                return 0, ('{"verdict": "telling", "file": "fix-and-land.md", "quote": '
+                           '"before you push, write the release entry and its number"}'), ""
+            return 1, "", "the model fell over"
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which", lambda n: "/usr/bin/claude")
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "fail"
+    assert check.extra["telling"] == ["fix-and-land.md"]
+    assert check.extra["unanswered"], "and it still says what it could not judge"
+
+
+def test_more_documents_than_the_call_ceiling_is_an_unknown(monkeypatch, tmp_path,
+                                                            stamping_repo, no_cache):
+    """The byte ceiling bounds how much is read; this bounds how often it is asked, and
+    reaching it is an unknown for the same reason reaching the other one is."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{f"brief-{i}": "prose" for i in range(4)})
+    monkeypatch.setattr(qd, "LLM_MAX_CALLS", 7)
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "unknown"
+    assert "more than the 7 questions" in check.detail
+    assert not calls, "it was not asked at all"
+
+
+def test_each_document_is_asked_about_on_its_own(monkeypatch, tmp_path, stamping_repo,
+                                                  no_cache):
+    """A model asked to find one sentence in thirteen documents at once answered `clean`
+    about a corpus that visibly contained it, on the second run, over the same bytes it
+    had answered `telling` about on the first. That is #408's named failure — the benign
+    answer because it found nothing — so the unit of a question is one document."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"a": "prose about A", "b": "prose about B"})
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert len(calls) == 4, "two documents, each read twice to establish a clean"
+    sent = [c[-1] for c in calls]
+    assert any("prose about A" in x and "prose about B" not in x for x in sent)
+    assert any("prose about B" in x and "prose about A" not in x for x in sent)
+
+
+def test_a_clean_answer_has_to_be_said_twice(monkeypatch, tmp_path, stamping_repo,
+                                             no_cache):
+    """A `telling` answer arrives carrying evidence a reader can go and check. A `clean`
+    answer carries nothing at all — it is an assertion that something is not there, made
+    by a process that cannot show its work, and #408 names that as the exact failure this
+    tool exists to catch. So it is asked again, under its own cache key, because a cached
+    first answer would otherwise confirm itself."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"a": "harmless prose"})
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "ok"
+    assert len(calls) == 2, "one clean answer was believed on its own"
+
+
+def test_a_second_reading_that_finds_something_outranks_a_first_that_did_not(
+        monkeypatch, tmp_path, stamping_repo, no_cache):
+    """Disagreement resolves toward the finding — the order #417 settled for the truncated
+    reads. An answer that found nothing cannot make an answer that found something stop
+    having found it."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"a": "before you push, write the release entry and its number"})
+    real = qd.run_cmd
+    seen: list[int] = []
+
+    def fake(argv, **kw):
+        if argv and argv[0] == qd.LLM_CLI:
+            seen.append(1)
+            if len(seen) == 1:
+                return 0, '{"verdict": "clean"}', ""
+            return 0, ('{"verdict": "telling", "file": "a.md", "quote": '
+                       '"before you push, write the release entry and its number"}'), ""
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which", lambda n: "/usr/bin/claude")
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "fail"
+    assert check.extra["telling"] == ["a.md"]
+
+
+def test_a_first_reading_that_finds_something_is_not_second_guessed(monkeypatch, tmp_path,
+                                                                    stamping_repo,
+                                                                    no_cache):
+    """The asymmetry costs nothing on the path that matters: a finding is already
+    established by a quote this file has checked against the text."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"a": "before you push, write the release entry and its number"})
+    calls = _model_says(monkeypatch, '{"verdict": "telling", "file": "a.md", "quote": '
+                                     '"before you push, write the release entry and its '
+                                     'number"}')
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "fail"
+    assert len(calls) == 1
+
+
+def test_a_confirmation_that_could_not_be_made_is_unknown_and_never_clean(
+        monkeypatch, tmp_path, stamping_repo, no_cache):
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"a": "harmless prose"})
+    real = qd.run_cmd
+    seen: list[int] = []
+
+    def fake(argv, **kw):
+        if argv and argv[0] == qd.LLM_CLI:
+            seen.append(1)
+            if len(seen) == 1:
+                return 0, '{"verdict": "clean"}', ""
+            return 1, "", "the model fell over"
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which", lambda n: "/usr/bin/claude")
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "unknown"
+    assert "second could not be made" in check.detail
+
+
+def test_the_two_readings_are_independent_of_each_other(tmp_path, no_cache):
+    """Under its own cache key, or the first answer confirms itself and the second reading
+    is a lookup rather than a question."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+
+    assert qd._cache_key("row", "q?", ev, 1) != qd._cache_key("row", "q?", ev, 2)
