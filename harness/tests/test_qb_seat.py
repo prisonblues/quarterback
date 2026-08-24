@@ -386,6 +386,23 @@ def test_the_brief_sends_the_seat_to_the_command_that_claims_before_it_works(run
         "by every seat on the machine")
 
 
+def test_the_brief_does_not_send_a_seat_hunting_for_work_off_the_plan(run):
+    """A repo with no plan means STOP, not "go and find something" (#424).
+
+    The brief used to say: no plan, so scan the open issues, judge which are
+    unclaimed and undiscussed, and pick one. That is work discovery outside the
+    human-ordered plan — #63, hand-rolled, in the default text every seat on the
+    box reads, and with none of the appetite gates #85/#86 put around the real
+    thing. A repo where nobody has ordered anything is a repo where nobody has
+    decided what is worth doing, and a pane with no operator is the worst place
+    for an agent to decide it instead.
+    """
+    out = run("1", "--dry-run").stdout.lower()
+    assert "no plan at all" in out and "stop" in out
+    assert "open issue" not in out, (
+        "the seat is choosing its own work from the issue list again")
+
+
 def test_the_brief_can_be_replaced_wholesale(run, agent):
     run("1", env={"QB_SEAT_BRIEF": "do the other thing"})
     assert json.loads(agent.read_text())["args"] == ["--", "do the other thing"]

@@ -75,15 +75,21 @@ is the wrong one".
 
 ## 3. Dispatch on the ref kind
 
-The JSON's `dispatch` field is the command, already worked out. A plan item names an issue, a PR,
-or nothing at all — there is no fourth kind, because the board stores only those.
+`qb-next` claims and reports; **you** run what it names. It prints the command in `dispatch` and
+stops there, deliberately — a tool that ran a slash command would be a second dispatcher, and the
+one thing it must own is the claim. A plan item names an issue, a PR, or nothing at all: there is
+no fourth kind, because the board stores only those.
+
+**Run the command in `dispatch` as it stands.** The two substitutions below are the only ones, and
+each needs the human to have asked for it *in this invocation* — not your judgement about what the
+item deserves. If you substitute, say so in the same breath as the item.
 
 - **`ref.kind == "issue"`** → run `/fix-issue <number>`. That owns the worktree and its isolated
-  database; do not create one yourself. If the human said they want it landed and not just opened,
-  `/fix-and-land <number>` is the same work with the review and the merge gate on the end — but the
-  default is `/fix-issue`, because merging is a human step here.
-- **`ref.kind == "pr"`** → run `/review-pr <number>` (or `/panel-review-pr <number>` if the repo's
-  rules enable a panel and the human asked for one).
+  database; do not create one yourself. Substitution: `/fix-and-land <number>` if the human said
+  they want it landed rather than opened. The default is `/fix-issue`, because merging is a human
+  step here.
+- **`ref.kind == "pr"`** → run `/review-pr <number>`. Substitution: `/panel-review-pr <number>` if
+  the human asked for a panel and the repo's rules enable one.
 - **`ref` is null** → there is no forge behind this item. It is house work, admin, or anything in a
   `project:` scope. Work it **in place**: no worktree, no branch, no PR. The item's `title` and
   `note` are the brief, and the board is where you report — post a `finding` or a `done`, and if
@@ -110,10 +116,17 @@ made, you ran out of context:
 qb-next --release <item_id>
 ```
 
-Do it the moment you stop working on it. The claim expires by itself, but that means the next agent
-waits out your whole TTL for something you are not doing. Say on the board what you learned — a
-`stuck` or a `finding` with `refs` to the item — so the next agent to take it starts from where you
-got to rather than from the beginning.
+Do it the moment you stop working on it.
+
+**Be honest about what "on any exit" is.** It is a discipline, not a guarantee: nothing wraps your
+dispatch in a `finally`, so a crash, a kill, or a context that runs out will not release anything.
+What covers that case is the claim's TTL — it lapses on its own, which is exactly why the board
+made claims expire — and the cost is that the next agent waits the whole TTL out for work nobody is
+doing. That is the difference between releasing and being released, and it is why this step is
+written as something you do rather than something that happens.
+
+Say on the board what you learned as well — a `stuck` or a `finding` with `refs` to the item — so
+the next agent to take it starts from where you got to rather than from the beginning.
 
 ## 5. One item, then stop
 

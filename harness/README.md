@@ -444,10 +444,27 @@ and it does not add an item so there is one to take.
 **A ref that is already closed is bookkeeping, not a second item.** `qb-reconcile` finds
 these regularly. `qb-next` claims the item, asks the forge, and if the issue is closed or the
 PR merged it records the item done — with a note saying the issue closing is what decided it
-— and carries on to the next free one. Only a definite answer skips an item: a missing `gh`,
-a network outage or a repo the token cannot see all mean *work it*, because the other way
-round lets an outage close a plan. `--no-verify-ref` turns the question off entirely, which
-is what a board with no forge behind it wants (#327).
+— and carries on to the next free one. Three things bound that, and each is a way it could
+have gone wrong:
+
+- **The terminal state is per kind: `CLOSED` for an issue, `MERGED` for a PR.** GitHub calls
+  an unmerged PR `CLOSED`, and a plan row naming one is usually work rather than a leftover —
+  reopen it, replace it, find out why it was closed. Sharing one state set between the two
+  kinds would have retired all of them quietly.
+- **Only a definite answer skips an item.** A missing `gh`, a network outage or a repo the
+  token cannot see all mean *work it*, because the other way round lets an outage close a
+  plan. `--no-verify-ref` turns the question off entirely, which is what a board with no
+  forge behind it wants (#327).
+- **If the board will not record it, the claim goes back and the run stops.** The row was
+  claimed before the forge was asked, so a failed `plan_done` leaves that claim live; walking
+  on would take a second item and exit 0 holding both, one of them on work this agent has
+  decided not to do and nobody else can now take.
+
+**Exit 2 is load-bearing, and it covers more than an unreachable board.** A rotated token, a
+500, a refusal, a reply that is not the shape the client reads: every one of those is "could
+not tell" and none of them is evidence about what is free. Reporting them as exit 1 would
+have an agent announce an empty plan on the strength of never having managed to read it —
+the absence-vs-inability collapse `qb-claim` also has three exit codes for.
 
 ### `/fix-issue <number>` — the driver
 
@@ -1250,7 +1267,14 @@ and that is the design rather than an omission. Since #424 the pickup is that co
 than four paragraphs of this brief: a brief is prose a model may skim, and the one step that
 must not be skimmed is the claim, so it lives in `qb-next` where it is code. (The brief it
 replaced composed its own claim key, `kind='work'`, `key='<owner>/<repo>#<number>'` — #172,
-in the one text every seat on the box reads.) A
+in the one text every seat on the box reads.)
+
+**A repo with no plan now means stop, and that is a deliberate narrowing.** The old brief's
+fallback was: no plan, so scan the open issues, judge which are unclaimed and undiscussed,
+and pick one. That is work discovery outside the human-ordered plan — #63, hand-rolled, in
+the default text of every seat on the box, and with none of the appetite gates #85/#86 put
+around the real thing. A repo where nobody has ordered anything is a repo where nobody has
+decided what is worth doing. Give the seat a plan, or attach to the pane and tell it. A
 spawner that reads the plan and hands seat 1 the first item is hub-and-spoke with a hub
 that runs once, at t=0, and then stops existing. Override it wholesale with
 `QB_SEAT_BRIEF` if a fleet wants a different one — or set it to the empty string for a

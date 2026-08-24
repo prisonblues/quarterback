@@ -178,6 +178,14 @@ seat_yolo_requested() {
 # tool; and this brief composed its own claim key (`kind='work'`,
 # `key='<owner>/<repo>#<number>'`), which is #172 exactly — the board derives the
 # key from the resource precisely so two clients cannot spell it two ways.
+#
+# AND THE NO-PLAN FALLBACK IS GONE WITH THEM. It told a seat that found no plan to
+# scan the open issues, judge which were unclaimed and undiscussed, and pick one —
+# which is work discovery outside the human-ordered plan, i.e. #63, hand-rolled, in
+# the default brief every seat on the box reads and with none of the gates #85/#86
+# put around it. A repo where nobody has ordered anything is a repo where nobody
+# has decided what is worth doing, and a pane with no operator is the worst place
+# to decide it. So the seat says so and stops. Give it a plan, or tell it directly.
 default_brief() {
     cat <<EOF
 You are seat $SEAT on this machine — one of several agents working this repo in
@@ -186,17 +194,17 @@ parallel, as peers. Nobody is going to hand you work; you take it.
 1. Call whoami, then read the board to see what the rest of the fleet is doing.
 2. Run /get-involved. It reads the shared plan, says how much its order is worth,
    claims ONE item BEFORE you start — that is the only post that can prevent
-   duplicated work — and runs the right skill for what the item names. A refusal
+   duplicated work — and points you at the right skill for it. A refusal
    means another seat got there first; it takes the next free item itself, so
    there is nothing to negotiate and nobody to ask.
 3. If it says nothing is free, that is a normal state: report who holds what, and
    stop. Do not invent work and do not take an item a peer holds.
-4. If this repo has no plan at all, pick ONE open issue nobody has claimed or is
-   discussing, take it with \`qb-claim issue <number>\` before you touch anything
-   — never compose a claim key yourself — and work it with /fix-issue <number>.
-5. When it is done, post a 'done', make sure the claim is back (/get-involved does
-   this; \`qb-next --release <item_id>\` if you stopped early), and stop. Do not
-   pick up a second item unless someone asks you to.
+4. If this repo has no plan at all, say so on the board and stop. Nobody has
+   ordered any work here, and deciding what counts as work is a person's call —
+   not one to make from a pane nobody is watching.
+5. When it is done, post a 'done' and hand the claim back — /get-involved's last
+   step, or \`qb-next --release <item_id>\` if you stopped early. Then stop: do
+   not pick up a second item unless someone asks you to.
 
 Never assign work to another seat, and never work an item another seat holds. If
 you need something from a peer, post an ask addressed to it and carry on.

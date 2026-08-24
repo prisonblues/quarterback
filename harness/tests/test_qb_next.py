@@ -66,13 +66,26 @@ class Board:
     """
 
     def __init__(self, items: list[dict], trusted: bool = True,
-                 pair: bool = False) -> None:
+                 pair: bool = False, page: int | None = None,
+                 envelope_override: dict | None = None,
+                 refuse: dict | None = None) -> None:
         self.lock = threading.Lock()
         self.items = [self._row(spec, rank) for rank, spec in enumerate(items, 1)]
         self.trusted = trusted
         #: Hold `GET /plan` until two agents have read it, so the collision the
         #: two-agent test is about cannot be missed by one finishing first.
         self.barrier = threading.Barrier(2, timeout=20) if pair else None
+        #: How many rows the PAGE carries. The real endpoint truncates `items` and
+        #: computes `next` from the whole open set, so a `next` that is not in
+        #: `items` is a state the board really produces and not a contrivance.
+        self.page = page
+        #: An envelope that is not the shape the client reads — a proxy's error
+        #: page, a field that arrived null, a board a version ahead.
+        self.envelope_override = envelope_override
+        #: Force a status on a write: {"claim": (500, {...}), "done": …,
+        #: "release": …}. The real endpoint refuses in more ways than one peer
+        #: holding the row, and every one of them used to look the same here.
+        self.refuse = refuse or {}
         self.posts: list[tuple[str, dict]] = []
 
     @staticmethod
@@ -98,12 +111,15 @@ class Board:
     # -- reads
 
     def envelope(self) -> dict:
+        if self.envelope_override is not None:
+            return self.envelope_override
         with self.lock:
             rows = [dict(i) for i in self.items if i["state"] == "open"]
         free = [i for i in rows
                 if not i["claim"] and not i["blocked_by"] and not i["covered_by"]]
         nxt = dict(free[0]) if free else None
         trust = self._trust(len(rows))
+        page = rows if self.page is None else rows[-self.page:]
         if nxt is not None:
             nxt["caveat"] = None if self.trusted else (
                 f"{trust['unchosen']} of {len(rows)} open items sit where they were "
@@ -111,7 +127,8 @@ class Board:
                 f"{trust['first_unchosen']['rank']} of the {SCOPE} list.")
         return {
             "repo": SCOPE, "exact": False, "scopes": [], "plan": None, "plans": [],
-            "items": rows, "truncated": False, "next": nxt, "order_trust": trust,
+            "items": page, "truncated": len(page) < len(rows), "next": nxt,
+            "order_trust": trust,
             "counts": {
                 "open": len(rows),
                 "claimed": sum(1 for i in rows if i["claim"]),
@@ -140,6 +157,8 @@ class Board:
         `app/api/claims.py:_conflict` uses — the refusal is somebody to talk to
         rather than a denial, and `qb-next` reads `held_by` out of it to say so.
         """
+        if "claim" in self.refuse:
+            return self.refuse["claim"]
         with self.lock:
             item = self._find(body["item_id"])
             if item is None:
@@ -163,6 +182,8 @@ class Board:
                          "claim_id": str(uuid.uuid4())}
 
     def done(self, body: dict) -> tuple[int, dict]:
+        if "done" in self.refuse:
+            return self.refuse["done"]
         with self.lock:
             item = self._find(body["item_id"])
             if item is None:
@@ -172,6 +193,8 @@ class Board:
             return 200, {"item_id": item["item_id"], "state": "done"}
 
     def release(self, body: dict) -> tuple[int, dict]:
+        if "release" in self.refuse:
+            return self.refuse["release"]
         with self.lock:
             item = self._find(body["item_id"])
             if item is None:
@@ -195,10 +218,18 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send(404, {"detail": "no"})
         query = parse_qs(parsed.query)
         self.board.posts.append(("GET /plan", {k: v[0] for k, v in query.items()}))
+        # RENDERED BEFORE THE BARRIER, and that ordering is the whole trick. Waiting
+        # first and rendering afterwards lets the agent released first claim rank 1
+        # and be finished before the second agent's envelope is built — which then
+        # honestly reports rank 1 as taken, hands out rank 2, and the two agents
+        # never contend at all. The test passed anyway (they took different items)
+        # while asserting nothing about the interlock, and failed on CI when the
+        # timing went the other way. Rendering first fixes both: neither reply
+        # leaves until both have been computed from the same pre-claim state.
+        envelope = self.board.envelope()
         if self.board.barrier is not None:
-            # Both agents hold the same `next` before either may claim it.
             self.board.barrier.wait()
-        self._send(200, self.board.envelope())
+        self._send(200, envelope)
 
     def do_POST(self) -> None:                                   # noqa: N802
         length = int(self.headers.get("Content-Length") or 0)
@@ -656,3 +687,200 @@ def test_the_brief_branches_on_every_exit_code_this_tool_returns():
         "releasing on a FAILED exit is the half that gets dropped, and then the "
         "next agent waits out the whole TTL for work nobody is doing")
     assert "reorder" in text, "the brief must say it may not reorder the plan"
+
+
+# ------------------------------------------- "I could not ask" is not "nothing free"
+
+
+def test_a_refused_claim_is_unknown_and_never_nothing_free(gh):
+    """Exit 2, not 1 — and it must not walk on to meet the same wall three times.
+
+    Every non-409 answer to a claim used to return the same "not this one" as a
+    lost race, so a rotated token, a 500 or a bad TTL walked the whole candidate
+    list and came out as "nothing free in this scope". That is a statement about
+    the plan, made on the strength of never having managed to write to it — the
+    absence-vs-inability collapse `qb-claim` has three exit codes to avoid.
+    """
+    board = Board([{}, {}, {}], refuse={"claim": (500, {"detail": "boom"})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 2
+    assert "nothing free" not in got.stderr
+    assert "not evidence about what is free" in got.stderr
+    claims = [p for p in board.posts if p[0] == "POST /plan/item/claim"]
+    assert len(claims) == 1, "it walked on to meet the same failure again"
+
+
+def test_a_rotated_token_is_unknown_too(gh):
+    board = Board([{}, {}], refuse={"claim": (401, {"detail": {"error": "no"}})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 2
+
+
+def test_nothing_reaches_stdout_without_a_claim(gh):
+    """The dispatch line is the report that an item is YOURS. No claim, no line.
+
+    A tool that printed what to run and left the claim to its caller would move
+    the only post that prevents duplicated work to after the duplication.
+    """
+    board = Board([{}, {}], refuse={"claim": (409, {"detail": {
+        "error": "work claim is held", "held_by": "zeus/amber-otter",
+        "session": "s9", "note": "landing it"}})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 1
+    assert got.stdout.strip() == ""
+    assert "zeus/amber-otter has it" in got.stderr
+
+
+def test_a_plan_hold_names_its_holder_and_not_a_phantom(gh):
+    """`covered_by` is a 409 too, and the holder is inside it, not at `held_by`."""
+    board = Board([{}], refuse={"claim": (409, {"detail": {
+        "error": "the plan this item belongs to is held by somebody else",
+        "covered_by": {"plan_id": "p", "label": "stage 1",
+                       "holder": "zeus/drift-frost", "session": "s2"}}})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert "zeus/drift-frost holds the whole plan (stage 1)" in got.stderr
+
+
+def test_a_blocked_race_does_not_invent_a_holder(gh):
+    """An invented holder is worse than an unknown: a reader goes looking for them.
+
+    The board answers 409 five ways and only two of them are a peer with the row.
+    "That item is waiting on unfinished work" is the plan moving, not somebody
+    holding it, and saying `somebody has it` sends an agent to ask a peer who does
+    not exist.
+    """
+    board = Board([{}], refuse={"claim": (409, {"detail": {
+        "error": "that item is waiting on unfinished work",
+        "blocked_by": [{"item_id": "x", "title": "first this"}]}})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert "waiting on unfinished work, so it is not free either" in got.stderr
+    assert "has it" not in got.stderr
+    assert "somebody has it" not in got.stderr
+
+
+def test_a_malformed_envelope_is_unknown_and_not_an_empty_plan(gh):
+    """An uncaught error exits 1 in Python, and 1 is the one answer this may not fake."""
+    board = Board([{}], envelope_override={"items": "not a list", "next": 7})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 2
+    assert "not a shape this understands" in got.stderr
+    assert "Nothing was concluded about the plan" in got.stderr
+
+
+# ------------------------------------------------- the board's `next` is the answer
+
+
+def test_the_boards_next_is_taken_even_when_it_is_off_the_page(gh):
+    """`items` is a page; `next` is computed from the whole open set. They differ.
+
+    The endpoint's own comment records why it is built that way: deriving both
+    from one truncated query made `next` describe the page, and it answered
+    "nothing is free" with free work at rank limit+1. Re-deriving the answer from
+    `items` here would walk back into that one process along, so `next` goes at the
+    head of the candidates whether or not the page carries it.
+    """
+    board = Board([{}, {}, {}], page=1)          # the page holds rank 3 only
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, "--json", gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 0
+    answer = json.loads(got.stdout)
+    assert answer["item_id"] == board.row(1)["item_id"], (
+        "it took a row off the page instead of the board's own answer")
+    assert answer["was_next"] is True
+
+
+# ------------------------------------------- a closed ref, and the claim behind it
+
+
+def test_a_pr_that_was_closed_without_merging_is_worked_not_retired(gh):
+    """GitHub calls an unmerged PR `CLOSED`, and that is not the same as finished.
+
+    A plan row naming one is usually work — reopen it, replace it, find out why it
+    was closed. Sharing one terminal-state set with issues would have this tool
+    quietly retire all of them.
+    """
+    board = Board([{"ref": {"kind": "pr", "value": "431"}}, {}])
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, "--json", gh_path=gh,
+                  env={"QB_TEST_GH_STATE_431": "CLOSED"})
+    finally:
+        httpd.shutdown()
+    assert json.loads(got.stdout)["item_id"] == board.row(1)["item_id"]
+    assert board.row(1)["state"] == "open"
+
+
+def test_when_the_board_will_not_record_a_closed_row_the_claim_goes_back(gh):
+    """And nothing else is claimed. One invocation must not end holding two items.
+
+    The row is claimed BEFORE the forge is asked, so a `done` that fails leaves
+    that claim live. Walking on from there would take a second item and exit 0
+    holding both — one of them on work this agent has decided not to do and nobody
+    else can now take.
+    """
+    board = Board([{}, {}], refuse={"done": (500, {"detail": "no"})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh,
+                  env={"QB_TEST_GH_STATE_61": "CLOSED"})
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 2
+    assert board.row(1)["claim"] is None, "the claim it decided not to work is still held"
+    assert board.row(2)["claim"] is None, "it claimed a second item on the way out"
+    assert "released" in got.stderr
+    assert [p[0] for p in board.posts].count("POST /plan/item/claim") == 1
+
+
+def test_when_the_release_fails_too_it_names_the_stranded_item(gh):
+    """The remedy has to be in the text, because nothing else is going to say it."""
+    board = Board([{}, {}], refuse={"done": (500, {"detail": "no"}),
+                                    "release": (500, {"detail": "no"})})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, gh_path=gh,
+                  env={"QB_TEST_GH_STATE_61": "CLOSED"})
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 2
+    assert "AND THE CLAIM IS STILL HELD" in got.stderr
+    assert f"qb-next --release {board.row(1)['item_id']}" in got.stderr
+    assert "lapses on its own TTL" in got.stderr
+
+
+# ------------------------------------------------------------- argument hygiene
+
+
+def test_tries_below_one_is_refused_where_it_was_typed(three, gh):
+    """It used to be clamped, so `--tries 0` got one try and reported "walked 1"."""
+    _board, url = three
+    got = run(url, "--scope", SCOPE, "--tries", "0", gh_path=gh)
+    assert got.returncode == 2
+    assert "at least 1" in got.stderr
