@@ -2991,10 +2991,23 @@ def test_the_doctor_produces_the_prompt_and_never_runs_it(monkeypatch, door,
 
 @pytest.fixture
 def no_cache(monkeypatch, tmp_path):
-    """A cache of its own per test. Without this the suite reads the developer's, which
-    would make every assertion below depend on what somebody asked yesterday."""
+    """A cache of its own per test, and NO model CLI unless the test says otherwise.
+
+    The cache half is obvious: without it the suite reads the developer's and every
+    assertion below depends on what somebody asked yesterday.
+
+    The `which` half is the one that was learned the hard way, and it is
+    `_hermetic_git`'s argument applied to a second piece of the environment. A test that
+    forgets to stub the CLI passes on a developer's machine, where `claude` is on PATH,
+    and fails in CI and in flake.nix's sandbox, where it is not — so the suite's verdict
+    depends on who ran it. Defaulting it to ABSENT makes the forgetful test fail
+    everywhere, which is the direction a test suite has to fail in.
+    """
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.delenv("QB_DOCTOR_LLM", raising=False)
+    real_which = qd.shutil.which
+    monkeypatch.setattr(qd.shutil, "which",
+                        lambda n: None if n == qd.LLM_CLI else real_which(n))
     return tmp_path / "cache"
 
 
@@ -3346,10 +3359,15 @@ def test_a_cached_finding_whose_quote_no_longer_matches_is_not_believed(monkeypa
     """Validation is a function of the answer AND the evidence, so a cache entry that was
     honest about one corpus is not honest about another."""
     ev = qd.gather_evidence([_write(tmp_path, "a.md", "stamp the release number here")])
+    # The CLI has to be present, or the wrapper never reaches the cache: CI has no
+    # `claude` on PATH and this test passed locally for exactly that reason.
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
     monkeypatch.setattr(qd, "cache_get", lambda _k: {
         "verdict": "telling", "file": "b.md", "quote": "stamp the release number"})
 
     answer, why = qd.ask_model("row", "q?", ev)
+
+    assert not calls, "a cache hit was served and then asked anyway"
 
     assert answer is None
     assert "b.md" in why
