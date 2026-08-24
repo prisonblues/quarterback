@@ -96,6 +96,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -2704,9 +2705,12 @@ LLM_MAX_BYTES = 400_000
 LLM_NO_TOOLS = ("Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Edit",
                 "Write", "Task", "NotebookEdit")
 
-#: Bumped whenever a question below changes. It is part of the cache key, so a
-#: reworded question does not read yesterday's answer to a different question.
-PROMPT_VERSION = "1"
+#: The shortest a quotation may be and still be evidence. Codex found the hole: a
+#: `telling` answer citing `"a"` satisfies "the quote is in the file" for every file
+#: ever written, so the citation check would pass while establishing nothing. A
+#: sentence a worker could act on is longer than this; anything shorter is not the
+#: instruction it claims to have found.
+MIN_QUOTE = 24
 
 #: How long a cached answer stands. The evidence digest is already in the key, so
 #: this is not for correctness — it is so a wrong verdict ages out and the file
@@ -2762,7 +2766,6 @@ def gather_evidence(paths: list[Path], transform=None) -> Evidence:
                             f"{LLM_MAX_BYTES}-byte ceiling — a corpus this could not read "
                             "whole is one it cannot clear")
     joined = "\0".join(f"{n}\0{t}" for n, t in out)
-    import hashlib  # noqa: PLC0415 — one caller, and only on the expensive path
     return Evidence(files=tuple(out),
                     digest=hashlib.sha256(joined.encode()).hexdigest()[:16])
 
@@ -2776,8 +2779,15 @@ def _cache_path() -> Path:
     return Path(root) / "quarterback" / "doctor-llm.json"
 
 
-def _cache_key(row: str, evidence: Evidence) -> str:
-    return f"{row}:{PROMPT_VERSION}:{LLM_MODEL}:{evidence.digest}"
+def _cache_key(row: str, question: str, evidence: Evidence) -> str:
+    """Row, question, model, and the bytes that were read — all four, none by discipline.
+
+    The question is hashed in rather than tracked by a version constant somebody has to
+    remember to bump: Codex pointed out that a reworded question would otherwise read
+    yesterday's answer to a different one, and a rule enforced by remembering is not one.
+    """
+    asked = hashlib.sha256(question.encode()).hexdigest()[:12]
+    return f"{row}:{asked}:{LLM_MODEL}:{evidence.digest}"
 
 
 def cache_get(key: str) -> dict | None:
@@ -2802,11 +2812,14 @@ def cache_get(key: str) -> dict | None:
 def cache_put(key: str, answer: dict) -> None:
     path = _cache_path()
     try:
-        held = json.loads(path.read_text())
-        if not isinstance(held, dict):
-            held = {}
+        loaded = json.loads(path.read_text())
     except Exception:                                         # noqa: BLE001 — start fresh
-        held = {}
+        loaded = {}
+    # Entries that are not dicts are dropped ON LOAD rather than tripped over during
+    # eviction, which is where Codex found them raising: `kv[1].get("at")` on a corrupt
+    # file with more than LLM_CACHE_MAX entries is an AttributeError outside the guard.
+    held = {k: v for k, v in loaded.items() if isinstance(v, dict)} \
+        if isinstance(loaded, dict) else {}
     held[key] = {"at": datetime.now(UTC).isoformat(), "answer": answer}
     if len(held) > LLM_CACHE_MAX:
         oldest = sorted(held.items(), key=lambda kv: str(kv[1].get("at")))
@@ -2853,10 +2866,13 @@ def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None,
         return None, f"model checks are switched off here ({LLM_ENV})"
     if shutil.which(LLM_CLI) is None:
         return None, f"no {LLM_CLI} on this host, so nothing here can ask the question"
-    key = _cache_key(row, evidence)
+    key = _cache_key(row, question, evidence)
     cached = cache_get(key)
     if cached is not None:
-        return {**cached, "cached": True}, ""
+        answer, why = validated(cached, evidence)
+        if answer is None:
+            return None, f"a cached answer no longer stands up: {why}"
+        return {**answer, "cached": True}, ""
     argv = [LLM_CLI, "-p", "--model", LLM_MODEL, "--max-budget-usd", LLM_BUDGET_USD,
             "--disallowed-tools", *LLM_NO_TOOLS]
     rc, out, err = run_cmd(argv, timeout=LLM_TIMEOUT,
@@ -2871,12 +2887,31 @@ def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None,
     if not match:
         return None, f"{LLM_CLI} answered with no JSON object: {clip_line(out) or '(nothing)'}"
     try:
-        answer = json.loads(match.group(0))
+        parsed = json.loads(match.group(0))
     except ValueError:
         return None, f"{LLM_CLI}'s answer did not parse: {clip_line(match.group(0))}"
+    answer, why = validated(parsed, evidence)
+    if answer is None:
+        return None, why
+    cache_put(key, answer)
+    return {**answer, "cached": False}, ""
+
+
+def validated(answer: object, evidence: Evidence) -> tuple[dict | None, str]:
+    """Everything an answer must satisfy — applied to a CACHED one as well as a fresh one.
+
+    Codex found the hole this closes, and it is the family this file exists to keep out:
+    a cached answer that skipped these checks reaches `check_instructions`, is not
+    `telling`, and falls through to the `ok` return. A hand-edited or corrupt cache file
+    would therefore have been a way to make a green row, which is the absent signal
+    rendering as the benign one arriving through the back door of an optimisation.
+
+    So validation is not part of parsing; it is a function of the answer and the evidence,
+    and both routes to an answer go through it.
+    """
     if not isinstance(answer, dict) or answer.get("verdict") not in _ANSWERS:
-        return None, (f"{LLM_CLI} answered {answer.get('verdict')!r} if anything, which is "
-                      f"not one of {_ANSWERS}")
+        got = answer.get("verdict") if isinstance(answer, dict) else answer
+        return None, (f"the answer's verdict was {got!r}, which is not one of {_ANSWERS}")
     if answer["verdict"] == "cannot tell":
         return None, f"the model could not tell: {clip_line(str(answer.get('reason', '')))}"
     if answer["verdict"] == "telling":
@@ -2884,13 +2919,16 @@ def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None,
         if named not in evidence.names:
             return None, (f"the answer cited {named!r}, which was not among the documents "
                           "it was given — so it is about something this cannot show you")
-        text = dict(evidence.files)[named]
-        if not quote.strip() or " ".join(quote.split()) not in " ".join(text.split()):
+        tidy = " ".join(quote.split())
+        if len(tidy) < MIN_QUOTE:
+            return None, (f"the answer quoted {tidy!r} from {named}, which is too short to "
+                          f"be the instruction it claims to have found ({MIN_QUOTE} "
+                          "characters is the floor) — a substring is not a citation")
+        if tidy not in " ".join(dict(evidence.files)[named].split()):
             return None, (f"the answer quoted a line that is not in {named} — a composed "
                           "quotation is not evidence, and this is an unknown rather than a "
                           "finding")
-    cache_put(key, answer)
-    return {**answer, "cached": False}, ""
+    return answer, ""
 
 
 def unfenced(text: str) -> str:

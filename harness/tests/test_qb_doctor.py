@@ -3317,3 +3317,81 @@ def test_the_group_is_selectable_by_name(monkeypatch):
     qd.main(["--only", "semantic"])
 
     assert seen == [{spec.name for spec in qd.CHECKS if spec.group == "semantic"}]
+
+
+# ----------------------------------------- what Codex found in the first cut
+
+def test_a_cached_answer_is_validated_again_before_it_is_believed(monkeypatch, tmp_path,
+                                                                   no_cache):
+    """The optimisation's back door, found by Codex. A cached answer that skipped the
+    checks reaches the row, is not `telling`, and falls through to the `ok` return — so a
+    hand-edited or corrupt cache file was a way to make a green row, which is the absent
+    signal rendering as the benign one arriving through a fast path."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "harmless prose")])
+    monkeypatch.setattr(qd, "cache_get",
+                        lambda _k: {"verdict": "cannot tell", "reason": "shown too little"})
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    answer, why = qd.ask_model("row", "q?", ev)
+
+    assert answer is None, "a cached non-answer was served as an answer"
+    assert "cached answer no longer stands up" in why
+    assert not calls
+
+
+def test_a_cached_finding_whose_quote_no_longer_matches_is_not_believed(monkeypatch,
+                                                                        tmp_path,
+                                                                        no_cache):
+    """Validation is a function of the answer AND the evidence, so a cache entry that was
+    honest about one corpus is not honest about another."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "stamp the release number here")])
+    monkeypatch.setattr(qd, "cache_get", lambda _k: {
+        "verdict": "telling", "file": "b.md", "quote": "stamp the release number"})
+
+    answer, why = qd.ask_model("row", "q?", ev)
+
+    assert answer is None
+    assert "b.md" in why
+
+
+def test_a_reworded_question_does_not_read_yesterdays_answer(monkeypatch, tmp_path,
+                                                             no_cache):
+    """The question is hashed into the key rather than tracked by a constant somebody has
+    to remember to bump. A rule enforced by remembering is not one."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    qd.ask_model("row", "does this prose tell a worker to stamp?", ev)
+    qd.ask_model("row", "does this prose tell a worker to reserve?", ev)
+
+    assert len(calls) == 2, "a different question was answered from the same cache entry"
+
+
+def test_a_quotation_too_short_to_be_an_instruction_is_not_a_citation(monkeypatch,
+                                                                      tmp_path, no_cache):
+    """`"a"` is in every file ever written, so the citation check would pass while
+    establishing nothing. A sentence a worker could act on is longer than the floor."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "nothing about releases at all")])
+    _model_says(monkeypatch, '{"verdict": "telling", "file": "a.md", "quote": "a"}')
+
+    answer, why = qd.ask_model("row", "q?", ev)
+
+    assert answer is None, "a one-character substring was accepted as evidence"
+    assert "too short to be the instruction" in why
+
+
+def test_a_corrupt_cache_with_a_full_table_does_not_raise(monkeypatch, tmp_path,
+                                                          no_cache):
+    """Eviction sorts on each entry's timestamp, and an entry that is not a dict is an
+    AttributeError outside the guard — on the path that writes, so it would take the row
+    down after the call had already been paid for."""
+    path = qd._cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({str(i): "not a dict" for i in range(qd.LLM_CACHE_MAX + 5)}))
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    answer, why = qd.ask_model("row", "q?", ev)
+
+    assert why == "" and answer["verdict"] == "clean"
+    assert json.loads(path.read_text())
