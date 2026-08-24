@@ -1701,6 +1701,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.12** — the reconciler stops caring what order you work in.
 - **v3.13** — a release stops being something a branch does.
 - **v3.14** — the doctor learns whether work can land, and the plan can be dragged.
+- **v3.15** — obeying the merge queue is no longer what makes you lapse from it.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
