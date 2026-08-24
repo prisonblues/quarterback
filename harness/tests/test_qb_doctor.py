@@ -2983,3 +2983,337 @@ def test_the_doctor_produces_the_prompt_and_never_runs_it(monkeypatch, door,
     assert door.calls, "it still escalates"
     assert not any("MAGIC-BRIEF-TEXT" in " ".join(argv) for argv in ran), (
         "a brief reached a subprocess — the doctor has started dispatching")
+
+
+# --------------------------------------------------------------------------- #
+# the semantic group — a model answers, and Python decides what an answer is
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture
+def no_cache(monkeypatch, tmp_path):
+    """A cache of its own per test. Without this the suite reads the developer's, which
+    would make every assertion below depend on what somebody asked yesterday."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.delenv("QB_DOCTOR_LLM", raising=False)
+    return tmp_path / "cache"
+
+
+def _model_says(monkeypatch, answer: str, *, rc: int = 0, on_stderr: str = "",
+                have_cli: bool = True) -> list[list[str]]:
+    """Stub the model CLI and record what it was actually asked."""
+    calls: list[list[str]] = []
+    real = qd.run_cmd
+    real_which = qd.shutil.which
+
+    def fake(argv, **kw):
+        if argv and argv[0] == qd.LLM_CLI:
+            calls.append([*argv, kw.get("stdin") or ""])
+            return rc, answer, on_stderr
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which",
+                        lambda n: (real_which(n) if n != qd.LLM_CLI
+                                   else ("/usr/bin/claude" if have_cli else None)))
+    return calls
+
+
+def _write(where: Path, name: str, body: str) -> Path:
+    p = where / name
+    p.write_text(body)
+    return p
+
+
+def test_unfenced_is_the_complement_of_fenced():
+    """The split that keeps this group from duplicating a predicate: `briefs` reads what
+    is inside the fences, this reads what is outside them, and between them they see the
+    document once."""
+    doc = "prose one\n\n~~~bash\nfenced one\n~~~\n\nprose two\n\n```\nfenced two\n```\n"
+
+    assert "fenced one" not in qd.unfenced(doc)
+    assert "fenced two" not in qd.unfenced(doc)
+    assert "prose one" in qd.unfenced(doc) and "prose two" in qd.unfenced(doc)
+    assert "fenced one" in qd.fenced(doc) and "prose one" not in qd.fenced(doc)
+
+
+def test_an_empty_manifest_is_an_unknown_before_anything_is_asked(monkeypatch, no_cache):
+    """The evidence gate, decided in Python before the call — the `edge` row's shape.
+    "Nothing here can see it" is a verdict the code reaches, not one the model offers."""
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    answer, why = qd.ask_model("x", "q?", qd.gather_evidence([]))
+
+    assert answer is None
+    assert "nothing here to read" in why
+    assert not calls, "the model was asked about a corpus that does not exist"
+
+
+def test_a_file_that_could_not_be_read_makes_the_whole_manifest_unusable(
+        monkeypatch, tmp_path, no_cache):
+    """The correction #417 made to `check_briefs`, applied before the expensive call: the
+    walk that skips the unreadable file and passes on the rest is reporting a clean corpus
+    it never read."""
+    good = tmp_path / "a.md"
+    good.write_text("fine")
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    evidence = qd.gather_evidence([good, tmp_path / "gone.md"])
+
+    assert evidence.why and "gone.md" in evidence.why
+    assert qd.ask_model("x", "q?", evidence) == (None, evidence.why)
+    assert not calls
+
+
+def test_reaching_the_evidence_ceiling_is_an_unknown_not_a_disclosed_pass(
+        monkeypatch, tmp_path, no_cache):
+    """#417 closed exactly this hole in the GitHub-backed rows: a truncated read that
+    disclosed the cap in its detail and returned `ok` anyway, where the honesty of the
+    disclosure is what made it convincing. A corpus this could not read whole is one it
+    cannot clear."""
+    monkeypatch.setattr(qd, "LLM_MAX_BYTES", 50)
+    big = tmp_path / "big.md"
+    big.write_text("x" * 400)
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    evidence = qd.gather_evidence([big])
+
+    assert "ceiling" in evidence.why
+    assert qd.ask_model("x", "q?", evidence)[0] is None
+    assert not calls
+
+
+def test_a_host_with_no_model_cli_is_an_unknown(monkeypatch, tmp_path, no_cache):
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    _model_says(monkeypatch, "", have_cli=False)
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert answer is None
+    assert f"no {qd.LLM_CLI} on this host" in why
+
+
+def test_the_off_switch_is_an_unknown_and_never_a_pass(monkeypatch, tmp_path, no_cache):
+    """A sandbox with no network runs this suite, and a host whose owner does not want
+    model calls made from it is a real configuration. Neither may render as `ok`."""
+    monkeypatch.setenv(qd.LLM_ENV, "0")
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert answer is None and qd.LLM_ENV in why
+    assert not calls
+
+
+@pytest.mark.parametrize("rc,out,err,expect", [
+    (1, "", "boom", "exited 1"),
+    (124, "", "timed out after 240s", "exited 124"),
+    (0, "I think it is probably fine", "", "no JSON object"),
+    (0, '{"verdict": "clean"', "", "no JSON object"),
+    (0, '{"verdict": "definitely fine"}', "", "not one of"),
+    (0, '{"verdict": "cannot tell", "reason": "I was shown too little"}', "",
+     "could not tell"),
+    (0, "Error: Exceeded USD budget (1.00)", "", "ceiling for one call was reached"),
+])
+def test_every_way_a_call_can_fail_is_an_unknown(monkeypatch, tmp_path, no_cache,
+                                                 rc, out, err, expect):
+    """One place where "could not be asked" is phrased, so no row can reach a verdict
+    without having been answered. Not one of these may come back as `clean`: an LLM check
+    that returns the benign answer because it found nothing is the precise failure this
+    whole tool exists to catch."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    _model_says(monkeypatch, out, rc=rc, on_stderr=err)
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert answer is None, "a call that did not answer produced an answer"
+    assert expect in why
+
+
+def test_an_answer_citing_a_file_it_was_not_given_is_discarded(monkeypatch, tmp_path,
+                                                               no_cache):
+    """The clause a prompt cannot enforce. An answer about a file that was not in the
+    manifest is the model reasoning from its own memory of this repository, and the row
+    cannot show a reader the evidence for it."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "harmless prose")])
+    _model_says(monkeypatch, '{"verdict": "telling", "file": "elsewhere.md", '
+                             '"quote": "stamp the release"}')
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert answer is None, "discarding is an unknown, not a finding and not a pass"
+    assert "elsewhere.md" in why and "was not among the documents" in why
+
+
+def test_an_answer_quoting_a_line_that_is_not_there_is_discarded(monkeypatch, tmp_path,
+                                                                 no_cache):
+    """A composed quotation is not evidence. This is what makes the verdict arguable
+    rather than merely distrusted — the quote is checked against the bytes that were
+    sent, so a reader can go and look."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "nothing about releases here")])
+    _model_says(monkeypatch, '{"verdict": "telling", "file": "a.md", '
+                             '"quote": "now stamp the release number"}')
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert answer is None
+    assert "quoted a line that is not in a.md" in why
+
+
+def test_a_quote_is_matched_across_rewrapped_whitespace(monkeypatch, tmp_path, no_cache):
+    """A model copying a sentence out of a wrapped markdown paragraph will not reproduce
+    its line breaks, and rejecting a true finding over a newline would make the check
+    useless in the direction that matters."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md",
+                                    "before you push,\nstamp the release number.\n")])
+    _model_says(monkeypatch, '{"verdict": "telling", "file": "a.md", '
+                             '"quote": "before you push, stamp the release number."}')
+
+    answer, why = qd.ask_model("x", "q?", ev)
+
+    assert why == ""
+    assert answer["verdict"] == "telling"
+
+
+def test_the_answer_is_cached_on_the_digest_of_what_was_read(monkeypatch, tmp_path,
+                                                             no_cache):
+    """How the expensive half stays affordable without being opt-in-and-therefore-never-
+    run: a scheduled re-read of unchanged documents costs nothing."""
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "harmless prose")])
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    first, _ = qd.ask_model("row", "q?", ev)
+    second, _ = qd.ask_model("row", "q?", ev)
+
+    assert len(calls) == 1, "the same bytes were paid for twice"
+    assert first["cached"] is False and second["cached"] is True
+
+
+def test_a_cache_entry_is_not_reused_for_different_bytes(monkeypatch, tmp_path, no_cache):
+    """The key is the digest of what was read, so an edit to any document asks again —
+    which is the property that makes caching safe here at all."""
+    _model_says(monkeypatch, '{"verdict": "clean"}')
+    one = qd.gather_evidence([_write(tmp_path, "a.md", "harmless prose")])
+    qd.ask_model("row", "q?", one)
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    two = qd.gather_evidence([_write(tmp_path, "a.md", "harmless prose, edited")])
+    qd.ask_model("row", "q?", two)
+
+    assert one.digest != two.digest
+    assert len(calls) == 1
+
+
+def test_an_unreadable_cache_is_a_miss_and_never_an_error(monkeypatch, tmp_path,
+                                                          no_cache):
+    """A diagnostic that fell over on its own scratch file would be unavailable precisely
+    when somebody needed it."""
+    path = qd._cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json at all")
+    ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    answer, why = qd.ask_model("row", "q?", ev)
+
+    assert why == "" and answer["verdict"] == "clean"
+    assert len(calls) == 1
+
+
+# ------------------------------------------------------- the row itself
+
+def test_the_model_is_only_shown_prose(monkeypatch, tmp_path, stamping_repo, no_cache):
+    """Python first, and Python wherever a predicate can decide it. `briefs` already reads
+    the fences deterministically, so sending them here would be paying a model to
+    duplicate a `grep` — and would let the two rows disagree about one line."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "prose about landing\n\n```bash\n"
+                        "python3 scripts/release_stamp.py apply\n```\n"})
+    calls = _model_says(monkeypatch, '{"verdict": "clean"}')
+
+    qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    sent = calls[0][-1]
+    assert "prose about landing" in sent
+    assert "release_stamp.py apply" not in sent
+
+
+def test_a_telling_verdict_is_the_finding_with_its_evidence(monkeypatch, tmp_path,
+                                                            stamping_repo, no_cache):
+    """The check the whole group exists for. Five agents stamped because a document told
+    them to, and the sentence that told them need never have been inside a fence."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "Once ready, before you push: write the release "
+                        "entry, then its number.\n"})
+    _model_says(monkeypatch, '{"verdict": "telling", "file": "fix-and-land.md", '
+                             '"quote": "before you push: write the release entry, then '
+                             'its number."}')
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "fail"
+    assert check.extra["telling"] == "fix-and-land.md"
+    assert "release entry" in check.extra["quote"]
+    assert check.extra["read"] == ["fix-and-land.md"]
+    assert check.extra["digest"] and check.extra["model"] == qd.LLM_MODEL
+
+
+def test_a_row_that_could_not_ask_is_unknown_and_says_what_it_read(
+        monkeypatch, tmp_path, stamping_repo, no_cache):
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "prose"})
+    _model_says(monkeypatch, "", have_cli=False)
+
+    check = qd.check_instructions(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "unknown"
+    assert "nothing here could judge" in check.detail
+    assert check.extra["read"] == ["fix-and-land.md"]
+
+
+def test_no_semantic_row_goes_green_on_a_host_that_cannot_ask(monkeypatch, tmp_path,
+                                                              stamping_repo, no_cache):
+    """The group-wide constraint, asserted over the GROUP for the reason the landing one
+    is: the failure guarded against is a row added later without an unknown path. A
+    semantic check that returned `ok` because it could not ask would be the absent signal
+    rendering as the benign one, in the tool built to catch that."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "prose", "review-pr": "more prose"})
+    monkeypatch.setenv(qd.LLM_ENV, "0")
+    host = host_for(stamping_repo, harness_bin=harness / "bin")
+
+    rows = [spec for spec in qd.CHECKS if spec.group == "semantic"]
+    assert rows, "there is a semantic group to assert over"
+    for spec in rows:
+        check = spec.fn(host)
+        assert check.verdict == "unknown", f"{spec.name} answered {check.verdict}"
+        assert check.detail
+
+
+def test_the_semantic_group_does_not_run_unless_it_is_asked_for(monkeypatch, repo):
+    """Selection IS the bound. `qb-doctor` is a command people type when something already
+    feels wrong, and #55's argument is that unbounded spend must not hang off that."""
+    ran: list[str] = []
+    spec = qd.CheckSpec("costly", "semantic",
+                        lambda _h: (ran.append("asked"), qd.Check("costly", "-", "", "ok"))[1],
+                        explanation="x " * 50)
+    monkeypatch.setattr(qd, "CHECKS", (spec,))
+
+    assert qd.run_checks(host_for(repo)) == []
+    assert not ran, "a bare qb-doctor spent money"
+
+    rows = qd.run_checks(host_for(repo), {"costly"})
+
+    assert [c.name for c in rows] == ["costly"] and ran == ["asked"]
+
+
+def test_the_group_is_selectable_by_name(monkeypatch):
+    seen: list[set[str] | None] = []
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: object())
+    monkeypatch.setattr(qd, "run_checks",
+                        lambda _h, only=None: (seen.append(only),
+                                               [qd.Check("instructions", "-", "x", "ok")])[1])
+
+    qd.main(["--only", "semantic"])
+
+    assert seen == [{spec.name for spec in qd.CHECKS if spec.group == "semantic"}]

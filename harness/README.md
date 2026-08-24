@@ -1965,6 +1965,7 @@ qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
 qb-doctor --explain           # why each bad row matters, and the brief written for it
+qb-doctor --only semantic     # the model-backed rows — NOT run by a bare qb-doctor
 qb-doctor --announce          # put every FAILING row on the board (for a timer)
 ```
 
@@ -2230,6 +2231,78 @@ systemctl --user enable --now qb-doctor-landing.timer
   cannot be posted is still printed: the finding stands whether or not the board took it.
 - **Still advisory.** Nothing in the unit merges, evicts or re-orders anything. It says the
   line has stopped and names somebody to ask.
+
+#### The `semantic` group — the one question no predicate can decide (#408)
+
+**Python first, and Python wherever a predicate can decide it.** An LLM check that
+duplicates a predicate is strictly worse — slower, costlier, non-deterministic — so this
+group holds exactly one row, and it holds it because the question genuinely cannot be
+written as a predicate.
+
+`briefs` reads the **fenced code blocks** of the briefs this host would open, with a
+CommonMark scanner, and deliberately leaves prose alone: a paragraph explaining that
+stamping used to happen and no longer does is the removal working, and a `grep` cannot
+tell that paragraph from an instruction. `instructions` is handed those same documents
+**with the fences taken out** and asked the one thing the scanner cannot answer — does
+this prose still *direct* a worker to produce a release number? On the night of
+2026-08-23 five agents stamped a release and every one of them was following a document.
+The sentence that told them to need never have been inside a fence, and on the machine
+this was written on it was not:
+
+```
+instructions  …/quarterback-harness/commands  fix-and-land.md still tells an agent in
+                                              prose to stamp or reserve a release      FAIL
+    quote: **Once READY, before you push: the release entry, then its number.**
+```
+
+##### Its honest `unknown` lives in Python, not in the model's answer
+
+An LLM check that returns `ok` because it found nothing is the precise failure this whole
+tool exists to catch, and a model that has seen nothing will still answer confidently. So
+the abstention is enforced in three places, only one of which is prompt design:
+
+1. **The evidence gate**, before the call. `gather_evidence` builds the manifest and
+   refuses it whole: nothing readable, *one* file unreadable, or more bytes than the
+   ceiling allows, and the row is `unknown` **without the model having been asked**. This
+   is the `edge` row's shape — "nothing here can see whether the secret is set" is decided
+   by the code, not by the thing being asked. Reaching the byte ceiling is an `unknown`
+   and never a disclosed pass, which is the hole #417 closed in the GitHub-backed rows.
+2. **The call wrapper.** `ask_model` is the one place "could not be asked" is phrased: no
+   CLI, the switch off, a non-zero exit, a timeout, no JSON, a verdict outside the closed
+   vocabulary, the model's own `cannot tell`, the per-call dollar ceiling reached — and
+   two clauses no prompt can enforce. **An answer citing a file it was not given is
+   discarded**, because it is the model reasoning from its own memory of this repository
+   and the row cannot show a reader the evidence. **An answer quoting a line that is not
+   in the text is discarded**, because a composed quotation is not evidence. Both discards
+   are `unknown`, never `clean`.
+3. **The prompt**, which offers `cannot tell` and says it is never a polite way of
+   agreeing. Weakest of the three on its own, which is why it is third.
+
+`test_no_semantic_row_goes_green_on_a_host_that_cannot_ask` asserts this over the group
+rather than over a list of names, the same way the landing group's meta-test does.
+
+##### And it is bounded three ways
+
+- **Selection is the bound.** A bare `qb-doctor` does not run this group. It is a command
+  people type when something already feels wrong, and #55's argument is that unbounded
+  spend must not hang off that. `--only semantic` runs it; a timer that wants it asks for
+  it by name (`--only landing,semantic --announce --quiet`).
+- **Every call carries a ceiling the CLI enforces** (`--max-budget-usd`) and a timeout,
+  rather than an estimate this file makes — so it holds even if this file is wrong about
+  what a call costs. `QB_DOCTOR_LLM=0` turns the group off entirely, for a sandbox with no
+  network or a host whose owner does not want model calls made from it.
+- **The answer is cached on the digest of what was read.** A scheduled re-run over
+  unchanged documents costs nothing at all, and an edit to any one of them asks again.
+  That is how the expensive half stays affordable without being
+  opt-in-and-therefore-never-run.
+
+##### What it records
+
+`read` (the filenames), `bytes`, `digest`, `model`, whether the answer was `cached`, and
+on a finding the `file` and the **verbatim quote** — which is what makes a wrong verdict
+arguable rather than merely distrusted. The brief for this row says so in as many words:
+read the sentence in place first, and if it turns out to be a description rather than an
+instruction, the row is wrong and saying so is the result.
 
 ##### `queue` — the pair, and the clock
 

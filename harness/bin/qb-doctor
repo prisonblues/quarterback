@@ -328,8 +328,13 @@ def clip_line(text: str, width: int = 90) -> str:
 
 
 def run_cmd(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
-            timeout: int = CMD_TIMEOUT) -> tuple[int, str, str]:
+            timeout: int = CMD_TIMEOUT, stdin: str | None = None) -> tuple[int, str, str]:
     """One subprocess. Returns ``(rc, stdout, stderr)``; never raises.
+
+    ``stdin`` exists for the one caller that has to use it: a model CLI is handed a
+    prompt carrying every document it may read, and Linux caps a SINGLE argv entry
+    at 128 KiB — so the obvious positional form fails with `E2BIG` on a corpus of
+    any size, and fails as an OSError rather than as an answer.
 
     A missing binary comes back as ``(127, "", "<name>: not found")`` rather than
     an exception, because "this host has no systemctl" is an answer a check has
@@ -338,7 +343,7 @@ def run_cmd(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
     """
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
-                           timeout=timeout)
+                           timeout=timeout, input=stdin)
     except FileNotFoundError:
         return 127, "", f"{argv[0]}: not found"
     except subprocess.TimeoutExpired:
@@ -2623,6 +2628,388 @@ def _tag_report(rc: int, out: str) -> tuple[dict | None, str]:
 
 
 # --------------------------------------------------------------------------- #
+# the semantic group — the questions a predicate cannot decide (#408)
+# --------------------------------------------------------------------------- #
+#
+# THE RULE THIS GROUP EXISTS UNDER: Python first, and Python wherever a predicate
+# can decide it. An LLM check that duplicates a predicate is strictly worse —
+# slower, costlier, non-deterministic — so the only questions here are the ones
+# no predicate can answer. `briefs` reads FENCED BLOCKS, deterministically, and
+# deliberately lets prose alone, because prose explaining that a mechanism was
+# removed is the removal working. Whether a paragraph DIRECTS a worker or merely
+# DESCRIBES what used to happen is a question about meaning, and it is the exact
+# question that would have prevented the night of 2026-08-23, when five agents
+# stamped a release because a document told them to.
+#
+# AND THE RULE THAT KEEPS IT HONEST: an LLM check must be able to answer
+# `unknown`, and must do so by default when it cannot see enough. That is
+# enforced in THREE places in Python, only one of which is prompt design, because
+# a model that has seen nothing will still answer confidently:
+#
+#   1. :func:`gather_evidence` — the manifest, decided before the call. Nothing
+#      readable, one file unreadable, or more bytes than the ceiling allows, and
+#      the row is `unknown` WITHOUT the model having been asked. This is the
+#      `edge` row's shape: "nothing here can see whether the secret is set" is
+#      decided by the code, not by the thing being asked.
+#   2. :func:`ask_model` — the wrapper. No CLI, disabled, timed out, non-zero
+#      exit, no JSON, a verdict outside the closed vocabulary, or an answer citing
+#      a file it was not given or quoting a line that is not in the text. One
+#      place where "could not be asked" is phrased, so no row can reach a verdict
+#      without having been answered — the same shape `board_get` and
+#      `open_pull_requests` already have.
+#   3. The prompt, which offers `cannot tell` and says it is never a polite way of
+#      agreeing. Weakest of the three on its own, which is why it is third.
+#
+# AND IT IS BOUNDED, three ways. It does not run by default — `SCHEDULED` keeps
+# the group out of a bare `qb-doctor`, because this is a command people type when
+# something already feels wrong and unbounded spend attached to that is #55's
+# argument. Every call carries a dollar ceiling the CLI itself enforces and a
+# timeout. And the answer is CACHED ON THE DIGEST OF WHAT WAS READ, so a
+# scheduled re-run over unchanged documents costs nothing at all — which is how
+# the expensive half stays affordable without being opt-in-and-therefore-never-run.
+
+#: Which groups a bare `qb-doctor` leaves out. Selection IS the bound: `--only
+#: semantic` runs them, `--only landing,semantic` puts them on the timer beside the
+#: rows that already run there, and typing `qb-doctor` costs what it always did.
+SCHEDULED = ("semantic",)
+
+#: The CLI a semantic check asks. A subprocess to a vendor CLI rather than an SDK,
+#: because that is how everything else in this harness asks a model (`panel_seats`,
+#: `epic.triage`) and adding an SDK dependency to a diagnostic that must run on a
+#: host too stale to have `qb-bump` would be the wrong trade.
+LLM_CLI = "claude"
+
+#: Off switch, for the two places that need one: a sandbox with no network (this
+#: suite's own nix check runs there) and a host whose owner does not want model
+#: calls made from it. `0`, `off`, `no` and `false` all mean off.
+LLM_ENV = "QB_DOCTOR_LLM"
+
+#: Model and per-call ceiling. The ceiling is enforced by the CLI (`--max-budget-usd`)
+#: rather than by an estimate here, so it holds even if this file is wrong about what
+#: a call costs. It has to clear the fixed overhead of a session as well as the
+#: evidence, which is why it is not a few cents.
+LLM_MODEL = "sonnet"
+LLM_BUDGET_USD = "1.00"
+LLM_TIMEOUT = 240
+
+#: The evidence ceiling, in bytes. Reaching it is an `unknown` and NOT a disclosed
+#: pass — #417 closed exactly that hole in the GitHub-backed rows, where a truncated
+#: read said so in its detail and returned `ok` anyway. A corpus this could not read
+#: whole is a corpus it cannot clear.
+LLM_MAX_BYTES = 400_000
+
+#: Tools the model is refused. It is given every document it may look at and asked
+#: about those; anything it went and read on its own would be evidence this row
+#: cannot show a reader, and the answer validation would reject a quote from it.
+LLM_NO_TOOLS = ("Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Edit",
+                "Write", "Task", "NotebookEdit")
+
+#: Bumped whenever a question below changes. It is part of the cache key, so a
+#: reworded question does not read yesterday's answer to a different question.
+PROMPT_VERSION = "1"
+
+#: How long a cached answer stands. The evidence digest is already in the key, so
+#: this is not for correctness — it is so a wrong verdict ages out and the file
+#: does not grow without bound.
+LLM_CACHE_DAYS = 7
+LLM_CACHE_MAX = 200
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What a semantic check may read, decided in Python before anything is asked.
+
+    ``why`` is the whole point of the type: it is empty when the manifest is usable
+    and a sentence when it is not, and a caller that reaches the model with a
+    non-empty ``why`` is a bug. `files` is `(name, text)` so that an answer citing a
+    file can be checked against the text that was actually supplied, rather than
+    against whatever is on disk by the time somebody reads the report.
+    """
+
+    files: tuple[tuple[str, str], ...] = ()
+    digest: str = ""
+    why: str = ""
+
+    @property
+    def names(self) -> list[str]:
+        return [name for name, _text in self.files]
+
+    @property
+    def size(self) -> int:
+        return sum(len(text) for _name, text in self.files)
+
+
+def gather_evidence(paths: list[Path], transform=None) -> Evidence:
+    """The manifest, or why there is not one. Never partial, never truncated.
+
+    A file that cannot be read makes the whole manifest unusable rather than being
+    skipped, which is the correction #417 made to `check_briefs` for the same
+    reason: the walk that skips the unreadable file and passes on the rest is
+    reporting a clean corpus it never read.
+    """
+    if not paths:
+        return Evidence(why="there is nothing here to read")
+    out: list[tuple[str, str]] = []
+    for path in sorted(paths):
+        text = _read(path)
+        if text is None:
+            return Evidence(why=f"{path.name} could not be read, so the set this would "
+                                "have judged is not the set that is there")
+        out.append((path.name, transform(text) if transform else text))
+    size = sum(len(t) for _n, t in out)
+    if size > LLM_MAX_BYTES:
+        return Evidence(why=f"{len(out)} file(s) come to {size} bytes, over the "
+                            f"{LLM_MAX_BYTES}-byte ceiling — a corpus this could not read "
+                            "whole is one it cannot clear")
+    joined = "\0".join(f"{n}\0{t}" for n, t in out)
+    import hashlib  # noqa: PLC0415 — one caller, and only on the expensive path
+    return Evidence(files=tuple(out),
+                    digest=hashlib.sha256(joined.encode()).hexdigest()[:16])
+
+
+def llm_enabled() -> bool:
+    return os.environ.get(LLM_ENV, "1").strip().lower() not in ("0", "off", "no", "false")
+
+
+def _cache_path() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(root) / "quarterback" / "doctor-llm.json"
+
+
+def _cache_key(row: str, evidence: Evidence) -> str:
+    return f"{row}:{PROMPT_VERSION}:{LLM_MODEL}:{evidence.digest}"
+
+
+def cache_get(key: str) -> dict | None:
+    """Yesterday's answer to exactly this question about exactly these bytes.
+
+    Best-effort in both directions: an unreadable or corrupt cache is a cache miss,
+    never an error, because a diagnostic that fell over on its own scratch file
+    would be unavailable precisely when somebody needed it.
+    """
+    try:
+        held = json.loads(_cache_path().read_text())
+        entry = held[key]
+        age = datetime.now(UTC) - datetime.fromisoformat(entry["at"])
+    except Exception:                                         # noqa: BLE001 — a miss
+        return None
+    if age.days >= LLM_CACHE_DAYS:
+        return None
+    answer = entry.get("answer")
+    return answer if isinstance(answer, dict) else None
+
+
+def cache_put(key: str, answer: dict) -> None:
+    path = _cache_path()
+    try:
+        held = json.loads(path.read_text())
+        if not isinstance(held, dict):
+            held = {}
+    except Exception:                                         # noqa: BLE001 — start fresh
+        held = {}
+    held[key] = {"at": datetime.now(UTC).isoformat(), "answer": answer}
+    if len(held) > LLM_CACHE_MAX:
+        oldest = sorted(held.items(), key=lambda kv: str(kv[1].get("at")))
+        held = dict(oldest[-LLM_CACHE_MAX:])
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(held, indent=1, sort_keys=True))
+
+
+#: The three answers a semantic question may come back with. Closed, for the reason
+#: `VERDICTS` is closed: a fourth invented by the model has to become an `unknown`
+#: rather than something the caller pattern-matches its way past.
+_ANSWERS = ("clean", "telling", "cannot tell")
+
+
+def _prompt(question: str, evidence: Evidence) -> str:
+    parts = [question, "", f"THE {len(evidence.files)} DOCUMENT(S) YOU MAY JUDGE, and "
+             "nothing else exists for this question:"]
+    for name, text in evidence.files:
+        parts += ["", f"===== BEGIN {name} =====", text, f"===== END {name} ====="]
+    return "\n".join(parts)
+
+
+def ask_model(row: str, question: str, evidence: Evidence) -> tuple[dict | None, str]:
+    """``(answer, why-there-is-none)``. The one place "could not be asked" is phrased.
+
+    Everything that can go wrong between deciding to ask and having an answer comes
+    out of here as a sentence, so no check below can reach a verdict without having
+    been answered. That is the same contract `board_get` and `open_pull_requests`
+    hold for the GitHub-backed rows, and the group-wide meta-test asserts it the same
+    way.
+
+    The last two clauses are the ones that matter and the ones a prompt cannot
+    enforce. A `telling` verdict must name a file FROM THE MANIFEST and quote text
+    that is actually IN it — an answer that cites something it was not given is a
+    model reasoning about its own memory of this repository, and a quote that is not
+    in the text is one it composed. Both are discarded rather than believed, and
+    discarding them is an `unknown`, never a `clean`: the failure this whole tool
+    exists to catch is the absent signal rendering as the benign one.
+    """
+    if evidence.why:
+        return None, evidence.why
+    if not llm_enabled():
+        return None, f"model checks are switched off here ({LLM_ENV})"
+    if shutil.which(LLM_CLI) is None:
+        return None, f"no {LLM_CLI} on this host, so nothing here can ask the question"
+    key = _cache_key(row, evidence)
+    cached = cache_get(key)
+    if cached is not None:
+        return {**cached, "cached": True}, ""
+    argv = [LLM_CLI, "-p", "--model", LLM_MODEL, "--max-budget-usd", LLM_BUDGET_USD,
+            "--disallowed-tools", *LLM_NO_TOOLS]
+    rc, out, err = run_cmd(argv, timeout=LLM_TIMEOUT,
+                           stdin=_prompt(question, evidence))
+    if rc != 0:
+        return None, f"{LLM_CLI} exited {rc}: {clip_line(err or out) or 'and said nothing'}"
+    # The CLI reports a reached budget on stdout with exit 0, which `panel_seats`
+    # also has to special-case. An answer that was never generated is not an answer.
+    if "budget" in out.lower() and "exceed" in out.lower():
+        return None, f"the ${LLM_BUDGET_USD} ceiling for one call was reached: {clip_line(out)}"
+    match = re.search(r"\{.*\}", out, re.S)
+    if not match:
+        return None, f"{LLM_CLI} answered with no JSON object: {clip_line(out) or '(nothing)'}"
+    try:
+        answer = json.loads(match.group(0))
+    except ValueError:
+        return None, f"{LLM_CLI}'s answer did not parse: {clip_line(match.group(0))}"
+    if not isinstance(answer, dict) or answer.get("verdict") not in _ANSWERS:
+        return None, (f"{LLM_CLI} answered {answer.get('verdict')!r} if anything, which is "
+                      f"not one of {_ANSWERS}")
+    if answer["verdict"] == "cannot tell":
+        return None, f"the model could not tell: {clip_line(str(answer.get('reason', '')))}"
+    if answer["verdict"] == "telling":
+        named, quote = str(answer.get("file", "")), str(answer.get("quote", ""))
+        if named not in evidence.names:
+            return None, (f"the answer cited {named!r}, which was not among the documents "
+                          "it was given — so it is about something this cannot show you")
+        text = dict(evidence.files)[named]
+        if not quote.strip() or " ".join(quote.split()) not in " ".join(text.split()):
+            return None, (f"the answer quoted a line that is not in {named} — a composed "
+                          "quotation is not evidence, and this is an unknown rather than a "
+                          "finding")
+    cache_put(key, answer)
+    return {**answer, "cached": False}, ""
+
+
+def unfenced(text: str) -> str:
+    """A markdown document with every fenced code block removed — its PROSE.
+
+    The complement of :func:`fenced`, and the split that keeps this group from
+    duplicating a predicate: `briefs` reads what is inside the fences and this reads
+    what is outside them, so the two cannot disagree about the same line and the
+    model is never billed for text a `grep` already settled.
+    """
+    out: list[str] = []
+    opener: tuple[str, int] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        char = stripped[:1]
+        if char in ("`", "~"):
+            run = len(stripped) - len(stripped.lstrip(char))
+            rest = stripped[run:]
+            if opener is None:
+                if run >= 3 and (char != "`" or "`" not in rest):
+                    opener = (char, run)
+                    continue
+            elif char == opener[0] and run >= opener[1] and not rest:
+                opener = None
+                continue
+        if opener is None:
+            out.append(line)
+    return "\n".join(out)
+
+
+STAMPING_QUESTION = """You are auditing agent-facing instructions for one removed mechanism.
+
+BACKGROUND, which is settled fact and not something for you to weigh:
+Release version numbers in this project are assigned on the integration branch AFTER a
+merge, by a release tool a person runs. Issue #122 removed every branch-side way of doing
+it. A branch names no version, reserves no release number, edits no generated changelog,
+and cuts no release. A worker that stamps a version anyway produces a number that cannot
+be right, because a branch cannot know which release it will land in.
+
+YOUR QUESTION, and it is only this one:
+Does the prose below still DIRECT a worker to produce a release version number, to stamp
+or reserve one, or to cut a release from a branch?
+
+Two things constrain the answer.
+
+PROSE ONLY. The fenced code blocks have been removed before you were given this, because a
+separate deterministic check already reads those. Do not reason about what a command
+would do; reason about what the text tells a worker to do.
+
+INSTRUCTIONS, NOT DESCRIPTIONS. A passage explaining that stamping used to happen and no
+longer does is the removal working as intended, and it is CLEAN. A passage telling the
+worker to name a version, bump one, reserve one, or run a release is TELLING, wherever in
+the document it sits.
+
+ANSWER with one JSON object and nothing else, no prose around it:
+  {"verdict": "clean"}
+  {"verdict": "telling", "file": "<exact filename from the list below>",
+   "quote": "<the sentence, copied exactly from the text>"}
+  {"verdict": "cannot tell", "reason": "<one line>"}
+
+"cannot tell" is a real answer and it is the right one whenever you would otherwise be
+guessing. It is never a polite way of saying clean. If the text you were given is not
+enough to judge, say so.
+
+The quote is checked against the text below. An answer whose quote is not found there is
+discarded rather than believed, so copy it exactly and do not paraphrase."""
+
+
+def check_instructions(host: Host) -> Check:
+    """Do the briefs this host reads still TELL a worker to stamp a release, in prose?
+
+    The semantic sibling of `check_briefs`, and deliberately disjoint from it. That row
+    reads fenced blocks with a scanner and cannot look at prose, because prose is where
+    the removal is explained and a predicate cannot tell an explanation from an
+    instruction. This one is handed the prose with the fences taken out and asked exactly
+    that question, which is the one that would have prevented the night five agents
+    stamped: every one of them was following a document.
+
+    Everything that could make the answer unsafe is decided in Python — see
+    :func:`gather_evidence` and :func:`ask_model`. What is left for the model is a
+    judgement about meaning over text it can see, and its `clean` is only ever accepted
+    over a manifest that was read whole.
+    """
+    if not fragments_in_use(host):
+        return Check("instructions", str(host.repo),
+                     "this repo has no changelog.d/, so no brief here can tell an agent to "
+                     "stop doing something it never did", "ok")
+    harness = installed_harness(host)
+    briefs = commands_dir(harness)
+    if briefs is None:
+        return Check("instructions", str(harness),
+                     "this harness has no commands/ directory, so the prose an agent on "
+                     "this host reads could not be found", "unknown",
+                     manual="reinstall the harness (qb-bump), then re-run")
+    evidence = gather_evidence(sorted(briefs.glob("*.md")), transform=unfenced)
+    answer, why = ask_model("instructions", STAMPING_QUESTION, evidence)
+    seen = {"read": evidence.names, "bytes": evidence.size, "digest": evidence.digest,
+            "model": LLM_MODEL}
+    if answer is None:
+        return Check("instructions", str(briefs),
+                     f"nothing here could judge what the prose in these briefs tells an "
+                     f"agent to do: {why}", "unknown", extra=seen)
+    seen["cached"] = answer.get("cached", False)
+    if answer["verdict"] == "telling":
+        return Check("instructions", str(briefs),
+                     f"{answer['file']} still tells an agent in prose to stamp or reserve a "
+                     "release — #122 removed every branch-side way of doing it, and a brief "
+                     "is what an agent does", "fail",
+                     manual=f"read {briefs}/{answer['file']} and compare it against "
+                            f"{host.repo}/harness/commands/{answer['file']}",
+                     extra={**seen, "telling": answer["file"],
+                            "quote": answer.get("quote", "")})
+    return Check("instructions", str(briefs),
+                 f"the prose of all {len(evidence.names)} brief(s) this host reads was "
+                 "judged, and none of it directs an agent to stamp a release", "ok",
+                 extra=seen)
+
+
+# --------------------------------------------------------------------------- #
 # composing the brief — the half #408 is about
 # --------------------------------------------------------------------------- #
 
@@ -2782,6 +3169,7 @@ def _lay_out(spec: CheckSpec, check: Check, brief: Brief, task: str,
 GROUPS = {
     "host": "is this host wired up (#204)",
     "landing": "can work actually land (#406, #407)",
+    "semantic": "do the instructions still say the right thing (#408) — not run by default",
 }
 
 #: Every check, in the order the report prints them: the three version lines and
@@ -3262,6 +3650,69 @@ CHECKS = (
                 ),
                 needs=("unreadable",)),
         }),
+    CheckSpec(
+        "instructions", "semantic", check_instructions,
+        explanation=(
+            "The deterministic `briefs` row reads fenced code blocks, and it is right to: a "
+            "predicate can tell whether a document RUNS a removed command. What it cannot "
+            "tell is whether a paragraph DIRECTS a worker or merely describes what used to "
+            "happen — and prose explaining a removal is the removal working, so the row "
+            "deliberately leaves prose alone. That gap is where the instruction actually "
+            "lives. On the night of 2026-08-23 five agents stamped a release and every one "
+            "of them was following a document; the sentence that told them to need never "
+            "have been inside a fence. This is the only question in this tool that no "
+            "predicate can decide, which is the whole of why it is allowed to cost money."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("A brief this host reads still tells an agent, in prose, to produce a "
+                      "release version number — {telling}, and the sentence is quoted in "
+                      "`quote` below. Establish which of the two causes it is before "
+                      "changing anything, exactly as the `briefs` row's own brief says: "
+                      "compare {telling} against `{repo}/harness/commands/{telling}`. If "
+                      "the checkout's copy no longer says it, this host is reading a stale "
+                      "harness and the fix is the `harness` row's. If it does, rewrite the "
+                      "sentence — say that the number is assigned on the integration branch "
+                      "after the merge, by a person, and that a branch names no version."),
+                constraints=(
+                    "This verdict came from a model and the evidence is in `quote`. Read "
+                    "the sentence in place before you act on it: if the quote turns out to "
+                    "be a description of what used to happen rather than an instruction, "
+                    "the row is wrong and saying so is the result.",
+                    "Do not edit files inside the nix store. The subject is a build output.",
+                    "Do not delete the paragraph that explains the removal. Prose saying "
+                    "`a branch names no version` is the point of #122, not a leftover of "
+                    "it — this row is about text that still gives an ORDER.",
+                ),
+                verify=(
+                    "the sentence is gone from the checkout's copy, and "
+                    "`pytest {repo}/harness/tests/ -k no_brief_tells_an_agent_to_stamp` "
+                    "still passes",
+                ),
+                needs=("telling", "quote")),
+            "unknown": Brief(
+                audience="human",
+                task=("Nobody asked this question, or nobody could answer it, and the row "
+                      "says which — no model on this host, the switch off, the byte "
+                      "ceiling reached, a file unreadable, or an answer that cited "
+                      "something it was not shown. None of those is a fault in the briefs "
+                      "and none of them is work for an agent. What IS worth a decision is "
+                      "how long this has been unknown: a semantic check that never runs is "
+                      "the same as not having one, and the fault it looks for is the kind "
+                      "that goes unnoticed for months. Either give this host what it needs "
+                      "to ask — a model CLI, the switch on, a ceiling that fits the corpus "
+                      "— or say plainly that this question is not being asked here, so "
+                      "nobody reads a permanent `?` as a permanent all-clear."),
+                constraints=(
+                    "Do not relax the checks to obtain an answer. A `clean` over a corpus "
+                    "that was not read whole, or a finding whose quotation nothing could "
+                    "verify, is the exact failure this tool exists to catch — and it costs "
+                    "money to produce.",
+                    "The deterministic half still ran. `briefs` reads the same files' code "
+                    "blocks and its verdict stands on its own; this being unknown does not "
+                    "put that in doubt.",
+                )),
+        }),
 )
 
 
@@ -3287,6 +3738,12 @@ def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
     out: list[Check] = []
     for spec in CHECKS:
         if only is not None and spec.name not in only:
+            continue
+        # Selection IS the bound on the expensive group. A bare `qb-doctor` is a
+        # command people type when something already feels wrong, and attaching
+        # unbounded model spend to that is what #55 settled: `--only semantic`
+        # runs them, and a timer that wants them asks for them by name.
+        if only is None and spec.group in SCHEDULED:
             continue
         try:
             check = spec.fn(host)
@@ -3522,7 +3979,12 @@ ANNOUNCED = ("fail",)
 #: the LIST of pull requests that are ready and cannot land — which is precisely what
 #: makes that finding this finding. One name, two meanings, and dropping it by name
 #: would have silenced the second for the sake of the first.
-VOLATILE = ("queued", "open", "entries", "behind", "read")
+#: `bytes`, `digest` and `cached` join them from the semantic group, and for a
+#: reason worth stating: a digest is a "which", but it is the which of EVERY document
+#: read, so an unrelated edit to an unrelated brief would change it and re-announce a
+#: fault that has not changed. What makes a semantic finding this finding is the file
+#: and the sentence, which are `telling` and `quote`.
+VOLATILE = ("queued", "open", "entries", "behind", "read", "bytes", "digest", "cached")
 
 
 def _instance(check: Check) -> str:
