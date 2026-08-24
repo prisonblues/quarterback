@@ -53,6 +53,16 @@ precisely what every one of the four had going for it. So the hooks check reads
 `core.hooksPath` and the files under the common git dir; the reconcile check asks
 systemd; the edge check makes a live request.
 
+AND WHAT A ROW IS, since #408: a verdict, a written explanation of why it
+matters, and a brief an agent can be handed without a person writing one. The
+diagnosis half of this tool worked from the day it landed — it found four unwired
+mechanisms in one morning and a fifth within three hours of its own release — and
+every one of those findings then became a person reading a row, deciding what it
+meant, and hand-writing a brief. That step is the bottleneck and it is the one
+that cannot be scaled by adding agents. `CheckSpec` is where the explanation and
+the brief live; `Brief.needs` is why a row that could not be evaluated produces no
+brief instead of a confident one.
+
 AND THE RULE THAT DECIDES HOW THEY REPORT: a check that could not be made is NOT
 a check that passed. This repo has now settled that argument three times — #244
 (`prune-worktrees` called a skipped scan "Clean"), `qb-reconcile`'s
@@ -78,6 +88,7 @@ Usage:
     qb-doctor --only landing      a whole group of them (host | landing)
     qb-doctor --human-url URL     the browser vhost, for the edge check
     qb-doctor --quiet             print only the rows that are not ok
+    qb-doctor --explain           why each bad row matters, and its ready-made brief
 """
 
 from __future__ import annotations
@@ -85,6 +96,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -183,6 +195,20 @@ class Check:
     #: than passed at every construction site, so a check function cannot file itself
     #: under a group its registration disagrees with.
     group: str = "host"
+    #: Why this row matters, in prose — copied off the registration by `run_checks`,
+    #: for the same reason `group` is. Per-ROW and not per-verdict: the paragraph is
+    #: the same however the row came out, because it is about the mechanism rather
+    #: than about today's answer.
+    explanation: str = ""
+    #: The brief, rendered — or None, which is a real and common answer. Assigned by
+    #: `run_checks` from the registration's per-verdict `briefs`; see :func:`compose`.
+    prompt: str | None = None
+    #: Who the prompt above is for, in `AUDIENCES`. None when there is none.
+    prompt_for: str | None = None
+    #: Why there is no prompt, when there is none. Never empty in that case, because
+    #: a row that silently carries no brief is indistinguishable from one whose brief
+    #: could not be assembled, and those are opposite facts.
+    no_prompt: str = ""
 
     def __post_init__(self) -> None:
         assert self.verdict in VERDICTS, f"{self.verdict!r} is not one of {VERDICTS}"
@@ -190,7 +216,94 @@ class Check:
     def as_dict(self) -> dict:
         return {"name": self.name, "group": self.group, "subject": self.subject,
                 "detail": self.detail, "verdict": self.verdict, "manual": self.manual,
-                "fix": self.fix, **({"extra": self.extra} if self.extra else {})}
+                "fix": self.fix, "explanation": self.explanation, "prompt": self.prompt,
+                "prompt_for": self.prompt_for, "no_prompt": self.no_prompt or None,
+                **({"extra": self.extra} if self.extra else {})}
+
+
+#: Who a brief is written for. Two, and they do not merge: an `agent` brief is a
+#: piece of work with constraints and a finish line; a `human` brief is an
+#: escalation — a judgement, a password, a deploy, something nothing here may
+#: decide. #279's `needs_human` draws the same line one layer up.
+AUDIENCES = ("agent", "human")
+
+
+@dataclass(frozen=True)
+class Brief:
+    """What to hand somebody when a row comes out one particular way.
+
+    Written **at the same time as the check, by whoever understood the fault** —
+    #408 is explicit that a brief generated from the error message afterwards
+    restates the assertion, which is the one thing nobody needed written down. The
+    fields are the shape every good brief in this repo's history already had, named
+    so that a registration missing one is visibly missing it:
+
+    * ``task``        — what to do, in the imperative. Templated against the row's
+                        ``extra``, so the fixed half is the understanding and the
+                        variable half is what today's run actually found.
+    * ``constraints`` — what NOT to do, and what has already been settled. This is
+                        the half that stops an agent redesigning something on its
+                        own authority, and it is the half a generated prompt can
+                        never contain.
+    * ``verify``      — how to know it worked. Never "the command exited 0": #414
+                        is an entire issue about an installer's exit code being read
+                        as the guard being installed, and the answer there was to
+                        re-check. :func:`compose` therefore appends the re-check to
+                        every agent brief itself.
+    * ``needs``       — the ``extra`` keys the task is written around. An evidence
+                        gate, not documentation: a brief whose facts the row did not
+                        report is not rendered at all.
+
+    ``manual`` on the `Check` is NOT this, and the two must not merge. A `manual` is
+    one command line a person runs; a brief is a paragraph nobody executes. Collapse
+    them and you either put an unrunnable paragraph where the report prints a
+    command, or lose the command.
+    """
+
+    audience: str
+    task: str
+    constraints: tuple[str, ...] = ()
+    verify: tuple[str, ...] = ()
+    needs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        assert self.audience in AUDIENCES, f"{self.audience!r} is not one of {AUDIENCES}"
+        assert self.task.strip(), "a brief with no task is not a brief"
+
+
+@dataclass(frozen=True)
+class CheckSpec:
+    """One registration: the check, and everything about it that is not a verdict.
+
+    This used to be `(name, group, fn)`, and #408 is what stopped it being a tuple —
+    a six-tuple carrying prose is unreadable at the call site and unaddressable
+    everywhere else. The property the tuple had is kept: `--only` still validates a
+    name against this registry before anything runs.
+
+    ``explanation`` and ``briefs`` live HERE rather than on the `Check` for the
+    reason `group` does. The understanding is written once, beside the predicate,
+    by the person who had it; a check function that could compose its own brief
+    could compose one its registration disagrees with, and the docstring — where
+    this understanding lives today — is a place nothing can reach.
+
+    ``briefs`` is keyed by verdict, and a verdict that is not a key gets **no
+    brief**. That is the default and it is the safe one: most rows have nothing
+    useful to say about their own `ok`, and an `unknown` splits in two — "this host
+    cannot see it" is a person's job and "this repo is in a shape nothing here can
+    parse" is an agent's, and only the registration knows which.
+    """
+
+    name: str
+    group: str
+    fn: object
+    explanation: str
+    briefs: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        assert self.explanation.strip(), f"{self.name} has no explanation"
+        for verdict, brief in self.briefs.items():
+            assert verdict in VERDICTS, f"{self.name}: {verdict!r} is not a verdict"
+            assert isinstance(brief, Brief), f"{self.name}: {verdict} is not a Brief"
 
 
 #: How systemd says it could not be asked. Matched FIRST, before anything is read as
@@ -216,8 +329,13 @@ def clip_line(text: str, width: int = 90) -> str:
 
 
 def run_cmd(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
-            timeout: int = CMD_TIMEOUT) -> tuple[int, str, str]:
+            timeout: int = CMD_TIMEOUT, stdin: str | None = None) -> tuple[int, str, str]:
     """One subprocess. Returns ``(rc, stdout, stderr)``; never raises.
+
+    ``stdin`` exists for the one caller that has to use it: a model CLI is handed a
+    prompt carrying every document it may read, and Linux caps a SINGLE argv entry
+    at 128 KiB — so the obvious positional form fails with `E2BIG` on a corpus of
+    any size, and fails as an OSError rather than as an answer.
 
     A missing binary comes back as ``(127, "", "<name>: not found")`` rather than
     an exception, because "this host has no systemctl" is an answer a check has
@@ -226,7 +344,7 @@ def run_cmd(argv: list[str], *, cwd: str | None = None, env: dict | None = None,
     """
     try:
         p = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True,
-                           timeout=timeout)
+                           timeout=timeout, input=stdin)
     except FileNotFoundError:
         return 127, "", f"{argv[0]}: not found"
     except subprocess.TimeoutExpired:
@@ -2510,6 +2628,692 @@ def _tag_report(rc: int, out: str) -> tuple[dict | None, str]:
     return report, ""
 
 
+# --------------------------------------------------------------------------- #
+# the semantic group — the questions a predicate cannot decide (#408)
+# --------------------------------------------------------------------------- #
+#
+# THE RULE THIS GROUP EXISTS UNDER: Python first, and Python wherever a predicate
+# can decide it. An LLM check that duplicates a predicate is strictly worse —
+# slower, costlier, non-deterministic — so the only questions here are the ones
+# no predicate can answer. `briefs` reads FENCED BLOCKS, deterministically, and
+# deliberately lets prose alone, because prose explaining that a mechanism was
+# removed is the removal working. Whether a paragraph DIRECTS a worker or merely
+# DESCRIBES what used to happen is a question about meaning, and it is the exact
+# question that would have prevented the night of 2026-08-23, when five agents
+# stamped a release because a document told them to.
+#
+# AND THE RULE THAT KEEPS IT HONEST: an LLM check must be able to answer
+# `unknown`, and must do so by default when it cannot see enough. That is
+# enforced in THREE places in Python, only one of which is prompt design, because
+# a model that has seen nothing will still answer confidently:
+#
+#   1. :func:`gather_evidence` — the manifest, decided before the call. Nothing
+#      readable, one file unreadable, or more bytes than the ceiling allows, and
+#      the row is `unknown` WITHOUT the model having been asked. This is the
+#      `edge` row's shape: "nothing here can see whether the secret is set" is
+#      decided by the code, not by the thing being asked.
+#   2. :func:`ask_model` — the wrapper. No CLI, disabled, timed out, non-zero
+#      exit, no JSON, a verdict outside the closed vocabulary, or an answer citing
+#      a file it was not given or quoting a line that is not in the text. One
+#      place where "could not be asked" is phrased, so no row can reach a verdict
+#      without having been answered — the same shape `board_get` and
+#      `open_pull_requests` already have.
+#   3. The prompt, which offers `cannot tell` and says it is never a polite way of
+#      agreeing. Weakest of the three on its own, which is why it is third.
+#
+# AND IT IS BOUNDED, three ways. It does not run by default — `SCHEDULED` keeps
+# the group out of a bare `qb-doctor`, because this is a command people type when
+# something already feels wrong and unbounded spend attached to that is #55's
+# argument. Every call carries a dollar ceiling the CLI itself enforces and a
+# timeout. And the answer is CACHED ON THE DIGEST OF WHAT WAS READ, so a
+# scheduled re-run over unchanged documents costs nothing at all — which is how
+# the expensive half stays affordable without being opt-in-and-therefore-never-run.
+
+#: Which groups a bare `qb-doctor` leaves out. Selection IS the bound: `--only
+#: semantic` runs them, `--only landing,semantic` puts them on the timer beside the
+#: rows that already run there, and typing `qb-doctor` costs what it always did.
+SCHEDULED = ("semantic",)
+
+#: The CLI a semantic check asks. A subprocess to a vendor CLI rather than an SDK,
+#: because that is how everything else in this harness asks a model (`panel_seats`,
+#: `epic.triage`) and adding an SDK dependency to a diagnostic that must run on a
+#: host too stale to have `qb-bump` would be the wrong trade.
+LLM_CLI = "claude"
+
+#: Off switch, for the two places that need one: a sandbox with no network (this
+#: suite's own nix check runs there) and a host whose owner does not want model
+#: calls made from it. `0`, `off`, `no` and `false` all mean off.
+LLM_ENV = "QB_DOCTOR_LLM"
+
+#: Model and per-call ceiling. The ceiling is enforced by the CLI (`--max-budget-usd`)
+#: rather than by an estimate here, so it holds even if this file is wrong about what
+#: a call costs. It has to clear the fixed overhead of a session as well as the
+#: evidence, which is why it is not a few cents.
+LLM_MODEL = "sonnet"
+LLM_BUDGET_USD = "1.00"
+LLM_TIMEOUT = 240
+
+#: The most model calls one run of one row may make. The byte ceiling bounds how much
+#: is read; this bounds how often it is asked, and the two are separate because the
+#: answer to "one document at a time" is more calls over the same bytes.
+LLM_MAX_CALLS = 40
+
+#: The evidence ceiling, in bytes. Reaching it is an `unknown` and NOT a disclosed
+#: pass — #417 closed exactly that hole in the GitHub-backed rows, where a truncated
+#: read said so in its detail and returned `ok` anyway. A corpus this could not read
+#: whole is a corpus it cannot clear.
+LLM_MAX_BYTES = 400_000
+
+#: Tools the model is refused. It is given every document it may look at and asked
+#: about those; anything it went and read on its own would be evidence this row
+#: cannot show a reader, and the answer validation would reject a quote from it.
+LLM_NO_TOOLS = ("Bash", "Read", "Glob", "Grep", "WebFetch", "WebSearch", "Edit",
+                "Write", "Task", "NotebookEdit")
+
+#: The shortest a quotation may be and still be evidence. Codex found the hole: a
+#: `telling` answer citing `"a"` satisfies "the quote is in the file" for every file
+#: ever written, so the citation check would pass while establishing nothing. A
+#: sentence a worker could act on is longer than this; anything shorter is not the
+#: instruction it claims to have found.
+MIN_QUOTE = 24
+
+#: How long a cached answer stands. The evidence digest is already in the key, so
+#: this is not for correctness — it is so a wrong verdict ages out and the file
+#: does not grow without bound.
+LLM_CACHE_DAYS = 7
+LLM_CACHE_MAX = 200
+
+
+@dataclass(frozen=True)
+class Evidence:
+    """What a semantic check may read, decided in Python before anything is asked.
+
+    ``why`` is the whole point of the type: it is empty when the manifest is usable
+    and a sentence when it is not, and a caller that reaches the model with a
+    non-empty ``why`` is a bug. `files` is `(name, text)` so that an answer citing a
+    file can be checked against the text that was actually supplied, rather than
+    against whatever is on disk by the time somebody reads the report.
+    """
+
+    files: tuple[tuple[str, str], ...] = ()
+    digest: str = ""
+    why: str = ""
+
+    @property
+    def names(self) -> list[str]:
+        return [name for name, _text in self.files]
+
+    @property
+    def size(self) -> int:
+        return sum(len(text) for _name, text in self.files)
+
+    def each(self) -> "list[Evidence]":
+        """This manifest as one Evidence per document — the unit a question is asked in.
+
+        A model asked to find one sentence in thirteen documents at once answered `clean`
+        about a corpus that visibly contained it, on the second run, over the same bytes
+        it had answered `telling` about on the first. That is the failure #408 names in
+        as many words: an LLM check returning the benign answer because it found nothing.
+        A needle in one document is a question a model reliably answers; a needle in a
+        corpus is a question it plausibly declines to.
+
+        It costs no more to ask this way — the same bytes are read either way and only
+        the per-call overhead multiplies — and it buys two things beside reliability. A
+        finding is scoped to the document it is in, so the citation check is over the one
+        file it could have come from. And the cache is per document, so editing one brief
+        re-asks about one brief.
+        """
+        return [Evidence(files=(one,), digest=_digest((one,))) for one in self.files]
+
+
+def gather_evidence(paths: list[Path], transform=None) -> Evidence:
+    """The manifest, or why there is not one. Never partial, never truncated.
+
+    A file that cannot be read makes the whole manifest unusable rather than being
+    skipped, which is the correction #417 made to `check_briefs` for the same
+    reason: the walk that skips the unreadable file and passes on the rest is
+    reporting a clean corpus it never read.
+    """
+    if not paths:
+        return Evidence(why="there is nothing here to read")
+    out: list[tuple[str, str]] = []
+    for path in sorted(paths):
+        text = _read(path)
+        if text is None:
+            return Evidence(why=f"{path.name} could not be read, so the set this would "
+                                "have judged is not the set that is there")
+        out.append((path.name, transform(text) if transform else text))
+    size = sum(len(t) for _n, t in out)
+    if size > LLM_MAX_BYTES:
+        return Evidence(why=f"{len(out)} file(s) come to {size} bytes, over the "
+                            f"{LLM_MAX_BYTES}-byte ceiling — a corpus this could not read "
+                            "whole is one it cannot clear")
+    return Evidence(files=tuple(out), digest=_digest(tuple(out)))
+
+
+def _digest(files: tuple[tuple[str, str], ...]) -> str:
+    joined = "\0".join(f"{n}\0{t}" for n, t in files)
+    return hashlib.sha256(joined.encode()).hexdigest()[:16]
+
+
+def llm_enabled() -> bool:
+    return os.environ.get(LLM_ENV, "1").strip().lower() not in ("0", "off", "no", "false")
+
+
+def _cache_path() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(root) / "quarterback" / "doctor-llm.json"
+
+
+def _cache_key(row: str, question: str, evidence: Evidence, sample: int = 1) -> str:
+    """Row, question, model, and the bytes that were read — all four, none by discipline.
+
+    The question is hashed in rather than tracked by a version constant somebody has to
+    remember to bump: Codex pointed out that a reworded question would otherwise read
+    yesterday's answer to a different one, and a rule enforced by remembering is not one.
+    """
+    asked = hashlib.sha256(question.encode()).hexdigest()[:12]
+    return f"{row}:{asked}:{LLM_MODEL}:{evidence.digest}:{sample}"
+
+
+def cache_get(key: str) -> dict | None:
+    """Yesterday's answer to exactly this question about exactly these bytes.
+
+    Best-effort in both directions: an unreadable or corrupt cache is a cache miss,
+    never an error, because a diagnostic that fell over on its own scratch file
+    would be unavailable precisely when somebody needed it.
+    """
+    try:
+        held = json.loads(_cache_path().read_text())
+        entry = held[key]
+        age = datetime.now(UTC) - datetime.fromisoformat(entry["at"])
+    except Exception:                                         # noqa: BLE001 — a miss
+        return None
+    if age.days >= LLM_CACHE_DAYS:
+        return None
+    answer = entry.get("answer")
+    return answer if isinstance(answer, dict) else None
+
+
+def cache_put(key: str, answer: dict) -> None:
+    path = _cache_path()
+    try:
+        loaded = json.loads(path.read_text())
+    except Exception:                                         # noqa: BLE001 — start fresh
+        loaded = {}
+    # Entries that are not dicts are dropped ON LOAD rather than tripped over during
+    # eviction, which is where Codex found them raising: `kv[1].get("at")` on a corrupt
+    # file with more than LLM_CACHE_MAX entries is an AttributeError outside the guard.
+    held = {k: v for k, v in loaded.items() if isinstance(v, dict)} \
+        if isinstance(loaded, dict) else {}
+    held[key] = {"at": datetime.now(UTC).isoformat(), "answer": answer}
+    if len(held) > LLM_CACHE_MAX:
+        oldest = sorted(held.items(), key=lambda kv: str(kv[1].get("at")))
+        held = dict(oldest[-LLM_CACHE_MAX:])
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(held, indent=1, sort_keys=True))
+
+
+#: The three answers a semantic question may come back with. Closed, for the reason
+#: `VERDICTS` is closed: a fourth invented by the model has to become an `unknown`
+#: rather than something the caller pattern-matches its way past.
+_ANSWERS = ("clean", "telling", "cannot tell")
+
+
+def _prompt(question: str, evidence: Evidence) -> str:
+    parts = [question, "", f"THE {len(evidence.files)} DOCUMENT(S) YOU MAY JUDGE, and "
+             "nothing else exists for this question:"]
+    for name, text in evidence.files:
+        parts += ["", f"===== BEGIN {name} =====", text, f"===== END {name} ====="]
+    return "\n".join(parts)
+
+
+def ask_model(row: str, question: str, evidence: Evidence,
+              sample: int = 1) -> tuple[dict | None, str]:
+    """``(answer, why-there-is-none)``. The one place "could not be asked" is phrased.
+
+    Everything that can go wrong between deciding to ask and having an answer comes
+    out of here as a sentence, so no check below can reach a verdict without having
+    been answered. That is the same contract `board_get` and `open_pull_requests`
+    hold for the GitHub-backed rows, and the group-wide meta-test asserts it the same
+    way.
+
+    The last two clauses are the ones that matter and the ones a prompt cannot
+    enforce. A `telling` verdict must name a file FROM THE MANIFEST and quote text
+    that is actually IN it — an answer that cites something it was not given is a
+    model reasoning about its own memory of this repository, and a quote that is not
+    in the text is one it composed. Both are discarded rather than believed, and
+    discarding them is an `unknown`, never a `clean`: the failure this whole tool
+    exists to catch is the absent signal rendering as the benign one.
+    """
+    if evidence.why:
+        return None, evidence.why
+    if not llm_enabled():
+        return None, f"model checks are switched off here ({LLM_ENV})"
+    if shutil.which(LLM_CLI) is None:
+        return None, f"no {LLM_CLI} on this host, so nothing here can ask the question"
+    key = _cache_key(row, question, evidence, sample)
+    cached = cache_get(key)
+    if cached is not None:
+        answer, why = validated(cached, evidence)
+        if answer is None:
+            return None, f"a cached answer no longer stands up: {why}"
+        return {**answer, "cached": True}, ""
+    argv = [LLM_CLI, "-p", "--model", LLM_MODEL, "--max-budget-usd", LLM_BUDGET_USD,
+            "--disallowed-tools", *LLM_NO_TOOLS]
+    rc, out, err = run_cmd(argv, timeout=LLM_TIMEOUT,
+                           stdin=_prompt(question, evidence))
+    if rc != 0:
+        return None, f"{LLM_CLI} exited {rc}: {clip_line(err or out) or 'and said nothing'}"
+    # The CLI reports a reached budget on stdout with exit 0, which `panel_seats`
+    # also has to special-case. An answer that was never generated is not an answer.
+    if "budget" in out.lower() and "exceed" in out.lower():
+        return None, f"the ${LLM_BUDGET_USD} ceiling for one call was reached: {clip_line(out)}"
+    match = re.search(r"\{.*\}", out, re.S)
+    if not match:
+        return None, f"{LLM_CLI} answered with no JSON object: {clip_line(out) or '(nothing)'}"
+    try:
+        parsed = json.loads(match.group(0))
+    except ValueError:
+        return None, f"{LLM_CLI}'s answer did not parse: {clip_line(match.group(0))}"
+    answer, why = validated(parsed, evidence)
+    if answer is None:
+        return None, why
+    cache_put(key, answer)
+    return {**answer, "cached": False}, ""
+
+
+def validated(answer: object, evidence: Evidence) -> tuple[dict | None, str]:
+    """Everything an answer must satisfy — applied to a CACHED one as well as a fresh one.
+
+    Codex found the hole this closes, and it is the family this file exists to keep out:
+    a cached answer that skipped these checks reaches `check_instructions`, is not
+    `telling`, and falls through to the `ok` return. A hand-edited or corrupt cache file
+    would therefore have been a way to make a green row, which is the absent signal
+    rendering as the benign one arriving through the back door of an optimisation.
+
+    So validation is not part of parsing; it is a function of the answer and the evidence,
+    and both routes to an answer go through it.
+    """
+    if not isinstance(answer, dict) or answer.get("verdict") not in _ANSWERS:
+        got = answer.get("verdict") if isinstance(answer, dict) else answer
+        return None, (f"the answer's verdict was {got!r}, which is not one of {_ANSWERS}")
+    if answer["verdict"] == "cannot tell":
+        return None, f"the model could not tell: {clip_line(str(answer.get('reason', '')))}"
+    if answer["verdict"] == "telling":
+        named, quote = str(answer.get("file", "")), str(answer.get("quote", ""))
+        if named not in evidence.names:
+            return None, (f"the answer cited {named!r}, which was not among the documents "
+                          "it was given — so it is about something this cannot show you")
+        tidy = " ".join(quote.split())
+        if len(tidy) < MIN_QUOTE:
+            return None, (f"the answer quoted {tidy!r} from {named}, which is too short to "
+                          f"be the instruction it claims to have found ({MIN_QUOTE} "
+                          "characters is the floor) — a substring is not a citation")
+        if tidy not in " ".join(dict(evidence.files)[named].split()):
+            return None, (f"the answer quoted a line that is not in {named} — a composed "
+                          "quotation is not evidence, and this is an unknown rather than a "
+                          "finding")
+    return answer, ""
+
+
+def unfenced(text: str) -> str:
+    """A markdown document with every fenced code block removed — its PROSE.
+
+    The complement of :func:`fenced`, and the split that keeps this group from
+    duplicating a predicate: `briefs` reads what is inside the fences and this reads
+    what is outside them, so the two cannot disagree about the same line and the
+    model is never billed for text a `grep` already settled.
+    """
+    out: list[str] = []
+    opener: tuple[str, int] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        char = stripped[:1]
+        if char in ("`", "~"):
+            run = len(stripped) - len(stripped.lstrip(char))
+            rest = stripped[run:]
+            if opener is None:
+                if run >= 3 and (char != "`" or "`" not in rest):
+                    opener = (char, run)
+                    continue
+            elif char == opener[0] and run >= opener[1] and not rest:
+                opener = None
+                continue
+        if opener is None:
+            out.append(line)
+    return "\n".join(out)
+
+
+#: The question, and every word of it is load-bearing — this is the ONE piece of the
+#: honest-unknown that lives in the prompt rather than in Python, and it is third of
+#: three because it is the weakest.
+#:
+#: The clause that earns its place is "if you cannot tell whether a passage orders or
+#: describes, that is `cannot tell`". #408's requirement is that the check default to
+#: unknown when it cannot see enough, and the first cut read that as being about the
+#: amount of TEXT — so a passage the model found genuinely ambiguous came back `clean`,
+#: which is the benign default arriving by the only route left open to it. Not seeing
+#: enough and not being able to decide are the same failure to establish something, and
+#: they get the same answer.
+STAMPING_QUESTION = """You are auditing one agent-facing instruction document for one
+removed mechanism.
+
+BACKGROUND, which is settled fact and not something for you to weigh:
+Release version numbers in this project are assigned on the integration branch AFTER a
+merge, by a release tool a person runs. Issue #122 removed every branch-side way of doing
+it. A branch names no version, reserves no release number, assembles no release entry, and
+cuts no release. A worker that produces a version anyway produces a number that cannot be
+right, because a branch cannot know which release it will land in.
+
+YOUR QUESTION, and it is only this one:
+Does the prose below DIRECT a worker to make a release version number exist on a branch?
+
+That covers being told to name one, stamp one, bump one, reserve one, assemble a release
+entry, apply a version to one, or run a release step before the merge. It is the OUTCOME
+that matters, not the wording: a passage that tells the worker when to do it, or in what
+order, or what to do if it fails, is directing them to do it.
+
+Three things constrain the answer.
+
+PROSE ONLY. The fenced code blocks have been removed before you were given this, because a
+separate deterministic check already reads those and this one must not duplicate it. Do
+not reason about what a command would do. Reason about what the text tells a worker to do.
+
+INSTRUCTIONS, NOT DESCRIPTIONS. A passage explaining that this USED to happen and no
+longer does, or explaining why a branch names no version, is the removal working as
+intended, and it is CLEAN.
+
+AND IF YOU CANNOT TELL WHICH OF THOSE A PASSAGE IS, SAY SO. "cannot tell" is a real
+answer and it is the right one whenever you would otherwise be guessing — including when
+the text is there in front of you and you simply cannot decide whether it orders or
+describes. It is never a polite way of saying clean. Failing to see enough and failing to
+be able to decide are the same thing here and they get the same answer.
+
+ANSWER with one JSON object and nothing else, no prose around it:
+  {"verdict": "clean"}
+  {"verdict": "telling", "file": "<the exact filename below>",
+   "quote": "<the sentence, copied exactly from the text>"}
+  {"verdict": "cannot tell", "reason": "<one line>"}
+
+The quote is checked against the text below and must be at least 24 characters. An answer
+whose quote is not found there is discarded rather than believed, so copy it exactly and
+do not paraphrase."""
+
+
+def judge(one: Evidence) -> tuple[str, dict | str, int]:
+    """One document, judged — and `clean` has to be said twice.
+
+    THE ASYMMETRY IS THE POINT, and it is this repo's own rule about absence rather than
+    a hedge against a flaky model. A `telling` answer arrives carrying evidence: a
+    filename from the manifest and a sentence :func:`validated` has already found in the
+    text, so a reader can go and look, and one sample is enough to establish it. A `clean`
+    answer carries nothing at all. It is an assertion that something is not there, made by
+    a process that cannot show its work — the exact shape of claim this whole file exists
+    to distrust, and #408 names it: "an LLM check that returns `ok` because it found
+    nothing is the exact failure this tool exists to catch".
+
+    So a single `clean` is not an established absence, and this asks again — a second,
+    independent sample under its own cache key, because a cached first answer would
+    otherwise confirm itself. That is an argument from what the two answers ARE and not
+    from an observed flake: no run on the machine this was written on has yet disagreed
+    with itself, and the honest reason for the second reading is that a miss is the one
+    outcome this check must not produce, while a false finding is caught by a reader
+    following the quote. Paying twice on the path that claims nothing is there is the
+    cheap side of that trade.
+
+    It costs nothing on the path that finds something, and `readings` in the row's `extra`
+    says how many questions were actually asked.
+
+    Disagreement resolves toward the finding, which is the same order #417 settled for the
+    truncated reads: an answer that found nothing cannot make an answer that found
+    something stop having found it. Anything else — either sample unanswerable, the model
+    unable to tell — is `unknown`, never `clean`.
+
+    Returns the verdict, the answer or the reason there is none, and how many readings
+    it took.
+    """
+    first, why = ask_model("instructions", STAMPING_QUESTION, one, sample=1)
+    if first is None:
+        return "unknown", why, 1
+    if first["verdict"] == "telling":
+        return "telling", first, 1
+    second, why2 = ask_model("instructions", STAMPING_QUESTION, one, sample=2)
+    if second is None:
+        return "unknown", (f"one reading found nothing and the second could not be made, "
+                           f"so nothing was established: {why2}"), 2
+    if second["verdict"] == "telling":
+        return "telling", second, 2
+    return "clean", "", 2
+
+
+def check_instructions(host: Host) -> Check:
+    """Do the briefs this host reads still TELL a worker to stamp a release, in prose?
+
+    The semantic sibling of `check_briefs`, and deliberately disjoint from it. That row
+    reads fenced blocks with a scanner and cannot look at prose, because prose is where
+    the removal is explained and a predicate cannot tell an explanation from an
+    instruction. This one is handed the prose with the fences taken out and asked exactly
+    that question, which is the one that would have prevented the night five agents
+    stamped: every one of them was following a document.
+
+    ONE DOCUMENT PER CALL — see :meth:`Evidence.each` for why, and it is not an
+    optimisation. Everything else that could make the answer unsafe is decided in Python:
+    :func:`gather_evidence` refuses an incomplete manifest before anything is asked, and
+    :func:`ask_model` is the only place a verdict can come from.
+
+    THE READ-WHOLE RULE, applied across the calls rather than within one. A document that
+    could not be judged makes the row `unknown` even if the others came back clean —
+    "twelve of thirteen are fine" is not an answer to "do the briefs on this host tell an
+    agent to stamp". But a finding among the ones that WERE judged is still a finding, so
+    the fail branch comes first: an unanswerable thirteenth cannot make a telling third
+    stop telling.
+    """
+    if not fragments_in_use(host):
+        return Check("instructions", str(host.repo),
+                     "this repo has no changelog.d/, so no brief here can tell an agent to "
+                     "stop doing something it never did", "ok")
+    harness = installed_harness(host)
+    briefs = commands_dir(harness)
+    if briefs is None:
+        return Check("instructions", str(harness),
+                     "this harness has no commands/ directory, so the prose an agent on "
+                     "this host reads could not be found", "unknown",
+                     manual="reinstall the harness (qb-bump), then re-run")
+    evidence = gather_evidence(sorted(briefs.glob("*.md")), transform=unfenced)
+    seen = {"read": evidence.names, "bytes": evidence.size, "digest": evidence.digest,
+            "model": LLM_MODEL}
+    if evidence.why:
+        return Check("instructions", str(briefs),
+                     f"nothing here could judge what the prose in these briefs tells an "
+                     f"agent to do: {evidence.why}", "unknown", extra=seen)
+    # Two per document, because a `clean` has to be said twice — see :func:`judge`.
+    if len(evidence.files) * 2 > LLM_MAX_CALLS:
+        return Check("instructions", str(briefs),
+                     f"{len(evidence.files)} documents at up to two readings each is more "
+                     f"than the {LLM_MAX_CALLS} questions one run of this row may ask, so "
+                     "it was not asked at all", "unknown", extra=seen)
+    telling: dict[str, str] = {}
+    unanswered: list[str] = []
+    cached = readings = 0
+    for one in evidence.each():
+        name = one.names[0]
+        verdict, said, asked = judge(one)
+        readings += asked
+        if verdict == "unknown":
+            unanswered.append(f"{name} ({said})")
+            continue
+        if verdict == "telling":
+            telling[name] = str(said.get("quote", ""))
+        cached += 1 if isinstance(said, dict) and said.get("cached") else 0
+    seen |= {"asked": len(evidence.files), "readings": readings, "cached": cached}
+    if telling:
+        named = ", ".join(sorted(telling))
+        return Check("instructions", str(briefs),
+                     f"{named} still tell(s) an agent in prose to stamp or reserve a "
+                     "release — #122 removed every branch-side way of doing it, and a brief "
+                     "is what an agent does", "fail",
+                     manual=f"read {briefs}/{sorted(telling)[0]} and compare it against "
+                            f"{host.repo}/harness/commands/{sorted(telling)[0]}",
+                     extra={**seen, "telling": sorted(telling), "quote": telling,
+                            "unanswered": unanswered})
+    if unanswered:
+        return Check("instructions", str(briefs),
+                     f"{len(unanswered)} of {len(evidence.files)} brief(s) could not be "
+                     f"judged, so what the prose on this host tells an agent is not known: "
+                     f"{'; '.join(unanswered[:2])}", "unknown",
+                     extra={**seen, "unanswered": unanswered})
+    return Check("instructions", str(briefs),
+                 f"the prose of all {len(evidence.names)} brief(s) this host reads was "
+                 "judged, one at a time and twice each, and none of it directs an agent to "
+                 "stamp a release", "ok", extra=seen)
+
+
+# --------------------------------------------------------------------------- #
+# composing the brief — the half #408 is about
+# --------------------------------------------------------------------------- #
+
+#: Row facts a brief may name without declaring them in `needs`. They are on every
+#: `Check` by construction, so there is nothing for an evidence gate to gate.
+_ALWAYS = ("row", "group", "subject", "detail", "verdict", "repo")
+
+
+def _spell(value: object) -> str:
+    """One `extra` value, in a sentence rather than in Python's repr.
+
+    A brief is read by a person or pasted to an agent, and `['a.md', 'b.md']` in the
+    middle of an instruction is noise both of them have to parse back.
+    """
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(v) for v in sorted(value, key=str)) or "(none)"
+    if isinstance(value, dict):
+        return ", ".join(f"{k}={v}" for k, v in sorted(value.items())) or "(none)"
+    if value is None:
+        return "(none)"
+    return str(value)
+
+
+def _absent(check: Check, needs: tuple[str, ...]) -> list[str]:
+    """Which of a brief's required facts this row did not actually establish.
+
+    Absent and *empty* are both absent: `offenders: []` is the row saying it found
+    no offenders, and a brief written around which pull requests offend has nothing
+    to be written around. `0` is not empty — `waited_minutes: 0` is a measurement.
+    """
+    out = []
+    for key in needs:
+        if key not in check.extra:
+            out.append(key)
+            continue
+        value = check.extra[key]
+        if value is None or (hasattr(value, "__len__") and len(value) == 0):
+            out.append(key)
+    return out
+
+
+def _recheck(check: Check, host: Host) -> str:
+    """How to know it worked, for every agent brief: ask the row again.
+
+    Appended by this file rather than written into each registration, because it is
+    a command and not an understanding — the one mechanical part of a brief, and the
+    part #414 is an issue about. There, `qb-bump`'s own exit code was read as the
+    harness having been carried; the answer was that only a re-check can say so, and
+    `apply_fixes` already draws the same line for `--fix`.
+
+    Spelled as a path INTO THE CHECKOUT rather than as a bare `qb-doctor`, which is
+    #422: the staler a host, the likelier the remedy is missing from it, and the
+    checkout is present by definition — this tool is comparing against it.
+    """
+    return (f"python3 {host.repo}/harness/bin/qb-doctor --only {check.name} "
+            f"--repo {host.repo}   # the row itself, re-asked — not the exit code of "
+            "whatever you ran")
+
+
+def compose(spec: CheckSpec, check: Check, host: Host) -> tuple[str | None, str | None, str]:
+    """``(prompt, audience, why-there-is-none)`` for one row, as it came out today.
+
+    Three ways this returns no prompt, and the last is the one #408 turns on.
+
+    1. **No brief is registered for this verdict.** The default. An `ok` row has
+       nothing to dispatch, and plenty of rows have nothing useful to say about
+       their own `warn` either.
+    2. **A brief is registered and the row did not establish the facts it is written
+       around.** `queue`'s brief is "go and ask whoever holds the head of the line";
+       a `queue` row that could not read the queue has no head to name. Rendering it
+       anyway produces a confident instruction with a hole in it, which is precisely
+       the family #411 files: an unknown rendering as a known one, in the benign
+       direction, because the template had to emit *something*.
+    3. **The template names a fact nothing supplies.** A typo in a registration is a
+       missing brief, not a brief containing `{holder}`.
+
+    In all three the answer is a sentence saying so. A caller that got `None` and no
+    reason could not tell "nothing to dispatch here" from "the brief broke", and
+    those are opposite facts about the same row.
+    """
+    brief = spec.briefs.get(check.verdict)
+    if brief is None:
+        return None, None, (f"no brief is registered for a {check.verdict} on {spec.name} — "
+                            "which is the default, and for an `ok` row it is the answer")
+    missing = _absent(check, brief.needs)
+    if missing:
+        named = ", ".join(f"`{m}`" for m in missing)
+        return None, brief.audience, (
+            f"the brief for a {check.verdict} on {spec.name} is written around {named}, "
+            f"and this row reported {'none of them' if len(missing) > 1 else 'nothing there'} "
+            "— so there is no brief rather than one with a hole in it")
+    facts = {k: _spell(v) for k, v in check.extra.items()}
+    facts.update(row=check.name, group=check.group, subject=check.subject,
+                 detail=check.detail, verdict=check.verdict, repo=str(host.repo))
+    try:
+        task = brief.task.format(**facts)
+        constraints = [c.format(**facts) for c in brief.constraints]
+        verify = [v.format(**facts) for v in brief.verify]
+    except (KeyError, IndexError) as exc:                     # noqa: BLE001 — it IS the answer
+        return None, brief.audience, (
+            f"the brief for a {check.verdict} on {spec.name} names {exc}, which no fact on "
+            "this row supplies — a registration bug, and a missing brief is the honest "
+            "reading of it")
+    if brief.audience == "agent":
+        verify = [*verify, _recheck(check, host)]
+    return _lay_out(spec, check, brief, task, constraints, verify), brief.audience, ""
+
+
+def _lay_out(spec: CheckSpec, check: Check, brief: Brief, task: str,
+             constraints: list[str], verify: list[str]) -> str:
+    """The brief as text, in the order somebody reads it.
+
+    Prose is wrapped; the bullets are not, for the reason :func:`_wrap`'s docstring
+    gives — a constraint or a verification is usually a command or a path, and one a
+    reader cannot select in a single line is one they will retype wrong.
+    """
+    who = ("an agent — this is work" if brief.audience == "agent"
+           else "a person — this is an escalation, not a fix")
+    out = [f"qb-doctor / {spec.name} ({spec.group}) — {_GLYPHS[check.verdict]}",
+           f"for: {who}",
+           f"subject: {check.subject}",
+           "",
+           "WHAT THE ROW FOUND",
+           *(f"  {line}" for line in _wrap(check.detail, 84)),
+           "",
+           "WHY IT MATTERS",
+           *(f"  {line}" for line in _wrap(" ".join(spec.explanation.split()), 84)),
+           "",
+           "DO",
+           *(f"  {line}" for line in _wrap(task, 84))]
+    if constraints:
+        out += ["", "CONSTRAINTS", *(f"  - {c}" for c in constraints)]
+    if verify:
+        out += ["", "DONE WHEN", *(f"  - {v}" for v in verify)]
+    if check.manual:
+        out += ["", "WHAT THE REPORT PRINTS FOR A PERSON (not yours to run blind)",
+                f"  {check.manual}"]
+    if check.extra:
+        out += ["", "WHAT THIS RUN ESTABLISHED",
+                *(f"  {k}: {_spell(v)}" for k, v in sorted(check.extra.items()))]
+    return "\n".join(out)
+
+
 #: The questions this tool asks, as opposed to the rows that answer them. Two, and
 #: they are separate because a row's group decides what a reader does with a `FAIL`:
 #: a broken `host` row is fixed on this machine, and a broken `landing` row is fixed
@@ -2526,6 +3330,7 @@ def _tag_report(rc: int, out: str) -> tuple[dict | None, str]:
 GROUPS = {
     "host": "is this host wired up (#204)",
     "landing": "can work actually land (#406, #407)",
+    "semantic": "do the instructions still say the right thing (#408) — not run by default",
 }
 
 #: Every check, in the order the report prints them: the three version lines and
@@ -2533,23 +3338,543 @@ GROUPS = {
 #: rather than a registry decorator so `--only` can validate a name against it
 #: before anything runs.
 CHECKS = (
-    ("checkout", "host", check_checkout),
-    ("board", "host", check_board),
-    ("harness", "host", check_harness),
-    ("client", "host", check_client),
-    ("token", "host", check_token),
-    ("hooks", "host", check_hooks),
-    ("stash", "host", check_stash),
-    ("reconcile", "host", check_reconcile),
-    ("edge", "host", check_edge),
-    ("tools", "host", check_tools),
-    ("merges", "landing", check_merges),
-    ("queue", "landing", check_queue),
-    ("landed", "landing", check_landed),
-    ("tags", "landing", check_tags),
-    ("generated", "landing", check_generated),
-    ("stamper", "landing", check_stamper),
-    ("briefs", "landing", check_briefs),
+    CheckSpec(
+        "checkout", "host", check_checkout,
+        explanation=(
+            "Every row below that compares something against *this checkout* is only as "
+            "current as the checkout is. `git status` says a branch is up to date with "
+            "origin/main against whatever was last fetched, so on a box that has not "
+            "fetched for a week it is a sentence about the past — and the harness row "
+            "then measures a store path against a source tree that is behind it and "
+            "reports the difference the wrong way round. That is why this fetches before "
+            "it counts, and why a fetch that fails is an unknown rather than a pass."),
+        briefs={
+            "warn": Brief(
+                audience="agent",
+                task=("Bring {repo} up to date: it is {behind} commit(s) behind, and the "
+                      "rest of this report is measured against it. Fast-forward it, then "
+                      "re-run the whole doctor — rows that were computed against the old "
+                      "tree may say something different against the new one."),
+                constraints=(
+                    "Fast-forward only: `git -C {repo} pull --ff-only`. A merge commit "
+                    "nobody asked for is a worse outcome than a stale checkout.",
+                    "If this is a worktree on a feature branch, being behind the default "
+                    "branch is the ordinary state and not a fault — say so and stop, "
+                    "rather than rebasing somebody's branch under them.",
+                ),
+                needs=("behind",)),
+        }),
+    CheckSpec(
+        "board", "host", check_board,
+        explanation=(
+            "The board, the harness and the client are versioned independently and none "
+            "of them can see the other two, so skew surfaces as somebody else's error: "
+            "`qb-dash` reported `board unreachable` about a board that was up and six "
+            "days old. This row is one half of the comparison that nothing else in the "
+            "fleet makes. A served version BELOW the checkout's means the deployed image "
+            "predates code that is already merged, so a client built from this tree will "
+            "call routes that are not there yet."),
+        briefs={
+            "warn": Brief(
+                audience="agent",
+                task=("The board is serving {served} and this checkout declares {declared}, "
+                      "so the CHECKOUT is the stale one. Pull it and re-run — this is not a "
+                      "deploy problem."),
+                constraints=(
+                    "Fast-forward only: `git -C {repo} pull --ff-only`.",
+                ),
+                needs=("served", "declared")),
+        }),
+    CheckSpec(
+        "harness", "host", check_harness,
+        explanation=(
+            "The harness on PATH is a nix store path built from a pinned rev, and no "
+            "script inside it can tell you it is stale because each one knows only its "
+            "own path. When it falls behind, the fleet's briefs, hooks and tools are all "
+            "the OLD ones while the repository has moved — which is how three commands "
+            "came to be missing from this box entirely, and how agents on it were still "
+            "being told to stamp a release. It is the row most likely to explain a fault "
+            "somewhere else, and the row whose own remedy is likeliest to be missing "
+            "(#422): the staler the host, the older the repair tool it carries."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The harness on PATH ({subject}) is behind {repo}. Carry the "
+                      "checkout's harness onto this machine. Run the CHECKOUT's copy — "
+                      "`python3 {repo}/harness/bin/qb-bump --host $(hostname)` — never the "
+                      "bare name, because the thing that is stale is exactly the thing "
+                      "that would supply it (#422, and `missing` above may well include "
+                      "`qb-bump` itself). It prepares the consuming flake's input bump, "
+                      "builds this machine's system with it, and hands back the one "
+                      "command that needs a password."),
+                constraints=(
+                    "That last command needs a person. Print it, say what it will do, and "
+                    "stop there — do not attempt a privileged rebuild.",
+                    "If `qb-bump` refuses because two flake outputs declare this hostname, "
+                    "that refusal is correct behaviour (#414). Ask which host attribute is "
+                    "meant; do not guess between a bare-metal machine and a VM.",
+                    "Do not read `qb-bump`'s exit code as the harness having been carried. "
+                    "#414 is an entire issue about that: it once reported `nothing to "
+                    "carry` about a harness 74 commits behind, because it was run from the "
+                    "wrong directory.",
+                    "Files that merely `differ` may be packaging rewrites rather than "
+                    "drift — `_same_after_packaging` already excludes the known ones "
+                    "(#353), so anything still listed is real.",
+                ),
+                verify=(
+                    "the row is `ok`, or its `missing` list is empty and `differ` names "
+                    "only files you can account for",
+                ))
+        }),
+    CheckSpec(
+        "client", "host", check_client,
+        explanation=(
+            "`qb-mcp` execs `$QUARTERBACK_REPO/mcp/.venv/bin/python`, so the venv that "
+            "matters is the CONFIGURED checkout's and not whichever directory you happen "
+            "to be standing in. When it is broken every MCP tool in every session on this "
+            "box fails at once, and the message an agent sees is about the board rather "
+            "than about a venv — which is how #204's third symptom was chased for a day."),
+        briefs={}),
+    CheckSpec(
+        "token", "host", check_token,
+        explanation=(
+            "A token is what makes a post on the board attributable to a machine, and "
+            "every claim, lease and escalation this fleet coordinates through depends on "
+            "one resolving. A host with no token is not merely quiet — it is invisible to "
+            "the claim mechanism, so its agents duplicate work that somebody else has "
+            "already announced they are doing."),
+        briefs={
+            "fail": Brief(
+                audience="human",
+                task=("This machine cannot authenticate to {subject}, so nothing it does "
+                      "is attributable and nothing it claims is honoured. The token comes "
+                      "out of `~/.config/quarterback/config` or the environment, and "
+                      "issuing one is not something an agent may do for itself."),
+                constraints=(
+                    "Do not mint, copy or read a token from another machine's config to "
+                    "get past this. A token is the identity, and sharing one makes two "
+                    "machines indistinguishable on the board.",
+                )),
+        }),
+    CheckSpec(
+        "hooks", "host", check_hooks,
+        explanation=(
+            "The guards live in `harness/githooks/` in git, and `ls` on that directory "
+            "succeeds on a machine where not one of them is installed — which is exactly "
+            "what all four of 2026-08-22's unwired mechanisms had going for them. This "
+            "reads `core.hooksPath` and the files under the shared git dir instead. An "
+            "absent `reference-transaction` is how one agent popped another worktree's "
+            "stash; an absent `pre-push` is how a branch reaches origin carrying a "
+            "release number the base already has."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("Install the checkout's own hooks into this repository's shared git "
+                      "dir: `python3 {repo}/harness/bin/qb-hooks install`. It resolves its "
+                      "sources relative to itself, so the CHECKOUT's hooks land with no "
+                      "rebuild and no privileges — a repo can have current hooks and a "
+                      "stale harness at the same time (#419)."),
+                constraints=(
+                    "`qb-hooks` with no argument runs `status`, not `install`. `installed` "
+                    "in green reads exactly like a confirmation of the thing you meant to "
+                    "do, and #419 records three consecutive sessions lost to that.",
+                    "`installed` is also a narrower answer than the reader's question: it "
+                    "says a file is present, not that it is current. If a hook is refusing "
+                    "pushes with a diagnosis that does not match this repository, "
+                    "re-install from the checkout before believing it.",
+                ),
+                verify=(
+                    "a `git push --dry-run` on a branch you expect to be clean is not "
+                    "refused, and one you expect to be caught still is",
+                )),
+        }),
+    CheckSpec(
+        "stash", "host", check_stash,
+        explanation=(
+            "Every worktree of a repository shares one `refs/stash` — it lives in the "
+            "common git dir — so `stash@{{0}}` means whatever the last pusher meant, "
+            "across every worktree any skill has ever created. The guard refuses the "
+            "shared ref while linked worktrees exist; what it cannot do is drain the "
+            "entries pushed before it existed, and those are somebody's uncommitted work "
+            "sitting behind a name that no longer identifies it."),
+        briefs={
+            "warn": Brief(
+                audience="human",
+                task=("The guard is live, so nothing new can land in the shared stash. "
+                      "{entries} entr(y/ies) predate it and no installer can clear them: "
+                      "each one is uncommitted work from a worktree that may no longer "
+                      "exist, and only a person can decide whether it is still wanted."),
+                constraints=(
+                    "Do not drop or apply one to tidy the report. `git stash list` and "
+                    "`git stash show -p stash@{{N}}` are reads; anything else is a "
+                    "decision about somebody else's work.",
+                ),
+                needs=("entries",)),
+        }),
+    CheckSpec(
+        "reconcile", "host", check_reconcile,
+        explanation=(
+            "The board's plan is what a cold agent reads to find out what to do next, and "
+            "`qb-reconcile` is what keeps it honest by noticing that an item's issue has "
+            "closed. The timer existed in-repo and on no host, so the plan went 39% wrong "
+            "— 13 of 33 items pointing at closed issues — while every component involved "
+            "reported itself healthy. Nothing downstream can detect this: a stale plan "
+            "reads exactly like a plan."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The reconcile timer is not running on this host. The units are in "
+                      "`{repo}/harness/loops/systemd/`; install them for this user and "
+                      "enable the timer, then confirm it has actually fired rather than "
+                      "merely being enabled."),
+                constraints=(
+                    "User units, not system ones. This runs as the agent's own user and "
+                    "needs no privileges.",
+                    "`systemctl --user enable --now` exits 0 on a bus that will drop the "
+                    "unit at logout. If the box has no lingering session, say so — "
+                    "`loginctl enable-linger` is a person's call.",
+                ),
+                verify=(
+                    "`systemctl --user list-timers qb-reconcile.timer` shows a LAST that "
+                    "is not `n/a`",
+                )),
+        }),
+    CheckSpec(
+        "edge", "host", check_edge,
+        explanation=(
+            "`HUMAN_EDGE_SECRET` is what lets the browser vhost vouch for a person, and it "
+            "was documented in DEPLOY.md with a checklist and deployed nowhere — so every "
+            "human-only endpoint has 403'd since v2.39 while nothing anywhere said so. "
+            "The row is also this file's model for an honest unknown: behind forward-auth "
+            "with no session, `nothing here can see whether the secret is set` is a better "
+            "answer than a green tick, and the 401 the auth proxy returns is "
+            "indistinguishable by status code from the one the app returns."),
+        briefs={
+            "unknown": Brief(
+                audience="human",
+                task=("Nothing on this host can see the far side of the edge — the row above "
+                      "says which hop stopped it. That is a session and a deployment "
+                      "question rather than a code one. Either "
+                      "run this again with `QUARTERBACK_EDGE_COOKIE` set to a signed-in "
+                      "session, or work it from the runbook."),
+                constraints=(
+                    "Do not treat this as a fault in the board. An unknown here means the "
+                    "measurement could not be made — the secret may be perfectly fine.",
+                    "The remedy needs 1Password and a redeploy. Nothing automated should "
+                    "start half of it.",
+                )),
+            "fail": Brief(
+                audience="human",
+                task=("The board answered from behind the edge and human writes are "
+                      "refused. `HUMAN_EDGE_SECRET` has to be generated into "
+                      "1Password and sops and deployed on both sides — the runbook this "
+                      "row prints is the sequence."),
+                constraints=(
+                    "Two deploys, and a partial one leaves the edge and the app disagreeing "
+                    "about the same secret. A tool that started this and failed halfway "
+                    "would do it inside somebody's production deploy.",
+                )),
+        }),
+    CheckSpec(
+        "tools", "host", check_tools,
+        explanation=(
+            "Half the rows in this report are a subprocess, and a missing `gh` or an "
+            "unauthenticated one turns them into unknowns rather than answers. This row "
+            "exists so that a report full of unknowns has one line at the top saying why, "
+            "instead of leaving a reader to infer a cause from eight symptoms."),
+        briefs={}),
+    CheckSpec(
+        "merges", "landing", check_merges,
+        explanation=(
+            "If something reserves a release number at push time and the repository "
+            "squashes or rebases on merge, the commit the tag was reserved against stops "
+            "existing when the pull request lands — and the tag is then pointing at a "
+            "commit that is not in the history it claims to tag. That is #406, found as "
+            "`refs/tags/v3.8` sitting off main. The row asks what a tool IS rather than "
+            "running it, because running an unknown program to find out what it is would "
+            "be the hazard itself."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("This repository reserves a release number at push time ({reserves}) "
+                      "AND allows a merge method that rewrites the commit it was reserved "
+                      "against ({allows}). One of the two has to go. #122 removed "
+                      "branch-side stamping precisely so that nothing reserves before the "
+                      "merge; if a reservation site survives here, work out whether it is "
+                      "a leftover of that removal before you touch the repository's "
+                      "settings."),
+                constraints=(
+                    "Changing a repository's allowed merge methods affects everyone. "
+                    "Propose it; do not flip it as part of a fix.",
+                    "Removing the reservation site is the preferred half — a number "
+                    "assigned on `main` after the merge cannot be orphaned by a merge.",
+                ),
+                needs=("reserves", "allows")),
+        }),
+    CheckSpec(
+        "queue", "landing", check_queue,
+        explanation=(
+            "`queued > 0 && ready == 0` is the ordinary state of a queue that is working, "
+            "for as long as a landing takes. Past that it means the head of the line is "
+            "held by something that is no longer moving, and everything behind it waits "
+            "on a session that may have ended hours ago. On the night this row was written "
+            "for, seven green pull requests sat behind one for over three hours and every "
+            "other surface was green; a human noticed because a version number had not "
+            "changed."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The line into {subject} has stopped, and the head is held by "
+                      "`{head_holder}`. Ask them, on the board, whether they are still on "
+                      "it — `board_post(type='ask', to='{head_holder}', summary='queue head "
+                      "on {subject} has not moved in {waited_minutes}m — still on it?')` — "
+                      "and report what you learn. If nothing answers, the finding is that "
+                      "the holder is gone, which is a fact for a person and not a licence "
+                      "to act."),
+                constraints=(
+                    "The queue is ADVISORY and stays that way. Do not evict the head, do "
+                    "not re-order the line, do not merge anything to unblock it. #405 and "
+                    "#227 both settled this and the measurements held: the system was "
+                    "never wrong about who should land next, only about who was still "
+                    "there.",
+                    "A stalled queue is somebody to talk to. Talking to them is the work.",
+                ),
+                verify=(
+                    "the holder has answered, or you have said on the board that they did "
+                    "not — either is a result; a silent retry is not",
+                ),
+                needs=("head_holder", "waited_minutes")),
+        }),
+    CheckSpec(
+        "landed", "landing", check_landed,
+        explanation=(
+            "A pull request GitHub calls CLEAN can land, so if one has been CLEAN while "
+            "the tip of the integration branch has not moved for hours, something between "
+            "'ready' and 'landed' has stopped — a required check nobody is running, an "
+            "approval nobody is giving, an auto-merge that is off. This row is the one "
+            "that fails when the pipeline is broken rather than when a repository is "
+            "misconfigured, and it is deliberately about the branch's tip commit rather "
+            "than about anything GitHub's API calls 'last activity'."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("Ready and not landing means the obstacle is somewhere after "
+                      "mergeability, so find out which. For each of {ready}, read its check "
+                      "runs, its review state, whether auto-merge is enabled and whether a "
+                      "required check is queued and never starting. Report the reason; "
+                      "land it only if the reason turns out to be something you are "
+                      "entitled to fix."),
+                constraints=(
+                    "Do not merge a pull request to clear this row. The row is a symptom "
+                    "and merging it destroys the evidence without fixing the cause.",
+                    "Check the merge queue before touching anything — the head of the line "
+                    "may be a different pull request entirely, and jumping it is the "
+                    "behaviour #405 argued the queue exists to prevent.",
+                ),
+                needs=("ready",)),
+        }),
+    CheckSpec(
+        "tags", "landing", check_tags,
+        explanation=(
+            "A release tag is the durable claim that a version number means one specific "
+            "commit. When one points off the history it names, the claim is false for "
+            "everybody who ever fetches it — and it was found that way: `refs/tags/v3.8` "
+            "pointing at a commit that is not an ancestor of main, because the branch that "
+            "reserved it was squashed on merge (#406). The tagger is what answers here, "
+            "because telling an orphan from a live reservation needs the CHANGELOG read at "
+            "the ref with this repo's own rules."),
+        briefs={
+            "fail": Brief(
+                audience="human",
+                task=("Tags are pointing off the history they name: {orphaned}. A tag that "
+                      "has been fetched by anybody is a published fact, and moving or "
+                      "deleting one is a decision about what the fleet already believes — "
+                      "not something to be repaired quietly. What is wanted first is the "
+                      "diagnosis: which branch reserved each of these, whether it landed, "
+                      "and whether the merge rewrote its commit."),
+                constraints=(
+                    "Do not move, delete or force-push a tag. Read `merges` in the same "
+                    "report — if it is failing, the cause is still live and re-pointing "
+                    "the tag would only postpone the next one.",
+                ),
+                needs=("orphaned",)),
+        }),
+    CheckSpec(
+        "generated", "landing", check_generated,
+        explanation=(
+            "`CHANGELOG.md` is output: the release job writes it and nothing else does. "
+            "Every branch that shipped anything used to edit the same lines at the top of "
+            "it, so N branches in flight was N-choose-2 conflicts by construction, over "
+            "nothing — both entries were right and git cannot know that two insertions at "
+            "one offset are independent. On 2026-08-23 the three open pull requests that "
+            "had written a release entry were all CONFLICTING and the three that had not "
+            "were all MERGEABLE. `changelog.d/` exists to keep branches out of that file."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("Pull request(s) {offenders} edit a file the release job writes. "
+                      "Move each one's entry into a `changelog.d/` fragment instead — one "
+                      "file named `<issue>.<kind>.md`, naming no version — and revert its "
+                      "edit to the generated file. `{repo}/changelog.d/README.md` is the "
+                      "whole contract and it is four lines long."),
+                constraints=(
+                    "Name no version in the fragment, not even a placeholder. The number "
+                    "is derived on `main` after the merge, against the commit that "
+                    "actually exists.",
+                    "Do not edit `CHANGELOG.md` or the README's release list to fix this. "
+                    "They are output; the pre-push hook and a CI job both refuse a branch "
+                    "that touches them.",
+                    "These are other people's branches. Say what needs doing on each "
+                    "before you push to one.",
+                ),
+                verify=(
+                    "`python3 {repo}/scripts/changelog_fragments.py check` parses the new "
+                    "fragment, and the pull request is no longer CONFLICTING",
+                ),
+                needs=("offenders",)),
+        }),
+    CheckSpec(
+        "stamper", "landing", check_stamper,
+        explanation=(
+            "#122 removed branch-side release stamping: a branch names no version, because "
+            "the number belongs to the commit that lands on `main` and a branch cannot "
+            "know which that will be. An affordance that survives the removal is the "
+            "removal not having happened — anything reachable will eventually be reached, "
+            "and the first thing to reach it is an agent following a brief."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("Something in {repo} still lets a branch write a version number for "
+                      "itself. Remove the affordance rather than documenting "
+                      "around it. Check what still calls it first — a hook, a brief, a CI "
+                      "job — because a caller left pointing at a deleted entry point is "
+                      "#419, where a missing subcommand was reported as `another branch "
+                      "has already reserved your release number`."),
+                constraints=(
+                    "Releases are cut on `main` by `scripts/release.py run`, by a person. "
+                    "Nothing you do here should give a branch a second way to do it.",
+                    "If a caller has to keep working through the transition, make its "
+                    "failure say `this subcommand no longer exists`. An exit code read as "
+                    "a refusal is how a deleted command came to name a culprit that did "
+                    "not exist.",
+                )),
+        }),
+    CheckSpec(
+        "briefs", "landing", check_briefs,
+        explanation=(
+            "A brief is what an agent DOES. #122 removed branch-side release stamping from "
+            "the code, and on the night of 2026-08-23 five agents stamped anyway — every "
+            "one of them following a document that still told them to. A mechanism removed "
+            "from the code and left in the brief has not been removed. And the briefs on a "
+            "host are the ones the harness ON PATH ships, which is a different set from the "
+            "repository's the moment that harness falls behind: a test can pin what a repo "
+            "ships, and only something running on the machine can see what the machine "
+            "reads."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The briefs this host would open — in {subject} — still tell an agent "
+                      "to run a release command #122 removed: {telling}. There are exactly "
+                      "two causes and they have different owners, so establish which "
+                      "before changing anything. Compare each named file against "
+                      "`{repo}/harness/commands/`. If the checkout's copy is already clean, "
+                      "this host is reading a STALE HARNESS and the fix is to carry the "
+                      "current one over — see the `harness` row in the same report, and "
+                      "run the checkout's `qb-bump`, not the bare name. If the checkout's "
+                      "copy still carries the instruction, the brief itself is wrong: "
+                      "delete the command from the fenced block and say in prose what "
+                      "replaced it."),
+                constraints=(
+                    "Do not edit files inside the nix store. The store path in `subject` is "
+                    "a build output; editing it fixes nothing and survives nothing.",
+                    "Code blocks only. Prose that explains what used to happen and why it "
+                    "no longer does is the point of the change, not a leftover of it — the "
+                    "row reads fences for exactly that reason.",
+                    "A brief this row could not READ is a separate finding and appears as "
+                    "`unreadable`, not as a clean file.",
+                ),
+                verify=(
+                    "`pytest {repo}/harness/tests/ -k no_brief_tells_an_agent_to_stamp` "
+                    "still passes, which pins what the REPO ships",
+                ),
+                needs=("telling",)),
+            "unknown": Brief(
+                audience="agent",
+                task=("The briefs this host reads could not all be read: {unreadable}. Find "
+                      "out why those file(s) are unreadable — a broken symlink, a "
+                      "half-written store path, a permissions bit — and report it. Until "
+                      "then nothing can say what an agent on this box is being told to do."),
+                constraints=(
+                    "An unreadable brief is not a clean brief. Do not close this by "
+                    "skipping the file, which is the exact defect this branch of the row "
+                    "was added to prevent.",
+                ),
+                needs=("unreadable",)),
+        }),
+    CheckSpec(
+        "instructions", "semantic", check_instructions,
+        explanation=(
+            "The deterministic `briefs` row reads fenced code blocks, and it is right to: a "
+            "predicate can tell whether a document RUNS a removed command. What it cannot "
+            "tell is whether a paragraph DIRECTS a worker or merely describes what used to "
+            "happen — and prose explaining a removal is the removal working, so the row "
+            "deliberately leaves prose alone. That gap is where the instruction actually "
+            "lives. On the night of 2026-08-23 five agents stamped a release and every one "
+            "of them was following a document; the sentence that told them to need never "
+            "have been inside a fence. This is the only question in this tool that no "
+            "predicate can decide, which is the whole of why it is allowed to cost money."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("Brief(s) this host reads still tell an agent, in prose, to produce "
+                      "a release version number: {telling}. The sentence found in each is "
+                      "quoted under `quote` below. Establish which of the two causes it is "
+                      "before changing anything, exactly as the `briefs` row's own brief "
+                      "says: compare each named file against the checkout's copy in "
+                      "`{repo}/harness/commands/`. If the checkout's copy no longer says "
+                      "it, this host is reading a stale harness and the fix is the "
+                      "`harness` row's. If it does, rewrite the sentence — say that the "
+                      "number is assigned on the integration branch after the merge, by a "
+                      "person, and that a branch names no version."),
+                constraints=(
+                    "This verdict came from a model and the evidence is in `quote`. Read "
+                    "the sentence in place before you act on it: if the quote turns out to "
+                    "be a description of what used to happen rather than an instruction, "
+                    "the row is wrong and saying so is the result.",
+                    "Do not edit files inside the nix store. The subject is a build output.",
+                    "Do not delete the paragraph that explains the removal. Prose saying "
+                    "`a branch names no version` is the point of #122, not a leftover of "
+                    "it — this row is about text that still gives an ORDER.",
+                ),
+                verify=(
+                    "the sentence is gone from the checkout's copy, and "
+                    "`pytest {repo}/harness/tests/ -k no_brief_tells_an_agent_to_stamp` "
+                    "still passes",
+                ),
+                needs=("telling", "quote")),
+            "unknown": Brief(
+                audience="human",
+                task=("Nobody asked this question, or nobody could answer it, and the row "
+                      "says which — no model on this host, the switch off, the byte "
+                      "ceiling reached, a file unreadable, or an answer that cited "
+                      "something it was not shown. None of those is a fault in the briefs "
+                      "and none of them is work for an agent. What IS worth a decision is "
+                      "how long this has been unknown: a semantic check that never runs is "
+                      "the same as not having one, and the fault it looks for is the kind "
+                      "that goes unnoticed for months. Either give this host what it needs "
+                      "to ask — a model CLI, the switch on, a ceiling that fits the corpus "
+                      "— or say plainly that this question is not being asked here, so "
+                      "nobody reads a permanent `?` as a permanent all-clear."),
+                constraints=(
+                    "Do not relax the checks to obtain an answer. A `clean` over a corpus "
+                    "that was not read whole, or a finding whose quotation nothing could "
+                    "verify, is the exact failure this tool exists to catch — and it costs "
+                    "money to produce.",
+                    "The deterministic half still ran. `briefs` reads the same files' code "
+                    "blocks and its verdict stands on its own; this being unknown does not "
+                    "put that in doubt.",
+                )),
+        }),
 )
 
 
@@ -2559,9 +3884,9 @@ def selectable() -> dict[str, set[str]]:
     A group expands to its rows, so `--only landing` is `--only merges` today and
     stays correct as #407 adds to it — which is the point of naming the group at all.
     """
-    names = {name: {name} for name, _g, _fn in CHECKS}
+    names = {spec.name: {spec.name} for spec in CHECKS}
     for group in GROUPS:
-        names[group] = {name for name, g, _fn in CHECKS if g == group}
+        names[group] = {spec.name for spec in CHECKS if spec.group == group}
     return names
 
 
@@ -2573,15 +3898,27 @@ def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
     is already odd, so "one row could not be computed" has to be a row.
     """
     out: list[Check] = []
-    for name, group, fn in CHECKS:
-        if only is not None and name not in only:
+    for spec in CHECKS:
+        if only is not None and spec.name not in only:
+            continue
+        # Selection IS the bound on the expensive group. A bare `qb-doctor` is a
+        # command people type when something already feels wrong, and attaching
+        # unbounded model spend to that is what #55 settled: `--only semantic`
+        # runs them, and a timer that wants them asks for them by name.
+        if only is None and spec.group in SCHEDULED:
             continue
         try:
-            check = fn(host)
+            check = spec.fn(host)
         except Exception as exc:                              # noqa: BLE001 — it IS the report
-            check = Check(name, "-", f"the check itself raised {type(exc).__name__}: {exc}",
-                          "unknown")
-        check.group = group
+            check = Check(spec.name, "-",
+                          f"the check itself raised {type(exc).__name__}: {exc}", "unknown")
+        check.group = spec.group
+        check.explanation = spec.explanation
+        # The brief is composed HERE, from the registration, for the same reason the
+        # group is assigned here: a check function that could write its own brief
+        # could write one its registration disagrees with. `compose` is also the only
+        # place that may decide there is none, and it always says why.
+        check.prompt, check.prompt_for, check.no_prompt = compose(spec, check, host)
         out.append(check)
     return out
 
@@ -2656,7 +3993,8 @@ def _wrap(text: str, width: int) -> list[str]:
                          break_long_words=False) or [""]
 
 
-def render(checks: list[Check], colour: bool, quiet: bool = False) -> str:
+def render(checks: list[Check], colour: bool, quiet: bool = False,
+           explain: bool = False) -> str:
     """The report: one row per check, verdict last, remedy underneath.
 
     Verdict last rather than first because that is the shape #204 asked for, and
@@ -2689,8 +4027,51 @@ def render(checks: list[Check], colour: bool, quiet: bool = False) -> str:
         # own soft wrap runs past the margin and still yields one line on select.
         if c.manual:
             lines.append(f"{'':<{lead}}-> {c.manual}")
+        if explain and c.verdict != "ok":
+            lines += ["", *_explained(c), ""]
     lines += ["", summary(checks)]
-    return "\n".join(lines)
+    if not explain:
+        lines += [_dispatchable(checks)]
+    return "\n".join(x for x in lines if x is not None)
+
+
+def _explained(check: Check) -> list[str]:
+    """One row's explanation and brief, indented under it, for `--explain`.
+
+    Off by default and that is not timidity: a brief is twenty lines and the report
+    is seventeen rows, so printing them always would bury the one word a reader came
+    for. The footer says how many there are.
+    """
+    out = [f"  {line}" for line in _wrap(" ".join(check.explanation.split()), 86)]
+    if check.prompt:
+        who = "an agent" if check.prompt_for == "agent" else "a person"
+        out += ["", f"  --- brief for {who} " + "-" * 40]
+        out += [f"  {line}" if line else "" for line in check.prompt.splitlines()]
+    else:
+        out += ["", *(f"  (no brief: {line})" for line in _wrap(check.no_prompt, 80))]
+    return out
+
+
+def _dispatchable(checks: list[Check]) -> str | None:
+    """The footer that says a brief exists, without printing seventeen of them.
+
+    It also names the rows that have none, because "this fault has no brief written
+    for it" is a fact about the tool that a reader should be able to see — a report
+    that mentioned only the rows it could brief would read as though the rest were
+    fine.
+    """
+    interesting = [c for c in checks if c.verdict != "ok"]
+    if not interesting:
+        return None
+    briefed = [c for c in interesting if c.prompt]
+    bare = [c.name for c in interesting if not c.prompt]
+    if not briefed:
+        return (f"no brief for {', '.join(bare)} — qb-doctor --explain says why, per row")
+    line = (f"{len(briefed)} row(s) carry a brief ready to hand over "
+            f"({', '.join(c.name for c in briefed)}) — qb-doctor --explain, or --json")
+    if bare:
+        line += f"; nothing written for {', '.join(bare)}"
+    return line
 
 
 def summary(checks: list[Check]) -> str:
@@ -2760,7 +4141,13 @@ ANNOUNCED = ("fail",)
 #: the LIST of pull requests that are ready and cannot land — which is precisely what
 #: makes that finding this finding. One name, two meanings, and dropping it by name
 #: would have silenced the second for the sake of the first.
-VOLATILE = ("queued", "open", "entries", "behind", "read")
+#: `bytes`, `digest` and `cached` join them from the semantic group, and for a
+#: reason worth stating: a digest is a "which", but it is the which of EVERY document
+#: read, so an unrelated edit to an unrelated brief would change it and re-announce a
+#: fault that has not changed. What makes a semantic finding this finding is the file
+#: and the sentence, which are `telling` and `quote`.
+VOLATILE = ("queued", "open", "entries", "behind", "read", "bytes", "digest", "cached",
+            "asked", "readings")
 
 
 def _instance(check: Check) -> str:
@@ -2797,10 +4184,23 @@ def _escalation(check: Check, slug: str, base_url: str) -> tuple[str, str]:
              f"subject: {check.subject}",
              f"verdict: {check.verdict}",
              "", check.detail]
+    if check.explanation:
+        lines += ["", "why it matters:", check.explanation]
     if check.manual:
         lines += ["", f"needs a person: {check.manual}"]
     if check.fix:
         lines += ["", f"or run: qb-doctor --fix --only {check.name}"]
+    # The brief travels through the SAME door as the finding, rather than beside it.
+    # #408 is explicit that the doctor must not dispatch — so what goes on the board
+    # is a post somebody reads and decides about, and `--announce` (#405) is the seam
+    # that already exists for exactly that. A prompt on a second channel would be a
+    # dispatch mechanism wearing an escalation's clothes.
+    if check.prompt:
+        who = "an agent" if check.prompt_for == "agent" else "a person"
+        lines += ["", f"a brief is ready for {who} — nothing has run it, and nothing "
+                      "here will:", "", check.prompt]
+    elif check.no_prompt:
+        lines += ["", f"no brief: {check.no_prompt}"]
     if check.extra:
         lines += ["", json.dumps(check.extra, indent=2, sort_keys=True)]
     if base_url:
@@ -2896,12 +4296,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="the whole report as JSON")
     parser.add_argument("--only", metavar="NAMES",
                         help="comma-separated check names ("
-                             + ",".join(n for n, _g, _fn in CHECKS)
+                             + ",".join(spec.name for spec in CHECKS)
                              + ") or group names (" + ",".join(GROUPS) + ")")
     parser.add_argument("--human-url", metavar="URL", dest="human_url",
                         help="the browser vhost, for the edge check (else QUARTERBACK_HUMAN_URL)")
     parser.add_argument("--quiet", action="store_true",
                         help="print only the rows that are not ok")
+    parser.add_argument("--explain", action="store_true",
+                        help="under every row that is not ok, print why it matters and "
+                             "the brief written for it — or say why there is none (#408)")
     parser.add_argument("--announce", action="store_true",
                         help="put every FAILING row on the board through the "
                              "needs-human door, so a timer can run this unattended "
@@ -2930,7 +4333,7 @@ def main(argv: list[str] | None = None) -> int:
                           "exit_code": exit_code(checks)}, indent=2))
     else:
         colour = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-        print(render(checks, colour, quiet=args.quiet))
+        print(render(checks, colour, quiet=args.quiet, explain=args.explain))
         manual = [c for c in checks if c.verdict not in HEALTHY and c.manual and not c.fix]
         if manual:
             print("\nNeeds a person — nothing above ran these:")

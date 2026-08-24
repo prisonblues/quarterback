@@ -1964,6 +1964,8 @@ qb-doctor --only hooks,edge   # just those rows
 qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
+qb-doctor --explain           # why each bad row matters, and the brief written for it
+qb-doctor --only semantic     # the model-backed rows — NOT run by a bare qb-doctor
 qb-doctor --announce          # put every FAILING row on the board (for a timer)
 ```
 
@@ -2042,6 +2044,111 @@ can run a command the author did not mark runnable:
   generated into 1Password *and* sops and two separate deploys; a tool that tried would
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
+
+#### A row is a verdict, an explanation, and a brief (#408)
+
+A row used to be a verdict and a one-line remedy, and every finding therefore became a
+person reading it, working out what it meant, and hand-writing a brief for whoever would
+fix it. Four findings in two days had exactly that shape — #414, #419, #422, #411 — and
+the hand-written brief was the same length each time. Diagnosis scales by adding checks;
+that step scales by adding people, which is the one thing that cannot be done.
+
+So a registration carries three things beside the predicate:
+
+```python
+CheckSpec(
+    "briefs", "landing", check_briefs,
+    explanation=("A brief is what an agent DOES. #122 removed branch-side release "
+                 "stamping from the code, and five agents stamped anyway — every one "
+                 "of them following a document that still told them to. …"),
+    briefs={
+        "fail": Brief(
+            audience="agent",
+            task="…establish which of the two causes this is before changing anything…",
+            constraints=("Do not edit files inside the nix store. …",),
+            verify=("`pytest -k no_brief_tells_an_agent_to_stamp` still passes…",),
+            needs=("telling",)),
+    })
+```
+
+| field | what it is for |
+|---|---|
+| `explanation` | **why the row matters**, in prose. Per-*row*, not per-verdict — the same paragraph however the row came out, because it is about the mechanism rather than today's answer. |
+| `briefs` | a `Brief` **per verdict**. A verdict that is not a key gets no brief, which is the default and the safe one. |
+| `Brief.audience` | `agent` (this is work) or `human` (this is an escalation). They do not merge. |
+| `Brief.task` | what to do, templated against the row's `extra` — the fixed half is the understanding, the variable half is what this run found. |
+| `Brief.constraints` | what **not** to do, and what has already been settled. The half a generated prompt can never contain. |
+| `Brief.verify` | how to know it worked. |
+| `Brief.needs` | the `extra` keys the task is written around — an evidence gate, not documentation. |
+
+**They are written by hand, at the same time as the check.** #408 is explicit that a
+prompt generated from the error message afterwards restates the assertion, which is the
+one thing nobody needed written down. The moment the understanding exists is the moment
+the predicate is written, and until now the only place to put it was a docstring, which
+nothing can reach.
+
+##### `extra` is the documented variable half
+
+Every row already populated `extra` with the facts a brief needs — `head_holder`,
+`head_pr`, `waited_minutes`, `offenders`, `conflicting`, `orphaned`, `telling`,
+`unreadable`, `differ`, `missing`. `needs` is what turns that from a debugging aside into
+a contract: **a brief whose facts the row did not establish is not rendered at all.**
+
+That is the whole of it, and it is the difference between this being useful and being a
+confident-guess generator. `queue`'s brief says *go and ask whoever holds the head of the
+line*; a `queue` row that could not read the queue has no head to name. Rendering it
+anyway produces a specific, plausible, entirely fabricated instruction — which is #419's
+family (an error rendering as a different and confident diagnosis) arriving at the
+dispatch layer. **Absent and empty are both absent**: `offenders: []` is the row saying it
+found none. A run that reaches this state gets no prompt and a sentence saying which fact
+was missing, because `None` with no reason cannot be told apart from "nothing to dispatch
+here", and those are opposite facts.
+
+##### `manual` and a brief are different things
+
+`manual` is one command line for a person and is never executed. A brief is a paragraph
+nobody executes. Collapsing them either puts an unrunnable paragraph where the report
+prints a command, or loses the command. `briefs`'s manual is `qb-bump --host $(hostname)`;
+its brief is three paragraphs about which of two causes this is. Both exist on the row,
+and the brief quotes the manual under a heading that says it is not the agent's to run
+blind.
+
+##### `unknown` splits in two
+
+"This host cannot see it" — no token, no `gh`, forward-auth with no session — is a
+person's or an installer's job, so its brief is an escalation (#279's `needs_human`).
+"This repo is in a shape nothing here can parse" is agent work. Only the registration
+knows which, so it is a per-verdict field on it and it defaults to neither.
+
+##### Every agent brief ends by re-asking its own row
+
+Appended by the tool rather than written into each registration, because it is a command
+and not an understanding:
+
+```
+python3 <checkout>/harness/bin/qb-doctor --only briefs --repo <checkout>
+```
+
+#414 is an entire issue about an installer's exit code being read as the guard having
+been installed — `qb-bump` once reported `nothing to carry` about a harness 74 commits
+behind — and `apply_fixes` already draws the same line for `--fix`. It is spelled as a
+path **into the checkout** rather than as a bare `qb-doctor` because of #422: the staler
+a host, the likelier the remedy is missing from it, and the checkout is present by
+definition.
+
+##### The doctor produces the brief and never runs it
+
+Finding a fault and starting an agent to fix it, ungated, is the same self-approval shape
+#85, #86, #78 and #335 have each settled. So the brief travels out through the door the
+finding already uses — `--announce`, into #274's needs-human post — and not on a channel
+of its own, which would be a dispatch mechanism wearing an escalation's clothes.
+`test_the_doctor_produces_the_prompt_and_never_runs_it` asserts that no subprocess this
+tool spawns carries one.
+
+The report does not print briefs by default either: seventeen rows and twenty lines each
+would bury the one word a reader came for. The footer says how many are ready and **which
+rows have none**, because "no brief is written for this fault" is a fact about the tool
+that a reader should be able to see.
 
 #### The `landing` group — can work actually get out of here? (#407)
 
@@ -2124,6 +2231,100 @@ systemctl --user enable --now qb-doctor-landing.timer
   cannot be posted is still printed: the finding stands whether or not the board took it.
 - **Still advisory.** Nothing in the unit merges, evicts or re-orders anything. It says the
   line has stopped and names somebody to ask.
+
+#### The `semantic` group — the one question no predicate can decide (#408)
+
+**Python first, and Python wherever a predicate can decide it.** An LLM check that
+duplicates a predicate is strictly worse — slower, costlier, non-deterministic — so this
+group holds exactly one row, and it holds it because the question genuinely cannot be
+written as a predicate.
+
+`briefs` reads the **fenced code blocks** of the briefs this host would open, with a
+CommonMark scanner, and deliberately leaves prose alone: a paragraph explaining that
+stamping used to happen and no longer does is the removal working, and a `grep` cannot
+tell that paragraph from an instruction. `instructions` is handed those same documents
+**with the fences taken out** and asked the one thing the scanner cannot answer — does
+this prose still *direct* a worker to produce a release number? On the night of
+2026-08-23 five agents stamped a release and every one of them was following a document.
+The sentence that told them to need never have been inside a fence, and on the machine
+this was written on, against the harness that host was carrying at the time, it was not:
+
+```
+instructions  …/quarterback-harness/commands  fix-and-land.md still tells an agent in
+                                              prose to stamp or reserve a release      FAIL
+    quote: **Once READY, before you push: the release entry, then its number.**
+```
+
+That host was bumped an hour later and the row went `ok` against the new store path,
+whose `fix-and-land.md` does not carry the sentence — which is the row working, not the
+row wavering. It is worth saying plainly because the two answers look like a flake and
+are not one: the question is *what does this machine read*, and what this machine read
+changed.
+
+##### One document per question, and a `clean` said twice
+
+A model asked to find one sentence across thirteen documents is being asked a different
+and harder question than one asked about a single document, so the unit is one document.
+It costs no more — the same bytes are read either way and only the per-call overhead
+multiplies — and it buys two things beside reliability: a finding is scoped to the file
+it could have come from, so the citation check is tighter, and the cache is per document,
+so editing one brief re-asks about one brief.
+
+A `telling` answer is accepted on one reading, because it arrives carrying evidence: a
+filename from the manifest and a sentence the wrapper has already found in the text. A
+`clean` answer is asked again, under its own cache key, because it carries nothing at
+all — it is an assertion that something is not there, made by a process that cannot show
+its work, and that is the claim this whole file exists to distrust. Disagreement resolves
+toward the finding. Anything else is `unknown`.
+
+##### Its honest `unknown` lives in Python, not in the model's answer
+
+An LLM check that returns `ok` because it found nothing is the precise failure this whole
+tool exists to catch, and a model that has seen nothing will still answer confidently. So
+the abstention is enforced in three places, only one of which is prompt design:
+
+1. **The evidence gate**, before the call. `gather_evidence` builds the manifest and
+   refuses it whole: nothing readable, *one* file unreadable, or more bytes than the
+   ceiling allows, and the row is `unknown` **without the model having been asked**. This
+   is the `edge` row's shape — "nothing here can see whether the secret is set" is decided
+   by the code, not by the thing being asked. Reaching the byte ceiling is an `unknown`
+   and never a disclosed pass, which is the hole #417 closed in the GitHub-backed rows.
+2. **The call wrapper.** `ask_model` is the one place "could not be asked" is phrased: no
+   CLI, the switch off, a non-zero exit, a timeout, no JSON, a verdict outside the closed
+   vocabulary, the model's own `cannot tell`, the per-call dollar ceiling reached — and
+   two clauses no prompt can enforce. **An answer citing a file it was not given is
+   discarded**, because it is the model reasoning from its own memory of this repository
+   and the row cannot show a reader the evidence. **An answer quoting a line that is not
+   in the text is discarded**, because a composed quotation is not evidence. Both discards
+   are `unknown`, never `clean`.
+3. **The prompt**, which offers `cannot tell` and says it is never a polite way of
+   agreeing. Weakest of the three on its own, which is why it is third.
+
+`test_no_semantic_row_goes_green_on_a_host_that_cannot_ask` asserts this over the group
+rather than over a list of names, the same way the landing group's meta-test does.
+
+##### And it is bounded three ways
+
+- **Selection is the bound.** A bare `qb-doctor` does not run this group. It is a command
+  people type when something already feels wrong, and #55's argument is that unbounded
+  spend must not hang off that. `--only semantic` runs it; a timer that wants it asks for
+  it by name (`--only landing,semantic --announce --quiet`).
+- **Every call carries a ceiling the CLI enforces** (`--max-budget-usd`) and a timeout,
+  rather than an estimate this file makes — so it holds even if this file is wrong about
+  what a call costs. `QB_DOCTOR_LLM=0` turns the group off entirely, for a sandbox with no
+  network or a host whose owner does not want model calls made from it.
+- **The answer is cached on the digest of what was read.** A scheduled re-run over
+  unchanged documents costs nothing at all, and an edit to any one of them asks again.
+  That is how the expensive half stays affordable without being
+  opt-in-and-therefore-never-run.
+
+##### What it records
+
+`read` (the filenames), `bytes`, `digest`, `model`, whether the answer was `cached`, and
+on a finding the `file` and the **verbatim quote** — which is what makes a wrong verdict
+arguable rather than merely distrusted. The brief for this row says so in as many words:
+read the sentence in place first, and if it turns out to be a description rather than an
+instruction, the row is wrong and saying so is the result.
 
 ##### `queue` — the pair, and the clock
 
