@@ -373,6 +373,82 @@ claims rather than taking them, which is what lets it be re-run to check its own
 and what would let a CI job call it. See [loops/README.md](loops/README.md) for the check
 list and the exit-code contract.
 
+### `/get-involved` and `qb-next` — nobody hands you the work (#424)
+
+Every other command here takes an issue number a person looked up. This is the one that
+does not:
+
+```bash
+/get-involved                     # this checkout's repo scope
+/get-involved project:65lowther   # a scope with no repo behind it (#323)
+```
+
+It reads the board's plan for the scope, takes the first item that is open, unclaimed,
+unblocked and outside anybody else's hold, claims it, and runs the right existing skill on
+it — `/fix-issue` for an issue-backed item, `/review-pr` for a PR-backed one, and neither
+for an item with no ref, which is house work and gets worked in place.
+
+**Nothing here is new capability.** `GET /plan` has computed `next` since v2.39,
+`POST /plan/item/claim` has been the interlock just as long, and `POST /plan/item/done`
+closes the loop. What was missing was a caller: thirteen briefs in `commands/`, none of
+which contained the word `plan`. That is the shape of #169 — a finished mechanism nothing
+invokes — and this is the fix for one instance of it.
+
+**What it buys is a fleet with no dispatcher.** Tell three agents "get involved" and they
+take three different items, because the claim is atomic and the loser is told who won. The
+job it removes is the one a person does hour to hour: picking each item and handing it over
+by number.
+
+The mechanical half is `qb-next`, so the discipline is in code rather than in prose a model
+may skim:
+
+```bash
+qb-next                      # read the plan, claim `next`, print the command to run
+qb-next --json               # …and everything about it, including the caveat
+qb-next --dry-run            # say what it would take; take nothing
+qb-next --done <item_id>     # record it finished, dropping the claim
+qb-next --release <item_id>  # put it back — on ANY exit, failure included
+
+#   exit 0  took one     — stdout is the command to run on it
+#   exit 1  nothing free — everything is claimed, blocked, covered or done
+#   exit 2  unknown      — the board is unreachable, or refused
+```
+
+Four decisions in it are worth stating, because each is a way this could have gone wrong:
+
+- **It says what the order is worth before it takes anything.** `next` walks rank order, so
+  it is only as good as the ranks — and an appended item sits where `plan_add` put it, not
+  where anybody decided it belonged. The board reports that as `order_trust` and
+  `next.caveat`; `qb-next` prints both on stderr *before* the claim and repeats them in
+  `--json`, and the brief is told to relay the substance in its first message. An agent that
+  takes rank 1 without saying nobody chose rank 1 has laundered insertion order into
+  priority, which is what #183 exists to prevent.
+- **It cannot reorder.** `POST /plan/reorder` is human-only and nothing here calls it. An
+  agent that rearranges the plan to suit itself has approved its own work.
+- **It refuses to claim without a session id.** A plan claim is session-owned, and a claim
+  recording no session falls back to the machine — so two sessionless agents on one box
+  would renew *each other's* claim and both work the same item, which is precisely the
+  failure it exists to prevent.
+- **One item per invocation, and it stops.** A loop over items is an agent deciding how much
+  work the fleet takes on, and nothing bounds that yet (#80 measures integration cost as
+  quadratic in open PRs). `qb-seat`'s brief stops after one item for the same reason. The
+  loops that do loop — `/fix-and-land` — loop over review *rounds* inside one issue, under
+  a round cap and a spend ceiling that already exist.
+
+**Exit 1 is not an error.** Everything claimed, blocked or covered is what a working fleet
+looks like. It reports the counts, names the holders so you can go and ask one, and stops —
+it does not scan GitHub for something else to do (that is #63, deliberately a separate and
+much larger thing: it decides what *is* work, where this only reads an order a human set)
+and it does not add an item so there is one to take.
+
+**A ref that is already closed is bookkeeping, not a second item.** `qb-reconcile` finds
+these regularly. `qb-next` claims the item, asks the forge, and if the issue is closed or the
+PR merged it records the item done — with a note saying the issue closing is what decided it
+— and carries on to the next free one. Only a definite answer skips an item: a missing `gh`,
+a network outage or a repo the token cannot see all mean *work it*, because the other way
+round lets an outage close a plan. `--no-verify-ref` turns the question off entirely, which
+is what a board with no forge behind it wants (#327).
+
 ### `/fix-issue <number>` — the driver
 
 End-to-end resolution of a GitHub issue in a dedicated worktree with its own database copy.
@@ -1169,8 +1245,12 @@ and transcript push all arrive from the lifecycle hooks, and the worktree with i
 database arrives from `/fix-issue`. What is left is: name the seat, enter the repo, start
 the agent on a brief.
 
-The brief is **identical for every seat** — *read the board, claim an unclaimed item
-atomically, work it, release on exit* — and that is the design rather than an omission. A
+The brief is **identical for every seat** — *read the board, run `/get-involved`, stop* —
+and that is the design rather than an omission. Since #424 the pickup is that command rather
+than four paragraphs of this brief: a brief is prose a model may skim, and the one step that
+must not be skimmed is the claim, so it lives in `qb-next` where it is code. (The brief it
+replaced composed its own claim key, `kind='work'`, `key='<owner>/<repo>#<number>'` — #172,
+in the one text every seat on the box reads.) A
 spawner that reads the plan and hands seat 1 the first item is hub-and-spoke with a hub
 that runs once, at t=0, and then stops existing. Override it wholesale with
 `QB_SEAT_BRIEF` if a fleet wants a different one — or set it to the empty string for a
@@ -1347,9 +1427,10 @@ whole tmux server, so since #208 the seat number alone no longer says which seat
 the dashboard's SEATS panel and its FLEET-row jump both go through this.
 
 One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
-bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board,
-claim one unclaimed item atomically, work it, release — and self-selects. Nothing reads the
-plan on the agents' behalf and nothing assigns.
+bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board, run
+`/get-involved`, stop — and self-selects. Nothing reads the plan on the agents' behalf and
+nothing assigns: each seat reads it for itself and the claim is what keeps them off each
+other, which is why three seats given one brief take three different items.
 
 **Why real sessions and not sub-agents.** Sub-agents are a star: one orchestrator holds the
 plan, fans out, and every result funnels back through one context window. Children are

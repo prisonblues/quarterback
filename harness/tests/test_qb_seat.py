@@ -366,12 +366,24 @@ def test_every_seat_gets_the_same_brief_but_its_own_number(run):
     ).replace(seat_name(2), "seat-N")
 
 
-def test_the_brief_tells_the_seat_to_claim_before_it_works(run):
+def test_the_brief_sends_the_seat_to_the_command_that_claims_before_it_works(run):
     """The whole point of self-selection: an advisory claim after the fact
-    cannot stop two seats doing one item."""
+    cannot stop two seats doing one item.
+
+    It names `/get-involved` rather than describing the pickup, and that is the
+    assertion (#424). A brief is prose a model may skim; the claim is the one step
+    that must not be skimmed, so it belongs in a tool that takes it. This brief
+    used to spell out the whole sequence AND compose its own claim key —
+    `kind='work'`, `key='<owner>/<repo>#<number>'` — which is #172 in the one place
+    every seat on the box reads: the board derives a key from the resource
+    precisely so two clients cannot spell it two ways.
+    """
     out = run("1", "--dry-run").stdout.lower()
-    assert "atomically" in out
-    assert "kind='work'" in out
+    assert "/get-involved" in out
+    assert "before you start" in out
+    assert "kind='work'" not in out and "key='" not in out, (
+        "a brief that composes a claim key by hand is #172, and this one is read "
+        "by every seat on the machine")
 
 
 def test_the_brief_can_be_replaced_wholesale(run, agent):

@@ -51,7 +51,11 @@ stdenvNoCC.mkDerivation {
   # what a person types when a box is behaving oddly and so is worth nothing at
   # a path they would have to look up — and which additionally has to be on PATH
   # to do its job, since one of the questions it answers is whether the harness
-  # ON PATH matches the checkout in front of you (#204); and the board client's
+  # ON PATH matches the checkout in front of you (#204); `qb-next`, which
+  # `/get-involved` calls by name and which is also what a person types to ask
+  # the board what to pick up — the one entry point here that answers "what
+  # should I do" rather than being told (#424), so a path they would have to
+  # look up defeats it exactly as it defeats the doctor; and the board client's
   # own four (#230) — `qb-hook`, which ~/.claude/settings.json names by absolute
   # path, `qb-mcp`, which ~/.claude.json does, `qb-claude-setup`, which writes
   # both of those from the home-manager activation, and `qb` for a human.

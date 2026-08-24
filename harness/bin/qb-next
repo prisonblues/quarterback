@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""qb-next — take the next free item off the plan. The caller the plan never had (#424).
+
+  qb-next                       this checkout's scope: read the plan, claim `next`
+  qb-next --scope project:65lowther     a scope with no repo behind it (#323)
+  qb-next --dry-run             say what it would take, and take nothing
+  qb-next --json                the whole answer on stdout, not just the dispatch
+  qb-next --done <item_id>      record it finished, dropping the claim
+  qb-next --release <item_id>   put it back — do this on ANY exit, failure included
+
+  0  took one  — stdout is the command to run on it (`--json` for everything)
+  1  nothing free — every item is claimed, blocked, covered or done. Not an error
+  2  unknown  — the board is unreachable, or refused
+
+**The board side has been finished for weeks and nothing called it.** `GET /plan`
+computes `next`, `POST /plan/item/claim` is the interlock that stops two agents
+taking one item, `POST /plan/item/done` closes the loop — and all thirteen slash
+commands in `harness/commands/` take an issue number a human already looked up.
+This is the missing link and nothing more: it decides nothing about what is work
+(that is #63, deliberately elsewhere), it starts no sessions (#277/#371/#372), and
+it cannot reorder anything, because reordering is `POST /plan/reorder` and that is
+human-only.
+
+**IT SAYS HOW MUCH THE ORDER IS WORTH, BEFORE IT TAKES ANYTHING.** `next` walks
+rank order, so it is exactly as good as the ranks — and an item that was appended
+sits where `plan_add` put it, not where anybody decided it belonged. The board
+reports that in `order_trust` and carries it to a headline reader as
+`next.caveat`; this prints both on stderr *before* the claim and repeats them in
+`--json`, so a caller cannot end up quoting rank 1 as a priority nobody chose.
+That is #183's whole point, and burying it is the failure mode this tool was
+written with a warning about.
+
+**IT REFUSES WITHOUT A SESSION ID.** A plan claim is owned by the session
+(`session_owned=True` in `claim_item`), and a claim that recorded no session falls
+back to the machine — so two agents on one box with no session between them would
+*renew each other's claim* and both work the same item, which is the one failure
+this tool exists to prevent. No session, no claim.
+
+**A refusal is not the end of the walk.** A 409 names the holder and means
+somebody got there first, which is an answer, not a wall: it says who has it and
+moves to the next free item. `--tries` bounds that so a busy plan cannot turn one
+invocation into a sweep.
+
+**A ref that is already closed is bookkeeping, not work.** `qb-reconcile` finds
+these regularly: the issue was closed by hand or by another PR and the plan row
+outlived it. Claiming one, seeing it closed, and going on to the next item is not
+a second helping of work — `plan_done` records what the closed issue already
+decided (the issue closing is what makes it done; this only stops the next agent's
+read being one item out of date) and the walk continues. `--no-verify-ref` skips
+the check for a board with no forge behind it (#327).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+TOOK, NOTHING, UNKNOWN = 0, 1, 2
+
+#: What to run on an item, by the kind of thing its ref names. The plan stores
+#: only `issue`, `pr` or nothing at all (`ItemIn.ref_kind` is
+#: ``Literal["issue", "pr"] | None``), so this table is complete rather than a
+#: sample — and a ref-less item is not a gap in it: that is house work, admin, or
+#: anything in a `project:` scope, and it has no forge behind it to dispatch to.
+#: The names are this package's own slash commands, which is why they can be
+#: hard-coded here: `hm-module.nix` links them into ~/.claude/commands from the
+#: same derivation that installs this file.
+DISPATCH = {"issue": "/fix-issue", "pr": "/review-pr"}
+
+#: A scope with no repository behind it (#323). Nothing here dereferences a ref
+#: in one, because the board refuses to store a forge ref against one at all.
+PROJECT = "project:"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-next", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scope", default=None,
+                    help="owner/name, or project:<name>. Default: this checkout's repo")
+    ap.add_argument("--repo-path", default=".",
+                    help="the checkout whose origin remote names the scope")
+    ap.add_argument("--exact", action="store_true",
+                    help="this scope only — do not widen to the fleet-wide items")
+    ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
+                    help="your session id (default: $CLAUDE_CODE_SESSION_ID). A plan "
+                         "claim is owned by the session, so this is required")
+    ap.add_argument("--ttl", type=int, default=None,
+                    help="seconds the claim holds without a renew (default: the board's)")
+    ap.add_argument("--note", default=None,
+                    help="what you are doing with it — shown to whoever is refused")
+    ap.add_argument("--tries", type=int, default=4,
+                    help="how many candidates to walk past holders and closed refs "
+                         "before giving up (default 4)")
+    ap.add_argument("--no-verify-ref", action="store_true",
+                    help="do not ask the forge whether the ref is still open")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what it would take; claim nothing")
+    ap.add_argument("--json", action="store_true",
+                    help="the whole answer on stdout instead of the dispatch line")
+    ap.add_argument("--done", metavar="ITEM_ID", default=None,
+                    help="record that item finished, dropping the claim with it")
+    ap.add_argument("--release", metavar="ITEM_ID", default=None,
+                    help="put that item back — on any exit, failure included")
+    args = ap.parse_args()
+
+    if args.done and args.release:
+        print("qb-next: --done and --release name two different things to do with "
+              "one item; pick one", file=sys.stderr)
+        return UNKNOWN
+
+    try:
+        client, _cfg = board_client()
+    except Exception as e:                                        # noqa: BLE001
+        print(f"unknown: could not reach the board — {e.__class__.__name__}: {e}",
+              file=sys.stderr)
+        return UNKNOWN
+
+    if args.done or args.release:
+        return _finish(client, args)
+    return _take(client, args)
+
+
+# ---------------------------------------------------------------- the walk
+
+
+def _take(client, args) -> int:
+    """Read the plan, say what the order is worth, and claim the first free item."""
+    scope = args.scope or repo_slug(args.repo_path)
+    if not scope:
+        print(f"unknown: no owner/name could be read from the git remote at "
+              f"{args.repo_path!r}, and no --scope was given. A plan is per scope, "
+              f"and guessing one from a directory name is how work lands in the "
+              f"wrong list", file=sys.stderr)
+        return UNKNOWN
+    # Before anything is claimed, because a session is what makes the claim mean
+    # one agent. See the module docstring: without one, two agents on this box
+    # renew each other's claim and both work the item.
+    if not args.session and not args.dry_run:
+        print("unknown: no session id. A plan claim is owned by the session, and a "
+              "claim that records none falls back to the machine — so a co-tenant's "
+              "claim would read as your own and you would both work the same item. "
+              "Set CLAUDE_CODE_SESSION_ID, or pass --session.", file=sys.stderr)
+        return UNKNOWN
+
+    try:
+        plan = client.get("/plan", {"repo": scope, "session": args.session,
+                                    "exact": "true" if args.exact else None,
+                                    "limit": 200})
+    except Exception as e:                                        # noqa: BLE001
+        print(f"unknown: could not read the plan — {e.__class__.__name__}: {e}",
+              file=sys.stderr)
+        return UNKNOWN
+
+    trust = plan.get("order_trust") or {}
+    nxt = plan.get("next")
+    _say_order(trust, nxt)
+
+    candidates = _free(plan)
+    if not candidates:
+        _say_nothing_free(scope, plan)
+        return NOTHING
+
+    if args.dry_run:
+        head = candidates[0]
+        print(f"would take: {_label(head)} — {head.get('title')}", file=sys.stderr)
+        _emit(args, _answer(head, None, trust, nxt, [], [], scope, dry=True))
+        return TOOK
+
+    passed, closed = [], []
+    for item in candidates[:max(1, args.tries)]:
+        taken = _claim(client, item, args, passed)
+        if taken is None:
+            continue
+        if not args.no_verify_ref:
+            state = _ref_state(item, scope)
+            if state is not None:
+                closed.append({"item_id": item["item_id"], "state": state,
+                               "ref": item.get("ref") or None})
+                _retire(client, item, args, state)
+                continue
+        _emit(args, _answer(item, taken, trust, nxt, passed, closed, scope))
+        return TOOK
+
+    _say_exhausted(candidates, args.tries, passed, closed)
+    return NOTHING
+
+
+def _free(plan: dict) -> list[dict]:
+    """The items this agent may take, in rank order — `next` first, then the rest.
+
+    `next` is the board's own answer and is used as such; what this adds is the
+    QUEUE BEHIND IT, which the board does not send because a single answer is what
+    a reader wants. It is needed the moment two agents read the same plan in the
+    same second: they are handed the same `next`, one of them loses the claim, and
+    without the rest of the list the loser has nothing to fall back to and would
+    have to re-read to find out what it already knows.
+
+    The filter is `next`'s own, applied to `items`: open, unclaimed, unblocked, and
+    not covered by somebody else's plan hold. `items` is already in rank order and
+    `claim`/`covered_by` are resolved against the session this read sent, so
+    "somebody else's" means what it means everywhere else on the board.
+    """
+    rows = plan.get("items") or []
+    return [i for i in rows
+            if i.get("state") == "open" and not i.get("claim")
+            and not i.get("blocked_by") and not i.get("covered_by")]
+
+
+def _claim(client, item: dict, args, passed: list) -> dict | None:
+    """Take one item, or record who has it and hand back None.
+
+    A 409 is somebody to talk to rather than a wall — the board answers it with
+    the holder, their session and what they said they were doing — so the holder
+    is kept for the report and the walk goes on to the next item. That is the
+    behaviour that makes three agents invoking this take three different items.
+    """
+    body: dict = {"item_id": item["item_id"], "session": args.session}
+    if args.ttl is not None:
+        body["ttl"] = args.ttl
+    if args.note:
+        body["note"] = args.note
+    try:
+        return client.post("/plan/item/claim", body)
+    except urllib.error.HTTPError as e:
+        detail = _detail(e)
+        held = detail if isinstance(detail, dict) else {}
+        if e.code == 409:
+            who = (held.get("held_by") or (held.get("covered_by") or {}).get("holder")
+                   or "somebody")
+            passed.append({"item_id": item["item_id"], "ref": _ref_label(item),
+                           "held_by": who, "why": _message(detail)})
+            print(f"passed over {_label(item)}: {_message(detail)} — {who} has it",
+                  file=sys.stderr)
+            return None
+        print(f"unknown: the board refused the claim on {_label(item)} — "
+              f"HTTP {e.code}: {_message(detail)}", file=sys.stderr)
+        return None
+    except Exception as e:                                        # noqa: BLE001
+        print(f"unknown: could not claim {_label(item)} — "
+              f"{e.__class__.__name__}: {e}", file=sys.stderr)
+        return None
+
+
+def _retire(client, item: dict, args, state: str) -> None:
+    """Record an item whose ref closed without it. Best-effort, and says so if not.
+
+    This is the one write here that is not a claim, and it decides nothing: the
+    issue closing is what made the work done, and `plan_done` only stops the next
+    agent's read being one item out of date. Failing to record it is not fatal —
+    the walk goes on either way, and `qb-reconcile` finds the row again.
+    """
+    note = (f"ref {_ref_label(item)} is already {state.lower()} — recorded by "
+            f"qb-next while picking up work; the issue closing is what decided it")
+    try:
+        client.post("/plan/item/done", {"item_id": item["item_id"],
+                                        "session": args.session, "note": note})
+        print(f"skipped {_label(item)}: {_ref_label(item)} is already "
+              f"{state.lower()}; marked done and moving on", file=sys.stderr)
+    except Exception as e:                                        # noqa: BLE001
+        print(f"skipped {_label(item)}: {_ref_label(item)} is already "
+              f"{state.lower()}, but the board would not record it "
+              f"({e.__class__.__name__}: {e}) — release it by hand and tell "
+              f"qb-reconcile", file=sys.stderr)
+
+
+def _finish(client, args) -> int:
+    """`--done` or `--release`: the other end of the claim."""
+    item_id = args.done or args.release
+    path = "/plan/item/done" if args.done else "/plan/item/release"
+    body: dict = {"item_id": item_id, "session": args.session}
+    if args.done and args.note:
+        body["note"] = args.note
+    try:
+        answer = client.post(path, body)
+    except urllib.error.HTTPError as e:
+        print(f"unknown: the board answered HTTP {e.code} — {_message(_detail(e))}",
+              file=sys.stderr)
+        return UNKNOWN
+    except Exception as e:                                        # noqa: BLE001
+        print(f"unknown: could not reach the board — {e.__class__.__name__}: {e}",
+              file=sys.stderr)
+        return UNKNOWN
+    print(f"{'done' if args.done else 'released'}: {item_id}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(answer, indent=2))
+    return TOOK
+
+
+# ---------------------------------------------------------------- the forge
+
+
+def _ref_state(item: dict, scope: str) -> str | None:
+    """``"CLOSED"``/``"MERGED"`` if the ref is finished, else None — None on doubt.
+
+    Only a definite finished answer skips an item. A `gh` that is missing, a
+    network that is down, a repo the token cannot see: every one of those returns
+    None, so the item is worked rather than silently retired. Getting this the
+    other way round would let an outage mark a plan done.
+    """
+    ref = item.get("ref") or {}
+    kind, value = ref.get("kind"), ref.get("value")
+    repo = item.get("repo") or scope
+    if not kind or not value or not repo or repo.startswith(PROJECT):
+        return None
+    sub = "issue" if kind == "issue" else "pr"
+    try:
+        got = subprocess.run(["gh", sub, "view", str(value), "--repo", repo,
+                              "--json", "state"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if got.returncode != 0:
+        return None
+    try:
+        state = str(json.loads(got.stdout).get("state") or "").upper()
+    except Exception:                                             # noqa: BLE001
+        return None
+    return state if state in ("CLOSED", "MERGED") else None
+
+
+# ---------------------------------------------------------------- what it says
+
+
+def _say_order(trust: dict, nxt: dict | None) -> None:
+    """The provenance of the order, on stderr, before anything is claimed.
+
+    Printed whether or not it is good news. A line that appears only when
+    something is wrong is one a reader never learns to look for, which is the
+    reason `order_trust` is always present in the board's own answer.
+    """
+    if trust.get("trusted"):
+        print(f"order: chosen — {sum((trust.get('by_source') or {}).values())} "
+              f"open items, all of them placed by somebody", file=sys.stderr)
+    else:
+        first = trust.get("first_unchosen") or {}
+        print(f"ORDER NOT CHOSEN: {trust.get('unchosen')} open items sit where they "
+              f"were appended, the first at rank {first.get('rank')}. Rank is partly "
+              f"just the order things were added — it is not a priority, and saying "
+              f"so is part of taking one.", file=sys.stderr)
+        if trust.get("hint"):
+            print(f"  {trust['hint']}", file=sys.stderr)
+    if (nxt or {}).get("caveat"):
+        print(f"CAVEAT ON `next`: {nxt['caveat']}", file=sys.stderr)
+
+
+def _say_nothing_free(scope: str, plan: dict) -> None:
+    """Everything is taken, blocked or covered. A real state, and not an error.
+
+    It says which of the three, because the remedy differs: a claimed item needs
+    nobody, a blocked one needs its blocker finishing, and a covered one needs a
+    word with whoever holds the plan. And it names holders, because the point of
+    the board is that you can go and ask them.
+    """
+    counts = plan.get("counts") or {}
+    print(f"nothing free in {scope}: {counts.get('open', 0)} open — "
+          f"{counts.get('claimed', 0)} claimed, {counts.get('blocked', 0)} blocked, "
+          f"{counts.get('covered', 0)} covered by somebody's plan hold "
+          f"({counts.get('done', 0)} done)", file=sys.stderr)
+    for item in (plan.get("items") or [])[:10]:
+        holder = item.get("claim") or item.get("covered_by")
+        if holder:
+            print(f"  {_label(item)} — {holder.get('holder')}: "
+                  f"{holder.get('note') or 'no note'}", file=sys.stderr)
+    print("This is not an error and it is not a reason to invent work: the plan is "
+          "a human's ordering and adding to it is a separate decision. Ask a holder "
+          "whether they want a hand, or stop.", file=sys.stderr)
+
+
+def _say_exhausted(candidates: list, tries: int, passed: list, closed: list) -> None:
+    print(f"nothing taken: walked {min(len(candidates), max(1, tries))} of "
+          f"{len(candidates)} free items — {len(passed)} were claimed by somebody "
+          f"between the read and the claim, {len(closed)} had refs that are already "
+          f"closed. Run it again: the plan moved under this one.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- the answer
+
+
+def _answer(item: dict, taken: dict | None, trust: dict, nxt: dict | None,
+            passed: list, closed: list, scope: str, dry: bool = False) -> dict:
+    """Everything a caller needs to act, including what the order was worth.
+
+    `caveat` and `order_trust` ride along rather than being left on stderr, so a
+    caller reading `--json` cannot end up with the item and not the qualification
+    on it. `dispatch` is the command to run; it is null for a ref-less item, which
+    is a real kind of work and not a missing case.
+    """
+    ref = (item.get("ref") or {})
+    return {
+        "item_id": item.get("item_id"),
+        "title": item.get("title"),
+        "repo": item.get("repo") or scope,
+        "scope": scope,
+        "ref": ref or None,
+        "rank": item.get("rank"),
+        "rank_source": item.get("rank_source"),
+        "placed_for": item.get("placed_for"),
+        "note": item.get("note"),
+        "plan": item.get("plan"),
+        "depends_on": item.get("depends_on") or [],
+        "claim_id": (taken or {}).get("claim_id"),
+        "claimed": bool(taken),
+        "dry_run": dry,
+        "was_next": bool(nxt) and nxt.get("item_id") == item.get("item_id"),
+        "dispatch": _dispatch(item),
+        "caveat": (nxt or {}).get("caveat"),
+        "order_trust": trust,
+        "passed_over": passed,
+        "closed_refs": closed,
+    }
+
+
+def _dispatch(item: dict) -> str | None:
+    ref = item.get("ref") or {}
+    command = DISPATCH.get(ref.get("kind") or "")
+    return f"{command} {ref.get('value')}" if command else None
+
+
+def _emit(args, answer: dict) -> None:
+    """stdout carries one thing, and which one is the caller's choice.
+
+    The dispatch line by default, because that is what a caller does next and it
+    needs no parsing; `--json` replaces it with the whole answer, which then really
+    is JSON rather than JSON with a line stuck to the end of it. Commentary is on
+    stderr throughout — the same split `qb-claim` makes.
+    """
+    if args.json:
+        print(json.dumps(answer, indent=2))
+        return
+    print(answer["dispatch"] or f"item {answer['item_id']} — {answer['title']}")
+
+
+# ---------------------------------------------------------------- odds and ends
+
+
+def _ref_label(item: dict) -> str:
+    ref = item.get("ref") or {}
+    if not ref:
+        return "no ref"
+    return f"{ref.get('kind')} #{ref.get('value')}"
+
+
+def _label(item: dict) -> str:
+    """How an item is named in a line a human reads: its ref, else its id."""
+    ref = item.get("ref") or {}
+    if ref:
+        return f"#{ref.get('value')}"
+    return str(item.get("item_id"))[:8]
+
+
+def _detail(e: urllib.error.HTTPError):
+    """The board's own message, parsed if it is JSON. Never raises."""
+    try:
+        body = json.loads(e.read().decode())
+    except Exception:                                             # noqa: BLE001
+        return e.reason
+    return body.get("detail", body) if isinstance(body, dict) else body
+
+
+def _message(detail) -> str:
+    """One line out of a refusal, whatever shape it arrived in."""
+    if isinstance(detail, dict):
+        return str(detail.get("error") or detail)
+    return str(detail)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
