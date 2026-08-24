@@ -1964,6 +1964,7 @@ qb-doctor --only hooks,edge   # just those rows
 qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
+qb-doctor --explain           # why each bad row matters, and the brief written for it
 qb-doctor --announce          # put every FAILING row on the board (for a timer)
 ```
 
@@ -2042,6 +2043,111 @@ can run a command the author did not mark runnable:
   generated into 1Password *and* sops and two separate deploys; a tool that tried would
   fail halfway through somebody's production deploy. What `qb-doctor` owes there is the
   precise remedy and the runbook path, which is what it prints.
+
+#### A row is a verdict, an explanation, and a brief (#408)
+
+A row used to be a verdict and a one-line remedy, and every finding therefore became a
+person reading it, working out what it meant, and hand-writing a brief for whoever would
+fix it. Four findings in two days had exactly that shape — #414, #419, #422, #411 — and
+the hand-written brief was the same length each time. Diagnosis scales by adding checks;
+that step scales by adding people, which is the one thing that cannot be done.
+
+So a registration carries three things beside the predicate:
+
+```python
+CheckSpec(
+    "briefs", "landing", check_briefs,
+    explanation=("A brief is what an agent DOES. #122 removed branch-side release "
+                 "stamping from the code, and five agents stamped anyway — every one "
+                 "of them following a document that still told them to. …"),
+    briefs={
+        "fail": Brief(
+            audience="agent",
+            task="…establish which of the two causes this is before changing anything…",
+            constraints=("Do not edit files inside the nix store. …",),
+            verify=("`pytest -k no_brief_tells_an_agent_to_stamp` still passes…",),
+            needs=("telling",)),
+    })
+```
+
+| field | what it is for |
+|---|---|
+| `explanation` | **why the row matters**, in prose. Per-*row*, not per-verdict — the same paragraph however the row came out, because it is about the mechanism rather than today's answer. |
+| `briefs` | a `Brief` **per verdict**. A verdict that is not a key gets no brief, which is the default and the safe one. |
+| `Brief.audience` | `agent` (this is work) or `human` (this is an escalation). They do not merge. |
+| `Brief.task` | what to do, templated against the row's `extra` — the fixed half is the understanding, the variable half is what this run found. |
+| `Brief.constraints` | what **not** to do, and what has already been settled. The half a generated prompt can never contain. |
+| `Brief.verify` | how to know it worked. |
+| `Brief.needs` | the `extra` keys the task is written around — an evidence gate, not documentation. |
+
+**They are written by hand, at the same time as the check.** #408 is explicit that a
+prompt generated from the error message afterwards restates the assertion, which is the
+one thing nobody needed written down. The moment the understanding exists is the moment
+the predicate is written, and until now the only place to put it was a docstring, which
+nothing can reach.
+
+##### `extra` is the documented variable half
+
+Every row already populated `extra` with the facts a brief needs — `head_holder`,
+`head_pr`, `waited_minutes`, `offenders`, `conflicting`, `orphaned`, `telling`,
+`unreadable`, `differ`, `missing`. `needs` is what turns that from a debugging aside into
+a contract: **a brief whose facts the row did not establish is not rendered at all.**
+
+That is the whole of it, and it is the difference between this being useful and being a
+confident-guess generator. `queue`'s brief says *go and ask whoever holds the head of the
+line*; a `queue` row that could not read the queue has no head to name. Rendering it
+anyway produces a specific, plausible, entirely fabricated instruction — which is #419's
+family (an error rendering as a different and confident diagnosis) arriving at the
+dispatch layer. **Absent and empty are both absent**: `offenders: []` is the row saying it
+found none. A run that reaches this state gets no prompt and a sentence saying which fact
+was missing, because `None` with no reason cannot be told apart from "nothing to dispatch
+here", and those are opposite facts.
+
+##### `manual` and a brief are different things
+
+`manual` is one command line for a person and is never executed. A brief is a paragraph
+nobody executes. Collapsing them either puts an unrunnable paragraph where the report
+prints a command, or loses the command. `briefs`'s manual is `qb-bump --host $(hostname)`;
+its brief is three paragraphs about which of two causes this is. Both exist on the row,
+and the brief quotes the manual under a heading that says it is not the agent's to run
+blind.
+
+##### `unknown` splits in two
+
+"This host cannot see it" — no token, no `gh`, forward-auth with no session — is a
+person's or an installer's job, so its brief is an escalation (#279's `needs_human`).
+"This repo is in a shape nothing here can parse" is agent work. Only the registration
+knows which, so it is a per-verdict field on it and it defaults to neither.
+
+##### Every agent brief ends by re-asking its own row
+
+Appended by the tool rather than written into each registration, because it is a command
+and not an understanding:
+
+```
+python3 <checkout>/harness/bin/qb-doctor --only briefs --repo <checkout>
+```
+
+#414 is an entire issue about an installer's exit code being read as the guard having
+been installed — `qb-bump` once reported `nothing to carry` about a harness 74 commits
+behind — and `apply_fixes` already draws the same line for `--fix`. It is spelled as a
+path **into the checkout** rather than as a bare `qb-doctor` because of #422: the staler
+a host, the likelier the remedy is missing from it, and the checkout is present by
+definition.
+
+##### The doctor produces the brief and never runs it
+
+Finding a fault and starting an agent to fix it, ungated, is the same self-approval shape
+#85, #86, #78 and #335 have each settled. So the brief travels out through the door the
+finding already uses — `--announce`, into #274's needs-human post — and not on a channel
+of its own, which would be a dispatch mechanism wearing an escalation's clothes.
+`test_the_doctor_produces_the_prompt_and_never_runs_it` asserts that no subprocess this
+tool spawns carries one.
+
+The report does not print briefs by default either: seventeen rows and twenty lines each
+would bury the one word a reader came for. The footer says how many are ready and **which
+rows have none**, because "no brief is written for this fault" is a fact about the tool
+that a reader should be able to see.
 
 #### The `landing` group — can work actually get out of here? (#407)
 

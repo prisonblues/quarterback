@@ -974,9 +974,10 @@ def test_a_check_that_raises_becomes_an_unknown_naming_the_exception(monkeypatch
     def boom(_host):
         raise RuntimeError("the host is very odd")
 
-    monkeypatch.setattr(qd, "CHECKS", (("boom", "host", boom),
-                                       ("fine", "host", lambda _h: qd.Check(
-                                           "fine", "-", "", "ok"))))
+    monkeypatch.setattr(qd, "CHECKS", (
+        qd.CheckSpec("boom", "host", boom, explanation="a check that explodes"),
+        qd.CheckSpec("fine", "host", lambda _h: qd.Check("fine", "-", "", "ok"),
+                     explanation="a check that does not")))
     out = qd.run_checks(host_for(repo))
     assert [c.verdict for c in out] == ["unknown", "ok"]
     assert "RuntimeError: the host is very odd" in out[0].detail
@@ -1042,7 +1043,7 @@ def test_every_check_name_is_offered_by_only(capsys):
     `CHECKS` cannot be selected and a name in the help with no check cannot run.
     Group names too, for the same reason: `--only landing` is only discoverable if
     the help says the word."""
-    names = [n for n, _g, _fn in qd.CHECKS] + list(qd.GROUPS)
+    names = [spec.name for spec in qd.CHECKS] + list(qd.GROUPS)
     assert len(set(names)) == len(names)
     with pytest.raises(SystemExit):
         qd.main(["--help"])
@@ -1698,8 +1699,9 @@ def test_the_merges_row_never_offers_to_fix_itself(monkeypatch, landing_repo, se
 # --------------------------------------------------------------------------- #
 
 def test_every_check_belongs_to_a_group_this_file_declares():
-    for name, group, _fn in qd.CHECKS:
-        assert group in qd.GROUPS, f"{name} is filed under {group!r}, which is not a group"
+    for spec in qd.CHECKS:
+        assert spec.group in qd.GROUPS, (
+            f"{spec.name} is filed under {spec.group!r}, which is not a group")
 
 
 def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
@@ -1713,7 +1715,7 @@ def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
 
     qd.main(["--only", "landing"])
 
-    assert seen == [{n for n, g, _fn in qd.CHECKS if g == "landing"}]
+    assert seen == [{spec.name for spec in qd.CHECKS if spec.group == "landing"}]
     assert len(seen[0]) > 1, "the point of a group is that it holds more than one row"
 
 
@@ -1729,7 +1731,8 @@ def test_a_rows_group_comes_from_the_registration_not_from_the_check(monkeypatch
     def boom(_host):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(qd, "CHECKS", (("merges", "landing", boom),))
+    monkeypatch.setattr(qd, "CHECKS", (qd.CheckSpec("merges", "landing", boom,
+                                                    explanation="it explodes"),))
     rows = qd.run_checks(host_for(repo))
 
     assert rows[0].group == "landing"
@@ -2502,7 +2505,7 @@ def test_the_real_tagger_answers_the_argv_this_row_sends_it(landing_repo):
 # ----------------------------------------------------------------- the group
 
 def test_the_landing_group_holds_every_row_that_answers_can_work_land():
-    names = {n for n, g, _fn in qd.CHECKS if g == "landing"}
+    names = {spec.name for spec in qd.CHECKS if spec.group == "landing"}
 
     assert names == {"merges", "queue", "landed", "tags", "generated", "stamper", "briefs"}
 
@@ -2527,7 +2530,7 @@ def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, t
                        "source_harness": tmp_path / "empty", "gh_cache": {}})
     _gh_answers(monkeypatch, {}, have_gh=False)
 
-    rows = [(name, fn) for name, group, fn in qd.CHECKS if group == "landing"]
+    rows = [(spec.name, spec.fn) for spec in qd.CHECKS if spec.group == "landing"]
     assert len(rows) >= 6, "this asserts over the group, so the group has to be read"
     for name, fn in rows:
         check = fn(blind)
@@ -2702,3 +2705,281 @@ def test_announcing_changes_neither_the_report_nor_the_exit_code(
     assert json.loads(out.out)["checks"][0]["name"] == "queue"
     assert "needs-human announced" in out.err
     assert len(door.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# #408 — a row is a verdict, an explanation, and a brief somebody can be handed
+# --------------------------------------------------------------------------- #
+
+def test_every_row_carries_an_explanation_written_by_hand():
+    """The explanation is the half #408 says nobody can generate.
+
+    Length is a crude proxy and it is the right one here: text short enough to be a
+    restatement of the check's own name is exactly what the issue forbids, and a
+    registration added later with `explanation="checks the thing"` is the way this
+    stops happening. What it cannot assert is that the paragraph is TRUE — that is
+    what writing it beside the predicate, at the moment the understanding exists, is
+    for.
+    """
+    for spec in qd.CHECKS:
+        assert len(spec.explanation.split()) >= 40, (
+            f"{spec.name}'s explanation is {len(spec.explanation.split())} words — too "
+            "short to be anything but a restatement of the assertion")
+        for verdict, brief in spec.briefs.items():
+            assert brief.task.strip() != spec.explanation.strip(), (
+                f"{spec.name}/{verdict}: the explanation and the brief are the same text "
+                "— they answer different questions, WHY and WHAT TO DO")
+
+
+def test_a_rows_explanation_comes_from_the_registration_not_from_the_check(monkeypatch,
+                                                                          repo):
+    """The same argument `group` already makes in this file: a check function that
+    could write its own explanation could write one its registration disagrees with,
+    and the docstring where this understanding lives today is a place nothing can
+    reach."""
+    monkeypatch.setattr(qd, "CHECKS", (
+        qd.CheckSpec("merges", "landing", lambda _h: qd.Check("merges", "-", "x", "ok"),
+                     explanation="the registration's paragraph, not the function's"),))
+
+    rows = qd.run_checks(host_for(repo))
+
+    assert rows[0].explanation == "the registration's paragraph, not the function's"
+    assert rows[0].as_dict()["explanation"] == rows[0].explanation
+
+
+def test_an_ok_row_gets_no_brief_and_the_report_says_why(repo):
+    """No brief is the DEFAULT and for an `ok` row it is the answer. What it must not
+    be is silence: a caller that got `None` and no reason could not tell "nothing to
+    dispatch here" from "the brief broke", and those are opposite facts."""
+    spec = qd.CheckSpec("queue", "landing", lambda _h: None, explanation="x" * 200,
+                        briefs={"fail": qd.Brief(audience="agent", task="do the thing")})
+    check = qd.Check("queue", "-", "nothing is queued", "ok")
+
+    prompt, audience, why = qd.compose(spec, check, host_for(repo))
+
+    assert prompt is None
+    assert audience is None
+    assert "no brief is registered for a ok" in why
+
+
+def test_a_brief_is_refused_rather_than_rendered_with_a_hole_in_it(repo):
+    """THE test for this change, and the one that keeps it from being a confident-guess
+    generator. `queue`'s brief is "go and ask whoever holds the head of the line"; a
+    `queue` row that could not read the queue has no head to name. Rendering it anyway
+    produces a specific, plausible, entirely fabricated instruction — which is #419's
+    family at the dispatch layer, and #411's at the presentation one.
+    """
+    spec = next(s for s in qd.CHECKS if s.name == "queue")
+    blind = qd.Check("queue", "acme/repo@main", "could not read the queue", "fail",
+                     extra={"head_holder": "", "waited_minutes": 0})
+
+    prompt, audience, why = qd.compose(spec, blind, host_for(repo))
+
+    assert prompt is None, "a brief with a hole in it is worse than no brief"
+    assert audience == "agent", "the registration still says who it would have been for"
+    assert "`head_holder`" in why and "no brief rather than one with a hole" in why
+
+
+def test_an_empty_list_is_an_absent_fact_not_an_established_one(repo):
+    """`offenders: []` is the row saying it found none. A brief written around WHICH
+    pull requests offend has nothing to be written around, and the benign default —
+    rendering the empty list as though it were the finding — is the direction that
+    hides the anomaly (#411)."""
+    spec = next(s for s in qd.CHECKS if s.name == "generated")
+    empty = qd.Check("generated", "/repo", "could not tell", "fail",
+                     extra={"open": 3, "offenders": []})
+
+    prompt, _audience, why = qd.compose(spec, empty, host_for(repo))
+
+    assert prompt is None
+    assert "`offenders`" in why
+
+
+def test_a_template_naming_a_fact_nothing_supplies_is_a_missing_brief(repo):
+    """A typo in a registration is a missing brief, not a brief containing `{holder}`."""
+    spec = qd.CheckSpec("queue", "landing", lambda _h: None, explanation="x" * 200,
+                        briefs={"fail": qd.Brief(audience="agent",
+                                                 task="ask {holdr} about it")})
+    check = qd.Check("queue", "-", "stalled", "fail", extra={"head_holder": "zeus/a"})
+
+    prompt, _audience, why = qd.compose(spec, check, host_for(repo))
+
+    assert prompt is None
+    assert "holdr" in why
+
+
+def test_no_landing_row_produces_a_brief_on_a_host_that_can_see_nothing(
+        monkeypatch, tmp_path, landing_host):
+    """The harder half of #408's acceptance test, asserted over the GROUP for the same
+    reason `test_no_landing_row_goes_green_on_a_host_that_can_see_nothing` is: the
+    failure guarded against is a row added later whose brief renders anyway.
+
+    An honest `unknown` with no prompt is correct. An `unknown` with a confident prompt
+    is the bug — and it is a worse bug than the green row, because somebody would act
+    on it.
+    """
+    (landing_host.repo / "scripts" / "release_tag.py").write_text("import fire\n")
+    monkeypatch.setenv("QB_RELEASE_STAMP", str(landing_host.repo / "gone.py"))
+    blind = qd.Host(**{**landing_host.__dict__, "base_url": None, "token": None,
+                       "harness_bin": tmp_path / "empty" / "bin",
+                       "source_harness": tmp_path / "empty", "gh_cache": {}})
+    _gh_answers(monkeypatch, {}, have_gh=False)
+
+    rows = qd.run_checks(blind, {s.name for s in qd.CHECKS if s.group == "landing"})
+
+    assert len(rows) >= 6
+    for row in rows:
+        assert row.verdict == "unknown"
+        assert row.prompt is None, (
+            f"{row.name} could not be evaluated and produced a brief anyway:\n{row.prompt}")
+        assert row.no_prompt, f"{row.name} carries no brief and does not say why"
+
+
+def test_every_agent_brief_ends_by_re_asking_its_own_row(repo):
+    """#414: an installer's exit code is not the guard being installed, and the answer
+    there was to re-check. So every agent brief's last line is the row itself, re-asked
+    — and spelled as a path INTO THE CHECKOUT, because #422 is an issue about a remedy
+    that named a command the stale host did not carry."""
+    host = host_for(repo)
+    for spec in qd.CHECKS:
+        for verdict, brief in spec.briefs.items():
+            if brief.audience != "agent":
+                continue
+            check = qd.Check(spec.name, "-", "d", verdict,
+                             extra={k: "something" for k in brief.needs})
+            prompt, _who, why = qd.compose(spec, check, host)
+            assert prompt, f"{spec.name}/{verdict}: {why}"
+            last = prompt.splitlines()[-1] if "WHAT THIS RUN" not in prompt else ""
+            assert f"harness/bin/qb-doctor --only {spec.name}" in prompt, (
+                f"{spec.name}/{verdict} does not tell an agent how to know it worked")
+            assert str(repo) in prompt, "the re-check has to name a runnable path"
+            assert last is not None
+
+
+def test_a_manual_and_a_brief_do_not_merge(repo):
+    """A `manual` is one command a person runs; a brief is a paragraph nobody executes.
+    Collapse them and you either put an unrunnable paragraph where the report prints a
+    command, or lose the command."""
+    spec = next(s for s in qd.CHECKS if s.name == "briefs")
+    check = qd.Check("briefs", "/store/commands", "they still tell an agent to stamp",
+                     "fail", manual="qb-bump --host $(hostname)",
+                     extra={"telling": ["fix-and-land.md"]})
+
+    prompt, _who, _why = qd.compose(spec, check, host_for(repo))
+
+    assert check.manual == "qb-bump --host $(hostname)", "the command is untouched"
+    assert prompt.count("\n") > 10, "a brief is a briefing, not a command line"
+    assert "not yours to run blind" in prompt
+    assert check.manual in prompt, "the brief still tells the agent what a person sees"
+
+
+def test_a_human_brief_is_not_dressed_up_as_work(repo):
+    """`unknown` splits in two. "This host cannot see it" is a person's or an installer's
+    job — #279's `needs_human` — and its brief is an escalation, not a fix. Only the
+    registration knows which, so it is a per-verdict field on it."""
+    spec = next(s for s in qd.CHECKS if s.name == "edge")
+    check = qd.Check("edge", "https://board.example", "302 — forward-auth", "unknown")
+
+    prompt, audience, _why = qd.compose(spec, check, host_for(repo))
+
+    assert audience == "human"
+    assert "this is an escalation, not a fix" in prompt
+    assert "--only edge" not in prompt, "a person is not asked to re-run the row"
+
+
+def test_the_report_names_the_briefs_without_printing_them(repo, monkeypatch, capsys):
+    """Seventeen rows and a twenty-line brief each would bury the one word a reader came
+    for. The footer says how many are ready and which rows have none; `--explain` is
+    what prints them."""
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: host_for(repo))
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: [
+        qd.Check("briefs", "/x", "they still tell an agent to stamp", "fail",
+                 prompt="THE BRIEF", prompt_for="agent"),
+        qd.Check("client", "/y", "no venv", "fail", no_prompt="nothing is written for it")])
+
+    qd.main([])
+
+    out = capsys.readouterr().out
+    assert "THE BRIEF" not in out
+    assert "1 row(s) carry a brief ready to hand over (briefs)" in out
+    assert "nothing written for client" in out
+
+
+def test_explain_prints_the_explanation_and_the_brief_under_the_row(repo, monkeypatch,
+                                                                    capsys):
+    rows = [qd.Check("briefs", "/x", "d", "fail", explanation="because it matters",
+                     prompt="THE BRIEF", prompt_for="agent"),
+            qd.Check("queue", "/y", "d", "ok", explanation="not printed", prompt=None)]
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: host_for(repo))
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: rows)
+
+    qd.main(["--explain"])
+
+    out = capsys.readouterr().out
+    assert "because it matters" in out
+    assert "THE BRIEF" in out
+    assert "not printed" not in out, "an ok row has nothing to explain"
+
+
+def test_explain_says_why_a_row_has_no_brief(repo, monkeypatch, capsys):
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: host_for(repo))
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: [
+        qd.Check("client", "/y", "d", "fail", explanation="e" * 60,
+                 no_prompt="no brief is registered for a fail on client")])
+
+    qd.main(["--explain"])
+
+    assert "(no brief: no brief is registered" in capsys.readouterr().out
+
+
+def test_json_carries_the_explanation_and_the_brief(repo, monkeypatch, capsys):
+    """`--json` is the interface a dispatcher would read, and #408's whole point is that
+    the brief exists before anybody writes one by hand."""
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: host_for(repo))
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: [
+        qd.Check("briefs", "/x", "d", "fail", explanation="why", prompt="THE BRIEF",
+                 prompt_for="agent")])
+
+    qd.main(["--json"])
+
+    row = json.loads(capsys.readouterr().out)["checks"][0]
+    assert row["explanation"] == "why"
+    assert row["prompt"] == "THE BRIEF"
+    assert row["prompt_for"] == "agent"
+    assert row["no_prompt"] is None
+
+
+def test_the_brief_travels_through_the_door_the_finding_does(door, landing_host):
+    """#405's `--announce` is the existing seam and the brief goes through it rather than
+    around it. A prompt on a second channel would be a dispatch mechanism wearing an
+    escalation's clothes."""
+    check = qd.Check("briefs", "/store", "they still tell an agent to stamp", "fail",
+                     explanation="a brief is what an agent does",
+                     prompt="DO THE THING", prompt_for="agent")
+
+    qd.announce_failures([check], landing_host, str(BIN / "qb-doctor"))
+
+    detail = door.calls[0]["detail"]
+    assert "DO THE THING" in detail
+    assert "a brief is what an agent does" in detail
+    assert "nothing has run it, and nothing here will" in detail
+
+
+def test_the_doctor_produces_the_prompt_and_never_runs_it(monkeypatch, door,
+                                                          landing_host):
+    """#85, #86, #78 and #335 have each settled this shape: finding a fault and starting
+    an agent to fix it, ungated, is self-approval. The doctor writes the brief; something
+    else decides whether to run it — so no subprocess this tool spawns may carry one.
+    """
+    ran: list[list[str]] = []
+    monkeypatch.setattr(qd, "run_cmd", lambda argv, **kw: (ran.append(argv), (0, "", ""))[1])
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: landing_host)
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: [
+        qd.Check("briefs", "/store", "d", "fail", prompt="MAGIC-BRIEF-TEXT",
+                 prompt_for="agent", fix=["true"])])
+
+    qd.main(["--announce", "--fix"])
+
+    assert door.calls, "it still escalates"
+    assert not any("MAGIC-BRIEF-TEXT" in " ".join(argv) for argv in ran), (
+        "a brief reached a subprocess — the doctor has started dispatching")
