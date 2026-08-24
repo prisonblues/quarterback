@@ -2535,3 +2535,170 @@ def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, t
             f"{name} answered {check.verdict} on a host that could see nothing: "
             f"{check.detail}")
         assert check.detail, f"{name} said unknown without saying why"
+
+
+# --------------------------------------------------------------------------- #
+# --announce: the caller #405 was missing (#274's door)
+# --------------------------------------------------------------------------- #
+
+class _FakeNeedsHuman:
+    """A stand-in for `harness/loops/needs_human.py` that records what it was told.
+
+    The point under test is that the escalation goes through #274's door and not
+    through a second spelling of it, so the test asserts on the CALL rather than on
+    a request body — a hand-rolled `POST /post` here would pass a test written the
+    other way round while putting the fleet's escalations somewhere nobody watches.
+    """
+
+    NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "other")
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def digest(self, *parts: str) -> str:
+        return "|".join(parts)
+
+    def announce(self, **kw) -> str:
+        self.calls.append(kw)
+        return f"needs-human announced as post {len(self.calls)}"
+
+
+@pytest.fixture
+def door(monkeypatch) -> _FakeNeedsHuman:
+    fake = _FakeNeedsHuman()
+    monkeypatch.setitem(sys.modules, "needs_human", fake)
+    return fake
+
+
+def _rows(*specs: tuple[str, str]) -> list[qd.Check]:
+    return [qd.Check(name, "acme/repo@main", f"{name} says so", verdict)
+            for name, verdict in specs]
+
+
+def test_only_a_failing_row_is_announced(door, landing_host):
+    """`unknown` is a check that could not be made, and its ordinary causes — no
+    network, no `gh`, no token — hold for hours. On a timer that would announce
+    forever, so the unattended door carries established findings only. A person
+    typing `qb-doctor` still sees every unknown in the report."""
+    checks = _rows(("queue", "fail"), ("landed", "unknown"), ("tags", "ok"),
+                   ("merges", "warn"))
+
+    said = qd.announce_failures(checks, landing_host, str(BIN / "qb-doctor"))
+
+    assert [c["summary"].split(":")[0] for c in door.calls] == ["queue"]
+    assert len(said) == 1
+
+
+def test_the_escalation_carries_the_class_the_reason_and_the_row(door, landing_host):
+    check = qd.Check("queue", "acme/repo@main",
+                     "7 queued on main and NONE ready — the oldest has waited 3h 10m",
+                     "fail", manual="ask zeus/opal-vermeil, who holds the head (PR #401)",
+                     extra={"queued": 7, "ready": 0, "head_pr": 401})
+    check.group = "landing"
+
+    qd.announce_failures([check], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert call["cls"] in _FakeNeedsHuman.NEEDS_HUMAN_CLASSES
+    assert "NONE ready" in call["summary"]
+    # The reason is the remedy, because #274 refuses an escalation that carries none.
+    assert "zeus/opal-vermeil" in call["reason"]
+    assert "head_pr" in call["detail"]
+    assert {"kind": "pr", "value": "401", "repo": call["repo"]} in call["refs"]
+    assert call["repo"], "the escalation names the repository it is about"
+
+
+def test_a_row_whose_courier_raises_does_not_take_the_rest_of_the_report_down(
+        monkeypatch, door, landing_host):
+    """`announce` documents that it never raises, and this does not take its word for
+    it. The harness on PATH goes stale — there is a row about exactly that — so the
+    copy imported here can be older than the contract, and this runs on a timer where
+    an escape would silence every row behind it."""
+    def explode(**kw):
+        if "queue" in kw["summary"]:
+            raise RuntimeError("the board's client is from another century")
+        return "needs-human announced"
+
+    monkeypatch.setattr(door, "announce", explode)
+
+    said = qd.announce_failures(_rows(("queue", "fail"), ("tags", "fail")),
+                                landing_host, str(BIN / "qb-doctor"))
+
+    assert any("NOT announced" in line and "RuntimeError" in line for line in said)
+    assert any(line == "needs-human announced" for line in said), (
+        "the row behind the failing courier still reached the board")
+
+
+def test_a_row_with_no_head_pr_still_distinguishes_its_own_occurrences(door, landing_host):
+    """The dedupe key is built from what a row says identifies its fault, not from one
+    field the queue row happens to carry. `landed` names the pull requests that are
+    ready and cannot land; two different sets of them are two different findings, and a
+    key that only knew about `head_pr` would suppress the second for twelve hours."""
+    first = qd.Check("landed", "acme/repo", "2 ready, main is 4h old", "fail",
+                     extra={"open": 6, "ready": [401, 403], "tip_age_minutes": 240})
+    second = qd.Check("landed", "acme/repo", "2 ready, main is 5h old", "fail",
+                      extra={"open": 7, "ready": [418, 419], "tip_age_minutes": 300})
+
+    qd.announce_failures([first, second], landing_host, str(BIN / "qb-doctor"))
+
+    assert len({c["key"] for c in door.calls}) == 2
+
+
+def test_the_same_fault_ticking_on_a_timer_keeps_one_key(door, landing_host):
+    """The other direction, and the one that decides whether a timer is usable. A stall
+    reported at 40 minutes and again at 55 is one fault, so how long it has run and how
+    many are behind it are kept out of the key — otherwise every tick is a new question
+    and #274's dedupe protects nobody."""
+    at_40 = qd.Check("queue", "acme/repo@main", "7 queued, none ready", "fail",
+                     extra={"queued": 7, "ready": 0, "waited_minutes": 40, "head_pr": 401})
+    at_55 = qd.Check("queue", "acme/repo@main", "7 queued, none ready", "fail",
+                     extra={"queued": 9, "ready": 0, "waited_minutes": 55, "head_pr": 401})
+
+    qd.announce_failures([at_40, at_55], landing_host, str(BIN / "qb-doctor"))
+
+    assert len({c["key"] for c in door.calls}) == 1
+
+
+def test_a_second_stall_behind_a_different_head_is_not_swallowed_by_the_first(
+        door, landing_host):
+    """#274 dedupes on a key for twelve hours, which is what keeps a timer quiet. The
+    key therefore has to carry what makes THIS stall this one — otherwise the second
+    time the line jams, behind a different PR, the fleet's protection from noise
+    hides the news."""
+    first = qd.Check("queue", "acme/repo@main", "7 queued, none ready", "fail",
+                     extra={"head_pr": 401})
+    second = qd.Check("queue", "acme/repo@main", "4 queued, none ready", "fail",
+                      extra={"head_pr": 419})
+
+    qd.announce_failures([first, second], landing_host, str(BIN / "qb-doctor"))
+
+    keys = [c["key"] for c in door.calls]
+    assert len(set(keys)) == 2, "two different heads are two different questions"
+    assert all("qb-doctor" in k and "queue" in k for k in keys)
+
+
+def test_an_unreachable_door_is_reported_and_never_raised(monkeypatch, landing_host):
+    """An escalation must survive its own courier: the finding stands whether or not
+    the board took the post, and a doctor that crashed on a timer would be silent in
+    exactly the way #405 is about."""
+    monkeypatch.setattr(qd, "loops_dir", lambda _script: None)
+
+    said = qd.announce_failures(_rows(("queue", "fail")), landing_host, "/nowhere/qb-doctor")
+
+    assert said and "NOT announced" in said[0]
+
+
+def test_announcing_changes_neither_the_report_nor_the_exit_code(
+        monkeypatch, door, landing_host, capsys):
+    """`--json` stays a document. A caller piping this into `jq` must not find a
+    courier's progress note spliced into it, and the exit code is the report's."""
+    monkeypatch.setattr(qd, "survey", lambda *_a, **_k: landing_host)
+    monkeypatch.setattr(qd, "run_checks", lambda *_a, **_k: _rows(("queue", "fail")))
+
+    code = qd.main(["--only", "queue", "--announce", "--json"])
+
+    out = capsys.readouterr()
+    assert code == 2
+    assert json.loads(out.out)["checks"][0]["name"] == "queue"
+    assert "needs-human announced" in out.err
+    assert len(door.calls) == 1

@@ -1,0 +1,20 @@
+[Unit]
+Description=Timer for the landing-group escalation (#405)
+
+[Timer]
+# Every 15 minutes, and the number is chosen against the thing being watched.
+# `check_queue` calls a line stalled after 30 minutes with nothing ready, which is
+# more than double the slowest landing measured on #398 — so a 15-minute tick puts
+# the ceiling on noticing at about 45 minutes, against the three hours #405
+# actually ran. Faster buys little: the predicate has its own clock and would just
+# report the same not-yet-a-stall more often.
+OnBootSec=6min
+OnUnitActiveSec=15min
+# No catch-up storm after the box was off: this reports present state, and
+# replaying missed ticks would ask the same question of the same queue several
+# times in a row. The dedupe would swallow the repeats, which is worse — it would
+# spend the twelve-hour key on a backlog rather than on the news.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

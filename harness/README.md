@@ -1964,6 +1964,7 @@ qb-doctor --only hooks,edge   # just those rows
 qb-doctor --only landing      # or a whole group of them
 qb-doctor --human-url URL     # the browser vhost, for the edge check
 qb-doctor --quiet             # only the rows that are not ok
+qb-doctor --announce          # put every FAILING row on the board (for a timer)
 ```
 
 ```
@@ -2091,6 +2092,38 @@ use".
 system was never wrong about who should land next, only about who was still there. So the
 stalled-queue row carries no `fix`; what it carries is the name of whoever holds the head,
 because a stalled queue is somebody to talk to.
+
+##### `--announce` — the caller these rows were missing (#405)
+
+This group had the right predicate on the night it was written for and nobody ran it. A
+doctor is a command a person types, and the whole of #405 is that nobody was there to type
+anything: seven green pull requests, zero ready, `main` unmoved for over three hours, every
+surface green, and it took a human noticing that a version number had not changed.
+
+So the missing piece was never a second predicate — it was a caller. `--announce` puts every
+**failing** row on the board through the needs-human door (#274), which is the one place the
+harness escalates from, and
+[`loops/systemd/qb-doctor-landing.{service,timer}`](loops/systemd/) run it every fifteen
+minutes:
+
+```bash
+qb-doctor --only landing --announce --quiet
+systemctl --user enable --now qb-doctor-landing.timer
+```
+
+- **`fail` only.** An `unknown` is a check that could not be *made*, and its ordinary causes
+  — no network, no `gh`, no board token — hold for hours, so on a timer they would announce
+  forever. Every unknown is still printed in the report, which is where that distinction
+  earns its keep; the unattended door carries established findings.
+- **The dedupe key carries the head PR.** #274 does not repeat a key inside twelve hours,
+  which is what keeps a timer quiet — and a key that named only the row would let a second
+  stall, behind a different pull request, be swallowed as if it were the first. Protection
+  from noise must not become suppression of news.
+- **Announcing changes nothing else.** It writes to stderr, so `--json` stays a document a
+  caller can pipe into `jq`, and the exit code is still the report's. An escalation that
+  cannot be posted is still printed: the finding stands whether or not the board took it.
+- **Still advisory.** Nothing in the unit merges, evicts or re-orders anything. It says the
+  line has stopped and names somebody to ask.
 
 ##### `queue` — the pair, and the clock
 

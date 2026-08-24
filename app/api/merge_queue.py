@@ -47,12 +47,12 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import func, literal, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import clean_session, is_unique_violation, live_claim
-from app.auth import identify, reader
+from app.auth import identify, optional_identity, reader
 from app.claimkey import BadRef, derive
 from app.db import get_session
 from app.models.merge_queue import PROCEEDS, VERDICTS, MergeQueueEntry
@@ -63,9 +63,17 @@ router = APIRouter(tags=["merge-queue"])
 #: How long an entry survives without being renewed. Much shorter than a claim's
 #: hour, and on purpose: a lapsed claim frees a resource nobody is using, while a
 #: lapsed queue entry lets everybody behind it move. The cost of getting this
-#: wrong is asymmetric — an agent that is still working re-enqueues on its next
-#: poll and keeps its place (``entered_at`` is never bumped), whereas a head that
-#: died holds the whole line for however long this is.
+#: wrong is asymmetric — an agent that is still working renews on its next poll
+#: and keeps its place (``entered_at`` is never bumped), whereas a head that died
+#: holds the whole line for however long this is.
+#:
+#: The number is not what #405 was about, and raising it was the wrong fix twice.
+#: What renews an entry is: see :func:`_renew_on_read`. Until that landed, every
+#: act that renewed one — enqueue at a new head, in practice a push — was an act
+#: this endpoint's own ``reason`` tells a waiter not to take, so the agents most
+#: likely to lose their place were the ones following instructions. PR #398's
+#: landing was measured at 5m37s against this 1800s window; the 30 minutes that
+#: expired its entry were 27 minutes of waiting politely.
 DEFAULT_TTL = 1800
 MAX_TTL = 86_400
 
@@ -149,9 +157,12 @@ async def _sweep_lapsed(session: AsyncSession, repo: str, base: str,
     head, and a board that showed them alike would report an abandoned land as a
     finished one.
 
-    Called only from the write paths. ``GET`` filters expired rows on the way past
-    instead — a read must not mutate, which is the rule ``GET /claims`` already
-    keeps.
+    Called only from the write paths, and still is. ``GET`` filters expired rows
+    on the way past rather than sweeping them, so a read never retires anybody
+    else's entry — the rule ``GET /claims`` keeps, and the half of it that matters:
+    one caller's read must not change what another caller is told. The one write a
+    read now makes is :func:`_renew_on_read`, which touches a single row, only the
+    caller's own, and only to push its expiry out.
     """
     await session.execute(
         update(MergeQueueEntry)
@@ -177,6 +188,162 @@ async def _live_entries(session: AsyncSession, repo: str, base: str,
                MergeQueueEntry.left_at.is_(None), MergeQueueEntry.expires_at > now)
         .order_by(MergeQueueEntry.entered_at, MergeQueueEntry.pr)
     )).all())
+
+
+#: A renewal is written as ``now + ttl_seconds``, and ``ttl_seconds`` is a column,
+#: so the arithmetic happens in the database rather than in a read-then-write that
+#: two overlapping polls could interleave.
+_ONE_SECOND = text("interval '1 second'")
+
+
+async def _renew_on_read(session: AsyncSession, repo: str, base: str, pr: int,
+                         caller: str | None, now: datetime) -> datetime | None:
+    """Push this PR's expiry out because its own holder just asked where it is.
+
+    Returns the new expiry, or None when nothing was renewed.
+
+    **A waiter asking its position IS the liveness the TTL was approximating.**
+    Before this, the only acts that renewed an entry were enqueues — in practice a
+    push, an integration, a re-run of CI — and :func:`decide` tells a non-head not
+    to do any of them, because each costs a real CI run to learn what the line
+    already says and invalidates the head's checks on the way past. So obeying the
+    queue was what made an agent lapse from it, and the entries that expired were
+    the well-behaved ones. #405 measured that twice on one night: PR #398's whole
+    landing took 5m37s against a 1800-second window, and it lost its place anyway,
+    27 minutes of which was spent waiting quietly. Renewing on the read removes the
+    proxy and measures the thing itself.
+
+    It still fails safe, which is the only property the TTL was ever for: an agent
+    that has genuinely died stops reading, and its entry lapses exactly as before.
+    An agent that polls forever holds its place forever — deliberately, because
+    "still asking" and "still working" are the same fact from the board's side, and
+    a head that holds position without landing is a thing to *observe* (qb-doctor's
+    `queue` row) rather than a thing for this endpoint to evict. #405 and #227 both
+    settled that the queue stays advisory.
+
+    **Only the entry's own holder renews it, and that is the whole authorisation.**
+    The holder recorded here is what :func:`app.auth.identify` returned to the
+    enqueue — machine proved by the token, agent name allocated by the board — and
+    the caller is resolved the same way, so this is not a field anybody can assert
+    about themselves. Everything else that reads this endpoint renews nothing:
+
+    * a **browser** on the human board authenticates at the edge and resolves to
+      ``human/<user>``, which no entry is ever held by;
+    * a **peer** checking on the head it waits behind (the whole reason ``pr`` may
+      name somebody else's PR) is not evidence that the head's agent is alive —
+      renewing there would let the queue's most attentive waiter hold a dead head's
+      place indefinitely, which is precisely the case the timer exists for;
+    * a **monitor** — `qb-doctor`, `qb-dash`, `qb-reconcile` — reads the queue
+      whole, without a ``pr``, and renews nothing at all. That is why a bare read
+      does not renew everything the caller holds: a poller on the same box would
+      otherwise keep a dead agent's entry alive, and nothing on the board could
+      tell the two apart.
+
+    A **lapsed** entry is not renewed back to life: ``expires_at > now`` is in the
+    predicate, so this cannot resurrect what a sweep has already retired, and a
+    holder whose entry has gone re-enqueues (at the back, which is honest) rather
+    than discovering it had silently been restored.
+
+    ``updated_at`` is deliberately NOT moved. That column orders *content* writes —
+    :func:`_join` refuses an enqueue stamped older than the row it would overwrite,
+    which is what stops a slow poll putting a stale ``ready`` verdict back onto a
+    commit the PR has moved off. A read that bumped it would make an in-flight
+    enqueue lose that comparison and report the PR's old head back to the agent
+    that had just told it the new one.
+
+    Two things a second reviewer (codex) asked about, recorded here because the
+    answers are the design rather than an oversight:
+
+    * **Within one machine token, this grants nothing new.** The agent key that
+      distinguishes ``zeus/one`` from ``zeus/two`` is client-supplied and unproved
+      — :mod:`app.identity` says why — so anything holding that machine's bearer
+      token can present itself as either. It could also simply
+      ``POST /merge-queue/enqueue`` for that PR, which rewrites ``holder``,
+      ``verdict``, ``head_sha`` and the expiry together. Renewal is strictly less
+      than that, and the boundary it does enforce is the one a token actually
+      proves: another *machine*, and a person at the human board, renew nothing.
+    * **Expiry is judged against this request's own ``now``**, the single stamp
+      :func:`_sweep_lapsed` and :func:`_live_entries` also use, so the three cannot
+      disagree inside one answer. The cost is a window between stamping ``now`` and
+      executing this statement — the first thing the handler does — in which an
+      entry could cross its expiry and be renewed a moment after lapsing. That is
+      sub-millisecond and self-correcting; a second clock source, judging one row by
+      wall time while the response's own listing judged it by the request stamp,
+      would buy it back by letting one answer contradict itself.
+    """
+    if caller is None:
+        return None
+    got = await session.execute(
+        update(MergeQueueEntry)
+        .where(MergeQueueEntry.repo == repo, MergeQueueEntry.base == base,
+               MergeQueueEntry.pr == pr, MergeQueueEntry.left_at.is_(None),
+               MergeQueueEntry.expires_at > now,
+               MergeQueueEntry.holder == caller)
+        # GREATEST, so a renewal can only ever push the expiry out. Two of one
+        # agent's polls can overlap — it is a poll loop, that is what they do — and
+        # a plain assignment would let the older one land second and pull the entry
+        # in by the gap between them. Renewal is a floor under the expiry, never a
+        # restatement of it. (codex)
+        .values(expires_at=func.greatest(
+            MergeQueueEntry.expires_at,
+            literal(now) + MergeQueueEntry.ttl_seconds * _ONE_SECOND))
+        .returning(MergeQueueEntry.expires_at)
+    )
+    fresh = got.scalar_one_or_none()
+    await session.commit()
+    return fresh
+
+
+def _machine(agent: str) -> str:
+    """The half of a board identity a token proves — ``zeus`` of ``zeus/jasper-moss``.
+
+    Used only to phrase a refusal, never to grant one: a machine runs several
+    agents at once and they all authenticate as it, so "same box" is not "same
+    session" and cannot be what authorises a renewal.
+    """
+    return agent.partition("/")[0]
+
+
+def _renewal_view(entries: list[MergeQueueEntry], pr: int, caller: str | None,
+                  renewed: datetime | None) -> dict:
+    """Did this read keep the PR's place, and if not, why not — said out loud.
+
+    Reported rather than done silently, because a renewal an agent cannot observe
+    is a renewal it cannot rely on: the failure #405 records is precisely a queue
+    that was faithfully reporting its state to anyone who asked while nobody could
+    see the mechanism that was retiring them. An agent that is polling to hold its
+    place gets to read back that the polling worked, and a peer that expected to
+    be renewing somebody else learns in one line that it never was.
+    """
+    if renewed is not None:
+        return {"renewed": True, "expires": renewed.isoformat(),
+                "why": f"this read renewed #{pr}'s entry: you hold it, and asking "
+                       f"where you are in the line is what keeps your place"}
+    entry = next((e for e in entries if e.pr == pr), None)
+    if caller is None:
+        why = ("nothing was renewed: this read carried no agent identity. Only the "
+               "agent an entry names can renew it, and a read authorised at the "
+               "edge is a person looking, not an agent working")
+    elif entry is None:
+        why = (f"nothing was renewed: #{pr} has no live entry on this base, so "
+               f"there is no place to keep")
+    elif entry.holder != caller:
+        why = (f"nothing was renewed: #{pr}'s entry is held by {entry.holder}, and "
+               f"only its holder renews it — your reading about it is not evidence "
+               f"that they are still there")
+        if _machine(entry.holder) == _machine(caller):
+            # The near miss, and the one worth spelling out: a box runs several
+            # agents, and a caller that authenticated as the bare machine (or as a
+            # different agent on it) is not the session that enqueued. Said with
+            # the way out, because there is one and it costs nothing — enqueueing
+            # again rewrites `holder` and never touches `entered_at`.
+            why += (f". That is this machine under another name, so if the land has "
+                    f"been handed over, enqueue #{pr} again — it rewrites the holder "
+                    f"and keeps the place")
+    else:
+        why = (f"nothing was renewed: #{pr}'s entry was retired between this read "
+               f"and the renewal, so it is no longer in the line")
+    return {"renewed": False, "expires": None, "why": why}
 
 
 def is_ready(entry: MergeQueueEntry) -> bool:
@@ -256,7 +423,9 @@ def decide(entries: list[MergeQueueEntry], pr: int,
     behaviour this replaces gets wrong. A non-head may do neither: it must not
     rebase, push or restart CI, because all three cost a real CI run to discover
     something the board already knew, and the push also invalidates the head's
-    green checks. The head may integrate — that is what its slot is for — but may
+    green checks. The one thing it *may* do is ask again — and since #405 that is
+    also what holds its place, so the advice no longer costs an agent the entry it
+    is being advised about. The head may integrate — that is what its slot is for — but may
     only merge while the board holds a ``ready`` verdict about the commit the PR
     is actually on.
 
@@ -293,7 +462,8 @@ def decide(entries: list[MergeQueueEntry], pr: int,
             "reason": (f"queued behind #{ahead.pr}, position {position} of "
                        f"{len(order)} — do not rebase, push or restart CI: you "
                        f"would spend a run to learn what this line already says, "
-                       f"and invalidate #{ahead.pr}'s checks doing it"),
+                       f"and invalidate #{ahead.pr}'s checks doing it. Poll this "
+                       f"endpoint instead: asking is what keeps your place"),
             "waiting_on": {"pr": ahead.pr, "holder": ahead.holder,
                            "session": ahead.session, "note": ahead.note},
         }
@@ -407,11 +577,13 @@ async def read_queue(
     repo: str = Query(..., min_length=1, description="`owner/name`"),
     base: str = Query(..., min_length=1, description="the branch being landed onto"),
     pr: int | None = Query(default=None, ge=1,
-                           description="also answer `you`: what may THIS pr do right now"),
+                           description="also answer `you`: what may THIS pr do right "
+                                       "now — and renew that entry, if you hold it"),
     head: str | None = Query(default=None, min_length=7, max_length=64,
                              description="`pr`'s head oid as YOU see it — how a head "
                                          "change invalidates readiness without a write"),
     _: str = Depends(reader),
+    caller: str | None = Depends(optional_identity),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """The line for one base: who is next, who is waiting, and what each waits on.
@@ -422,12 +594,25 @@ async def read_queue(
     this release can populate it.
 
     Expired-but-unswept entries are filtered out on the way past rather than swept,
-    because a read must not mutate — the rule ``GET /claims`` keeps. So this view
-    and the unique index can briefly disagree about one lapsed row, and the reader
-    that matters (an agent deciding whether it may move) gets the truthful answer.
+    so this view and the unique index can briefly disagree about one lapsed row, and
+    the reader that matters (an agent deciding whether it may move) gets the truthful
+    answer.
+
+    **Asking where you are in the line keeps your place.** Sending ``pr`` renews
+    that entry when — and only when — the entry names you as its holder, and the
+    answer says so in ``renewal``. This is the one write on a read path in this
+    module and :func:`_renew_on_read` argues it: every *other* act that renewed an
+    entry is an act the ``reason`` below tells a waiter not to take, so a queue
+    whose TTL only noticed writes was retiring the agents that obeyed it (#405).
+    Nothing else here mutates: a peer's read, a monitor's poll and a browser's page
+    load all renew nothing, and an entry that has already lapsed is not revived.
     """
     canon_repo, canon_base, key = _scope(repo, base)
     now = _utcnow()
+    # Before the entries are read, so the view reports the expiry this very call
+    # just wrote rather than the one it replaced.
+    renewed = (await _renew_on_read(session, canon_repo, canon_base, pr, caller, now)
+               if pr is not None else None)
     entries = await _live_entries(session, canon_repo, canon_base, now)
     claim = await live_claim(session, "merge", key, now)
     out = {
@@ -458,6 +643,7 @@ async def read_queue(
     }
     if pr is not None:
         out["you"] = decide(entries, pr, at_head=_norm_sha(head) if head else None)
+        out["renewal"] = _renewal_view(entries, pr, caller, renewed)
     elif head is not None:
         # A head with no PR names nothing. Refused rather than ignored: a caller
         # that believed it was asking "is my entry stale" and silently got the

@@ -20,6 +20,11 @@ lock:
 * **Readiness is about a commit, not a memory.** A head change invalidates it.
 * **Enqueue is idempotent and never costs a place.** An agent that has just been
   refused is meant to call it again on its next poll.
+* **Asking where you are keeps your place, and only your own** (#405). Every act
+  that used to renew an entry is an act the queue's own `reason` tells a waiter not
+  to take, so the entries that lapsed were the well-behaved ones. A read naming a
+  PR renews it when the caller holds it; a peer, a person and a monitor renew
+  nothing, and a lapsed entry is not revived.
 * **It is not a second lock.** No path here writes a `kind='merge'` claim, and
   the head being ready confers no claim at all — it says go and ask for one.
 
@@ -34,10 +39,11 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select, update
 from sqlalchemy import text as sa_text
-from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
+import app.api.merge_queue as mq
 from app.db import async_session
 from app.models.merge_queue import MergeQueueEntry
 
@@ -83,6 +89,37 @@ async def leave(client, pr: int, reason: str = "merged", headers=LAPTOP, *,
                           headers=headers)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+async def _entry(pr: int, *, repo: str = REPO, base: str = BASE) -> MergeQueueEntry:
+    """The live row for a PR, read behind the endpoint's back."""
+    async with async_session() as s:
+        got = await s.scalar(
+            select(MergeQueueEntry).where(
+                MergeQueueEntry.repo == repo, MergeQueueEntry.base == base,
+                MergeQueueEntry.pr == pr, MergeQueueEntry.left_at.is_(None)))
+        assert got is not None, f"#{pr} has no live entry"
+        return got
+
+
+async def _nearly_expired(pr: int, seconds: int = 30, *, repo: str = REPO,
+                          base: str = BASE) -> datetime:
+    """Wind an entry's expiry down to `seconds` away, and say where it now sits.
+
+    Renewal is `now + ttl_seconds`, so an entry left at its full window moves by
+    only the microseconds a request takes — a difference a test could assert on
+    and learn nothing from. Winding it down first makes the renewal the size of
+    the TTL, which is the thing that either happened or did not.
+    """
+    when = datetime.now(UTC) + timedelta(seconds=seconds)
+    async with async_session() as s:
+        await s.execute(
+            update(MergeQueueEntry)
+            .where(MergeQueueEntry.repo == repo, MergeQueueEntry.base == base,
+                   MergeQueueEntry.pr == pr, MergeQueueEntry.left_at.is_(None))
+            .values(expires_at=when))
+        await s.commit()
+    return when
 
 
 async def _expire(repo: str, base: str, pr: int) -> None:
@@ -772,3 +809,414 @@ async def test_a_leave_naming_its_entry_cannot_retire_a_later_one(client):
               "entry_id": again["entry"]["entry_id"]}, headers=LAPTOP)
     assert good.status_code == 200 and good.json()["left"] is True
     assert good.json()["active_order"] == []
+
+
+# ------------------------------------------------ #405: asking is what keeps your place
+
+
+async def test_asking_where_you_are_in_the_line_is_what_keeps_your_place(client):
+    """The fix, and the defect it is against.
+
+    Every act that renewed an entry before this — enqueue at a new head, which in
+    practice means a push — is an act the queue's own refusal tells a waiter not to
+    take: *"do not rebase, push or restart CI"*. So the entries that lapsed were the
+    ones whose agents obeyed, and the way to keep a place in the line was to ignore
+    the advice the line gives you. A waiter asking where it is IS the liveness the
+    TTL was approximating, so it is now measured directly.
+    """
+    repo = "acme/renew"
+    await join(client, repo=repo, pr=601, headers=LAPTOP)
+    close = await _nearly_expired(601, repo=repo)
+
+    body = await read(client, repo=repo, pr=601, headers=LAPTOP)
+
+    row = await _entry(601, repo=repo)
+    assert row.expires_at > close + timedelta(minutes=25), (
+        "a read by the entry's own holder must push the expiry out by the TTL")
+    assert body["renewal"]["renewed"] is True
+    assert "keeps your place" in body["renewal"]["why"]
+    assert body["renewal"]["expires"] == row.expires_at.isoformat()
+    # And the advice and the mechanism now agree, which is the whole repair.
+    second = await read(client, repo=repo, pr=601, headers=LAPTOP)
+    assert "asking is what keeps your place" not in second["you"]["reason"], (
+        "the head is not the one being told to wait")
+
+
+async def test_the_advice_that_used_to_cost_a_waiter_its_place_now_names_the_renewal(client):
+    repo = "acme/advice"
+    await join(client, repo=repo, pr=610, headers=LAPTOP)
+    await join(client, repo=repo, pr=611, headers=SERVER)
+
+    body = await read(client, repo=repo, pr=611, headers=SERVER)
+
+    reason = body["you"]["reason"]
+    assert "do not rebase, push or restart CI" in reason
+    assert "asking is what keeps your place" in reason, (
+        "a refusal that leaves an agent nothing to do that would renew its entry is "
+        "the defect; the refusal has to name the thing that does")
+    assert body["renewal"]["renewed"] is True
+
+
+async def test_a_peer_reading_about_your_entry_renews_nothing(client):
+    """The authorisation, and the property the TTL has left.
+
+    A peer at position 2 watching the head is the most attentive reader the queue
+    has — and its attention says nothing about whether the head's agent is alive. If
+    that read renewed, a dead head would be held in place by the very agent it is
+    blocking, which is exactly the case the timer exists for.
+    """
+    repo = "acme/peerread"
+    await join(client, repo=repo, pr=602, headers=LAPTOP)
+    close = await _nearly_expired(602, repo=repo)
+
+    body = await read(client, repo=repo, pr=602, headers=DESKTOP)
+
+    assert body["renewal"]["renewed"] is False
+    assert "laptop" in body["renewal"]["why"]
+    row = await _entry(602, repo=repo)
+    assert abs((row.expires_at - close).total_seconds()) < 1
+
+
+async def test_another_agent_on_the_holders_own_machine_renews_nothing(client):
+    """A box runs several agents and they all authenticate as it.
+
+    So "same machine" cannot be what authorises a renewal — it would let any agent
+    on the box hold a dead peer's place. The refusal names the way out instead, and
+    it is one that costs nothing: re-enqueueing rewrites the holder and leaves
+    `entered_at` alone.
+    """
+    repo = "acme/sibling"
+    driver = {**LAPTOP, "X-Agent-Key": "driver405"}
+    sibling = {**LAPTOP, "X-Agent-Key": "sibling405"}
+    entered = await join(client, repo=repo, pr=603, headers=driver)
+    assert entered["entry"]["holder"].startswith("laptop/")
+    close = await _nearly_expired(603, repo=repo)
+
+    body = await read(client, repo=repo, pr=603, headers=sibling)
+
+    assert body["renewal"]["renewed"] is False
+    assert "this machine under another name" in body["renewal"]["why"]
+    assert "enqueue #603 again" in body["renewal"]["why"]
+    row = await _entry(603, repo=repo)
+    assert abs((row.expires_at - close).total_seconds()) < 1
+
+
+async def test_a_monitor_reading_the_whole_queue_renews_nothing(client):
+    """`qb-doctor`, `qb-dash` and `qb-reconcile` read the line without naming a PR.
+
+    That is why a bare read does not renew everything the caller holds: a poller on
+    the same box would otherwise keep a dead agent's entry alive on a timer, and
+    nothing on the board could tell that apart from an agent still working.
+    """
+    repo = "acme/monitor"
+    await join(client, repo=repo, pr=604, headers=LAPTOP)
+    close = await _nearly_expired(604, repo=repo)
+
+    body = await read(client, repo=repo, headers=LAPTOP)
+
+    assert "renewal" not in body, "a read that names no PR renews nothing and says so by silence"
+    row = await _entry(604, repo=repo)
+    assert abs((row.expires_at - close).total_seconds()) < 1
+
+
+async def test_a_person_looking_at_the_board_renews_nobodys_entry(client):
+    """The human board reads this endpoint too, through the edge.
+
+    A person watching the queue is not evidence that the agent driving #605 is
+    alive, and both tiers of browser identity are refused: an edge-vouched
+    `human/rich`, who is somebody but is not the holder, and a bare `Remote-User`
+    that resolves to nobody at all.
+    """
+    repo = "acme/browsing"
+    await join(client, repo=repo, pr=605, headers=LAPTOP)
+    close = await _nearly_expired(605, repo=repo)
+
+    vouched = await read(client, repo=repo, pr=605,
+                         headers={"Remote-User": "rich", "X-Edge-Auth": "tok-edge"})
+    assert vouched["renewal"]["renewed"] is False
+    assert "laptop" in vouched["renewal"]["why"]
+
+    bare = await read(client, repo=repo, pr=605, headers={"Remote-User": "rich"})
+    assert bare["renewal"]["renewed"] is False
+    assert "no agent identity" in bare["renewal"]["why"]
+
+    row = await _entry(605, repo=repo)
+    assert abs((row.expires_at - close).total_seconds()) < 1
+
+
+async def test_a_lapsed_entry_is_not_renewed_back_into_the_line(client):
+    """Renewal holds a place; it does not restore one.
+
+    An entry the queue has already stopped counting has let everybody behind it
+    move, and quietly reviving it on the next poll would put a PR back in a line
+    that has advanced past it. The holder is told there is no place to keep, and
+    re-enqueues at the back — which is honest, and is what the response says.
+    """
+    repo = "acme/lapsed"
+    await join(client, repo=repo, pr=606, headers=LAPTOP)
+    await _expire(repo, BASE, 606)
+
+    body = await read(client, repo=repo, pr=606, headers=LAPTOP)
+
+    assert body["renewal"]["renewed"] is False
+    assert "no live entry" in body["renewal"]["why"]
+    assert body["active_order"] == []
+    assert body["you"]["queued"] is False
+
+
+async def test_a_renewal_moves_the_expiry_and_leaves_the_write_order_alone(client):
+    """`updated_at` orders CONTENT writes, and a read must not compete in that order.
+
+    `_join` refuses an enqueue stamped older than the row it would overwrite — that
+    is what stops a slow poll putting a stale `ready` verdict back onto a commit the
+    PR has moved off. A read that bumped `updated_at` would make an in-flight
+    enqueue lose that comparison and be answered with the PR's old head, by the
+    board, after it had just been told the new one.
+    """
+    repo = "acme/writeorder"
+    await join(client, repo=repo, pr=607, headers=LAPTOP)
+    before = await _entry(607, repo=repo)
+    await _nearly_expired(607, repo=repo)
+
+    await read(client, repo=repo, pr=607, headers=LAPTOP)
+
+    after = await _entry(607, repo=repo)
+    assert after.updated_at == before.updated_at
+    assert after.head_sha == before.head_sha
+    assert after.expires_at > before.expires_at
+
+
+async def test_renewing_never_moves_a_pr_in_the_line(client):
+    """The FIFO key is untouched: renewing is not re-arriving."""
+    repo = "acme/fifokey"
+    first = await join(client, repo=repo, pr=608, headers=LAPTOP)
+    await join(client, repo=repo, pr=609, headers=SERVER)
+
+    for _ in range(3):
+        await read(client, repo=repo, pr=608, headers=LAPTOP)
+
+    assert (await read(client, repo=repo, headers=LAPTOP))["active_order"] == [608, 609]
+    assert (await _entry(608, repo=repo)).entered_at.isoformat() == first["entry"]["entered"]
+
+
+async def test_an_overtaken_poll_cannot_pull_an_entry_in(client, monkeypatch):
+    """A renewal is a floor under the expiry, not a restatement of it.
+
+    One agent's polls overlap — it is a poll loop, that is what they do — and a
+    plain assignment would let the older of two land second and pull the entry in
+    by the gap between them. Nothing about "I asked" should ever shorten a window.
+    """
+    repo = "acme/floor"
+    await join(client, repo=repo, pr=612, headers=LAPTOP)
+    await read(client, repo=repo, pr=612, headers=LAPTOP)
+    stood_at = (await _entry(612, repo=repo)).expires_at
+
+    # The same agent's earlier poll, delayed on the wire, arriving second.
+    monkeypatch.setattr(mq, "_utcnow",
+                        lambda: datetime.now(UTC) - timedelta(minutes=5))
+    late = await read(client, repo=repo, pr=612, headers=LAPTOP)
+
+    assert (await _entry(612, repo=repo)).expires_at == stood_at
+    assert late["renewal"]["expires"] == stood_at.isoformat()
+
+
+# --------------------------------- #405, reconstructed: the night of 2026-08-22
+
+
+class _Clock:
+    """A hand-wound `now` for the endpoint, so a half-hour costs no wall time.
+
+    Every timestamp the queue writes and every comparison it makes goes through
+    `merge_queue._utcnow`, so winding this forward is the whole of "time passed" —
+    no sleeping, and no TTL shrunk to two seconds, which would test a different
+    number from the one that shipped.
+    """
+
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def tick(self, minutes: float) -> datetime:
+        self.now += timedelta(minutes=minutes)
+        return self.now
+
+
+#: The line as it stood, in arrival order: the one that was landing, then three
+#: that were finished, green and waiting their turn.
+_HEAD, _WAITERS = 391, (398, 397, 399)
+
+
+def _agent(pr: int) -> dict:
+    """One agent per PR, each addressable in its own right — the real shape.
+
+    Four sessions on one box all authenticate as that box, so the holder recorded
+    on an entry is `laptop/<name>`. It matters here because the whole question is
+    whose read renews what.
+    """
+    return {**LAPTOP, "X-Agent-Key": f"night{pr}"}
+
+
+async def _the_stalled_night(client, monkeypatch, *, repo: str, renews: bool) -> dict:
+    """Replay the measured failure: one landing, three waiting politely.
+
+    `renews=False` is the code as it stood — the read path wrote nothing at all, so
+    the only act that could renew an entry was an enqueue, which in practice means
+    a push. `renews=True` is this fix. Everything else is identical, including what
+    each agent does, which is the point: the difference is not in the agents'
+    behaviour but in whether obeying the queue costs them their place.
+    """
+    if not renews:
+        async def _no_renewal(*_args, **_kw):
+            return None
+        # `raising=False` so this replay also runs against a tree that has no
+        # renewal to remove — which is what makes the pair a before/after rather
+        # than two readings of the same code. Against the fix, patching it out IS
+        # the old behaviour; against the pre-fix tree, the patch is a no-op and the
+        # old behaviour is simply what happens.
+        monkeypatch.setattr(mq, "_renew_on_read", _no_renewal, raising=False)
+
+    clock = _Clock(datetime.now(UTC))
+    monkeypatch.setattr(mq, "_utcnow", clock)
+
+    # 01:12 — four PRs take their places a minute apart, in arrival order. Their
+    # windows therefore close a minute apart too: +30, +31, +32, +33.
+    line = (_HEAD, *_WAITERS)
+    for pr in line:
+        await join(client, repo=repo, pr=pr, head=SHA_A, headers=_agent(pr),
+                   note=f"landing #{pr}")
+        if pr != line[-1]:
+            clock.tick(1)
+    assert (await read(client, repo=repo))["active_order"] == [_HEAD, *_WAITERS]
+
+    # +12 — the head integrates. This is a push, and a push has ALWAYS renewed:
+    # the enqueue that reports the new head moves the expiry out to +42.
+    clock.tick(9)
+    await join(client, repo=repo, pr=_HEAD, head=SHA_B, headers=_agent(_HEAD),
+               note="integrated origin/main, second CI cycle")
+
+    # +22 and +32 — the waiters do the one thing the queue permits them: ask. No
+    # rebase, no push, no CI run, exactly as `you.reason` instructs.
+    polls: list[dict] = []
+    for _ in range(2):
+        clock.tick(10)
+        for pr in _WAITERS:
+            polls.append(await read(client, repo=repo, pr=pr, headers=_agent(pr)))
+
+    # +36 — past every waiter's window and inside the head's, which its
+    # integration push moved. This is where the two versions of this code diverge.
+    clock.tick(4)
+    return {"clock": clock, "view": await read(client, repo=repo), "polls": polls}
+
+
+async def test_before_the_fix_the_agents_that_obeyed_the_queue_lost_their_places(
+        client, monkeypatch):
+    """The defect, reconstructed against the code as it stood.
+
+    Three PRs, green and finished, spent half an hour doing precisely what the
+    queue told them to do — *"do not rebase, push or restart CI"* — and were
+    retired for it. The head, which pushed, kept its place. So the timer was not
+    catching a dead agent: it was catching every agent that followed instructions,
+    and sparing the one that did the expensive thing.
+
+    Then the compounding, which is what the measurements record. Each lapsed PR
+    re-enqueues — that is what its brief says to do — and re-entry is a new
+    arrival, so the line comes back in whatever order the agents happened to
+    notice. #398, which arrived first among the three and had already integrated,
+    is now last, behind two PRs that never did.
+    """
+    repo = "acme/thenight-before"
+    night = await _the_stalled_night(client, monkeypatch, repo=repo, renews=False)
+
+    assert night["view"]["active_order"] == [_HEAD], (
+        "every waiter lapsed; the only entry left is the one that pushed")
+    assert night["view"]["counts"]["queued"] == 1
+
+    # The polls record the retirement happening. At +22 all three are in the line
+    # and are told to sit still. At +32 the first two are already out of it — and
+    # the call that told them so is the call that would have kept them in.
+    early, late = night["polls"][:3], night["polls"][3:]
+    for poll in early:
+        assert poll["you"]["queued"] is True
+        assert poll["you"]["may_integrate"] is False
+    assert [poll["you"]["queued"] for poll in late] == [False, False, True], (
+        "windows close in arrival order, so the PR that had waited longest is the "
+        "first to be dropped for waiting")
+
+    # And a PR absent from the queue is indistinguishable from one that never
+    # joined it, which is the sentence each of them is now told.
+    gone = await read(client, repo=repo, pr=398, headers=_agent(398))
+    assert gone["you"]["queued"] is False
+    assert "not in the queue" in gone["you"]["reason"]
+
+    # Re-entry, in the order the three agents happen to poll next.
+    for pr in (399, 397, 398):
+        night["clock"].tick(1)
+        await join(client, repo=repo, pr=pr, head=SHA_C, headers=_agent(pr),
+                   verdict="ready", note="re-joining after my entry lapsed")
+    back = await read(client, repo=repo, pr=398, headers=_agent(398))
+    assert back["active_order"] == [_HEAD, 399, 397, 398]
+    assert back["you"]["position"] == 4, (
+        "the PR that arrived first among the waiters, and the only one of the "
+        "three that had integrated, is now last in a line it was second in")
+
+
+async def test_after_the_fix_a_waiter_that_only_asks_keeps_its_place_for_hours(
+        client, monkeypatch):
+    """The same night, the same agents, the same polite behaviour — and the line
+    is still the line.
+
+    Nothing about the agents changed and nothing new was asked of them: the read
+    they were already making to find out whether it was their turn is now also what
+    holds their place. Half an hour in, past a window every one of them was inside
+    when the old code retired them, all four entries stand in arrival order, none
+    of them has spent a CI run, and none of them has written anything to the board
+    since it joined.
+
+    Then the wait the measurements actually record. #403, #404 and #401 each spent
+    between 312 and 327 minutes queued for under an hour of work, so half an hour is
+    not the case that matters — a window that survived one landing would lapse ten
+    times over across five hours. The second half of this test polls for five of
+    them and asserts the line is still the line at the end.
+    """
+    repo = "acme/thenight-after"
+    night = await _the_stalled_night(client, monkeypatch, repo=repo, renews=True)
+
+    assert night["view"]["active_order"] == [_HEAD, *_WAITERS]
+    assert night["view"]["counts"]["queued"] == 4
+    for poll in night["polls"]:
+        assert poll["renewal"]["renewed"] is True
+        assert poll["you"]["queued"] is True
+
+    # Positions are the arrival positions, not new ones bought by re-enqueueing.
+    for expected, pr in enumerate(_WAITERS, start=2):
+        mine = await read(client, repo=repo, pr=pr, headers=_agent(pr))
+        assert mine["you"]["position"] == expected
+        assert mine["you"]["may_integrate"] is False, (
+            "still a waiter: renewal buys a place in the line, never permission")
+
+    # Five more hours of polite waiting — the measured shape of #403 (312 min
+    # queued for ~60 min of work), #404 (327) and #401 (332). Nobody pushes,
+    # nobody re-enqueues, nobody spends a CI run; they ask, every twenty minutes,
+    # and that is the whole of what holds a queue together now.
+    clock = night["clock"]
+    for _ in range(15):
+        clock.tick(20)
+        for pr in _WAITERS:
+            answer = await read(client, repo=repo, pr=pr, headers=_agent(pr))
+            assert answer["renewal"]["renewed"] is True
+    assert (await read(client, repo=repo))["active_order"] == list(_WAITERS), (
+        "five hours in, the three that kept asking are still in arrival order")
+    assert (await _entry(398, repo=repo)).entered_at < clock.now - timedelta(hours=5)
+
+    # The head is gone, and that is the fail-safe working rather than the bug
+    # returning: it pushed at +12 and never read the line again, so nothing said it
+    # was still there. A landing agent polls like everybody else — this one is a
+    # replay of the night, not a model of good behaviour — and the property being
+    # shown is that silence, and only silence, retires an entry.
+    assert _HEAD not in (await read(client, repo=repo))["active_order"]
+
+    # An hour after their last read the waiters go the same way.
+    clock.tick(61)
+    assert (await read(client, repo=repo))["active_order"] == []
