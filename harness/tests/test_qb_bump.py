@@ -27,6 +27,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -69,7 +70,7 @@ def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setenv("QUARTERBACK_CONFIG", str(tmp_path / "no-such-config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(qb, "CACHE", tmp_path / "cache" / "quarterback" / "harness-bump")
-    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, "QUARTERBACK_CONSUMER_ROOTS"):
+    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, "QUARTERBACK_CONSUMER_ROOTS", "QUARTERBACK_REPO"):
         monkeypatch.delenv(var, raising=False)
 
 
@@ -106,9 +107,14 @@ def consumer_repo(tmp_path) -> Path:
 
 @pytest.fixture
 def quarterback_repo(tmp_path) -> Path:
-    """A checkout whose origin names `prisonblues/quarterback` — the slug a lock carries."""
+    """A checkout whose origin names `prisonblues/quarterback` — the slug a lock carries.
+
+    It carries a `harness/bin` because that is what makes a directory a checkout
+    this tool can compare anything against, and since #414 a directory without one
+    is refused rather than silently reported as carrying no drift.
+    """
     repo = tmp_path / "quarterback"
-    repo.mkdir()
+    (repo / "harness" / "bin").mkdir(parents=True)
     _git(repo, "init", "-q", "-b", "main")
     _git(repo, "remote", "add", "origin", "https://github.com/prisonblues/quarterback.git")
     return repo
@@ -737,3 +743,190 @@ def test_a_modified_file_in_the_consumer_is_named_before_the_switch(consumer_rep
     monkeypatch.setattr(qb.os, "execvp", lambda f, argv: None)
     assert qb.apply(proposal, dry_run=False) == 0
     assert "NOT part of what was built" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# #414 — which checkout it compared, and refusing when there is not one
+# --------------------------------------------------------------------------- #
+
+def _installed_harness(tmp_path: Path, stale: bool = True) -> Path:
+    """A `bin/` in the shape home-manager puts one on PATH, optionally behind a checkout.
+
+    A real copy of `harness/bin` rather than a stub, because the subject of the
+    demonstration below is what the REAL `qb-doctor` concludes when it is asked
+    about a directory that has no `harness/` in it — the fallback in
+    `checkout_harness_bin` that made an installed harness compare itself with
+    itself. A stub doctor would answer whatever the stub was told to answer,
+    which is the one thing this test must not do.
+    """
+    root = tmp_path / "quarterback-harness-0.1.0"
+    shutil.copytree(BIN, root / "bin", ignore=shutil.ignore_patterns("__pycache__"))
+    if stale:
+        for gone in ("qb-reconcile", "qb-admit", "qb-stage"):
+            (root / "bin" / gone).unlink(missing_ok=True)
+        cw = root / "bin" / "create-worktree"
+        cw.write_text(cw.read_text(encoding="utf-8") + "\n# an older revision\n",
+                      encoding="utf-8")
+    return root / "bin"
+
+
+def test_a_cwd_that_is_not_a_checkout_refuses_instead_of_reporting_nothing_to_carry(
+        tmp_path, monkeypatch, capsys):
+    """#414, reproduced end to end with the real `qb-doctor` and no stub anywhere.
+
+    The morning this was found: a harness 74 commits and eleven releases behind on
+    PATH, `qb-bump` run from `~/source/nix-fleet`, and the answer was *"nothing to
+    carry: the harness on PATH IS this checkout"* — exit 0, a positive assertion of
+    health, about a box `qb-doctor` called `FAIL — 10 differ` sixty seconds later.
+
+    Both halves are asserted here because it is the disagreement that is the bug:
+    pointed at a real checkout the drift comes back `fail`, and from a directory
+    that is not a checkout the tool now says it cannot tell instead of saying
+    there is nothing to do.
+    """
+    installed = _installed_harness(tmp_path)
+    checkout = tmp_path / "quarterback"
+    shutil.copytree(BIN, checkout / "harness" / "bin",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    _git(checkout, "init", "-q", "-b", "main")
+    # A git repository that is not THIS one — `~/source/nix-fleet`, where the
+    # command was actually typed. It has to be a real repository for the bug to
+    # appear at all: a plain directory already refused, because `qb-doctor` exits 3
+    # on one and `harness_drift` reads that as "could not be run". A repository with
+    # no `harness/` in it is the case that got all the way to a green answer.
+    elsewhere = tmp_path / "nix-fleet"
+    elsewhere.mkdir()
+    _git(elsewhere, "init", "-q", "-b", "main")
+
+    # Prepended, not replaced: `qb-doctor` shells out to `git`, and a PATH with no
+    # git in it would fail this for a reason that is not the one under test.
+    monkeypatch.setenv("PATH", f"{installed}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(qb, "__file__", str(installed / "qb-bump"))
+    monkeypatch.setattr(qb, "have_nix", lambda: False)
+    monkeypatch.chdir(elsewhere)
+
+    # Pointed at the checkout, the drift is real and `qb-doctor` says so.
+    assert qb.main(["--repo", str(checkout), "--json", "--no-announce"]) == 1
+    aimed = json.loads(capsys.readouterr().out)
+    assert aimed["drift"]["verdict"] == "fail"
+    assert aimed["repo"] == {"path": str(checkout), "found_by": "named by --repo"}
+
+    # Same machine, same second, same PATH — from a directory that is not a
+    # checkout. This used to be exit 0 and "nothing to carry".
+    assert qb.main(["--json", "--no-announce"]) == 1
+    blind = json.loads(capsys.readouterr().out)
+    assert blind["outcome"] == "unknown"
+    assert blind["detail"].startswith("cannot tell")
+    assert str(elsewhere) in blind["detail"] and "not a quarterback checkout" in blind["detail"]
+    assert "--repo" in blind["detail"] and "QUARTERBACK_REPO" in blind["detail"]
+
+
+def test_the_refusal_goes_to_stderr_and_never_reads_as_an_all_clear(tmp_path, monkeypatch,
+                                                                    capsys):
+    monkeypatch.chdir(tmp_path)
+    assert qb.main(["--no-announce"]) == 1
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "cannot tell" in err and "not knowing" in err
+
+
+def test_a_declared_checkout_makes_it_work_from_anywhere(tmp_path, quarterback_repo,
+                                                         monkeypatch, capsys):
+    """Door three: a fleet that says where its checkout is gets an answer from `~`."""
+    elsewhere = tmp_path / "somewhere-else"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    monkeypatch.setenv("QUARTERBACK_REPO", str(quarterback_repo))
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, CURRENT))
+    assert qb.main(["--json", "--no-announce"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["repo"] == {"path": str(quarterback_repo),
+                           "found_by": "declared by QUARTERBACK_REPO"}
+
+
+def test_a_declared_checkout_that_is_not_one_is_refused_rather_than_fallen_back_from(
+        tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QUARTERBACK_REPO", str(tmp_path / "gone"))
+    checkout, why = qb.resolve_repo(None, {})
+    assert checkout is None and "QUARTERBACK_REPO" in why and "not a quarterback checkout" in why
+
+
+def test_a_named_repo_that_is_not_a_checkout_is_a_typo_and_says_so(tmp_path, consumer_repo):
+    """`--repo` is somebody saying it, so a wrong one is corrected, not worked around —
+    the same reason `named_consumer` refuses a `--flake` that pins nothing."""
+    checkout, why = qb.resolve_repo(str(consumer_repo), {})
+    assert checkout is None
+    assert str(consumer_repo) in why and "harness/bin" in why
+
+
+def test_the_working_directory_wins_over_a_declared_one_and_resolves_to_the_root(
+        tmp_path, quarterback_repo, monkeypatch):
+    """A person standing in a checkout means that one — and standing in a subdirectory
+    of it still means it, which is why the row names the root and not the cwd."""
+    monkeypatch.setenv("QUARTERBACK_REPO", str(tmp_path / "elsewhere"))
+    monkeypatch.chdir(quarterback_repo / "harness")
+    checkout, why = qb.resolve_repo(None, {"QUARTERBACK_REPO": str(tmp_path / "elsewhere")})
+    assert why == "" and checkout.found_by == "the working directory"
+    assert checkout.path.resolve() == quarterback_repo.resolve()
+
+
+def test_the_no_op_names_the_checkout_it_compared(tmp_path, quarterback_repo, capsys,
+                                                  monkeypatch):
+    """"Nothing to carry" is a claim about a specific pair of directories, and a reader
+    who cannot see which pair cannot tell a true one from #414's false one."""
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, CURRENT))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    said = capsys.readouterr().out
+    assert "nothing to carry" in said
+    assert f"compared against {quarterback_repo} (named by --repo)" in said
+
+
+NO_HARNESS = {"checks": [{"name": "harness", "subject": "-", "verdict": "unknown",
+                          "detail": "no harness on PATH (create-worktree not found), so "
+                                    "nothing to compare this checkout against", "extra": {}}]}
+
+
+def test_a_harness_row_that_is_not_ok_is_not_an_all_clear(tmp_path, quarterback_repo, capsys,
+                                                          monkeypatch):
+    """Found by Codex on this branch, one function from #414 and the same mistake: "nothing to
+    carry" used to mean `not fail`, so a row of `unknown` — a machine with no harness on PATH
+    AT ALL, which is the most carrying-needed state there is — came back as exit 0."""
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, NO_HARNESS))
+    assert qb.main(["--repo", str(quarterback_repo), "--json", "--no-announce"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["outcome"] == "unknown"
+    assert out["detail"].startswith("cannot tell") and "unknown, not ok" in out["detail"]
+    assert out["drift"]["verdict"] == "unknown"
+
+
+def test_only_ok_and_fail_are_answers_and_a_warn_is_neither(tmp_path, quarterback_repo,
+                                                            monkeypatch):
+    warned = {"checks": [{"name": "harness", "subject": "/nix/store/x/bin", "verdict": "warn",
+                          "detail": "something the doctor is not sure about", "extra": {}}]}
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, warned))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
+
+
+def test_the_no_op_names_the_installed_harness_as_well_as_the_checkout(tmp_path,
+                                                                      quarterback_repo,
+                                                                      capsys, monkeypatch):
+    """A comparison has two sides, and the one that is actually in doubt is which `bin/` PATH
+    resolved to. `qb-doctor` already reports it as the row's subject; this stops dropping it."""
+    monkeypatch.setattr(sys, "argv", ["qb-bump"])
+    monkeypatch.setattr(qb, "__file__", _stub_doctor(tmp_path, CURRENT))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    assert "/nix/store/x/bin, compared against" in capsys.readouterr().out
+
+
+def test_the_environment_beats_the_site_config_for_the_declared_checkout(tmp_path,
+                                                                        quarterback_repo,
+                                                                        monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("QUARTERBACK_REPO", str(quarterback_repo))
+    checkout, why = qb.resolve_repo(None, {"QUARTERBACK_REPO": str(tmp_path / "from-the-file")})
+    assert why == "" and checkout.path.resolve() == quarterback_repo.resolve()

@@ -7,7 +7,8 @@
   qb-bump --apply --dry-run     print that command rather than running it
 
   0  nothing to carry — the harness on PATH is this checkout's
-  1  cannot tell — no qb-doctor, no nix, no consuming flake, or more than one
+  1  cannot tell — not in a quarterback checkout, a harness row that is neither
+     ok nor fail, no qb-doctor, no nix, no consuming flake, or more than one
   2  a bump is prepared and BUILT, and one command by a person finishes it
   3  nothing to apply — no prepared bump, a moved tree, no terminal, or a bad flag
   4  the bump does not build — refused to propose it
@@ -48,6 +49,17 @@ have anything written over it. The only file this ever writes into a consumer's
 checkout is `flake.lock`, only under `--apply`, and only when the human running it
 is the one who typed the command. Committing that lock is the consumer's business
 and stays theirs.
+
+**"I cannot tell" is not "there is nothing to carry", and the difference is the
+whole point of the tool.** This resolved the checkout it compares against from the
+working directory and never said so, so run from a consumer's checkout it found no
+`harness/` to compare, `qb-doctor` fell back to the tree beside itself — which for
+an installed `qb-doctor` is the installed harness, always identical to itself — and
+this printed "nothing to carry" about a box 74 commits and eleven releases behind.
+That is a positive assertion of health, and a person who reads one stops looking.
+So the checkout is resolved deliberately now (`--repo`, the working directory,
+`QUARTERBACK_REPO`), it is NAMED in every report including the no-op, and no
+checkout at all is `unknown`/1 rather than `current`/0 — see `resolve_repo` (#414).
 
 **The consuming flake is a third thing, and it is found rather than assumed.**
 `qb-doctor` records that it cannot find it, which is why its comparison is a
@@ -223,6 +235,103 @@ def tail(text: str, lines: int = ERROR_LINES) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# 0. the checkout the comparison is ABOUT — resolved, and always named
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Checkout:
+    """The quarterback checkout the harness on PATH is measured against."""
+
+    path: Path
+    found_by: str     #: how it was arrived at, so the report can say
+
+
+def quarterback_checkout(where: Path) -> Path | None:
+    """`where`'s repository root if that root carries a `harness/bin`, else None.
+
+    `harness/bin` and not the origin remote, because `harness/bin` is literally
+    the thing being compared: it is the directory `qb-doctor` diffs the installed
+    harness against, and a repository without one has nothing to say about
+    whether this machine's harness is stale. (The origin is checked too, one step
+    later, by `repo_slug` — a checkout with no origin cannot be matched to a
+    consumer's lock entry either. Two different requirements, both real.)
+    """
+    rc, top, _ = run(["git", "-C", str(where), "rev-parse", "--show-toplevel"])
+    if rc != 0 or not top:
+        return None
+    root = Path(top)
+    return root if (root / "harness" / "bin").is_dir() else None
+
+
+def resolve_repo(repo_arg: str | None, cfg: dict[str, str]) -> tuple[Checkout | None, str]:
+    """``(Checkout, "")`` or ``(None, why-there-is-none)`` — named, cwd, declared, refuse.
+
+    **The rule, stated because its absence is what #414 was.** This used to be
+    `Path(args.repo) if args.repo else Path.cwd()` and nothing else, which is a
+    resolution rule you can only discover by being burned by it. Run from
+    `~/source/nix-fleet` on a box whose harness was 74 commits and eleven releases
+    behind, `qb-bump` compared the installed harness against a directory with no
+    `harness/` in it at all: `qb-doctor` fell back to the tree beside itself, which
+    for an *installed* `qb-doctor` IS the installed harness, and an installed
+    harness is identical to itself forever. `ok`. So `qb-bump` printed **"nothing
+    to carry"** about a machine that `qb-doctor`, pointed at a real checkout one
+    minute later, called `FAIL — 10 differ`.
+
+    So the order is:
+
+    1. `--repo`, which is somebody saying it. A named directory that is not a
+       checkout is a typo and is refused rather than fallen back from, the way
+       `named_consumer` refuses a `--flake` that pins nothing.
+    2. the working directory, when it is inside one — an agent runs this from the
+       checkout it is working in, and a person standing in one means that one.
+    3. `QUARTERBACK_REPO`, from the environment then the site config. This is the
+       door that makes the tool work from anywhere, and it is not a new one: it is
+       the same key `qb-env` writes and `qb-mcp` and `qb-doctor` already read to
+       find this repo. A fleet that declares itself once gets a `qb-bump` that
+       answers correctly from `~`, from `/etc/nixos`, from a consumer's checkout.
+    4. nothing. Which is `unknown`, exit 1, "cannot tell" — never exit 0.
+
+    **The refusal is the point of the change.** "Nothing to carry" is a positive
+    assertion of health, not silence: a person who reads it stops looking, which
+    is exactly what happened. `qb-reconcile` draws this line as could-not-check
+    versus nothing-to-report and `qb-doctor`'s rows draw it as `unknown` versus
+    `ok`; this file already had the vocabulary in its exit codes (1 is "cannot
+    tell") and simply was not reaching for it here.
+    """
+    if repo_arg:
+        named = Path(repo_arg).expanduser()
+        root = quarterback_checkout(named)
+        if root is None:
+            return None, (f"--repo names {named}, which is not a quarterback checkout — no "
+                          "harness/bin in it (or it is not a git repository), so there is "
+                          "nothing there to compare the harness on PATH against")
+        return Checkout(root, "named by --repo"), ""
+
+    cwd = Path.cwd()
+    root = quarterback_checkout(cwd)
+    if root is not None:
+        return Checkout(root, "the working directory"), ""
+
+    declared = os.environ.get("QUARTERBACK_REPO") or cfg.get("QUARTERBACK_REPO")
+    if declared:
+        where = as_path(declared)
+        root = quarterback_checkout(where) if where else None
+        if root is None:
+            return None, (f"cannot tell: QUARTERBACK_REPO names {declared}, which is not a "
+                          "quarterback checkout — no harness/bin in it — and the working "
+                          f"directory ({cwd}) is not one either, so there is nothing here to "
+                          "compare the harness on PATH against. Run it from a checkout or "
+                          "pass --repo DIR")
+        return Checkout(root, "declared by QUARTERBACK_REPO"), ""
+
+    return None, (f"cannot tell: {cwd} is not a quarterback checkout, and nothing declares "
+                  "one, so there is no harness/bin here to compare the harness on PATH "
+                  "against. This is NOT 'nothing to carry' — it is not knowing. Run it from "
+                  "a quarterback checkout, pass --repo DIR, or set QUARTERBACK_REPO (in the "
+                  "environment or ~/.config/quarterback/config) so it works from anywhere")
+
+
+# --------------------------------------------------------------------------- #
 # 1. the drift — asked of qb-doctor, never worked out here
 # --------------------------------------------------------------------------- #
 
@@ -239,6 +348,20 @@ class Drift:
     @property
     def stale(self) -> bool:
         return self.verdict == "fail"
+
+    @property
+    def current(self) -> bool:
+        """`ok` and only `ok`, which is not the same as "not `fail`".
+
+        Found by Codex on #414's own branch, one function away from the bug being
+        fixed there and the identical category error: `not stale` used to mean
+        "nothing to carry", so a `harness` row of `unknown` — "no harness on PATH
+        (create-worktree not found), so nothing to compare this checkout against",
+        which is a machine with NO harness on it at all — came back as exit 0 and
+        an all-clear. A box that has never had the harness installed is the most
+        carrying-needed state there is.
+        """
+        return self.verdict == "ok"
 
 
 def doctor_path(script: str) -> str | None:
@@ -896,12 +1019,14 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
 # 7. the report
 # --------------------------------------------------------------------------- #
 
-def render_proposal(proposal: Proposal, drift: Drift, consumer: Consumer,
-                    announced: str) -> str:
+def render_proposal(proposal: Proposal, drift: Drift, checkout: Checkout,
+                    consumer: Consumer, announced: str) -> str:
     n = len(drift.missing) + len(drift.differ)
     lines = [
         f"stale: {drift.detail}",
         "",
+        f"harness    {drift.subject or 'the one on PATH'}",
+        f"checkout   {checkout.path} ({checkout.found_by})",
         f"consumer   {consumer.flake} ({consumer.found_by})",
         f"input      {proposal.input}",
     ]
@@ -931,7 +1056,8 @@ def main(argv: list[str] | None = None) -> int:
                     "flake's bump, build it, and hand a person one command (#267).")
     parser.add_argument("--repo", metavar="DIR",
                         help="the quarterback checkout the harness is compared against "
-                             "(default: the cwd's)")
+                             "(default: the cwd's, then $QUARTERBACK_REPO; with neither, "
+                             "this refuses rather than reporting no drift)")
     parser.add_argument("--flake", metavar="DIR",
                         help="the consuming flake (default: $" + FLAKE_KEY + ", the site "
                              "config, then a scan)")
@@ -956,17 +1082,31 @@ def main(argv: list[str] | None = None) -> int:
         return apply(load(), args.dry_run)
 
     script = __file__
-    repo = Path(args.repo).expanduser() if args.repo else Path.cwd()
+    cfg = site_config()
     out: dict = {"outcome": "", "detail": ""}
+
+    checkout, why = resolve_repo(args.repo, cfg)
+    if checkout is None:
+        return report(args, {"outcome": "unknown", "detail": why}, 1)
+    repo = checkout.path
+    out["repo"] = {"path": str(repo), "found_by": checkout.found_by}
+    against = f"compared against {repo} ({checkout.found_by})"
 
     drift, why = harness_drift(repo, script)
     if drift is None:
-        return report(args, {"outcome": "unknown", "detail": why}, 1)
+        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
     out["drift"] = {"verdict": drift.verdict, "detail": drift.detail,
-                    "missing": drift.missing, "differ": drift.differ}
-    if not drift.stale:
+                    "subject": drift.subject, "missing": drift.missing, "differ": drift.differ}
+    installed = f"{drift.subject}, " if drift.subject else ""
+    if drift.current:
         return report(args, {**out, "outcome": "current",
-                             "detail": f"nothing to carry: {drift.detail}"}, 0)
+                             "detail": f"nothing to carry: {drift.detail} "
+                                       f"({installed}{against})"}, 0)
+    if not drift.stale:
+        return report(args, {**out, "outcome": "unknown",
+                             "detail": f"cannot tell: qb-doctor's harness row is "
+                                       f"{drift.verdict}, not ok — {drift.detail} "
+                                       f"({installed}{against})"}, 1)
 
     if not have_nix():
         return report(args, {**out, "outcome": "unknown",
@@ -977,7 +1117,6 @@ def main(argv: list[str] | None = None) -> int:
         return report(args, {**out, "outcome": "unknown",
                              "detail": f"{repo} has no origin remote, so nothing here knows "
                                        "which repository a consumer would be pinning"}, 1)
-    cfg = site_config()
     consumer, why = resolve_consumer(args.flake, cfg, slug)
     if consumer is None:
         return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
@@ -1022,6 +1161,7 @@ def main(argv: list[str] | None = None) -> int:
                 "and has been built, so what is left is one command by a person"),
         detail="\n".join([
             drift.detail,
+            f"checkout: {repo} ({checkout.found_by})",
             f"consumer: {consumer.flake} (input {consumer.input})",
             f"pin:      {proposal.old_rev[:12]} -> {proposal.new_rev[:12]}",
             f"built:    {attr} -> {proposal.out_path}",
@@ -1032,7 +1172,8 @@ def main(argv: list[str] | None = None) -> int:
     out.update({"outcome": "prepared", "proposal": asdict(proposal), "announced": announced,
                 "detail": f"a bump to {proposal.new_rev[:12]} is built and waiting for "
                           f"`{proposal.prepared_by} --apply`"})
-    return report(args, out, 2, text=render_proposal(proposal, drift, consumer, announced))
+    return report(args, out, 2,
+                  text=render_proposal(proposal, drift, checkout, consumer, announced))
 
 
 def report(args, out: dict, code: int, text: str | None = None) -> int:
