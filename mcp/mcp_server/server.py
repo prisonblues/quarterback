@@ -780,10 +780,24 @@ def merge_queue(ctx: Context, base: str, repo_path: str = ".",
     here to sometimes name a holder who never enqueued at all — a human merging in
     the UI is entitled to, and this queue is advisory like everything else here.
 
-    Ordering is strict FIFO by arrival. `suggested_order` is always null: ordering
-    proposals are the unfinished half of #227, deliberately absent because an
-    agent rewriting the queue while trying to land makes the queue one more shared
-    thing to fight over.
+    **`active_order` is the line and `suggested_order` is an opinion about it**
+    (#80). The line is strict FIFO by arrival and nothing reorders it: a rank is
+    not a place in it, and being ranked first is not being at the head. Putting a
+    proposal into force stays #227's unfinished half, because an agent rewriting
+    the queue while trying to land makes the queue one more shared thing to fight
+    over.
+
+    Read `suggestion.order_trust` before you act on `suggested_order`, and expect
+    it to be null: it is withheld entirely while the board holds no changed-file
+    list for some queued PR, since an order that skipped a PR nobody can measure
+    would be a confident answer built on a partial measurement. `suggestion` still
+    carries the per-PR reasoning either way — which PRs collide on which paths,
+    what each weighs, and the caveat naming what it could not see.
+
+    The order it proposes lands the provably disjoint PRs first (they cost nobody
+    anything from any position) and then the heaviest colliders: a re-integration
+    is work done on the LATE PR, so the big branch lands clean and the small ones
+    rebase onto it rather than the other way round.
 
     Args:
         base: the branch being landed ONTO — `main`, `release/2.x`. One queue per

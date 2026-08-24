@@ -28,10 +28,13 @@ lock:
 * **It is not a second lock.** No path here writes a `kind='merge'` claim, and
   the head being ready confers no claim at all — it says go and ask for one.
 
-Deliberately absent, and asserted as absent: ordering proposals. #227's own
-argument is that agents proposing an order while trying to land makes the queue
-"another shared resource every agent thrashes", so the first cut is strict FIFO
-and `suggested_order` is permanently null.
+Deliberately absent, and asserted as absent: queue MUTATION. #227's own argument
+is that agents rewriting an order while trying to land makes the queue "another
+shared resource every agent thrashes", so `active_order` is strict FIFO and the
+`order-proposal` / `reorder` endpoints that would put a proposal into force are
+still #227's second half. #80 added an advisory `suggested_order` beside it —
+tested in `test_merge_queue_ranking.py`, and asserted here only in the negative:
+it never becomes the line.
 """
 
 from __future__ import annotations
@@ -482,18 +485,20 @@ async def test_leaving_the_queue_does_not_release_the_merge_claim(client):
 # -------------------------------------------------- FIFO, and only FIFO
 
 
-async def test_the_first_cut_offers_no_suggested_order_and_says_so(client):
-    """#227 asks for `active_order` and `suggested_order` to be distinguishable
-    so a proposal can never look like the live order. The distinction ships from
-    the first cut with nothing able to populate the second half — agents
-    proposing an order while trying to land is the thrash the issue warns about,
-    and it needs the acceptance machinery this release does not have."""
+async def test_a_proposal_can_never_be_put_into_force(client):
+    """#227 asks for `active_order` and `suggested_order` to be distinguishable so
+    a proposal can never look like the live order. #80 populates the second half;
+    what stays absent is anything that turns one into the other. Mutation needs a
+    human or an accepted proposal, and neither endpoint exists — an agent that may
+    silently rewrite the sequence is an agent with human privileges."""
     repo = "acme/fifo"
     await join(client, 1801, SHA_A, repo=repo, verdict="ready")
     view = await read(client, repo=repo)
     assert view["ordering"] == "fifo"
     assert view["active_order"] == [1801]
+    # One entry: one arrangement, and no ranking is run for it.
     assert view["suggested_order"] is None
+    assert view["suggestion"] is None
 
     for path in ("/merge-queue/order-proposal", "/merge-queue/reorder"):
         r = await client.post(path, json={}, headers=LAPTOP)
