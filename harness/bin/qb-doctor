@@ -31,9 +31,20 @@ In the same minute the merge queue held seven green pull requests with none
 ready, main had not moved in three hours, `refs/tags/v3.8` pointed at a commit
 that is not in main's history, and three branches were conflicting on the one
 file `changelog.d/` exists to keep them out of. Every row was correct and not one
-of them was about the pipeline the work has to travel down. `merges` is the first
-row of that group; it asks whether a merge into this repo can rewrite the commit a
-release tag was reserved against.
+of them was about the pipeline the work has to travel down. There is a row for
+each of those now — `queue`, `landed`, `tags`, `generated` — beside `merges`,
+which asks whether a merge here can rewrite the commit a release tag was reserved
+against, and `stamping`, which asks whether the affordance #122 removed is still
+reachable from this host.
+
+AND THE RULE THAT KEEPS THAT GROUP HONEST: most of it needs the board or GitHub,
+and a landing group that went green having seen neither would be a worse version
+of the problem it exists to solve. So every row that needs something it could not
+reach says `unknown` and says which thing — and none of them fails a repo for not
+using the mechanism it is about. An empty queue on a repo with no pull requests
+is fine; a repo that does not do releases out of fragments needs no fragment row.
+Nothing in the group merges, re-points a tag or evicts a queue entry: #405 argued
+the queue must stay advisory and the argument held under measurement.
 
 THE RULE THAT DECIDES THE SHAPE OF EVERY CHECK BELOW: look where the mechanism
 RUNS, never where its source lives. `ls harness/githooks/reference-transaction`
@@ -64,7 +75,7 @@ Usage:
     qb-doctor --json              the whole report as JSON
     qb-doctor --repo DIR          check that checkout instead of the cwd's
     qb-doctor --only hooks,edge   just those rows
-    qb-doctor --only landing      a whole group of them
+    qb-doctor --only landing      a whole group of them (host | landing)
     qb-doctor --human-url URL     the browser vhost, for the edge check
     qb-doctor --quiet             print only the rows that are not ok
 """
@@ -82,9 +93,12 @@ import subprocess
 import sys
 import textwrap
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import quote
 
 #: The four answers a check can give. Closed, and closed for the reason
 #: `qbdata.CI_STATES` is closed (#324): these feed a count, a glyph and an exit
@@ -275,6 +289,11 @@ class Host:
     #: see that every check is a function of this object.
     client_repo: Path | None = None
     remote: str = "origin"
+    #: One `gh pr list` answer, shared by the rows that need it. Two rows asked for
+    #: overlapping fields and paid for two round trips to say different things about the
+    #: same pull requests, which is both slow and a way for them to disagree. Per-Host
+    #: rather than module-level so a test drives one survey and not a leftover.
+    gh_cache: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -1729,6 +1748,768 @@ def _merge_verdict(slug: str, settings: dict, because: str) -> Check:
                  extra={"settings": settings, "reserves": because})
 
 
+# --------------------------------------------------------------------------- #
+# can work land? the rest of the group (#407, #122)
+# --------------------------------------------------------------------------- #
+
+#: How long a queue may hold entries with none ready before that is a finding. Not a
+#: guess: PR #398 was landed twice and timed, at 5m37s and 12m59s from merge to green,
+#: and #405's stall ran for over three hours. Fifteen minutes sits inside the noise of
+#: one slow landing; thirty is more than double the slowest measured one and still turns
+#: a three-hour stall into a half-hour question.
+QUEUE_STALL_MINUTES = 30
+
+#: How long the integration branch may stand still WHILE something is ready to land on
+#: it. The condition is what makes the number safe — a quiet `main` at four in the
+#: morning is not a fault, and a `main` that has not moved for two hours with green
+#: pull requests waiting is the single most legible statement of #405's night.
+MAIN_STALL_MINUTES = 120
+
+#: How many open pull requests the GitHub-backed rows read. A cap, because these run on a
+#: command a person types when something feels wrong and `gh` pages until it has them all.
+#: Reaching it is NOT reported and moved on from: a row that saw the first N and found
+#: nothing has not established that there is nothing, so it says `unknown`. Codex found
+#: that on the first cut — the cap was disclosed in the detail and the verdict was still
+#: `ok`, which is the disclosure making the false green sound careful.
+#:
+#: A finding among the ones that WERE read is still a finding, so the fail branches come
+#: first: truncation cannot make a pull request that edits CHANGELOG.md stop editing it.
+PR_SAMPLE = 200
+
+#: The fields both GitHub-backed rows ask for. One list rather than two overlapping ones,
+#: so the answer can be cached and the two rows cannot come to describe the same pull
+#: requests differently.
+_PR_FIELDS = "number,isDraft,files,mergeStateStatus"
+
+#: What `mergeStateStatus` says when GitHub has computed that a merge would succeed right
+#: now. Used instead of a rollup of check conclusions because it is GitHub's own answer to
+#: the question the row is asking, and a hand-rolled "are all the checks green" agrees
+#: with it until somebody adds a required review or a merge-queue rule.
+_READY_TO_LAND = "CLEAN"
+
+#: And what it says when it has not computed one yet. GitHub resolves this lazily; a PR
+#: nobody has asked about since its last push answers UNKNOWN, which is not evidence that
+#: it is unready.
+_STATE_UNKNOWN = ("UNKNOWN", "", None)
+
+#: The file the release job writes and no branch may edit (#122, decision (a)). The
+#: README's release list is guarded too, and is deliberately NOT looked for here: the
+#: guard exempts the rest of README.md so that documentation is not taxed, and a list of
+#: changed paths cannot tell an edit to the release list from an edit to anything else in
+#: the file. Naming README.md here would fail a branch for improving its own docs.
+GENERATED_BY_THE_RELEASE_JOB = ("CHANGELOG.md",)
+
+#: A code fence in a brief running one of these is a document telling the next agent to do
+#: the thing #122 removed. Kept in step with `test_no_brief_tells_an_agent_to_stamp_a_release`
+#: by saying so in both places: the test pins the briefs this repo ships, and this row asks
+#: the same question of the briefs INSTALLED on this host, which is a different set the
+#: moment the harness on PATH falls behind.
+_STAMPING_COMMANDS = (
+    r"release_stamp\.py",                          # the tool itself, gone since #122
+    r"changelog_fragments\.py\"?\s+assemble",      # the branch-side entry builder
+    r"release_tag\.py\"?\s+reserve",               # the push-time number reservation
+    r"release\.py\"?\s+run",                       # the release job — `main` only
+)
+
+#: A fenced block in a brief. The leading `[ \t]*` is not cosmetic and the same pattern in
+#: `test_commands_wired.py` says why: every fence in `fix-and-review.md` sits inside a
+#: numbered step and is indented, so an anchored ``` matches nothing at all — and "no
+#: forbidden command in any code block" over zero code blocks passes on every file.
+_FENCE = re.compile(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", re.DOTALL | re.MULTILINE)
+
+
+def commands_dir(harness: Path) -> Path | None:
+    """Where the briefs an agent actually reads live, in the two layouts that exist.
+
+    The same two places :func:`githooks_dir` looks, for the same reason: a checkout keeps
+    `bin/` and `commands/` as siblings, and the package puts the briefs under
+    `share/quarterback-harness/`. Hard-coding either would make this row quietly stop
+    reading anything on half the fleet.
+    """
+    for cand in (harness / "commands", harness / "share" / "quarterback-harness" / "commands"):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+def installed_harness(host: Host) -> Path:
+    """The harness tree whose briefs this host would actually open.
+
+    The one on PATH when there is one, and this script's own otherwise — the rule the
+    rest of this file follows. It matters here more than anywhere: the `harness` row
+    exists because the harness on PATH goes stale, and a stale harness ships stale
+    briefs. Reading the checkout's briefs while an agent on this box reads the store's
+    would report the repository's intentions rather than the machine's behaviour.
+    """
+    return host.harness_bin.parent if host.harness_bin else host.source_harness
+
+
+def fragments_in_use(host: Host) -> bool:
+    """Does this repo do releases out of `changelog.d/` fragments?
+
+    The scope test for both #122 rows, and it is a directory rather than a config flag
+    because that is what `changelog.d/README.md` says the contract is. A repo whose
+    branches legitimately write their own release entry is not failing anything.
+    """
+    return (host.repo / "changelog.d").is_dir()
+
+
+def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+    """One authenticated GET against the board, decoded — or a sentence saying why not.
+
+    Returns ``(payload, "")`` or ``(None, why)``. Every caller turns the `why` into an
+    `unknown`, so there is one place where "the board could not be asked" is phrased and
+    no way for a row to reach a verdict without having been answered.
+    """
+    if not host.base_url:
+        return None, "no board is configured (QUARTERBACK_BASE_URL unset), so nothing here " \
+                     "can read the queue"
+    if not host.token:
+        return None, "this machine resolved no board token, so the queue cannot be read " \
+                     "(the token row says which of the three sources is empty)"
+    status, body, err = http_get(f"{host.base_url}{path}",
+                                 {"Authorization": f"Bearer {host.token}"})
+    if err:
+        return None, f"could not reach the board: {err}"
+    if status != 200:
+        return None, f"the board answered {status} to {path}"
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None, f"the board did not answer JSON to {path}"
+    if not isinstance(payload, dict):
+        return None, f"the board did not answer an object to {path}"
+    return payload, ""
+
+
+def _age_minutes(stamp: str | None) -> float | None:
+    """Minutes since an ISO-8601 instant, or None when it cannot be read as one."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    # Negative is returned rather than clamped, so a caller can tell "just now" from "this
+    # instant is in the future", which is clock skew or bad data and not evidence of health.
+    return (datetime.now(UTC) - when).total_seconds() / 60
+
+
+def _sane_counts(counts: object) -> bool:
+    """Is this a pair of queue counts that could describe a real queue?
+
+    Presence and type are not enough, and Codex found both holes. `bool` is an `int` in
+    Python, so `{"queued": True}` typechecks; and `ready > queued`, or a negative either
+    way, is a board answering something no queue can be in. The row's `ok` branches read
+    those numbers, so an answer that cannot be true has to be an `unknown` — the same
+    rule as a field GitHub did not send.
+    """
+    if not isinstance(counts, dict):
+        return False
+    queued, ready = counts.get("queued"), counts.get("ready")
+    for n in (queued, ready):
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            return False
+    return ready <= queued
+
+
+def _spell_age(minutes: float) -> str:
+    """`14m`, `3h 12m` — short enough for a report row, exact enough to quote."""
+    total = int(minutes)
+    return f"{total}m" if total < 60 else f"{total // 60}h {total % 60:02d}m"
+
+
+def check_queue(host: Host) -> Check:
+    """Is the line moving, or is everything in it waiting on nothing?
+
+    #405, and the cheapest row in this group. On the night of 2026-08-22/23 the merge
+    queue held seven green pull requests with ZERO ready and `main` did not move for over
+    three hours, while this tool reported nine `ok` and one `unknown`. Every row it had
+    was correct and not one of them was about the line.
+
+    `queued > 0 && ready == 0` is the whole predicate, plus a clock. Both halves are
+    needed: nothing ready is the normal state of a queue whose head is mid-preland, and
+    an empty queue on a repo with no open pull requests is not a fault. What is a fault is
+    that pair holding for longer than a landing takes.
+
+    ADVISORY, and this row does not soften that. #405 argued the queue must stay advisory
+    and the argument held under measurement: the system was never wrong about who should
+    land next, only about who was still there. So nothing here evicts an entry, re-orders
+    the line or merges anything — it says the line has stopped, and names the head so
+    there is somebody to ask.
+    """
+    slug = github_slug(host)
+    if slug is None:
+        return Check("queue", host.remote,
+                     f"{host.remote} is not a github.com remote, so this checkout does not "
+                     "name a queue the board would recognise", "unknown",
+                     manual="read the queue by hand: GET /merge-queue?repo=…&base=…")
+    base = _default_branch(host)
+    if base is None:
+        return Check("queue", slug, f"could not resolve {host.remote}'s default branch, and "
+                     "the queue is keyed by the branch being landed onto", "unknown",
+                     manual=f"git -C {host.repo} remote set-head {host.remote} --auto")
+    payload, why = board_get(host, f"/merge-queue?repo={quote(slug)}&base={quote(base)}")
+    if payload is None:
+        return Check("queue", host.base_url or "-", why, "unknown",
+                     manual="see the board and token rows")
+    counts = payload.get("counts")
+    if not _sane_counts(counts):
+        return Check("queue", slug, "the board answered without a usable pair of queue "
+                     "counts, so whether anything can land could not be read", "unknown",
+                     manual=f"{host.base_url}/merge-queue?repo={slug}&base={base}")
+    queued, ready = counts["queued"], counts["ready"]
+    subject = f"{slug}@{base}"
+    if queued == 0:
+        return Check("queue", subject, f"nothing is queued to land on {base}", "ok",
+                     extra={"queued": 0, "ready": 0})
+    if ready > 0:
+        return Check("queue", subject, f"{queued} queued on {base}, {ready} ready to land",
+                     "ok", extra={"queued": queued, "ready": ready})
+    entries = payload.get("entries") or []
+    ages = [a for a in (_age_minutes((e or {}).get("entered")) for e in entries)
+            if a is not None and a >= 0]
+    if not ages:
+        return Check("queue", subject,
+                     f"{queued} queued on {base} with none ready, and the board stated no "
+                     "usable arrival time for any of them — so how long that has been true "
+                     "could not be read", "unknown",
+                     manual=f"{host.base_url}/merge-queue?repo={slug}&base={base}")
+    waited = max(ages)
+    head = (payload.get("head") or {})
+    who = head.get("holder") or "nobody named"
+    pr = head.get("pr")
+    if waited >= QUEUE_STALL_MINUTES:
+        return Check("queue", subject,
+                     f"{queued} queued on {base} and NONE ready — the oldest has waited "
+                     f"{_spell_age(waited)}, so nothing in the line can move", "fail",
+                     manual=f"ask {who}, who holds the head (PR #{pr}): a lapsed entry is "
+                            "returned to the back of the line and may have been conflicted "
+                            f"by whatever landed ahead of it (#405). {host.base_url}"
+                            f"/merge-queue?repo={slug}&base={base}",
+                     extra={"queued": queued, "ready": 0, "waited_minutes": int(waited),
+                            "head_pr": pr, "head_holder": who})
+    return Check("queue", subject,
+                 f"{queued} queued on {base}, none ready yet — the oldest has waited "
+                 f"{_spell_age(waited)}, which is inside a landing", "ok",
+                 extra={"queued": queued, "ready": 0, "waited_minutes": int(waited)})
+
+
+def open_pull_requests(host: Host) -> tuple[list[dict] | None, str]:
+    """The open pull requests on this repo, or a sentence saying why not.
+
+    One place, because two rows need them and each would otherwise invent its own way of
+    not being able to reach GitHub — and its own field list, which is how two rows come
+    to describe the same pull requests differently. Cached on the Host so a plain run
+    makes one call and not two.
+
+    A list of exactly `PR_SAMPLE` is a TRUNCATED list, and callers are told so through
+    :func:`truncated` rather than left to compare lengths. Its `ok` branches have to
+    become `unknown`; its finding branches do not, since a pull request that was read and
+    is wrong does not stop being wrong because others were not read.
+    """
+    slug = github_slug(host)
+    if slug is None:
+        return None, (f"{host.remote} is not a github.com remote, so the open pull requests "
+                      "cannot be read from here")
+    if shutil.which("gh") is None:
+        return None, "no gh on this host, so nothing can ask GitHub about the open pull requests"
+    if "prs" in host.gh_cache:
+        return host.gh_cache["prs"]
+    rc, out, err = run_cmd(["gh", "pr", "list", "--repo", slug, "--state", "open",
+                            "--limit", str(PR_SAMPLE), "--json", _PR_FIELDS], timeout=60)
+    if rc != 0:
+        answer = (None, f"gh could not list the pull requests: "
+                        f"{clip_line(err) or f'exit {rc}'}")
+    else:
+        try:
+            prs = json.loads(out)
+        except ValueError:
+            prs = None
+        answer = ((prs, "") if isinstance(prs, list)
+                  else (None, "gh did not answer a list of pull requests"))
+    host.gh_cache["prs"] = answer
+    return answer
+
+
+def truncated(prs: list[dict]) -> bool:
+    """Did the read stop at the cap? Then this is a sample and not the population."""
+    return len(prs) >= PR_SAMPLE
+
+
+def check_landed(host: Host) -> Check:
+    """Has the integration branch moved, given what is ready to land on it?
+
+    "Six green pull requests, main unchanged for four hours" is the one-line statement of
+    the night #407 was filed, and no row anywhere made it. The two halves have to be asked
+    together: a quiet `main` is not a fault on its own, and a green pull request is not a
+    fault on its own. Together they are the definition of work that cannot land.
+
+    Readiness is `mergeStateStatus == CLEAN`, which is GitHub's own answer to "would a
+    merge succeed right now". Rolling up check conclusions here would agree with it until
+    somebody added a required review or a merge-queue rule, and then disagree silently.
+    GitHub computes it lazily, so `UNKNOWN` is a pull request nobody has asked about since
+    its last push — counted as unknown and never as unready.
+
+    WHAT "MOVED" MEANS HERE, EXACTLY, because the honest name for it is not the obvious
+    one. GitHub's REST API states no ref-update time for a branch, so what is read is the
+    COMMITTER DATE OF THE TIP COMMIT, and that is what the verdict says. For a repo that
+    lands with merge commits the two are the same instant, and this repo's `merges` row is
+    about keeping it that way. Where they part is a fast-forward of a commit made earlier
+    — that reads as an older move than it was, so this row can ask its question early on a
+    repo that fast-forwards. It cannot read late, which is the direction that would matter.
+    """
+    slug = github_slug(host)
+    base = _default_branch(host)
+    if slug is None or base is None:
+        return Check("landed", host.remote,
+                     "this checkout does not resolve to a GitHub repo and default branch, so "
+                     "whether the branch that work lands on is moving cannot be asked",
+                     "unknown", manual=f"git -C {host.repo} remote -v")
+    prs, why = open_pull_requests(host)
+    if prs is None:
+        return Check("landed", slug, why, "unknown", manual="see the tools row for gh")
+    rc, when, err = run_cmd(["gh", "api", f"repos/{slug}/commits/{quote(base)}",
+                             "--jq", ".commit.committer.date"], timeout=20)
+    age = _age_minutes(when) if rc == 0 else None
+    if age is None or age < 0:
+        return Check("landed", slug, f"could not read when the tip of {base} was committed: "
+                     f"{clip_line(err) or when or f'exit {rc}'}", "unknown",
+                     manual=f"gh api repos/{slug}/commits/{base}")
+    ready = [p["number"] for p in prs
+             if not p.get("isDraft") and p.get("mergeStateStatus") == _READY_TO_LAND]
+    unsaid = [p["number"] for p in prs
+              if not p.get("isDraft") and p.get("mergeStateStatus") in _STATE_UNKNOWN]
+    moved = f"the tip of {base} was committed {_spell_age(age)} ago"
+    # The finding first, and deliberately before the truncation guard: a pull request that
+    # was read and is ready does not stop being ready because others were not read.
+    if ready and age >= MAIN_STALL_MINUTES:
+        return Check("landed", slug,
+                     f"{_spell_prs(ready)} ready to land and {moved} — work that is finished "
+                     "is not reaching the branch it has to reach", "fail",
+                     manual="read the queue row, then `gh pr view <n>` on the head of the "
+                            "line: the queue is advisory and a person landing one of these "
+                            "by hand is a legitimate move (#405)",
+                     extra={"open": len(prs), "ready": ready, "tip_age_minutes": int(age)})
+    if truncated(prs):
+        return Check("landed", slug,
+                     f"{moved}, and this read the first {PR_SAMPLE} open pull requests and "
+                     "stopped — so whether anything beyond them is ready to land could not "
+                     "be established", "unknown",
+                     manual=f"gh pr list --repo {slug} --state open --limit 1000 --json "
+                            "number,mergeStateStatus")
+    if not ready and unsaid:
+        return Check("landed", slug,
+                     f"{moved}, and GitHub has not yet computed a merge state for "
+                     f"{_spell_prs(unsaid)} — so whether anything is ready to land could "
+                     "not be read", "unknown",
+                     manual=f"gh pr list --repo {slug} --json number,mergeStateStatus "
+                            "(GitHub computes it lazily; asking again usually settles it)")
+    if not ready:
+        return Check("landed", slug, f"{moved}; nothing among {len(prs)} open pull "
+                     f"request(s) is ready to land, so a still {base} is not a stall", "ok",
+                     extra={"open": len(prs), "ready": 0, "tip_age_minutes": int(age)})
+    return Check("landed", slug, f"{_spell_prs(ready)} ready to land, and {moved}", "ok",
+                 extra={"open": len(prs), "ready": ready, "tip_age_minutes": int(age)})
+
+
+def _spell_prs(numbers: list[int]) -> str:
+    """`3 pull requests (#401, #403, #404)`, capped so a row stays a row."""
+    shown = ", ".join(f"#{n}" for n in numbers[:6])
+    more = "" if len(numbers) <= 6 else f", +{len(numbers) - 6} more"
+    word = "pull request" if len(numbers) == 1 else "pull requests"
+    return f"{len(numbers)} {word} ({shown}{more})"
+
+
+def check_generated(host: Host) -> Check:
+    """Is any open pull request editing a file the release job GENERATES? (#122)
+
+    `CHANGELOG.md` is output. The release number is applied on the integration branch
+    after the merge, and a branch that edits it is refused by the pre-push hook and by CI
+    — but a guard that only exists in a hook is absent on the machine that needed it
+    (#169, five instances in two days), and a pull request opened from a checkout with no
+    hooks reaches this state and sits in it.
+
+    The cost is not abstract. Every stamped branch writes the same lines of the same file,
+    so N of them in flight is N-choose-2 conflicts BY CONSTRUCTION, over nothing — both
+    entries are right and both belong, and git cannot know that two insertions at one
+    offset are independent. On 2026-08-23 the three open pull requests that had written a
+    release entry were all `CONFLICTING` and the three that had not were all `MERGEABLE`;
+    PR #398 landed both ways and settles it.
+
+    ASKED BEFORE THE CONFLICT, not after. #407 proposed this as "are open pull requests
+    conflicting on CHANGELOG.md", which is the same fault observed one step later — the
+    edit is the fault and the conflict is only its commonest consequence, and a row that
+    waits for the conflict cannot fire on the first branch to make it. The conflict count
+    is reported beside the finding because it says how urgent it is, not because it is the
+    test.
+
+    TWO THINGS IT DOES NOT SEE, both stated because a limit nobody wrote down is a limit
+    nobody remembers:
+
+    * **The README's release list**, which the same guard covers. The guard exempts the
+      rest of `README.md` so that documenting anything is not taxed, and a list of changed
+      paths cannot tell an edit to the release list from an edit to the installation
+      instructions. A row that named `README.md` would fail a branch for improving its own
+      docs, which is how a row gets ignored.
+    * **A rename AWAY from `CHANGELOG.md`.** GitHub reports the resulting path, so a
+      branch that renamed the generated file out of the way looks like a branch that
+      touched some other file. That is a different and much rarer fault than writing an
+      entry into it, and catching it would need the rename metadata this call does not
+      carry.
+    """
+    if not fragments_in_use(host):
+        return Check("generated", str(host.repo),
+                     "this repo has no changelog.d/, so its release notes are not generated "
+                     "output and a branch editing them is not a fault", "ok")
+    prs, why = open_pull_requests(host)
+    if prs is None:
+        return Check("generated", str(host.repo), why, "unknown",
+                     manual="see the tools row for gh")
+    offenders = [p for p in prs
+                 if any(f.get("path") in GENERATED_BY_THE_RELEASE_JOB
+                        for f in (p.get("files") or []))]
+    # The finding first. Truncation cannot make a pull request that edits CHANGELOG.md
+    # stop editing it, so a fail among the ones that WERE read is a fail either way.
+    if offenders:
+        dirty = [p["number"] for p in offenders if p.get("mergeStateStatus") == "DIRTY"]
+        tail = f"; {len(dirty)} of them already conflicting" if dirty else ""
+        return Check("generated", str(host.repo),
+                     f"{_spell_prs([p['number'] for p in offenders])} edit "
+                     f"{', '.join(GENERATED_BY_THE_RELEASE_JOB)}, which the release job "
+                     f"writes and no branch does{tail}", "fail",
+                     manual="each of those writes `changelog.d/<issue>.<kind>.md` instead "
+                            "and reverts the entry — see changelog.d/README.md",
+                     extra={"open": len(prs), "offenders": [p["number"] for p in offenders],
+                            "conflicting": dirty})
+    if truncated(prs):
+        # Codex found this as a false green. The cap was named in the detail and the
+        # verdict was `ok` anyway, which is a disclosure making an unmade check sound
+        # careful — the 51st pull request is exactly where the offender would be.
+        return Check("generated", str(host.repo),
+                     f"this read the first {PR_SAMPLE} open pull requests and stopped, so "
+                     f"whether any beyond them edits {', '.join(GENERATED_BY_THE_RELEASE_JOB)}"
+                     " could not be established", "unknown",
+                     manual=f"gh pr list --repo {github_slug(host)} --state open "
+                            "--limit 1000 --json number,files")
+    return Check("generated", str(host.repo),
+                 f"none of {len(prs)} open pull request(s) edits "
+                 f"{', '.join(GENERATED_BY_THE_RELEASE_JOB)}", "ok",
+                 extra={"open": len(prs), "offenders": []})
+
+
+def check_stamper(host: Host) -> Check:
+    """Can a branch in THIS REPO still write a version number itself? (#122)
+
+    #122 deleted `release_stamp.py` rather than documenting against it, because a branch
+    that can stamp itself will — and every mechanism that existed only to catch a branch
+    that had (the collision check, the push-time reservation, `no unstamped release on
+    main`) went with it. If the tool comes back, all of them are missing.
+
+    Its own row rather than half of a stamping one, and Codex is why: a stamper in the
+    repository and a stale brief on this machine are two reasons to fire, with two owners
+    and two remedies — the code even chose a different `manual` depending on which had
+    happened. One row with two premises is exactly how the `merges` row drifted, and
+    writing a second one is cheaper than explaining the first.
+    """
+    if not fragments_in_use(host):
+        return Check("stamper", str(host.repo),
+                     "this repo has no changelog.d/, so there is no branch-side stamping "
+                     "here to have removed", "ok")
+    stamper, why = _branch_side_stamper(host)
+    if why:
+        return Check("stamper", str(host.repo), why, "unknown",
+                     manual=f"git -C {host.repo} config --get qb.releaseStamp")
+    if stamper is not None:
+        return Check("stamper", _relative(stamper, host.repo),
+                     f"{_relative(stamper, host.repo)} is a branch-side stamper — a branch "
+                     "that can write a version number will, and every guard that existed to "
+                     "catch one that had was deleted with it (#122)", "fail",
+                     manual="delete it; the number is applied on the integration branch "
+                            "after the merge, by scripts/release.py run")
+    return Check("stamper", str(host.repo),
+                 "nothing here lets a branch write a version number", "ok")
+
+
+def check_briefs(host: Host) -> Check:
+    """Do the briefs THIS HOST WOULD OPEN still tell an agent to stamp a release? (#122)
+
+    The site that is not in the repository, and the reason this is a doctor row and not
+    only a test. Five agents stamped on the night of 2026-08-23 and every one of them was
+    following a document — *a mechanism removed from the code and left in the brief has
+    not been removed*. And the briefs on a host are the ones the harness ON PATH ships,
+    which is a different set from the repository's the moment that harness falls behind.
+    `test_no_brief_tells_an_agent_to_stamp_a_release` pins what this repo SHIPS; this asks
+    what this box READS, and on the machine it was written on the two disagreed.
+
+    Code blocks only, the same line that test draws: prose may explain what used to happen
+    and why it does not any more, and a fence may not carry the command. Inside a fence the
+    text goes through :func:`_shell_code`, so a commented-out command and a heredoc body
+    are not instructions — a false FAIL here sends somebody to rebuild a harness that was
+    fine. Quoted spans are deliberately kept, which is the opposite of what the hook
+    reading does: briefs quote the paths they run
+    (`python3 "$WT_DIR/scripts/release_stamp.py" preflight`), and emptying quoted spans
+    here stopped this seeing the very line it exists for.
+
+    A brief this cannot READ is not a brief that read clean. Codex found that: the walk
+    skipped an unreadable file and the row went green on the ones that were left.
+    """
+    if not fragments_in_use(host):
+        return Check("briefs", str(host.repo),
+                     "this repo has no changelog.d/, so no brief here can tell an agent to "
+                     "stop doing something it never did", "ok")
+    harness = installed_harness(host)
+    briefs = commands_dir(harness)
+    if briefs is None:
+        return Check("briefs", str(harness),
+                     "this harness has no commands/ directory, so the briefs an agent on "
+                     "this host reads could not be found — and a stamping instruction left "
+                     "in one is how the mechanism comes back", "unknown",
+                     manual="reinstall the harness (qb-bump), then re-run")
+    telling, unreadable = _briefs_that_tell_an_agent_to_stamp(briefs)
+    if telling:
+        return Check("briefs", str(briefs),
+                     f"{', '.join(sorted(telling))} run a release command #122 removed, in a "
+                     "code block — a branch names no version and cuts no release", "fail",
+                     manual=f"qb-bump --host $(hostname)   # if {briefs} is a stale harness; "
+                            "otherwise the brief itself is wrong",
+                     extra={"telling": sorted(telling), "unreadable": sorted(unreadable)})
+    if unreadable:
+        return Check("briefs", str(briefs),
+                     f"{', '.join(sorted(unreadable))} could not be read, so what {'it tells' if len(unreadable) == 1 else 'they tell'} "
+                     "an agent to do is not known", "unknown",
+                     manual=f"ls -l {briefs}", extra={"unreadable": sorted(unreadable)})
+    read = len(list(briefs.glob("*.md")))
+    return Check("briefs", str(briefs),
+                 f"none of the {read} brief(s) this host reads runs a stamping command in a "
+                 "code block", "ok", extra={"read": read})
+
+
+def _branch_side_stamper(host: Host) -> tuple[Path | None, str | None]:
+    """The tool a branch would stamp itself with, or why this cannot say.
+
+    `QB_RELEASE_STAMP`, then `qb.releaseStamp`, then `scripts/release_stamp.py` — the shape
+    `release_tagger` uses, so a repo that moved its tools is described by one rule and not
+    by two that agree until somebody moves one. And the same three-way answer, for the same
+    reason: a DECLARED stamper that is not at the path it was declared at is not an absent
+    affordance, and a `git config` that could not be read is not a key that is unset.
+    """
+    from_env = os.environ.get("QB_RELEASE_STAMP")
+    if from_env:
+        return ((Path(from_env), None) if Path(from_env).is_file() else
+                (None, f"QB_RELEASE_STAMP names {from_env}, which is not a file — so what "
+                       "a branch here could stamp with is declared and not there"))
+    rc, cfg, err = run_cmd(["git", "-C", str(host.repo), "config", "--get", "qb.releaseStamp"])
+    if rc not in (0, 1):
+        return None, ("this checkout will not say what `qb.releaseStamp` is set to "
+                      f"({clip_line(err) or f'git config exit {rc}'})")
+    if rc == 0 and cfg:
+        cand = Path(cfg) if cfg.startswith("/") else host.repo / cfg
+        return ((cand, None) if cand.is_file() else
+                (None, f"qb.releaseStamp names {cfg}, which is not a file — so what a branch "
+                       "here could stamp with is declared and not there"))
+    default = host.repo / "scripts" / "release_stamp.py"
+    return (default if default.is_file() else None), None
+
+
+def _briefs_that_tell_an_agent_to_stamp(briefs: Path) -> tuple[set[str], set[str]]:
+    """``(the briefs that do, the briefs that could not be read)``."""
+    telling: set[str] = set()
+    unreadable: set[str] = set()
+    for path in sorted(briefs.glob("*.md")):
+        text = _read(path)
+        if text is None:
+            unreadable.add(path.name)
+            continue
+        runnable = _shell_code(fenced(text))
+        if any(re.search(pattern, runnable) for pattern in _STAMPING_COMMANDS):
+            telling.add(path.name)
+    return telling, unreadable
+
+
+def fenced(text: str) -> str:
+    """Every fenced code block in a markdown document, concatenated.
+
+    A scanner rather than a regex, because a regex over ``` gets three things wrong and
+    Codex named all three: a `~~~` fence is missed entirely, a four-backtick fence is
+    closed by the first ``` inside it, and the closer's indentation is not the opener's.
+    The rule here is CommonMark's: a fence opens with three or more `` ` `` or `~`, and is
+    closed by a run of the SAME character at least as long, with nothing after it.
+
+    Indented fences are the reason any of this matters at all — every fence in
+    `fix-and-review.md` sits inside a numbered step, so an anchored ``` matches nothing,
+    and "no forbidden command in any code block" over zero code blocks passes on every
+    possible file.
+    """
+    out: list[str] = []
+    opener: tuple[str, int] | None = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        char = stripped[:1]
+        if char in ("`", "~"):
+            run = len(stripped) - len(stripped.lstrip(char))
+            rest = stripped[run:]
+            if opener is None:
+                if run >= 3 and (char != "`" or "`" not in rest):
+                    opener = (char, run)
+                    continue
+            elif char == opener[0] and run >= opener[1] and not rest:
+                opener = None
+                continue
+        if opener is not None:
+            out.append(line)
+    return "\n".join(out)
+
+
+#: What a tag reconciliation has to state before this will read it as one. Every key,
+#: with the right container type — because a report that omitted them all would otherwise
+#: default to four empty collections and be reported as a clean repository. Codex found
+#: that: `{}`, `{"clean": false}`, and any unrelated program that happens to print JSON
+#: all came out `ok`.
+_TAG_REPORT = {"orphaned": dict, "reserved": dict, "misplaced": dict, "untagged": list}
+
+#: The only two exit codes a reconciliation may have. `release_tag.py` documents 0 = clean,
+#: 1 = a condition could not be checked, 2 = STOP — so anything else is a program that did
+#: not answer this question, whatever it printed.
+_TAG_EXITS = (0, 2)
+
+
+def check_tags(host: Host) -> Check:
+    """Do the release tags point into the history they claim to tag?
+
+    #406's other half. `v3.8` was tagged at a commit a squash merge had discarded, so the
+    tag addressed history nobody could reach while the v3.8 entry sat on `main` — and the
+    CI job named `every release on main has a tag` stayed green, because it asked whether
+    a tag of that NAME resolved. CI only runs on a push; a person runs the doctor when
+    something feels wrong, which is when this gets asked.
+
+    ONE ROW, because there is one invariant: *a tag `vX.Y` points at a commit whose
+    CHANGELOG declares `vX.Y`*. That is `release_tag.py`'s own single sentence, and
+    `untagged`, `misplaced` and `orphaned` are the three ways it can be false, not three
+    separate questions. The tool reports one condition per line for the reader; the row
+    reports one verdict about the invariant, and leads with the orphan because that is the
+    one a merge strategy caused.
+
+    A LIVE RESERVATION IS NOT A FINDING, and telling it from an orphan is the whole
+    difficulty. A tag off the integration ref is two things wearing one face: a release
+    that has not landed there (a local cut not yet pushed, or a pre-#122 reservation),
+    which holds a number nothing else will hand out and is fine; or a release that HAS
+    landed and whose tag is somewhere else, which is the defect. One
+    `git merge-base --is-ancestor` cannot make that call — it needs the CHANGELOG at the
+    ref to say which releases have landed. Reporting reservations would train people to
+    ignore the row, which is worse than not having it.
+
+    THIS ROW EXECUTES A PROGRAM OUT OF THE REPOSITORY, and that is a decision rather than
+    an oversight. `merges` reads its tagger and refuses to run it, because `merges` asks
+    what a tool IS and running a program to find that out is the hazard itself. This asks
+    what the repository's TAGS ARE, and the tagger is the only thing that can answer: what
+    counts as a release heading here is a masked-markdown question with fenced blocks,
+    inline code spans and blockquoted fences all mattering, and this repo's CHANGELOG
+    quotes `## vX.Y` inside examples. `release_tag.py`'s own `_load_stamper` refuses to
+    keep a second copy of that rule, and a second copy here would agree with it until the
+    morning one of them was asked about a squash.
+
+    The parse that precedes the run is a COMPATIBILITY GATE and not a sandbox, and Codex
+    was right to say so: module-level code runs before any argument is parsed, and the
+    file can change between the read and the exec. What the gate buys is that an old or
+    foreign tagger is not invoked with a subcommand it does not have; what makes running
+    it acceptable is that this is the repository's own release tool, which its pre-push
+    hook and its CI already run on every push. What is NOT trusted is the answer: the exit
+    code, every field and its type are all checked before a verdict is reached.
+    """
+    tagger, why = release_tagger(host)
+    if why:
+        return Check("tags", str(host.repo), why, "unknown",
+                     manual=f"git -C {host.repo} config --get qb.releaseTag")
+    if tagger is None:
+        return Check("tags", str(host.repo),
+                     "this repo has no release tagger, so nothing here can reconcile a tag "
+                     "against the history it names", "ok")
+    rel = _relative(tagger, host.repo)
+    text = _read(tagger)
+    names = _python_subcommands(text) if text is not None and _is_python(tagger, text) else None
+    if names is None or "check" not in names:
+        return Check("tags", rel,
+                     f"{rel} does not declare a `check` subcommand this could read, and "
+                     "nothing else here can tell a tag left over from a reservation from one "
+                     "a squash merge orphaned", "unknown",
+                     manual=f"{rel} check --json --repo {host.repo}")
+    base = _default_branch(host)
+    if base is None:
+        # NOT a fallback to HEAD. The question is about the ref work lands on, and asking
+        # it of whatever branch this worktree happens to be on would answer a different
+        # question in the same words.
+        return Check("tags", str(host.repo),
+                     f"could not resolve {host.remote}'s default branch, and a tag is "
+                     "orphaned or reserved only with respect to the ref work lands on",
+                     "unknown",
+                     manual=f"git -C {host.repo} remote set-head {host.remote} --auto")
+    ref = f"{host.remote}/{base}"
+    argv = [sys.executable, str(tagger), "check", "--json", "--repo", str(host.repo),
+            "--ref", ref]
+    rc, out, err = run_cmd(argv, cwd=str(host.repo), timeout=60)
+    report, complaint = _tag_report(rc, out)
+    if report is None:
+        return Check("tags", ref, f"{rel} {complaint}"
+                     + (f": {clip_line(err)}" if err else ""), "unknown",
+                     manual=" ".join(argv[1:]))
+    orphaned, untagged = report["orphaned"], report["untagged"]
+    misplaced, reserved = report["misplaced"], report["reserved"]
+    # Said in every verdict, including the passing one, because a reader who does not know
+    # that reservations are excluded cannot tell a quiet row from an incurious one.
+    aside = (f"; {len(reserved)} tag(s) off {ref} are unpushed local cuts or pre-#122 "
+             "reservations, which is not a finding" if reserved else "")
+    if orphaned:
+        return Check("tags", ref,
+                     f"{', '.join(sorted(orphaned))} landed on {ref} and "
+                     f"{'is' if len(orphaned) == 1 else 'are'} tagged off it — a rewriting "
+                     f"merge discarded the commit the tag named (#406){aside}", "fail",
+                     manual=f"{rel} check --ref {ref}   # it prints where each one landed and "
+                            "the leased force-push to re-point it; nothing moves a tag for you",
+                     extra={"orphaned": orphaned, "reserved": reserved})
+    if untagged or misplaced:
+        parts = []
+        if untagged:
+            parts.append(f"{', '.join(sorted(untagged))} shipped on {ref} with no tag")
+        if misplaced:
+            parts.append(f"{', '.join(sorted(misplaced))} tagged at a commit that does not "
+                         "declare it")
+        return Check("tags", ref, "; ".join(parts) + aside, "fail",
+                     manual=f"{rel} check --ref {ref}",
+                     extra={"untagged": untagged, "misplaced": misplaced,
+                            "reserved": reserved})
+    return Check("tags", ref, f"every release on {ref} is tagged, and every tag is on the "
+                 f"history it names{aside}", "ok", extra={"reserved": reserved})
+
+
+def _tag_report(rc: int, out: str) -> tuple[dict | None, str]:
+    """A reconciliation this row is willing to read a verdict out of, or why it is not.
+
+    Nothing here is inferred from what is missing. Every key must be present with the
+    right container type, the exit code must be one of the two this question has, and the
+    two must agree — a `0` alongside findings, or a `2` alongside none, is a program whose
+    answer this cannot use, whichever half were believed.
+    """
+    if rc not in _TAG_EXITS:
+        return None, f"exited {rc}, which is not an answer about the tags"
+    try:
+        report = json.loads(out)
+    except ValueError:
+        return None, "did not answer a report about the tags"
+    if not isinstance(report, dict):
+        return None, "did not answer a report about the tags"
+    for key, kind in _TAG_REPORT.items():
+        if not isinstance(report.get(key), kind):
+            return None, f"answered a report with no usable `{key}`"
+    findings = any(report[k] for k in ("orphaned", "untagged", "misplaced"))
+    if findings != (rc == 2):
+        return None, (f"exited {rc} and reported "
+                      f"{'findings' if findings else 'none'}, which disagree")
+    return report, ""
+
+
 #: The questions this tool asks, as opposed to the rows that answer them. Two, and
 #: they are separate because a row's group decides what a reader does with a `FAIL`:
 #: a broken `host` row is fixed on this machine, and a broken `landing` row is fixed
@@ -1763,6 +2544,12 @@ CHECKS = (
     ("edge", "host", check_edge),
     ("tools", "host", check_tools),
     ("merges", "landing", check_merges),
+    ("queue", "landing", check_queue),
+    ("landed", "landing", check_landed),
+    ("tags", "landing", check_tags),
+    ("generated", "landing", check_generated),
+    ("stamper", "landing", check_stamper),
+    ("briefs", "landing", check_briefs),
 )
 
 

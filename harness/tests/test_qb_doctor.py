@@ -26,6 +26,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -1128,6 +1129,7 @@ TAGGER_THAT_RESERVES_NOTHING = (
 def landing_repo(repo: Path) -> Path:
     """A repo in scope for the merges row: a GitHub remote and a tagger that reserves."""
     _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
     (repo / "scripts").mkdir()
     (repo / "scripts" / "release_tag.py").write_text(RESERVING_TAGGER)
     return repo
@@ -1700,13 +1702,9 @@ def test_every_check_belongs_to_a_group_this_file_declares():
         assert group in qd.GROUPS, f"{name} is filed under {group!r}, which is not a group"
 
 
-def test_the_landing_group_holds_the_merges_row():
-    assert qd.selectable()["landing"] == {"merges"}
-
-
 def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
-    """`--only landing` is `--only merges` today and stays correct as #407 adds to it,
-    which is the point of naming the group at all."""
+    """`--only landing` names a question rather than a list of rows, which is what made
+    #407 an extension of a category instead of a retrofit around a single check."""
     seen: list[set[str] | None] = []
     monkeypatch.setattr(qd, "survey", lambda *_a, **_k: object())
     monkeypatch.setattr(qd, "run_checks",
@@ -1715,7 +1713,8 @@ def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
 
     qd.main(["--only", "landing"])
 
-    assert seen == [{"merges"}]
+    assert seen == [{n for n, g, _fn in qd.CHECKS if g == "landing"}]
+    assert len(seen[0]) > 1, "the point of a group is that it holds more than one row"
 
 
 def test_a_group_name_that_does_not_exist_is_refused_before_anything_runs(capsys):
@@ -1736,3 +1735,803 @@ def test_a_rows_group_comes_from_the_registration_not_from_the_check(monkeypatch
     assert rows[0].group == "landing"
     assert rows[0].verdict == "unknown"
     assert rows[0].as_dict()["group"] == "landing"
+
+
+# --------------------------------------------------------------------------- #
+# the landing group (#407) — is the line moving, is main moving, are the tags sound
+# --------------------------------------------------------------------------- #
+
+def _iso(minutes_ago: float) -> str:
+    """An ISO-8601 instant that many minutes in the past."""
+    return (datetime.now(UTC) - timedelta(minutes=minutes_ago)).isoformat()
+
+
+def _queue(queued: int, ready: int, *, oldest: float = 1.0, pr: int = 7,
+           holder: str = "zeus/jasper-moss") -> dict:
+    """What `GET /merge-queue` answers, in the shape `app/api/merge_queue.py` sends it."""
+    entries = [{"pr": pr + i, "position": i + 1, "holder": holder,
+                "ready": i < ready, "entered": _iso(oldest - i)}
+               for i in range(queued)]
+    return {"repo": "acme/thing", "base": "main", "entries": entries,
+            "head": entries[0] if entries else None,
+            "counts": {"queued": queued, "ready": ready, "not_ready": queued - ready}}
+
+
+def _board_says(monkeypatch, payload, *, status: int = 200, err: str | None = None) -> None:
+    """Answer for the board and nothing else. `payload` may be a dict or raw text."""
+    body = payload if isinstance(payload, str) else json.dumps(payload)
+    monkeypatch.setattr(qd, "http_get", lambda url, headers=None: (status, body, err))
+
+
+def _gh_answers(monkeypatch, answers: dict[str, tuple[int, str, str]], *,
+                have_gh: bool = True) -> None:
+    """Answer several DIFFERENT gh calls, chosen by a marker in the argv.
+
+    `check_landed` makes two — `gh pr list` and `gh api repos/…/commits/…` — and a
+    fixture that answered both with one body would have the row reading a list of pull
+    requests as a commit date and still passing, which is a test asserting its own stub.
+    """
+    real = qd.run_cmd
+    real_which = qd.shutil.which
+
+    def fake(argv, **kwargs):
+        if argv and argv[0] == "gh":
+            joined = " ".join(argv)
+            for marker, answer in answers.items():
+                if marker in joined:
+                    return answer
+            return 1, "", f"no stub for: {joined}"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", fake)
+    monkeypatch.setattr(qd.shutil, "which",
+                        lambda n: ("/usr/bin/gh" if have_gh else None) if n == "gh"
+                        else real_which(n))
+
+
+@pytest.fixture
+def landing_host(landing_repo: Path) -> qd.Host:
+    """A repo the whole landing group is in scope for: GitHub remote, board, token."""
+    (landing_repo / "changelog.d").mkdir()
+    return host_for(landing_repo, base_url="https://board.example", token="t")
+
+
+# ----------------------------------------------------------------- queue
+
+def test_an_empty_queue_is_not_a_fault(monkeypatch, landing_host):
+    """"Do not fail on irrelevance". A repo with nothing waiting to land has an empty
+    queue, and that is the healthy state, not an absent one."""
+    _board_says(monkeypatch, _queue(0, 0))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "ok"
+    assert "nothing is queued" in check.detail
+
+
+def test_a_queue_with_something_ready_is_moving(monkeypatch, landing_host):
+    _board_says(monkeypatch, _queue(3, 1))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "ok"
+    assert "3 queued" in check.detail and "1 ready" in check.detail
+
+
+def test_nothing_ready_for_a_few_minutes_is_a_landing_in_progress(monkeypatch, landing_host):
+    """The other half of the predicate, and the reason it needs a clock. Nothing ready is
+    the normal state of a queue whose head is mid-preland — PR #398 was timed at 5m37s
+    and 12m59s from merge to green — so the pair alone is not a finding."""
+    _board_says(monkeypatch, _queue(3, 0, oldest=4))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "ok"
+    assert "inside a landing" in check.detail
+
+
+def test_a_queue_with_nothing_ready_for_longer_than_a_landing_is_the_stall(
+        monkeypatch, landing_host):
+    """#405. Seven green pull requests, zero ready, main unmoved for three hours — and
+    nine `ok` rows about it. This is the row that disagrees."""
+    _board_says(monkeypatch, _queue(7, 0, oldest=190, pr=401, holder="zeus/opal-vermeil"))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "fail"
+    assert "7 queued" in check.detail and "NONE ready" in check.detail
+    assert "3h 10m" in check.detail
+    # A stalled queue is somebody to talk to, which is the only remedy there is: nothing
+    # here evicts an entry or merges anything (#405 — the queue stays advisory).
+    assert "zeus/opal-vermeil" in check.manual and "#401" in check.manual
+
+
+def test_a_stalled_queue_names_no_command_that_changes_it(monkeypatch, landing_host):
+    _board_says(monkeypatch, _queue(7, 0, oldest=190))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.fix is None, "the queue is advisory; nothing here may evict or merge (#405)"
+
+
+@pytest.mark.parametrize("kw,phrase", [
+    ({"base_url": None}, "no board is configured"),
+    ({"token": None}, "resolved no board token"),
+])
+def test_a_queue_that_could_not_be_asked_about_is_unknown(landing_host, kw, phrase):
+    """The rule this group is bound by. A landing group that went green having seen
+    nothing would be a worse version of the problem it exists to solve."""
+    host = qd.Host(**{**landing_host.__dict__, **kw})
+
+    check = qd.check_queue(host)
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+@pytest.mark.parametrize("payload,status,err,phrase", [
+    (None, 0, "URLError: refused", "could not reach the board"),
+    ({}, 503, None, "answered 503"),
+    ("not json", 200, None, "did not answer JSON"),
+    ({"counts": {"queued": "several"}}, 200, None, "usable pair of queue counts"),
+    ({"counts": {"queued": 0, "ready": -1}}, 200, None, "usable pair of queue counts"),
+    ({"counts": {"queued": 1, "ready": 2}}, 200, None, "usable pair of queue counts"),
+    ({"counts": {"queued": True, "ready": False}}, 200, None, "usable pair of queue counts"),
+])
+def test_a_board_that_will_not_state_the_queue_is_unknown_and_never_ok(
+        monkeypatch, landing_host, payload, status, err, phrase):
+    _board_says(monkeypatch, payload if payload is not None else "", status=status, err=err)
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+def test_a_queue_whose_entries_carry_no_arrival_time_is_unknown_not_a_stall(
+        monkeypatch, landing_host):
+    """How long the pair has held is half the predicate. Without it the row can neither
+    fail nor pass, and guessing either way is the collapse this file forbids."""
+    payload = _queue(3, 0)
+    for e in payload["entries"]:
+        e.pop("entered")
+    _board_says(monkeypatch, payload)
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "no usable arrival time" in check.detail
+
+
+def test_a_queue_entry_that_arrived_in_the_future_is_not_evidence_of_health(
+        monkeypatch, landing_host):
+    """Clock skew, or a board answering nonsense. Read as an age it is negative, which
+    lands in the "inside a landing" pass — so it is discarded before the clock is read,
+    and a queue with nothing else to go on is an `unknown`."""
+    _board_says(monkeypatch, _queue(3, 0, oldest=-90))
+
+    check = qd.check_queue(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "no usable arrival time" in check.detail
+
+
+# ----------------------------------------------------------------- landed
+
+_COMMIT = "repos/acme/thing/commits/main"
+
+
+def test_green_pull_requests_and_a_main_that_has_not_moved_is_the_finding(
+        monkeypatch, landing_host):
+    """"Six green pull requests, main unchanged for 4h" — the single most legible
+    statement of the night #407 was filed, which no row anywhere made."""
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([
+            {"number": 401, "isDraft": False, "mergeStateStatus": "CLEAN"},
+            {"number": 403, "isDraft": False, "mergeStateStatus": "CLEAN"},
+            {"number": 404, "isDraft": False, "mergeStateStatus": "DIRTY"}]), ""),
+        _COMMIT: (0, _iso(250), ""),
+    })
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "fail"
+    assert "#401" in check.detail and "#403" in check.detail
+    assert "#404" not in check.detail, "a conflicting PR is not ready to land"
+    assert "4h 10m" in check.detail
+
+
+def test_a_still_main_with_nothing_ready_is_not_a_stall(monkeypatch, landing_host):
+    """Both halves, or the row fires every night on every quiet repo — which is how a row
+    gets ignored."""
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([{"number": 401, "isDraft": False,
+                                    "mergeStateStatus": "BLOCKED"}]), ""),
+        _COMMIT: (0, _iso(600), ""),
+    })
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "ok"
+    assert "not a stall" in check.detail
+
+
+def test_a_ready_pull_request_and_a_main_that_moved_recently_is_fine(
+        monkeypatch, landing_host):
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([{"number": 401, "isDraft": False,
+                                    "mergeStateStatus": "CLEAN"}]), ""),
+        _COMMIT: (0, _iso(9), ""),
+    })
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "ok"
+    assert "9m ago" in check.detail
+
+
+def test_a_draft_is_not_ready_to_land(monkeypatch, landing_host):
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([{"number": 401, "isDraft": True,
+                                    "mergeStateStatus": "CLEAN"}]), ""),
+        _COMMIT: (0, _iso(600), ""),
+    })
+
+    assert qd.check_landed(landing_host).verdict == "ok"
+
+
+def test_a_merge_state_github_has_not_computed_is_unknown_and_not_unready(
+        monkeypatch, landing_host):
+    """GitHub resolves `mergeStateStatus` lazily, so a pull request nobody has asked
+    about since its last push answers UNKNOWN. Read as "not ready" it would make a
+    stalled repo look quiet — the absent signal rendering as the benign one, one more
+    time."""
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([{"number": 401, "isDraft": False,
+                                    "mergeStateStatus": "UNKNOWN"}]), ""),
+        _COMMIT: (0, _iso(600), ""),
+    })
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "#401" in check.detail
+
+
+@pytest.mark.parametrize("answers,have_gh,phrase", [
+    ({}, False, "no gh on this host"),
+    ({"pr list": (1, "", "gh: HTTP 401")}, True, "could not list the pull requests"),
+    ({"pr list": (0, "[]", ""), _COMMIT: (1, "", "gh: not found")}, True,
+     "could not read when the tip of main was committed"),
+])
+def test_a_landing_row_that_could_not_ask_github_is_unknown(
+        monkeypatch, landing_host, answers, have_gh, phrase):
+    _gh_answers(monkeypatch, answers, have_gh=have_gh)
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+def test_a_truncated_read_cannot_report_that_nothing_is_ready(monkeypatch, landing_host):
+    """The cap was disclosed in the detail and the verdict was `ok` anyway, which is a
+    disclosure making an unmade check sound careful. The pull request beyond the cap is
+    exactly where the ready one would be."""
+    _gh_answers(monkeypatch, {
+        "pr list": (0, json.dumps([{"number": n, "isDraft": False,
+                                    "mergeStateStatus": "BLOCKED"}
+                                   for n in range(qd.PR_SAMPLE)]), ""),
+        _COMMIT: (0, _iso(600), ""),
+    })
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "unknown"
+    assert f"first {qd.PR_SAMPLE} open pull requests" in check.detail
+
+
+def test_a_truncated_read_can_still_report_what_it_did_see(monkeypatch, landing_host):
+    """The other side of the same rule. Truncation cannot make a pull request that was
+    read and is ready stop being ready, so the finding branches come first."""
+    prs = [{"number": n, "isDraft": False, "mergeStateStatus": "BLOCKED"}
+           for n in range(qd.PR_SAMPLE - 1)]
+    prs.append({"number": 999, "isDraft": False, "mergeStateStatus": "CLEAN"})
+    _gh_answers(monkeypatch, {"pr list": (0, json.dumps(prs), ""),
+                              _COMMIT: (0, _iso(600), "")})
+
+    check = qd.check_landed(landing_host)
+
+    assert check.verdict == "fail"
+    assert "#999" in check.detail
+
+
+# ----------------------------------------------------------------- generated
+
+def test_a_pull_request_editing_the_generated_changelog_is_the_finding(
+        monkeypatch, landing_host):
+    """#122's measured evidence: on 2026-08-23 the three open pull requests that had
+    written a release entry were all CONFLICTING and the three that had not were all
+    MERGEABLE. The edit is the fault; the conflict is its commonest consequence."""
+    _gh_answers(monkeypatch, {"pr list": (0, json.dumps([
+        {"number": 398, "isDraft": False, "mergeStateStatus": "DIRTY",
+         "files": [{"path": "CHANGELOG.md"}, {"path": "app/main.py"}]},
+        {"number": 401, "isDraft": False, "mergeStateStatus": "CLEAN",
+         "files": [{"path": "changelog.d/401.fix.md"}]}]), "")})
+
+    check = qd.check_generated(landing_host)
+
+    assert check.verdict == "fail"
+    assert "#398" in check.detail and "#401" not in check.detail
+    assert "1 of them already conflicting" in check.detail
+    assert "changelog.d/<issue>.<kind>.md" in check.manual
+
+
+def test_a_pull_request_touching_the_readme_is_not_the_finding(monkeypatch, landing_host):
+    """The guard exempts the rest of README.md so that documenting anything is not taxed,
+    and a list of changed paths cannot tell an edit to the release list from an edit to
+    the installation instructions. Failing a branch for improving its own docs is how a
+    row gets ignored."""
+    _gh_answers(monkeypatch, {"pr list": (0, json.dumps([
+        {"number": 401, "isDraft": False, "mergeStateStatus": "CLEAN",
+         "files": [{"path": "README.md"}, {"path": "changelog.d/401.docs.md"}]}]), "")})
+
+    assert qd.check_generated(landing_host).verdict == "ok"
+
+
+def test_a_truncated_read_cannot_report_that_no_pull_request_edits_it(
+        monkeypatch, landing_host):
+    """Codex's first finding. `check_generated` noticed the exact truncation, said so in
+    its detail, and returned `ok` — the 51st pull request being precisely where the
+    offender would be."""
+    _gh_answers(monkeypatch, {"pr list": (0, json.dumps(
+        [{"number": n, "isDraft": False, "mergeStateStatus": "CLEAN",
+          "files": [{"path": "app/main.py"}]} for n in range(qd.PR_SAMPLE)]), "")})
+
+    check = qd.check_generated(landing_host)
+
+    assert check.verdict == "unknown"
+    assert f"first {qd.PR_SAMPLE} open pull requests" in check.detail
+
+
+def test_github_is_asked_about_the_pull_requests_once(monkeypatch, landing_host):
+    """Two rows, one call. Two would be slower and, worse, a way for the two rows to come
+    to describe the same pull requests differently."""
+    calls: list[list[str]] = []
+    real = qd.run_cmd
+    real_which = qd.shutil.which
+
+    def counting(argv, **kw):
+        if argv and argv[0] == "gh":
+            calls.append(argv)
+            if "pr" in argv:
+                return 0, "[]", ""
+            return 0, _iso(5), ""
+        return real(argv, **kw)
+
+    monkeypatch.setattr(qd, "run_cmd", counting)
+    monkeypatch.setattr(qd.shutil, "which",
+                        lambda n: "/usr/bin/gh" if n == "gh" else real_which(n))
+
+    qd.check_landed(landing_host)
+    qd.check_generated(landing_host)
+
+    assert sum(1 for c in calls if "pr" in c and "list" in c) == 1
+
+
+def test_a_repo_that_does_not_generate_its_release_notes_is_not_asked(monkeypatch, repo):
+    """Scope. A repo whose branches legitimately write their own release entry is not
+    failing anything, and there is no `changelog.d/` to say otherwise."""
+    _gh_answers(monkeypatch, {})
+
+    check = qd.check_generated(host_for(repo))
+
+    assert check.verdict == "ok"
+    assert "no changelog.d/" in check.detail
+
+
+def test_the_generated_row_is_unknown_when_it_cannot_reach_github(monkeypatch, landing_host):
+    _gh_answers(monkeypatch, {}, have_gh=False)
+
+    check = qd.check_generated(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "no gh on this host" in check.detail
+
+
+# ------------------------------------------------------- stamper and briefs
+
+
+@pytest.fixture
+def stamping_repo(landing_repo: Path) -> Path:
+    """A repo that does releases out of fragments, which is what puts it in scope."""
+    (landing_repo / "changelog.d").mkdir()
+    return landing_repo
+
+
+def _briefs(harness: Path, **files: str) -> Path:
+    d = harness / "commands"
+    d.mkdir(parents=True, exist_ok=True)
+    for name, body in files.items():
+        (d / f"{name}.md").write_text(body)
+    return d
+
+
+def test_a_brief_that_runs_a_removed_release_command_in_a_fence_is_the_finding(
+        tmp_path, stamping_repo):
+    """Five agents stamped on the night of 2026-08-23 and every one was following a
+    document. A mechanism removed from the code and left in the brief has not been
+    removed."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "Step 4:\n\n```bash\n"
+                        "python3 scripts/release_stamp.py apply --onto origin/main\n```\n"})
+
+    check = qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "fail"
+    assert "fix-and-land.md" in check.detail
+    assert "qb-bump" in check.manual
+
+
+def test_a_quoted_path_in_a_fence_is_still_the_command_it_runs(tmp_path, stamping_repo):
+    """The regression that hid a real finding for one commit. Briefs quote the paths they
+    run — `python3 "$WT_DIR/scripts/release_stamp.py" preflight` is the line the installed
+    `fix-and-review.md` carries — so emptying quoted spans here, which is exactly right
+    when reading a hook, stopped this seeing the very thing it exists for."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-review": '```bash\npython3 "$WT_DIR/scripts/'
+                        'release_stamp.py" preflight --repo "$WT_DIR"\n```\n'})
+
+    assert qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin")).verdict \
+        == "fail"
+
+
+def test_prose_explaining_the_removed_command_is_not_an_instruction_to_run_it(
+        tmp_path, stamping_repo):
+    """The line `test_no_brief_tells_an_agent_to_stamp_a_release` draws, drawn the same
+    way here: the paragraph explaining why a branch does not stamp has to name the
+    command to explain anything at all."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "A branch never runs `release_stamp.py apply` — the "
+                        "number is applied on main after the merge.\n\n```bash\n"
+                        "gh pr merge --merge\n```\n"})
+
+    assert qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin")).verdict == "ok"
+
+
+def test_a_commented_out_command_inside_a_fence_is_not_an_instruction(
+        tmp_path, stamping_repo):
+    """A false FAIL here sends somebody to rebuild a harness that was fine."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "```bash\n# we used to run release_stamp.py here\n"
+                        "gh pr merge --merge\n```\n"})
+
+    assert qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin")).verdict == "ok"
+
+
+@pytest.mark.parametrize("body", [
+    "~~~bash\nscripts/release_stamp.py apply\n~~~\n",
+    "````bash\n```\nscripts/release_stamp.py apply\n```\n````\n",
+    "1. do it:\n\n   ```bash\n   scripts/release_stamp.py apply\n   ```\n",
+])
+def test_every_fence_markdown_has_is_read_as_one(tmp_path, stamping_repo, body):
+    """Codex named all three. A `~~~` fence was missed entirely; a four-backtick block was
+    closed by the first ``` inside it, so everything after read as prose; and the indented
+    fence is the reason any of this matters — every fence in `fix-and-review.md` sits
+    inside a numbered step, and "no forbidden command in any code block" over zero code
+    blocks passes on every possible file."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": body})
+
+    assert qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin")).verdict \
+        == "fail"
+
+
+def test_text_outside_every_fence_is_never_read_as_a_command(tmp_path, stamping_repo):
+    """The other direction of the same scanner: a closing fence has to close."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "```bash\ngh pr merge\n```\n\n"
+                        "Then never run scripts/release_stamp.py apply again.\n"})
+
+    assert qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin")).verdict == "ok"
+
+
+def test_the_briefs_read_are_the_ones_this_host_would_open_not_the_checkouts(
+        tmp_path, stamping_repo):
+    """The site that makes this a doctor row rather than only a test. The briefs on a host
+    are the ones the harness on PATH ships, which is a different set from the
+    repository's the moment that harness falls behind — and the `harness` row exists
+    precisely because it does."""
+    stale = tmp_path / "store" / "quarterback-harness-0.1.0"
+    _briefs(stale / "share" / "quarterback-harness",
+            **{"fix-and-land": "```bash\nscripts/release_stamp.py apply\n```\n"})
+    current = tmp_path / "checkout" / "harness"
+    _briefs(current, **{"fix-and-land": "```bash\ngh pr merge --merge\n```\n"})
+
+    on_path = qd.check_briefs(host_for(stamping_repo, harness_bin=stale / "bin",
+                                       source_harness=current))
+    assert on_path.verdict == "fail", "the stale harness on PATH is what an agent reads"
+
+    checkout_only = qd.check_briefs(host_for(stamping_repo, source_harness=current))
+    assert checkout_only.verdict == "ok"
+
+
+def test_a_brief_that_could_not_be_read_is_unknown_rather_than_a_clean_one(
+        tmp_path, stamping_repo):
+    """Codex found this: the walk skipped an unreadable file and the row went green on the
+    ones that were left, which is a check that could not be made rendering as a pass."""
+    harness = tmp_path / "installed"
+    briefs = _briefs(harness, **{"fix-and-land": "```bash\ngh pr merge\n```\n",
+                                 "panel-review-pr": "```bash\ngh pr merge\n```\n"})
+    (briefs / "panel-review-pr.md").chmod(0o000)
+    try:
+        check = qd.check_briefs(host_for(stamping_repo, harness_bin=harness / "bin"))
+    finally:
+        (briefs / "panel-review-pr.md").chmod(0o644)
+
+    assert check.verdict == "unknown"
+    assert "panel-review-pr.md" in check.detail
+
+
+def test_a_harness_with_no_briefs_at_all_is_unknown(tmp_path, stamping_repo):
+    """A row that could not find the documents is not a row that read clean ones."""
+    check = qd.check_briefs(host_for(stamping_repo, harness_bin=tmp_path / "empty" / "bin",
+                                     source_harness=tmp_path / "empty"))
+
+    assert check.verdict == "unknown"
+    assert "no commands/ directory" in check.detail
+
+
+def test_a_branch_side_stamper_is_its_own_row(tmp_path, stamping_repo):
+    """#122 deleted the file rather than documenting against it, because a branch that can
+    stamp itself will. Its own row and not half of a stamping one: a stamper in the
+    repository and a stale brief on this machine have two owners and two remedies, and one
+    row with two premises is how the `merges` row drifted."""
+    (stamping_repo / "scripts" / "release_stamp.py").write_text("# apply a version\n")
+
+    check = qd.check_stamper(host_for(stamping_repo))
+
+    assert check.verdict == "fail"
+    assert "scripts/release_stamp.py" in check.detail
+    assert "release.py run" in check.manual
+
+
+def test_a_repo_with_no_stamper_says_so(stamping_repo):
+    assert qd.check_stamper(host_for(stamping_repo)).verdict == "ok"
+
+
+@pytest.mark.parametrize("row", ["check_stamper", "check_briefs"])
+def test_a_repo_that_does_not_stamp_at_all_is_not_asked(tmp_path, landing_repo, row):
+    """Scope. A repo with no `changelog.d/` never had the affordance removed, so there is
+    nothing here to have come back."""
+    harness = tmp_path / "installed"
+    _briefs(harness, **{"fix-and-land": "```bash\nscripts/release_stamp.py apply\n```\n"})
+    (landing_repo / "scripts" / "release_stamp.py").write_text("# apply a version\n")
+
+    check = getattr(qd, row)(host_for(landing_repo, harness_bin=harness / "bin"))
+
+    assert check.verdict == "ok"
+    assert "no changelog.d/" in check.detail
+
+
+@pytest.mark.parametrize("setup,phrase", [
+    ("env", "QB_RELEASE_STAMP names"),
+    ("config", "qb.releaseStamp names"),
+    ("unreadable", "`qb.releaseStamp`"),
+])
+def test_a_stamper_that_is_declared_and_absent_is_unknown_not_gone(
+        monkeypatch, stamping_repo, setup, phrase):
+    """A DECLARED stamper that is not at the path it was declared at is not an absent
+    affordance, and a `git config` that could not be read is not a key that is unset —
+    the same three-way answer `release_tagger` makes, for the same reason."""
+    if setup == "env":
+        monkeypatch.setenv("QB_RELEASE_STAMP", str(stamping_repo / "gone.py"))
+    elif setup == "config":
+        _git(stamping_repo, "config", "qb.releaseStamp", "tools/gone.py")
+    else:
+        real = qd.run_cmd
+        monkeypatch.setattr(qd, "run_cmd", lambda argv, **kw:
+                            (128, "", "fatal: bad config line 3")
+                            if "qb.releaseStamp" in argv else real(argv, **kw))
+
+    check = qd.check_stamper(host_for(stamping_repo))
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+# ----------------------------------------------------------------- tags
+
+def _report(**over) -> str:
+    """A tag reconciliation in the shape `release_tag.py check --json` prints one."""
+    return json.dumps({"clean": True, "ref": "origin/main", "orphaned": {}, "reserved": {},
+                       "misplaced": {}, "untagged": [], **over})
+
+
+def _tagger(repo: Path, body: str) -> None:
+    """A tagger the row is allowed to run: it declares a `check` subcommand, so the parse
+    of the file says the thing being executed is the thing that was read."""
+    (repo / "scripts" / "release_tag.py").write_text(
+        "import argparse, json, sys\n"
+        "sub = argparse.ArgumentParser().add_subparsers()\n"
+        'sub.add_parser("check")\n'
+        + body)
+
+
+def _prints(payload: str, exit_code: int = 0) -> str:
+    return f"print({payload!r})\nsys.exit({exit_code})\n"
+
+
+def test_an_orphaned_release_tag_is_the_finding(landing_repo):
+    """#406. `v3.8` was tagged at a commit a squash discarded, so the tag addressed
+    history nobody could reach while the entry sat on main — and the guard called `every
+    release on main has a tag` stayed green, because a tag of that name resolved."""
+    _tagger(landing_repo, _prints(_report(clean=False, orphaned={"v3.8": "abc123"}), 2))
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert "v3.8" in check.detail
+    assert "nothing moves a tag for you" in check.manual
+
+
+def test_a_reserved_tag_is_listed_and_is_never_a_finding(landing_repo):
+    """A tag off the ref is two things wearing one face. Reporting the harmless one would
+    train people to ignore the row, which is worse than not having it — so a reservation
+    is named in the passing verdict and does not change it."""
+    _tagger(landing_repo, _prints(_report(reserved={"v3.14": "def456"})))
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "ok"
+    assert "1 tag(s) off" in check.detail and "not a finding" in check.detail
+
+
+@pytest.mark.parametrize("over,phrase", [
+    ({"untagged": ["v3.9"]}, "v3.9 shipped"),
+    ({"misplaced": {"v3.9": "abc123"}}, "does not declare it"),
+])
+def test_the_other_two_ways_the_invariant_is_false_are_findings_too(
+        landing_repo, over, phrase):
+    """One row, because there is one invariant — a tag `vX.Y` points at a commit whose
+    CHANGELOG declares `vX.Y`. `untagged`, `misplaced` and `orphaned` are the three ways
+    it can be false, not three questions."""
+    _tagger(landing_repo, _prints(_report(clean=False, **over), 2))
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "fail"
+    assert phrase in check.detail
+
+
+def test_clean_tags_are_ok(landing_repo):
+    _tagger(landing_repo, _prints(_report()))
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "ok"
+    assert "every tag is on the history it names" in check.detail
+
+
+def test_a_repo_with_no_tagger_has_nothing_to_reconcile(repo):
+    check = qd.check_tags(host_for(repo))
+
+    assert check.verdict == "ok"
+    assert "no release tagger" in check.detail
+
+
+def test_a_tagger_without_a_check_subcommand_is_not_run_and_is_unknown(landing_repo):
+    """It is run only when the parse of the file says it has a `check` subcommand, so an
+    old or foreign tagger is never invoked with a subcommand it does not have. That is a
+    compatibility gate and not a sandbox, and the docstring says so."""
+    (landing_repo / "scripts" / "release_tag.py").write_text(
+        'sub.add_parser("backfill")\nraise SystemExit("this must never run")\n')
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert "does not declare a `check` subcommand" in check.detail
+
+
+def test_a_checkout_whose_integration_ref_is_unknown_does_not_answer_about_head(repo):
+    """NOT a fallback. The question is about the ref work lands on, and asking it of
+    whatever branch this worktree happens to be on would answer a different question in
+    the same words — a feature branch could take a clean tag verdict that says nothing
+    about landing."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    (repo / "scripts").mkdir()
+    _tagger(repo, _prints(_report()))
+
+    check = qd.check_tags(host_for(repo))
+
+    assert check.verdict == "unknown"
+    assert "default branch" in check.detail
+
+
+@pytest.mark.parametrize("body,phrase", [
+    ('sys.stderr.write("limited: no remote\\n")\nsys.exit(1)\n', "exited 1"),
+    ('print("clean, probably")\n', "did not answer a report"),
+    (_prints("{}"), "no usable `orphaned`"),
+    (_prints('{"clean": false}'), "no usable `orphaned`"),
+    (_prints(json.dumps({"clean": True, "orphaned": {}, "reserved": {}, "misplaced": {},
+                         "untagged": "none"})), "no usable `untagged`"),
+    (_prints(_report(), 2), "disagree"),
+    (_prints(_report(clean=False, orphaned={"v3.8": "abc"}), 0), "disagree"),
+    (_prints(_report(), 7), "exited 7"),
+])
+def test_a_report_this_cannot_use_is_unknown_rather_than_clean(landing_repo, body, phrase):
+    """Nothing is inferred from what is missing, and Codex is why: every absent field
+    defaulted to an empty collection, so `{}`, `{"clean": false}` and any unrelated
+    program that happened to print JSON all came out `ok`. Every key must be present with
+    the right container type, the exit code must be one of the two this question has, and
+    the two must agree — a `0` alongside findings is a program whose answer this cannot
+    use, whichever half were believed."""
+    _tagger(landing_repo, body)
+
+    check = qd.check_tags(host_for(landing_repo))
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+def test_the_real_tagger_answers_the_argv_this_row_sends_it(landing_repo):
+    """Against the file this repo actually ships, not a stub that prints what the row
+    wants. A stub proves the consumer's happy path; only the real tool proves the two
+    halves of the contract — the subcommand, the flags, the exit codes and the field
+    names — are still the same ones."""
+    real = HARNESS.parent / "scripts" / "release_tag.py"
+    assert real.is_file()
+    (landing_repo / "scripts" / "release_tag.py").write_text(real.read_text())
+    (landing_repo / "scripts" / "release.py").write_text(
+        (HARNESS.parent / "scripts" / "release.py").read_text())
+    (landing_repo / "CHANGELOG.md").write_text("# Changelog\n\n## v1.0 — the first one\n")
+    _git(landing_repo, "add", "-A")
+    _git(landing_repo, "-c", "core.hooksPath=/nonexistent", "commit", "-qm", "tagger")
+    _git(landing_repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    untagged = qd.check_tags(host_for(landing_repo))
+    assert untagged.verdict == "fail", untagged.detail
+    assert "v1 shipped on origin/main with no tag" in untagged.detail
+
+    _git(landing_repo, "tag", "-a", "v1", "-m", "v1", "HEAD")
+    tagged = qd.check_tags(host_for(landing_repo))
+
+    assert tagged.verdict == "ok", tagged.detail
+
+
+# ----------------------------------------------------------------- the group
+
+def test_the_landing_group_holds_every_row_that_answers_can_work_land():
+    names = {n for n, g, _fn in qd.CHECKS if g == "landing"}
+
+    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper", "briefs"}
+
+
+def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, tmp_path,
+                                                                  landing_host):
+    """The constraint the whole group is bound by, asserted OVER THE GROUP — because the
+    failure it guards against is a row added later without it, and Codex was right that a
+    hardcoded list of four names does not guard that at all.
+
+    The repo here is in scope for every row: a GitHub remote, a tagger that reserves,
+    `changelog.d/`, a declared stamper, a harness. What it does not have is anything that
+    can answer — no board, no token, no `gh`, a tagger whose command set cannot be
+    enumerated, a harness with no briefs, and a stamper declared at a path that is not
+    there. A landing group that went green in that state would be a worse version of the
+    problem it exists to solve.
+    """
+    (landing_host.repo / "scripts" / "release_tag.py").write_text("import fire\n")
+    monkeypatch.setenv("QB_RELEASE_STAMP", str(landing_host.repo / "gone.py"))
+    blind = qd.Host(**{**landing_host.__dict__, "base_url": None, "token": None,
+                       "harness_bin": tmp_path / "empty" / "bin",
+                       "source_harness": tmp_path / "empty", "gh_cache": {}})
+    _gh_answers(monkeypatch, {}, have_gh=False)
+
+    rows = [(name, fn) for name, group, fn in qd.CHECKS if group == "landing"]
+    assert len(rows) >= 6, "this asserts over the group, so the group has to be read"
+    for name, fn in rows:
+        check = fn(blind)
+        assert check.verdict == "unknown", (
+            f"{name} answered {check.verdict} on a host that could see nothing: "
+            f"{check.detail}")
+        assert check.detail, f"{name} said unknown without saying why"
