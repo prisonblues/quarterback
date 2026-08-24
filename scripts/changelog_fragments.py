@@ -111,11 +111,39 @@ _NOT_FRAGMENTS = frozenset({"README.md"})
 #: A fragment's title: a level-1 heading on the first non-blank line.
 _TITLE = re.compile(r"^#[ \t]+(?P<title>\S.*?)[ \t]*$")
 
-#: A heading a fragment may not contain. `#` opens a document and `##` opens a RELEASE — an
-#: assembled fragment carrying one would split the release it was folded into, and the split
-#: would look like a second release to `release.py`. `###` and below are how the CHANGELOG
-#: already sections a long entry and are left alone.
-_TOP_HEADING = re.compile(r"^#{1,2}[ \t]+\S", re.MULTILINE)
+#: An ATX heading in a fragment's body — the one definition the refusals and the demotion
+#: both read. Two of them disagreeing about which line is a heading is precisely where a
+#: silent rewrite would hide, so there is one.
+#:
+#: Up to three leading spaces, because that is CommonMark's limit and a `  ## v9.9` renders
+#: as a heading like any other. **Four or more is an indented code block**, so a `### ` there
+#: is a shell comment or a quoted sample and is neither refused nor demoted — `mask_code`
+#: says the same thing about indented blocks and for the same reason.
+#:
+#: `#hashtag` is not a heading: ATX wants a space (or end of line) after the hashes.
+_HEADING = re.compile(r"^(?P<indent>[ ]{0,3})(?P<hashes>#{1,6})(?=[ \t]|$)", re.MULTILINE)
+
+#: A setext underline: `Title` on one line, `===` or `---` under it. Refused rather than
+#: demoted, because setext has only two levels and both of them are the levels a fragment
+#: may not contain anyway — this closes a spelling of the `_HEADING` level-1-and-2 refusal,
+#: it does not add a rule. `_is_setext` decides whether a match really is one, since `---`
+#: is also a thematic break and a front-matter fence.
+_RULE_LINE = re.compile(r"^(?P<indent>[ ]{0,3})(?P<rule>=+|-+)[ \t]*$", re.MULTILINE)
+
+#: Lines that a `---` may follow WITHOUT being a setext underline: CommonMark only makes one
+#: out of a paragraph, so a rule under a heading, a fence, a quote, a list marker, an
+#: indented code block, an HTML block, a link reference definition, a table row or another
+#: rule is a thematic break. Erring towards "not setext" here leaves such a line exactly as
+#: today's parser leaves it, which is the conservative direction: a missed one is the status
+#: quo, a false one refuses prose nobody could rewrite to please it. The four-space case is
+#: the one that matters in practice — a fragment ending a sample with `    ls -l` and then
+#: ruling a line off under it is ordinary, and refusing it would be this check's own bug.
+_NOT_A_PARAGRAPH = re.compile(
+    r"^(?:[ ]{4,}"
+    r"|[ ]{0,3}(?:#{1,6}(?=[ \t]|$)|>|[-*+][ \t]|\d+[.)][ \t]|`{3,}|~{3,}"
+    r"|<|\|"
+    r"|\[[^\]]*\]:"
+    r"|=+[ \t]*$|-+[ \t]*$))")
 
 #: The retired placeholder. It meant "a release entry whose number is not decided yet" and
 #: there are no undecided entries any more — a fragment IS the entry until the release job
@@ -143,6 +171,10 @@ class Fragment:
     kind: str
     title: str | None
     body: str
+    #: `body` with its own headings pushed down one level, for the assembly that puts this
+    #: fragment's title above them. Computed by the pass that REFUSED the bodies it cannot
+    #: demote (`demote`), so the text that ships and the text that was checked are one text.
+    demoted: str
 
     @property
     def order(self) -> tuple[int, int, str]:
@@ -150,6 +182,82 @@ class Fragment:
         fragments produce the same entry and a re-run is a no-op rather than a reshuffle."""
         numeric = int(self.issue) if self.issue.isdigit() else 0
         return KINDS.index(self.kind), numeric, self.issue
+
+
+def _is_setext(masked: str, m: re.Match[str]) -> bool:
+    """Is this `===`/`---` line an underline for the line above it, or a thematic break?
+
+    CommonMark makes a setext heading out of a **paragraph** line, so the answer is entirely
+    about what precedes the rule. Everything doubtful is answered "thematic break", which
+    leaves the line exactly where today's parser leaves it — see `_NOT_A_PARAGRAPH`.
+
+    One gap, stated rather than papered over: a paragraph line made *only* of code spans
+    (`` `qb-doctor` `` alone on its line) masks to nothing visible, so a `---` under it reads
+    as a break here. That is what this parser already does with it, so the gap is the status
+    quo and not a new hole.
+    """
+    start = masked.rfind("\n", 0, m.start())
+    if start < 0:  # the rule is the first line: a front-matter fence or a break, not a heading
+        return False
+    prev = masked[masked.rfind("\n", 0, start) + 1:start]
+    if not prev.strip(" \t\0"):  # blank, or wholly inside a fenced block
+        return False
+    return not _NOT_A_PARAGRAPH.match(prev)
+
+
+def demote(body: str, where: str) -> str:
+    """`body` with every heading in it pushed down one level, refusing what cannot be.
+
+    A fragment's title becomes a `###` when several fragments are folded into one release
+    entry, and the fragment's own sections are `###` too because `changelog.d/README.md`
+    requires `###`-or-deeper. Left alone the two collide: v3.13 assembled seven fragments
+    into twenty-one sibling `###` headings, in which a fragment's title and its own first
+    section read as equals (#413). Demoting the body restores the nesting its author wrote.
+
+    Located on MASKED text and applied to the original by offset. A `###` inside a fence or a
+    code span is a quoted example — this repo's entries are mostly shell — and rewriting one
+    would corrupt the sample with nothing to notice. Four-space-indented blocks are outside
+    `_HEADING` for the same reason.
+
+    Refuses rather than guesses at the two shapes it cannot represent: a `######`, which has
+    no seventh level to go to, and a `#`/`##`, which would open a release rather than a
+    section. Both name the file, because the fragment's author is the only one who can fix it
+    and `check` runs on their branch.
+    """
+    masked = rs.mask_code(body, where)
+
+    for m in _RULE_LINE.finditer(masked):
+        if _is_setext(masked, m):
+            kind = "`=`" if m.group("rule").startswith("=") else "`-`"
+            raise FragmentError(
+                f"{where} underlines a line with {kind}, which markdown reads as a setext "
+                "heading — a `#` if `=`, a `##` if `-`. Folded into CHANGELOG.md that opens "
+                "a RELEASE, and there is no setext spelling of `###` for the demotion to "
+                "reach. Write the heading as `###` or deeper. If the rule was meant as a "
+                "horizontal break, give it a blank line above — that is what makes it one — "
+                "and note that a fragment has no YAML front matter: its first line is its "
+                "`# title`")
+
+    out, at = [], 0
+    for m in _HEADING.finditer(masked):
+        level = len(m.group("hashes"))
+        if level <= 2:
+            raise FragmentError(
+                f"{where} contains a `#` or `##` heading in its body. Folded into "
+                "CHANGELOG.md a `##` opens a RELEASE, so the entry would split in two and "
+                "`release.py` would see a second one. Use `###` and below, which is how the "
+                "CHANGELOG already sections a long entry")
+        if level == 6:
+            raise FragmentError(
+                f"{where} contains a `######` heading, and markdown has no seventh level to "
+                "demote it to. A fragment's own headings each drop one level when it is "
+                "folded in under its title, so `#####` is the deepest a fragment may go. "
+                "Flatten that section — or the one above it — to `#####` or shallower")
+        out.append(body[at:m.start("hashes")])
+        out.append("#" * (level + 1))
+        at = m.end("hashes")
+    out.append(body[at:])
+    return "".join(out)
 
 
 def parse_fragment(path: Path, text: str) -> Fragment:
@@ -169,17 +277,17 @@ def parse_fragment(path: Path, text: str) -> Fragment:
             "really has grown, rather than spelling it differently in one file")
 
     lines = text.split("\n")
-    title, consumed = None, 0
+    title = None
     first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
     if first is not None and (t := _TITLE.match(lines[first])):
         title = t.group("title")
-        consumed = sum(len(ln) + 1 for ln in lines[:first + 1])
         lines = lines[first + 1:]
     body = "\n".join(lines).strip("\n")
 
     # Fenced blocks and code spans blanked, so an EXAMPLE of a release heading — which is how
-    # a changelog entry explains this convention — is not read as one. Both checks below run
-    # on it, and both would otherwise refuse the entry that documents them.
+    # a changelog entry explains this convention — is not read as one. The placeholder check
+    # below runs on it, and would otherwise refuse the entry that documents it; `demote` masks
+    # the body the same way, for the same reason and with more at stake — it REWRITES.
     masked = rs.mask_code(text, f"{FRAGMENT_DIR}/{path.name}")
 
     if not body.strip():
@@ -187,12 +295,7 @@ def parse_fragment(path: Path, text: str) -> Fragment:
             f"{FRAGMENT_DIR}/{path.name} has no body under its title. A fragment IS the "
             "changelog entry — say what was broken or missing before this change, because "
             "that is the part no diff recovers")
-    if _TOP_HEADING.search(masked, consumed):
-        raise FragmentError(
-            f"{FRAGMENT_DIR}/{path.name} contains a `#` or `##` heading in its body. Folded "
-            "into CHANGELOG.md a `##` opens a RELEASE, so the entry would split in two and "
-            "`release.py` would see a second one. Use `###` and below, which is how the "
-            "CHANGELOG already sections a long entry")
+    demoted = demote(body, f"{FRAGMENT_DIR}/{path.name}")
     if _PLACEHOLDER_MENTION.search(masked):
         raise FragmentError(
             f"{FRAGMENT_DIR}/{path.name} mentions `{_RETIRED_PLACEHOLDER}`, which is retired "
@@ -200,7 +303,8 @@ def parse_fragment(path: Path, text: str) -> Fragment:
             "and that is the whole reason two branches can write one each without racing for "
             "anything. The release job numbers the entry on `main` after the merge. If you "
             "are reading a document that told you to write it, that document is stale")
-    return Fragment(path=path, issue=m.group("issue"), kind=kind, title=title, body=body)
+    return Fragment(path=path, issue=m.group("issue"), kind=kind, title=title, body=body,
+                    demoted=demoted)
 
 
 def load(repo: Path) -> list[Fragment]:
@@ -244,9 +348,15 @@ def release_title(fragments: list[Fragment], given: str | None) -> str:
 def entry(fragments: list[Fragment], title: str, version: str) -> str:
     """The `## vX.Y` entry, ready to sit at the top of CHANGELOG.md.
 
-    One fragment becomes the entry body directly. Several become `###` subsections under it,
-    each keeping its own title, because this file's entries already section that way and
-    running three unrelated changes together as one wall of prose loses which is which.
+    One fragment becomes the entry body directly, verbatim: its own `###` sections already
+    sit one level under the `##` release heading, which is the nesting its author wrote.
+
+    Several become `###` subsections under it, each keeping its own title — this file's
+    entries already section that way, and running three unrelated changes together as one
+    wall of prose loses which is which. Here a fragment's body is **demoted** one level, so
+    its `###` sections become `####` and sit under its title rather than beside it. Without
+    that the two collide: v3.13 folded seven fragments into twenty-one sibling `###`
+    headings with the fragment boundaries invisible (#413).
     """
     parts = [f"## {version} — {title}\n"]
     if len(fragments) == 1:
@@ -254,7 +364,7 @@ def entry(fragments: list[Fragment], title: str, version: str) -> str:
     else:
         for f in fragments:
             heading = f.title or f"{f.kind} #{f.issue.lstrip('+')}"
-            parts.append(f"\n### {heading}\n\n{f.body}\n")
+            parts.append(f"\n### {heading}\n\n{f.demoted}\n")
     return "".join(parts)
 
 

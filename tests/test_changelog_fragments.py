@@ -270,6 +270,128 @@ def test_several_fragments_become_sub_sections_of_one_entry(repo):
     assert "## v2.2 — two things\n\n### the renderer\n\nWhy the renderer.\n" in changelog
     assert "### the seats\n\nWhy the seats.\n" in changelog
 
+# ---------------------------------------------------------------------------
+# demotion — a fragment's own sections belong UNDER its title, not beside it
+#
+# The first release assembled from seven fragments produced twenty-one sibling `###`
+# headings, because a fragment's title becomes a `###` and `changelog.d/README.md` requires
+# the fragment's own sections to be `###` too (#413). These are the tests where getting it
+# wrong is silent: the masking ones, where a rewritten code sample ships inside an entry
+# `release.py frozen` will not let anyone correct afterwards.
+# ---------------------------------------------------------------------------
+
+
+def test_a_fragments_own_sections_are_demoted_under_its_title(repo):
+    """Every level moves, not just the first: a `####` under a `###` has to become `#####`
+    or the nesting inverts halfway down the entry."""
+    fragment(repo, "296.feat.md",
+             "# the renderer\n\nWhy.\n\n### a section\n\nProse.\n\n#### deeper\n\nMore.\n")
+    fragment(repo, "298.fix.md", "# the seats\n\nWhy the seats.\n")
+    assemble(repo, "two things")
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "### the renderer\n\nWhy.\n\n#### a section\n\nProse.\n\n##### deeper\n" in changelog
+    assert "\n### a section" not in changelog
+
+
+def test_a_lone_fragments_sections_are_left_where_its_author_put_them(repo):
+    """One fragment's body goes in directly under the `##` release heading with no title of
+    its own above it, so its `###` sections already sit exactly one level down."""
+    fragment(repo, "296.feat.md", "# the renderer\n\nWhy.\n\n### a section\n\nProse.\n")
+    assemble(repo)
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "## v2.2 — the renderer\n\nWhy.\n\n### a section\n\nProse.\n" in changelog
+
+
+def test_a_heading_inside_a_fence_is_a_sample_and_is_not_demoted(repo):
+    """This repo's entries are essays full of shell, and a `#` at the start of a line in one
+    of them is a comment. Rewriting it corrupts the sample with nothing to notice."""
+    fragment(repo, "296.feat.md",
+             "# the renderer\n\nWhy.\n\n```bash\n### a comment, not a heading\nls\n```\n")
+    fragment(repo, "298.fix.md", "# the seats\n\nWhy the seats.\n")
+    assemble(repo, "two things")
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "```bash\n### a comment, not a heading\nls\n```" in changelog
+
+
+def test_a_heading_inside_a_code_span_is_not_demoted(repo):
+    """A code span may wrap — this repo wraps prose at 100 columns — and the continuation
+    line can start with the hashes. That is the one shape where a span, rather than a fence,
+    decides whether a line-initial `###` is a heading, so it is the shape worth a test."""
+    fragment(repo, "296.feat.md",
+             "# the renderer\n\nWrite it as `a section\n### and its hashes` and no deeper.\n")
+    fragment(repo, "298.fix.md", "# the seats\n\nWhy the seats.\n")
+    assemble(repo, "two things")
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "`a section\n### and its hashes` and no deeper." in changelog
+
+
+def test_an_indented_code_block_is_not_demoted(repo):
+    """Four spaces is a code block, which is markdown's own rule — and the same line
+    `mask_code` draws. Three spaces or fewer is a heading like any other."""
+    fragment(repo, "296.feat.md",
+             "# the renderer\n\nWhy.\n\n    ### four spaces, so this is code\n\n"
+             "  ### three spaces, so this is a heading\n\nProse.\n")
+    fragment(repo, "298.fix.md", "# the seats\n\nWhy the seats.\n")
+    assemble(repo, "two things")
+    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert "    ### four spaces, so this is code\n" in changelog
+    assert "  #### three spaces, so this is a heading\n" in changelog
+
+
+def test_a_six_level_heading_is_refused_rather_than_demoted_or_left(repo):
+    """There is no seventh level. Leaving it inverts the nesting it sits in and flattening it
+    loses a distinction its author drew, so the author is told while they still hold the
+    file — `check` runs on their branch."""
+    fragment(repo, "296.feat.md", "# the renderer\n\nWhy.\n\n###### as deep as it goes\n")
+    with pytest.raises(cf.FragmentError) as e:
+        cf.load(repo)
+    assert "296.feat.md" in str(e.value)
+    assert "no seventh level" in str(e.value)
+
+
+def test_a_six_level_heading_inside_a_fence_is_a_sample_and_is_allowed(repo):
+    fragment(repo, "296.feat.md", "# the renderer\n\nWhy.\n\n```md\n###### too deep\n```\n")
+    assert cf.load(repo)[0].title == "the renderer"
+
+
+@pytest.mark.parametrize("rule", ["===", "---"])
+def test_a_setext_underline_is_refused(repo, rule):
+    """Setext has levels one and two and nothing else — exactly the levels a fragment may not
+    contain — so there is no `###` for the demotion to reach. It is the existing refusal in a
+    second spelling, not a new rule."""
+    fragment(repo, "296.feat.md", f"# the renderer\n\nA section title\n{rule}\n\nProse.\n")
+    with pytest.raises(cf.FragmentError) as e:
+        cf.load(repo)
+    assert "296.feat.md" in str(e.value)
+    assert "setext" in str(e.value)
+
+
+@pytest.mark.parametrize("before", ["\n", "### a heading\n", "- a list item\n", "> a quote\n",
+                                    "    an indented code block\n", "<div>\n",
+                                    "| a table | row |\n", "[ref]: https://example.invalid\n"])
+def test_a_rule_that_underlines_nothing_is_a_thematic_break(repo, before):
+    """CommonMark makes a setext heading out of a PARAGRAPH and out of nothing else, so a
+    rule under a blank line, a heading, a list item or a quote is a horizontal break. Reading
+    one as a heading would refuse prose its author cannot rewrite to please the check."""
+    fragment(repo, "296.feat.md", f"# the renderer\n\nWhy.\n\n{before}---\n\nProse.\n")
+    assert cf.load(repo)[0].title == "the renderer"
+
+
+def test_a_rule_inside_a_fence_is_not_a_setext_heading(repo):
+    fragment(repo, "296.feat.md",
+             "# the renderer\n\nWhy.\n\n```yaml\non: push\n---\n```\n")
+    assert cf.load(repo)[0].title == "the renderer"
+
+
+def test_an_indented_top_level_heading_is_refused_like_an_unindented_one(repo):
+    """Markdown allows a heading three spaces in, so `  ## v9.9` opens a release exactly as
+    `## v9.9` does. The refusal and the demotion read one definition of a heading, because
+    two of them disagreeing about a line is where a silent rewrite would hide."""
+    fragment(repo, "296.feat.md", "# the renderer\n\nWhy.\n\n  ## a release\n\nProse.\n")
+    with pytest.raises(cf.FragmentError) as e:
+        cf.load(repo)
+    assert "opens a RELEASE" in str(e.value)
+
 
 def test_the_bullet_lands_where_the_renderer_puts_it(repo):
     """The README bullet and the CHANGELOG entry are written in one pass, so they cannot

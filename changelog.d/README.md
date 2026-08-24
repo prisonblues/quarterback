@@ -25,6 +25,22 @@ what every entry in CHANGELOG.md leads with.
 into, and the release tool would read the split as a second release.
 ```
 
+`###` to `#####`, and write them at the depth that reads right *here* — assembly moves them.
+When a release folds in several fragments, each fragment's title becomes the `###` and its
+own headings drop one level under it, so the `###` above renders as `####`. That is why
+`#####` is the floor: a `######` has no level left to drop to, and it is refused by name
+rather than quietly flattened.
+
+Underlining a line with `===` or `---` is a heading too — markdown's setext form — and it is
+refused for the same reason a `##` is: setext has only levels one and two. A `---` meant as a
+horizontal rule needs a blank line above it, which is what makes it one rather than an
+underline for the paragraph it touches.
+
+A `#` at the start of a line inside a fenced block, a code span or a four-space indented
+block is a shell comment or a quoted sample, and nothing above applies to it. Write examples
+fenced rather than indented, which is the convention the rest of this repo's markdown tooling
+assumes.
+
 ## Name no version
 
 Not `v3.13`, and not `vNEXT` either — the placeholder is retired and a fragment carrying it is
