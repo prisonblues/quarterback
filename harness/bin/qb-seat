@@ -169,22 +169,42 @@ seat_yolo_requested() {
 # the fleet into a drain, which is the eventual shape and is NOT safe yet: nothing
 # yet bounds how much work a fleet may take on, and #80 measures integration cost
 # as quadratic in open PRs. Batch now, drain when the appetite gates land.
+#
+# THE PICKUP IS A COMMAND NOW, NOT FOUR PARAGRAPHS OF THIS (#424). The steps this
+# used to spell out — read the plan, take the top free item atomically, dispatch on
+# what it names — are `/get-involved`, which calls the board's own `plan_claim`
+# rather than describing it. Two things go with that. A brief is prose a model may
+# skim, and the one step that cannot be skimmed is the claim, so it belongs in a
+# tool; and this brief composed its own claim key (`kind='work'`,
+# `key='<owner>/<repo>#<number>'`), which is #172 exactly — the board derives the
+# key from the resource precisely so two clients cannot spell it two ways.
+#
+# AND THE NO-PLAN FALLBACK IS GONE WITH THEM. It told a seat that found no plan to
+# scan the open issues, judge which were unclaimed and undiscussed, and pick one —
+# which is work discovery outside the human-ordered plan, i.e. #63, hand-rolled, in
+# the default brief every seat on the box reads and with none of the gates #85/#86
+# put around it. A repo where nobody has ordered anything is a repo where nobody
+# has decided what is worth doing, and a pane with no operator is the worst place
+# to decide it. So the seat says so and stops. Give it a plan, or tell it directly.
 default_brief() {
     cat <<EOF
 You are seat $SEAT on this machine — one of several agents working this repo in
 parallel, as peers. Nobody is going to hand you work; you take it.
 
 1. Call whoami, then read the board to see what the rest of the fleet is doing.
-2. Pick ONE unclaimed item: the shared plan on the board if it has one, otherwise
-   an open issue nobody has claimed or is discussing. Prefer the top of the plan —
-   the ordering in it is reasoned and is not visible in the issue list.
-3. Take it ATOMICALLY before you touch anything, with a work claim on the board
-   (kind='work', key='<owner>/<repo>#<number>'). A conflict means another seat got
-   there first: do not negotiate and do not ask a human — take the next item.
-4. Work it with /fix-issue <number>. That owns the worktree and its database; do
-   not create one yourself.
-5. When it is done, post a 'done', release your claim, and stop. Do not pick up a
-   second item unless someone asks you to.
+2. Run /get-involved. It reads the shared plan, says how much its order is worth,
+   claims ONE item BEFORE you start — that is the only post that can prevent
+   duplicated work — and points you at the right skill for it. A refusal
+   means another seat got there first; it takes the next free item itself, so
+   there is nothing to negotiate and nobody to ask.
+3. If it says nothing is free, that is a normal state: report who holds what, and
+   stop. Do not invent work and do not take an item a peer holds.
+4. If this repo has no plan at all, say so on the board and stop. Nobody has
+   ordered any work here, and deciding what counts as work is a person's call —
+   not one to make from a pane nobody is watching.
+5. When it is done, post a 'done' and hand the claim back — /get-involved's last
+   step, or \`qb-next --release <item_id>\` if you stopped early. Then stop: do
+   not pick up a second item unless someone asks you to.
 
 Never assign work to another seat, and never work an item another seat holds. If
 you need something from a peer, post an ask addressed to it and carry on.

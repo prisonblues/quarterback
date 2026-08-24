@@ -177,6 +177,14 @@
           # coupling between them, a command nobody runs or a brief calling a command that
           # does not exist, asserted in neither check (#340).
           install -Dm644 ${./harness/commands/fix-issue.md} harness/commands/fix-issue.md
+          # And `/get-involved`, for the same reason one file along (#424). Its half of
+          # test_qb_next.py is the coupling between the tool and the brief that calls it:
+          # `qb-next` answers 0 / 1 / 2 — took one, nothing free, could not ask — and a
+          # brief that knows two of the three treats the third as whichever it resembles,
+          # which would have an agent announce an empty plan every time the board was
+          # unreachable. Without this line that guard SKIPS here, in the only check that
+          # runs it, which is the failure #163 is named after.
+          install -Dm644 ${./harness/commands/get-involved.md} harness/commands/get-involved.md
           # The two tools the pre-push guard hands its questions to. Its whole contract is
           # that it DELEGATES — the graph to `migration_reconcile.py heads --ref`, the
           # generated release files to `release.py guard` and a rewritten release entry to
