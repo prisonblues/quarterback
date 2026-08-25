@@ -1394,6 +1394,66 @@ variable are the same mechanism, so they cannot drift.
 branch until it has claimed), does not assign work, and does not drive the agents past
 starting them.
 
+#### The top line — who this screen is, and what is left to spend
+
+`status 2` makes room for the seat bar, and tmux numbers those two lines 0 and 1. `install_bar`
+only ever wrote index 1 — and **writing one index of an array option at session level stops tmux
+inheriting the global array**, so index 0, which nothing set, resolved to empty. Every screen has
+therefore carried a full-width blank strip in whatever `status-style` is (green, on a stock tmux)
+since the bar shipped. Measured both ways: drop our `status-format[1]` and line 0 renders tmux's
+own status line again; set index 0 alongside ours and it renders whatever we put there. Nothing
+was relying on it, which is unusual — it makes this a free line rather than a trade.
+
+**Identity on the left, the ceiling on the right.** The seat bar says what the seats are *doing*
+and nothing said whose they were, so the left is `quarterback: <repo>` — `QB_SEATS_TOP` says
+something else, and `QB_SEATS_TOP=` (empty) means no words of ours there at all. The right is
+`qb-pace`'s verdict, because the shared subscription's five-hour and weekly caps are the only
+hard ceiling this fleet has and their one on-screen home was the dash — which the qb key has
+just made hideable with a single keystroke. A ceiling you can hide is not a brake.
+
+**No `#()` in the format**, and that is the whole reason `qb-seat-top` is a loop rather than a
+format. A status line re-expands every `status-interval` — 15s by default, *per attached client*
+— and a `#(shell command)` in one runs on that cadence. `qb-seat-top` is awake on its own timer
+anyway, so it writes the answers into session options and the format merely reads them:
+`#{@qb_pace}` costs nothing to expand however many clients are looking. The severity picks its
+colour through a conditional over literal styles rather than `#[fg=#{@qb_pace_sev}]`, for the
+reason `seat_state_style` gives — style parsing and format expansion are different passes.
+
+**The reveal is an aesthetic and says so.** It is lexray's `decrypt_text.js` effect with the same
+parameters — a 40ms tick, one character settling every second tick, left to right, spaces left
+alone — replaying every `QB_SEATS_TOP_EVERY` seconds (30 by default; `0` draws the line once and
+leaves nothing running). Nothing depends on it: `QB_SEATS_TOP_ANIMATE=0` writes the text straight
+out, and the reveal settles on precisely what that would have shown, which is what
+`test_the_reveal_settles_on_exactly_the_static_text` pins.
+
+A status line is not obviously capable of an animation, so it was measured before it was written.
+One `tmux set-option` round trip is **3.5ms** — a ceiling of about 286 frames a second — and a
+24-character reveal is 50 frames, **all 50 of which reached the terminal with none coalesced**, at
+21fps. The cost is 175ms of tmux calls per replay against a build that already spends forty of
+them, which is what makes a 30-second replay reasonable and a continuous loop not.
+
+Three things the effect needed that the browser version does not:
+
+- **Single-width characters only.** `decrypt_text.js` scrambles with `∞ ∑ ∏ √ ∫ ≤ ≥ ≈ ≠ ± × ÷`,
+  which are East Asian *ambiguous* width — a terminal may draw them two columns wide, and several
+  do. In a browser that is nothing; on a status line it means one frame is a column wider than the
+  last, so the line jitters sideways all the way through the reveal. The box-drawing glyphs that
+  replace them are unambiguously narrow.
+- **No fork per character.** `out="$out$(rand_char)"` is a subshell for every scrambled column of
+  every frame — about 580 of them per reveal, twice a minute, for an animation. Inline, all 50
+  frames generate in 40ms, and the reveal keeps the 40ms tick it is supposed to have rather than
+  drifting to whatever the forks cost.
+- **A detached screen is not animated to.** One tmux query per interval buys that, against fifty
+  `set-option`s played to an empty socket — a screen left over a weekend would play thousands.
+
+**A missing `qb-seat-top` must not take the build down**, which is `dash_hooks`' rule arriving
+again. During a rollout PATH's harness and a checkout disagree about which scripts exist, so
+`beside_me` answers with a path that is not there — and a `run-shell -b` on a missing command does
+*not* fail quietly: measured as `no current client` and `not in a mode` on stderr and a non-zero
+exit, which under `set -e` killed `qb-seats` with the session, the seats and the tape already
+created, on an error naming none of them. So the copy is asked for before it is run, and a screen
+that cannot refresh its top line still draws it once and says on stderr why it will not change.
+
 #### The qb key — every seat-level action, without the mouse
 
 The seat bar is clickable and until #248 that was the *only* way in: adding a seat from the

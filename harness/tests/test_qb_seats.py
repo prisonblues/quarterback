@@ -158,6 +158,17 @@ def screen(tmp_path):
         # ABOUT the note turn it back on and put a stub qb-pace ahead of the real
         # one on PATH.
         "QB_SEATS_PACE": "off",
+        # AND NO TOP-LINE LOOP, for the fourth time and the same reason as the
+        # three above. `qb-seat-top` is started by every screen these tests build
+        # — a hundred and twenty of them in a run — and each would sit in a sleep
+        # loop for the life of its session replaying a decrypt animation. Worse
+        # than the waste, it WRITES to the session while the assertions read it:
+        # a test that captures the bar mid-reveal is a test that fails once a
+        # fortnight for a reason nobody will find. 0 replays means one pass and
+        # nothing left running, and the tests that are ABOUT the line turn it
+        # back on.
+        "QB_SEATS_TOP_EVERY": "0",
+        "QB_SEATS_TOP_ANIMATE": "0",
     }
 
     def _run(*args, name="t", exe=None):
@@ -1187,6 +1198,153 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
         done = click(screen, junk, "t")
         assert done.returncode in (0, 1), f"{junk!r} → {done.returncode} {done.stderr}"
     assert panes(screen) == before, "an unknown range moved the furniture"
+
+
+# ---- the top line -----------------------------------------------------------
+#
+# `status 2` makes room for the seat bar and tmux numbers the two lines 0 and 1;
+# install_bar only ever wrote index 1. Writing ONE index of an array option at
+# session level stops tmux inheriting the global array, so index 0 resolved to
+# empty and every screen carried a full-width blank strip in whatever
+# status-style is. Nothing was relying on it, which is what makes it a free line
+# rather than a trade.
+
+def top_format(run, name="t"):
+    return run.tmux("show-options", "-v", "-t", f"={name}:", "status-format[0]").stdout.strip()
+
+
+def test_the_top_line_is_not_blank(screen):
+    """The regression, stated as the thing that was wrong: a screen's line 0 was
+    empty, so it drew as a full-width bar of `status-style` and nothing else."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert fmt, "line 0 is empty again — the screen has a blank strip across the top"
+    assert "#{@qb_top}" in fmt, f"the line says nothing about this screen: {fmt}"
+
+
+def test_the_top_line_says_which_screen_this_is(screen):
+    """The seat bar says what the seats are doing; nothing said whose they were."""
+    screen("-n", "2")
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", said
+
+
+def test_the_top_line_takes_words_of_your_own(screen):
+    """`${VAR+set}`, so an EMPTY QB_SEATS_TOP is a deliberate "no words of ours
+    there" and an unset one means "pick for me" — the same two different answers
+    QB_SEATS_DASH draws, and the same spelling."""
+    screen.env["QB_SEATS_TOP"] = "the fleet, at rest"
+    try:
+        screen("-n", "2")
+    finally:
+        del screen.env["QB_SEATS_TOP"]
+    assert screen.tmux("show-options", "-v", "-t", "=t:",
+                       "@qb_top_text").stdout.strip() == "the fleet, at rest"
+
+    screen.env["QB_SEATS_TOP"] = ""
+    try:
+        screen("-n", "2", name="bare")
+    finally:
+        del screen.env["QB_SEATS_TOP"]
+    assert screen.tmux("show-options", "-v", "-t", "=bare:",
+                       "@qb_top_text").stdout.strip() == ""
+
+
+def test_the_top_line_runs_no_shell_on_every_redraw(screen):
+    """A status line re-expands every `status-interval` — 15s by default, PER
+    ATTACHED CLIENT — and a `#(shell command)` in one runs on that cadence. So
+    the ceiling is not `#(qb-pace)`: qb-seat-top is awake on its own timer
+    anyway, writes the answer into a session option, and the format reads it.
+    """
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert "#(" not in fmt, f"the top line shells out on every redraw: {fmt}"
+    assert "#{@qb_pace}" in fmt, f"the ceiling is not on the line at all: {fmt}"
+
+
+def test_the_top_line_paints_its_own_colours_too(screen):
+    """The same rule the seat bar has, and for the same reason — this line sits
+    on the identical `status-style` green."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    naked = [fg for fg, bg in bar_pairs(fmt) if bg is None]
+    assert not naked, f"these take whatever status-style is: {naked}"
+    assert "#[fill=" in fmt, "the top line does not paint its own line"
+    for fg, bg in bar_pairs(fmt):
+        if bg is None or _rgb(fg) is None or _rgb(bg) is None:
+            continue
+        ratio = _contrast(fg, bg)
+        assert ratio >= 4.5, f"{fg} on {bg} is {ratio:.2f}:1, and 4.5:1 is the floor"
+
+
+def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
+    """The partial-install case, and it used to take the whole build down.
+
+    During a rollout PATH's harness and a checkout disagree about which scripts
+    exist, so `beside_me` answers with a path that is not there — and a
+    `run-shell -b` on a missing command does NOT fail quietly. Measured on 3.6a
+    as `no current client` and `not in a mode` on stderr and a non-zero exit,
+    which under `set -e` killed qb-seats with the session, the seats and the tape
+    already created, on an error naming none of that. Same shape as the resize
+    hook's version of this, and the same answer: ask first.
+
+    What the screen loses is only that the line refreshes. The line itself is set
+    before the probe, so it still says which screen this is.
+    """
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key"):
+        copy = lonely / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    # BIN off PATH, or beside_me finds the ordinary qb-seat-top there.
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+
+    done = screen("-n", "2", exe=[str(lonely / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
+    assert "qb-seat-top" in done.stderr, \
+        f"nothing said why the line will not refresh: {done.stderr}"
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", \
+        f"the line is not even drawn once: {said!r}"
+
+
+def test_the_reveal_settles_on_exactly_the_static_text(screen):
+    """The animation is an aesthetic and nothing may depend on it, so the thing
+    worth pinning is that it is INVISIBLE in the outcome: the reveal ends on
+    precisely the text a screen with QB_SEATS_TOP_ANIMATE=0 would have shown.
+
+    It also has to actually animate, or this passes against a line that never
+    moved — hence the intermediate frames. A detached screen is deliberately not
+    animated to, so this needs a real client.
+    """
+    screen.env["QB_SEATS_TOP_EVERY"] = "5"
+    screen.env["QB_SEATS_TOP_ANIMATE"] = "1"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_TOP_EVERY"] = "0"
+        screen.env["QB_SEATS_TOP_ANIMATE"] = "0"
+
+    settled = f"quarterback: {screen.repo.name}"
+    with attached_client(screen, 120, 30):
+        seen = set()
+        deadline = time.time() + 25
+        while time.time() < deadline and len(seen - {settled, ""}) < 3:
+            seen.add(screen.tmux("show-options", "-v", "-t", "=t:",
+                                 "@qb_top").stdout.strip())
+            time.sleep(0.03)
+        frames = seen - {settled, ""}
+        assert frames, f"the line never moved: {seen}"
+        # Every frame is the same width as the answer, or the line would jitter
+        # sideways all the way through the reveal.
+        for frame in frames:
+            assert len(frame) == len(settled), f"{frame!r} is not {len(settled)} wide"
+        assert wait_until(
+            lambda: screen.tmux("show-options", "-v", "-t", "=t:",
+                                "@qb_top").stdout.strip() == settled), \
+            "the reveal did not settle on the text it was decrypting to"
 
 
 # ---- the qb key --------------------------------------------------------------
@@ -2823,8 +2981,14 @@ def test_a_new_screen_says_what_its_seats_are_about_to_spend(screen):
                      'echo "estimate  3 seats x 1 round ~ 851,385 tokens"\n')
     result = screen("-n", "3")
     assert result.returncode == 0
-    assert log.read_text().strip() == "asked --estimate 3", \
-        "the note was not asked about THIS screen"
+    # The ESTIMATE line, not the whole log. The top line asks the same binary a
+    # different question a moment later — `qb-pace` with no arguments, for the
+    # verdict it puts on the right of the screen — and both reads hit qb-pace's
+    # own three-minute cache. What this test is about is which N the note asked
+    # for.
+    asked = [ln for ln in log.read_text().splitlines() if "--estimate" in ln]
+    assert asked == ["asked --estimate 3"], \
+        f"the note was not asked about THIS screen: {log.read_text()!r}"
     assert "qb-seats: pace: SLOW — 5h at 74%; resets in 47m" in result.stderr
     assert "qb-seats: estimate  3 seats x 1 round ~ 851,385 tokens" in result.stderr
 

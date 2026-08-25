@@ -114,6 +114,7 @@ BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
 KEY_DEFAULT="C-q"       # the qb key, when QB_SEATS_KEY does not say otherwise
 BAR_BG=colour235        # the seat bar's OWN ground — see seat_bar for why it
 BAR_FG=colour109        # cannot borrow the theme's status-style
+TOP_EVERY=30            # seconds between top-line replays; 0 = draw it once
 DASH_SIZE="${QB_SEATS_DASH_SIZE:-78}"   # dash width in columns, down the right of
                         # the window. 78 is what the dashboard's own table wants
                         # before it starts wrapping, not a taste in proportions
@@ -163,6 +164,12 @@ Environment:
                       third of the window — the seats need the rest)
   QB_SEATS_BAR        0 to leave the status line and the mouse alone (see below)
   QB_SEATS_KEY        the qb key, default $KEY_DEFAULT; empty for no key at all
+  QB_SEATS_TOP        what the top line says on the left (default
+                      \`quarterback: <repo>\`); empty for no words of ours there
+  QB_SEATS_TOP_EVERY  seconds between top-line replays, default $TOP_EVERY; 0 draws
+                      it once and leaves nothing running
+  QB_SEATS_TOP_ANIMATE 0 to write the top line straight out rather than
+                      decrypting it into place
   QB_SEAT_YOLO        0 to give the seats their permission prompts back
   QB_SEAT_AGENT       the agent binary a seat runs, instead of \`claude\`
   QB_SEAT_SCOPE       what the seats are called after — \`seat-<scope>-<n>\`.
@@ -672,6 +679,109 @@ install_bar() {
     if-shell -F '#{&&:#{!=:#{@qb_bar},},#{==:#{mouse_status_line},#{@qb_bar}}}' \
       "$stash ; $inner" \
       'switch-client -t ='
+}
+
+# ---- the top line ------------------------------------------------------------
+# THE LINE THAT WAS ALWAYS THERE AND ALWAYS BLANK. `status 2` makes room for the
+# seat bar and tmux numbers the two lines 0 and 1; install_bar only ever wrote
+# `status-format[1]`. Writing ONE index of an array option at session level stops
+# tmux inheriting the GLOBAL array, so index 0 — which nothing set — resolved to
+# empty, and every screen has carried a full-width blank strip in whatever
+# `status-style` is (green, on a stock tmux) since the bar shipped. Measured both
+# ways: drop our `status-format[1]` and line 0 renders tmux's own status line
+# again; set index 0 alongside ours and it renders whatever we put there.
+#
+# Nothing was relying on it, which is unusual and is what makes this a free line
+# rather than a trade.
+#
+# IDENTITY ON THE LEFT, THE CEILING ON THE RIGHT. The seat bar says what the
+# seats are doing and nothing said whose they were; and the shared
+# subscription's caps are the only hard ceiling this fleet has, whose one
+# on-screen home was the dash — which the qb key has just made hideable with a
+# single keystroke. A ceiling you can hide is not a brake.
+#
+# NOT `#(qb-pace)`. A status line re-expands every `status-interval` — 15s by
+# default, PER ATTACHED CLIENT — and a `#(shell command)` in one runs on that
+# cadence. qb-seat-top is awake on its own timer anyway, so it writes the answer
+# into a session option and this merely reads it: `#{@qb_pace}` costs nothing to
+# expand however many clients are looking.
+#
+# THE SEVERITY IS A CONDITIONAL OVER LITERAL STYLES, not a colour substituted
+# into one. `#[fg=#{@qb_pace_fg}]` does not work — style parsing and format
+# expansion are different passes in tmux — and seat_state_style says the same
+# thing about a seat's colour. The three arms are 6.13:1, 8.20:1 and 6.53:1
+# against this ground; see seat_bar for why a background is named at all.
+top_line() {
+  local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
+  printf '%s' \
+"#[fill=$BAR_BG]#[align=left]$ground #{@qb_top}"\
+"#[align=right]"\
+"#{?@qb_pace,"\
+"#{?#{==:#{@qb_pace_sev},critical},#[fg=colour210]#[bg=$BAR_BG],#{?#{==:#{@qb_pace_sev},warning},#[fg=colour214]#[bg=$BAR_BG],#[fg=colour108]#[bg=$BAR_BG]}}"\
+"#{@qb_pace}$ground  ,}"\
+"%H:%M "
+}
+
+# The knobs are recorded ON THE SESSION rather than read from the environment by
+# qb-seat-top, and that is the same rule the ＋ and the resize hook follow: it is
+# started by `run-shell`, whose environment is the tmux SERVER's and not the one
+# the screen was built in. Recording them also means a screen can be retimed
+# while it is up — `tmux set-option -t <screen> @qb_top_every 300` lands on the
+# next pass, with nothing restarted.
+install_top() {
+  local top=$1 every text
+  tmux set-option -t "$SESSION_ID:" 'status-format[0]' "$(top_line)"
+
+  # `${VAR+set}` again, so an EMPTY QB_SEATS_TOP is a deliberate "no words of
+  # ours on that line" and an unset one means "pick for me" — the same spelling
+  # as QB_SEATS_DASH, and the same two different answers.
+  if [ -n "${QB_SEATS_TOP+set}" ]; then
+    text=$QB_SEATS_TOP
+  else
+    text="quarterback: ${REPO##*/}"
+  fi
+  tmux set-option -t "$SESSION_ID:" @qb_top_text "$text"
+  tmux set-option -t "$SESSION_ID:" @qb_top "$text"
+
+  every=${QB_SEATS_TOP_EVERY:-$TOP_EVERY}
+  case "$every" in ''|*[!0-9]*) every=$TOP_EVERY ;; esac
+  tmux set-option -t "$SESSION_ID:" @qb_top_every "$every"
+  tmux set-option -t "$SESSION_ID:" @qb_top_animate "${QB_SEATS_TOP_ANIMATE:-1}"
+  # One knob for "do not ask about the subscription", not two: QB_SEATS_PACE=off
+  # already silences the estimate this script prints, and it means the same thing
+  # here.
+  [ "${QB_SEATS_PACE:-on}" = off ] \
+    && tmux set-option -t "$SESSION_ID:" @qb_top_pace 0
+
+  # ASKED FOR BEFORE IT IS RUN, which is dash_hooks' rule and it arrived here the
+  # same way: during a rollout PATH's harness and this checkout can disagree
+  # about which scripts exist, and `beside_me` then answers with a path that is
+  # not there. A `run-shell -b` on a missing command does NOT fail quietly —
+  # measured on 3.6a as `no current client` and `not in a mode` on stderr and a
+  # non-zero exit, which under `set -e` took the whole build down with the
+  # session, the seats, the dash and the tape already created. The line itself is
+  # already set above and says the right thing; what is lost without the loop is
+  # only that it refreshes, which is worth one line on stderr and not a screen.
+  if [ ! -x "$top" ]; then
+    warn "top line: no qb-seat-top at $top, so the line is drawn once and will not
+       refresh — the ceiling on the right of it will stay blank. Two copies of the
+       harness have drifted; reinstalling it is the fix."
+    return 0
+  fi
+  # `--once` for a screen that asked for no replays, so nothing is left running
+  # for a line that will never change. Otherwise the loop, in the background,
+  # parented to the tmux server and ending with the session.
+  #
+  # Tolerated as well as probed. The probe covers the case that has happened; a
+  # `run-shell` that refuses for some other reason is still not worth failing a
+  # screen that is otherwise built and working.
+  if [ "$every" = 0 ]; then
+    tmux run-shell -b "$(sh_quote "$top") $(sh_quote "$SESSION_ID") --once" \
+      || warn "top line: tmux would not start qb-seat-top"
+  else
+    tmux run-shell -b "$(sh_quote "$top") $(sh_quote "$SESSION_ID")" \
+      || warn "top line: tmux would not start qb-seat-top"
+  fi
 }
 
 # ---- the qb key -------------------------------------------------------------
@@ -1588,6 +1698,12 @@ tmux set-option -t "$SESSION_ID:" @qb_seats_bin "$SELF"
 # gives back everything the bar can do without the mouse. Wanting one and not the
 # other is an ordinary preference in both directions.
 [ -z "$QB_KEY" ] || install_key "$QB_KEY" "$(beside_me qb-seat-key)" "$SELF"
+
+# The top line goes with the bar rather than with the key, because it is the same
+# line of screen: without `status 2` there is nowhere to put it, and `status 2`
+# is the bar's doing. QB_SEATS_BAR=0 therefore leaves the whole status line alone
+# exactly as it says it does.
+[ "${QB_SEATS_BAR:-1}" = 0 ] || install_top "$(beside_me qb-seat-top)"
 
 # ROWS ARE BUILT, NOT CHOSEN. `select-layout tiled` picks its own arrangement
 # from the window's aspect ratio — six seats in a 240x60 window come out 2 across
