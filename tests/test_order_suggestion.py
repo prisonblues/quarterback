@@ -752,6 +752,67 @@ async def test_a_finding_with_a_recorded_outcome_stops_holding_an_item_at_the_he
     assert e["basis"] == "ambiguous"
 
 
+async def test_a_skipped_merge_updates_the_reading_without_erasing_the_findings(client):
+    """#94, and the reason this endpoint reads TWO runs rather than one.
+
+    A skipped run is a real observation of the PR — the skip path fetches the same
+    `gh pr view` metadata as any other exit — but it reviewed nothing, so it has
+    no findings at all. Answer both questions from it and an item with open work
+    reads clear and climbs the plan; answer neither from it and a PR merged since
+    its last review still reads OPEN.
+
+    So the readings come from the newest run of any kind and the findings from the
+    newest run that reviewed, which is the seam this module already draws between
+    `inputs.readings` and the run's provenance."""
+    repo = "acme/ord-skipped"
+    item = await add(client, repo, "has open work", ref_kind="pr", ref_value="21")
+    other = await add(client, repo, "quiet")
+    reviewed = await review(client, repo, 21, pr_state="OPEN", ci_status="PASS",
+                            to_fix=[finding("sk1")])
+    await age_run(reviewed["id"], days=1)
+    # …then a merge lands on it and the panel declines to review the merge.
+    await review(client, repo, 21, round=2, reviewed=False, pr_state="MERGED",
+                 ci_status="FAIL", skip_reason="title matches skip pattern /^Merge /")
+
+    body = await order(client, repo)
+    e = entry(body, item["item_id"])
+    # The reading is the newest one: the PR has merged since it was reviewed.
+    assert e["inputs"]["readings"]["pr_state"] == "MERGED"
+    assert e["inputs"]["readings"]["ci"] == "FAIL"
+    # The findings are the last REVIEW's, and they are still outstanding.
+    assert e["run"]["run_id"] == reviewed["id"]
+    assert e["run"]["confirmed"] == 1 and e["run"]["outstanding_findings"] == 1
+    assert e["inputs"]["open_work"] is True
+    assert other["item_id"] in body["suggested_order"]
+
+
+async def test_a_pr_whose_only_run_reviewed_nothing_is_unread_not_clear(client):
+    """The other side of the same split. A PR the board has only ever seen skipped
+    has a reading and no review — so it reports what it saw and leaves
+    `outstanding_findings` absent, which lands it in the unread bucket rather than
+    among the items with no work left."""
+    repo = "acme/ord-onlyskip"
+    item = await add(client, repo, "only ever skipped", ref_kind="pr", ref_value="31")
+    await review(client, repo, 31, reviewed=False, pr_state="OPEN",
+                 skip_reason="title matches skip pattern /^Merge /")
+
+    body = await order(client, repo)
+    e = entry(body, item["item_id"])
+    # The reading is real and feeds the rules.
+    assert e["inputs"]["readings"]["pr_state"] == "OPEN"
+    # …and there is no review to attach findings to, so no round is cited and
+    # no finding count is invented for one.
+    assert "run_id" not in e["run"] and "outstanding_findings" not in e["run"]
+    # `open_work: false` here means "nothing red is ATTACHED", which is what it
+    # has always meant for a PR nobody has panelled — and it is not left to be
+    # read as an all-clear: the item is named in `unknown`, which is the whole
+    # point of that list.
+    unpanelled = next(u for u in body["unknown"]
+                      if u["input"] == "review_state" and "never recorded" in u["reason"])
+    assert unpanelled["items"] == [item["item_id"]]
+    assert "reviewed nothing" in unpanelled["reason"]
+
+
 async def test_a_repo_spelt_with_capitals_does_not_hide_its_panel_run(client):
     """GitHub repos are case-insensitive and the plan lower-cases its copy for that
     reason, while ``review_runs.repo`` is stored as the panel sent it. Comparing

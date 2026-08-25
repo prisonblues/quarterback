@@ -164,6 +164,43 @@ async def test_a_skipped_round_does_not_turn_open_findings_into_gone(client, rep
     assert statuses == {"a" * 12: "open"}
 
 
+async def test_a_skipped_round_does_not_spend_the_findings_window(client, repo):
+    """The same defect one layer out, and the one an after-the-fact filter would
+    have missed. `limit` bounds what is FETCHED, so a PR collecting skipped merges
+    would spend its window on rounds with no findings in them and the real rounds
+    would fall off the end — their defects not `gone` but absent, which reads
+    emptier still. `limit=1` after one skipped merge returned nothing at all."""
+    await record(client, reviewed_payload(
+        repo, 5, "app/x.py",
+        to_fix=[{"title": "still open", "file": "app/x.py", "severity": "P1",
+                 "key": "c" * 12}]))
+    await record(client, skipped_payload(repo, 5, "app/x.py", round=2))
+
+    got = (await client.get("/review/findings",
+                            params={"repo": repo, "pr": 5, "limit": 1},
+                            headers=AGENT)).json()
+    assert [f["status"] for f in got["findings"]] == ["open"]
+    assert got["rounds"] == 1, "a round that reviewed nothing is not a round here"
+
+
+async def test_a_skipped_round_does_not_erase_a_cycles_ending(client, repo):
+    """A skipped round inherits its cycle id from the baseline, so it qualifies as
+    "the newest run of this cycle" and would have supplied the cycle's ending from
+    stop fields no stopping rule ever set — reporting a converged cycle as one
+    nobody ever ruled on. Same family as the `gone` bug: the record going quiet
+    about a judgement that was actually made."""
+    await record(client, reviewed_payload(
+        repo, 5, "app/x.py", cycle="cyc-1",
+        round_stop={"stop": True, "confident": True, "reason": "dry round"}))
+    await record(client, skipped_payload(repo, 5, "app/x.py", round=2, cycle="cyc-1"))
+
+    got = (await client.get("/review/findings",
+                            params={"repo": repo, "pr": 5}, headers=AGENT)).json()
+    assert got["stopped"] is True
+    assert got["stop_confident"] is True
+    assert got["stop_reason"] == "dry round"
+
+
 async def test_a_skipped_round_is_not_a_round_the_review_queue_counts(client, repo):
     """`_cycle_rounds` counts a cap off the newest run's round number, so a merge
     commit landing on a PR mid-cycle could reach `max_rounds` and hold the review

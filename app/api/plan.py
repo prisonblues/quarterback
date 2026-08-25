@@ -2685,19 +2685,41 @@ async def _pr_evidence(session: AsyncSession,
     if not wanted:
         return {}, problems
 
-    # Newest run per (repo, pr) — but never a run that reviewed nothing (#94).
-    # This evidence is "how much confirmed work is still outstanding on the PR
-    # behind this item", and a title-skipped merge carries no findings at all, so
-    # letting one be the newest run would report every item on that PR as clear
-    # and move it up the plan. `IS NOT FALSE`, so every run recorded before the
-    # column keeps answering exactly as it does today.
-    runs = list(await session.scalars(
-        select(ReviewRun)
-        .where(tuple_(ReviewRun.repo, ReviewRun.pr).in_(list(wanted)),
-               ReviewRun.reviewed.isnot(False))
-        .distinct(ReviewRun.repo, ReviewRun.pr)
-        .order_by(ReviewRun.repo, ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
-    ))
+    # TWO newest runs per (repo, pr), because the evidence below answers two
+    # different questions and #94 pulled them apart (#94).
+    #
+    # `state_runs` — the newest run of any kind, including a title-skipped merge.
+    # It supplies the READINGS: `pr_state`, `draft`, `ci`. Those are observations
+    # about the pull request, and the skip path fetches the same `gh pr view`
+    # metadata as any other exit, so its reading is as good and newer. A PR
+    # merged since its last review says MERGED here for the first time.
+    #
+    # `review_runs_` — the newest run that actually reviewed. It supplies the
+    # FINDINGS and the provenance beside them. A skipped merge carries no
+    # findings at all, so letting one answer would report every item on that PR
+    # as clear of outstanding work and move it up the plan — the ordering
+    # equivalent of a false all-clear.
+    #
+    # The split is along the seam this module already draws: `_PROVENANCE_FIELDS`
+    # is deliberately kept apart from the readings so that neither is stored
+    # twice and free to disagree. Provenance stays whole and comes from ONE run,
+    # so `run_id`, `as_of`, `round`, `head_sha` and the two counts always
+    # describe the same round; a caller reading `as_of` is told the age of the
+    # REVIEW, which is the number `_stale` ages.
+    #
+    # `IS NOT FALSE` on the second, so every run recorded before the column keeps
+    # answering exactly as it does today.
+    def _newest(*extra):
+        return (
+            select(ReviewRun)
+            .where(tuple_(ReviewRun.repo, ReviewRun.pr).in_(list(wanted)), *extra)
+            .distinct(ReviewRun.repo, ReviewRun.pr)
+            .order_by(ReviewRun.repo, ReviewRun.pr,
+                      ReviewRun.ts.desc(), ReviewRun.id.desc())
+        )
+
+    state_runs = {(r.repo.lower(), r.pr): r for r in await session.scalars(_newest())}
+    runs = list(await session.scalars(_newest(ReviewRun.reviewed.isnot(False))))
     # Confirmed findings on those runs, and which of them somebody has recorded an
     # outcome for. All four outcomes count as answered, `deferred` included: it
     # says the work was moved to an issue, which is a decision, and treating it as
@@ -2722,27 +2744,39 @@ async def _pr_evidence(session: AsyncSession,
         ):
             answered.add((repo.lower(), pr, key))
 
+    by_pair = {(r.repo.lower(), r.pr): r for r in runs}
     evidence: dict[tuple[str, int], dict] = {}
-    for run in runs:
-        pair = (run.repo.lower(), run.pr)
-        keys = confirmed.get(run.id, set())
+    # Keyed off the state runs, which are a superset: a PR whose only run is a
+    # skipped merge has readings and no review, and reporting it with a null
+    # `outstanding_findings` puts it in `_unknown` — named as unread rather than
+    # silently absent, which is what it was before this endpoint could see it.
+    for pair, state in state_runs.items():
+        run = by_pair.get(pair)
+        keys = confirmed.get(run.id, set()) if run is not None else set()
         evidence[pair] = {
-            "run_id": run.id,
-            "as_of": run.ts.isoformat(),
-            "round": run.round,
-            "head_sha": run.head_sha,
-            "pr_state": run.pr_state,
-            "draft": run.is_draft,
-            "ci": run.ci_status,
-            "confirmed": len(keys),
+            # Provenance: the REVIEW's, whole and from one run, or absent.
+            **({} if run is None else {
+                "run_id": run.id,
+                "as_of": run.ts.isoformat(),
+                "round": run.round,
+                "head_sha": run.head_sha,
+            }),
+            # Readings: the newest observation of the PR, whoever made it.
+            "pr_state": state.pr_state,
+            "draft": state.is_draft,
+            "ci": state.ci_status,
             # Only CONFIRMED findings count as work, matching every other number
             # this board publishes about a round — and the count that was left out
             # rides along beside it, because a rule that quietly ignores a
             # category is a rule nobody can argue with. A finding no judge ruled
             # on is not evidence of anything yet (v2.37), and a round recorded
             # with `judged: false` is all unjudged.
-            "unjudged": run.n_unjudged,
-            "outstanding_findings": sum(1 for k in keys if (*pair, k) not in answered),
+            **({} if run is None else {
+                "unjudged": run.n_unjudged,
+                "confirmed": len(keys),
+                "outstanding_findings": sum(
+                    1 for k in keys if (*pair, k) not in answered),
+            }),
         }
     return evidence, problems
 
@@ -2830,7 +2864,13 @@ def _unknown(views: list[dict], evidence: dict[tuple[str, int], dict],
                 no_ref.append(v["item_id"])
             continue
         ev = evidence.get(key)
-        if ev is None:
+        # No evidence at all, or evidence with no REVIEW in it (#94). The second
+        # is a PR the board has only ever seen skipped: it has a reading — the
+        # skip path fetches the same metadata as any other exit, so `pr_state`
+        # and `ci` are real and feed the rules — and no round has ever looked at
+        # the code. `as_of` is the age of a review, so there is none to age, and
+        # the honest bucket is the same one: nobody has reviewed this.
+        if ev is None or "as_of" not in ev:
             never.append(v["item_id"])
             continue
         age = (now - datetime.fromisoformat(ev["as_of"])).total_seconds() / 86400
@@ -2847,8 +2887,10 @@ def _unknown(views: list[dict], evidence: dict[tuple[str, int], dict],
     if never:
         out.append({
             "input": "review_state",
-            "reason": "the board has never recorded a panel run for this PR; it knows only "
-                      "the PRs it has panelled, so this is not evidence the PR is fine",
+            "reason": "the board has never recorded a panel that REVIEWED this PR — it "
+                      "has either never seen the PR at all, or seen it only on a round "
+                      "that reviewed nothing (a title-skipped merge). It knows only the "
+                      "PRs it has panelled, so this is not evidence the PR is fine",
             "consequence": "placed on dependency edges, blockers and staleness alone",
             "items": never,
         })

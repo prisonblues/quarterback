@@ -4730,6 +4730,15 @@ async def pr_finding_history(
     cycle-less run is the newest in the window, the ending still comes from the
     cycle's last round rather than from the run that happened to land after it.
 
+    **Rounds that reviewed nothing are not traced** (#94). Since the board started
+    recording title-skipped panels, a pull request's newest run may be a merge
+    commit nobody read — and this endpoint is entirely about what rounds FOUND, so
+    such a run has nothing to contribute to any chain and three ways to corrupt
+    the answer: it would consume a slot of ``limit``, it would become the round a
+    defect must appear in to count as ``open``, and it would supply the cycle's
+    ending from stop fields no stopping rule ever set. ``GET /reviews`` with
+    ``include_unreviewed`` lists them; ``rounds`` here counts rounds that ran.
+
     ``cycles: 0`` is a real answer, not an absent one: every traced run predates the
     column or was a one-shot read, there is nothing to misattribute between, and the
     window summarises — which is what keeps the pre-cycle archive reading as it
@@ -4781,7 +4790,31 @@ async def pr_finding_history(
     fetched_rows = list(
         (await session.execute(
             select(ReviewRun, _UNREAD_COUNT)
-            .where(ReviewRun.repo == repo, ReviewRun.pr == pr)
+            # Rounds that REVIEWED, and the filter is in front of the window on
+            # purpose (#94). This is not the newest-run-per-PR selection the
+            # collision endpoint guards; it is "the last N rounds of ONE pull
+            # request", every one of which is returned, so narrowing the
+            # population cannot promote a stale answer — there is no per-PR
+            # winner to promote.
+            #
+            # Placed here rather than applied to the fetched rows because `limit`
+            # bounds what is FETCHED. A PR that collects several skipped merges
+            # would otherwise spend its whole window on rounds with no findings
+            # in them, and the real rounds would fall off the end — their defects
+            # not `gone` but simply absent, which reads emptier still. `limit=1`
+            # after one skipped merge is the sharp case: it returned nothing at
+            # all.
+            #
+            # It also settles `last` further down. A skipped round carries the
+            # cycle id it inherited, so it qualifies as "the newest run of this
+            # cycle" and would supply the cycle's ending from its own NULL
+            # `stopped` / `stop_confident` — reporting a converged cycle as one
+            # nobody ever ruled on.
+            #
+            # `IS NOT FALSE`: every round recorded before the column is NULL, and
+            # `IS TRUE` would empty this endpoint for the entire archive.
+            .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+                   _review_happened())
             .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
             .limit(limit + 1)
         )).all()
@@ -4802,36 +4835,15 @@ async def pr_finding_history(
     runs = list(reversed(fetched[:limit]))  # chronological: a chain reads left to right
     order = {r.id: i for i, r in enumerate(runs)}
     ts_by_run = {r.id: r.ts for r in runs}
-    # The newest run that actually REVIEWED, not simply the newest run (#94).
-    #
-    # This one line decides every chain's `status`, because a defect is `open`
-    # while its last observation is in `latest_id` and `gone` once it is not. Read
-    # as "the newest row", recording a title-skipped merge after a real round
-    # would flip every outstanding finding on that PR to `gone` — nobody
-    # re-reviewed anything, and the record would say the defects were no longer
-    # being found. A false all-clear, manufactured by the fix that made skipped
-    # runs visible. That is the failure this whole issue is about, arriving inside
-    # its own repair.
-    #
-    # `is not False`, and the tempting `is True` is WRONG here — it was the first
-    # cut of this line. A PR whose rounds all predate the column carries NULL on
-    # every one of them, so `is True` selects nothing, the fallback takes over,
-    # and the fallback is the newest run outright — which on a PR with legacy
-    # rounds and one new skipped round is the skipped run, i.e. exactly the bug,
-    # reintroduced by the guard against it. `is not False` says "not known to be a
-    # non-review": legacy rounds answer as they always have, and only a run that
-    # states outright that it reviewed nothing is passed over.
-    #
-    # The fallback then covers one case only — a PR whose every run is a declared
-    # non-review — where there are no findings to have a status at all.
-    #
-    # Chosen out of `runs` AFTER the window was selected, never as a predicate in
-    # front of the selection. Filtering the query would change which rounds the
-    # chains are built from, silently drop a skipped round out of a cycle's round
-    # count, and resurrect an older head as "latest" — the mistake
-    # `GET /review/collisions` was rewritten twice to stop making.
-    reviewed_runs = [r for r in runs if r.reviewed is not False]
-    latest_id = (reviewed_runs or runs)[-1].id
+    # Every run in the window reviewed something — the query above says so — so
+    # this is the newest ROUND, and a defect last seen in it is still open while
+    # one last seen earlier is `gone`. That is only true because of that filter:
+    # read off the newest run outright, a title-skipped merge recorded after a
+    # real round would flip every outstanding finding on the PR to `gone` with
+    # nobody having re-reviewed anything. A false all-clear manufactured by the
+    # fix that made skipped runs visible, which is this issue's own disease
+    # arriving inside its repair.
+    latest_id = runs[-1].id
 
     findings = list(
         (await session.scalars(
