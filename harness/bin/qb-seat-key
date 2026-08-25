@@ -365,7 +365,17 @@ restore_widths() {
 hide_pane() {   # hide_pane <what> <pane id> <size to come back at>
   local widths
   widths=$(pane_widths)
-  tmux break-pane -d -s "$2" -n "$HOLDING" \
+  # `-t "$SID:"` NAMES THE SESSION, and it is not decoration. `break-pane`
+  # with no destination puts the new window in the CLIENT'S CURRENT session,
+  # not in the one the source pane lives in — so on a server running more than
+  # one screen, hiding a pane on the screen you are NOT looking at parks it in
+  # the other screen's window list. Everything downstream then fails to find
+  # it: `pane_exists` and the restore path both search `list-panes -s -t
+  # "$SID"`, which is scoped to this session, so the pane is simultaneously
+  # alive, stranded, and reported as gone. Measured on 3.6a against two live
+  # screens; it cannot show up in a test with one session on the server, which
+  # is why it went unnoticed until a screen was built beside a real one.
+  tmux break-pane -d -s "$2" -t "$SID:" -n "$HOLDING" \
     || die "$1: tmux would not break the pane out"
   tmux set-option -t "$SID:" "@qb_hidden_$1" "$2 $3 $widths"
 }
@@ -452,7 +462,9 @@ restore_dash() {
       # purpose — a full-height dash down the side of a shortened tape, which is
       # the exact thing the step-aside exists to avoid. Nothing has moved at this
       # point, so refusing leaves a screen that is merely missing its dash.
-      tmux break-pane -d -s "$tape" -n "$HOLDING" \
+      # -t, for the reason hide_pane gives: without it this parks the tape in
+      # whichever session the client is looking at.
+      tmux break-pane -d -s "$tape" -t "$SID:" -n "$HOLDING" \
         || die "dash: the tape would not step out of the way, so nothing was moved"
     fi
     if ! tmux join-pane -h -f -l "$size" -s "$p" -t "$target"; then
@@ -583,7 +595,10 @@ expand_dash() {
   size=$(tmux display-message -p -t "$p" '#{pane_width}') \
     || die "expand: tmux reported no width for the dash"
   widths=$(pane_widths)
-  tmux break-pane -s "$p" -n "$EXPANDED" \
+  # -t, for the reason hide_pane gives — and here it is the difference between
+  # a dash filling the screen you are on and a dash appearing in somebody
+  # else's window list while yours reports it missing.
+  tmux break-pane -s "$p" -t "$SID:" -n "$EXPANDED" \
     || die "expand: tmux would not break the dash out"
   tmux set-option -t "$SID:" @qb_hidden_dash "$p $size $widths"
   tmux set-option -t "$SID:" @qb_dash_expanded "$p"

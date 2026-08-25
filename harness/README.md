@@ -2207,6 +2207,18 @@ which of the two states they are refusing for: "hidden" about a dash filling the
 front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
 state.
 
+**`break-pane` must name the session, and until now none of these did.** With no `-t`,
+`break-pane` puts the new window in the **client's current** session rather than the source
+pane's — so on a server running two screens, taking a pane out of the one you are not
+looking at parks it in the other one's window list. Everything downstream then fails to find
+it: `pane_exists` and the restore path both search `list-panes -s -t "$SID"`, which is scoped
+to the session, so the pane is at once alive, stranded, and reported as gone, with no way
+back through this script. It is not reachable with one session on the server, which is why
+`d` and `t` carried it from the day they shipped and the hide/show tests never saw it — it
+turned up the first time a test screen was built beside a real one, with the dash landing in
+`seats-quarterback:qb-dash` while its own screen said it was missing. All three breaks name
+`-t "$SID:"` now, and the regression test builds two screens because one cannot show it.
+
 **Nothing had to be taught about this mode for the resize hook to leave it alone.**
 `qb-seats`' own `dash_pane` looks in `$SESSION_ID:seats` and nowhere else, so an expanded
 dash is outside its reach and cannot be shrunk back to 78 columns by an attaching client.

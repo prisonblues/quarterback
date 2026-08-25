@@ -2117,6 +2117,42 @@ def test_two_screens_disagree_about_whether_their_tape_is_showing(screen):
                        "@qb_hidden_tape").stdout.strip() == ""
 
 
+@pytest.mark.parametrize("action", ["dash", "expand", "tape"])
+def test_a_pane_taken_out_of_the_row_stays_in_its_own_session(screen, action):
+    """`break-pane` with no `-t` uses the CLIENT'S CURRENT session, not the source
+    pane's — so on a server running two screens, taking a pane out of the one you
+    are not looking at parks it in the other one's window list.
+
+    Everything downstream then fails to find it: `pane_exists` and the whole
+    restore path search `list-panes -s -t "$SID"`, which is scoped to the session,
+    so the pane is at once alive, stranded, and reported as gone. There is no way
+    back for it through this script.
+
+    IT CANNOT BE SEEN WITH ONE SESSION ON THE SERVER, which is why it survived the
+    hide/show tests entirely and only turned up when a screen was built beside a
+    real one on a developer's box: the dash landed in `seats-quarterback:qb-dash`
+    while its own screen reported it missing. Two screens, and the second is the
+    current one — which is what makes the wrong answer available.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2", name="one")
+    screen("-n", "2", name="two")          # built last, so it is the current session
+
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+
+    stranded = [line for line in screen.tmux(
+        "list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_name}"
+    ).stdout.splitlines() if line.startswith(("%",)) and " two:" in line
+        and not line.endswith(":seats")]
+    assert stranded == [], f"`{action}` on screen one put a pane in screen two: {stranded}"
+
+    # And the round trip still works, which is the thing the stranding broke: the
+    # pane was findable enough to break out and not findable enough to bring back.
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+    assert len(aux_panes(screen, "one")) == 2, \
+        f"`{action}` could not put the pane back on its own screen"
+
+
 def test_a_nudge_records_the_width_it_landed_at(screen):
     """@qb_dash_width is what the window-resized hook puts the dash back to on
     every attach and every terminal resize, so a nudge that did not write it
