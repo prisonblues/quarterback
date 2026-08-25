@@ -63,7 +63,7 @@ _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 #: ``picked-up`` row is at a position somebody's action decided even though no
 #: one ranked it, so a plan full of in-flight work is still a plan you can
 #: believe — see :func:`app.api.plan._order_trust`.
-RANK_SOURCES = ("appended", "submitted", "placed", "ordered", "picked-up")
+RANK_SOURCES = ("appended", "submitted", "placed", "ordered", "picked-up", "derived")
 
 _RANK_SOURCE_LIST = ", ".join(f"'{s}'" for s in RANK_SOURCES)
 

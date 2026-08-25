@@ -12,9 +12,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from collections.abc import Iterable, Iterator
 
 import httpx
+
+#: The header a delegated agent presents (#478). Must match
+#: ``app.auth.ELEVATED_HEADER``; the two live in different repos' worth of
+#: distance, so the name is stated once on each side and the tests pin it.
+ELEVATED_HEADER = "X-Agent-Elevated"
+
 
 
 def _decode_frame(data: list[str]) -> dict | None:
@@ -77,19 +84,11 @@ class QuarterbackClient:
         requested_name: str | None = None,
         session: str | None = None,
         transport: httpx.BaseTransport | None = None,
-        human_url: str | None = None,
-        edge_cookie: str | None = None,
+        elevated: str | None = None,
+        elevated_cmd: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
-        # The BROWSER vhost and the session cookie that authenticates a person on
-        # it. Both optional and both usually absent: every read and almost every
-        # write in this client goes to the agent host with a bearer token, and
-        # this pair exists only for the handful of endpoints `app.auth.human`
-        # gates. See :meth:`_human_post` for why it cannot be the same host.
-        self._human_url = (human_url or "").rstrip("/") or None
-        self._edge_cookie = edge_cookie or None
-        self._human_http: httpx.Client | None = None
         self._transport = transport
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
@@ -102,6 +101,17 @@ class QuarterbackClient:
             headers["X-Agent-Key"] = key
         if requested_name:
             headers["X-Agent-Name"] = requested_name
+        # This machine's DELEGATED credential (#478), for the narrow set of writes
+        # `app.auth.delegated` names. It goes to the ordinary agent host beside the
+        # bearer — it is a client-supplied credential like the bearer, not an
+        # edge-injected proof like `Remote-User`, so the edge neither supplies it
+        # nor strips it and no vhost change is involved.
+        #
+        # Resolved LAZILY and never here: the command is usually `op read`, which
+        # can prompt, and this client is constructed once per MCP session on every
+        # session start — to serve two tools a session will probably never call.
+        self._elevated = elevated or None
+        self._elevated_cmd = elevated_cmd or None
         # A TRANSPORT is injected, never a client, and this is round 2's third
         # P2. The parameter used to take an httpx.Client and call
         # `.headers.update()` on it — which mutates an object the caller owns, so
@@ -119,80 +129,74 @@ class QuarterbackClient:
 
     def close(self) -> None:
         self._http.close()
-        if self._human_http is not None:
-            self._human_http.close()
 
-    # ------------------------------------------------------------------ human
+    # -------------------------------------------------------------- delegated
 
-    #: What to tell a caller that has no cookie. Long because it is the entire
-    #: remedy: this fails on every box until somebody does it once, and a
-    #: "403 Forbidden" would send them to the board's auth code instead.
-    NO_COOKIE = (
-        "this call needs a signed-in person, and this host has no session. "
-        "Set QUARTERBACK_EDGE_COOKIE to a browser session cookie for "
-        "{url} (sign in there, copy the session cookie), and "
-        "QUARTERBACK_HUMAN_URL to the browser vhost. `qb-doctor` reports the "
-        "same thing as its `edge` row."
+    #: What to tell a caller with no credential. Long because it is the whole
+    #: remedy: this fails on every unprovisioned box, and a bare 403 would send
+    #: somebody to the board's auth code instead of to their own config.
+    NO_CREDENTIAL = (
+        "this call needs a delegated credential and this host has none. Set "
+        "QUARTERBACK_ELEVATED_TOKEN, or QUARTERBACK_ELEVATED_TOKEN_CMD to a "
+        "command that prints it (the fleet resolves it from 1Password, per "
+        "machine). It is not the board bearer and not a person's session."
     )
 
-    def _human_client(self) -> httpx.Client:
-        """The client for writes only a person may make.
+    def _resolve_elevated(self, refresh: bool = False) -> str | None:
+        """This machine's delegated secret, from the literal or from the command.
 
-        **A second client, and a second host, neither of which is an accident.**
-        ``app/auth.py``: *"the browser vhost has no token and the agent vhost
-        strips ``X-Edge-Auth``"* — so a human-gated write aimed at
-        ``QUARTERBACK_BASE_URL`` cannot succeed however it is authenticated, and
-        the split is the deployment's, not this client's.
-
-        It carries the cookie and **not** the bearer. Sending the machine token
-        to a host that has no use for it would hand a second vhost a credential
-        it never needs to see, and the token is the one that names this machine
-        everywhere else.
+        ``refresh`` re-runs the command past any cached value, which is what a 403
+        means here: a secret that authenticated yesterday is exactly what is stale
+        after a rotation. Same move ``QUARTERBACK_TOKEN_REFRESH_CMD`` makes one
+        credential over.
         """
-        if self._human_http is None:
-            self._human_http = httpx.Client(
-                timeout=30,
-                headers={"Cookie": self._edge_cookie or ""},
-                transport=self._transport,
-                # A 302 from forward-auth is the answer, not a redirect to
-                # follow: chasing it lands on Authelia's login page and returns
-                # 200 with HTML, which is the one way this can look like success
-                # while having authenticated nobody.
-                follow_redirects=False,
-            )
-        return self._human_http
+        if self._elevated and not refresh:
+            return self._elevated
+        if not self._elevated_cmd:
+            return self._elevated
+        try:
+            out = subprocess.run(self._elevated_cmd, shell=True, check=False,
+                                 capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            return self._elevated
+        # First line only, exactly as `qb_resolve_token` trims: a store that
+        # prints a warning after the value must not put it in a header.
+        value = out.split("\n", 1)[0].strip()
+        if value:
+            self._elevated = value
+        return self._elevated
 
-    def _human_post(self, path: str, body: dict) -> dict:
-        """POST to the browser vhost as the signed-in person.
+    def _delegated_post(self, path: str, body: dict) -> dict:
+        """POST to the agent host, carrying this machine's delegated credential.
 
-        Raises :class:`RuntimeError` for every way this fails to *reach* a
-        person — no URL, no cookie, or a forward-auth bounce — because those are
-        one missing setup step and not an answer about the request. A real
-        refusal from the app still arrives as an ``HTTPStatusError``, so callers
-        keep telling "you may not" apart from "you are nobody".
+        The same host and the same bearer as every other call — only one extra
+        header. A missing credential is refused BEFORE the request, because that
+        is one setup step rather than an answer about what was asked.
         """
-        if not self._human_url:
-            raise RuntimeError(
-                "QUARTERBACK_HUMAN_URL is not set: this write goes to the "
-                "browser vhost, which cannot be derived from the agent host")
-        if not self._edge_cookie:
-            raise RuntimeError(self.NO_COOKIE.format(url=self._human_url))
-        resp = self._human_client().post(f"{self._human_url}{path}", json=body)
-        if resp.status_code in (301, 302, 303, 307, 308):
-            raise RuntimeError(
-                f"the browser vhost answered {resp.status_code} — forward-auth "
-                "bounced this request, so the cookie is missing, wrong or "
-                f"expired. {self.NO_COOKIE.format(url=self._human_url)}")
+        if not self._resolve_elevated():
+            raise RuntimeError(self.NO_CREDENTIAL)
+        resp = self._send_delegated(path, body)
+        # One retry, and only when there is somewhere fresher to look. A rotated
+        # secret's first symptom is a write that worked yesterday.
+        if resp.status_code == 403 and self._elevated_cmd \
+                and self._resolve_elevated(refresh=True):
+            resp = self._send_delegated(path, body)
         resp.raise_for_status()
         return resp.json()
 
+    def _send_delegated(self, path: str, body: dict) -> httpx.Response:
+        """One POST with whatever secret is current — split out so the retry above
+        re-reads the header rather than reusing a stale one."""
+        return self._http.post(self._url(path), json=body,
+                               headers={ELEVATED_HEADER: self._elevated or ""})
+
     def plan_reorder(self, body: dict) -> dict:
-        """``POST /plan/reorder`` — set the order. Human-gated (#479)."""
-        return self._human_post("/plan/reorder", body)
+        """``POST /plan/reorder`` — put an order into force. Delegated (#478)."""
+        return self._delegated_post("/plan/reorder", body)
 
     def plan_item_update(self, body: dict) -> dict:
-        """``POST /plan/item/update`` — retitle, move, re-reason, drop. Human-gated."""
-        return self._human_post("/plan/item/update", body)
+        """``POST /plan/item/update`` — retitle, move, re-reason, drop. Delegated."""
+        return self._delegated_post("/plan/item/update", body)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"

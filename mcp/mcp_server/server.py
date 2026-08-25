@@ -135,18 +135,18 @@ async def app_lifespan(server: FastMCP):
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
     if not base_url:
         raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
-    # The browser vhost and a signed-in session cookie, for the writes
-    # `app.auth.human` gates. Both optional: absent, every human-gated tool
-    # refuses with the remedy rather than failing at the network. See #479 for
-    # what having them here widens, and `qb-mcp` for where they are exported.
+    # This machine's DELEGATED credential, for the narrow set of writes
+    # `app.auth.delegated` names (#478). Optional: absent, those two tools refuse
+    # with the remedy and every other tool is unaffected. It goes to the same
+    # agent host as everything else — see `qb-mcp` for where it is exported.
     client = QuarterbackClient(
         base_url,
         token,
         key=resolve_key(),
         requested_name=resolve_requested_name(),
         session=resolve_session(),
-        human_url=os.environ.get("QUARTERBACK_HUMAN_URL", "").strip() or None,
-        edge_cookie=os.environ.get("QUARTERBACK_EDGE_COOKIE", "").strip() or None,
+        elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
+        elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
     )
     try:
         yield AppContext(client=client)
@@ -1597,7 +1597,7 @@ def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dic
     """Put an order into force. **A human's decision, which you may be asked to apply.**
 
     `plan_order` computes what the rules imply and cannot apply it; this is the
-    call that does. It goes to the browser vhost as the signed-in person, so it
+    call that does. It goes to the ordinary board host with your bearer, and it
     needs `QUARTERBACK_HUMAN_URL` and `QUARTERBACK_EDGE_COOKIE` — without either
     it refuses and says which is missing, rather than failing at the network.
 
@@ -1617,10 +1617,9 @@ def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dic
       `preference` is often 0 and `interchangeable` near-total, which means the
       dependency graph pinned the ends and the human's priorities are doing the
       real work.
-    * **Say on the board that you did it, and on whose say-so.** The order
-      arrives as `rank_source: "ordered"` — indistinguishable from one a person
-      typed — so the board post is the only provenance there is until #479's
-      item 6 lands.
+    * **Say on the board that you did it, and on whose say-so.** The row records
+      `derived` and who wrote it, which says an agent applied this — it cannot say
+      WHO asked, and that half is only ever in your post.
 
     Args:
         order: item ids, in the order wanted. Items in scope you leave out keep
@@ -1644,10 +1643,10 @@ def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
                      state: str | None = None) -> dict:
     """Retitle, re-reason, move or drop one item. Same human gate as `plan_reorder`.
 
-    The verb for a note that has gone stale — which is the common case and the
-    honest one: an agent writes an item's reasoning when it adds it, the issue
-    then moves on, and until this tool existed nobody could correct the note but
-    a person in a browser. Correcting your own reasoning overrides no one.
+    The verb for a note that has gone stale — the common case and the honest one:
+    an agent writes an item's reasoning when it adds it, the issue then moves on,
+    and until this tool existed nobody could correct the note but a person in a
+    browser. Correcting your own reasoning overrides no one.
 
     `state="dropped"` is not `done`: one says the work happened, the other that a
     person decided it should not. Treat it as a person's call and not yours —

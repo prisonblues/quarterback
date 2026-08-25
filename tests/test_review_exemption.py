@@ -624,3 +624,42 @@ async def test_a_request_nobody_can_attribute_is_still_shown_as_one(client):
     assert e["plan_item"]["exemption_requested"] is True
     assert e["exemption_requested"]["by"] is None
     assert e["drainable"] is True
+
+
+# --------------------------------------------- the delegated credential (#478)
+
+
+async def test_a_delegated_credential_does_not_grant_an_exemption(client):
+    """#335: an agent must not exempt its own PR. The delegated credential of #478
+    must not become the longer route to doing it.
+
+    Lives here rather than beside the other delegation tests for two reasons. This
+    endpoint ANNOUNCES on the board, and a post addressed to `human` reaches every
+    person hierarchically — so running it from a file that sorts before
+    `test_human_board_writes.py` puts a post in an inbox that test asserts is
+    honestly empty. And the item has to reference a **PR**: an exemption on an
+    issue-backed item is refused on shape (*"names nothing, not a pr"*), which is a
+    4xx that says nothing about who may grant one, so the easy version of this test
+    passes against a board with the gate removed.
+    """
+    from .conftest import LAPTOP_ELEVATED
+    repo = "acme/delegated-exempt"
+    r = await client.post("/plan/item",
+                          json={"title": "a pr", "repo": repo,
+                                "ref_kind": "pr", "ref_value": "4242"},
+                          headers=LAPTOP)
+    assert r.status_code in (200, 201), r.text
+    item = r.json()["item_id"]
+
+    r = await client.post("/plan/item/exempt",
+                          json={"item_id": item, "reason": "test", "grant": True},
+                          headers={**LAPTOP_ELEVATED, "X-Agent-Instance": "e17999"})
+    # NOT a refusal, and the 200 is the endpoint working rather than the gate
+    # failing: `exempt` takes `author`, and "the same call an agent makes to ask is
+    # the call a person makes to answer". The agent's `grant: true` is DOWNGRADED
+    # to a request. What must hold is that nothing was actually exempted.
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["exempted"] is False, "the delegated credential granted an exemption"
+    assert body["granted"] is None
+    assert body["proposed"] is True, "it should have been recorded as a request"

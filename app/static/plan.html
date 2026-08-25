@@ -389,7 +389,7 @@ function rankWhy(it){
 // chosen. The model settles it: "each submission leaves exactly one position
 // nobody chose", which is the batch's FIRST item, and that one is `appended`.
 // The rest had their order picked by the submitter.
-const RANK_CHOSEN = new Set(["ordered", "placed", "picked-up", "submitted"]);
+const RANK_CHOSEN = new Set(["ordered", "placed", "picked-up", "submitted", "derived"]);
 function rankClass(it){
   if(!(it.rank_source in RANK_WHY)) return " unclear";
   return RANK_CHOSEN.has(it.rank_source) ? " chosen" : "";

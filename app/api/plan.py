@@ -67,7 +67,7 @@ from app.api.claims import (
     live_claim,
     may_mutate,
 )
-from app.auth import author, human, identify, reader
+from app.auth import author, delegated, human, identify, reader
 from app.claimkey import WORK, BadRef, canonical_repo, derive, work_ref
 from app.db import get_session
 from app.identity import HUMAN, is_human, same_machine
@@ -907,10 +907,25 @@ def _order_trust(open_views: list[dict]) -> dict:
     # In the read's own order, so `first_unchosen` is the first one a reader
     # walking this list actually meets.
     unchosen = [v for v in open_views if v["rank_source"] == "appended"]
+    # `derived` rows are counted beside `unchosen`, never inside it, and they do
+    # NOT flip `trusted` (#478). A delegated reorder was asked for by a person and
+    # computed from facts, so it is not a position nobody chose — and the
+    # `picked-up` migration already settled the general case: counting a new
+    # source as untrusted makes the plan read as less trustworthy "for the sole
+    # reason that agents were working", swamping the signal that the human's
+    # ordering has gaps with the signal that the fleet is busy. Weaker than
+    # `ordered` and much stronger than `appended` is a count, not a boolean.
+    derived = [v for v in open_views if v["rank_source"] == "derived"]
     return {
         "trusted": not unchosen,
         "by_source": by_source,
         "unchosen": len(unchosen),
+        "derived": len(derived),
+        "derived_hint": None if not derived else
+                        "an agent applied that order on somebody's instruction, "
+                        "computed from `GET /plan/order`'s rules. It is a real "
+                        "decision and it is not a person's own sequence — read "
+                        "the board for who asked and when.",
         # One row, named exactly: the first item in this read whose position
         # nobody chose. Null when there is none, rather than a sentinel a client
         # has to know about.
@@ -2536,7 +2551,7 @@ async def set_depends(
 @router.post("/plan/item/update")
 async def update_item(
     body: UpdateIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Retitle, move, re-reason, or drop an item. Human-only, like reordering.
@@ -2926,7 +2941,7 @@ async def _ref_taken(session: AsyncSession, repo: str | None, ref_kind: str | No
 @router.post("/plan/reorder")
 async def reorder(
     body: ReorderIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """Set the order. **Human-only** — this is the endpoint decision 1 is about.
@@ -2958,6 +2973,13 @@ async def reorder(
     ordered = [by_id[str(i)] for i in dict.fromkeys(str(i) for i in body.order)]
     rest = [i for i in by_id.values() if i not in ordered]
     listed = {i.id for i in ordered}
+    # WHO asked decides what the rank claims about itself (#478). A person's
+    # sequence is `ordered`; a delegated agent's is `derived` — a rule and an
+    # instruction produced it together, which is weaker evidence than a person
+    # typing it and much stronger than an append. Writing `ordered` for both
+    # would make an agent-applied order indistinguishable from a human's in the
+    # one field a client can read, which is #183's substitution exactly.
+    chosen = "ordered" if is_human(editor) else "derived"
     now = _utcnow()
     for rank, item in enumerate([*ordered, *rest], start=1):
         # `ordered` is the human's sequence and `rest` is what the page did not
@@ -2965,7 +2987,7 @@ async def reorder(
         # arrived after the page loaded was carried along, not decided on, and
         # marking it would make `GET /plan` claim a human had chosen a position
         # they never saw (#183).
-        source = "ordered" if item.id in listed else item.rank_source
+        source = chosen if item.id in listed else item.rank_source
         if item.rank != rank or item.rank_source != source:
             item.rank, item.rank_source, item.updated_at = rank, source, now
     await session.commit()

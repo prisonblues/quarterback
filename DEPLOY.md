@@ -85,6 +85,7 @@ container rather than putting them in the compose file:
 |---|---|
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
 | `HUMAN_EDGE_SECRET` | the value the browser vhost injects as `X-Edge-Auth`; without it the human-only endpoints refuse everyone and the browser board cannot post |
+| `ELEVATED_TOKENS` (or `ELEVATED_TOKENS_FILE`) | `hermes:<secret>,zeus:<secret>` — per machine, and **not** a way to be a person: it authorises `POST /plan/reorder` and `POST /plan/item/update` for an agent that keeps its own name. Unset refuses every delegated write |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
 
