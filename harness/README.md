@@ -2101,7 +2101,7 @@ editing the SOURCE path collides with it invisibly. `review_run_files` has one p
 no notion of an alias, so storing the old path too would make `files_recorded` exceed GitHub's
 count and fail #80's `counts_agree` — the PR would go unattested for having read more than
 anyone else does. `loops/panel.py` has the same hole and says so. This counts them per PR, so
-an operator can see where the grain runs out.
+an operator can see where the grain runs out; the grain itself is #453.
 
 The list comes from `gh api --paginate .../pulls/N/files`, not `gh pr view --json files`.
 `pr view` asks GraphQL for `files(first: 100)` and does not page, so a 322-file PR arrives as

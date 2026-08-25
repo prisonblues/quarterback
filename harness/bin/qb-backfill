@@ -51,8 +51,8 @@ exits 0 (measured, on kubernetes/kubernetes#141360). The panel compares that lis
 against `changedFiles` and prints a note, which is survivable when the list is a side
 effect of a review; here the list is the whole product, so it is read to the end.
 
-**One hole is left open and is reported rather than closed: renames.** GitHub counts
-a rename as one changed file, so a row holding only the destination path satisfies
+**One hole is left open and is reported rather than closed: renames (#453).** GitHub
+counts a rename as one changed file, so a row holding only the destination path satisfies
 `files_complete` while another PR editing the SOURCE path collides with it invisibly.
 `review_run_files` has one path column and no notion of an alias, so storing the old
 path as well would make `files_recorded` exceed GitHub's count and fail #80's
@@ -189,7 +189,7 @@ def changed_files(repo: str, pr: int) -> tuple[list[dict], int, str | None]:
     the PR unattested for having read MORE than anyone else does. Diverging from the
     panel here would also put two spellings of one field in the harness, which is the
     fault this repo keeps closing. So the count is reported, the operator is told, and
-    the grain itself is somebody else's issue.
+    the grain itself is #453.
     """
     out, err = _gh(["gh", "api", "--paginate",
                     f"repos/{repo}/pulls/{pr}/files",
@@ -397,6 +397,9 @@ def payload(repo: str, meta: dict, files: list[dict], truncated: bool,
         # exactly as it treats the `"unknown"` the panel's own skip path writes, and
         # `_ready` goes false — a PR that was known green reads as not-known-green
         # until something measures it again, which is the direction this repo errs in.
+        # The real repair is on the READ side and is #454: `_pr_evidence` takes its
+        # three readings off one run whole, so a producer that measured two of them
+        # writes NULL over the third.
         "changed_files": files,
         # GitHub's count, verbatim, beside a list that may not reach it. The
         # comparison between the two is what tells every downstream reader the list is
