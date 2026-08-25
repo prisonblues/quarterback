@@ -240,7 +240,7 @@ if [ "$MODE" = check ]; then
       | ((\$live.hooks[\$e] // []) | map(select(mine)) | first) as \$hit
       | [ \$e, \$want, (if \$hit == null then \"\" else (\$hit | qbcmd) end),
           \$wantm, (if \$hit == null then \"\" else (\$hit | qbmatcher) end) ]
-      | @tsv" "$S" 2>/dev/null
+      | join(\"\u001f\")" "$S" 2>/dev/null
   ) || rows=""
   if [ "$(printf '%s\n' "$rows" | grep -c .)" != "$NEVENTS" ]; then
     echo "qb-claude-setup: could not read $NEVENTS hook events out of $S."
@@ -249,7 +249,14 @@ if [ "$MODE" = check ]; then
     exit 1
   fi
   missing=0; other=0
-  while IFS=$'\t' read -r ev want cmd wantm matcher; do
+  # UNIT SEPARATOR, not tab, and this is not a style choice. Tab is an IFS
+  # *whitespace* character, so `read` folds runs of them into one delimiter and
+  # discards empty fields — which was invisible while the possibly-empty `cmd`
+  # was the LAST field, and became a column shift the moment a field was added
+  # after it. An unwired event then read its own matcher as its command and
+  # reported SKEW instead of MISSING: the one host state this mode exists to
+  # name, renamed. \037 is not whitespace, so an empty field stays a field.
+  while IFS=$'\037' read -r ev want cmd wantm matcher; do
     [ -n "$ev" ] || continue
     if [ -z "$cmd" ]; then
       printf 'MISSING  %-17s no qb-hook entry — this host is deaf on that event\n' "$ev"
