@@ -1886,16 +1886,33 @@ def test_the_dash_comes_back_above_the_tape_and_not_beside_it(screen):
 def test_a_hidden_pane_keeps_the_process_that_was_in_it(screen):
     """Which is the whole reason this is `break-pane` and not "kill it and split a
     new one": a tape that restarted would lose everything it had followed, and a
-    dash would come back to a blank pane and a poll interval."""
+    dash would come back to a blank pane and a poll interval.
+
+    THE PID, NOT THE TEXT ON SCREEN. This asserted that the stub's output was
+    still in the pane, which is a proxy for the claim and a fragile one — the
+    board stub `printf`s without a newline, so the shell's prompt lands on the
+    same line and readline redraws it from column 0, wiping the output. That
+    depends on the shell, the width and the timing: it passed 139 runs locally
+    and in the flake sandbox, and failed once on CI. The pane's pid is the claim
+    itself, and it cannot be redrawn away.
+    """
     screen("-n", "2")
-    tape = pane_id(screen, "tape") or [p for p, n in panes(screen) if not n][0]
-    assert "tape-stub" in wait_for_pane(screen, tape, "tape-stub")
+
+    def the_tape():
+        return pane_id(screen, "tape") or [p for p, n in panes(screen) if not n][0]
+
+    def pid_of(pane):
+        return screen.tmux("display-message", "-p", "-t", pane,
+                           "#{pane_pid}").stdout.strip()
+
+    tape = the_tape()
+    was = pid_of(tape)
+    assert was.isdigit(), f"the tape has no process at all: {was!r}"
 
     assert seat_key(screen, "tape", "t").returncode == 0
     assert seat_key(screen, "tape", "t").returncode == 0
-    same = pane_id(screen, "tape") or [p for p, n in panes(screen) if not n][0]
-    assert same == tape, "the pane was replaced rather than moved"
-    assert "tape-stub" in screen.tmux("capture-pane", "-p", "-t", tape).stdout
+    assert the_tape() == tape, "the pane was replaced rather than moved"
+    assert pid_of(tape) == was, "the pane came back with a different process in it"
 
 
 def test_the_tape_toggle_works_on_a_screen_with_no_dash(screen):
