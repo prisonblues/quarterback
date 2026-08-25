@@ -640,6 +640,62 @@ hand, `qb-hooks uninstall` to take it off. `install` is idempotent, and re-runni
 repo that was set up before a new guard existed picks it up — `create-worktree` runs it on the
 main checkout every time it makes a worktree, so that normally happens on its own.
 
+### The shared-checkout guard — the one refusal on the board (#185)
+
+Everything else quarterback does is advisory, and for everything else advisory is enough: a
+signal you can act on later is still worth having. This one is not like that. `git reset
+--hard` in a tree holding somebody else's uncommitted work destroys it at the instant it runs,
+so there is no later moment at which a warning would still have helped. That asymmetry is the
+whole argument for a refusal, and it is why there is exactly one.
+
+It has happened five times here. Four in `65lowther` — an agent's in-flight `clash.py`
+committed by somebody else under a message saying the work was not theirs; a half-wired
+`annex.yaml` include that gave all four agents the same 41-error build. Twice more on
+2026-08-25, in quarterback's own checkout, where a `git reset --hard` took a peer's review
+fixes while they were still writing them.
+
+`qb-hook` gates `Bash` at `PreToolUse`. Three facts have to be true **together**:
+
+- the command destroys uncommitted work — `git reset --hard|--merge`, `git checkout -- ` /
+  `-f` / `.`, `git restore`, `git clean -fd|--force`, `git worktree remove --force`;
+- this working tree actually holds some, **untracked files included** — `git clean -fd`
+  destroys precisely the files that `--untracked-files=no` would have hidden, and one of the
+  five was an untracked file;
+- and a peer is live in **this exact cwd**, which `GET /active?cwd=` has answered since v2.6.
+
+Take any one away and nothing happens. A clean tree is never refused. `git status` never
+reaches the board at all — the fast path is one regex against a string the hook already holds,
+which matters because this fires on every Bash call in every session on the box. Alone in a
+tree, your own uncommitted work stays yours to throw away.
+
+**It matches the tree, not the repo.** Two agents in two worktrees of one repo are not in each
+other's way, and a gate that refused them would be refusing people who are free — which is how
+a primitive gets learned around, and then it is worse than nothing.
+
+**`QB_ALLOW_SHARED_TREE=1`** in front of the command proceeds anyway, the same shape and the
+same reasoning as `QB_ALLOW_SHARED_STASH`. An advisory gate needs a way past or it gets turned
+off wholesale; putting the override in the command makes taking it deliberate and visible.
+
+**`git stash` is not in that list**, though it belongs to the family. It is already refused by
+the `reference-transaction` hook above, which is strictly better for it: that one catches a
+stash typed outside Claude Code entirely, and it does not wait for a peer to be live, because
+a shared `refs/stash` stack is a hazard either way. Two gates on one command would only mean
+two escape hatches under different names.
+
+**And the note that precedes it was wrong in the same place.** The SessionStart occupancy note
+scopes by `repo` when there is one — which, inside a git repo, is always — so it never asked
+about a working tree. On the night, it named the very agents whose work was about to be
+destroyed and closed with "no need to hold off". That sentence is right about a repo and
+backwards about a tree. The hook now asks both questions and gives them opposite answers:
+sharing a repo is company, sharing a tree gets its own line, its own names, and a
+`git worktree add` to get out of it.
+
+**Fail-open, unchanged.** Board unreachable, request timed out, answer will not parse, `cwd` is
+not a checkout: all let the command through. A coordination board is not in the critical path
+of anyone’s work, and a guard that failed closed would turn every board outage into a
+fleet-wide one. `harness/tests/test_qb_hook_shared_tree.py` pins all of it, including every
+command that must *not* be refused.
+
 ### The pre-push guard — a two-headed graph, a branch writing in a generated file, and a rewritten release
 
 The other hook `qb-hooks` installs, and the reason it exists is that on 2026-08-22 four
