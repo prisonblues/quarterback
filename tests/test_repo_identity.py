@@ -403,6 +403,27 @@ async def test_the_bare_name_widening_is_a_name_and_not_a_basename(client, repo)
     assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
 
 
+@pytest.mark.parametrize("repo", NOT_A_REPO_NOR_A_NAME + NOT_A_NAME_EITHER)
+async def test_the_landing_graph_read_refuses_a_spelling_that_is_neither(client, repo):
+    """`GET /landing` is the second read on this board that takes a bare name, and
+    for the same reason `GET /worktrees` does — the spelling a board post carries.
+    It widens exactly that far and no further: an empty graph in answer to a clone
+    URL would read as "nothing gates anything here"."""
+    r = await client.get("/landing", params={"repo": repo}, headers=LAPTOP)
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO)
+async def test_a_landing_EDGE_cannot_be_WRITTEN_under_any_of_them(client, repo):
+    """The write is strict where the read is not, and here the asymmetry matters
+    more than usual: a node IS a claim key, so a second spelling of one repo is a
+    second node that nothing will ever match against the first."""
+    r = await client.post("/landing/gate", headers=LAPTOP, json={
+        "blocked": {"kind": "pr", "value": "2", "repo": repo},
+        "blocker": {"kind": "pr", "value": "1", "repo": "acme/keyed"}})
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
 @pytest.mark.parametrize("repo", NOT_A_REPO)
 async def test_a_worktree_cannot_be_REGISTERED_under_any_of_them(client, repo):
     """The write is strict where the read is not, and that asymmetry is the whole
