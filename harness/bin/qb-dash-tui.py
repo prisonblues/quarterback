@@ -348,7 +348,13 @@ class Dash(App):
         self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None
-        self.held: dict = {}                  # 'owner/repo#n' → the claim on it
+        # 'owner/repo#n' → the claim on it. NONE UNTIL THE BOARD HAS ANSWERED,
+        # and the distinction is the whole of #433: `{}` means "the board says
+        # nothing is held", which is an answer, and this panel sorts on it. An
+        # empty dict standing in for "not asked yet" made those two the same, so
+        # the table painted every issue as free and re-sorted when the truth
+        # arrived — moving rows out from under a pointer already aimed at them.
+        self.held: dict | None = None
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
         # Where launched work runs, what it runs, and whether it asks first.
@@ -742,7 +748,11 @@ class Dash(App):
         # held by an agent working out of another repo's checkout, is still held.
         # Narrowing here would draw it as free and send the next seat into it.
         held = qd.claims_by_issue(claims)
-        if holders(held) != holders(self.held):
+        # `self.held is None` is its own reason to render: the FIRST answer has
+        # to reach the table even when it is empty, and comparing holders alone
+        # cannot see that transition — {} and {} are equal. That is the case the
+        # renewal guard above was never written for.
+        if self.held is None or holders(held) != holders(self.held):
             self.held = held
             self.render_issues(self.issues, self.issue_err)
 
@@ -984,6 +994,17 @@ class Dash(App):
         panel is for: the ⚒ on its row starts /fix-issue on it.
         """
         self.issues, self.issue_err = issues, err
+        if self.held is None:
+            # `gh` answered before the board did. Painting now would order every
+            # issue as free and then rearrange, and the rearrangement is the bug:
+            # a reader picks a row by looking at it, and it has to still be there
+            # when the click lands. The rows are kept and `render_board` paints
+            # them the moment it knows — which is a fraction of a second, against
+            # a `gh` call that has already taken seconds. A board that ERRORS
+            # still gets here: `fetch_board` returns a state rather than raising,
+            # so `render_board` always runs and this never waits for ever.
+            self.query_one("#t_issues", Static).update("ISSUES · waiting for the board")
+            return
         table = self.query_one("#issues", DataTable)
         table.clear()
         free = 0
@@ -1337,7 +1358,7 @@ class Dash(App):
         if (why := self.wrong_repo(issue.get("repo"), f"#{number}")):
             self.say(why)
             return
-        if (holder := holders(self.held).get(qd.issue_key(issue))):
+        if (holder := holders(self.held or {}).get(qd.issue_key(issue))):
             self.say(f"#{number} is claimed by {holder} (the board's last answer, "
                      f"`r` re-reads it) — the spawn takes that claim, so "
                      f"`qb-release issue {number}` is what frees it")

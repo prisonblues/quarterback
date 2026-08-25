@@ -960,6 +960,103 @@ async def _drive_queue_state(queue) -> tuple[list[list[str]], str, list, str]:
                 str(app.query_one("#t_queue").content), [], app.detail_text)
 
 
+async def _drive_held_race() -> tuple[list[str], list[str]]:
+    """`gh` answering before the board — the order the race can actually take.
+
+    Both are started from `on_mount` with nothing sequencing them, and `gh issue
+    list` is the slow one, so the board usually wins and the bug usually hides.
+    Driven by hand here rather than waited for, because a test that reproduced
+    this by racing two real calls would be the flake it is meant to replace.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
+               "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426, 422)]
+    # The newest issue is the held one, so a sort that knows about claims puts it
+    # LAST and a sort that does not puts it FIRST. Any weaker fixture and the two
+    # orders coincide and the test proves nothing.
+    claims = [{"kind": "work", "key": f"{qd.REPO}#427", "holder": "hermes/x",
+               "expires": None}]
+
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_issues(issues, None)
+        await pilot.pause()
+        table = app.query_one("#issues")
+        first = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+        app.render_board({"agents": [], "claims": claims})
+        await pilot.pause()
+        after = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+        return first, after
+
+
+def test_the_issue_list_never_reorders_rows_it_has_already_drawn():
+    """#433: a row a reader has aimed at has to still be there when the click lands.
+
+    `self.held` was `{}` before the board answered and `{}` when the board said
+    nothing is held, so the panel could not tell "not asked yet" from an answer.
+    When `gh` won the race it painted every issue as free and re-sorted the moment
+    the claims arrived — #427 drawn at the top, then moved to the bottom, and a
+    click on the top row taking #426 instead.
+
+    The fix is not a faster board or a lock: it is that an order this panel is
+    about to rearrange is worth less than no order at all, so it draws nothing
+    until it can draw the right one. Hence the two assertions — the first paint is
+    EMPTY, and the paint that follows is already final.
+
+    The renewal guard on `render_board` cannot cover this and is not at fault: it
+    compares holders, and the transition here is `{}` → `{}` whenever nothing is
+    held, which compares equal.
+    """
+    first, after = asyncio.run(_drive_held_race())
+    assert first == [], f"the table painted before it knew what was claimed: {first}"
+    assert after == ["426", "422", "427"], after
+
+
+def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
+    """The empty answer is still an answer: no claims must paint, not stall.
+
+    The other half of #433. Holding the paint until the board answers is only safe
+    if EVERY answer releases it, and the emptiest one is the easy one to miss:
+    `render_board` compares holders, and with nothing claimed anywhere that is `{}`
+    against `{}`, which is not a change. A fix that released the paint on a holder
+    change alone would trade an intermittent wrong row for an ISSUES panel that a
+    quiet fleet never sees at all.
+
+    Kept separate from the reorder test because it fails for a different reason and
+    would otherwise be masked by it: this one is red against the naive fix and green
+    against no fix at all, which is exactly the pairing that says the release
+    condition — not merely the gate — is the part being pinned.
+    """
+    async def drive() -> list[str]:
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
+                   "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426)]
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_issues(issues, None)
+            await pilot.pause()
+            app.render_board({"agents": [], "claims": []})
+            await pilot.pause()
+            table = app.query_one("#issues")
+            return [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+
+    assert asyncio.run(drive()) == ["427", "426"]
+
+
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
     """#262: `who state stage what ttl`, and the stage cell is column 2.
 
@@ -1020,6 +1117,11 @@ async def _drive_icons() -> list[str]:
     async with app.run_test(size=(90, 44)) as pilot:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.repo_slug = qd.REPO                            # what this checkout is
+        # The board has answered and nothing is held. Said rather than assumed:
+        # `held` is None until it answers and ISSUES deliberately paints nothing
+        # then (#433), so a driver that renders the table by hand has to stand in
+        # for the board as well.
+        app.held = {}
         app.render_prs([{"number": 1, "title": "ours", "repo": qd.REPO,
                          "isDraft": False, "statusCheckRollup": []},
                         {"number": 2, "title": "theirs", "repo": "someone/else",
@@ -1352,6 +1454,9 @@ async def _drive_two_repos() -> list[str]:
     app.refresh_plan = lambda: None
     app.refresh_prs = lambda: None
     app.refresh_issues = lambda: None
+
+    # As above: the board answered, nothing is held (#433).
+    app.held = {}
 
     opened: list[str] = []
     app.open_pr = lambda pr: opened.append(f"{pr.get('repo')}#{pr.get('number')}")
