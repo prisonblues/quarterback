@@ -402,6 +402,45 @@ POST  /plan/scope        { name, note? }  -> 201 {scope, created}      ← human
                           one that exists returns it with created=false
 GET   /plan/view         (browser view — the plan, and where a human reorders it)
 
+# the landing graph — what gates what, across repos, and who is minding it (#294)
+GET   /landing           ?repo=&node=
+                          -> {nodes:[{key, repo, kind, value, blocked_by:[…], blocks:[…],
+                              landable, depth, in_cycle, in_scope, minders:[…], minded,
+                              since, passed_by, claim}], cycles, swept, truncated, counts}
+                          a node IS a claim key (`prisonblues/quarterback!290`), so the
+                          repository is inside the identity and an edge crosses repos
+                          without any column being about that. ?repo= seeds on that repo's
+                          nodes and returns the CLOSURE — a chain that leaves the repo
+                          comes back whole, because truncating it at the boundary reports
+                          the far node as landable when three things gate it. Nodes the
+                          chain dragged in carry `in_scope: false`. `depth` is landings
+                          until landable (0 = go now, null in or behind a cycle);
+                          `passed_by` is merges landed on this repo since the graph first
+                          heard about the node — counted per PR, so one merge announced
+                          by both CI and an agent is one. It DECIDES nothing: no order,
+                          no recommendation, no `next` — #80 consumes this.
+                          The read SWEEPS: it filters edges whose blocker has been
+                          announced merged and watches whose holder stopped being
+                          present, for every caller, and PERSISTS that only for an
+                          authenticated one — `reader` lets an unproved Remote-User look,
+                          and a spoofed one must not also buy a committed write
+POST  /landing/gate      { blocked:{kind,value,repo}, blocker:{…}, note? } -> 201
+                          idempotent over live rows. A cycle is recorded and reported,
+                          never refused: a real deadlock a store will not hold goes back
+                          to being prose. A same-repo issue→issue edge is accepted with
+                          `advice` naming GitHub as its better home (#229)
+POST  /landing/clear     { blocker:{…}, blocked?:{…}, resolution } (landed | dropped)
+                          omit `blocked` to clear everything that blocker gated at once.
+                          Usually unnecessary: the board resolves edges from its own
+                          `published` merge announcements and records the post that said
+                          so — but only where the post names `owner/name`, since
+                          `Merge pull request #40` under a bare repo could be either
+POST  /landing/mind      { node:{…}, note?, session?, ttl? } -> 201 {…, also_minding}
+                          stand by for a node, visibly. NOT a claim: several agents may
+                          mind one node while none is doing it. Lives while your session
+                          holds a lease — presence is the expiry, the TTL is a backstop
+POST  /landing/unmind    { node:{…}, holder? }         (idempotent; `lapsed` stays false)
+
 # what order the RULES imply, beside the order in force (#232, deterministic half)
 GET   /plan/order        ?repo=   (the scope EXACTLY — a read that never widens)
                           -> {active_order, suggested_order, changed, moves, entries:[…],

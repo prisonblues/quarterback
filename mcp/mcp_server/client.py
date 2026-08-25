@@ -291,6 +291,30 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    # -- the landing graph (#294) ---------------------------------------
+
+    def landing(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/landing"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
+    def landing_write(self, path: str, body: dict) -> dict:
+        """gate / clear / mind / unmind.
+
+        The session is stamped on ``mind`` only, and that is the whole expiry
+        design rather than a detail: a watch lives while its holder's presence
+        does, so a watch that named no session has nothing but its TTL to lean
+        on. ``unmind`` is a machine-level act (you may stand down a watch your
+        own box set) and takes none — an argument an endpoint ignores is an
+        argument that will one day mean something else.
+        """
+        if path == "mind" and self._session and not body.get("session"):
+            body = {**body, "session": self._session}
+        resp = self._http.post(self._url(f"/landing/{path}"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     # -- the plan (v2.39; a plan became a row of its own in #172) ------
 
     def plans(self, params: dict) -> dict:

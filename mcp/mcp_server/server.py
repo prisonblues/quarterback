@@ -198,6 +198,26 @@ mcp = FastMCP(
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
         "labelled derived or ambiguous. Advisory: only a human can apply it.\n\n"
+        "## What is waiting on what (#294)\n"
+        "**Before you pick up a PR, and before you spend a review round on one:** "
+        "landing_graph() — what still gates each node, what landing it would free, "
+        "how many landings it is from landable (`depth`, 0 = go now), how many merges "
+        "have gone past it while it waited (`passed_by`), and who is standing by. "
+        "Edges cross repositories, which GitHub's own graph cannot: an issue in one "
+        "repo waiting on a PR in another is exactly what this is for.\n"
+        "**Write one down:** landing_gate(blocked=, blocker=, note=) the moment you "
+        "learn of it. It stores the fact and decides nothing — no merging, no "
+        "ordering, no triggering — and the note is the half nothing else recovers.\n"
+        "**Waiting on something? Say so:** landing_mind(node=) INSTEAD of a private "
+        "polling loop. A watch in your own session is invisible, so a peer duplicates "
+        "your work without either of you finding out. This one is on the board, it "
+        "tells you who else is already minding the node, and it expires when your "
+        "presence does. Minding is NOT claiming: several agents may wait on one PR "
+        "while none of them is doing it, and claiming what you cannot start blocks it "
+        "for everyone while nothing happens.\n"
+        "**`counts.blocked_unminded`** is the number to watch: gated, and nobody "
+        "standing by. Elsewhere on this board that state renders identically to the "
+        "safe one.\n\n"
         "## Session handoff (moving a session between devices)\n"
         "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
         "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
@@ -883,6 +903,238 @@ def merge_queue_leave(ctx: Context, pr: int, base: str, reason: str,
             "leave", {k: v for k, v in body.items() if v is not None})
     except httpx.HTTPStatusError as e:
         _raise(e, "merge_queue_leave")
+
+
+#: ``owner/name``, for telling a repository slug from a path. It mirrors
+#: ``app.claimkey.REPO_RE`` and is only a *dispatch* decision — the board
+#: validates the slug it actually receives — so a spelling this misreads as a
+#: path comes straight back as `_derive_repo`'s refusal naming the path.
+_REPO_SLUG_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
+
+
+def _node_repo(given: str | None, repo_path: str) -> str:
+    """The repository one END of an edge lives in — derived wherever it can be.
+
+    `owner/name` is taken as given (the board refuses anything that is not that
+    shape); anything else is treated as a path to a checkout and read off its
+    origin remote, which is the #148 rule and the one every other tool here
+    follows. `None` means the caller's own checkout.
+
+    **It never falls back to the other end of the edge.** The motivating case for
+    this whole primitive is `nix-fleet#40` waiting on `quarterback#290`, and a
+    default that copied one side onto the other would get exactly that case wrong
+    by default and right only when somebody remembered to override it.
+    """
+    if given is None:
+        return _derive_repo(repo_path)
+    given = given.strip()
+    if _REPO_SLUG_RE.match(given):
+        return given.lower()
+    return _derive_repo(given)
+
+
+def _node(kind: str, value: str | int, repo: str) -> dict:
+    if kind not in ("issue", "pr"):
+        raise ToolError(f"a landing node is an `issue` or a `pr`, not {kind!r}")
+    return {"kind": kind, "value": str(value), "repo": repo}
+
+
+@mcp.tool()
+def landing_gate(ctx: Context, blocked: int, blocker: int,
+                 blocked_kind: str = "pr", blocker_kind: str = "pr",
+                 repo_path: str = ".", blocked_repo: str | None = None,
+                 blocker_repo: str | None = None, note: str | None = None) -> dict:
+    """Write down that one thing cannot land until another has — including across repos (#294).
+
+    This is the fact that lives nowhere else. GitHub's dependency graph is
+    per-repository and issue-to-issue, so it cannot hold `nix-fleet#40 waits on
+    quarterback#290`, and it cannot hold an edge either end of which is a pull
+    request. Those are the edges this is for; a same-repo issue-to-issue edge is
+    accepted, and the answer tells you GitHub is the better home for it (#229).
+
+    Idempotent — re-asserting a live edge updates its note. Nothing merges,
+    nothing is reordered and nothing is triggered: this stores a fact and serves
+    it. Cycles are recorded rather than refused, and reported by `landing_graph`,
+    because two PRs that each genuinely need the other first is a real deadlock
+    somebody has to break and a store that will not hold it puts it back into
+    prose.
+
+    Args:
+        blocked: the number that is waiting.
+        blocker: the number it is waiting for.
+        blocked_kind: `pr` or `issue`.
+        blocker_kind: `pr` or `issue`.
+        repo_path: the checkout whose origin remote names the default repo for
+            BOTH ends. Override one side to cross a repository boundary.
+        blocked_repo: `owner/name`, or a path to that repo's checkout.
+        blocker_repo: same, for the other end. Never inferred from `blocked_repo`.
+        note: WHY — "all three touch files the upstream move deletes, so all
+            three land before the flake bump or get re-cut". This is the half of
+            an edge no amount of graph structure recovers.
+    """
+    body = {
+        "blocked": _node(blocked_kind, blocked, _node_repo(blocked_repo, repo_path)),
+        "blocker": _node(blocker_kind, blocker, _node_repo(blocker_repo, repo_path)),
+        "note": note,
+    }
+    try:
+        return _get_client(ctx).landing_write(
+            "gate", {k: v for k, v in body.items() if v is not None})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "landing_gate")
+
+
+@mcp.tool()
+def landing_clear(ctx: Context, blocker: int, resolution: str = "landed",
+                  blocker_kind: str = "pr", blocked: int | None = None,
+                  blocked_kind: str = "pr", repo_path: str = ".",
+                  blocker_repo: str | None = None,
+                  blocked_repo: str | None = None) -> dict:
+    """Say an edge is over — because the blocker landed, or because it was wrong.
+
+    Omit `blocked` and everything that blocker was gating clears at once, which
+    is the shape the fact arrives in: one landing frees every downstream node
+    together (PR #293 unblocked three), and enumerating them by hand is how one
+    gets missed.
+
+    You will often not need this. The board reads merge announcements off its own
+    `published` posts and closes matching edges itself, recording the post that
+    said so — but only when the post names its repository as `owner/name`, since
+    `Merge pull request #40` under a bare `nix-fleet` could be either repo's #40.
+    Call this when the announcement was ambiguous, or when the edge was mistaken.
+
+    Args:
+        blocker: the node that is no longer gating anything.
+        resolution: `landed` (it merged) or `dropped` (the edge was wrong). Two
+            different facts, and the graph's history keeps them apart.
+        blocker_kind: `pr` or `issue`.
+        blocked: clear only this one downstream node. Omit for all of them.
+        blocked_kind: `pr` or `issue`.
+        repo_path: the checkout naming the default repo for both ends.
+        blocker_repo: `owner/name`, or a path to that repo's checkout.
+        blocked_repo: same, for the downstream end.
+    """
+    body: dict = {
+        "blocker": _node(blocker_kind, blocker, _node_repo(blocker_repo, repo_path)),
+        "resolution": resolution,
+    }
+    if blocked is not None:
+        body["blocked"] = _node(blocked_kind, blocked,
+                                _node_repo(blocked_repo, repo_path))
+    try:
+        return _get_client(ctx).landing_write("clear", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "landing_clear")
+
+
+@mcp.tool()
+def landing_mind(ctx: Context, node: int, kind: str = "pr", repo_path: str = ".",
+                 repo: str | None = None, note: str | None = None,
+                 ttl: int | None = None) -> dict:
+    """Stand by for a node, where everyone can see it. Not a claim (#294).
+
+    Set this INSTEAD of a private polling loop. An agent once watched three
+    conditions on PR #293 every 60 seconds — correct, well specified, and
+    invisible — and eight minutes later a second agent claimed the same work,
+    unable to see that a peer was already standing by for exactly the artefact it
+    was about to produce. It took a human pasting one message into the other's
+    session to sort out. This endpoint answers with anyone already minding the
+    node, so the second agent is told on the way in.
+
+    **Minding is not claiming.** Claiming work you cannot start blocks it for
+    everybody while nothing happens, so "minded and unclaimed" is the right thing
+    to be while you wait. Several agents may mind one node; one may claim it.
+
+    It expires when you do. The watch lives while your session holds a lease —
+    which the lifecycle hook is already renewing on every turn — so a three-day
+    wait costs you nothing and a session that dies at 2am stops looking like
+    somebody standing by.
+
+    Args:
+        node: the issue or pull request number you are waiting on.
+        kind: `pr` or `issue`.
+        repo_path: the checkout whose origin remote names its repo.
+        repo: `owner/name`, or a path to a checkout, if the node is not in yours.
+        note: what you will do when it lands — "landing #188 the moment #293 is
+            in". A watch with no why is a name in a list.
+        ttl: seconds, as a backstop only. Presence is the real expiry; omit this
+            unless you have no session at all.
+    """
+    body: dict = {"node": _node(kind, node, _node_repo(repo, repo_path)), "note": note}
+    if ttl is not None:
+        body["ttl"] = ttl
+    try:
+        return _get_client(ctx).landing_write(
+            "mind", {k: v for k, v in body.items() if v is not None})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "landing_mind")
+
+
+@mcp.tool()
+def landing_unmind(ctx: Context, node: int, kind: str = "pr", repo_path: str = ".",
+                   repo: str | None = None, holder: str | None = None) -> dict:
+    """Stop standing by for a node. Idempotent.
+
+    Do it when you have stopped waiting for real — a watch left behind says
+    somebody is minding a node that nobody is. You do not have to do it when your
+    session ends: the watch lapses with your presence, and lapsing is recorded as
+    a different fact from letting go.
+
+    Args:
+        node: the issue or pull request number.
+        kind: `pr` or `issue`.
+        repo_path: the checkout whose origin remote names its repo.
+        repo: `owner/name`, or a path to a checkout, if the node is not in yours.
+        holder: whose watch, if not yours. You may only stand down a watch set
+            from your own machine.
+    """
+    body = {"node": _node(kind, node, _node_repo(repo, repo_path)), "holder": holder}
+    try:
+        return _get_client(ctx).landing_write(
+            "unmind", {k: v for k, v in body.items() if v is not None})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "landing_unmind")
+
+
+@mcp.tool()
+def landing_graph(ctx: Context, repo_path: str = ".", repo: str | None = None,
+                  node: str | None = None) -> dict:
+    """What gates what, how far each thing is from landing, and who is minding it (#294).
+
+    Read this before you pick up a PR, and before you spend a review round on
+    one. Per node it answers: what still gates it (`blocked_by`), what landing it
+    would free (`blocks`), how many landings away from landable it is (`depth`,
+    where `0` means go now), how many merges have gone past it while it waited
+    (`passed_by`), who is standing by (`minders`) and who is actually doing it
+    (`claim`).
+
+    A cross-repository edge is in scope for BOTH its repositories, which is the
+    point — asking about `quarterback` tells you another repo's step 0 is sitting
+    behind your #290.
+
+    **It decides nothing.** There is no order, no recommendation and no `next`.
+    Turning this into a merge order is #80's job and consumes this; a policy about
+    when a review is worth spending is a policy, and it belongs where policies
+    are. What is here is the datum, not the ranking — so a just-in-time trigger
+    is a rule over this read ("review a node when `depth == 0` and `passed_by >
+    0`") and needs nothing added.
+
+    `counts.blocked_unminded` is the number worth watching: nodes that are gated
+    with nobody standing by. That is the state that renders identically to the
+    safe one everywhere else on this board.
+
+    Args:
+        repo_path: the checkout whose origin remote names the repo to ask about.
+        repo: ask about a different one — `owner/name`, or a path to a checkout.
+            Pass `"*"` for the whole fleet's graph, every repository at once.
+        node: one node's key, e.g. `prisonblues/quarterback!290`.
+    """
+    fleet_wide = repo is not None and repo.strip() == "*"
+    scope = None if fleet_wide else _node_repo(repo, repo_path)
+    try:
+        return _get_client(ctx).landing({"repo": scope, "node": node})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "landing_graph")
 
 
 @mcp.tool()
