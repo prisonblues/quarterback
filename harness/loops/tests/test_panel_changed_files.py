@@ -224,6 +224,50 @@ def test_a_skipped_pr_still_sends_its_file_list(monkeypatch, capsys):
     assert payload["changed_lines"] == 133
 
 
+def test_a_skipped_pr_reaches_the_board(monkeypatch, capsys, recorded_runs):
+    """#94, and the half that was missing. Emitting the file list was never the
+    problem — this path has carried a complete one for releases. It returned
+    before `record_run`, so the list reached `--json` and the next round's
+    `--baseline` and never the board, and `GET /review/collisions` saw a skipped
+    PR as neither subject nor rival: no row to be a subject, no row to be a rival.
+
+    What is recorded is not a review. The payload says `reviewed: false` with the
+    reason beside it, and it names no reviewers — so it contributes no scorecard
+    and no finding, and every per-reviewer statistic is untouched by construction
+    rather than by a filter downstream."""
+    _gh(monkeypatch, _meta_json("Merge test into main"), {})
+    assert panel.run("r", 1707, post=False, json_out=True) == 0
+
+    assert len(recorded_runs) == 1, "the skipped round never reached the board"
+    sent = recorded_runs[0]
+    assert sent["reviewed"] is False
+    assert "skip pattern" in sent["skip_reason"]
+    # The reason it is worth recording at all.
+    assert [f["path"] for f in sent["changed_files"]] == [
+        "app/api/reviews.py", "harness/loops/panel.py"]
+    assert sent["changed_files_total"] == 2
+    # And the reason recording it is not the disease it was avoiding: nothing
+    # here can become a scorecard or a finding.
+    assert not sent.get("reviewers_selected")
+    assert not sent.get("reviewers")
+    assert sent["to_fix"] == [] and sent["dismissed"] == []
+
+
+def test_a_skipped_pr_the_board_would_not_take_says_so_in_the_payload(
+        monkeypatch, capsys, recorded_runs):
+    """#284's rule reaches this exit too, and the ordering is what makes it work:
+    the record is attempted BEFORE `--json-file` is written and before the payload
+    is printed, so `config_notes` carries the miss in the artefact on disk as well
+    as on the wire. Recorded afterwards, the note would exist only in a stderr
+    line inside a subprocess nobody reads."""
+    monkeypatch.setattr(panel, "record_run",
+                        lambda p: "this round was NOT recorded on the board — no `qb`")
+    _gh(monkeypatch, _meta_json("Merge test into main"), {})
+    assert panel.run("r", 1708, post=False, json_out=True) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any("NOT recorded on the board" in n for n in payload["config_notes"])
+
+
 def test_a_partial_list_is_said_out_loud_and_not_only_implied(monkeypatch, capsys):
     """The two numbers are in the payload either way. This is the copy a human
     reads — the same treatment #75 gave a short panel, for the same reason: a

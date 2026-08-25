@@ -2685,9 +2685,16 @@ async def _pr_evidence(session: AsyncSession,
     if not wanted:
         return {}, problems
 
+    # Newest run per (repo, pr) — but never a run that reviewed nothing (#94).
+    # This evidence is "how much confirmed work is still outstanding on the PR
+    # behind this item", and a title-skipped merge carries no findings at all, so
+    # letting one be the newest run would report every item on that PR as clear
+    # and move it up the plan. `IS NOT FALSE`, so every run recorded before the
+    # column keeps answering exactly as it does today.
     runs = list(await session.scalars(
         select(ReviewRun)
-        .where(tuple_(ReviewRun.repo, ReviewRun.pr).in_(list(wanted)))
+        .where(tuple_(ReviewRun.repo, ReviewRun.pr).in_(list(wanted)),
+               ReviewRun.reviewed.isnot(False))
         .distinct(ReviewRun.repo, ReviewRun.pr)
         .order_by(ReviewRun.repo, ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
     ))

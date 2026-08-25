@@ -1551,10 +1551,22 @@ diff the reviewers are handed. That is what lets the skip path — which never f
 increment: a collision surface that narrowed with the increment would report two PRs as no
 longer colliding because one stopped *re-reading* a file it still changes.
 
-> **The skip path emits this but does not record it.** It returns before `record_run` — no
-> review happened — so a skipped PR's file list reaches `--json` and the next round's
-> `--baseline`, and never the board. Do not read "the skip payload carries it" as "the
-> board can answer collision queries about a skipped PR"; it cannot.
+> **The skip path records it too, since #94** — and the row says no review happened. It
+> used to return before `record_run` on the correct reasoning that recording a non-event as
+> an event is its own disease, which left the board with no file list for merges, promotes
+> and format-the-world commits: the changes that touch the most files, collide with the most
+> work and are merged unattended most often. `GET /review/collisions` saw a skipped PR as
+> neither subject nor rival.
+>
+> The payload has always carried `reviewed: false` and a `skip_reason`; the board simply had
+> nowhere to put them. It stores both now, so a skipped run is a row that states what it
+> measured and denies having reviewed anything. It carries no `reviewers_selected` and no
+> findings, so it contributes no scorecard and no finding row — every per-reviewer statistic
+> is untouched by construction rather than by a filter.
+>
+> Read `reviewed` before counting runs. A query that means "a review happened" asks
+> `reviewed IS NOT FALSE`, never `IS TRUE`: every run recorded before the column carries
+> NULL, and `IS TRUE` would report the whole board as never reviewed.
 
 ### A round the board did not take says so (#284)
 

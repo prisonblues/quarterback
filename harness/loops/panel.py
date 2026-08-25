@@ -909,8 +909,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # and found nothing" and "never reviewed at all" arrive as the
             # same empty stdout — and the second one silently reads as a
             # clean PR. Same SHAPE as a reviewed run, too, so reading any
-            # other key of it is not a KeyError. Not recorded on the board:
-            # no review happened.
+            # other key of it is not a KeyError.
+            #
+            # RECORDED on the board since #94, and the payload's own
+            # `reviewed: false` is what makes that not a lie. It used to
+            # return here, on the correct reasoning that no review happened
+            # and a non-event recorded as an event is its own disease — but
+            # the board then held no file list for merges, promotes and
+            # format-the-world commits, which are precisely the changes that
+            # touch the most files and collide with the most work, and
+            # `GET /review/collisions` saw a skipped PR as neither subject
+            # nor rival. The fix is not to pretend a review happened; it is
+            # to record what this round MEASURED and let the row say, in the
+            # column the board now stores, that nothing was reviewed.
             #
             # It says WHICH round it is and which cycle that round belongs to,
             # because the caller is told to feed every round's --json-file
@@ -1004,6 +1015,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                     measured_to="skip"),
                 "run_key": run_key,
             }
+            # Recorded BEFORE the file is written and before the payload is
+            # printed, exactly as the reviewed and refusal paths do it and for
+            # the same reason (#284): a board that would not take the run has to
+            # say so in the artefact on disk and in `--json`, not in a stderr line
+            # inside a subprocess nobody reads. Under `record`, because
+            # `--no-record` is a caller saying this run does not go on the board.
+            #
+            # Appended to the PAYLOAD's list and not to `notes`, which is the one
+            # difference from the reviewed path worth stating. There `notes` IS
+            # `payload["config_notes"]` — the same object — so appending to either
+            # reaches both. Here `config_notes` was built as `notes +
+            # skip_prior.problems`, a new list, so a note appended to `notes`
+            # after the payload exists lands nowhere the payload can see. The
+            # refusal path does it this way for the same reason.
+            #
+            # What is sent carries `reviewed: false` and `skip_reason`, so the
+            # board stores a run that states it reviewed nothing. It has no
+            # `reviewers_selected` and no findings, so it contributes no
+            # scorecard and no finding row — every per-reviewer statistic is
+            # untouched by construction rather than by a filter.
+            if record:
+                missed = record_run(skipped_payload)
+                if missed:
+                    skipped_payload["config_notes"].append(missed)
             # --json-file is honoured here too, and its failure fails the run the
             # same way. The caller is told "if the panel could not write that file
             # the round did not happen", and it then feeds the file to the next
@@ -2642,9 +2677,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "unread_files": unread_files,
         "changed_files": changed_files, "changed_files_total": changed_files_total,
         "pr_state": pr_state, "is_draft": is_draft,
-        # Always True in a payload the BOARD sees — the skip path returns before
-        # `record_run` because no review happened. It is here for `--json`
-        # consumers, which get both shapes and need to tell them apart.
+        # True here, and no longer the only value the BOARD sees. This comment
+        # used to read "always True in a payload the board sees", which was
+        # already untrue when it was written: the pre-flight refusal path sends
+        # `reviewed: false` and IS recorded, so the board has been receiving
+        # "nothing was reviewed" and discarding it for several releases. It
+        # stores the field since #94, and the title-pattern skip records too, so
+        # all three exits now say what they are on the board as well as in
+        # `--json`.
         "reviewed": True,
         "diff_truncated": truncated,
         # Where this run sits in the panel -> fix -> panel cycle, and what the

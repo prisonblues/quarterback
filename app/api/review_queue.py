@@ -156,12 +156,36 @@ async def _last_runs(session: AsyncSession, repo: str,
     :func:`_cycle_rounds`. It is published beside it because "this PR has had
     eleven rounds across four cycles" is a fact about the PR that no per-cycle
     number carries.
+
+    **Runs that reviewed nothing are excluded, and here that is a filter in front
+    of a selection on purpose** (#94). Since the board started recording
+    title-skipped panels, ``review_runs`` holds rows whose whole purpose is the
+    changed-file list they carry; letting one be "the newest run for this PR"
+    would tell the queue three false things at once — that the PR's outstanding
+    findings had stopped being raised, that its cycle had advanced a round
+    (:func:`_cycle_rounds` counts the cap off ``run.round``, so a merge could
+    round-cap the review it is asking for), and that nothing had been confirmed.
+
+    Elsewhere a predicate in front of a newest-run selection is this codebase's
+    standing bug, because it resurrects an older run and hands back its answer
+    with nothing marking it stale. It is safe here for a reason that does not
+    travel: this queue asks "what is the state of REVIEW on this PR", so the
+    older review genuinely is the answer — and the staleness it would otherwise
+    hide is caught one layer up, where ``classify`` compares the run's
+    ``head_sha`` against the PR's live head and returns ``stale`` when they
+    differ. A PR whose newest event is a skipped merge therefore comes back
+    "reviewed at an older commit, review it again", which is the truth.
+
+    ``IS NOT FALSE`` rather than ``IS TRUE``: every run recorded before the column
+    existed is NULL, and ``IS TRUE`` would report the entire board as never
+    reviewed.
     """
     if not numbers:
         return {}, {}
     rows = list((await session.scalars(
         select(ReviewRun)
-        .where(ReviewRun.pr.in_(numbers), ReviewRun.repo == repo)
+        .where(ReviewRun.pr.in_(numbers), ReviewRun.repo == repo,
+               ReviewRun.reviewed.isnot(False))
         .order_by(ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
     )).all())
     newest: dict[int, ReviewRun] = {}
