@@ -656,20 +656,34 @@ fixes while they were still writing them.
 
 `qb-hook` gates `Bash` at `PreToolUse`. Three facts have to be true **together**:
 
-- the command destroys uncommitted work — `git reset --hard|--merge`, `git checkout -- ` /
-  `-f` / `.`, `git switch -f|--discard-changes`, `git restore`, `git clean -fd|--force`,
-  `git worktree remove --force`;
+- the command destroys uncommitted work — `reset --hard|--merge`, `checkout` of a path or with
+  `-f`, `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
+  `rm -f`, `worktree remove --force`, `read-tree --reset -u`, `checkout-index -f`, and the
+  `--abort` of an in-progress merge/rebase/cherry-pick;
 - **the tree that command will actually touch** holds some, **untracked files included** —
   `git clean -fd` destroys precisely the files that `--untracked-files=no` would have hidden,
   and one of the five was an untracked file;
 - and a peer is live in that tree, which `GET /active?cwd=` has answered since v2.6.
 
-Take any one away and nothing happens. A clean tree is never refused. `git status` never
-reaches the board at all — the fast path is one regex against a string the hook already holds,
-which matters because this fires on every Bash call in every session on the box. Alone in a
-tree, your own uncommitted work stays yours to throw away. `--help` is never refused, and
-neither is a dry run: `git clean -n`, `-fdn` and `--dry-run` print what they would remove and
-remove nothing.
+Take any one away and nothing happens. A clean tree is never refused. Alone in a tree, your own
+uncommitted work stays yours to throw away. `--help` is never refused, and neither is a dry run:
+`git clean -n`, `-fdn` and `--dry-run` print what they would remove and remove nothing.
+
+**The command is tokenised, not matched.** A panel round found nine P1 bypasses in the regex that
+used to decide this, and they were one premise wearing nine faces — a regular expression cannot
+parse a shell command. `git -c core.filemode=false reset --hard` was not matched at all, because
+the pattern knew only `-C <path>` among the two-token global options. `git clean -n && git reset
+--hard` was excused by a dry run in a *different clause*; `git status --help; git reset --hard`
+the same through `--help`; the escape hatch the same through grep's per-**line** `^`. Patching
+those where they were found is how #67's loop starts — the special case is the next round's
+finding — so the premise went instead. `qb-classify-command` splits the command into clauses and
+classifies each on its own, which is what "does this command do X" needed all along. It reads
+inside `bash -c '…'` too, and `echo git reset --hard` is correctly not a reset.
+
+**The regex survives in one job: a prefilter.** It decides nothing and it may not refuse anything.
+It is there so the common case — every Bash call on this box that has nothing to do with git —
+costs one `grep` and no fork, before the hook has even resolved its token. Measured: 48ms for a
+non-git Bash call, against 137ms before the prefilter was moved ahead of the preamble.
 
 **It guards the tree the command names, not the one you are standing in.**
 `git -C ../peer-tree reset --hard` is checked against `../peer-tree`, and an explicit
@@ -695,15 +709,16 @@ must be a real leading assignment — a bare substring test let `QB_ALLOW_SHARED
 trailing `# QB_ALLOW_SHARED_TREE=1` comment through, which made the hatch quietly wider than the
 sentence documenting it.
 
-**What it cannot do, stated plainly.** It reads a command as text, so it cannot model shell
-evaluation: `bash -c 'git reset --hard'`, `${GIT:-git} reset --hard`, an alias, a shell function
-or `xargs` all go past it, and conversely `echo git reset --hard` is refused for saying the
-words. That is a tripwire's honest limit, not a bug to be fixed by a bigger regex — the threat
-model here is an accident between co-operating agents, not evasion, and the cost of a false
-positive is one refusal with a named escape hatch rather than a lost morning. It is also
-time-of-check-to-time-of-use: a peer can arrive in the tree after the check and before the
-command runs. The structural fix is one worktree per agent, which is what the ⚠️ startup note
-pushes people towards; this is defence in depth behind that.
+**What it still cannot do, stated plainly.** Tokenising closed most of what a regex could not
+reach — nested shells, quoting, clause scoping, `echo`ing the words — but not the parts that need
+a shell to actually run: `${GIT:-git} reset --hard`, an alias, a shell function, a command
+assembled by `xargs`. A target it cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown*
+and falls back to the cwd, which is the conservative half of being wrong rather than a fix. It is
+also time-of-check-to-time-of-use: a peer can arrive in the tree between the check and the
+command. The threat model is an accident between co-operating agents, not evasion, and the cost
+of a false positive is one refusal with a named escape hatch rather than a lost morning. The
+structural fix is one worktree per agent, which is what the ⚠️ startup note pushes people
+towards; this is defence in depth behind that.
 
 **`git stash` is not in that list**, though it belongs to the family. It is already refused by
 the `reference-transaction` hook above, which is strictly better for it: that one catches a

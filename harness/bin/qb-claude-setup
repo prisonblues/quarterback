@@ -202,6 +202,14 @@ JQ_MINE="def mine: any((.hooks? // [])[]?; (.command? // \"\") | test(\"$QB_HOOK
 # The command an entry contributes, or "" — used for both halves of --check, so the
 # expected string comes out of the fragment by the same rule the live one does.
 JQ_CMD="def qbcmd: [ (.hooks? // [])[]? | .command? // \"\" | select(test(\"$QB_HOOK_RE\")) ] | first // \"\";"
+# ...and the MATCHER it is scoped to, which is half of whether a host is wired.
+# Comparing the command alone reported `ok` for every host wired before the guard
+# widened `PreToolUse` from `Task` to `Task|Bash`: same command, same file, same
+# event — and no Bash call would ever reach the hook. A check that cannot see the
+# difference between wired and wired-for-the-wrong-tools is the doctor blessing a
+# host with no guard. An absent matcher is the empty string, which is what Claude
+# Code means by "every tool", so it compares equal only to another absent one.
+JQ_MATCHER="def qbmatcher: .matcher? // \"\";"
 
 # ---- --check ----------------------------------------------------------------
 if [ "$MODE" = check ]; then
@@ -222,12 +230,16 @@ if [ "$MODE" = check ]; then
     jq -r --slurpfile frag <(resolved_fragment) "
       $JQ_MINE
       $JQ_CMD
+      $JQ_MATCHER
       . as \$live
       | \$frag[0].hooks
       | keys_unsorted[] as \$e
-      | ( [ (.[\$e] // [])[] | qbcmd | select(. != \"\") ] | first // \"\" ) as \$want
+      | ( [ (.[\$e] // [])[] | select(qbcmd != \"\") ] | first ) as \$wantentry
+      | ( if \$wantentry == null then \"\" else (\$wantentry | qbcmd) end ) as \$want
+      | ( if \$wantentry == null then \"\" else (\$wantentry | qbmatcher) end ) as \$wantm
       | ((\$live.hooks[\$e] // []) | map(select(mine)) | first) as \$hit
-      | [ \$e, \$want, (if \$hit == null then \"\" else (\$hit | qbcmd) end) ]
+      | [ \$e, \$want, (if \$hit == null then \"\" else (\$hit | qbcmd) end),
+          \$wantm, (if \$hit == null then \"\" else (\$hit | qbmatcher) end) ]
       | @tsv" "$S" 2>/dev/null
   ) || rows=""
   if [ "$(printf '%s\n' "$rows" | grep -c .)" != "$NEVENTS" ]; then
@@ -237,11 +249,19 @@ if [ "$MODE" = check ]; then
     exit 1
   fi
   missing=0; other=0
-  while IFS=$'\t' read -r ev want cmd; do
+  while IFS=$'\t' read -r ev want cmd wantm matcher; do
     [ -n "$ev" ] || continue
     if [ -z "$cmd" ]; then
       printf 'MISSING  %-17s no qb-hook entry — this host is deaf on that event\n' "$ev"
       missing=1
+    elif [ "$cmd" = "$want" ] && [ "$matcher" != "$wantm" ]; then
+      # Right hook, wrong tools. Named separately from SKEW because the remedy is
+      # the same but the symptom is not: the command matches, so every other
+      # reading of this file says the host is fine.
+      printf 'SKEW     %-17s matcher %s — this install wires %s\n' \
+        "$ev" "${matcher:-<every tool>}" "${wantm:-<every tool>}"
+      printf '         %-17s (the hook is present and will not fire for the tools it is missing)\n' ""
+      other=1
     elif [ "$cmd" = "$want" ]; then
       printf 'ok       %-17s %s\n' "$ev" "$cmd"
     else

@@ -55,6 +55,7 @@ import pytest
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 HOOK = BIN / "qb-hook"
+CLASSIFY = BIN / "qb-classify-command"
 
 pytestmark = pytest.mark.skipif(
     shutil.which("jq") is None or shutil.which("bash") is None or shutil.which("git") is None,
@@ -85,6 +86,13 @@ class Guarded:
         self.bin.mkdir()
         (self.bin / "qb-hook").write_bytes(HOOK.read_bytes())
         (self.bin / "qb-hook").chmod(0o755)
+        # The classifier lives beside the hook, found the same way `qb-env` is.
+        # Leaving it out of this copy is not a neutral omission — the guard reads
+        # an absent classifier as "cannot classify" and lets everything through,
+        # so a fixture missing it would run every test below against a hook that
+        # refuses nothing and report them all green.
+        (self.bin / "qb-classify-command").write_bytes(CLASSIFY.read_bytes())
+        (self.bin / "qb-classify-command").chmod(0o755)
         (self.bin / "qb-env").write_text(
             "qb_load_config() {\n"
             "  QUARTERBACK_BASE_URL=http://board.test\n"
@@ -246,7 +254,12 @@ def test_the_refusal_says_what_to_do_instead(shared):
     to get one is how a gate gets worked around instead of used."""
     reason = shared.decision(shared.bash("git reset --hard"))["permissionDecisionReason"]
     assert "git worktree add" in reason
-    assert "git stash -u" in reason
+    # `qb-stash push`, not `git stash`: every worktree of a repo shares one
+    # `refs/stash`, and the harness installs a hook that refuses the shared one
+    # outright — so advice to `git stash -u` sent the reader into a second
+    # refusal from the same fleet.
+    assert "qb-stash push" in reason
+    assert "git stash" not in reason
 
 
 def test_a_peers_subagent_counts_as_a_peer(shared):
@@ -453,12 +466,24 @@ def test_the_shared_tree_note_says_the_opposite_of_the_repo_note(session):
     assert "git worktree add" in shared
 
 
-def test_the_repo_note_keeps_its_own_voice(session):
-    """The fix must not make the ordinary case alarming. Working the same repo
-    from two worktrees is what the board is for, and it still reads that way."""
-    session.peers(PEER, in_tree=session.cwd)
+def test_the_repo_note_keeps_its_own_voice_for_a_peer_elsewhere(session):
+    """The fix must not make the ordinary case alarming. A peer in ANOTHER
+    worktree of the same repo is what the board is for, and it still reads that
+    way — the friendly note, and no warning."""
+    session.peers(PEER, in_tree="/somewhere/else")
     note = session.start()
     assert "Working the same area is fine" in note
+    assert "SHARING a working tree" not in note
+
+
+def test_the_tree_note_replaces_the_repo_note_rather_than_arguing_with_it(session):
+    """447-F39. A peer sharing BOTH fired both notes, softest first: "no need to
+    hold off" immediately above "get out of this tree". One peer, one situation,
+    two contradictory instructions — and the wrong one led."""
+    session.peers(PEER, in_tree=session.cwd)
+    note = session.start()
+    assert "SHARING a working tree" in note
+    assert "no need to hold off" not in note
 
 
 def test_alone_in_your_tree_there_is_no_second_note(session):
@@ -637,3 +662,45 @@ def test_the_startup_note_counts_a_peers_subagent(session):
     session.peers({"agents": [], "subagents": [{"label": "Explore: audit"}]},
                   in_tree=session.cwd)
     assert "SHARING a working tree" in session.start()
+
+
+# ------------------------------------- the bypasses, end to end through the hook
+#
+# `test_qb_classify_command.py` holds the full matrix against the classifier
+# itself. These are the same defects driven through the real hook, because the
+# classifier being right is only half of it — the hook has to ask it, read its
+# answer, and act. The first cut had a correct-looking guard whose regex never
+# matched these at all.
+
+
+def test_a_global_option_with_a_value_no_longer_hides_the_verb(shared):
+    """447-F01, end to end. The whole match failed on this, so the guard never
+    ran — not the target lookup, the classification."""
+    d = shared.decision(shared.bash("git -c core.filemode=false reset --hard"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_a_harmless_clause_no_longer_excuses_a_destructive_one(shared):
+    """447-F13/F14, end to end. Both exemptions were tested against the whole
+    command string, so a `--help` or a `-n` anywhere in it excused everything."""
+    for cmd in ("git clean -n && git reset --hard",
+                "git status --help; git reset --hard"):
+        d = shared.decision(shared.bash(cmd))
+        assert d is not None and d["permissionDecision"] == "deny", cmd
+
+
+def test_a_hatch_on_another_line_no_longer_excuses_the_reset(shared):
+    """447-F15/F17, end to end. grep's `^` is a per-line anchor."""
+    d = shared.decision(shared.bash("QB_ALLOW_SHARED_TREE=1 echo hi\ngit reset --hard"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_an_install_without_the_classifier_lets_everything_through(shared):
+    """Fail-open, and worth pinning because it is what a half-migrated install
+    looks like: `qb-hook` and `qb-classify-command` are separately-pinned store
+    paths, so a hook can outrun its own classifier. The guard must then refuse
+    nothing rather than guess — and a fixture that lost the classifier silently
+    would report every test in this file green against a hook that does nothing,
+    which is why this one asserts the behaviour instead of leaving it implied."""
+    (shared.bin / "qb-classify-command").unlink()
+    assert shared.decision(shared.bash("git reset --hard")) is None

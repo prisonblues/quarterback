@@ -22,9 +22,11 @@ for. Use them to reach out when it helps; never to hold off. The last two are di
 concrete instructions. Pull before you build on that checkout. And get yourself out of a shared
 tree before you edit anything — a peer's uncommitted edits are in the same files as yours, every
 build you run there compiles their half-finished work as if it were yours, and `git reset --hard`,
-`git checkout --`, `git clean` and `git restore` destroy it outright. Those four are refused
-outright while a peer is live in the tree; `QB_ALLOW_SHARED_TREE=1` in front of the command is the
-override, once you have actually talked to them.
+`git checkout --`, `git clean`, `git switch -f` and `git restore` destroy it outright. Those are
+refused while a peer is live in the tree — the full list is in `harness/README.md`, and it is read
+by a tokeniser rather than matched as text, so the wrapping and quoting do not change the answer.
+`QB_ALLOW_SHARED_TREE=1` in front of the command is the override, once you have actually talked to
+them.
 
 **Talk directly — don't wait for a human to broker.** The point of the board is that two agents
 circling the same problem find each other and compare notes themselves:
