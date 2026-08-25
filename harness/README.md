@@ -2043,6 +2043,86 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
 
+### `qb-backfill` — the collision datum, recovered from the forge (#449)
+
+`suggested_order` (#80) is published only when **every** queued PR's evidence is attested:
+measured, complete, internally consistent, and taken at the commit the queue has that PR on.
+So one branch panelled before #94 — a real review that recorded no file list, because nothing
+stored one then — turns the ranking off for the whole queue. A repository with thirty open PRs
+is thirty chances to be that one, and the field was null on both this repo and `lexray`.
+
+#94 said no backfill was possible and was right about the thing it meant: those panel payloads
+are gone. The underlying fact is not. The forge still knows which files every open PR touches,
+and #94's own nullable columns exist to carry a file list on a row that states no review
+happened.
+
+```bash
+qb-backfill                     # dry run over this checkout's repo
+qb-backfill --repo owner/name   # an explicit repo — any repo, not this one
+qb-backfill --apply             # write the rows
+qb-backfill --pr 12 --pr 34     # just these open PRs
+qb-backfill --json              # the whole answer as a document
+```
+
+```
+0  every open PR is answered for
+1  at least one is not: the forge would not say, the board refused it, or GitHub's own
+   list came back short of GitHub's own count
+2  could not start — no repo, no `gh`, no board. NOT a statement about any PR
+```
+
+**It never claims a review.** The row carries `reviewed: false`, a `skip_reason` naming the
+tool, the issue and the commit it read, and nothing that could be read as a verdict — no
+findings, no scorecards, no stop, no confidence. `GET /reviews` hides it by default;
+`/review/stats`, `/review/spend` and `/review/findings` exclude it under #94's
+`reviewed IS NOT FALSE` rule; `app.api.plan._pr_evidence` still takes its findings from the
+newest run that actually reviewed. What changes is the one thing it is for: the newest run per
+PR now holds a file list, so `app.ranking` can attest it.
+
+The absences are load-bearing. A single finding beside `reviewed: false` makes the board drop
+the flag to NULL — "nobody said" — which is exactly the pre-#94 state these rows exist to
+leave.
+
+**A short list is recorded as short.** `changed_files_total` is GitHub's own `changedFiles`
+and never `len(files)`: agreeing by construction is not evidence, and deriving one from the
+other would delete the comparison `app.collisions.files_complete` is built on. Three ways the
+stored list could be a prefix, all three reported — GitHub caps a file list at 3,000; a paged
+read that dies partway is refused outright rather than recorded short; and the board's own
+`changed_files_dropped` is read back off the write and believed over what was sent. A prefix
+leaves the PR unattested and the run exits 1, which is the right outcome: it keeps
+`suggested_order` null rather than ranking a branch by files it never listed.
+
+The list comes from `gh api --paginate .../pulls/N/files`, not `gh pr view --json files`.
+`pr view` asks GraphQL for `files(first: 100)` and does not page, so a 322-file PR arrives as
+100 paths and exit 0 (measured, on `kubernetes/kubernetes#141360`). `loops/panel.py` lives with
+that because its list is a side effect of a review and it prints a note when the two counts
+disagree; here the list is the whole product.
+
+**A re-run on an unchanged PR moves nothing.** Two guards, for two different failures. The
+`run_key` carries the repo, the PR and the head, so a second write of the same fact meets the
+board's unique index and comes back `recorded: false` — the guard that holds when two agents
+run this against one repo at the same moment, which no read-then-write check can cover. And
+before writing at all, a PR whose newest run already carries a complete list at the head the
+forge reports now is left alone as `already`, so it never shadows a run that already answered.
+That check reads the stored list and deliberately not `reviewed`: whether a seat ran is not
+what makes a file list usable, and sparing reviewed runs would leave the pre-#94 population
+permanently unanswerable.
+
+A PR that pushes gets a new head, both guards open, and the new commit is recorded. #80 attests
+a list only against the commit the queue has the PR on, so a row recorded against a head the
+branch has left is worth less than nothing — expect to re-run this on a busy queue.
+
+**It refuses rather than guesses** (#414): `--repo`, or the origin of the checkout at `--path`,
+and if neither says then it stops rather than falling back to a default and reporting a
+confident nothing-to-do about a repository it never found. A `gh pr list` that comes back
+exactly `--limit` long says so and exits 1, because a partial sweep must not read as a whole
+one. Dry run by default, `--apply` is the only thing that writes, and an argument it does not
+understand is refused rather than treated as consent.
+
+`GET /review/collisions` is untouched. It gained no predicate in #94 and gains none here — a
+backfilled run enters the same unconditional newest-run selection as any other, and is
+classified afterwards like any other.
+
 ### `qb-doctor` — is this host wired up, and can work land from it?
 
 Three questions nothing else on the box can answer, in one report.
