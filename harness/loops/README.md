@@ -1783,8 +1783,13 @@ same-UID permission gate closes that, and `qb-start`'s own notes make the same a
 ### Two budgets, because one counts the wrong thing
 
 `--start-max` (default **1**) counts **sessions started**. `--attempt-max` (default **5**)
-counts **`qb-start` invocations**, started or refused. Neither is `qb-start`'s own cap, which
-bounds how many spawns may be *live* on a box.
+counts **spawn requests**, started or refused. Neither is `qb-start`'s own cap, which bounds
+how many spawns may be *live* on a box.
+
+"Spawn requests", not "calls to `qb-start`": the once-per-run `qb-start --policy` probe is a
+question, not a request — it posts nothing, claims nothing and reads only a local file — so it
+sits outside the budget, and `--attempt-max 5` permits five requests plus that one probe. A run
+whose budget is zero returns *before* probing, so a freeze genuinely asks nothing.
 
 The second exists because the first cannot express the runaway it claimed to prevent. A
 refusal about a single issue — somebody else holds it — correctly does not stop the sweep and

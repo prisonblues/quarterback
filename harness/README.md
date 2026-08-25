@@ -1165,7 +1165,8 @@ being folded into `cli` — a board someone is scanning for surprises needs that
 The watcher adds brakes of its own on top, because the ones at the primitive are per-spawn and
 it is the end of the chain that reads a **public tracker**: `--start` is off, so a survey still
 starts nothing unless a run asks it to; `--start-max` (default 1) bounds sessions started; and
-`--attempt-max` (default 5) bounds `qb-start` invocations whether they start anything or not.
+`--attempt-max` (default 5) bounds spawn requests whether they start anything or not (the
+once-per-run `--policy` probe is a question, not a request, and sits outside it).
 The second ceiling is not redundant — a refusal about one issue starts nothing and so spends
 none of the first, which let a backlog of held issues make one call each while `--start-max 1`
 appeared to hold. Details in `harness/loops/README.md`.

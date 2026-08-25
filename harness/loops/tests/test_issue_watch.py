@@ -704,9 +704,12 @@ def spawns(monkeypatch):
             self.returncode = code
 
     def fake(argv, **_kw):
+        # ONE queue for both the `--policy` probe and the spawn requests, in
+        # call order — so a test that queues exits has to account for the probe,
+        # which is the arithmetic `--attempt-max` gets wrong if nobody does.
+        # (This used to branch on `--policy` into two identical arms, implying a
+        # distinction that was never there.)
         calls.append(list(argv))
-        if argv[1:2] == ["--policy"]:
-            return Done(exits.pop(0) if exits else 0)
         return Done(exits.pop(0) if exits else 0)
 
     monkeypatch.setattr(iw.subprocess, "run", fake)
@@ -961,13 +964,43 @@ def test_a_refused_command_does_not_hold_back_a_different_one(spawns,
     assert got[1].started == iw.STARTED
 
 
-def test_start_max_zero_is_a_freeze_that_asks_nothing(spawns, monkeypatch):
-    """Zero is legal and means what it says — including not consulting the box."""
+@pytest.mark.parametrize("limit,attempts,says", [
+    pytest.param(0, 5, "--start-max of 0", id="start-max-zero"),
+    pytest.param(1, 0, "--attempt-max of 0", id="attempt-max-zero"),
+])
+def test_a_zero_ceiling_is_a_freeze_that_asks_nothing_at_all(spawns, monkeypatch,
+                                                             limit, attempts, says):
+    """Zero means what it says, INCLUDING not knocking on the machine's door.
+
+    Asserted on `spawns.calls`, not on `_starts()`. The distinction is the whole
+    test: `_starts` filters out the `qb-start --policy` probe, so an earlier
+    version of this passed while the probe still ran — the test was named "asks
+    nothing" and was checking something weaker. A codex re-review caught exactly
+    that, and the fix was to return before probing rather than to rename the test.
+    """
     monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
     got = _many(3)
-    iw.run_starts(got, {"path": "."}, limit=0, attempts_max=5)
-    assert _starts(spawns) == []
-    assert all("--start-max of 0" in a.started for a in got)
+    iw.run_starts(got, {"path": "."}, limit=limit, attempts_max=attempts)
+    assert spawns.calls == [], "a frozen run must not even ask --policy"
+    assert all(says in a.started for a in got)
+
+
+def test_the_attempt_budget_is_spawn_requests_not_qb_start_calls(spawns,
+                                                                 monkeypatch):
+    """`--attempt-max N` permits N spawn requests plus the one policy probe.
+
+    Pinned because the docstring used to say "how many times one run may call
+    qb-start at all", which was false by exactly one. The probe is a question —
+    it posts nothing, claims nothing and reads a local file — so it is
+    deliberately outside the budget; what is not acceptable is the prose and the
+    behaviour disagreeing, so the arithmetic is asserted here.
+    """
+    monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
+    spawns.exits.extend([0] + [8] * 30)
+    iw.run_starts(_many(30), {"path": "."}, limit=9, attempts_max=5)
+    assert len(_starts(spawns)) == 5, "five spawn requests"
+    assert len(spawns.calls) == 6, "…plus exactly one policy probe"
+    assert len([c for c in spawns.calls if "--policy" in c]) == 1
 
 
 @pytest.mark.parametrize("bad", ["-1", "-30", "two", ""])

@@ -140,7 +140,18 @@ DEFAULT_LIMIT = 30
 #: tracker.
 DEFAULT_START_MAX = 1
 
-#: How many times ONE run may invoke `qb-start` at all, started or refused.
+#: How many SPAWN REQUESTS one run may make — a request that started a session
+#: and one that was refused both count.
+#:
+#: "Spawn requests", not "invocations of qb-start", and the distinction is real
+#: rather than pedantic: `spawning_enabled` asks `qb-start --policy` once per
+#: run and that call is NOT counted. It is a question, not a request — it posts
+#: nothing, claims nothing, starts nothing, and reads only a local file — so
+#: counting it would spend a budget that exists to bound board posts and claim
+#: attempts on something that makes neither. An earlier draft of this comment
+#: said "may call qb-start at all", which was simply false: `--attempt-max 5`
+#: permitted six calls. A run whose budget is zero now returns before the probe,
+#: so the one case where "asks nothing" is claimed is the one case it is true.
 #:
 #: A second budget rather than a bigger first one, because `--start-max` counts
 #: the wrong thing to bound this. A refusal that is about a single issue —
@@ -871,7 +882,8 @@ def run_starts(assessments: list[Assessment], cfg: dict, *,
     """Hand the actionable issues to `qb-start`, in order, within both budgets.
 
     TWO budgets, because one cannot express this. `limit` counts SESSIONS
-    STARTED and `attempts_max` counts QB-START INVOCATIONS, and the gap between
+    STARTED and `attempts_max` counts SPAWN REQUESTS made (the one-off
+    `--policy` probe is a question, not a request, and is not counted), and the gap between
     them is where the first version of this was wrong: a refusal that is about
     one issue (somebody holds it) correctly does not stop the sweep, so with a
     single budget counting successes, thirty held issues produced thirty
@@ -900,6 +912,16 @@ def run_starts(assessments: list[Assessment], cfg: dict, *,
     # here with nobody looking. Reusing `may_write` rather than adding a switch:
     # a repo has answered this question once already, and two switches for one
     # question is how they come to disagree.
+    # Before the policy probe, because a run whose budget is zero has nothing to
+    # ask about. `spawning_enabled` is cheap and read-only, but a freeze that
+    # still went and knocked would make "asks nothing" false — and that sentence
+    # is the whole of what an operator typing `--start-max 0` is buying.
+    if limit <= 0 or attempts_max <= 0:
+        spent = "--start-max" if limit <= 0 else "--attempt-max"
+        for a in actionable:
+            a.started = (f"not attempted — this run's {spent} of "
+                         f"{limit if limit <= 0 else attempts_max} is spent")
+        return
     attended, unattended_why = may_write(cfg)
     if not attended:
         for a in actionable:
@@ -1053,8 +1075,9 @@ def main(argv: list[str] | None = None) -> int:
                          f"{DEFAULT_START_MAX}; 0 starts nothing)")
     ap.add_argument("--attempt-max", type=_ceiling, default=DEFAULT_ATTEMPT_MAX,
                     metavar="N",
-                    help=f"how many times one run may call qb-start at all, "
-                         f"started or refused (default {DEFAULT_ATTEMPT_MAX})")
+                    help=f"how many spawn requests one run may make, started "
+                         f"or refused (default {DEFAULT_ATTEMPT_MAX}); the "
+                         f"one-off policy probe is not one")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --start: make every refusal and print what would "
                          "run, but start nothing")
