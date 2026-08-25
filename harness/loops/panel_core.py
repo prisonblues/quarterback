@@ -661,6 +661,35 @@ coverage gap and none is a finding — they are how this checkout is built:
 `could_not_assess` now means what you could not resolve WITH the code in front of you.
 """
 
+#: The other half of the same slot, and the reason it is prose. Every seat wants to go
+#: looking for the code — `codex_args` measured it at five runs in seven — and the answer
+#: has been a flag per vendor: `--no-tools` for pi, two `-c` overrides for codex. There is
+#: no such flag for `agy`, whose own help offers only `--dangerously-skip-permissions` in
+#: the opposite direction. So this seat's `--no-tools` has to be a sentence, and it is the
+#: same sentence for the others because it is true of all three.
+#:
+#: IT IS NOT AN OPTIMISATION HERE. On codex the reach cost wall-clock; on antigravity a
+#: denied tool ENDS THE PROCESS — `permission check failed … user denied permission`, exit
+#: 1, no reply — so the seat that cannot be given the flag is also the one the reach kills
+#: (#458). Measured on the failing prompt, this text is the difference between exit 1 and a
+#: findings array that names the gap instead of hunting for it.
+NO_TOOLS_BRIEF = """YOU HAVE NO TOOLS, and this is the whole of what you are given. You cannot run
+commands, read files, browse a repository or search the web. Your working directory is an
+EMPTY repository — not this project — so there is nothing there to find, and an attempt to
+look is denied. On some of the CLIs this panel runs through, that denial does not merely
+fail: it ends the session, and the review is lost rather than delivered short.
+
+So do not go looking, and in particular do not guess at a path on the machine running this
+and ask to read it. The diff below, the CI text and this brief are the evidence; there is
+no more of it to be had this round.
+
+What you would have opened a file to settle is a `could_not_assess` entry, named as
+precisely as you can name it — "whether X's callers pass a list" tells the next round what
+to fetch, "I could not read the repo" does not. That entry is not a failure and does not
+count against you: it is the one thing you can do with a question the prompt does not
+answer, and it is how the panel learns what to put in the prompt next time.
+"""
+
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
 a pull request diff, held to the standard "nothing left to improve". The reports below come from
 several independent reviewers (Claude, Codex, SonarCloud), listed ONE PER REVIEWER — so the same
@@ -2303,6 +2332,7 @@ __all__ = [
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
+    "NO_TOOLS_BRIEF",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
     "board_dial_notes",

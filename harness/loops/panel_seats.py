@@ -2139,14 +2139,30 @@ def antigravity_args(model: str, effort: str, prompt: str,
     the caller clamps its diff to ARGV_PROMPT_MAX_BYTES before rendering.
 
     `--mode plan` is NOT a sandbox, despite reading like one: with permissions
-    granted, plan mode writes files. What actually keeps this reviewer off the
-    tree is that headless print mode cannot prompt for a tool permission, so any
-    tool needing one is auto-denied — and the diff is in the prompt, so it needs
-    no tool anyway. Plan mode is kept for the narrower thing it does do (biasing
-    it away from proposing edits), not as the guarantee. Anyone adding
+    granted, plan mode writes files. What keeps this reviewer off the tree is that
+    headless print mode cannot prompt for a tool permission, so any tool needing
+    one is auto-denied. Plan mode is kept for the narrower thing it does do
+    (biasing it away from proposing edits), not as the guarantee. Anyone adding
     `--dangerously-skip-permissions` here removes the real guard: measured, that
     turns the reviewer into an agent that runs the test suite against the dev
     database and reviews the checkout instead of the diff.
+
+    **THAT AUTO-DENIAL IS FATAL, AND USED TO BE DOCUMENTED HERE AS BENIGN** — the
+    reasoning being that the diff is in the prompt, so the seat needs no tool
+    anyway. The first half is true and the conclusion does not follow: `agy` does
+    not shrug and carry on reviewing, it exits 1 with `permission check failed for
+    command "pwd && ls -la": user denied permission` and returns nothing. The guard
+    works exactly as described and costs the whole seat, which is how this reviewer
+    came to be recorded as skipped on both rounds of one PR (#458).
+
+    It reaches because every seat reaches — `codex_args` measured five runs in
+    seven — and this is the seat with no flag to stop it: pi has `--no-tools`,
+    codex has its two `-c` overrides, `agy --help` offers only
+    `--dangerously-skip-permissions`, pointing the other way. `--sandbox` does not
+    help either; it restricts what a tool may do, not whether asking is fatal.
+    `NO_TOOLS_BRIEF` in the prompt is this seat's `--no-tools`, and it is measured:
+    on the same failing prompt it is the difference between exit 1 and a findings
+    array that names the gap instead of hunting for it.
 
     `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
     while run_cli is still patiently waiting out its own much longer bound — a
@@ -2703,9 +2719,11 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # empty directory, and spend the round reporting that the diff
                 # matches nothing in a checkout it was promised. Taking the brief
                 # back out is the one repair available this late, and it is exact:
-                # the text is a constant, so removing it restores the prompt the
-                # diff-only seats get.
-                prompt = prompt.replace(CODE_ACCESS_BRIEF, "")
+                # the text is a constant, so swapping it restores the prompt the
+                # diff-only seats get. SWAPPED, not removed — since #458 the slot
+                # is never empty, and a seat downgraded here is precisely one that
+                # will otherwise go looking for a checkout it was promised.
+                prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
         else:
             sandbox = member_sandbox(tmpdir / "cwd")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.

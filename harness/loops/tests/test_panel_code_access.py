@@ -592,6 +592,12 @@ def test_a_seat_downgraded_late_is_not_still_told_it_has_the_code(monkeypatch,
     assert got.code_blind is True
     assert "YOU HAVE THE CODE" not in seen["stdin"], (
         "the seat was promised a checkout it does not have")
+    # SWAPPED, not deleted (#458). A downgraded seat is exactly one that has been
+    # told to go and read the tree and then given an empty directory, so leaving
+    # the slot blank sends the seat likeliest to go looking with nothing telling
+    # it not to — and on the seat with no tool flag, going looking is fatal.
+    assert "YOU HAVE NO TOOLS" in seen["stdin"], (
+        "the downgraded seat was left with neither brief")
     capsys.readouterr()
 
 
@@ -1002,3 +1008,73 @@ def test_a_tarball_with_millions_of_entries_is_refused(monkeypatch, tmp_path):
     assert tree is None
     assert "entries, over the" in problem, problem
     assert not (tmp_path / "tree").exists(), "it unpacked despite the refusal"
+
+
+def test_the_diff_only_seats_are_told_they_have_no_tools(monkeypatch, tmp_path, capsys):
+    """The slot is either brief and never empty (#458).
+
+    Every seat goes looking for the code — `codex_args` measured five runs in seven
+    — and the answer has been a flag per vendor. `agy` has none, and unlike codex it
+    does not merely waste the time: a denied tool ends the process with
+    `permission check failed … user denied permission`, exit 1, no review. So the
+    seat that cannot be given the flag is the one the reach kills, and prose in the
+    prompt is the only lever that CLI leaves.
+
+    Driven through `run` and asserted on what the seat is HANDED, because the hole
+    was in the composition rather than in the text: the slot took `""` for every
+    seat without code access, and a test that formats the template itself would
+    have passed against that.
+    """
+    prompts: list[str] = []
+    cfg = json.loads(json.dumps(CFG))
+    cfg["reviewers"] = {"codex": {"enabled": True, "model": "", "effort": ""}}
+    cfg["review_panel"] = dict(cfg.get("review_panel", {}), reviewer_code_access=False)
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1,
+              "headRefOid": "abcdef1234"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda name, model, prompt, *a, **k: (
+                            prompts.append(prompt),
+                            panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+
+    assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
+                     record=False) == 0
+    capsys.readouterr()
+
+    assert prompts, "no seat was handed a prompt"
+    for prompt in prompts:
+        assert "YOU HAVE NO TOOLS" in prompt, "the slot went out empty"
+        assert "YOU HAVE THE CODE" not in prompt
+        # The half that turns the reach into evidence. Told only that it cannot
+        # look, a seat still has a question and no sanctioned way to report one.
+        assert "could_not_assess" in prompt
+
+
+def test_the_no_tools_brief_is_inside_what_the_argv_clamp_measures():
+    """It has to be in the RENDER, not bolted on in `antigravity_args`.
+
+    The kernel caps one argv element and `fit_argv_budget`'s ceiling applies to the
+    whole prompt — "the template counts", as it says. antigravity is both the seat
+    this brief exists for and the only seat the kernel can veto, so a brief added
+    after the clamp would put its whole length past the number that was just
+    measured. It is over a kilobyte; the clamp's own comments care about single
+    characters that encode to three bytes.
+    """
+    rendered = []
+
+    def render(budget):
+        out = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
+                                         code=panel_core.NO_TOOLS_BRIEF,
+                                         diff="+" * (budget or 0))
+        rendered.append(out)
+        return out
+
+    panel_seats.fit_argv_budget(render, 100)
+
+    assert rendered, "the clamp rendered nothing to measure"
+    assert all("YOU HAVE NO TOOLS" in r for r in rendered), (
+        "the clamp measured a prompt without the brief the seat will be sent")

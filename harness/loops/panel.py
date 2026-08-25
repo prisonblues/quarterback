@@ -1662,9 +1662,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # `reads_code` defaults False so the one-argument callers keep working —
         # `fit_argv_budget` takes this as a single-arg render, and antigravity is
         # never a code-reading seat, so that path is unaffected by construction.
+        # The slot is EITHER brief, never empty: a seat that gets the tree is told
+        # to use it, and a seat that does not is told there is nothing to look at
+        # and what to do instead (#458). Empty was the hole — it left the seats
+        # with no tool flag to work out their own situation, and the way they work
+        # it out is by trying.
+        #
+        # Inside the render on purpose, so `fit_argv_budget` counts it: the ceiling
+        # applies to the PROMPT, and antigravity is both the seat this text is for
+        # and the one seat the kernel can veto. Adding it in `antigravity_args`
+        # would put ~1,100 bytes past the clamp that just measured the prompt.
         return brief.format(n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text, diff=review.material(budget)[0],
-                            code=CODE_ACCESS_BRIEF if reads_code else "")
+                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
