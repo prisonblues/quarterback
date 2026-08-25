@@ -63,7 +63,7 @@ which are indexed; a boolean index here would be write cost on the review path
 for a scan Postgres would decline to use.
 
 Revision ID: m1986deca
-Revises: mef441e81
+Revises: m7c31f0d2
 Create Date: 2026-08-25 05:53:28.751964
 
 """
@@ -75,7 +75,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "m1986deca"
-down_revision: str | None = "mef441e81"
+down_revision: str | None = "m7c31f0d2"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
