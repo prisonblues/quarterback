@@ -108,6 +108,39 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
+async def _click_row(pilot, table, offset) -> None:
+    """Click `table` at `offset`, once the pane has stopped moving underneath it.
+
+    `row_count` says the rows are IN the table; it does not say the pane has
+    finished deciding where the table is. The caps line is the one row here that
+    APPEARS mid-run — `display: none` until the first limits or queue answer
+    (`render_limits`: `bar.display = bool(cells or self.queue)`) — and everything
+    below it drops a row when it does. `Pilot.click` resolves the widget's
+    position when it is CALLED, so a click aimed a moment before that answer is
+    delivered a row high, onto the header, and `ClickTable.on_click` refuses it
+    (`row: -1`) exactly as it should. Measured on main at about two failures in
+    six runs of `test_a_plan_row_explains_itself…`, read as flake.
+
+    So wait for the caps line first, then confirm the cell under the pointer is a
+    row rather than the header. Both are bounded and neither asserts: the wait is
+    against a board answer this test has already waited on, and where there is no
+    board there is no caps line and nothing that can move. It clicks when the wait
+    runs out either way, so a table that genuinely never drew fails on the
+    assertion that names it instead of timing out in here.
+    """
+    limits = table.screen.query_one("#limits")
+    for _ in range(60):
+        if limits.display:
+            break
+        await pilot.pause(0.05)
+    for _ in range(40):
+        x, y = table.region.offset.x + offset[0], table.region.offset.y + offset[1]
+        if table.screen.get_style_at(x, y).meta.get("row", -1) >= 0:
+            break
+        await pilot.pause(0.05)
+    await pilot.click(table, offset=offset)
+
+
 @needs_live_data
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
@@ -238,7 +271,7 @@ async def _drive_issues() -> list[str]:
         top = int(_numbered_cell(issues.get_row_at(0)))
 
         # The ⚒ column asks first, the same as the ⚖ does.
-        await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await _click_row(pilot, issues, (app_module.Dash.FIX_COLUMN + 2, 1))
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a fix with no confirmation")
@@ -296,7 +329,7 @@ async def _drive_plan() -> list[str]:
         _need_rows(plan, "plan items", app.plan_err)
 
         # Anywhere but the ⚒: the detail line, and it must name the row clicked.
-        await pilot.click(plan, offset=(40, 1))
+        await _click_row(pilot, plan, (40, 1))
         await pilot.pause(0.3)
         # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
         # `scope.column` (#261), so column 4 is the title on a wide pane and the
@@ -325,7 +358,7 @@ async def _drive_plan() -> list[str]:
         await pilot.pause(0.3)
         landed = ordered[plan.scroll_offset.y]
 
-        await pilot.click(plan, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await _click_row(pilot, plan, (app_module.Dash.FIX_COLUMN + 2, 1))
         await pilot.pause(0.3)
         issue = qd.plan_issue(landed)
         if started:
