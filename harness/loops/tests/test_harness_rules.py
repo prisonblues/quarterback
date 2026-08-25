@@ -1546,3 +1546,164 @@ def test_a_repo_with_no_rules_file_gets_the_closed_end_of_both_gates(repo):
     assert cfg["issue_pickup"]["allowed_authors"] == []
     assert cfg["issue_filing"]["unattended"] is False
     assert cfg["issue_filing"]["max_per_run"] == 1
+
+
+# ------------------------------------------------------------------ the modes
+#
+# #178. Two ways of working exist in this fleet and nothing named either, which
+# cost this repo a wrong attribution on 2026-08-17 and two agents' uncommitted
+# work on 2026-08-25. These cover the declaration, the two axes coming apart, and
+# the one alarm the declaration makes possible.
+
+@pytest.fixture(autouse=False)
+def fresh_reports():
+    """`_report` prints each problem once per PROCESS, and these tests assert on
+    what it printed. Without this the second test to provoke the same sentence
+    about the same repo sees an empty stderr and fails for a reason that has
+    nothing to do with what it is testing."""
+    hr._reported.clear()
+    yield
+    hr._reported.clear()
+
+
+def test_mode_defaults_to_cleanroom_the_safe_end_of_both_axes(repo):
+    """The default has to be the mode that ISOLATES, for the same reason every
+    other default here is the closed one: the cost of being wrong is ceremony a
+    repo did not want, and the cost of the other way round is a destroyed tree."""
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert (mode.name, mode.isolation, mode.landing) == ("cleanroom", "worktree", "pr")
+    assert mode.mixed is False
+    assert mode.label == "CLEANROOM"
+    assert mode.glyph == "⌂"
+
+
+def test_naming_jungle_takes_both_axes_from_the_preset(repo):
+    write_rules(repo, {"mode": {"name": "jungle"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert (mode.isolation, mode.landing) == ("shared", "direct")
+    assert mode.mixed is False
+    assert mode.label == "JUNGLE"
+    assert mode.glyph == "~"
+
+
+def test_an_axis_can_be_overridden_on_its_own(repo):
+    """#178's "cleanroom tree, jungle plan" — a coherent way to work that the two
+    names still describe, and the reason the axes are not hard-wired to a name."""
+    write_rules(repo, {"mode": {"name": "cleanroom", "landing": "direct"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert (mode.isolation, mode.landing) == ("worktree", "direct")
+    assert mode.mixed is True
+    assert mode.label == "CLEANROOM tree · JUNGLE plan"
+    assert mode.glyph == "⌂"      # from ISOLATION: the half you need at a glance
+
+
+def test_setting_one_key_does_not_drop_the_others(repo):
+    """`mode` is in _DEEP_BLOCKS, so a repo naming only the mode keeps the axes."""
+    write_rules(repo, {"mode": {"name": "jungle"}})
+    assert hr.resolve_repo(str(repo))["mode"]["isolation"] is None
+
+
+def test_an_unknown_mode_name_warns_and_falls_back_to_the_isolating_end(repo, capsys,
+                                                                        fresh_reports):
+    write_rules(repo, {"mode": {"name": "clanroom"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    err = capsys.readouterr().err
+    assert "clanroom" in err and "jungle" in err       # names the typo AND the options
+    assert (mode.name, mode.isolation) == ("cleanroom", "worktree")
+    assert mode.problems
+
+
+def test_an_unknown_axis_value_warns_and_takes_the_preset(repo, capsys, fresh_reports):
+    """The silent-typo failure one level down from `unknown_keys`: the KEY is
+    spelled perfectly and the value is not, so nothing above this notices."""
+    write_rules(repo, {"mode": {"name": "jungle", "isolation": "worktee"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert "worktee" in capsys.readouterr().err
+    assert mode.isolation == "shared"                  # jungle's, not cleanroom's
+
+
+def test_a_typo_in_a_mode_key_is_reported(repo, capsys):
+    write_rules(repo, {"mode": {"isolaton": "shared"}})
+    hr.resolve_repo(str(repo))
+    assert "isolaton" in capsys.readouterr().err
+    assert hr.unknown_keys({"mode": {"isolaton": 1}}) == {"mode": ["isolaton"]}
+
+
+def test_every_preset_is_a_full_set_of_known_axis_values():
+    """A third mode added to MODES gets this for free: a preset that omits an axis,
+    or spells a value the axis does not take, would resolve to a KeyError inside
+    `resolve_mode` at the moment somebody's session started."""
+    for name, spec in hr.MODES.items():
+        assert set(spec) == set(hr.MODE_AXES), name
+        for axis, value in spec.items():
+            assert value in hr.MODE_AXES[axis], (name, axis, value)
+
+
+# ------------------------------------------------- which checkout is this one
+
+def test_the_primary_checkout_is_told_from_a_worktree(repo, tmp_path):
+    wt = tmp_path / "myrepo-side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(wt))
+    assert hr.tree_of(repo).primary is True
+    assert hr.tree_of(wt).primary is False
+    # Both see the same set: the count is a property of the CHECKOUT, not of the
+    # directory the question was asked from.
+    assert hr.tree_of(repo).worktrees == hr.tree_of(wt).worktrees == 2
+
+
+def test_a_lone_clone_dispenses_nothing(repo):
+    """The false positive this clause exists to prevent. A private checkout that
+    nobody cuts worktrees from is primary and is NOT shared, and nagging its owner
+    is how a true alarm gets trained into noise."""
+    tree = hr.tree_of(repo)
+    assert (tree.primary, tree.dispenses, tree.shared) == (True, False, False)
+
+
+def test_a_worktree_json_makes_the_primary_checkout_a_shared_one(repo):
+    (repo / ".worktree.json").write_text("{}\n")
+    assert hr.tree_of(repo).shared is True
+
+
+def test_an_existing_worktree_says_the_same_thing_without_being_declared(repo, tmp_path):
+    git(repo, "worktree", "add", "-q", "-b", "side", str(tmp_path / "myrepo-side"))
+    assert hr.tree_of(repo).shared is True
+
+
+def test_somewhere_that_is_not_a_checkout_raises_no_alarm(tmp_path):
+    tree = hr.tree_of(tmp_path)
+    assert tree.shared is False
+    assert hr.mode_violation(hr.resolve_mode({}), tree) is None
+
+
+# ------------------------------------------------------------- and the alarm
+
+def test_the_alarm_fires_on_a_cleanroom_repo_in_its_shared_checkout(repo):
+    (repo / ".worktree.json").write_text("{}\n")
+    said = hr.mode_violation(hr.resolve_mode({}), hr.tree_of(repo))
+    assert said and "create-worktree" in said
+    assert "CLEANROOM" not in said     # the caller has just printed the mode line
+
+
+def test_the_alarm_is_silent_in_a_worktree_of_the_same_repo(repo, tmp_path):
+    (repo / ".worktree.json").write_text("{}\n")
+    wt = tmp_path / "myrepo-side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(wt))
+    assert hr.mode_violation(hr.resolve_mode({}), hr.tree_of(wt)) is None
+
+
+def test_a_jungle_repo_is_never_told_off_for_using_its_shared_checkout(repo):
+    """One direction only. A jungle repo worked in the shared tree is the mode
+    working, and #178 is explicit that the harness must not push it toward the
+    ceremony a cleanroom repo wants."""
+    (repo / ".worktree.json").write_text("{}\n")
+    write_rules(repo, {"mode": {"name": "jungle"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert hr.mode_violation(mode, hr.tree_of(repo)) is None
+
+
+def test_a_mixed_repo_is_judged_on_the_isolation_axis_alone(repo):
+    """`landing: direct` says nothing about trees, so the tree alarm ignores it."""
+    (repo / ".worktree.json").write_text("{}\n")
+    write_rules(repo, {"mode": {"name": "cleanroom", "landing": "direct"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert hr.mode_violation(mode, hr.tree_of(repo)) is not None

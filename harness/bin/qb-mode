@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""qb-mode — which of the two ways of working is this repo, and does this tree agree? (#178)
+
+  qb-mode                  one line: the mode, and what it means
+  qb-mode --bar            the status-bar form (`⌂ CLEANROOM`), nothing else
+  qb-mode --json           every field, for a caller that wants to branch
+  qb-mode --quiet          exit code only
+  qb-mode <path|repo>      ask about somewhere else
+
+  0  the tree agrees with the declaration
+  3  it does not — a cleanroom repo, worked in the shared checkout
+  4  cannot tell: no harness/loops to read the rules with, or not a checkout
+
+TWO WAYS OF WORKING EXIST IN THIS FLEET, both legitimate, and until #178 nothing
+named them, declared them, or showed which one you were in:
+
+    ⌂ CLEANROOM   own worktree · lands via PR        the unit of work is an ISSUE
+    ~ JUNGLE      shared tree  · commits direct      the unit of work is a PLAN ITEM
+
+WHY THIS IS A COMMAND AND NOT A LIBRARY CALL. Its three readers cannot make one.
+A status line is a shell script rendering every second or so; the session-start
+hook is bash and must not grow a Python import; and a person glancing at a strange
+checkout has nowhere to type `resolve_mode` at all. What they share is one
+question with one answer, and the failure mode of them each deriving it is the one
+`harness_rules` was built to prevent — several places a setting is written down,
+disagreeing quietly.
+
+The rules themselves stay where they are. This resolves nothing: it calls
+`harness_rules.resolve_mode`, which applies the same layering (`.harness-rules.sample`
+on the default branch, this box's overlay, the board's dials) that every other
+harness setting goes through. A second reader of that file would be a second answer.
+
+IT NEVER STOPS ANYTHING, which is the same bargain `worktree-holder` strikes and
+for the same reason. Exit 3 is a caller's cue to say so and offer the remedy, not
+to refuse. The thing worth preventing is walking into a shared tree without being
+told; a person who has been told and means it is not the failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+AGREES, VIOLATED, CANNOT_TELL = 0, 3, 4
+
+
+def loops_dir(script: str) -> Path | None:
+    """`harness/loops`, in the two layouts there are — a checkout and the package.
+
+    The same lookup `qb-bump` does, and it has to be repeated rather than shared:
+    home-manager installs each file in `bin/` as its own flat store path, so a
+    sibling module is the only relationship that survives an install, and `loops/`
+    is not a sibling of `bin/` — it lands in `share/quarterback-harness/`.
+    """
+    here = Path(os.path.realpath(script)).parent
+    for cand in (os.environ.get("QB_LOOPS_DIR"),
+                 here.parent / "loops",
+                 here.parent / "share" / "quarterback-harness" / "loops"):
+        if cand and Path(cand, "harness_rules.py").is_file():
+            return Path(cand)
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="How this repo is worked, and whether this tree agrees.",
+        epilog="Exit: 0 agrees, 3 shared checkout in a cleanroom repo, 4 cannot tell.")
+    ap.add_argument("repo", nargs="?", help="path or name (default: cwd)")
+    out = ap.add_mutually_exclusive_group()
+    out.add_argument("--bar", action="store_true", help="the status-bar form alone")
+    out.add_argument("--json", action="store_true", help="every field")
+    out.add_argument("--quiet", "-q", action="store_true", help="exit code only")
+    a = ap.parse_args()
+
+    where = loops_dir(sys.argv[0])
+    if where is None:
+        # Named rather than shrugged at: a status bar that silently drops a field
+        # is indistinguishable from a repo that has no mode, and they want
+        # different things done about them.
+        if not a.quiet:
+            print("qb-mode: no harness/loops beside this script, so the repo's "
+                  "rules cannot be read", file=sys.stderr)
+        return CANNOT_TELL
+    sys.path.insert(0, str(where))
+    import harness_rules  # noqa: PLC0415 — resolved at call time, by design
+
+    # NO BOARD ROUND TRIP FOR THIS QUESTION. `resolve_repo` consults the board's
+    # dial layer, with a five-second timeout — and the mode can never come from
+    # there. `BOARD_DIALS` is deliberately limited to judgements about COST, and
+    # excludes the whole class this belongs to for the reason it excludes
+    # `auto_merge`: a gate on how work lands is policy, and belongs where a human
+    # reviewing a branch can see it. So the call could only ever make the answer
+    # slower, never different — and this runs at session start, where up to five
+    # seconds of waiting is charged to every session on the fleet, and on a status
+    # line, where it is charged again on every render.
+    #
+    # `setdefault`, so an operator or a test that has already set the variable
+    # keeps whatever they meant by it. Being SET AT ALL is the documented offline
+    # switch; empty means "this run has no dials", which is the truth here.
+    os.environ.setdefault(harness_rules.DIALS_ENV, "")
+
+    try:
+        cfg = harness_rules.resolve_repo(a.repo)
+    except (harness_rules.RepoNotFound, SystemExit) as exc:
+        # SystemExit too: `resolve_repo` raises it for a checkout with no `origin`,
+        # which is a perfectly ordinary local repo and must not take a status bar
+        # down with it.
+        if not a.quiet:
+            print(f"qb-mode: {exc}", file=sys.stderr)
+        return CANNOT_TELL
+
+    mode = harness_rules.resolve_mode(cfg)
+    tree = harness_rules.tree_of(cfg["path"])
+    problem = harness_rules.mode_violation(mode, tree)
+
+    if a.json:
+        import json  # noqa: PLC0415 — only this branch pays for it
+        print(json.dumps({
+            "mode": mode.name, "isolation": mode.isolation, "landing": mode.landing,
+            "mixed": mode.mixed, "label": mode.label, "glyph": mode.glyph,
+            "how": mode.how, "repo": cfg["github"], "root": tree.root,
+            "primary": tree.primary, "shared_checkout": tree.shared,
+            "worktrees": tree.worktrees, "violation": problem,
+        }, indent=2, ensure_ascii=False))
+    elif a.bar:
+        print(f"{mode.glyph} {mode.label}")
+    elif not a.quiet:
+        print(f"{mode.glyph} {mode.label}   {mode.how}")
+        if problem:
+            print(problem, file=sys.stderr)
+
+    return VIOLATED if problem else AGREES
+
+
+if __name__ == "__main__":
+    sys.exit(main())

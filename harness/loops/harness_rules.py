@@ -217,6 +217,47 @@ REPO_ROOT = Path(os.environ.get("HARNESS_REPO_ROOT") or Path.home() / "source")
 # switch: no auto-merge, no unattended loop, edit-only headless agents.
 DEFAULTS: dict = {
     "enabled": True,
+    # WHICH OF THE TWO WAYS OF WORKING THIS REPO USES (#178). Both are legitimate,
+    # and until this key existed nothing named either — which is the whole of the
+    # bug rather than a documentation gap. On 2026-08-17 three agents shared one
+    # checkout of THIS repo and a `nix build` compiled one agent's in-progress
+    # edits as another agent's evidence. On 2026-08-25 four of us did it again and
+    # two lost uncommitted work to a `git reset --hard` typed by a third. Nobody
+    # chose to work that way either time: the session simply started in the shared
+    # tree, and nothing at any point said which mode was in force or that this was
+    # not it.
+    #
+    #   cleanroom  the unit of work is an ISSUE. Claim it, take your own worktree,
+    #              land through a PR. The name is about contamination control and
+    #              deliberately not `lab`, which would connote experimenting.
+    #   jungle     the unit of work is a PLAN ITEM. Riff off the board, work in the
+    #              shared checkout, commit straight to the branch. NOT
+    #              "uncoordinated" — it carries its structure on the board instead
+    #              of in issues and PRs, and it ships.
+    #
+    # DECLARED, NEVER DERIVED, which was argued rather than assumed (board 6279). A
+    # mode inferred from who is in the tree right now flips when a colleague's
+    # session lapses: an empty tree at 06:00 is not a cleanroom, it is an empty
+    # jungle. That would be a setting that lies at exactly the moment you check it,
+    # which is worse than one somebody forgot to set. Live presence is evidence
+    # that a declaration is being VIOLATED — a different signal, raised elsewhere
+    # (#185), and useful precisely because this key is what it contradicts.
+    #
+    # `cleanroom` is the default for the same reason every other default here is
+    # what it is: it is the safe end of both axes. An unconfigured repo gets its
+    # own worktree and a PR gate, and a repo that wants the shared tree asks.
+    "mode": {
+        "name": "cleanroom",
+        # THE TWO AXES, SEPARABLE ON PURPOSE. #178 is explicit that isolation (own
+        # worktree / shared checkout) and landing (PR gate / direct commit) are two
+        # dials which happen to move together today, and that wiring them together
+        # is how a mode name goes stale. `null` means "whatever the named mode
+        # says", which is the ordinary case; a value overrides that ONE axis, so
+        # "cleanroom tree, jungle plan" is a way a repo can actually be and the
+        # names still describe it. See MODES for the presets they fall back to.
+        "isolation": None,   # worktree | shared
+        "landing": None,     # pr | direct
+    },
     "auto_merge": "dependabot_patch_minor",
     "dependabot_author": "app/dependabot",
     "headless_permission_mode": "acceptEdits",
@@ -957,7 +998,88 @@ DEFAULTS: dict = {
 # Blocks merged one level deep rather than replaced wholesale, so a repo can set
 # `reviewers.sonarqube` without having to restate claude and codex.
 _DEEP_BLOCKS = ("reviewers", "review_panel", "loops", "issue_pickup",
-                "issue_filing", "epic", "preland", "in_flight")
+                "issue_filing", "epic", "preland", "in_flight", "mode")
+
+# ------------------------------------------------------------------ THE MODES
+#
+# The vocabulary `mode` in DEFAULTS is written in, and the only place either name
+# is defined. A preset is exactly a pair of axis values, so adding a third mode is
+# a line here and nothing else, and no consumer learns a name: they read the axes.
+
+#: The two axes, and every value each one may take. Checked rather than trusted —
+#: `"isolation": "worktee"` in a rules file would otherwise leave the axis at the
+#: preset with nothing on stderr, which is the silent-typo failure `unknown_keys`
+#: exists to stop one level up. This catches the same mistake in a VALUE, where
+#: the key is spelled perfectly.
+MODE_AXES: dict[str, tuple[str, ...]] = {
+    "isolation": ("worktree", "shared"),
+    "landing": ("pr", "direct"),
+}
+
+#: The presets: a mode name is a full set of axis values and nothing more. Both
+#: modes are spelled out rather than one being "the default and its opposite",
+#: because the two are peers — #178's whole point is that jungle is a legitimate
+#: way to work and not a degraded cleanroom.
+#:
+#: Keyed by axis NAME rather than positionally, which is not fussiness: a pair
+#: `("worktree", "pr")` has to agree with MODE_AXES' insertion order to mean
+#: anything, and the failure when it stops agreeing is a repo silently reported
+#: as landing by `worktree`.
+MODES: dict[str, dict[str, str]] = {
+    "cleanroom": {"isolation": "worktree", "landing": "pr"},
+    "jungle": {"isolation": "shared", "landing": "direct"},
+}
+
+#: Which mode each axis VALUE belongs to, for describing a repo whose axes have
+#: come apart. Derived from MODES rather than restated, so a third mode cannot
+#: introduce a value this table has never heard of.
+_AXIS_OWNER: dict[str, dict[str, str]] = {
+    axis: {spec[axis]: name for name, spec in MODES.items()} for axis in MODE_AXES
+}
+
+
+class Mode(NamedTuple):
+    """How this repo is worked: a name, the two axes it resolved to, and whether
+    those axes actually agree with the name.
+
+    `mixed` is not a diagnostic — "cleanroom tree, jungle plan" is a supported way
+    to work and #178 asks for it by name. It exists because a mode that is mixed
+    cannot be shown as one word without lying, and every consumer that renders
+    this (a status line, a session-start note, the dashboard) needs to know that
+    before it picks a format.
+    """
+
+    name: str
+    isolation: str
+    landing: str
+    mixed: bool
+    problems: tuple[str, ...]
+
+    @property
+    def glyph(self) -> str:
+        """One character for a status bar, from the ISOLATION axis.
+
+        Not from the name, and the difference matters on a mixed repo: the glyph
+        is the half a person needs at a glance — whether the tree they are about
+        to type in is theirs — and the landing axis is not visible from there.
+        """
+        return "⌂" if self.isolation == "worktree" else "~"
+
+    @property
+    def label(self) -> str:
+        """`CLEANROOM`, or both halves when the axes disagree with each other."""
+        if not self.mixed:
+            return self.name.upper()
+        return (f"{_AXIS_OWNER['isolation'][self.isolation].upper()} tree"
+                f" · {_AXIS_OWNER['landing'][self.landing].upper()} plan")
+
+    @property
+    def how(self) -> str:
+        """The expansion #178 sketches, so a name nobody has met still reads."""
+        tree = ("own worktree" if self.isolation == "worktree" else "shared tree")
+        land = ("lands via PR" if self.landing == "pr" else "commits direct")
+        return f"{tree} · {land}"
+
 
 # The documentation convention every rules file in the fleet leans on: a key
 # whose name starts with "_" is prose for whoever reads the file next, not a
@@ -2592,6 +2714,145 @@ def describe(cfg: dict) -> str:
             + ("  (unattended)" if unattended() else ""))
 
 
+def resolve_mode(cfg: dict) -> Mode:
+    """How this repo is worked, from a resolved config — #178.
+
+    THE ONE PLACE THE PRESETS ARE APPLIED. Every consumer wants the axes, not the
+    name: a session-start note wants to know whether this tree should be its own,
+    a skill picker wants to know whether work lands through a PR, and a status bar
+    wants one glyph. If each of them read `cfg["mode"]["name"]` and expanded it
+    itself, the third mode somebody adds would reach two of them.
+
+    A BAD VALUE WARNS AND FALLS BACK rather than raising, which is the treatment
+    every key in this file gets except `preland.disabled_checks`. The asymmetry
+    there is that a misspelled check name would leave a merge gate running while
+    reading as configured off — the fallback is the DANGEROUS end. Here it is the
+    safe end both times: an unreadable mode resolves to `cleanroom`, which asks
+    for an isolated tree and a PR gate, so the cost of a typo is ceremony a repo
+    did not want and never the silent loss of a tree it did.
+    """
+    block = cfg.get("mode")
+    if not isinstance(block, dict):
+        block = {}
+    problems: list[str] = []
+    fallback = DEFAULTS["mode"]["name"]
+
+    name = block.get("name") or fallback
+    if name not in MODES:
+        problems.append(
+            f"mode.name {name!r} is not a mode this harness knows "
+            f"({', '.join(sorted(MODES))}) — working as {fallback!r}, which asks "
+            f"for an isolated worktree and a PR. If this repo really is worked in "
+            f"the shared checkout, that is `jungle` and it needs spelling right.")
+        name = fallback
+    preset = MODES[name]
+
+    axes: dict[str, str] = {}
+    for axis, allowed in MODE_AXES.items():
+        said = block.get(axis)
+        if said is None:          # the ordinary case: take it from the preset
+            axes[axis] = preset[axis]
+            continue
+        if said not in allowed:
+            problems.append(
+                f"mode.{axis} {said!r} is not one of "
+                f"{', '.join(allowed)} — taking {preset[axis]!r} from the "
+                f"{name!r} preset instead.")
+            axes[axis] = preset[axis]
+            continue
+        axes[axis] = said
+
+    if problems:
+        # Through the shared reporter, so a resolution repeated per loop tick says
+        # this once and stays loud, and so the message names the file it came from.
+        _report(cfg.get("_rules_from") or "harness rules", problems,
+                cfg.get("github") or "")
+
+    return Mode(name=name, isolation=axes["isolation"], landing=axes["landing"],
+                mixed=any(axes[a] != preset[a] for a in MODE_AXES),
+                problems=tuple(problems))
+
+
+class Tree(NamedTuple):
+    """Which checkout this is, as git sees it — the local half of #178's alarm.
+
+    `primary` is the checkout every worktree was cut from: `~/source/quarterback`
+    rather than `~/source/quarterback-fix-issue-433`. It is the tree an agent ends
+    up in by DEFAULT, because that is where a session starts unless something hands
+    it somewhere else, and it is therefore the one several agents end up in at once.
+
+    `dispenses` is what makes the primary tree a SHARED one rather than merely the
+    first one. A lone clone that nobody cuts worktrees from is a private tree that
+    happens to be primary, and telling its owner to go and get a worktree would be
+    the false positive that teaches people to ignore the true ones. Two things say
+    a checkout hands out worktrees, and either is enough: `.worktree.json`, which
+    `create-worktree` refuses to act without and which is therefore this fleet's
+    explicit declaration, or a linked worktree already existing, which is the same
+    fact observed rather than declared.
+    """
+
+    root: str
+    primary: bool
+    dispenses: bool
+    worktrees: int
+
+    @property
+    def shared(self) -> bool:
+        """The tree another agent can walk into without being sent there."""
+        return self.primary and self.dispenses
+
+
+def tree_of(root: str | Path) -> Tree:
+    """Ask git which checkout `root` is. Never raises: a directory git will not
+    answer about is neither primary nor dispensing, so it resolves to "not shared"
+    and raises no alarm — which is the right answer for somewhere that is not a
+    checkout at all.
+    """
+    git_dir = _git(root, "rev-parse", "--git-dir").stdout.strip()
+    common = _git(root, "rev-parse", "--git-common-dir").stdout.strip()
+    # Both are printed relative to `root` in the primary checkout (`.git` and
+    # `.git`) and absolute from a linked one (`…/.git/worktrees/x` and `…/.git`),
+    # so they are resolved against `root` before being compared rather than
+    # compared as the strings git happened to choose.
+    base = Path(root)
+    primary = (bool(git_dir)
+               and Path(base, git_dir).resolve() == Path(base, common).resolve())
+    main_root = Path(base, common).resolve().parent if common else base
+
+    listed = _git(root, "worktree", "list", "--porcelain").stdout
+    worktrees = sum(1 for line in listed.splitlines() if line.startswith("worktree "))
+
+    return Tree(root=str(base), primary=primary,
+                dispenses=(main_root / ".worktree.json").is_file() or worktrees > 1,
+                worktrees=worktrees)
+
+
+def mode_violation(mode: Mode, tree: Tree) -> str | None:
+    """The sentence to say when the tree contradicts the declaration, or None.
+
+    ONE DIRECTION ONLY, and the asymmetry is the point. A cleanroom repo worked in
+    the shared checkout is the failure #178 was filed for and this names it. A
+    jungle repo worked in a private worktree is not the mirror image of that: it
+    costs nobody anything, it is what a jungle agent doing one careful thing might
+    reasonably choose, and a harness that nagged about it would be pushing a
+    jungle repo toward the ceremony #178 explicitly says not to push it toward.
+
+    It says what to DO rather than what is wrong, and it does NOT restate the mode:
+    every caller prints this directly under the mode line, and a warning whose first
+    clause the reader has just read is a warning they start skimming.
+    """
+    if mode.isolation != "worktree" or not tree.shared:
+        return None
+    return (f"You are in the SHARED checkout ({tree.root}), and work here belongs "
+            f"in a worktree of its own. Take one before you edit: "
+            f"`create-worktree <branch>`. Nothing stops another agent starting "
+            f"here too, and when one does, whichever of you types `git reset`, "
+            f"`git checkout --` or `git stash` destroys the other's uncommitted "
+            f"work with no warning and nothing to recover it from. That is not "
+            f"hypothetical: it happened here on 2026-08-17 and again on "
+            f"2026-08-25.")
+
+
 def _qbdata_candidates() -> list[Path]:
     """Where `qbdata.py` can be, in the three layouts it is ever read from.
 
@@ -3034,6 +3295,8 @@ if __name__ == "__main__":
                     help="every dial, its value, and the layer that answered")
     ap.add_argument("--dial", metavar="PATH",
                     help="one dial, e.g. review_panel.fix_severity_floor")
+    ap.add_argument("--mode", action="store_true",
+                    help="how this repo is worked, and whether this tree agrees")
     a = ap.parse_args()
     if a.discover:
         for p in discover():
@@ -3069,4 +3332,28 @@ if __name__ == "__main__":
                 line += f" {said['source']}"
             print(line)
         raise SystemExit(0)
+    if a.mode:
+        # `qb-mode` is the entry point a person or a hook uses; this is the same
+        # answer for anyone who already has the loops directory in front of them,
+        # and it is what that wrapper shells out to.
+        m, t = resolve_mode(c), tree_of(c["path"])
+        if a.json:
+            print(json.dumps({"mode": m.name, "isolation": m.isolation,
+                              "landing": m.landing, "mixed": m.mixed,
+                              "label": m.label, "glyph": m.glyph, "how": m.how,
+                              "root": t.root, "primary": t.primary,
+                              "shared_checkout": t.shared,
+                              "worktrees": t.worktrees,
+                              "violation": mode_violation(m, t)},
+                             indent=2, ensure_ascii=False))
+        else:
+            print(f"{m.glyph} {m.label}   {m.how}")
+            problem = mode_violation(m, t)
+            if problem:
+                print(problem, file=sys.stderr)
+        # Exit 3 for a tree that contradicts the declaration, so a caller can
+        # branch on it without parsing prose — and 0 when it agrees. Not 1: a
+        # violation is an answer this command gives successfully, and a shell
+        # that treats every non-zero as breakage should see the difference.
+        raise SystemExit(3 if mode_violation(m, t) else 0)
     print(json.dumps(c, indent=2) if a.json else describe(c))

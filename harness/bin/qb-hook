@@ -591,6 +591,36 @@ _sync_note() {   # echo the board's advice for THIS checkout, or nothing
   | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null
 }
 
+_mode_note() {   # #178 — which way this repo is worked, and whether this tree agrees
+  # THE ONE THING THAT WOULD HAVE STOPPED 2026-08-17 AND 2026-08-25. Both times
+  # several agents ended up editing one working tree, and both times a build or a
+  # `git reset --hard` destroyed work that nobody could get back. Neither time did
+  # anyone CHOOSE the shared tree: the session started there, and nothing at any
+  # point said which of the fleet's two ways of working was in force. This is the
+  # sentence that says it, before the first tool call rather than after the loss.
+  #
+  # It resolves NOTHING itself. `qb-mode` reads the repo's declared mode through
+  # the same `harness_rules` layering every other setting goes through, so this
+  # hook cannot become a second place the answer is worked out and quietly differ.
+  #
+  # Fail-open like everything else here, and one extra silence on purpose: an
+  # unconfigured or absent `qb-mode` says nothing at all. A note that appeared on
+  # boxes with the harness and vanished on boxes without it would teach people the
+  # absence means "jungle", and the absence means nothing of the kind.
+  [ -n "$cwd" ] || return 0
+  command -v qb-mode >/dev/null 2>&1 || return 0
+  local js
+  # Exit code deliberately ignored: 3 IS the interesting answer and it carries the
+  # body we want. Emptiness is the only failure this can act on.
+  js=$(qb-mode --json "$cwd" 2>/dev/null)
+  [ -n "$js" ] || return 0
+  printf '%s' "$js" | jq -r '
+    if .label == null then empty else
+      "quarterback: this repo is worked \(.glyph) \(.label) — \(.how)."
+      + (if .violation then "\n\n" + .violation else "" end)
+    end' 2>/dev/null
+}
+
 _publish_push() {   # announce HEAD if a push just put it on the tracking branch
   [ -n "$cwd" ] || return 0
   local top sha up subject
@@ -896,6 +926,12 @@ case "$EVENT" in
     # which is the only moment it saves a wasted build. Merged with the occupancy
     # note below into one injection.
     SEP=$'\n\n'; start_notes="$(_sync_note)"
+    # The mode next, and above the occupancy note on purpose: "several agents are
+    # live in this repo" reads completely differently depending on whether this
+    # repo expects them to share a tree, and the answer has to arrive first to
+    # frame it (#178).
+    mode_note="$(_mode_note)"
+    [ -n "$mode_note" ] && start_notes="${start_notes:+$start_notes$SEP}$mode_note"
 
     # Presence/collision (v2.7): our lease (with repo) is registered; ask who ELSE
     # is live in this repo — or, for a non-git dir, this exact cwd — self-quieted so
