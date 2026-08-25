@@ -294,3 +294,42 @@ async def test_an_item_with_no_ref_is_never_flagged(client):
 
     assert plan["items"][0]["reconcile"] is None
     assert plan["next"]["caveat"] is None or "reconcile" not in plan["next"]["caveat"]
+
+
+async def test_a_ref_that_changes_condition_dates_from_the_change(client):
+    """`since` is how long THIS has been true, not how long the ref has been flagged.
+
+    A ref can be a stale claim on Monday and a done candidate on Wednesday. Carrying
+    `first_seen` across that would date the second from the first, and the caveat
+    quotes it — "it has said so for 2 days" about a thing first said an hour ago is
+    the sentence a reader would act on hardest, and it would be false.
+    """
+    repo = "acme/reconcile-changed"
+    await issue(client, repo, 460)
+
+    await report(client, repo, [{"ref_kind": "issue", "ref_value": "460",
+                                 "condition": "stale_claim", "said": "claim is stale"}])
+    was = item_for(await read(client, repo, exact="true"), 460)["reconcile"]
+
+    await report(client, repo, [done(460, "and now it is closed")])
+    now = item_for(await read(client, repo, exact="true"), 460)["reconcile"]
+
+    assert was["condition"] == "stale_claim"
+    assert now["condition"] == "done_candidate"
+    assert now["since"] > was["since"], \
+        "the new condition inherited the old one's age"
+
+
+async def test_a_repeat_of_the_same_condition_keeps_its_age(client):
+    """The other half: only a CHANGE restarts it, or `since` would always be now
+    and the number would say nothing at all."""
+    repo = "acme/reconcile-unchanged"
+    await issue(client, repo, 461)
+
+    await report(client, repo, [done(461)])
+    was = item_for(await read(client, repo, exact="true"), 461)["reconcile"]
+    await report(client, repo, [done(461, "said again, differently worded")])
+    now = item_for(await read(client, repo, exact="true"), 461)["reconcile"]
+
+    assert now["since"] == was["since"]
+    assert now["said"] == "said again, differently worded"

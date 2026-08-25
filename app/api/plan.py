@@ -50,7 +50,8 @@ from typing import Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select, text, tuple_, update
+from sqlalchemy import case, delete, func, or_, select, text, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -791,7 +792,7 @@ async def _reconcile_for(session: AsyncSession,
     the table has to answer about twenty.
     """
     keys = {(i.repo, i.ref_kind, i.ref_value)
-            for i in items if i.ref_kind and i.ref_value}
+            for i in items if i.repo and i.ref_kind and i.ref_value}
     if not keys:
         return {}
     rows = await session.scalars(
@@ -974,7 +975,7 @@ def _reconciled_caveat(nxt: dict) -> str | None:
         return None
     days = found["days"]
     lately = ("in the last hour" if days < 0.05 else
-              f"for {days:g} day{'s' if days >= 2 else ''}")
+              f"for {days:g} day{'' if days == 1 else 's'}")
     said = found.get("said")
     quoted = f" — {said}" if said else ""
     if found["condition"] == "done_candidate":
@@ -1870,34 +1871,53 @@ async def report_reconcile(
         # and refusing the report would lose the other four findings with it.
         seen[(finding.ref_kind, finding.ref_value)] = finding
 
-    existing = {
-        (row.ref_kind, row.ref_value): row
-        for row in await session.scalars(
-            select(PlanReconcile).where(PlanReconcile.repo == body.repo))
-    }
 
-    stored = 0
-    for key, finding in seen.items():
-        row = existing.get(key)
-        if row is None:
-            session.add(PlanReconcile(
-                repo=body.repo, ref_kind=finding.ref_kind, ref_value=finding.ref_value,
-                condition=finding.condition, said=finding.said,
-                first_seen=now, last_seen=now, reported_by=reporter))
-        else:
-            # `first_seen` SURVIVES, and it is the reason these are rows and not a
-            # blob per pass: "a done candidate since Sunday" is the sentence that
-            # turns a report into an argument, and no single pass can say it.
-            row.condition, row.said = finding.condition, finding.said
-            row.last_seen, row.reported_by = now, reporter
-        stored += 1
+    # ON CONFLICT, not read-then-write. Two hosts hold this timer and their passes
+    # can land together, and the read above cannot see a row a concurrent request
+    # is inserting — so the plain version loses the race on the unique constraint
+    # and 500s, which the client reports as "not recorded" and the next tick
+    # silently repairs. `first_seen` is deliberately absent from the update:
+    # SURVIVING is what makes it mean "since", and it is the reason these are rows
+    # and not a blob per pass — "a done candidate since Sunday" is the sentence
+    # that turns a report into an argument, and no single pass can say it.
+    for finding in seen.values():
+        await session.execute(
+            pg_insert(PlanReconcile)
+            .values(repo=body.repo, ref_kind=finding.ref_kind,
+                    ref_value=finding.ref_value, condition=finding.condition,
+                    said=finding.said, first_seen=now, last_seen=now,
+                    reported_by=reporter)
+            .on_conflict_do_update(
+                constraint="uq_plan_reconcile_ref",
+                set_={"condition": finding.condition, "said": finding.said,
+                      "last_seen": now, "reported_by": reporter,
+                      # RESTARTED WHEN THE CONDITION CHANGES. `since` is quoted in
+                      # the caveat as how long THIS has been true, so carrying it
+                      # across a ref that was a stale claim on Monday and a done
+                      # candidate on Wednesday would date the second from the
+                      # first — a false sentence, and the one a reader would act
+                      # on hardest. Unqualified here is the EXISTING row, and
+                      # `excluded` would be the proposed one.
+                      "first_seen": case(
+                          (PlanReconcile.condition == finding.condition,
+                           PlanReconcile.first_seen), else_=now)}))
+    stored = len(seen)
 
-    resolved = [k for k in existing if k not in seen]
-    for key in resolved:
-        await session.delete(existing[key])
+    # ONE statement, evaluated against the table rather than against a list this
+    # request read a moment ago. Two passes can land together — two hosts hold this
+    # timer — and a read-then-delete lets each miss the other's inserts, leaving a
+    # union of two reports that neither pass made. Deleting by "not in what I was
+    # given" makes the loser's rows go with it: the outcome is one pass's set,
+    # which is what replacing a scope's findings is supposed to mean.
+    gone = await session.execute(
+        delete(PlanReconcile).where(
+            PlanReconcile.repo == body.repo,
+            tuple_(PlanReconcile.ref_kind, PlanReconcile.ref_value).notin_(seen)
+            if seen else text("true")))
+    resolved = gone.rowcount or 0
 
     await session.commit()
-    return {"repo": body.repo, "stored": stored, "resolved": len(resolved),
+    return {"repo": body.repo, "stored": stored, "resolved": resolved,
             "reported_by": reporter, "at": now.isoformat()}
 
 
