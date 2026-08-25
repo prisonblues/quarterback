@@ -1123,6 +1123,55 @@ def queue_cell(queue: dict) -> tuple[str, str, str, str]:
     return ("REVIEW", f"{depth} waiting", f"{'held' if held else 'oldest'} {age}", colour)
 
 
+#: What each `since_basis` means, said as the thing the age is measured FROM.
+#: The board publishes the basis beside the age precisely so a reader is not left
+#: guessing what "waiting 2d12h" is counting; spelling it out is that promise
+#: kept, and an unknown basis falls through as itself rather than being dropped.
+QUEUE_BASIS = {
+    "pr_opened": "since it was opened",
+    "last_run": "since the last round",
+    "queue_entered": "since it entered the queue",
+    "plan_item_updated": "since the plan item last moved",
+    "needs_human_first_flagged": "since a human was first asked",
+}
+
+
+def queue_detail(entry: dict) -> str:
+    """The whole of a review-queue row, for the detail line under the tables.
+
+    Worth a click because the row is six narrow cells and the entry carries the
+    argument: the board computes a `reason` sentence for every verdict, and that
+    sentence is the answer to "why is this one waiting" — it exists nowhere else,
+    not on the PR and not on the board tape.
+
+    EVERY hold is listed, not the first. `holds` is a list on purpose — "it is a
+    draft" and "somebody holds the claim" are two facts, and a reader shown only
+    the first would act the moment the draft flag cleared and be wrong. The row
+    above has room for one; this has room for all of them.
+    """
+    bits = [f"{short_repo(entry.get('repo') or REPO)}#{entry.get('pr')}",
+            entry.get("title") or "(untitled)",
+            entry.get("state") or "?"]
+    action = entry.get("next_action")
+    if action and action != "none":
+        # The board's own vocabulary, not the abbreviation the column wears: the
+        # cell says `re-panel` because eleven columns is what it has, and this
+        # line has room for the word the API actually uses.
+        bits.append(f"next: {action}" if entry.get("drainable")
+                    else f"would be: {action}")
+    age = waited(entry.get("age_seconds"))
+    if age:
+        basis = QUEUE_BASIS.get(entry.get("since_basis"), entry.get("since_basis"))
+        waiting = f"waiting {'at most ' if entry.get('age_is_upper_bound') else ''}{age}"
+        bits.append(f"{waiting} ({basis})" if basis else waiting)
+    holds = [h.get("code") for h in (entry.get("holds") or []) if h.get("code")]
+    if holds:
+        bits.append("held by " + ", ".join(holds))
+    if entry.get("reason"):
+        bits.append(entry["reason"])
+    return " · ".join(b for b in bits if b)
+
+
 def repo_ref(row: dict) -> str:
     """'prisonblues/quarterback#176' — a numbered row's identity, across repos.
 

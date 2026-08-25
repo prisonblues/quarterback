@@ -250,11 +250,24 @@ class Dash(App):
        `height: auto` the four tables simply stack past the bottom of a 42-row
        pane: the PRs then cannot be clicked, because they are not on screen —
        which is how the click test caught it. */
-    #seats  { height: 1fr; }
+    /* SEATS sizes to its CONTENT, and it is the only table here that may.
+       Every other one is unbounded — the fleet, the plan and the issue list are
+       as long as the board is — so `height: auto` on those is what put the PR
+       table off the bottom of the pane and made its rows unclickable. This one
+       is bounded by the seats in the row plus the ＋, so an fr share buys it
+       nothing and costs it the ＋ the moment another panel appears: adding
+       REVIEW QUEUE took the denominator from 10fr to 11fr and the ＋ row, the
+       only way to add a seat with the mouse, fell off a 50-row screen. The cap
+       is the backstop for a screen with more seats than anyone should have. */
+    #seats  { height: auto; max-height: 8; }
     #fleet  { height: 2fr; }
     #claims { height: 1fr; }
     #plan   { height: 2fr; }
     #prs    { height: 2fr; }
+    /* 1fr, not 2: the queue is at most as deep as OPEN PRs above it and is
+       usually shorter, and every row it takes here comes off ISSUES — which is
+       already the panel that falls below the fold (#269). */
+    #queue  { height: 1fr; }
     #issues { height: 2fr; }
     """
 
@@ -319,6 +332,10 @@ class Dash(App):
         # other and a pane is shown a state that belongs to something else.
         self.seat_states: dict[tuple[str | None, str | None, int], dict] = {}
         self.prs: list[dict] = []
+        # The derived review queue, kept for the same reason as `board`: `s`
+        # redraws from it, and it rides the gh clock so a re-fetch on a toggle
+        # would cost a `gh pr list` for a decision already made.
+        self.queue: dict = {}
         self.issues: list[dict] = []
         self.issue_err: str | None = None
         self.plan: dict = {}                      # the whole /plan envelope
@@ -367,10 +384,16 @@ class Dash(App):
             yield ClickTable(id="plan", cursor_type="row")
             yield Static("OPEN PRs", classes="title", id="t_prs")
             yield ClickTable(id="prs", cursor_type="row")
+            # Directly under OPEN PRs, which is where it answers the question that
+            # panel raises and cannot: that one says a PR exists and CI is green,
+            # this one says whether anybody has reviewed it (#273).
+            yield Static("REVIEW QUEUE", classes="title", id="t_queue")
+            yield ClickTable(id="queue", cursor_type="row")
             yield Static("ISSUES", classes="title", id="t_issues")
             yield ClickTable(id="issues", cursor_type="row")
         yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
-                     "plan row→why, ⚖→panel review, ⚒→fix issue   ? for keys",
+                     "plan row→why, queue row→what it waits on, "
+                     "⚖→panel review, ⚒→fix issue   ? for keys",
                      id="detail")
         yield Footer()
 
@@ -421,6 +444,10 @@ class Dash(App):
             ("#fleet", ("who", "state", "stage", *repo, "what", "ttl")),
             ("#plan", ("", "⚒", *repo, "rank", "ref", "title", "who")),
             ("#prs", ("", "⚖", *repo, "pr", "title", "age")),
+            # `waiting for` before `age` and both before the title: the whole
+            # point of the panel is the verb and the wait, and a title long
+            # enough to be useful would push them off a 78-column pane.
+            ("#queue", ("", "⚖", *repo, "pr", "waiting for", "age", "title")),
             ("#issues", ("", "⚒", *repo, "issue", "title", "who")),
         ):
             table = self.query_one(table_id, DataTable)
@@ -461,8 +488,25 @@ class Dash(App):
 
     @work(thread=True, exclusive=True, group="prs")
     def refresh_prs(self) -> None:
+        """The PR list and the queue derived from it, in one worker.
+
+        The queue is a BOARD call and still rides the gh clock, because it is a
+        join over the very PR rows fetched on the line above. Given its own timer
+        it would answer about PRs up to ninety seconds newer than the ones OPEN
+        PRs is drawing, and the two panels would disagree about any PR that moved
+        in between. `qb-dash.fetch_gh` makes the same choice for the same reason.
+
+        The PR table is rendered BEFORE the queue is fetched rather than after,
+        so a slow or dead board costs the queue panel and not the PR panel.
+        """
         prs, err = qd.fetch_prs()
         self.call_from_thread(self.render_prs, prs, err)
+        # `pr_err` and not a bare list: `fetch_prs` answers a failed `gh` with
+        # ([], err), and deriving from that empty list would have the board
+        # honestly report a drained queue for a repo with eight PRs waiting.
+        queue = (qd.fetch_review_queue(self.client, prs, pr_err=err)
+                 if self.client is not None else {})
+        self.call_from_thread(self.render_queue, queue)
 
     @work(thread=True, exclusive=True, group="issues")
     def refresh_issues(self) -> None:
@@ -562,6 +606,19 @@ class Dash(App):
                 text.append(f" {reset}", style="grey50")
         if err:
             text.append(" ?", style="grey50")
+        # The queue's depth and age ride the caps line beside the budget they
+        # would be spent out of — a panel round costs tokens, and "3 waiting" is
+        # only actionable next to how much is left. A depth of ZERO still draws:
+        # "nothing is waiting" is the answer this panel exists to make reachable,
+        # and a cell that vanished when it was true could not be told apart from
+        # a dashboard that never asked.
+        if self.queue:
+            label, depth, age, colour = qd.queue_cell(self.queue)
+            text.append("   ")
+            text.append(label, style="bold grey70")
+            text.append(f" {depth}", style=f"bold {colour}")
+            if age:
+                text.append(f" {age}", style="grey50")
         bar.update(text)
 
     def on_resize(self) -> None:
@@ -802,6 +859,83 @@ class Dash(App):
             title += f" · gh: {qd.clip(err, 24)}"
         self.query_one("#t_prs", Static).update(title)
 
+    def render_queue(self, queue: dict) -> None:
+        """What review is waiting on, and how long it has waited — #273.
+
+        The panel OPEN PRs cannot be: that one says a PR exists and CI is green,
+        and never said whether anybody had reviewed it. On 2026-08-20 six of
+        eight open PRs had never been panelled while the newest round on the
+        board was two and a half days old, and neither number was readable
+        anywhere.
+
+        Rows arrive oldest-drainable first and are drawn in that order. It is a
+        READING order and not a work order — the board refuses to rank the queue
+        (#232 owns that) — so this panel refuses too, and simply shows the top of
+        the list it was handed.
+
+        An entry nothing may act on KEEPS ITS PLACE, greyed, with the reason in
+        its verb column instead of a verb. A queue that hid its blocked entries
+        would report a depth of zero for a repo where everything is stuck (#244),
+        which is the one reading this panel exists to prevent.
+        """
+        self.queue = queue
+        table = self.query_one("#queue", DataTable)
+        table.clear()
+        entries = queue.get("entries") or []
+        for e in entries:
+            state = e.get("state") or ""
+            colour = qd.QUEUE_COLOUR.get(state, "grey50")
+            drains = bool(e.get("drainable"))
+            holds = e.get("holds") or []
+            hold = holds[0].get("code") if holds else state
+            action = e.get("next_action")
+            verb = (qd.QUEUE_VERB.get(action, action or "")
+                    if drains else qd.QUEUE_HOLD.get(hold, hold))
+            repo = e.get("repo") or qd.REPO
+            # By repo AND number, like every other table here: two watched repos
+            # both reach #42 eventually, and the bare number is what handed a
+            # table the same row key twice (#209).
+            key = f"queue:{qd.short_repo(repo)}#{e.get('pr')}"
+            # The ⚖ is offered ONLY where a panel round is the thing this entry
+            # is waiting for. `fix`, `rebase` and `land` are real next actions
+            # with no button on this dashboard, and `answer` is owed by a human —
+            # drawing a live ⚖ on any of them would start the wrong work, so they
+            # get the same grey the unreachable-repo guard uses one panel over.
+            offers_panel = drains and action in ("review", "re-review")
+            reachable = offers_panel and self.wrong_repo(e.get("repo"), "") is None
+            key = table.add_row(
+                Text("●", style=colour),
+                Text("⚖", style="bold cyan" if reachable else "grey30"),
+                *self.repo_cell(qd.short_repo(repo)),
+                Text(f"#{e.get('pr')}", style="bold grey70"),
+                Text(qd.clip(verb, 11), style=colour if drains else "grey50"),
+                # A `~` on an age that is the longest the wait COULD have been.
+                # Nothing records when a head moved or when a branch started
+                # conflicting, and a number nobody can rely on should say so.
+                Text(("~" if e.get("age_is_upper_bound") else "")
+                     + qd.waited(e.get("age_seconds")), style="grey50"),
+                Text(qd.clip(e.get("title") or "", 30 if self.scope.column else 42),
+                     style="white" if drains else "grey50"),
+                key=key,
+            ).value
+            self.rows[str(key)] = e
+
+        depth = queue.get("depth") or 0
+        held = max(0, (queue.get("open") or 0) - depth)
+        title = f"REVIEW QUEUE · {depth} waiting"
+        if held:
+            title += f" · {held} held"
+        age, oldest_held = qd.queue_oldest(queue)
+        if age:
+            title += f" · {'held' if oldest_held else 'oldest'} {age}"
+        if queue.get("error"):
+            title += f" · {qd.clip(queue['error'], 24)}"
+        self.query_one("#t_queue", Static).update(title)
+        # The caps line carries this same depth, and it is drawn on the limits
+        # clock — an hour long. Without this the cell up there would keep last
+        # hour's number while the panel down here showed this minute's.
+        self.render_limits(self.limits, self.limits_err)
+
     def render_issues(self, issues: list[dict], err: str | None) -> None:
         """Open issues, free ones first, the held ones greyed and named.
 
@@ -883,6 +1017,20 @@ class Dash(App):
                 # With the envelope, so the row the board named `next` can show the
                 # caveat the board attached to that recommendation.
                 self.say(qd.plan_detail(record, self.plan))
+        elif kind == "queue":
+            if column == self.PANEL_COLUMN:
+                # Only where the row drew a live ⚖. Everything else says what it
+                # is actually waiting for rather than starting a round that would
+                # be spent on the wrong thing — a conflicting branch burns a whole
+                # panel round to tell you it is conflicting (#271).
+                action = record.get("next_action")
+                if action in ("review", "re-review"):
+                    self.panel_pr({"repo": record.get("repo"),
+                                   "number": record.get("pr")})
+                else:
+                    self.say(qd.queue_detail(record))
+            else:
+                self.say(qd.queue_detail(record))
         elif kind == "issue":
             if column == self.FIX_COLUMN:
                 self.fix_issue(record)

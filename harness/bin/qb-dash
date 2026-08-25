@@ -5,6 +5,7 @@
 #   qb-dash --tui        the clickable one (what `qb` and `qb-dash-tui` run)
 #   qb-dash --once       one frame and exit
 #   qb-dash --scope all --tui    --tui is recognised wherever it appears
+#   qb-dash --can-tui    exit 0 if the clickable one could run here, else 1
 #
 # A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich (and
 # textual, for the clickable one), which a plain python3 does not have — so a
@@ -40,6 +41,51 @@ BIN_DIR="$(self_dir "$0")" || {
   exit 1
 }
 
+# `textual` only matters for the clickable one, so the plain renderer still runs
+# on an interpreter that has rich but no textual. Reads $MODE, so every caller
+# below sets that before asking.
+usable() {
+  [ -x "$1" ] || return 1
+  if [ "$MODE" = tui ]; then
+    "$1" -c 'import rich, textual' >/dev/null 2>&1
+  else
+    "$1" -c 'import rich' >/dev/null 2>&1
+  fi
+}
+
+# The interpreter search, as a function with ONE caller per question rather than
+# a straight-line block. `--can-tui` asks the same question the launch path asks
+# and must not answer it differently — a second copy would drift, and the box it
+# drifted on would be told the clickable dash was available and then shown the
+# error instead, in the pane least able to afford it. Sets $PY; empty means none.
+find_python() {
+  local candidate
+  CANDIDATES=(
+    "${QB_DASH_PYTHON:-}"
+    "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
+    "$BIN_DIR/../../mcp/.venv/bin/python"
+    "$HOME/source/quarterback/mcp/.venv/bin/python"
+  )
+  PY=""
+  for candidate in "${CANDIDATES[@]}"; do
+    case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
+    usable "$candidate" && { PY="$candidate"; return 0; }
+  done
+  command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \
+    && { PY="$(command -v python3)"; return 0; }
+  return 1
+}
+
+# --can-tui: answer whether the clickable renderer could run on this machine, and
+# run nothing. It exists so `qb-seats` can DEFAULT to the clickable dash and fall
+# back only where textual is genuinely absent, without carrying its own idea of
+# what "available" means. A question, not a flag, so it is answered before the
+# argument loop and never reaches a renderer.
+if [ "${1:-}" = "--can-tui" ]; then
+  MODE=tui
+  find_python >/dev/null 2>&1 && exit 0 || exit 1
+fi
+
 # --tui ANYWHERE, not only first. It used to be `case "${1:-}"`, which was fine
 # while the plain renderer owned every flag — but both renderers take `--scope`
 # and `--repo` now, so `qb-dash --scope all --tui` is a thing a person will type,
@@ -61,32 +107,7 @@ set -- ${ARGS+"${ARGS[@]}"}
 case "$PROG" in *-tui) MODE=tui ;; esac
 [ "$MODE" = tui ] && TARGET="$BIN_DIR/qb-dash-tui.py" || TARGET="$BIN_DIR/qb-dash.py"
 
-# `textual` only matters for the clickable one, so the plain renderer still runs
-# on an interpreter that has rich but no textual.
-usable() {
-  [ -x "$1" ] || return 1
-  if [ "$MODE" = tui ]; then
-    "$1" -c 'import rich, textual' >/dev/null 2>&1
-  else
-    "$1" -c 'import rich' >/dev/null 2>&1
-  fi
-}
-
-CANDIDATES=(
-  "${QB_DASH_PYTHON:-}"
-  "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
-  "$BIN_DIR/../../mcp/.venv/bin/python"
-  "$HOME/source/quarterback/mcp/.venv/bin/python"
-)
-PY=""
-for candidate in "${CANDIDATES[@]}"; do
-  case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
-  usable "$candidate" && { PY="$candidate"; break; }
-done
-[ -n "$PY" ] || { command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \
-  && PY="$(command -v python3)"; }
-
-if [ -z "$PY" ]; then
+if ! find_python; then
   cat >&2 <<EOF
 $PROG: no Python here can import what the dashboard needs
         (rich$([ "$MODE" = tui ] && printf ', textual')).

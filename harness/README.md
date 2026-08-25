@@ -1506,8 +1506,10 @@ along the bottom (the **tape**) is the event stream. Who is alive and on what, w
 which claim and for how long, what the fleet agreed to do next, every open PR with its CI
 verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
 the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub. `qb-dash` is the same views rendered
-without interaction, for a terminal that will not forward mouse events.
+where it is, a PR or an issue opens on GitHub, and a review-queue row says every
+reason it is still waiting. `qb-dash` is the same views rendered without
+interaction, for a box that cannot import `textual` — which is the whole of what
+it is for since #426. It is not a lesser default any more; it is the fallback.
 
 **The CI column has six states, and only one of them is quiet.** `gh pr view` reports a
 PR's checks as a rollup, and an empty rollup means two things that are not remotely alike:
@@ -1534,8 +1536,11 @@ only endpoint a gated run is visible from:
 The OPEN PRs title counts every one of those that is not green. Before this it counted reds
 and nothing else, so a PR whose runs were gated contributed to no number on the screen.
 
-`qb-dash` also carries a **REVIEW QUEUE** panel the clickable renderer does not have yet
-(#273). OPEN PRs above it says a PR exists and CI is green; it never said whether anybody
+**REVIEW QUEUE** sits directly under OPEN PRs in both renderers. It was the plain
+one's alone until #426, which is what made flipping the seat pane's default a port
+rather than a one-line change: the panel would have come off the screen, and a
+number nobody reads is how #273 happened in the first place. OPEN PRs above it
+says a PR exists and CI is green; it never said whether anybody
 had reviewed it, and on 2026-08-20 six of eight open PRs had never been panelled while the
 newest round on the board was two and a half days old — neither number readable anywhere.
 The panel is `POST /review-queue`: every open PR joined to every panel run, plan item, work
@@ -1754,15 +1759,25 @@ is the only place it can surface at all. Do not read a quiet dashboard as a uniq
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
 happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
-empty string for a screen with no dash**. The default is the plain `qb-dash` rather than
-the nicer clickable `qb-dash-tui`; `QB_SEATS_DASH=qb-dash-tui` opts in. The `DuplicateKey`
-crash that used to be the reason for that default is fixed (#208 for the seat rows, #209
-for the rest), so what is left is a packaging question rather than a correctness one:
-`textual` and `rich` are deliberately outside the ordinary dev install, and a default that
-wants them would leave anyone without them looking at a pane that says so. Nothing falls back to the TUI on its
-own, not even when `qb-dash` is the one that is missing: with neither installed the pane
-holds a shell and a line saying which command to set, rather than the screen quietly
-being one pane short.
+empty string for a screen with no dash**. The default is the clickable `qb-dash-tui`
+since #426, falling back to the plain `qb-dash` on a box where `textual` cannot be
+imported.
+
+It was the other way round for four days longer than it should have been. The plain
+one was the default because the TUI keyed its seat rows by seat NAME, every screen
+numbers its seats from 1, and a second screen anywhere on the box turned that pane
+into a `DuplicateKey` traceback — a pane you look at when something is wrong must
+not be the thing that breaks first. #208 and #209 closed that on 2026-08-20 (seat
+rows key on the tmux pane id now, which is unique box-wide) and nothing pointed back
+at the decision the fix released, so the workaround simply stayed.
+
+**The probe is now a dependency check rather than a crash check**, and the inversion
+is the point. `dash_cmd` asks `qb-dash --can-tui`, which runs the launcher's own
+interpreter search and so cannot disagree with the launch that follows — one search,
+not two that drift. `qb-dash` on PATH is still the gate: a partial install carrying
+only the TUI entry point falls to the placeholder rather than being promoted, and
+with neither installed the pane holds a shell and a line saying which command to
+set, rather than the screen quietly being one pane short.
 
 `QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
 wants before it wraps — **and never more than a third of the window**. That ceiling is

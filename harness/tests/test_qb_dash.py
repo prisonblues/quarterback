@@ -160,7 +160,12 @@ async def _drive() -> list[str]:
     jumped: list[int] = []
     app.open_pr = lambda pr: (opened.append(pr.get("number")),
                               app.say(f"opened #{pr.get('number')}"))[1]
-    app.jump_to_seat = lambda seat: (jumped.append(seat), True)[1]
+    # `scope` too, and not as decoration: `jump_to_seat` grew a second parameter
+    # when seat identity became per-project (#208), and this stub did not — so
+    # every run of this test died on a TypeError from inside the lambda rather
+    # than on anything it asserts. A stub of a real method has to keep that
+    # method's signature or it stops standing in for it.
+    app.jump_to_seat = lambda seat, scope=None: (jumped.append(seat), True)[1]
 
     failures: list[str] = []
     async with app.run_test(size=(80, 44)) as pilot:
@@ -676,6 +681,140 @@ async def _drive_stage() -> list[str]:
         await pilot.pause()
         fleet = app.query_one("#fleet")
         return [_cells(fleet, i)[2] for i in range(fleet.row_count)]
+
+
+#: A queue with one of each shape that matters: a row review can act on, and a
+#: row it cannot. Both are open PRs and both belong on screen (#244).
+QUEUE = {
+    "open": 2, "depth": 1, "error": None, "idle": None,
+    "oldest": {"age_seconds": 216000, "pr": 270, "repo": "prisonblues/quarterback"},
+    "oldest_held": None,
+    "entries": [
+        {"repo": "prisonblues/quarterback", "pr": 264, "title": "a first round",
+         "state": "unreviewed", "next_action": "review", "drainable": True,
+         "holds": [], "age_seconds": 3600, "since_basis": "pr_opened",
+         "age_is_upper_bound": False, "reason": "no run for this PR"},
+        {"repo": "prisonblues/quarterback", "pr": 270, "title": "conflicting",
+         "state": "blocked", "next_action": "integrate", "drainable": False,
+         "holds": [{"code": "conflicting"}, {"code": "draft"}],
+         "age_seconds": 216000, "since_basis": "pr_opened",
+         "age_is_upper_bound": True, "reason": "the branch conflicts with its base"},
+    ],
+}
+
+
+async def _drive_queue(offset) -> tuple[list[list[str]], str, list, str]:
+    """Render the review queue, then click it at `offset`."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    started: list = []
+    app.spawn_refusal = lambda command: None
+    app.run_spawn = lambda name, argv: started.append((name, argv))
+    app.run_in_window = lambda name, command: started.append((name, [command]))
+
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_queue(QUEUE)
+        await pilot.pause()
+        table = app.query_one("#queue")
+        rows = [_cells(table, i) for i in range(table.row_count)]
+        title = str(app.query_one("#t_queue").content)
+        await pilot.click(table, offset=offset)
+        await pilot.pause(0.3)
+        return rows, title, started, app.detail_text
+
+
+def test_the_review_queue_keeps_the_rows_nothing_can_act_on():
+    """#273 in the clickable renderer, and #244's rule inside it.
+
+    The panel OPEN PRs cannot be: that one says a PR exists and CI is green and
+    never said whether anybody had reviewed it. It was in the plain renderer only
+    until #426, so flipping the seat pane's default would have taken it off the
+    screen — which is how it stops being read a second time.
+
+    A blocked entry KEEPS ITS PLACE, with the hold where its verb would go. A
+    queue that hid what it could not act on would report a depth of zero for a
+    repo where everything is stuck, and that reading is the one this panel exists
+    to prevent.
+    """
+    rows, title, _, _ = asyncio.run(_drive_queue(offset=(60, 1)))
+    assert [r[2] for r in rows] == ["#264", "#270"], rows
+    # Column 3 is the verb on a narrow pane: state, ⚖, pr, verb, age, title.
+    assert rows[0][3] == "panel", rows[0]
+    assert rows[1][3] == "conflicting", rows[1]
+    # The board's own word, abbreviated for the column: `integrate` is what a
+    # DRAINABLE row would show, and this row is not one.
+    assert "integrate" not in rows[1][3]
+    # `~` on an age that is the longest the wait could have been — nothing
+    # records when a branch started conflicting.
+    assert rows[1][4].startswith("~"), rows[1]
+    assert not rows[0][4].startswith("~"), rows[0]
+    assert "1 waiting" in title and "1 held" in title, title
+
+
+def test_the_queues_scales_icon_is_live_only_where_a_round_is_what_is_wanted():
+    """`fix`, `rebase` and `land` are real next actions with no button here.
+
+    Drawing a live ⚖ on a conflicting branch would spend a whole panel round to
+    be told it conflicts (#271), so the icon is grey there and the click explains
+    the row instead of starting anything. Same dimming the unreachable-repo guard
+    uses one panel over, so "grey means not offered" is one habit and not two.
+    """
+    rows, _, started, detail = asyncio.run(
+        _drive_queue(offset=(_load_app().Dash.PANEL_COLUMN + 2, 2)))
+    assert rows[1][1] == "⚖", rows[1]
+    assert not started, "the ⚖ started a round on a row it cannot drain"
+    assert "conflicting" in detail, detail
+    assert "would be: integrate" in detail, detail
+
+
+def test_a_queue_row_says_every_reason_it_is_waiting_not_just_the_first():
+    """`holds` is a list on purpose, and the detail line is where they all fit.
+
+    "It is a draft" and "somebody holds the claim" are two facts; a reader shown
+    only the first would act the moment the draft flag cleared and be wrong. The
+    row above has room for one hold, so this line carries the rest — along with
+    the board's own `reason` sentence, which exists nowhere else.
+    """
+    _, _, started, detail = asyncio.run(_drive_queue(offset=(60, 2)))
+    assert not started
+    assert "conflicting, draft" in detail, detail
+    assert "the branch conflicts with its base" in detail, detail
+    assert "at most 2d12h" in detail, detail
+    assert "since it was opened" in detail, detail
+
+
+def test_the_caps_line_carries_the_queue_depth():
+    """The depth rides beside the budget it would be spent out of.
+
+    A panel round costs tokens, so "1 waiting" is only actionable next to how
+    much is left. Drawn on the limits clock, which is an hour long — so a new
+    queue has to redraw it, or the cell up there keeps last hour's number while
+    the panel below shows this minute's.
+    """
+    async def drive() -> str:
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.render_limits(
+                [{"label": "5h", "percent": 8, "resets": None, "severity": "ok"}],
+                None)
+            app.render_queue(QUEUE)
+            await pilot.pause()
+            return str(app.query_one("#limits").content)
+
+    line = asyncio.run(drive())
+    assert "REVIEW" in line and "1 waiting" in line, line
 
 
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
