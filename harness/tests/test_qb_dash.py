@@ -490,14 +490,24 @@ async def _drive_panel() -> list[str]:
                 failures.append("the review opened a window, not a seat-row pane")
 
         # Cancelling starts nothing — and the dialog has to have been THERE, or
-        # this passes on a click that missed. Row 2 is a second PR the repos need
-        # not have today, and a click that lands on nothing leaves `started` empty
-        # and the escape a no-op, which reads exactly like a cancel that worked.
+        # this passes on a click that missed: a click that lands on nothing leaves
+        # `started` empty and the escape a no-op, which reads exactly like a cancel
+        # that worked.
+        #
+        # ON A ROW THAT EXISTS, which is the half the first cut of that assertion
+        # left out. It clicked row 2 unconditionally, and a second row is not
+        # something this test can arrange — the panel shows what the fleet has open,
+        # so on a day with one PR in scope the click went past the last row, no
+        # dialog could appear, and the suite went red about the fleet's state rather
+        # than about this dashboard's behaviour. Row 2 when there is one, row 1
+        # otherwise: cancelling is worth testing on any day, and the row it happens
+        # on is not what is under test.
         started.clear()
-        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, 2))
+        cancel_on = 2 if prs.row_count >= 2 else 1
+        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, cancel_on))
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
-            failures.append("the ⚖ on the second row raised no confirmation to cancel")
+            failures.append(f"the ⚖ on row {cancel_on} raised no confirmation to cancel")
         else:
             await pilot.press("escape")
             await pilot.pause(0.3)
