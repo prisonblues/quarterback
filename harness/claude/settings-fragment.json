@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Task",
+        "matcher": "Task|Bash",
         "hooks": [ { "type": "command", "command": "@QB_HOOK@ PreToolUse" } ]
       }
     ],

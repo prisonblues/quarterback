@@ -953,3 +953,43 @@ def test_the_flake_no_longer_promises_a_wiring_it_does_not_do():
     assert "~/.local/bin" not in claim, (
         "the description still promises ~/.local/bin, which this module does not write")
     assert "board" in claim, "the description does not mention the board it now wires"
+
+
+def test_an_unwired_event_is_MISSING_even_though_a_field_after_it_is_set(tmp_path, monkeypatch):
+    """The column shift that CI caught, pinned.
+
+    `--check` builds its rows in jq and reads them in bash. Tab is an IFS
+    *whitespace* character, so `read` folds runs of tabs into a single delimiter
+    and drops empty fields entirely. That was harmless while the possibly-empty
+    `cmd` was the LAST column, and became a one-column shift the moment the
+    matcher was added after it: an event with no qb-hook entry read its own
+    matcher as its command, so the branch that reports MISSING never fired and
+    the host was told SKEW instead.
+
+    MISSING and SKEW are different facts with different remedies — "this host is
+    deaf on that event" against "it is wired to something else" — and the whole
+    point of the mode is telling them apart.
+    """
+    import json
+    import subprocess
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    hook = str(BIN / "qb-hook") if "BIN" in globals() else str(
+        Path(__file__).resolve().parents[1] / "bin" / "qb-hook")
+    frag = json.loads(
+        (Path(__file__).resolve().parents[1] / "claude" / "settings-fragment.json").read_text()
+        .replace("@QB_HOOK@", hook))
+    # PreToolUse wired to somebody else's guard: no qb-hook entry at all, and the
+    # entry that IS there carries a matcher — the exact shape that shifted.
+    frag["hooks"]["PreToolUse"] = [
+        {"matcher": "Task", "hooks": [{"type": "command", "command": "my-guard.sh"}]}
+    ]
+    (home / ".claude" / "settings.json").write_text(json.dumps(frag, indent=2))
+
+    got = subprocess.run([str(Path(__file__).resolve().parents[1] / "bin" / "qb-claude-setup"),
+                          "--check"],
+                         capture_output=True, text=True,
+                         env={**os.environ, "HOME": str(home)}, timeout=60)
+    assert "MISSING  PreToolUse" in got.stdout, got.stdout
+    assert got.returncode == 1, got.stdout

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Does this shell command destroy uncommitted work, and in which tree? (#185)
+
+**This exists because a regex could not answer that question, and nine P1s said so.**
+
+The first cut of the shared-checkout guard classified commands with one extended
+regular expression over the raw command string. A panel round found nine P1
+bypasses in it, and they were not nine defects — they were one premise, wearing
+nine faces:
+
+  * `git -c core.filemode=false reset --hard` was not matched **at all**, because
+    the pattern special-cased `-C <path>` as the only two-token global option and
+    stalled mid-option on every other one (`-c`, `--git-dir`, `--work-tree`).
+  * `git clean -n && git reset --hard` was exempted, because the `clean` dry-run
+    test ran against the WHOLE command rather than the clause that matched, so a
+    harmless first clause excused a destructive second one.
+  * `git status --help; git reset --hard` went the same way through `--help`.
+  * `QB_ALLOW_SHARED_TREE=1 echo hi\ngit reset --hard` went the same way through
+    the escape hatch, whose `^` anchor is per-LINE under grep.
+  * `-C` was preferred over `--work-tree=` unconditionally, and both were read
+    with a leftmost match over the whole string — so the tree that got checked
+    could belong to a different clause entirely.
+
+Patching those at the lines they name is how #67's loop starts: the special case
+is the next round's finding. So the premise goes instead. The command is
+TOKENISED, split into clauses, and each clause is classified on its own — which
+is what "does this command do X" required all along.
+
+**The regex survives, in one job only: a prefilter in the hook.** It is
+deliberately over-broad and it may not refuse anything by itself. It exists so
+the common case — every Bash call in every session on this box that has nothing
+to do with git — costs one `grep` and no fork at all. Only when it fires does the
+hook pay for this, which is a Python start-up on a command that was going to
+touch a repository anyway.
+
+## What this is for, and the bar it is held to
+
+**It is a tripwire for an ACCIDENT, not a gate against an adversary**, and that
+sentence is a decision (Rich, 2026-08-25) rather than a caveat. A second panel
+round found thirteen more P1 "bypasses" — a `cd` earlier in the command, `env
+git`, `sudo git`, a `$VAR` target, `git clean -i`, `git submodule deinit -f` —
+and they are not thirteen defects either. They are the next premise: that a
+STATIC reading of command text can determine what a command will do. It cannot,
+because the shell is Turing-complete, and an unbounded list of spellings is what
+chasing it produces.
+
+So the bar is the accident that actually happens, and the evidence says what
+that is. Counting #185's own five incidents by mechanism:
+
+  * board 3860 — "whoever runs `git commit -a` first sweeps up the other's
+    half-finished work"
+  * board 3879 — exactly that: an in-flight `clash.py` committed by somebody
+    else as `409bae0`, under a message saying the work was not theirs
+  * board 4004 — a half-wired `annex.yaml` include, everyone's red build. Not a
+    command at all
+  * board 3853 — a claim race. Not a command either
+  * 2026-08-25, twice — `git reset --hard` in a shared checkout
+
+The first cut of this guard covered the last row and nothing else: two of five.
+The commonest mechanism on that list is `git commit -a`, and it was not in the
+verb list at all. That is what this now covers, and it is why there are two
+classes below rather than one — the harm in a shared tree comes in two shapes,
+destroying a peer's uncommitted work and ABSORBING it, and only the first had
+ever been guarded.
+
+What it deliberately does NOT do is win an argument with a determined caller.
+`env git reset --hard`, `sudo git …`, a `$VAR` target, a `cd` in an earlier
+clause, an alias, a shell function, `xargs` — all documented, none chased. The
+threat model is two co-operating agents in one tree, the cost of a miss is the
+same as before this existed, and the cost of the arms race is two rounds and
+eighty-four findings that never touched three of the five incidents.
+
+Reads the command on stdin. Writes one JSON object on stdout:
+
+    {"destructive": bool,       # does a clause destroy OR absorb uncommitted work?
+     "harm": str|null,          # "destroys" or "sweeps" — they need different words
+     "target": str|null,        # the tree that clause names (-C / --work-tree), if any
+     "verb": str|null,          # what it was, for the refusal message
+     "allowed_by": str|null,    # the escape hatch, if the matched clause carried it
+     "parsed": bool}            # false when the command could not be tokenised
+
+`parsed: false` is NOT a refusal. The hook's contract is fail-open and an
+unparseable command is a command we know nothing about, which is the one state
+this must never dress up as knowledge.
+"""
+
+from __future__ import annotations
+
+import json
+import shlex
+import sys
+from pathlib import Path
+
+# Global options that swallow the NEXT token. Getting this list wrong is what
+# made `git -c core.filemode=false reset --hard` invisible: the scanner has to
+# know that `-c` eats `core.filemode=false`, or it reads the setting as the
+# subcommand and gives up. The `--opt=value` spellings need no entry — they are
+# one token and fall out of the `=` check below.
+GLOBAL_WITH_VALUE = {
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--config-env",
+}
+
+# Global options that stand alone. Anything dash-led and not in either set is
+# still skipped, so an option added to git tomorrow does not silently become the
+# subcommand — it just is not one, which is the safe direction.
+GLOBAL_ALONE = {
+    "-p", "--paginate", "-P", "--no-pager", "--bare", "--no-replace-objects",
+    "--literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+    "--icase-pathspecs", "--no-optional-locks", "--exec-path",
+    "--html-path", "--man-path", "--info-path", "--version", "--help", "-v", "-h",
+}
+
+# Shells whose `-c <string>` argument is another command. Looking inside is cheap
+# once you have tokens, and `bash -c 'git reset --hard'` was a documented hole in
+# the regex era.
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+
+SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
+
+HATCH = "QB_ALLOW_SHARED_TREE"
+HATCH_ON = {"1", "true"}
+
+
+def _tokenise(text: str) -> list[str]:
+    """POSIX tokens, with `;`/`&&`/`|` kept as their own tokens."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    return list(lexer)
+
+
+def _clauses(tokens: list[str]) -> list[list[str]]:
+    """Split a token stream on shell separators.
+
+    The whole point: `git clean -n && git reset --hard` is TWO commands, and a
+    dry run in the first says nothing about the second. Every exemption below is
+    scoped to the clause it was found in, which is the bug class this removes.
+    """
+    out: list[list[str]] = [[]]
+    for t in tokens:
+        if t in SEPARATORS:
+            out.append([])
+        else:
+            out[-1].append(t)
+    return [c for c in out if c]
+
+
+def _strip_assignments(clause: list[str]) -> tuple[list[str], str | None]:
+    """Peel `VAR=value` prefixes off a clause; report the escape hatch if present.
+
+    The hatch has to be a real leading assignment ON THIS CLAUSE. Under grep its
+    `^` was a line anchor, so a hatch on line 1 of a multi-line command excused a
+    reset on line 2 — and `echo QB_ALLOW_SHARED_TREE=1; git reset --hard`, which
+    assigns nothing at all, excused itself.
+    """
+    hatch = None
+    i = 0
+    while i < len(clause) and "=" in clause[i] and not clause[i].startswith("-"):
+        name, _, value = clause[i].partition("=")
+        if not name or not name.replace("_", "").isalnum():
+            break
+        if name == HATCH and value in HATCH_ON:
+            hatch = f"{name}={value}"
+        i += 1
+    return clause[i:], hatch
+
+
+def _git_args(clause: list[str]) -> tuple[list[str], dict] | None:
+    """`(args after the subcommand position, globals)` if this clause runs git."""
+    if not clause:
+        return None
+    argv0 = clause[0]
+    # A path-qualified git is still git: `/usr/bin/git reset --hard`.
+    if Path(argv0).name != "git":
+        return None
+
+    globals_: dict = {}
+    i = 1
+    while i < len(clause):
+        tok = clause[i]
+        if not tok.startswith("-"):
+            break
+        name, eq, value = tok.partition("=")
+        if eq:                                    # --work-tree=/path
+            globals_[name] = value
+            i += 1
+        elif tok in GLOBAL_WITH_VALUE:            # --work-tree /path
+            if i + 1 < len(clause):
+                globals_[tok] = clause[i + 1]
+            i += 2
+        else:                                     # -p, --bare, anything unknown
+            globals_.setdefault(tok, "")
+            i += 1
+    return clause[i:], globals_
+
+
+def _target(globals_: dict) -> str | None:
+    """The tree this clause names.
+
+    `--work-tree` wins over `-C` when both are present, and that ordering is the
+    fix for a real finding: `-C` sets the directory git runs *from*, while
+    `--work-tree` says which tree it *operates on*, so with both given the second
+    is the one whose files change. The regex preferred `-C` unconditionally.
+    """
+    for key in ("--work-tree", "-C", "--git-dir"):
+        value = globals_.get(key)
+        if not value:
+            continue
+        # A target we cannot resolve is UNKNOWN, and unknown must not read as
+        # "no target given". `git -C "$SOME_DIR" reset --hard` tokenises to the
+        # literal `$SOME_DIR` — nothing here expands it — and treating that as a
+        # path resolves to a directory that is not a checkout, so the guard would
+        # shrug at a command about to hard-reset whatever the variable holds.
+        # Returning None puts it back on the cwd, which is where the first cut
+        # put every command and is the conservative half of being wrong.
+        if any(ch in value for ch in "$`~*?"):
+            return None
+        return value[:-5] if key == "--git-dir" and value.endswith("/.git") else value
+    return None
+
+
+def _has(args: list[str], *names: str) -> bool:
+    return any(a in names for a in args)
+
+
+def _short_flags(args: list[str]) -> set[str]:
+    """Letters from short-flag clusters — `-fd` is `f` and `d`."""
+    out: set[str] = set()
+    for a in args:
+        if a.startswith("-") and not a.startswith("--") and len(a) > 1:
+            out.update(a[1:])
+    return out
+
+
+def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
+    """Does `git <verb> <args>` overwrite work that is not committed?
+
+    Deliberately absent: `stash`. It belongs to this family and is already
+    refused a layer down by the reference-transaction hook `qb-hooks` installs,
+    which catches it outside Claude Code too and does not wait for a peer to be
+    live. Two gates on one command is two escape hatches under different names.
+    """
+    flags = _short_flags(args)
+    positional = [a for a in args if not a.startswith("-")]
+
+    if verb == "reset":
+        return _has(args, "--hard", "--merge")
+    if verb in ("checkout", "switch"):
+        if _has(args, "-f", "--force", "--discard-changes") or "f" in flags:
+            return True
+        if verb == "checkout":
+            if "--" in args:
+                return True
+            # `git checkout .` / `./src` — and `git checkout <trackedfile>`,
+            # which overwrites that file and looks exactly like checking out a
+            # branch. The only thing that tells them apart is the filesystem.
+            for p in positional:
+                if p == "." or p.startswith("./") or p.startswith("../"):
+                    return True
+                if tree and (Path(tree) / p).exists():
+                    return True
+        return False
+    if verb == "restore":
+        # `--staged` alone touches the index only; with `--worktree` it does both.
+        return not (_has(args, "--staged", "-S") and not _has(args, "--worktree", "-W"))
+    if verb == "clean":
+        if _has(args, "-n", "--dry-run") or "n" in flags:
+            return False                      # printing what it would remove
+        return _has(args, "--force") or bool(flags & set("fdx"))
+    if verb == "rm":
+        return _has(args, "-f", "--force") or "f" in flags
+    if verb == "worktree":
+        return positional[:1] == ["remove"] and (_has(args, "-f", "--force") or "f" in flags)
+    if verb in ("merge", "rebase", "am", "cherry-pick", "revert"):
+        # An abort restores the pre-operation state, discarding whatever was
+        # written into the tree while the conflict was being resolved.
+        return _has(args, "--abort")
+    # `checkout-index -f` and `read-tree --reset -u` were here and are gone. Both
+    # are real, and neither has ever happened: they were reach, and reach is what
+    # the second round's thirteen P1s were made of.
+    return False
+
+
+def _sweeps(verb: str, args: list[str]) -> bool:
+    """Does `git <verb> <args>` take work that is not yours INTO your commit?
+
+    The other half of the harm, and the half that was missing. In a shared tree
+    you cannot tell your uncommitted files from a peer's, so a command that
+    stages or commits "everything" stages theirs. Board 3879 is one agent's
+    in-flight file committed by another under a message saying the work was not
+    theirs — no bytes destroyed, and the author of that work still lost it.
+    """
+    flags = _short_flags(args)
+    positional = [a for a in args if not a.startswith("-")]
+    if verb == "commit":
+        return _has(args, "--all") or "a" in flags
+    if verb == "add":
+        if _has(args, "-A", "--all", "-u", "--update"):
+            return True
+        return any(p == "." or p.startswith("./") or p == ":/" for p in positional)
+    return False
+
+
+def classify(command: str, depth: int = 0) -> dict:
+    miss = {"destructive": False, "harm": None, "target": None, "verb": None,
+            "allowed_by": None, "parsed": True}
+
+    # LINE BY LINE FIRST, and this is not a nicety. `shlex` counts a newline as
+    # ordinary whitespace, so tokenising the whole string welds every line into
+    # one clause — and a two-line command reads as `… echo hi git reset --hard`,
+    # whose argv0 is `echo` and which therefore runs git nowhere at all. That is
+    # the same clause-scoping defect the regex had, reproduced in the thing
+    # written to remove it, and it is why the escape-hatch case below is a test.
+    #
+    # A quoted string may legitimately span lines, in which case a line will not
+    # tokenise on its own; then, and only then, fall back to the whole command.
+    tokens: list[str] = []
+    try:
+        for line in command.split("\n"):
+            if not line.strip():
+                continue
+            tokens.extend(_tokenise(line))
+            tokens.append("\n")
+    except ValueError:
+        try:
+            tokens = _tokenise(command)
+        except ValueError:
+            # Unbalanced quotes, an unterminated heredoc. We know nothing, and
+            # saying so is the only honest answer — see the module docstring.
+            return {**miss, "parsed": False}
+
+    for clause in _clauses(tokens):
+        clause, hatch = _strip_assignments(clause)
+        if not clause:
+            continue
+
+        # `bash -c '<command>'` — one level down, cheap now that we have tokens.
+        if depth < 2 and Path(clause[0]).name in SHELLS and "-c" in clause:
+            idx = clause.index("-c")
+            if idx + 1 < len(clause):
+                inner = classify(clause[idx + 1], depth + 1)
+                if inner["destructive"]:
+                    return {**inner, "allowed_by": hatch or inner["allowed_by"]}
+            continue
+
+        parsed = _git_args(clause)
+        if parsed is None:
+            continue
+        args, globals_ = parsed
+        if not args:
+            continue
+        verb, rest = args[0], args[1:]
+        # `--help` on THIS clause, and only this one. Asking a verb to explain
+        # itself is not running it.
+        if _has(rest, "--help", "-h") or "--help" in globals_ or "-h" in globals_:
+            continue
+        tree = _target(globals_)
+        harm = ("destroys" if _destroys(verb, rest, tree)
+                else "sweeps" if _sweeps(verb, rest) else None)
+        if harm:
+            return {"destructive": True, "harm": harm, "target": tree, "verb": verb,
+                    "allowed_by": hatch, "parsed": True}
+    return miss
+
+
+def main() -> int:
+    print(json.dumps(classify(sys.stdin.read())))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
