@@ -595,3 +595,190 @@ async def test_the_axes_it_does_not_weigh_are_named_in_the_payload(client, repo)
     assert 294 in [a["issue"] for a in axes]
     assert any("hunk" in a["axis"] for a in axes)
     assert any("preland" in a["axis"] for a in axes)
+
+
+# ============================================================ #449: the hole
+# filled from the forge rather than from a review that never happened.
+
+
+async def backfill(client, repo: str, pr: int, paths: list[str],
+                   total: int | None = None, **over) -> dict:
+    """One row exactly as `harness/bin/qb-backfill` writes one.
+
+    Spelt out here rather than shelled out to, because what is under test is the
+    board's reading of the row and not the tool's ability to produce it — the tool
+    has its own suite in `harness/tests/test_qb_backfill.py`. What must not drift
+    is the SHAPE: `reviewed: false`, a `skip_reason`, a file list, GitHub's own
+    count, the head it was read at, and nothing at all that resembles a verdict.
+    """
+    body = {
+        "repo": repo, "pr": pr,
+        "head_sha": head_of(pr), "base": "main",
+        "changed_files": files(*paths),
+        "changed_files_total": len(paths) if total is None else total,
+        "pr_state": "OPEN", "is_draft": False,
+        "reviewed": False,
+        "skip_reason": (f"qb-backfill (#449): this PR's changed-file list, read from "
+                        f"the forge at {head_of(pr)[:8]}. No reviewer ran; nothing in "
+                        f"this run is a review"),
+        "run_key": f"qb-backfill:v1:{repo}:{pr}:{head_of(pr)}",
+    }
+    r = await client.post("/review", json={**body, **over}, headers=AGENT)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+async def test_a_backfilled_file_list_turns_the_order_back_on(client, repo):
+    """#449, and the whole reason it was filed.
+
+    The queue below is the pre-#94 world: every PR was really panelled, and not
+    one of those rounds recorded a changed-file list, because nothing stored one
+    then. #80 will not publish an order over evidence like that — and correctly,
+    since `disjoint` is a claim about the whole population and a PR nobody has a
+    list for may touch anything.
+
+    A backfill row says the one thing that was missing and nothing else. What it
+    restores is the ORDER, not a review: the rows below are attested because the
+    board now holds a complete file list taken at the commit the queue is on, and
+    that is exactly what attestation has always meant.
+    """
+    for pr in (1101, 1102, 1103):
+        await record(client, repo, pr)          # panelled, and no file list at all
+        await join(client, repo, pr, verdict="ready")
+
+    before = await read(client, repo)
+    assert before["suggested_order"] is None
+    assert before["suggestion"]["unranked"] == [1101, 1102, 1103]
+    assert [b["fault"] for b in before["suggestion"]["order_trust"]["blind_spots"]] == [
+        "no-file-list"] * 3
+
+    await backfill(client, repo, 1101, ["panel.py", "epic.py", "lander.py"])
+    await backfill(client, repo, 1102, ["panel.py"])
+    await backfill(client, repo, 1103, ["docs/README.md"])
+
+    after = await read(client, repo)
+    # The queue itself did not move — nothing here reorders anything.
+    assert after["active_order"] == [1101, 1102, 1103]
+    # …and the proposal exists now: disjoint first, then the heavier collider.
+    assert after["suggested_order"] == [1103, 1101, 1102]
+    s = after["suggestion"]
+    assert s["trusted"] is True and s["covers_all"] is True
+    assert s["order_trust"]["caveat"] is None
+    assert s["order_trust"]["blind_spots"] == []
+    assert all(row["attested"] for row in s["prs"])
+
+
+async def test_a_backfilled_row_is_not_counted_as_a_review_anywhere(client, repo):
+    """The other half of #449, and the one that would have been expensive to get
+    wrong: a row written to restore an ORDER must not restore a review with it.
+
+    #94's rule is that a question whose wrong answer is a false all-clear asks
+    `reviewed IS TRUE`, and a count that exists to match what has already been
+    published asks `reviewed IS NOT FALSE`. Every consumer below is on the second,
+    so a backfill row is excluded from all of them by the flag it sets itself.
+    """
+    await backfill(client, repo, 1201, ["panel.py"])
+
+    listed = await client.get("/reviews", headers=AGENT,
+                              params={"repo": repo, "pr": 1201})
+    assert listed.json() == [], "a backfill is not a run of this repository"
+
+    shown = await client.get("/reviews", headers=AGENT,
+                             params={"repo": repo, "pr": 1201,
+                                     "include_unreviewed": "true"})
+    (row,) = shown.json()
+    assert row["reviewed"] is False
+    assert "qb-backfill" in row["skip_reason"]
+    # No verdict of any kind rode in with the list.
+    assert row["reviewers"] == []
+    assert row["judged"] is False
+    assert row["stopped"] is None and row["stop_confident"] is None
+    assert row["confirmed"] == 0 and row["unjudged"] == 0
+
+    findings = await client.get("/review/findings", headers=AGENT,
+                                params={"repo": repo, "pr": 1201, "days": 3650})
+    assert findings.json()["rounds"] == 0, "a backfill is not a round that was traced"
+
+    stats = await client.get("/review/stats", headers=AGENT,
+                             params={"repo": repo, "days": 3650})
+    assert stats.json()["runs"] == 0
+
+
+async def test_a_backfill_that_recorded_a_prefix_does_not_attest(client, repo):
+    """The failure this had to be unable to commit. GitHub caps a file list at
+    3,000 and pages it besides, so the one thing a backfill must never do is
+    record `changed_files_total` from the length of the list it managed to read —
+    which would make every truncated list attest, on every one of the biggest PRs
+    in the queue, which are the ones that collide most."""
+    await backfill(client, repo, 1301, ["one.py"], total=2500)
+    await backfill(client, repo, 1302, ["two.py"])
+    await join(client, repo, 1301, verdict="ready")
+    await join(client, repo, 1302, verdict="ready")
+
+    view = await read(client, repo)
+    assert view["suggested_order"] is None
+    rows = {r["pr"]: r for r in view["suggestion"]["prs"]}
+    assert rows[1301]["files_complete"] is False
+    assert rows[1301]["attested"] is False
+    assert view["suggestion"]["order_trust"]["incomplete_lists"] == 1
+
+
+async def test_a_backfill_at_a_head_the_branch_has_left_does_not_attest(client, repo):
+    """#80 attests a list only against the commit the queue has the PR on, so a
+    backfill row is worth exactly as much as its `head_sha` and no more. The
+    repair is to run the tool again, which is why it is built to be re-run."""
+    await backfill(client, repo, 1401, ["panel.py"])
+    await backfill(client, repo, 1402, ["panel.py"])
+    await join(client, repo, 1401, head="f" * 40, verdict="ready")   # it pushed
+    await join(client, repo, 1402, verdict="ready")
+
+    view = await read(client, repo)
+    assert view["suggested_order"] is None
+    rows = {r["pr"]: r for r in view["suggestion"]["prs"]}
+    assert rows[1401]["evidence_pinned"] is False
+    assert view["suggestion"]["order_trust"]["stale_evidence"] == 1
+
+    # …and re-recording at the commit the queue is on is all it takes.
+    await backfill(client, repo, 1401, ["panel.py"], head_sha="f" * 40,
+                   run_key=f"qb-backfill:v1:{repo}:1401:{'f' * 40}")
+    again = await read(client, repo)
+    assert again["suggested_order"] is not None
+
+
+async def test_a_second_backfill_of_the_same_head_records_nothing(client, repo):
+    """The re-run guard, at the board end where it actually holds: the `run_key`
+    carries the head, so a repeat is refused by the unique index rather than
+    doubling the row and moving a published number."""
+    first = await backfill(client, repo, 1501, ["panel.py"])
+    r = await client.post("/review", headers=AGENT, json={
+        "repo": repo, "pr": 1501, "head_sha": head_of(1501), "base": "main",
+        "changed_files": files("panel.py"), "changed_files_total": 1,
+        "reviewed": False, "skip_reason": "qb-backfill (#449): again",
+        "run_key": f"qb-backfill:v1:{repo}:1501:{head_of(1501)}"})
+    assert r.status_code == 201
+    assert r.json() == {"id": first["id"], "recorded": False,
+                        "reason": "duplicate run_key"}
+
+
+async def test_a_backfilled_rival_enters_the_collision_query_unfiltered(client, repo):
+    """`GET /review/collisions` gained no predicate in #94 and gains none here: a
+    backfilled run is selected as any other newest run is, and classified
+    afterwards. What rides along is #94's own pair of columns, so a caller
+    ordering a drain can see that the rival it is about to collide with has been
+    read by nobody."""
+    await backfill(client, repo, 1601, ["panel.py", "epic.py"])
+    await backfill(client, repo, 1602, ["panel.py"])
+
+    r = await client.get("/review/collisions", headers=AGENT,
+                         params={"repo": repo, "pr": 1601, "days": 3650})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # Every class is a top-level list, and the rival lands in exactly one of them.
+    (rival,) = [row for cls in (COLLIDES, DISJOINT, PARTIAL, UNANSWERABLE)
+                for row in body[cls]]
+    assert rival["pr"] == 1602
+    assert rival["class"] == COLLIDES
+    assert rival["shared"] == 1
+    assert rival["files_complete"] is True
+    assert rival["reviewed"] is False
+    assert "qb-backfill" in rival["skip_reason"]
