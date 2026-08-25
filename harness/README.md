@@ -1071,8 +1071,15 @@ is what makes a spawn countable:
 
 | command | claims |
 |---|---|
+| `/investigate` | `issue <n>` |
 | `/fix-issue`, `/fix-and-review`, `/fix-and-land` | `issue <n>` |
 | `/review-pr`, `/panel-review-pr` | `pr <n>` |
+
+`/investigate` is the read-only rung and it is listed first deliberately. It was added for
+#63's watcher, and it *narrows* what a trigger can do rather than widening it: the watcher's
+default answer on a close call is understanding rather than a PR, so an allowlist holding
+`/fix-issue` and not `/investigate` would have left the safe action the unstartable one and
+the dangerous action the only one available.
 
 **Everything it starts is counted, claimed, attachable and endable.** In that order, and the
 order is the feature — a refusal costs nothing to unwind only while nothing has been taken:
@@ -1108,7 +1115,8 @@ session's own `create-worktree` renews and that the land step, the teardown and 
 back.
 
 **And what pulled it is recorded, which is the question a session nobody started raises.**
-`--via` names the caller — `cli` for a person at a prompt, `dash` for the dashboard's ⚒ —
+`--via` names the caller — `cli` for a person at a prompt, `dash` for the dashboard's ⚒,
+`watch` for the issue watcher (#63) —
 and it lands on the claim note, on the board post (spawns *and* refusals) and on the pane as
 `@qb_spawn_via`, so `tmux list-panes -a -F '#{@qb_spawn_via}'` answers it for a window
 somebody has found and does not recognise. The set is closed for the same reason the command
@@ -1137,7 +1145,7 @@ the plan, picks an item, or tells an agent what to work on. It is told a command
 by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
 agent takes stays the agent's own choice, self-selected and claimed atomically.
 
-**What pulls it: the dashboard's ⚒, and nothing else yet (#371).** The primitive landed with
+**What pulls it: the dashboard's ⚒ (#371), and the issue watcher (#63).** The primitive landed with
 no caller at all, which made the loop readable and still unstartable. The first caller is the
 cheapest one there is — `qb-dash-tui`'s ⚒, which is still a human click, so it needed no new
 safety: the gates, the machine cap, the allowlist and the claim are all here, at the
@@ -1146,11 +1154,30 @@ spawn lacked: a session inside `qb-admit`'s window, holding a claim taken before
 existed, endable by session id from the moment the pane appears, and posted to the board as
 `via dash`.
 
+**The second caller is the first one with no human at the end of it.** `issue_watch.py
+--start` (#63) hands `qb-start` an issue its survey found actionable, `via watch`. Nothing
+about the primitive changed to allow it, which is the point of having put the gates here:
+the machine policy, the cap, `qb-pace`, `qb-admit`, the allowlist and the claim all apply to
+the watcher exactly as they do to a click. What is genuinely new is that the answer to *what
+started this* is no longer a person, which is why `watch` is its own trigger name rather than
+being folded into `cli` — a board someone is scanning for surprises needs that to be greppable.
+
+The watcher adds brakes of its own on top, because the ones at the primitive are per-spawn and
+it is the end of the chain that reads a **public tracker**: `--start` is off, so a survey still
+starts nothing unless a run asks it to; `--start-max` (default 1) bounds sessions started; and
+`--attempt-max` (default 5) bounds spawn requests whether they start anything or not (the
+once-per-run `--policy` probe is a question, not a request, and sits outside it).
+The second ceiling is not redundant — a refusal about one issue starts nothing and so spends
+none of the first, which let a backlog of held issues make one call each while `--start-max 1`
+appeared to hold. Details in `harness/loops/README.md`.
+
 **A hook or a cron floor is still not built, and that is the deliberate part.** The button
-is paced by a person; the other two are not, and a trigger nobody is watching is the thing
-that turns a bug into an overnight incident. A `SessionEnd` hook also has a question to
-answer first that the button does not — *what is next* — and answering it by reading the
-plan and handing an agent the first item is the dispatch this whole design refuses.
+is paced by a person; a hook and a cron are not, and a trigger nobody is watching is the thing
+that turns a bug into an overnight incident. `--start` does not change that: it is a flag on a
+command, so somebody still runs it, and putting *that* on a timer is a decision made in a
+crontab where it can be read — not a default anything here ships. A `SessionEnd` hook also has
+a question to answer first that the button does not — *what is next* — and answering it by
+reading the plan and handing an agent the first item is the dispatch this whole design refuses.
 
 ### `qb-status` — the pane's answer, the agent's answer, and the gap
 
