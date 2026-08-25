@@ -210,6 +210,19 @@ reveal() {   # reveal <text>
 # `#[fg=#{@qb_pace_fg}]` does not work — style parsing and format expansion are
 # different passes in tmux — so the colour is chosen by a conditional over this,
 # exactly as seat_state_style picks a seat's colour. Same reason, same spelling.
+# A VERDICT THAT COULD NOT BE REFRESHED IS NOT A CURRENT ONE. This used to
+# return quietly on a missing binary, a timeout, an error or an empty answer,
+# which left the last reading on screen looking live — so a `STOP` from twenty
+# minutes ago read exactly like a `STOP` from now, on the one number this line
+# exists to carry. The reading is KEPT rather than cleared, because a stale
+# ceiling is still the best estimate anyone has and blanking it would lose that;
+# it is marked instead, and the format draws a marked one dimmer and prefixed
+# `~` — the same `~` the dashboard already uses for "at most this long ago".
+stale() {
+  [ -n "$(opt @qb_pace)" ] || return 0
+  tmux set-option -t "$SID:" @qb_pace_sev stale 2>/dev/null || true
+}
+
 pace() {
   local bin line verdict
   # QB_SEATS_PACE=off, recorded on the session by qb-seats. One knob for "do not
@@ -218,13 +231,13 @@ pace() {
   # not read the developer's real usage fifty times a run.
   [ "$(opt @qb_top_pace)" = 0 ] && return 0
   bin=$(command -v qb-pace 2>/dev/null) || bin="$(cd -P "$(dirname -- "$0")" && pwd)/qb-pace"
-  [ -x "$bin" ] || return 0
+  [ -x "$bin" ] || { stale; return 0; }
   if command -v timeout >/dev/null 2>&1; then
     line=$(timeout 20 "$bin" 2>/dev/null) || line=""
   else
     line=$("$bin" 2>/dev/null) || line=""
   fi
-  [ -n "$line" ] || return 0
+  [ -n "$line" ] || { stale; return 0; }
   # `pace: SLOW — 7d at 83% (warning); resets in 24h33m` is one line and the
   # prefix is this line's own label, so it goes.
   line=${line#pace: }

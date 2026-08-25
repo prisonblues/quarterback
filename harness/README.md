@@ -1419,6 +1419,14 @@ anyway, so it writes the answers into session options and the format merely read
 colour through a conditional over literal styles rather than `#[fg=#{@qb_pace_sev}]`, for the
 reason `seat_state_style` gives — style parsing and format expansion are different passes.
 
+**A reading that could not be refreshed is not a current one.** `pace()` returned quietly on a
+missing binary, a timeout, an error or an empty answer, which left the last reading on screen
+looking live — a `STOP` from twenty minutes ago read exactly like a `STOP` from now, on the one
+number the line exists to carry. The reading is *kept*, because a stale ceiling is still the best
+estimate anyone has and blanking it would throw that away to avoid looking confident; it is
+marked `stale` instead, and drawn dimmer and prefixed `~` — the same `~` the dashboard already
+uses for "at most this long ago".
+
 **The reveal is an aesthetic and says so.** It is lexray's `decrypt_text.js` effect with the same
 parameters — a 40ms tick, one character settling every second tick, left to right, spaces left
 alone — replaying every `QB_SEATS_TOP_EVERY` seconds (30 by default; `0` draws the line once and
@@ -1554,6 +1562,37 @@ a 78x44 dash down the side of a 121-column tape, where it had been 78x32 over a 
 one. So the tape steps out, the dash goes in, the tape comes back. Which pane is hidden is
 recorded on the **session** (`@qb_hidden_tape`, `@qb_hidden_dash`) and never on the server:
 two screens must be able to disagree about whether their tape is showing.
+
+**A path crosses two parsers, and `sh_quote` alone is not enough.** The dispatcher's path is
+written into a tmux command string, so it needs `sh_quote` *and* `tmux_quote` — the rule
+`tmux_quote` itself states, and which the first cut of `qb_actions` did not follow. The failure
+is the silent one: a checkout under `a$Bdir` bound every key to `/…/a/qb-seat-key`, because tmux
+expanded `$Bdir` to nothing. The screen builds, the bar draws, the table installs, and every key
+does nothing at all. A `"` in the path is the loud version — `syntax error`, and a half-built
+screen.
+
+The two halves of the escaping do not scale together, which is why `tmux_quote_n` exists beside
+`tmux_quote`. `\`, `"` and `$` are consumed by tmux's *parser*, once per pass, so a value inside
+a string inside a string needs them escaped twice — and a confirmed action is exactly that, since
+`confirm-before`'s command is stored by `bind-key` and parsed again when the answer comes back.
+`#` is not: parsing never touches it, and it is the single *format expansion* at the end that
+turns `##` into `#`, so doubling it per pass gives `####` and the wrong path. Two parses, one
+expansion. `test_the_key_works_from_a_checkout_full_of_metacharacters` presses a plain action and
+a confirmed one through a real keystroke from a directory called `a$B"c\d#e f'g`, because nothing
+short of that covers the whole chain.
+
+**A key press runs the copy its own screen was built with.** `bind-key -T qb` is server-wide and
+holds one path: the root key is gated per screen, but the table is not, so the last screen built
+writes it and a key pressed on an older screen arrives in the newer screen's `qb-seat-key`. Only
+wrong during a rollout, and exactly then that it matters — the same question `dash_hooks` answers
+for the resize hook. So the screen records `@qb_key_bin` and the dispatcher hands over, once,
+marked in the environment: a recorded path can be stale or can be this file under another name,
+and a hand-off that could hand off again is a loop a `run-shell -b` would hide completely.
+
+**A toggle does not move the cursor.** `join-pane` leaves the joined pane active, so showing the
+tape landed you *in* the tape — the next thing typed went to a board follower instead of the
+agent being worked with, and the next `C-q x` refused with "that pane is not a seat", correctly
+and confusingly. A toggle is about what is on the screen, never about where you are on it.
 
 **The screen and the pane travel in the binding**, expanded by tmux as the key is pressed —
 where `qb-seat-click` has to stash them in a server option and read them back. That stash exists

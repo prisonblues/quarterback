@@ -428,6 +428,30 @@ tmux_quote() {
   printf '%s' "$s"
 }
 
+# THE SAME THING FOR A VALUE THAT CROSSES MORE THAN ONE TMUX PARSE, and the two
+# halves do not scale together, which is the whole reason this is a second
+# function rather than a loop over the first.
+#
+# `\`, `"` and `$` are consumed by tmux's PARSER, once per pass — so a value
+# inside a string inside a string needs them escaped twice. `#` is not: parsing
+# never touches it, and it is the single FORMAT EXPANSION at the end that turns
+# `##` into `#`. Doubling it once per pass gives `####`, which expands to `##`
+# and leaves the wrong path.
+#
+# Measured, because it is not guessable: a confirmed action's command is stored
+# by `bind-key`, parsed again by `confirm-before` when the answer comes back, and
+# format-expanded once by `run-shell`. Two parses, one expansion.
+tmux_quote_n() {   # <passes> <value>
+  local n=$1 s=$2 i=0
+  while [ "$i" -lt "$n" ]; do
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//\$/\\\$}
+    i=$((i + 1))
+  done
+  printf '%s' "${s//\#/\#\#}"
+}
+
 # THIS FILE, absolutely. Not `beside_me qb-seats`, which asks PATH first — see
 # dash_hooks for why a self-referential caller cannot use that answer unchecked.
 myself() { printf '%s/%s' "$(cd -P "$(dirname "$0")" && pwd)" "${0##*/}"; }
@@ -709,15 +733,21 @@ install_bar() {
 # THE SEVERITY IS A CONDITIONAL OVER LITERAL STYLES, not a colour substituted
 # into one. `#[fg=#{@qb_pace_fg}]` does not work — style parsing and format
 # expansion are different passes in tmux — and seat_state_style says the same
-# thing about a seat's colour. The three arms are 6.13:1, 8.20:1 and 6.53:1
-# against this ground; see seat_bar for why a background is named at all.
+# thing about a seat's colour. The four arms are 6.13:1, 8.20:1, 6.53:1 and
+# 6.36:1 against this ground; see seat_bar for why a background is named at all.
+#
+# `stale` is the one that is not a severity: it means qb-seat-top could not
+# refresh the reading, so what is on screen is the last one it got. It is drawn
+# dimmer and prefixed `~`, which is the mark the dashboard already uses for "at
+# most this long ago" — a stale ceiling is still the best estimate anyone has,
+# and blanking it would throw that away to avoid looking confident.
 top_line() {
   local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
   printf '%s' \
 "#[fill=$BAR_BG]#[align=left]$ground #{@qb_top}"\
 "#[align=right]"\
 "#{?@qb_pace,"\
-"#{?#{==:#{@qb_pace_sev},critical},#[fg=colour210]#[bg=$BAR_BG],#{?#{==:#{@qb_pace_sev},warning},#[fg=colour214]#[bg=$BAR_BG],#[fg=colour108]#[bg=$BAR_BG]}}"\
+"#{?#{==:#{@qb_pace_sev},stale},#[fg=colour248]#[bg=$BAR_BG]~,#{?#{==:#{@qb_pace_sev},critical},#[fg=colour210]#[bg=$BAR_BG],#{?#{==:#{@qb_pace_sev},warning},#[fg=colour214]#[bg=$BAR_BG],#[fg=colour108]#[bg=$BAR_BG]}}}"\
 "#{@qb_pace}$ground  ,}"\
 "%H:%M "
 }
@@ -839,8 +869,20 @@ qb_key() {
 }
 
 qb_actions() {   # <qb-seat-key path> <qb-seats path>
-  local d k here
-  d=$(sh_quote "$1"); k=$(sh_quote "$2")
+  local d dd k here
+  # SH_QUOTE THEN TMUX_QUOTE, which is the rule stated by tmux_quote above and
+  # which this function did not follow. sh_quote alone leaves `$`, `"`, `\` and
+  # `#` live for tmux's own parser, and the failure is the silent one: a checkout
+  # under `a$Bdir` bound every key to `/…/a/qb-seat-key`, because tmux expanded
+  # `$Bdir` to nothing. The screen builds, the bar draws, the table installs, and
+  # every key does nothing at all — `run-shell -b` discards both streams. A `"`
+  # in the path is the loud version: `syntax error`, and a half-built screen.
+  #
+  # `d` crosses one tmux parse; `dd` crosses two, because a confirmed action's
+  # command is a tmux string inside a tmux string.
+  d=$(tmux_quote_n 1 "$(sh_quote "$1")")
+  dd=$(tmux_quote_n 2 "$(sh_quote "$1")")
+  k=$(tmux_quote_n 1 "$(sh_quote "$2")")
   # THE SCREEN AND THE PANE TRAVEL IN THE BINDING, expanded by tmux as the key is
   # pressed. This is where qb-seat-click's stash would have gone, and it is not
   # needed: `#{mouse_status_range}` is scoped to a mouse EVENT and is gone by the
@@ -870,7 +912,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
   # tmux's own popups do.
   printf '%s\n' \
     "a|add a seat|run-shell -b \"$d add $here\"" \
-    "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$d close $here\\\"\"" \
+    "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$dd close $here\\\"\"" \
     "t|show or hide the tape|run-shell -b \"$d tape $here\"" \
     "d|show or hide the dash|run-shell -b \"$d dash $here\"" \
     "=|the dash back to the width it asked for|run-shell -b \"$d fit $here\"" \
@@ -879,7 +921,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "j|jump to a seat — then 1-9|switch-client -T qb" \
     "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
     "||" \
-    "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$d kill $here\\\"\"" \
+    "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$dd kill $here\\\"\"" \
     "?|these keys, in full|display-popup -w 72 -h 27 \"$d guide\""
   # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
   # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
@@ -896,6 +938,18 @@ install_key() {
   # explain. On the session, so a second screen with a different QB_SEATS_KEY is
   # not answered for by the first.
   tmux set-option -t "$SESSION_ID:" @qb_key "$key"
+  # WHICH DISPATCHER THIS SCREEN WAS BUILT WITH, and it is recorded because the
+  # `qb` TABLE CANNOT HOLD IT. `bind-key -T qb` is server-wide: the root key is
+  # gated per screen, but the table's contents are one set for the whole server,
+  # so the last screen built wins and an older screen's keys then run the newer
+  # screen's qb-seat-key. That is the same "which copy of itself" question
+  # dash_hooks answers for the resize hook, one surface along, and it bites in
+  # the same place — a rollout, where PATH's harness and a checkout disagree.
+  #
+  # The table still names one path; qb-seat-key reads this and hands over to the
+  # copy the screen it was pressed on actually belongs to. Recorded even when the
+  # two agree, so the answer never depends on which screen was built last.
+  tmux set-option -t "$SESSION_ID:" @qb_key_bin "$dispatch"
 
   # A ROW WITH NO KEY IS A MENU SEPARATOR and binds nothing — which is why the
   # grouping lives in the table beside the actions rather than as a slice of the
@@ -922,7 +976,7 @@ install_key() {
   n=1
   while [ "$n" -le 9 ]; do
     tmux bind-key -T qb "$n" \
-      "run-shell -b \"$(sh_quote "$dispatch") seat$n '#{session_id}' '#{pane_id}'\""
+      "run-shell -b \"$(tmux_quote_n 1 "$(sh_quote "$dispatch")") seat$n '#{session_id}' '#{pane_id}'\""
     n=$((n + 1))
   done
 

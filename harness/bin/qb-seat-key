@@ -183,6 +183,29 @@ case "$SESSION" in
     ;;
 esac
 
+# ---- whose screen is this, and whose copy should be running ------------------
+# THE `qb` TABLE IS SERVER-WIDE AND HOLDS ONE PATH. The root key is gated per
+# screen — `#{==:#{@qb_key},<key>}` — but `bind-key -T qb` is not gated at all:
+# there is one table for the whole server and the last screen built wrote it. So
+# a key pressed on screen A can arrive in screen B's qb-seat-key, which is only
+# ever wrong during a rollout and is exactly then that it matters.
+#
+# @qb_key_bin is what the screen recorded at build time, so the fix is to hand
+# over. HOP ONCE, marked in the environment: the recorded path can be stale, or
+# can be this file under another name, and a hand-off that could hand off again
+# is a loop that a `run-shell -b` would hide completely.
+#
+# Everything above this line is version-agnostic — reading a session id, resolving
+# a name — so it is safe for either copy to have done it.
+if [ -z "${QB_SEAT_KEY_HANDOFF:-}" ]; then
+  theirs=$(tmux show-options -v -t "$SID:" @qb_key_bin 2>/dev/null) || theirs=""
+  mine="$(cd -P "$(dirname -- "$0")" && pwd)/${0##*/}"
+  if [ -n "$theirs" ] && [ "$theirs" != "$mine" ] && [ -x "$theirs" ]; then
+    export QB_SEAT_KEY_HANDOFF=1
+    exec "$theirs" "$ACTION" "$SESSION" "$PANE"
+  fi
+fi
+
 # ---- the scripts this shells out to -----------------------------------------
 # PATH first so an installed copy beats a checkout, then this script's own
 # directory, because the four install together. A `run-shell` from a key binding
@@ -341,8 +364,27 @@ hide_pane() {   # hide_pane <what> <pane id> <size to come back at>
 }
 
 # ---- the actions ------------------------------------------------------------
+# `join-pane` LEAVES THE JOINED PANE ACTIVE — measured on 3.6a, and it is not
+# what a toggle should do. Showing the tape again would land the cursor in the
+# tape, so the next thing typed goes to a board follower instead of the agent
+# that was being worked with, and the next `C-q x` refuses with "that pane is not
+# a seat" — correctly, and confusingly. A toggle is about what is on the screen,
+# never about where you are on it.
+#
+# Read before, put back after, and tolerated: a pane that has gone in between
+# (the ✕ can close a seat while the tape is hidden) is not worth failing a toggle
+# that has already done its job.
+active_pane() { tmux display-message -p -t "$SID:" '#{pane_id}' 2>/dev/null || true; }
+
+keep_cursor() {   # keep_cursor <pane id it was on>
+  [ -n "$1" ] || return 0
+  pane_exists "$1" || return 0
+  tmux select-pane -t "$1" 2>/dev/null || true
+}
+
 toggle_tape() {
-  local state p size widths target
+  local state p size widths target was
+  was=$(active_pane)
   state=$(hidden_state tape)
   if [ -n "$state" ]; then
     read -r p size widths <<<"$state"
@@ -361,6 +403,7 @@ toggle_tape() {
     tmux join-pane -v -f -l "$size" -s "$p" -t "$target" \
       || die "tape: tmux would not put the pane back"
     restore_widths "$widths"
+    keep_cursor "$was"
     tmux set-option -t "$SID:" -u @qb_hidden_tape
   else
     p=$(tape_pane)
@@ -380,7 +423,8 @@ toggle_tape() {
 # comes back — the same three panes, the same processes, the order they were
 # built in.
 toggle_dash() {
-  local state p size widths target tape tape_h=""
+  local state p size widths target tape tape_h="" was
+  was=$(active_pane)
   state=$(hidden_state dash)
   if [ -n "$state" ]; then
     read -r p size widths <<<"$state"
@@ -429,6 +473,7 @@ toggle_dash() {
         || tmux set-option -t "$SID:" @qb_hidden_tape "$tape $tape_h $widths"
     fi
     restore_widths "$widths"
+    keep_cursor "$was"
     tmux set-option -t "$SID:" -u @qb_hidden_dash
   else
     p=$(dash_pane)

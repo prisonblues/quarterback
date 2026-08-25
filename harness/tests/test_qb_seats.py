@@ -1277,6 +1277,150 @@ def test_the_top_line_paints_its_own_colours_too(screen):
         assert ratio >= 4.5, f"{fg} on {bg} is {ratio:.2f}:1, and 4.5:1 is the floor"
 
 
+def test_a_toggle_does_not_steal_the_cursor(screen):
+    """`join-pane` leaves the joined pane ACTIVE — measured on 3.6a — and that is
+    not what a toggle should do.
+
+    Showing the tape again landed the cursor in the tape, so the next thing typed
+    went to a board follower instead of the agent being worked with, and the next
+    `C-q x` refused with "that pane is not a seat" — correctly, and confusingly.
+    A toggle is about what is on the screen, never about where you are on it.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    seat2 = next(p for p, n in panes(screen) if n == "2")
+    screen.tmux("select-pane", "-t", seat2)
+
+    def where():
+        return screen.tmux("display-message", "-p", "-t", "=t:",
+                           "#{pane_id}").stdout.strip()
+
+    for action in ("tape", "tape", "dash", "dash"):
+        assert seat_key(screen, action, "t").returncode == 0
+        assert where() == seat2, f"{action} moved the cursor to {where()} (was {seat2})"
+
+
+def test_the_key_works_from_a_checkout_full_of_metacharacters(screen, tmp_path):
+    """RED/GREEN. `sh_quote` alone left `$`, `"`, `\\` and `#` live for tmux's OWN
+    parser, and the failure was the silent one: a checkout under `a$Bdir` bound
+    every key to `/…/a/qb-seat-key`, because tmux expanded `$Bdir` to nothing.
+    The screen builds, the bar draws, the table installs, and every key does
+    nothing at all — `run-shell -b` discards both streams. A `"` in the path is
+    the loud version: `syntax error`, and a half-built screen.
+
+    Driven through a real keystroke, because that is the only thing that proves
+    the whole chain: the bind-time parse, the confirm-time second parse, the
+    format expansion, and the shell that finally runs it. A PLAIN action crosses
+    one tmux parse and a CONFIRMED one crosses two, so both are pressed.
+    """
+    odd = tmp_path / "a$B\"c\\d#e f'g"
+    odd.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key", "qb-seat-top"):
+        copy = odd / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+
+    done = screen("-n", "2", exe=[str(odd / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert pane_id(screen, "tape"), "no tape to toggle"
+
+    with attached_client(screen, 140, 40) as press:
+        press("\x11", "t")                      # plain: one tmux parse
+        assert wait_until(lambda: pane_id(screen, "tape") is None), \
+            "C-q t did nothing — the bound path is not the real one"
+        press("\x11", "t")
+        assert wait_until(lambda: pane_id(screen, "tape") is not None)
+
+        # The cursor has to be on a seat for `close` to have one to close, and
+        # the toggle above deliberately left it where it was.
+        seat1 = next(p for p, n in panes(screen) if n == "1")
+        screen.tmux("select-pane", "-t", seat1)
+        press("\x11", "x", "y")                 # confirmed: two tmux parses
+        assert wait_until(lambda: sorted(n for _, n in panes(screen) if n) == ["2"]), \
+            "C-q x y did nothing — the confirmed path lost a quoting layer"
+
+
+def test_a_key_press_runs_the_copy_its_own_screen_was_built_with(screen, tmp_path):
+    """`bind-key -T qb` is SERVER-WIDE and holds one path. The root key is gated
+    per screen, but the table is not: the last screen built writes it, so a key
+    pressed on an older screen arrives in the newer screen's qb-seat-key. That is
+    only wrong during a rollout, and it is exactly then that it matters — the
+    same "which copy of itself" question dash_hooks answers for the resize hook.
+
+    So the screen records @qb_key_bin and the dispatcher hands over. The marker
+    proves the hand-off happened rather than the wrong copy quietly coping.
+    """
+    marker = tmp_path / "handed-off"
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    for name in ("qb-seat-key", "qb-seat-click", "qb-seats", "qb-seat-top"):
+        copy = theirs / name
+        text = (BIN / name).read_text()
+        if name == "qb-seat-key":
+            text = text.replace("set -euo pipefail\n",
+                                f"set -euo pipefail\n: > {marker}\n", 1)
+        copy.write_text(text)
+        copy.chmod(0o755)
+
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    assert screen("-n", "2", exe=[str(theirs / "qb-seats")]).returncode == 0
+    recorded = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_key_bin").stdout.strip()
+    assert recorded == str(theirs / "qb-seat-key"), recorded
+
+    # Now press it with the OTHER copy — which is what a second screen built from
+    # a different checkout leaves in the shared table.
+    marker.unlink(missing_ok=True)
+    done = subprocess.run([str(BIN / "qb-seat-key"), "tape", "t"],
+                          env=click_env(screen), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert marker.exists(), "the wrong copy handled the key instead of handing over"
+    assert aux_panes(screen) == [], "the tape did not hide"
+
+
+def test_a_pace_reading_that_could_not_be_refreshed_says_so(screen, tmp_path):
+    """A verdict that could not be refreshed is not a current one. `pace()` used
+    to return quietly on a missing binary, a timeout, an error or an empty
+    answer, which left the last reading on screen looking live — so a `STOP` from
+    twenty minutes ago read exactly like a `STOP` from now, on the one number the
+    line exists to carry.
+
+    The reading is KEPT, because a stale ceiling is still the best estimate
+    anyone has; it is marked, and the format draws a marked one dimmer and
+    prefixed `~`.
+    """
+    paceb = tmp_path / "paceb"
+    paceb.mkdir()
+    stub = paceb / "qb-pace"
+    stub.write_text("#!/bin/sh\necho 'pace: STOP — 5h at 99% (critical); resets in 12m'\n")
+    stub.chmod(0o755)
+    screen.env["PATH"] = f"{paceb}:{screen.env['PATH']}"
+    screen.env["QB_SEATS_PACE"] = "on"
+    screen.env["QB_SEATS_TOP_EVERY"] = "0"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_PACE"] = "off"
+
+    def opt(name):
+        return screen.tmux("show-options", "-v", "-t", "=t:", name).stdout.strip()
+
+    assert wait_until(lambda: opt("@qb_pace_sev") == "critical"), opt("@qb_pace_sev")
+    said = opt("@qb_pace")
+    assert "STOP" in said, said
+
+    # Now qb-pace stops answering, exactly as a timeout or an outage would.
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    done = subprocess.run([str(BIN / "qb-seat-top"), "$0", "--once"],
+                          env={**click_env(screen), "PATH": f"{paceb}:{screen.env['PATH']}"},
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert opt("@qb_pace_sev") == "stale", \
+        f"a reading that could not be refreshed still reads as current: {opt('@qb_pace_sev')}"
+    assert opt("@qb_pace") == said, "the last known reading was thrown away"
+
+
 def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
     """The partial-install case, and it used to take the whole build down.
 
