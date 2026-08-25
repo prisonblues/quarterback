@@ -1310,6 +1310,115 @@ def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
         f"the line is not even drawn once: {said!r}"
 
 
+def test_the_reveal_is_the_same_shape_as_the_answer(screen):
+    """The effect itself, read rather than caught.
+
+    A frame is on screen for 40ms, so a test that polls for one is a test that
+    races it — and that is not theoretical: the first spelling of this passed
+    locally, passed in the flake sandbox, and failed in the flake sandbox on the
+    same commit, for no reason but load. `--frames` prints the reveal with no
+    tmux and no clock anywhere near it, so everything the effect promises is
+    asserted by reading:
+
+      * every frame is exactly as wide as the answer, or the line jitters
+        sideways all the way through the reveal;
+      * spaces are never scrambled, which is what makes it read as decryption
+        rather than as noise — the shape of the words is there from frame one;
+      * characters settle left to right and never come unsettled;
+      * the last frame is the text itself.
+    """
+    text = "quarterback: a-repo"
+    done = subprocess.run([str(BIN / "qb-seat-top"), "--frames", text],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    frames = done.stdout.splitlines()
+    assert len(frames) > len(text), f"only {len(frames)} frames for {len(text)} characters"
+
+    for frame in frames:
+        assert len(frame) == len(text), f"{frame!r} is {len(frame)} wide, not {len(text)}"
+        for i, c in enumerate(text):
+            if c == " ":
+                assert frame[i] == " ", f"a space was scrambled in {frame!r}"
+
+    # THE SETTLED PREFIX IS COMPUTED, NOT MEASURED, and that distinction is the
+    # whole of why this test is not flaky. `commonprefix(frame, text)` counts a
+    # SCRAMBLED character that happens to land on the right one, so the measured
+    # prefix jumps around and a monotonicity assertion over it fails roughly one
+    # run in ten — which is exactly how this test first shipped. The reveal's
+    # contract is arithmetic: one character settles every second tick, so frame i
+    # has (i + 1) // 2 of them and those must be right whatever the tail rolled.
+    settle_every = 2                      # decrypt_text.js's settleEvery
+    for i, frame in enumerate(frames[:-1]):
+        revealed = (i + 1) // settle_every
+        assert frame[:revealed] == text[:revealed], (
+            f"frame {i} should have settled {revealed} characters: {frame!r}")
+    assert frames[-1] == text, f"the reveal ended on {frames[-1]!r}"
+
+
+def test_the_line_reveals_on_a_screen_somebody_is_looking_at(screen):
+    """That it runs at all, which is the only part a live screen has to answer —
+    and it is answered with a COUNT rather than by catching a frame, because a
+    count is still true a minute later.
+
+    A detached screen is deliberately not animated to: fifty `set-option`s played
+    to an empty socket buys nothing, and a screen left over a weekend would play
+    thousands. So this needs a real client, and the count must not move before
+    one arrives.
+    """
+    screen.env["QB_SEATS_TOP_EVERY"] = "5"
+    screen.env["QB_SEATS_TOP_ANIMATE"] = "1"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_TOP_EVERY"] = "0"
+        screen.env["QB_SEATS_TOP_ANIMATE"] = "0"
+
+    def reveals():
+        said = screen.tmux("show-options", "-v", "-t", "=t:",
+                           "@qb_top_reveals").stdout.strip()
+        return int(said) if said.isdigit() else 0
+
+    assert reveals() == 0, "a detached screen was animated to"
+    with attached_client(screen, 120, 30):
+        assert wait_until(lambda: reveals() >= 1, timeout=40), \
+            "the line never revealed on a screen with a client on it"
+        assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip() \
+            == f"quarterback: {screen.repo.name}", "the reveal did not settle on the text"
+
+
+def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
+    """The partial-install case, and it used to take the whole build down.
+
+    During a rollout PATH's harness and a checkout disagree about which scripts
+    exist, so `beside_me` answers with a path that is not there — and a
+    `run-shell -b` on a missing command does NOT fail quietly. Measured on 3.6a
+    as `no current client` and `not in a mode` on stderr and a non-zero exit,
+    which under `set -e` killed qb-seats with the session, the seats and the tape
+    already created, on an error naming none of that. Same shape as the resize
+    hook's version of this, and the same answer: ask first.
+
+    What the screen loses is only that the line refreshes. The line itself is set
+    before the probe, so it still says which screen this is.
+    """
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key"):
+        copy = lonely / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    # BIN off PATH, or beside_me finds the ordinary qb-seat-top there.
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+
+    done = screen("-n", "2", exe=[str(lonely / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
+    assert "qb-seat-top" in done.stderr, \
+        f"nothing said why the line will not refresh: {done.stderr}"
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", \
+        f"the line is not even drawn once: {said!r}"
+
+
 def test_the_reveal_settles_on_exactly_the_static_text(screen):
     """The animation is an aesthetic and nothing may depend on it, so the thing
     worth pinning is that it is INVISIBLE in the outcome: the reveal ends on

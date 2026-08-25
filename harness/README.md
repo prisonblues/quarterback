@@ -1432,6 +1432,17 @@ One `tmux set-option` round trip is **3.5ms** — a ceiling of about 286 frames 
 21fps. The cost is 175ms of tmux calls per replay against a build that already spends forty of
 them, which is what makes a 30-second replay reasonable and a continuous loop not.
 
+**Neither test catches a frame**, and that is deliberate. A frame is on screen for 40ms, so a
+test that polls for one races it — the first spelling did, passing locally, passing in the flake
+sandbox, and failing in the flake sandbox on the same commit for no reason but load. So the
+effect is read rather than caught: `qb-seat-top --frames TEXT` prints every frame of the reveal
+with no tmux and no clock anywhere near it, and the assertions are arithmetic — one character
+settles every second tick, so frame *i* has `(i + 1) // 2` of them settled and those must be
+right whatever the scrambled tail rolled. (Measuring the settled prefix instead of computing it
+is its own flake: a random character that lands on the right one inflates the count, which failed
+about one run in ten.) That it runs *at all* on a live screen is answered by `@qb_top_reveals`, a
+count of completed reveals — still true a minute later, where a frame is not.
+
 Three things the effect needed that the browser version does not:
 
 - **Single-width characters only.** `decrypt_text.js` scrambles with `∞ ∑ ∏ √ ∫ ≤ ≥ ≈ ≠ ± × ÷`,

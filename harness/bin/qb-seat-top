@@ -3,6 +3,7 @@
 #
 # Usage: qb-seat-top SESSION-ID          the loop, started by qb-seats
 #        qb-seat-top SESSION-ID --once   one pass, for a test or by hand
+#        qb-seat-top --frames TEXT       every frame of the reveal, one per line
 #
 # Exit codes:
 #   0  the session went away, or --once finished
@@ -60,13 +61,19 @@ SCRAMBLE='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
 SCRAMBLE=$SCRAMBLE'§¶•/\|[]{}<>░▒▓█▌▐─│┌┐└┘├┤┬┴┼═║╔╗╚╝'
 SYMBOL_BIAS=7           # out of 10, as decrypt_text.js's 0.7
 
-[ $# -ge 1 ] && [ $# -le 2 ] \
-  || { printf 'usage: %s SESSION-ID [--once]\n' "$PROG" >&2; exit 2; }
-SID=$1
+usage() {
+  printf 'usage: %s SESSION-ID [--once] | %s --frames TEXT\n' "$PROG" "$PROG" >&2
+  exit 2
+}
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+FRAMES=0
 ONCE=0
-[ "${2:-}" = "--once" ] && ONCE=1
-[ $# -eq 1 ] || [ "$ONCE" = 1 ] \
-  || { printf 'usage: %s SESSION-ID [--once]\n' "$PROG" >&2; exit 2; }
+case "$1" in
+  --frames) FRAMES=1; [ $# -eq 2 ] || usage ;;
+  *) SID=$1
+     [ "${2:-}" = "--once" ] && ONCE=1
+     [ $# -eq 1 ] || [ "$ONCE" = 1 ] || usage ;;
+esac
 
 # EVERY READ IS TOLERATED, and for dash_resize's reason rather than a taste for
 # defensive code: this runs detached from any command line, for as long as the
@@ -139,6 +146,25 @@ make_frame() {   # make_frame <text> <revealed>   -> FRAME
   done
   FRAME=$out
 }
+# THE REVEAL AS A PURE FUNCTION, printed rather than played. Every frame of it,
+# one per line, with no tmux and no clock anywhere near — so what the effect DOES
+# (every frame the width of the answer, characters settling left to right, spaces
+# never scrambled, the last frame the text itself) is asserted by reading, and
+# only that it runs at all is left to a live screen.
+if [ "$FRAMES" = 1 ]; then
+  text=$2
+  revealed=0
+  tick=0
+  while [ "$revealed" -lt "${#text}" ]; do
+    tick=$((tick + 1))
+    [ $(( tick % SETTLE_EVERY )) -eq 0 ] && revealed=$((revealed + 1))
+    make_frame "$text" "$revealed"
+    printf '%s\n' "$FRAME"
+  done
+  printf '%s\n' "$text"
+  exit 0
+fi
+
 
 # Whether `sleep` here takes a fraction, asked once rather than assumed. GNU and
 # busybox coreutils differ, and a `sleep 0.04` that errors would otherwise do so
@@ -148,7 +174,7 @@ FRACTIONAL_SLEEP=1
 sleep "$TICK" 2>/dev/null || FRACTIONAL_SLEEP=0
 
 reveal() {   # reveal <text>
-  local text=$1 revealed=0 tick=0 total
+  local text=$1 revealed=0 tick=0 total n
   total=${#text}
   if [ "$FRACTIONAL_SLEEP" = 0 ]; then
     tmux set-option -t "$SID:" @qb_top "$text" 2>/dev/null || true
@@ -164,6 +190,14 @@ reveal() {   # reveal <text>
   # Settled explicitly rather than left on the last frame, which is one character
   # short of the truth whenever the loop above exits on the count.
   tmux set-option -t "$SID:" @qb_top "$text" 2>/dev/null || true
+  # A COUNT OF COMPLETED REVEALS, which exists so that nothing has to catch one.
+  # A frame is on screen for 40ms; a test that polls for one is a test that races
+  # it, and that is not theoretical — the first spelling of this passed locally
+  # and in the flake sandbox and failed in the flake sandbox, on the same commit,
+  # for no reason but load. A counter is still true a minute later.
+  n=$(tmux show-options -v -t "$SID:" @qb_top_reveals 2>/dev/null) || n=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  tmux set-option -t "$SID:" @qb_top_reveals "$((n + 1))" 2>/dev/null || true
 }
 
 # THE CEILING, REFRESHED ON THIS LOOP'S TIMER AND NOT THE STATUS LINE'S. qb-pace

@@ -750,8 +750,12 @@ install_top() {
   # One knob for "do not ask about the subscription", not two: QB_SEATS_PACE=off
   # already silences the estimate this script prints, and it means the same thing
   # here.
-  [ "${QB_SEATS_PACE:-on}" = off ] \
-    && tmux set-option -t "$SESSION_ID:" @qb_top_pace 0
+  # An `if` and not `[ … ] && …`, which is seat_env_fill's warning one function
+  # along: a trailing AND-list whose test is false is a failing command, and this
+  # script runs under `set -e`.
+  if [ "${QB_SEATS_PACE:-on}" = off ]; then
+    tmux set-option -t "$SESSION_ID:" @qb_top_pace 0
+  fi
 
   # ASKED FOR BEFORE IT IS RUN, which is dash_hooks' rule and it arrived here the
   # same way: during a rollout PATH's harness and this checkout can disagree
