@@ -1757,7 +1757,7 @@ picks an architecture, implements it, opens a PR, and the decision has been made
 whichever model was cheapest that morning. So the survey half runs on every repo and the
 acting half runs on almost none.
 
-### Reaching a session takes four yeses, held by four different parties
+### Reaching a session takes four yeses, and no two live in the same place
 
 `--start` is the follow-up #63 deferred, and what makes it safe is not this flag — it is
 that this flag is the *only* one of the four a run can supply for itself:
@@ -1769,17 +1769,35 @@ that this flag is the *only* one of the four a run can supply for itself:
 | the run | may I act this time, and how much? | `--start`, off; `--start-max`, 1 |
 | **the machine** | does this box start sessions? | `qb-start`'s policy file |
 
-The last is the one that matters and the one **a repository cannot reach**: it lives in the
-user's config directory, ships absent, and fails closed. A poisoned checkout that flipped
-every switch it owns — its rules file, its CLAUDE.md, an issue body — still starts nothing.
+**Be precise about what the last one buys.** It lives in the user's config directory, ships
+absent, and fails closed, and **nothing here reads repository-controlled content as policy** —
+no file in a checkout is consulted to decide whether a session may start. That is what stops
+the tracker becoming an authorisation channel, which is the thing #63 was filed about.
 
-`--start-max` defaults to **1** and is not the same ceiling as `qb-start`'s. `qb-start` caps
-how many spawns may be *live* on a box; this caps how many one *sweep* may ask for. Without
-it, a first run against a backlog whose gate had just been opened would ask for a session per
-actionable issue and be refused thirty times over the box's single slot — thirty board posts
-and thirty attempted claims to start the one session there was room for. A refusal that is
-about the **box** (not enabled, at cap, paced, full, no tmux) stops the sweep for that reason;
-one about a single **issue** (somebody holds it, this command is not allowed here) does not.
+What it does *not* stop is a party that already has arbitrary execution as this user. A
+`CLAUDE.md` is repository content read by an agent holding a shell, and that agent could write
+`spawn.json` itself, shadow `qb-start` on `PATH`, or just run the agent binary directly. No
+same-UID permission gate closes that, and `qb-start`'s own notes make the same argument about
+`XDG_CONFIG_HOME`. Moving the boundary means an authority outside this UID — a different issue.
+
+### Two budgets, because one counts the wrong thing
+
+`--start-max` (default **1**) counts **sessions started**. `--attempt-max` (default **5**)
+counts **`qb-start` invocations**, started or refused. Neither is `qb-start`'s own cap, which
+bounds how many spawns may be *live* on a box.
+
+The second exists because the first cannot express the runaway it claimed to prevent. A
+refusal about a single issue — somebody else holds it — correctly does not stop the sweep and
+correctly starts nothing, so it spends none of `--start-max`; thirty held issues therefore made
+thirty invocations and thirty board posts while `--start-max 1` looked like it was holding.
+Measured, not theorised: a codex review of this file caught the contradiction.
+
+A refusal about the **box** (not enabled, at cap, paced, full, no tmux) stops the sweep. One
+about a single **issue** (somebody holds it) does not. One about a **command** — this machine's
+policy does not allow `/fix-issue` — is remembered and not re-asked, because unlike a held
+issue there is no chance the next one answers differently.
+
+Both ceilings refuse a negative value at the CLI. `0` is a legitimate freeze and stays legal.
 
 Every actionable issue comes back carrying what became of it — `started`, the refusal in
 full, or `not attempted` with the reason the sweep never reached it — on the report and in

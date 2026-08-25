@@ -1162,11 +1162,13 @@ the watcher exactly as they do to a click. What is genuinely new is that the ans
 started this* is no longer a person, which is why `watch` is its own trigger name rather than
 being folded into `cli` — a board someone is scanning for surprises needs that to be greppable.
 
-The watcher adds two brakes of its own on top, because the ones at the primitive are per-spawn
-and it is the end of the chain that reads a **public tracker**: `--start` is off, so a survey
-still starts nothing unless a run asks it to, and `--start-max` (default 1) bounds one sweep,
-so a backlog of thirty actionable issues cannot become thirty attempts at the box's single
-slot. Details in `harness/loops/README.md`.
+The watcher adds brakes of its own on top, because the ones at the primitive are per-spawn and
+it is the end of the chain that reads a **public tracker**: `--start` is off, so a survey still
+starts nothing unless a run asks it to; `--start-max` (default 1) bounds sessions started; and
+`--attempt-max` (default 5) bounds `qb-start` invocations whether they start anything or not.
+The second ceiling is not redundant — a refusal about one issue starts nothing and so spends
+none of the first, which let a backlog of held issues make one call each while `--start-max 1`
+appeared to hold. Details in `harness/loops/README.md`.
 
 **A hook or a cron floor is still not built, and that is the deliberate part.** The button
 is paced by a person; a hook and a cron are not, and a trigger nobody is watching is the thing

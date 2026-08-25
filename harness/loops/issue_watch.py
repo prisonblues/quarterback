@@ -38,7 +38,8 @@ is every repo by default — and this is the follow-up it deferred, so the prope
 is now narrower and worth stating exactly.
 
 `--start` hands an actionable issue to `qb-start` (#277) and nothing else does.
-Reaching a session takes FOUR independent yeses, held by different parties:
+Reaching a session takes FOUR yeses, and no two of them are written down in the
+same place:
 
     THE REPO      `issue_pickup.enabled`, false in `harness_rules.DEFAULTS` and
                   in this repo's `.harness-rules.sample`. Decides whether a loop
@@ -51,17 +52,30 @@ Reaching a session takes FOUR independent yeses, held by different parties:
                   directory outside any repository, ships absent, and fails
                   closed. Decides whether this BOX starts sessions.
 
-The last one is the one that matters most and is the one a repository cannot
-reach: nothing in a checkout — an issue body, a CLAUDE.md, a rules file — can
-grant it. So a poisoned repo that flipped every switch it owns still starts
-nothing, which is the property the other three cannot provide.
+BE PRECISE ABOUT WHAT THE LAST ONE BUYS, because it is easy to oversell and an
+earlier draft of this docstring did. It said a poisoned repo that flipped every
+switch it owns still starts nothing. That is true of everything the repo can
+WRITE and false of what the repo can SAY: a `CLAUDE.md` is repository content
+too, and it is read by an agent that holds a shell as this user — an agent that
+could create `spawn.json` itself, shadow `qb-start` on `PATH`, or simply run the
+agent binary directly and skip all of this.
 
-What survives of the old structural claim is the shape of the audit rather than
-its content: `test_issue_watch.py` still reads every subprocess call off this
-module's syntax tree, and the set it permits is now exactly `gh` and
-`qb_start_path()` — a resolver that takes no argument and can therefore only ever
-name one program. A command built from a string this module computed would still
-fail that test, which is the part that was actually protecting anything.
+So the property is narrower and worth stating in the form that is actually true:
+**nothing here reads repository-controlled content as policy.** No file in a
+checkout is consulted to decide whether a session may start. What that stops is
+the tracker becoming an authorisation channel — the specific thing #63 was filed
+about. What it cannot stop is a party that already has arbitrary execution as
+this user, and no same-UID permission gate can; `qb-start`'s own notes make this
+argument about `XDG_CONFIG_HOME` and it applies here unchanged. Moving that
+boundary means an authority outside this UID, which is a different issue.
+
+THE AUDIT IS A DRIFT GUARD, NOT A SECURITY CONTROL. `test_issue_watch.py` reads
+every subprocess call off this module's syntax tree and permits exactly `gh` and
+`qb_start_path()`. It catches the accident this file is one careless edit away
+from — a command assembled out of a computed string — and it caught exactly that
+while this was being written. It is not a boundary against a hostile committer,
+who would edit the test in the same commit, and `from subprocess import call`
+walks past it. Worth having, worth not mistaking for more than it is.
 
 The judge is the one thing that costs money, so it runs LAST: only for an issue
 the gate admitted and no signal held. That ordering is also the security
@@ -125,6 +139,22 @@ DEFAULT_LIMIT = 30
 #: is more forceful here: this is the end of the chain that reads a public
 #: tracker.
 DEFAULT_START_MAX = 1
+
+#: How many times ONE run may invoke `qb-start` at all, started or refused.
+#:
+#: A second budget rather than a bigger first one, because `--start-max` counts
+#: the wrong thing to bound this. A refusal that is about a single issue —
+#: somebody else holds it — correctly does not stop the sweep and correctly
+#: starts no session, so it spends none of `--start-max`. Thirty held issues
+#: therefore made thirty `qb-start` invocations and thirty board posts while
+#: `--start-max 1` appeared to be holding: exactly the runaway that flag's own
+#: docstring claimed to prevent. Measured, not theorised — a codex review of
+#: this file caught the contradiction between the two.
+#:
+#: Five, not one: the point is to bound a runaway, not to give up on the first
+#: issue a peer happens to hold. Small enough that the pathological case is a
+#: handful of posts rather than a backlog's worth.
+DEFAULT_ATTEMPT_MAX = 5
 
 #: Left in the comment this writes, so a second run recognises its own work. It
 #: carries a digest of the signals, not just a marker: an issue whose open
@@ -753,10 +783,14 @@ def qb_start_path() -> str:
     Takes no arguments ON PURPOSE, and that is the property the audit rests on
     rather than a style choice. A resolver with a parameter is one an issue body
     could eventually reach through — the caller passes a name, the name comes
-    from somewhere, and "somewhere" on a public tracker is a stranger. With no
-    parameter there is exactly one program this can ever return, and the module
-    keeps the shape #63 asked for: a spawn surface that is an allowlist rather
-    than a prompt.
+    from somewhere, and "somewhere" on a public tracker is a stranger.
+
+    What that buys is exactly one thing: the program NAME is fixed here and no
+    caller can influence it. It is NOT "only one program can ever be returned" —
+    an earlier draft said that and it was wrong, since `which` answers out of
+    `PATH` and the fallback is a file on disk. Anyone who can shadow `PATH` or
+    write into this checkout can change what runs, and they could equally run it
+    themselves; see the module docstring on where that boundary actually sits.
 
     Same two-step resolution as `qb-start.sibling` and for its reason: a
     home-manager install has PATH, a bare checkout has only the file.
@@ -777,8 +811,16 @@ def qb_start_path() -> str:
 #: turn one refusal into thirty identical board posts, which is how a watcher
 #: becomes the thing people mute.
 STOP, GO = True, False
+
+#: The two outcomes that mean a session exists (or would). Named rather than
+#: written out at each comparison: `run_starts` decides whether a budget was
+#: spent by matching on these, and a literal repeated at three sites is one that
+#: can be reworded at two of them.
+STARTED = "started"
+WOULD_START = "would start (--dry-run)"
+
 START_EXITS = {
-    0: ("started", GO),
+    0: (STARTED, GO),
     2: ("qb-start rejected the arguments — that is a bug here, not a refusal", STOP),
     3: ("spawning is not enabled on this machine", STOP),
     4: ("this machine's policy does not allow that command", GO),
@@ -819,13 +861,28 @@ def start_one(a: Assessment, repo_path: str,
         return f"qb-start did not run — {e.__class__.__name__}: {e}", STOP
     label, stop = START_EXITS.get(code, (f"qb-start exited {code}", STOP))
     if code == 0 and dry_run:
-        return "would start (--dry-run)", GO
+        return WOULD_START, GO
     return label, stop
 
 
 def run_starts(assessments: list[Assessment], cfg: dict, *,
-               limit: int = 1, dry_run: bool = False) -> None:
-    """Hand the actionable issues to `qb-start`, in order, up to `limit`.
+               limit: int = 1, attempts_max: int = DEFAULT_ATTEMPT_MAX,
+               dry_run: bool = False) -> None:
+    """Hand the actionable issues to `qb-start`, in order, within both budgets.
+
+    TWO budgets, because one cannot express this. `limit` counts SESSIONS
+    STARTED and `attempts_max` counts QB-START INVOCATIONS, and the gap between
+    them is where the first version of this was wrong: a refusal that is about
+    one issue (somebody holds it) correctly does not stop the sweep, so with a
+    single budget counting successes, thirty held issues produced thirty
+    invocations and thirty board posts while `--start-max 1` looked like it was
+    holding. That is precisely the runaway the cap was written to prevent, so it
+    now has a counter that a refusal actually spends.
+
+    A command refused by the machine's policy is remembered rather than
+    re-asked. Exit 4 is a fact about (this box, this command) and not about the
+    issue, so asking it once per issue is the same mistake in miniature — and
+    unlike a held issue there is no chance at all that the next one differs.
 
     Records the outcome on every actionable assessment — including the ones it
     never reached, which get `not attempted` rather than being left blank. That
@@ -853,8 +910,9 @@ def run_starts(assessments: list[Assessment], cfg: dict, *,
         for a in actionable:
             a.started = why
         return
-    started = 0
+    started = attempts = 0
     stopped = ""
+    refused: dict[str, str] = {}
     for a in actionable:
         if stopped:
             a.started = f"not attempted — {stopped}"
@@ -862,10 +920,20 @@ def run_starts(assessments: list[Assessment], cfg: dict, *,
         if started >= limit:
             a.started = f"not attempted — this run's --start-max of {limit} is spent"
             continue
+        if attempts >= attempts_max:
+            a.started = ("not attempted — this run's --attempt-max of "
+                         f"{attempts_max} is spent")
+            continue
+        if a.action in refused:
+            a.started = f"not attempted — {refused[a.action]}"
+            continue
         a.started, stop = start_one(a, str(cfg.get("path") or "."),
                                     dry_run=dry_run)
-        if a.started in ("started", "would start (--dry-run)"):
+        attempts += 1
+        if a.started in (STARTED, WOULD_START):
             started += 1
+        elif a.started == START_EXITS[4][0]:
+            refused[a.action] = f"{a.started} ({a.action})"
         if stop:
             stopped = a.started
 
@@ -922,7 +990,7 @@ def render(assessments: list[Assessment], repo: str,
         lines += ["", "Nothing was started: this run was not asked to (--start). "
                       "Acting on an issue is `qb-start`'s job."]
     else:
-        began = [a for a in assessments if a.started == "started"]
+        began = [a for a in assessments if a.started == STARTED]
         lines += ["", f"{len(began)} session(s) started of {len(actionable)} "
                       "actionable."]
     return "\n".join(lines)
@@ -933,6 +1001,27 @@ def _load(spec: str | None) -> dict:
         return resolve_repo(spec)
     except RepoNotFound as e:
         sys.exit(str(e))
+
+
+def _ceiling(text: str) -> int:
+    """A non-negative ceiling, refused at the CLI rather than absorbed.
+
+    A negative `--start-max` used to be accepted, and it FAILED CLOSED — the
+    first `started >= limit` was already true — so it started nothing and
+    reported "this run's --start-max of -1 is spent". Safe, and still wrong: a
+    ceiling that silently reinterprets a typo as a freeze is one nobody can tell
+    from a working one, and the operator who wrote `-1` meaning "no limit" got
+    the opposite of what they asked for without being told. Zero is a legitimate
+    freeze and stays legal; below zero is a mistake and is named as one.
+    """
+    try:
+        got = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number")
+    if got < 0:
+        raise argparse.ArgumentTypeError(
+            f"{got} is negative — use 0 to start nothing")
+    return got
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -958,10 +1047,14 @@ def main(argv: list[str] | None = None) -> int:
                     help="hand each actionable issue to qb-start. Off by "
                          "default, and refused anyway unless this machine's "
                          "spawn policy is enabled — see qb-start --policy")
-    ap.add_argument("--start-max", type=int, default=DEFAULT_START_MAX,
+    ap.add_argument("--start-max", type=_ceiling, default=DEFAULT_START_MAX,
                     metavar="N",
                     help=f"how many sessions one run may start (default "
-                         f"{DEFAULT_START_MAX})")
+                         f"{DEFAULT_START_MAX}; 0 starts nothing)")
+    ap.add_argument("--attempt-max", type=_ceiling, default=DEFAULT_ATTEMPT_MAX,
+                    metavar="N",
+                    help=f"how many times one run may call qb-start at all, "
+                         f"started or refused (default {DEFAULT_ATTEMPT_MAX})")
     ap.add_argument("--dry-run", action="store_true",
                     help="with --start: make every refusal and print what would "
                          "run, but start nothing")
@@ -977,7 +1070,8 @@ def main(argv: list[str] | None = None) -> int:
     # BEFORE either report, so that what happened to each issue is in the report
     # rather than in a second stream a reader has to interleave by hand.
     if args.start:
-        run_starts(got, cfg, limit=args.start_max, dry_run=args.dry_run)
+        run_starts(got, cfg, limit=args.start_max,
+                   attempts_max=args.attempt_max, dry_run=args.dry_run)
 
     if args.as_json:
         print(json.dumps({"repo": repo,

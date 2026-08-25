@@ -174,6 +174,17 @@ def test_the_qb_start_resolver_cannot_be_pointed_at_anything_else():
         (f"qb_start_path may name no program but QB_START: stray literals {names}")
     assert iw.QB_START == "qb-start"
 
+    # …and the literal check alone is not enough, which a codex review pointed
+    # out with a working counter-example: `return os.environ[QB_START]` adds no
+    # string constant and would have passed everything above while letting the
+    # environment name the program. So the callable surface is bounded too.
+    called = {ast.unparse(n.func) for n in ast.walk(fn) if isinstance(n, ast.Call)}
+    assert called <= {"which", "str", "Path", "Path(__file__).resolve"}, \
+        f"qb_start_path may not reach for anything else: {called}"
+    reads = {ast.unparse(n) for n in ast.walk(fn) if isinstance(n, ast.Subscript)}
+    assert not reads, \
+        f"a subscript here is a lookup this test cannot bound: {reads}"
+
 
 def test_a_survey_says_it_started_nothing(monkeypatch):
     """And says so where a person reads it, not only in a docstring."""
@@ -897,3 +908,76 @@ def test_an_unattended_run_may_spawn_where_the_repo_allowed_it(spawns, monkeypat
     got = iw.survey(cfg, limit=9)
     iw.run_starts(got, cfg, limit=5)
     assert got[0].started == "started"
+
+
+# ============================================================ THE TWO BUDGETS
+# a codex review found --start-max bounded the wrong thing (see 63.feat.md)
+
+def _many(n, action="/fix-issue"):
+    return [iw.Assessment(number=i, title=f"t{i}", author="prisonblues",
+                          action=action, why="w") for i in range(n)]
+
+
+def test_a_backlog_of_held_issues_cannot_burn_the_board(spawns, monkeypatch):
+    """The bug `--start-max`'s own docstring claimed to prevent, and did not.
+
+    A refusal about one issue does not stop the sweep and starts no session, so
+    it spends none of `--start-max` — which meant thirty issues held by peers
+    made thirty `qb-start` calls and thirty board posts while `--start-max 1`
+    looked like it was holding. `--attempt-max` is the counter a refusal spends.
+    """
+    monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
+    spawns.exits.extend([0] + [8] * 30)         # policy ok, then all HELD
+    got = _many(30)
+    iw.run_starts(got, {"path": "."}, limit=1, attempts_max=5)
+    assert len(_starts(spawns)) == 5, "the attempt budget is what bounds this"
+    assert "--attempt-max" in got[-1].started
+
+
+def test_a_command_the_policy_refuses_is_asked_once_not_once_per_issue(spawns,
+                                                                       monkeypatch):
+    """Exit 4 is a fact about (this box, this command), never about the issue.
+
+    So unlike a held issue there is no chance at all that the next one answers
+    differently, and re-asking is the same runaway in miniature.
+    """
+    monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
+    spawns.exits.extend([0] + [4] * 30)
+    got = _many(30)
+    iw.run_starts(got, {"path": "."}, limit=5, attempts_max=20)
+    assert len(_starts(spawns)) == 1
+    assert "/fix-issue" in got[-1].started and "not attempted" in got[-1].started
+
+
+def test_a_refused_command_does_not_hold_back_a_different_one(spawns,
+                                                              monkeypatch):
+    """Remembering is per COMMAND. A policy allowing /investigate and not
+    /fix-issue must still start the /investigate one."""
+    monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
+    spawns.exits.extend([0, 4, 0])
+    got = _many(1) + _many(1, action="/investigate")
+    iw.run_starts(got, {"path": "."}, limit=5, attempts_max=20)
+    assert "not allow" in got[0].started
+    assert got[1].started == iw.STARTED
+
+
+def test_start_max_zero_is_a_freeze_that_asks_nothing(spawns, monkeypatch):
+    """Zero is legal and means what it says — including not consulting the box."""
+    monkeypatch.setattr(iw, "may_write", lambda cfg: (True, ""))
+    got = _many(3)
+    iw.run_starts(got, {"path": "."}, limit=0, attempts_max=5)
+    assert _starts(spawns) == []
+    assert all("--start-max of 0" in a.started for a in got)
+
+
+@pytest.mark.parametrize("bad", ["-1", "-30", "two", ""])
+def test_a_negative_or_malformed_ceiling_is_a_cli_error(bad):
+    """It used to be accepted, and it failed closed — safe, and still wrong.
+
+    A ceiling that silently reinterprets `-1` (which an operator writes meaning
+    "no limit") as a freeze is one nobody can tell from a working one.
+    """
+    with pytest.raises(SystemExit):
+        iw.main(["--start", "--start-max", bad])
+    with pytest.raises(SystemExit):
+        iw.main(["--start", "--attempt-max", bad])
