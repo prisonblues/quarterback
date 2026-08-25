@@ -469,7 +469,20 @@ is in scope and gets made consistent: search the codebase, don't just review the
 }
 
 
-def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE) -> str:
+#: `repo` scope for a seat with no tools to search with. The rule is the same —
+#: anything you can see — without the one instruction that seat cannot follow.
+#: Before #458 it was handed the searching text with an empty code slot: wrong, but
+#: not self-contradictory. With NO_TOOLS_BRIEF in the same prompt it would be
+#: exactly the contradiction RELATED_CODE_SLOT is split in two to avoid, "a model
+#: resolves it whichever way it likes" — and on antigravity the way it likes is
+#: fatal.
+_REPO_SCOPE_NO_TOOLS = """WHAT COUNTS AS A FINDING HERE. Anything you can see. The marginal cost
+of completeness is near zero, so related code — callers, siblings, parallel implementations — is
+in scope wherever the diff puts it in front of you. You cannot go and find the rest: what you
+would have searched for is a `could_not_assess` entry naming what you would have opened."""
+
+
+def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE, reads_code: bool = True) -> str:
     """:data:`REVIEW_PROMPT` with `review_panel.reviewer_scope` filled in.
 
     A function rather than two constants because everything else about the two
@@ -478,6 +491,8 @@ def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE) -> str:
     read (:func:`panel_seats.reviewer_scope`), and this is the last line of defence
     rather than the one that reports."""
     para, related = _SCOPE_BRIEF.get(scope) or _SCOPE_BRIEF[DEFAULT_REVIEWER_SCOPE]
+    if not reads_code and scope == "repo":
+        para = _REPO_SCOPE_NO_TOOLS
     return (REVIEW_PROMPT.replace(REVIEWER_SCOPE_SLOT, para)
             .replace(RELATED_CODE_SLOT, related))
 
@@ -661,6 +676,49 @@ coverage gap and none is a finding — they are how this checkout is built:
 `could_not_assess` now means what you could not resolve WITH the code in front of you.
 """
 
+#: The other half of the same slot, and the reason it is prose. Every seat wants to go
+#: looking for the code — `codex_args` measured it at five runs in seven — and the answer
+#: has been a flag per vendor: `--no-tools` for pi, two `-c` overrides for codex. There is
+#: no such flag for `agy`, whose own help offers only `--dangerously-skip-permissions` in
+#: the opposite direction. So this seat's `--no-tools` has to be a sentence, and the others
+#: get it too because the SITUATION is the same for every code-blind seat.
+#:
+#: The situation, not the mechanism — the wording had to be widened for that (#459).
+#: "An attempt is denied" is true of agy and of pi under `--no-tools`, and false of a
+#: code-blind claude: `claude_args` pins `--allowedTools` only when the seat reads code,
+#: so the downgrade path, `reviewer_code_access` off and both judge paths all dispatch a
+#: claude holding its full default toolset — Bash included, as that function's own
+#: measurement records. What is true of all of them is that the cwd is empty and there is
+#: nothing to find, which is the part the instruction rests on.
+#:
+#: IT IS NOT AN OPTIMISATION HERE. On codex the reach cost wall-clock; on antigravity a
+#: denied tool ENDS THE PROCESS — `permission check failed … user denied permission`, exit
+#: 1, no reply — so the seat that cannot be given the flag is also the one the reach kills
+#: (#458). Measured on the failing prompt, this text is the difference between exit 1 and a
+#: findings array that names the gap instead of hunting for it.
+#: The half that is true of every prompt this panel sends a diff-only seat, kept
+#: apart from the review-path tail below so `ASK_PROMPT` can carry the same warning
+#: without inheriting a vocabulary its answer does not use — an ask returns
+#: holds/fails/cannot tell and has no `could_not_assess` to offer (#459).
+NO_TOOLS_RULE = """YOU HAVE NO TOOLS, and what you are given here is the whole of it. You cannot
+run commands, read files, browse a repository or search the web to any purpose. Your working
+directory is an EMPTY repository — not this project — so a tool that does run finds nothing, and
+on most of the CLIs this panel uses it does not run: the attempt is denied. On at least one of
+them that denial does not merely fail, it ENDS THE SESSION, and your answer is lost rather than
+delivered short.
+
+So do not go looking, and in particular do not guess at a path on the machine running this and
+ask to read it."""
+
+NO_TOOLS_BRIEF = NO_TOOLS_RULE + """
+
+What you would have opened a file to settle is a `could_not_assess` entry, named as precisely as
+you can name it — "whether X's callers pass a list" tells the next round what to fetch, "I could
+not read the repo" does not. That entry is not a failure and does not count against you: it is
+the one thing you can do with a question the prompt does not answer, and it is how the panel
+learns what to put in the prompt next time.
+"""
+
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
 a pull request diff, held to the standard "nothing left to improve". The reports below come from
 several independent reviewers (Claude, Codex, SonarCloud), listed ONE PER REVIEWER — so the same
@@ -726,10 +784,13 @@ question below does not ask about. A finding you make here goes nowhere.
 
 Someone is about to build a fix on the PREMISE below. Say whether it HOLDS.
 
-Answer from the material you are given and from nothing else. You have no tools and cannot open
-the repository, so if what you were given does not settle the question, say so — "cannot tell" is
-a real answer here and it is the right one whenever you would otherwise be guessing. It is never a
-polite way of agreeing.
+Answer from the material you are given and from nothing else.
+
+{no_tools}
+
+If what you were given does not settle the question, say so — "cannot tell" is a real answer here
+and it is the right one whenever you would otherwise be guessing. It is never a polite way of
+agreeing.
 
 Return ONLY a JSON object (no prose):
   {{"verdict": "holds|fails|cannot tell", "reason": "one line"}}
@@ -2303,6 +2364,8 @@ __all__ = [
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
+    "NO_TOOLS_BRIEF",
+    "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
     "board_dial_notes",

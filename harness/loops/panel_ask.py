@@ -712,7 +712,14 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
         # The budget cuts the file CONTENT inside the block, never the assembled
         # block — see _context_block. Slicing the finished string is how a clamp
         # lands halfway through a `--- CONTEXT: … ---` delimiter.
-        return ASK_PROMPT.format(premise=premise,
+        # `no_tools` inside the render, for the reason the diff path puts it there:
+        # `fit_argv_budget` below measures whatever this returns, and a brief added
+        # after that measurement is a kilobyte past the cap it just cleared. This
+        # path is why the claim "NO_TOOLS_BRIEF is this seat's --no-tools" was not
+        # yet true when it was written — an ask reached antigravity with the older,
+        # milder sentence, which says it has no tools and not that reaching for one
+        # ends the session (#459).
+        return ASK_PROMPT.format(premise=premise, no_tools=NO_TOOLS_RULE,
                                  context=context if budget is None
                                  else _context_block(read, budget))
 

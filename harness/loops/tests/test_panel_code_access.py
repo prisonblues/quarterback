@@ -592,6 +592,12 @@ def test_a_seat_downgraded_late_is_not_still_told_it_has_the_code(monkeypatch,
     assert got.code_blind is True
     assert "YOU HAVE THE CODE" not in seen["stdin"], (
         "the seat was promised a checkout it does not have")
+    # SWAPPED, not deleted (#458). A downgraded seat is exactly one that has been
+    # told to go and read the tree and then given an empty directory, so leaving
+    # the slot blank sends the seat likeliest to go looking with nothing telling
+    # it not to — and on the seat with no tool flag, going looking is fatal.
+    assert "YOU HAVE NO TOOLS" in seen["stdin"], (
+        "the downgraded seat was left with neither brief")
     capsys.readouterr()
 
 
@@ -1002,3 +1008,176 @@ def test_a_tarball_with_millions_of_entries_is_refused(monkeypatch, tmp_path):
     assert tree is None
     assert "entries, over the" in problem, problem
     assert not (tmp_path / "tree").exists(), "it unpacked despite the refusal"
+
+
+def test_the_diff_only_seats_are_told_they_have_no_tools(monkeypatch, tmp_path, capsys):
+    """The slot is either brief and never empty (#458).
+
+    Every seat goes looking for the code — `codex_args` measured five runs in seven
+    — and the answer has been a flag per vendor. `agy` has none, and unlike codex it
+    does not merely waste the time: a denied tool ends the process with
+    `permission check failed … user denied permission`, exit 1, no review. So the
+    seat that cannot be given the flag is the one the reach kills, and prose in the
+    prompt is the only lever that CLI leaves.
+
+    Driven through `run` and asserted on what the seat is HANDED, because the hole
+    was in the composition rather than in the text: the slot took `""` for every
+    seat without code access, and a test that formats the template itself would
+    have passed against that.
+    """
+    prompts: list[str] = []
+    cfg = json.loads(json.dumps(CFG))
+    cfg["reviewers"] = {"codex": {"enabled": True, "model": "", "effort": ""}}
+    cfg["review_panel"] = dict(cfg.get("review_panel", {}), reviewer_code_access=False)
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 3, "deletions": 1,
+              "headRefOid": "abcdef1234"},
+        diff="diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda name, model, prompt, *a, **k: (
+                            prompts.append(prompt),
+                            panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+
+    assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
+                     record=False) == 0
+    capsys.readouterr()
+
+    assert prompts, "no seat was handed a prompt"
+    for prompt in prompts:
+        assert "YOU HAVE NO TOOLS" in prompt, "the slot went out empty"
+        assert "YOU HAVE THE CODE" not in prompt
+        # The half that turns the reach into evidence — asserted on the BRIEF's own
+        # sentence. `could_not_assess` alone cannot fail: it is in the findings
+        # envelope every seat gets, with or without any of this.
+        assert "What you would have opened a file to settle" in prompt
+
+
+def test_the_no_tools_brief_reaches_the_seat_in_its_argv(monkeypatch):
+    """The real dispatch, not a prompt this test formatted itself (#459).
+
+    `antigravity` is the seat this brief exists for and the only one whose prompt
+    travels in argv, so what matters is the argv element `run_cli` is handed. A
+    test that builds `REVIEW_PROMPT` itself proves the constant interpolates,
+    which was never in doubt — the hole was in the composition.
+    """
+    seen = _seat_run(monkeypatch)
+    prompt = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
+                                        code=panel_core.NO_TOOLS_BRIEF, diff="+x")
+
+    panel.review_llm("antigravity", "gemini-3.7-flash-high", prompt)
+
+    assert seen["args"][0] == "agy", seen["args"]
+    assert any("YOU HAVE NO TOOLS" in a for a in seen["args"]), (
+        "the seat was launched without the brief that keeps it off the tree")
+
+
+def test_the_brief_is_inside_what_the_argv_clamp_measured(monkeypatch, tmp_path, capsys):
+    """It has to be in the RENDER, not bolted on in `antigravity_args` (#459).
+
+    `fit_argv_budget`'s ceiling applies to the whole prompt — "the template
+    counts" — and antigravity is both the seat this brief is for and the only seat
+    the kernel can veto. A brief added after the clamp is over a kilobyte past the
+    number the clamp just cleared, and the failure mode is the one that clamp
+    exists to prevent: honouring a budget right up to execve and dying there.
+
+    Driven with the cap dropped low enough to BITE, so the clamp is doing real
+    work rather than passing everything through, and asserted on the argv element
+    the seat would actually be handed.
+    """
+    # Derived, not picked: the ceiling has to sit ABOVE the template and brief —
+    # `fit_argv_budget` can only cut the diff, and a cap under the template's own
+    # length starves the prompt to nothing and fails for that reason instead of
+    # this one — and far enough below the whole prompt that the clamp does real
+    # work. Recomputed from the prose so an edit to the brief cannot silently turn
+    # this into a test that never clamps.
+    empty = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
+                                       code=panel_core.NO_TOOLS_BRIEF, diff="")
+    cap = len(empty.encode()) + 2_000
+    monkeypatch.setattr(panel_core, "ARGV_PROMPT_MAX_BYTES", cap)
+    monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", cap)
+    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", cap, raising=False)
+
+    prompts: dict[str, str] = {}
+    cfg = json.loads(json.dumps(CFG))
+    cfg["reviewers"] = {"antigravity": {"enabled": True,
+                                        "model": "gemini-3.7-flash-high",
+                                        "effort": "high"}}
+    cfg["review_panel"] = dict(cfg.get("review_panel", {}), reviewer_code_access=False)
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
+        meta={"title": "feat: x", "additions": 300, "deletions": 1,
+              "headRefOid": "abcdef1234"},
+        diff="diff --git a/a.py b/a.py\n" + "+x\n" * 4000))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda name, model, prompt, *a, **k: (
+                            prompts.setdefault(name, prompt),
+                            panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+
+    assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
+                     record=False) == 0
+    capsys.readouterr()
+
+    prompt = prompts.get("antigravity")
+    assert prompt, "antigravity was never dispatched"
+    assert "YOU HAVE NO TOOLS" in prompt
+    # The argv element the kernel would have to carry, built the way the seat
+    # builds it. Over the cap here means the clamp measured a prompt smaller than
+    # the one being sent — which is the bug this pins, not a tight fit.
+    argv = panel_seats.antigravity_args("gemini-3.7-flash-high", "high", prompt)
+    element = max(argv, key=len)
+    assert len(element.encode()) <= cap, (
+        f"the seat is handed {len(element.encode()):,} bytes against a "
+        f"{cap:,} byte clamp — the brief was added after the measurement")
+
+
+def test_a_seat_with_no_tools_is_not_told_to_search_the_codebase():
+    """`repo` scope and the no-tools brief contradicted each other (#459).
+
+    The scope paragraph says "search the codebase, don't just review the diff" and
+    the brief says "do not go looking", ~40 lines apart in one prompt. This module
+    splits RELATED_CODE_SLOT off from REVIEWER_SCOPE_SLOT precisely so a bullet
+    cannot contradict its own paragraph — "the contradiction a model resolves
+    whichever way it likes" — and on the seat whose reach is fatal, one of those
+    ways is losing the round.
+
+    The rule itself is unchanged: under `repo` a diff-only seat still reports
+    anything it can see. What goes is the instruction it cannot follow.
+    """
+    sighted = panel_core.reviewer_brief("repo")
+    blind = panel_core.reviewer_brief("repo", reads_code=False)
+
+    assert "search the codebase" in sighted, "the sighted brief lost its instruction"
+    assert "search the codebase" not in blind
+    # Same rule, still stated: the scope is not narrowed, only the means.
+    assert "Anything you can see" in blind
+    assert "could_not_assess" in blind
+    # And the narrower scopes are untouched — this is a `repo`-only contradiction.
+    assert panel_core.reviewer_brief("diff") == panel_core.reviewer_brief(
+        "diff", reads_code=False)
+
+
+def test_the_ask_path_carries_the_same_warning_as_the_review_path():
+    """`--ask` reaches the same seat through the same argv (#459).
+
+    `antigravity_args` serves both callers and only the review path had been given
+    the brief, so an ask still reached `agy` with the milder sentence — that it has
+    no tools, not that reaching for one ends the session. The docstring meanwhile
+    claimed the seat was protected.
+
+    The rule is shared; the tails are not, and that is the point of splitting it:
+    an ask answers holds/fails/cannot tell and has no `could_not_assess` to offer.
+    """
+    ask = panel_core.ASK_PROMPT.format(premise="p", context="c",
+                                       no_tools=panel_core.NO_TOOLS_RULE)
+
+    assert "YOU HAVE NO TOOLS" in ask
+    assert "does not merely fail" in ask, (
+        "the ask path kept the milder sentence, which says the seat has no tools "
+        "but not what reaching for one costs")
+    assert "cannot tell" in ask
+    assert "could_not_assess" not in ask, "the ask path was given the review path's tail"
