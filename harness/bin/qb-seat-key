@@ -1,0 +1,490 @@
+#!/usr/bin/env bash
+# qb-seat-key — what a key in the `qb` table does.
+#
+# Usage: qb-seat-key ACTION [SESSION [PANE]]   SESSION is an id or a name
+#
+# Actions:
+#   add              add a seat to this screen
+#   close            close the seat the key was pressed in (the caller confirms)
+#   seatN            jump to seat N
+#   tape             show or hide the tape
+#   dash             show or hide the dash
+#   fit              put the dash back to the width the screen asked for
+#   wider|narrower   nudge the dash by NUDGE columns, and remember the new width
+#   kill             kill the whole screen (the caller confirms)
+#   guide            print the key list — what `?` opens in a popup
+#
+# Exit codes:
+#   0  the action was carried out, or was a key this does not act on
+#   1  not inside tmux, or the screen the key named is gone, or the pane it
+#      needed is not there
+#   2  malformed arguments — a caller bug, and says so
+#
+# WHY A SCRIPT AND NOT A KEY BINDING, which is qb-seat-click's argument one
+# surface along. Every action here is three or four tmux commands with a
+# condition over them — hidden or shown, which pane is the join target, what
+# width to put back — and expressing that in nested `if-shell` would put three
+# levels of tmux quoting into qb-seats for logic a shell states in a line. It is
+# also the only half of the qb key that can be tested without a terminal: neither
+# a menu nor a keystroke can be driven headless, but the actions underneath both
+# can, and they are the part that breaks.
+#
+# WHY IT TAKES THE SCREEN AND THE PANE AS ARGUMENTS, where qb-seat-click reads
+# them back out of a server option. The ✕ has to stash because
+# `#{mouse_status_range}` is scoped to a mouse EVENT and expands to nothing by
+# the time `confirm-before` runs its command. A session and a pane are CLIENT
+# state rather than event state, so the binding can simply expand them and pass
+# them — measured on 3.6a against a real client and a real keystroke, from a
+# plain binding and from behind a y/n alike. Which is the better answer as well
+# as the shorter one: a server option is a race between two clients pressing the
+# key on one server, and an argument cannot be.
+#
+# THE SCREEN ARRIVES AS AN ID, `$0`, because that value crosses tmux's format
+# expansion into a shell command line and a session called `it's` would leave an
+# unterminated quote there. A NAME is accepted too, for the tests and for driving
+# this by hand, and resolved the way qb-seat-click resolves one.
+#
+# WHAT IT DOES NOT REIMPLEMENT. `add`, `close` and `seatN` are qb-seat-click's
+# three ranges under different names, so they are delegated to it rather than
+# written out again. That is not tidiness: the ✕ path ends the agent's board
+# session before it kills the pane (#277) and reflows the row afterwards, and a
+# second copy would be a second place for that to fall out of step — the keyboard
+# would close a seat and leave the board holding its lease for the rest of a TTL,
+# which is the exact bug qb-seat-click's end_agent exists to stop.
+set -euo pipefail
+
+PROG=${0##*/}
+NUDGE=8                 # columns per `wider`/`narrower` — a nudge you can see,
+                        # small enough that overshooting costs one more press
+MIN_DASH=10             # a dash narrower than this is a column of ellipses, and
+                        # tmux would happily take it to 1
+HOLDING=qb-hidden       # the window a hidden pane is parked in
+
+# On the screen as well as on stderr, because stderr is nowhere: every binding
+# reaches this through `run-shell -b`, which discards both streams. The same
+# reasoning as qb-seat-click's die, and the same failure it was written for — a
+# key that reports nothing at all is the worst way for a key to fail.
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  if [ -n "${TMUX:-}" ]; then tmux display-message "$PROG: $*" 2>/dev/null || true; fi
+  exit 1
+}
+
+[ $# -ge 1 ] && [ $# -le 3 ] \
+  || { printf 'usage: %s ACTION [SESSION [PANE]]\n' "$PROG" >&2; exit 2; }
+
+ACTION=$1
+SESSION=${2:-}
+PANE=${3:-}
+
+# THE ID, NEVER THE NAME, IS WHAT A `-t` GETS. The long version is in qb-seats
+# and in qb-seat-click; the short one is that `.` and `:` are a target's own
+# separators and tmux 3.7b keeps them in a session name verbatim, so
+# `-t "=my.screen"` parses as pane `screen` of session `my`. Read off
+# list-sessions rather than looked up with `-t`, because a lookup BY name is the
+# very thing that cannot be trusted here, and split by hand rather than with
+# `read`, which strips trailing IFS whitespace from the last field.
+session_id() {
+  local line
+  tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
+    | while IFS= read -r line; do
+        # `if`, NOT `[ … ] && printf`. A `&&` whose test fails is the last
+        # command in the loop body, so the `while` exits 1 whenever the session
+        # being looked for is not the LAST one listed — and under `pipefail` that
+        # is the pipeline's status, and so the command substitution's. A caller
+        # spelling `sid=$(session_id x) || sid=""` then discarded the id it had
+        # just been given: measured as a second screen on one server reporting
+        # "no screen named 'one' is up" about a screen tmux was listing.
+        if [ "${line#* }" = "$1" ]; then printf '%s\n' "${line%% *}"; fi
+      done
+}
+
+# ---- the guide --------------------------------------------------------------
+# Answered before anything else and before the tmux check, because it is the one
+# action that is pure text: `display-popup -E` runs it in a pane of its own, a
+# human runs it in a shell to find out what the key does, and the tests read it.
+# Requiring a server for it would make the one action that explains the feature
+# the one that cannot be run while learning it.
+#
+# The key is read off the screen rather than written out here, so a
+# QB_SEATS_KEY=M-q screen does not hand its user a cheatsheet for somebody else's
+# keyboard. Falling back to the default is the honest answer where there is no
+# screen to ask: it is what a screen this user has not reconfigured will use.
+if [ "$ACTION" = guide ]; then
+  key=""
+  if [ -n "${TMUX:-}" ]; then
+    # `?` is bound to a `display-popup`, and display-popup does NOT format-expand
+    # its command — measured on 3.6a, where the popup was handed the literal
+    # `#{session_id}`. So this one action cannot be told which screen it is for
+    # and asks instead: `display-message -p` with no `-t` answers with the
+    # client's current session, which inside a popup is the client that opened
+    # it. Every other action is handed the id and does not guess.
+    sid=$SESSION
+    [ -n "$sid" ] || sid=$(tmux display-message -p '#{session_id}' 2>/dev/null) || sid=""
+    [ -z "${sid:-}" ] || key=$(tmux show-options -v -t "$sid:" @qb_key 2>/dev/null || true)
+  fi
+  [ -n "$key" ] || key="C-q"
+  cat <<EOF
+  $key is the qb key. Press it, then one of:
+
+    a          add a seat
+    x          close this seat — the agent in it goes too (asks first)
+    1 … 9      jump to that seat
+
+    t          show or hide the tape (the board along the bottom)
+    d          show or hide the dash (the fleet down the right)
+    =          put the dash back to the width the screen asked for
+    > / <      the dash $NUDGE columns wider / narrower, and remember it
+
+    s          the screens that are up
+    K          kill this screen — every agent on it goes too (asks first)
+    ?          this list
+
+  Anything else opens the menu, which carries these same keys, and so does
+  pressing $key twice.
+
+  The key is server-wide, so it is gated on this being a qb screen: press it
+  anywhere else and tmux gets the keystroke it always did. QB_SEATS_KEY picks a
+  different one and QB_SEATS_KEY= (empty) means no key at all.
+EOF
+  exit 0
+fi
+
+[ -n "${TMUX:-}" ] || die "not inside tmux"
+
+[ -n "$SESSION" ] || die "no screen named: every binding passes one, and by hand
+       it is the second argument"
+
+# EITHER FORM. The bindings pass `#{session_id}`, which is a dollar and digits
+# and so survives a shell command line whatever the screen is called; a human or
+# a test passes the name, which is what `list` prints and what qb-seat-click and
+# `qb-seats -s` take. SESSION ends up holding the name either way, because those
+# two are what it is handed on to.
+case "$SESSION" in
+  '$'[0-9]*)
+    SID=$SESSION
+    SESSION=$(tmux display-message -p -t "$SID:" '#{session_name}' 2>/dev/null) \
+      || SESSION=""
+    [ -n "$SESSION" ] || die "no screen with id '$SID' is up"
+    ;;
+  *)
+    SID=$(session_id "$SESSION") || SID=""
+    [ -n "$SID" ] || die "no screen named '$SESSION' is up"
+    ;;
+esac
+
+# ---- the scripts this shells out to -----------------------------------------
+# PATH first so an installed copy beats a checkout, then this script's own
+# directory, because the four install together. A `run-shell` from a key binding
+# inherits the tmux SERVER's PATH, and the server usually predates anything that
+# put this harness on one — which is how the ＋ on the seat bar came to fail
+# silently, and the reason qb-seats records @qb_seats_bin at build time.
+beside_me() {
+  local found
+  found=$(command -v "$1" 2>/dev/null) && { printf '%s' "$found"; return; }
+  printf '%s/%s' "$(cd -P "$(dirname -- "$0")" && pwd)" "$1"
+}
+
+# The qb-seats the SCREEN was built with, which is not necessarily the one on
+# PATH: @qb_seats_bin is recorded on the session for exactly this, and the ＋
+# already reads it the same way.
+seats_bin() {
+  local bin
+  bin=$(tmux show-options -v -t "$SID:" @qb_seats_bin 2>/dev/null || true)
+  [ -n "$bin" ] || bin=$(beside_me qb-seats)
+  [ -x "$bin" ] || die "qb-seats is not on PATH and the session did not record it"
+  printf '%s' "$bin"
+}
+
+# Its stderr is captured and re-reported rather than left to fall into the hole
+# this script's own output goes into. qb-seat-click's `add` does the same and for
+# the same reason: a refusal that had a good reason looked identical to a key
+# that is not wired up.
+run_out() {   # run_out <what it was> <cmd...>
+  local what=$1 why; shift
+  if ! why=$("$@" 2>&1 >/dev/null); then die "${why:-$what failed}"; fi
+  return 0
+}
+
+# ---- finding the panes ------------------------------------------------------
+# Panes are found by option, never by index: the index shifts the moment one is
+# added or closed, which several of these actions do.
+labelled_pane() {   # <label> — anywhere in the SESSION, holding window included
+  tmux list-panes -s -t "$SID" -F '#{pane_id} #{@qb_label}' \
+    | awk -v want="$1" '$2 == want { print $1; exit }'
+}
+
+# THE TAPE IS NOT ALWAYS LABELLED, and a lookup that assumed it was would find
+# nothing on exactly the screens most likely to want the toggle. qb-seats names
+# it `tape` only when there is a dash to tell it apart FROM (see the note by its
+# split): on a one-auxiliary-pane screen the border has said `board` since that
+# script existed, and renaming it for everybody would be a gratuitous break. So
+# the label first, and then the pane that is neither a seat nor labelled
+# anything, which on a screen built by qb-seats is the tape and nothing else.
+#
+# The two options are CONCATENATED into one field rather than printed as two.
+# awk's default splitter collapses runs of whitespace, so `%3  dash` — the dash
+# pane, whose @qb_seat is empty — comes back as two fields with $2 == "dash", and
+# the obvious `$2 == "" && $3 == ""` test would be reading the seat field for the
+# label. Joined, the field is empty for the bare tape and non-empty for
+# everything else, which is the only question being asked.
+tape_pane() {
+  local p
+  p=$(labelled_pane tape)
+  [ -n "$p" ] && { printf '%s' "$p"; return; }
+  tmux list-panes -s -t "$SID" -F '#{pane_id} #{@qb_seat}#{@qb_label}' \
+    | awk '$2 == "" { print $1; exit }'
+}
+
+dash_pane() { labelled_pane dash; }
+
+# The seat a rejoin is aimed at, and the one a hidden pane was split off beside in
+# the first place: the LOWEST seat number still on the screen. Not `NR == 1` over
+# list-panes, which is pane order and shifts, and not seat 1, which may have been
+# closed by an ✕.
+first_seat() {
+  tmux list-panes -t "$SID:seats" -F '#{pane_id} #{@qb_seat}' \
+    | awk '$2 != "" { print $2, $1 }' | sort -n | awk 'NR == 1 { print $2 }'
+}
+
+pane_exists() {
+  tmux list-panes -s -t "$SID" -F '#{pane_id}' \
+    | awk -v want="$1" '$1 == want { found = 1 } END { exit !found }'
+}
+
+# ---- hiding and showing an auxiliary pane -----------------------------------
+# Hiding a pane in tmux is `break-pane -d` to a holding window and `join-pane`
+# back. Nothing about the pane's PROCESS changes across either — the tape keeps
+# following the board and the dash keeps polling — which is the whole reason this
+# is not "kill it and split a new one".
+#
+# WHAT IS HARD IS THE GEOMETRY COMING BACK, and two things that look like the
+# answer are not. Both measured on 3.6a:
+#
+#   * `#{window_layout}` saved and handed back to `select-layout` restores the
+#     shape and REASSIGNS THE PANES. Its leaves are pane indexes, not ids, and a
+#     rejoined pane lands at a different index — so a saved-and-restored screen
+#     put the tape in seat 2's cell, the dash in seat 3's and seat 3 in the strip
+#     along the bottom. It exits 0 while doing it.
+#   * `select-layout -E`, which is what qb-seat-click reflows a closed seat with,
+#     evens the whole row INCLUDING the dash — so the dash then reclaims its 78
+#     columns from one neighbour and the seats come out 50, 49 and 20 where they
+#     had been 39, 39 and 41.
+#
+# So the widths are recorded BY PANE ID before the break and reasserted after the
+# join, left to right, which converges exactly: the row is a fixed total, so
+# setting each pane in turn leaves the last one no choice. Same shape as the
+# dash's own @qb_dash_width reassert one level up, and for the same reason — a
+# width that fitted a moment ago fits now.
+#
+# STATE IS PER-SCREEN AND LIVES ON THE SESSION, never on the server: two screens
+# have to be able to disagree about whether their tape is showing, and a server
+# option would make the second one to toggle answer for the first. The value is
+# `<pane id> <size> <id>:<width> …` — what to join back, at what size, and the row
+# to put back around it — and it is read with a three-name `read`, so a state
+# that recorded no widths leaves the third variable empty rather than shifting
+# the size into it.
+hidden_state() { tmux show-options -v -t "$SID:" "@qb_hidden_$1" 2>/dev/null || true; }
+
+# Every pane in the window as `<id>:<width>`, in reading order — top row left to
+# right, then the row under it. `resize-pane -x` moves a boundary inside one row
+# only, so laying them out in that order is what makes the reassert converge: the
+# row is a fixed total and each pane in turn leaves the last one no choice.
+#
+# NOT `pane_top == 0`, which is what this said for one draft and which selected
+# NOTHING AT ALL on an ordinary screen. The seat bar sets `status 2` with
+# `status-position top`, so the first row of panes begins at pane_top 1 — the
+# recorded widths came back empty, the reassert had nothing to do, and a hidden
+# dash came back to a row of 35, 34 and 90 columns that had been 53, 52 and 54.
+# The quietest possible version of this bug: a toggle that restores the wrong
+# geometry still restores the pane, so nothing looks broken until you compare.
+# So no row is singled out at all now — every pane goes in, sorted, and a width
+# that has not changed is a `resize-pane` that does nothing.
+pane_widths() {
+  tmux list-panes -t "$SID:seats" \
+      -F '#{pane_top} #{pane_left} #{pane_id} #{pane_width}' \
+    | sort -k1,1n -k2,2n \
+    | awk '{ printf "%s:%s ", $3, $4 }'
+}
+
+# The widths go back with the failure tolerated, for the reason dash_resize gives
+# about its own resize: tmux clamps or refuses when the neighbours cannot give up
+# the columns, and a row a column or two out is not worth failing a toggle that
+# has already put the pane back where it belongs.
+restore_widths() {
+  local pair
+  for pair in $1; do
+    tmux resize-pane -t "${pair%%:*}" -x "${pair##*:}" 2>/dev/null || true
+  done
+}
+
+# THE WIDTHS ARE READ BEFORE THE BREAK, not after, and that is the whole of what
+# makes the restore exact. After it the hidden pane is not in the row at all and
+# its columns have already been handed to a neighbour — recording then would say
+# "seat 3 is 120 wide" and put a screen back the way the break left it.
+hide_pane() {   # hide_pane <what> <pane id> <size to come back at>
+  local widths
+  widths=$(pane_widths)
+  tmux break-pane -d -s "$2" -n "$HOLDING" \
+    || die "$1: tmux would not break the pane out"
+  tmux set-option -t "$SID:" "@qb_hidden_$1" "$2 $3 $widths"
+}
+
+# ---- the actions ------------------------------------------------------------
+toggle_tape() {
+  local state p size widths target
+  state=$(hidden_state tape)
+  if [ -n "$state" ]; then
+    read -r p size widths <<<"$state"
+    if ! pane_exists "$p"; then
+      # The holding window was killed by hand, or the pane's process died and
+      # took it with it. Clear the lie rather than refusing forever: the next
+      # press then hides a tape that is showing, which is what the key is for.
+      tmux set-option -t "$SID:" -u @qb_hidden_tape
+      die "the hidden tape is gone — nothing to bring back"
+    fi
+    target=$(first_seat)
+    [ -n "$target" ] || die "this screen has no seat to put the tape back beside"
+    # -v -f -l is verbatim what qb-seats' own split is: a strip off the bottom of
+    # the WHOLE window rather than of the pane it is taken from. The tape is last
+    # in the build order, so this is the same call whether or not there is a dash.
+    tmux join-pane -v -f -l "$size" -s "$p" -t "$target" \
+      || die "tape: tmux would not put the pane back"
+    restore_widths "$widths"
+    tmux set-option -t "$SID:" -u @qb_hidden_tape
+  else
+    p=$(tape_pane)
+    [ -n "$p" ] || die "this screen has no tape"
+    hide_pane tape "$p" "$(tmux display-message -p -t "$p" '#{pane_height}')"
+  fi
+}
+
+# THE DASH COMES BACK BY REPLAYING THE BUILD ORDER, which is the only spelling
+# that reproduces the screen. qb-seats splits the dash off the whole window first
+# — full height, so it spans both rows of a ten-seat grid — and takes the tape's
+# strip off the bottom afterwards, which is what leaves the dash ABOVE the tape
+# rather than beside it. Join the dash back with the tape already in place and
+# `-f` gives it the full height of the window instead: measured on 3.6a as a
+# 78x44 dash down the side of a 121-column tape, on a screen whose dash had been
+# 78x32 over a full-width one. So the tape steps out, the dash goes in, the tape
+# comes back — the same three panes, the same processes, the order they were
+# built in.
+toggle_dash() {
+  local state p size widths target tape tape_h=""
+  state=$(hidden_state dash)
+  if [ -n "$state" ]; then
+    read -r p size widths <<<"$state"
+    if ! pane_exists "$p"; then
+      tmux set-option -t "$SID:" -u @qb_hidden_dash
+      die "the hidden dash is gone — nothing to bring back"
+    fi
+    target=$(first_seat)
+    [ -n "$target" ] || die "this screen has no seat to put the dash back beside"
+    # Only a tape that is actually SHOWING has to step aside. One already hidden
+    # is not in the way, and breaking it out a second time would strand it under
+    # an @qb_hidden_tape this has no business rewriting.
+    tape=$(tape_pane)
+    if [ -n "$tape" ] && [ -z "$(hidden_state tape)" ]; then
+      tape_h=$(tmux display-message -p -t "$tape" '#{pane_height}')
+      # REFUSED RATHER THAN TOLERATED. Carrying on with the tape still in place
+      # is not "the toggle without the tidy-up", it is the wrong geometry on
+      # purpose — a full-height dash down the side of a shortened tape, which is
+      # the exact thing the step-aside exists to avoid. Nothing has moved at this
+      # point, so refusing leaves a screen that is merely missing its dash.
+      tmux break-pane -d -s "$tape" -n "$HOLDING" \
+        || die "dash: the tape would not step out of the way, so nothing was moved"
+    fi
+    if ! tmux join-pane -h -f -l "$size" -s "$p" -t "$target"; then
+      # PUT THE TAPE BACK BEFORE GIVING UP. It was where it belonged a moment
+      # ago and this failure is not about it; leaving it parked would strand a
+      # pane with nothing recording that it is parked, and the next `t` would
+      # then try to break out a pane that is already broken out.
+      if [ -n "$tape_h" ] \
+         && ! tmux join-pane -v -f -l "$tape_h" -s "$tape" -t "$target"; then
+        tmux set-option -t "$SID:" @qb_hidden_tape "$tape $tape_h $widths"
+      fi
+      die "dash: tmux would not put the pane back"
+    fi
+    # The tape goes back BEFORE the widths, which is the order this was measured
+    # in: a vertical join takes rows and leaves every column where it was, so the
+    # reassert is the last word either way and there is no reason to leave the
+    # screen briefly holding a row it will have to redo.
+    # A tape that could not be put back IS hidden, so the state has to say so —
+    # otherwise `t` finds it parked in the holding window (the lookup is over the
+    # whole session), tries to break out a pane that is already broken out, and
+    # the screen needs two presses to get back to one truth. Recorded rather than
+    # tolerated, and the same widths, since the row it belongs to has not moved.
+    if [ -n "$tape_h" ]; then
+      tmux join-pane -v -f -l "$tape_h" -s "$tape" -t "$target" \
+        || tmux set-option -t "$SID:" @qb_hidden_tape "$tape $tape_h $widths"
+    fi
+    restore_widths "$widths"
+    tmux set-option -t "$SID:" -u @qb_hidden_dash
+  else
+    p=$(dash_pane)
+    [ -n "$p" ] || die "this screen has no dash"
+    hide_pane dash "$p" "$(tmux display-message -p -t "$p" '#{pane_width}')"
+  fi
+}
+
+# A NUDGE UPDATES @qb_dash_width, and that is the point rather than a side
+# effect. That option is "the width this screen asked for", and it is what the
+# window-resized hook puts the dash back to on every attach and every terminal
+# resize — so a nudge that did not write it would be undone by the next resize,
+# which is not what somebody pressing `>` four times is asking for. The clamp is
+# untouched: dash_resize still caps a recorded request at a third of the window,
+# so a nudge past that survives until the next resize and then settles where it
+# fits, with qb-seats saying so on stderr as it always did.
+nudge_dash() {   # nudge_dash <+|->
+  local p now want
+  [ -z "$(hidden_state dash)" ] || die "the dash is hidden — bring it back first"
+  p=$(dash_pane)
+  [ -n "$p" ] || die "this screen has no dash"
+  now=$(tmux display-message -p -t "$p" '#{pane_width}') || die "the dash went away"
+  case "$now" in ''|*[!0-9]*) die "tmux reported no width for the dash" ;; esac
+  if [ "$1" = "+" ]; then want=$(( now + NUDGE )); else want=$(( now - NUDGE )); fi
+  [ "$want" -ge "$MIN_DASH" ] || want=$MIN_DASH
+  tmux resize-pane -t "$p" -x "$want" || true
+  # WHAT ACTUALLY LANDED, not what was asked for: tmux clamps quietly as well as
+  # refusing loudly, and recording the request would have the next resize hook
+  # asking for a width this window has already turned down.
+  now=$(tmux display-message -p -t "$p" '#{pane_width}') || return 0
+  tmux set-option -p -t "$p" @qb_dash_width "$now"
+}
+
+case "$ACTION" in
+  add)
+    run_out "add a seat" "$(beside_me qb-seat-click)" add "$SESSION"
+    ;;
+  close)
+    [ -n "$PANE" ] || die "no pane recorded for the key"
+    # The seat number off the pane the key was pressed in. A pane with no
+    # @qb_seat is the tape, the dash, or something the dashboard split into the
+    # row — none of which this closes, and all of which qb-seat-click would
+    # refuse anyway (its `$2 != ""` guard, which the test suite found by watching
+    # a malformed range close the board pane).
+    n=$(tmux show-options -p -t "$PANE" -qv @qb_seat 2>/dev/null) || n=""
+    [ -n "$n" ] || die "that pane is not a seat"
+    run_out "close seat $n" "$(beside_me qb-seat-click)" "kill$n" "$SESSION"
+    ;;
+  seat[0-9]*)
+    n=${ACTION#seat}
+    case "$n" in ''|*[!0-9]*) die "'$ACTION' names no seat" ;; esac
+    run_out "jump to seat $n" "$(beside_me qb-seat-click)" "seat$n" "$SESSION"
+    ;;
+  tape) toggle_tape ;;
+  dash) toggle_dash ;;
+  fit)  run_out "--dash-fit" "$(seats_bin)" --dash-fit -s "$SESSION" ;;
+  wider)    nudge_dash + ;;
+  narrower) nudge_dash - ;;
+  kill)
+    # The confirmation already happened, in the binding — the same contract
+    # qb-seat-click's kill path has with the ✕.
+    run_out "--kill" "$(seats_bin)" --kill -s "$SESSION"
+    ;;
+  # An action this does not know is not an error. The `Any` binding in the qb
+  # table hands over whatever was pressed so the menu can teach it, and a key
+  # this script has never heard of must not fill the status line with a complaint
+  # about it.
+  *) exit 0 ;;
+esac

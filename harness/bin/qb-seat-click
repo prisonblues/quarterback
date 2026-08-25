@@ -104,7 +104,14 @@ session_id() {
   local line
   tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
     | while IFS= read -r line; do
-        [ "${line#* }" = "$1" ] && printf '%s\n' "${line%% *}"
+        # `if`, NOT `[ … ] && printf`. A `&&` whose test fails is the last
+        # command in the loop body, so the `while` exits 1 whenever the session
+        # being looked for is not the LAST one listed — and under `pipefail` that
+        # is the pipeline's status, and so the command substitution's. A caller
+        # spelling `sid=$(session_id x) || sid=""` then discarded the id it had
+        # just been given: measured as a second screen on one server reporting
+        # "no screen named 'one' is up" about a screen tmux was listing.
+        if [ "${line#* }" = "$1" ]; then printf '%s\n' "${line%% *}"; fi
       done
 }
 

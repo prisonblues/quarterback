@@ -111,6 +111,7 @@ SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
 YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
 BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
+KEY_DEFAULT="C-q"       # the qb key, when QB_SEATS_KEY does not say otherwise
 DASH_SIZE="${QB_SEATS_DASH_SIZE:-78}"   # dash width in columns, down the right of
                         # the window. 78 is what the dashboard's own table wants
                         # before it starts wrapping, not a taste in proportions
@@ -159,6 +160,7 @@ Environment:
   QB_SEATS_DASH_SIZE  dash width in columns (default 78, and never more than a
                       third of the window — the seats need the rest)
   QB_SEATS_BAR        0 to leave the status line and the mouse alone (see below)
+  QB_SEATS_KEY        the qb key, default $KEY_DEFAULT; empty for no key at all
   QB_SEAT_YOLO        0 to give the seats their permission prompts back
   QB_SEAT_AGENT       the agent binary a seat runs, instead of \`claude\`
   QB_SEAT_SCOPE       what the seats are called after — \`seat-<scope>-<n>\`.
@@ -172,6 +174,16 @@ seat: the name jumps to that pane, the ✕ closes it after a y/n, and ＋ adds o
 Turning it on sets \`mouse on\`, \`status 2\` and \`status-position top\` for this
 session, and binds MouseDown1Status for the whole server — QB_SEATS_BAR=0 if
 that is not a trade you want.
+
+The qb key is the keyboard half of the same thing, and it is a key table rather
+than a menu key: $KEY_DEFAULT then \`a\` adds a seat, \`x\` closes this one, \`1\`-\`9\` jump,
+\`t\` and \`d\` hide and show the tape and the dash, \`=\` \`>\` \`<\` size the dash, \`K\`
+kills the screen and \`?\` explains it. Anything else opens a menu carrying the
+same keys, so the shortcut is learnt from the thing it replaces. The binding is
+server-wide, so it is gated on this being a screen and falls through to the key
+tmux would have sent anywhere else. QB_SEATS_KEY picks a different one —
+\`QB_SEATS_KEY=M-q\`, say, if $KEY_DEFAULT is your XON or your quoted-insert — and
+QB_SEATS_KEY= (empty) means no key is bound at all.
 EOF
 }
 
@@ -597,6 +609,165 @@ install_bar() {
       'switch-client -t ='
 }
 
+# ---- the qb key -------------------------------------------------------------
+# The keyboard half of the seat bar, and until it existed there was no other
+# half: every seat-level action was a click, adding a seat from the keyboard
+# meant dropping to a shell for `qb-seats --add`, and the tape and the dash could
+# not be got out of the way at all without dragging borders. Turning the bar on
+# also costs `mouse on`, i.e. shift-less text selection, which is a real price
+# for the only way in.
+#
+# A KEY TABLE RATHER THAN A MENU KEY, which is the one design decision here worth
+# arguing. `bind-key -n C-q switch-client -T qb` plus `bind-key -T qb <key>` is
+# how tmux implements its own prefix, and it costs nothing: C-q t is one chord
+# whether or not a menu was drawn, and a menu drawn on every press is a flash in
+# front of the screen you were looking at. What the menu is for is the press
+# where you do not know the key — so it is bound to `Any`, and a key the table
+# does not have opens it rather than being swallowed. That is the whole of "the
+# menu teaches the shortcut it is about to replace": you reach it by not knowing.
+#
+# THE HAZARD IS THAT A KEY TABLE IS SERVER-WIDE, exactly as install_bar says
+# about MouseDown1Status, and the answer is the same one. @qb_key is set on this
+# session and on nothing else, so in the user's other sessions the condition is
+# false and the else branch does verbatim what tmux would have done — sends the
+# key on to the pane. A session that is not a screen is therefore not quietly
+# missing a keystroke, which is the failure mode a bare `bind-key -n` has.
+#
+# C-q HAS PRIOR CLAIMS and they are worth stating rather than discovering: it is
+# XON under `stty ixon`, and readline and emacs bind it to quoted-insert. Inside
+# a seat pane tmux sees it first, so on a screen the agent loses it — hence
+# QB_SEATS_KEY, and hence the user's own prefix being left entirely alone.
+#
+# ONE TABLE GENERATES BOTH THE BINDINGS AND THE MENU. An accelerator on the menu
+# that is not the key bound in the table would make the menu a liar about the
+# thing it exists to teach, and two lists is how that happens. Each row is
+# `key|label|command`, the command is ONE tmux command string — measured on 3.6a:
+# bind-key parses a whole command handed to it as a single argument, and
+# display-menu takes an item's command as one argument too, so the same string
+# serves both without a second spelling.
+
+# `${VAR+set}` and not `${VAR:-}`, the same spelling as QB_SEATS_DASH and
+# qb-seat's QB_SEAT_BRIEF, and for the same reason: EMPTY MEANS NONE and unset
+# means pick for me. Those are different answers here — a user whose terminal or
+# whose emacs wants C-q asks for no key at all with `QB_SEATS_KEY=`, and a `-n`
+# test would read that as "not answered" and bind the default over the top of the
+# thing they were getting out of the way. QB_SEATS_BAR is spelt the other way
+# (`0` turns it off) because it is older than this rule; the two knobs are not
+# interchangeable and the usage text says so for each.
+qb_key() {
+  [ -n "${QB_SEATS_KEY+set}" ] && { printf '%s' "$QB_SEATS_KEY"; return; }
+  printf '%s' "$KEY_DEFAULT"
+}
+
+qb_actions() {   # <qb-seat-key path> <qb-seats path>
+  local d k here
+  d=$(sh_quote "$1"); k=$(sh_quote "$2")
+  # THE SCREEN AND THE PANE TRAVEL IN THE BINDING, expanded by tmux as the key is
+  # pressed. This is where qb-seat-click's stash would have gone, and it is not
+  # needed: `#{mouse_status_range}` is scoped to a mouse EVENT and is gone by the
+  # time confirm-before runs its command, which is why the ✕ has to record it —
+  # but a session and a pane are CLIENT state, not event state. Measured on 3.6a
+  # against a real client and a real keystroke: both arrive correct from a plain
+  # binding and from behind a `confirm-before` y/n. A server option would have
+  # been a race between two clients pressing the key on one server; an argument
+  # cannot be.
+  #
+  # THE ID AND NOT THE NAME, for this script's usual reason plus one specific to
+  # here. `.` and `:` are a target's own separators — and this value crosses
+  # tmux's expansion into a SHELL command line, where a session called `it's`
+  # would leave an unterminated quote. `$0` is a dollar and digits and can be
+  # neither. The dollar is safe: a format expands once, so tmux does not re-read
+  # `$0` as one of its own variables — measured, because the fall-through arm of
+  # the binding is written the other way round and does have to be.
+  here="'#{session_id}' '#{pane_id}'"
+  # `confirm-before`'s command is parsed when the answer comes back, not now, so
+  # it is a tmux string inside a tmux string — the one place here that nests, and
+  # the same shape install_bar's ✕ uses. Both confirmed actions kill an agent.
+  #
+  # NEITHER POPUP TAKES -E, and that is not an oversight. -E closes the popup the
+  # moment its command exits, and both of these are things to READ: `list` prints
+  # a handful of rows and returns, `guide` prints twenty lines. Without it the
+  # popup stays until q or Escape, which is what a cheatsheet wants and what
+  # tmux's own popups do.
+  printf '%s\n' \
+    "a|add a seat|run-shell -b \"$d add $here\"" \
+    "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$d close $here\\\"\"" \
+    "t|show or hide the tape|run-shell -b \"$d tape $here\"" \
+    "d|show or hide the dash|run-shell -b \"$d dash $here\"" \
+    "=|the dash back to the width it asked for|run-shell -b \"$d fit $here\"" \
+    ">|the dash wider|run-shell -b \"$d wider $here\"" \
+    "<|the dash narrower|run-shell -b \"$d narrower $here\"" \
+    "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
+    "||" \
+    "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$d kill $here\\\"\"" \
+    "?|these keys, in full|display-popup -w 78 -h 24 \"$d guide\""
+  # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
+  # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
+  # the guide asks tmux which session it is in instead. `display-message -p` with
+  # no `-t` answers with the client's current one, which inside a popup is the
+  # client that opened it.
+}
+
+install_key() {
+  local key=$1 dispatch=$2 seats=$3 k label cmd n
+  local -a menu=()
+
+  # What the gate reads, and what the guide reads to name the key it is about to
+  # explain. On the session, so a second screen with a different QB_SEATS_KEY is
+  # not answered for by the first.
+  tmux set-option -t "$SESSION_ID:" @qb_key "$key"
+
+  # A ROW WITH NO KEY IS A MENU SEPARATOR and binds nothing — which is why the
+  # grouping lives in the table beside the actions rather than as a slice of the
+  # array afterwards. It was a slice for one draft, `${menu[@]:0:8}`, and eight is
+  # not a multiple of three: the rule landed in the middle of the tape item and
+  # split its label off from its command.
+  while IFS='|' read -r k label cmd; do
+    if [ -z "$k" ]; then menu+=('' '' ''); continue; fi
+    tmux bind-key -T qb "$k" "$cmd"
+    menu+=("$label" "$k" "$cmd")
+  done < <(qb_actions "$dispatch" "$seats")
+
+  # The nine seat keys are bound and are deliberately NOT on the menu. A screen
+  # can have ten seats and a menu with ten more rows on it is a worse menu, while
+  # the digits are the one group nobody has to be taught — so the title carries
+  # them instead. A digit naming a seat that is not there reports it the way the
+  # bar's cells do, through qb-seat-click, rather than being bound per screen and
+  # going stale the moment a seat is added or closed.
+  n=1
+  while [ "$n" -le 9 ]; do
+    tmux bind-key -T qb "$n" \
+      "run-shell -b \"$(sh_quote "$dispatch") seat$n '#{session_id}' '#{pane_id}'\""
+    n=$((n + 1))
+  done
+
+  # `Any` is the discovery path — see the header. It is bound last so that every
+  # key above beats it, which is how tmux resolves a table: an exact match first,
+  # Any only when there is none.
+  #
+  # Every word its own argument, never a part-string with the items after it:
+  # tmux takes a whole command handed to it as ONE argument and it takes a
+  # pre-split argv, and mixing the two is a third thing that is neither.
+  tmux bind-key -T qb Any \
+    display-menu -T '#[align=centre] qb — 1-9 jumps to a seat ' -x C -y C \
+    "${menu[@]}"
+
+  # GATED ON THIS KEY, not merely on this being a screen. `#{!=:#{@qb_key},}`
+  # was the first spelling and it is subtly wrong on a box running two screens
+  # with different keys: nothing UNBINDS the first screen's key when the second
+  # is built, so a server ends up with both bound and both conditions true on
+  # both screens — C-q would open the table on a screen whose user had asked for
+  # M-q precisely to get C-q back. Comparing the value makes each binding answer
+  # for its own screen and fall through everywhere else, which is what the guide
+  # promises. The key cannot carry any of the format's own punctuation — `#`, `}`,
+  # `,`, `:` — nor a quote or a `$`; it is checked for exactly that before
+  # anything is built, which is why it can be interpolated raw here.
+  tmux bind-key -n "$key" \
+    if-shell -F "#{==:#{@qb_key},$key}" \
+      "switch-client -T qb" \
+      "send-keys $key"
+}
+
 # ---- where the seats work ---------------------------------------------------
 default_repo() {
   git rev-parse --show-toplevel 2>/dev/null \
@@ -632,7 +803,14 @@ session_id() {
   # space, which is where the id ends.
   tmux list-sessions -F '#{session_id} #{session_name}' 2>/dev/null \
     | while IFS= read -r line; do
-        [ "${line#* }" = "$1" ] && printf '%s\n' "${line%% *}"
+        # `if`, NOT `[ … ] && printf`. A `&&` whose test fails is the last
+        # command in the loop body, so the `while` exits 1 whenever the session
+        # being looked for is not the LAST one listed — and under `pipefail` that
+        # is the pipeline's status, and so the command substitution's. A caller
+        # spelling `sid=$(session_id x) || sid=""` then discarded the id it had
+        # just been given: measured as a second screen on one server reporting
+        # "no screen named 'one' is up" about a screen tmux was listing.
+        if [ "${line#* }" = "$1" ]; then printf '%s\n' "${line%% *}"; fi
       done
 }
 
@@ -1094,6 +1272,21 @@ if [ "$ACTION" = resume ]; then
   exit 0
 fi
 
+# A `--kill` THAT WAS TOLD WHICH SCREEN needs nothing else, and this is above the
+# repo derivation for the reason `list`, `resume` and `--dash-fit` are: killing a
+# screen is about one that already exists, so it must not need what BUILDING one
+# needs. It matters now because the qb key's K reaches here through a
+# `run-shell`, whose cwd is the tmux SERVER's — wherever that server was started,
+# which need not be a repo at all, and `qb-seats --kill -s t` then refused with
+# "not in a git repo" against a screen it could see. A bare `qb-seats --kill`
+# still means "the screen for the repo I am standing in" and falls through to the
+# derivation below, which is the only reason a kill ever wanted one.
+if [ "$ACTION" = kill ] && [ -n "$SESSION" ]; then
+  have_session || die "no session $SESSION"
+  tmux kill-session -t "$SESSION_ID"
+  exit 0
+fi
+
 [ -n "$REPO" ] || REPO=$(default_repo)
 REPO=$(cd -P "$REPO" 2>/dev/null && pwd) || die "no such directory: $REPO"
 [ -n "$SESSION" ] || SESSION="seats-${REPO##*/}"
@@ -1176,6 +1369,33 @@ esac
 { [ "$DASH_SIZE" -ge 1 ] && [ "$DASH_SIZE" -le "$WINDOW_COLS" ]; } \
   || die "QB_SEATS_DASH_SIZE=$DASH_SIZE: 1 to $WINDOW_COLS columns (a screen is built
        $WINDOW_COLS wide, and the dash never takes more than a third of the window)"
+
+# The qb key reaches a tmux command line the same way, and is checked here for the
+# same reason: `bind-key` is one of the last things this script does, so a key
+# tmux will not take would refuse with the session, the seats, the dash and the
+# tape already built.
+#
+# TWO PLACES THE VALUE LANDS, and the second is the strict one. It is a bare word
+# in `bind-key -n <key>` and in `send-keys <key>`, which rules out whitespace,
+# quotes, a backslash and a `;`. And it is interpolated into the gate's FORMAT,
+# `#{==:#{@qb_key},<key>}` — where `#` opens a format, `}` closes one, and `,`
+# and `:` are the separators between a format's own arguments. A key carrying one
+# of those does not fail loudly: the format still parses, as something else, and
+# the gate then answers a question nobody asked. `$` goes too, because tmux
+# expands one inside the double quotes the else-arm is written in.
+#
+# Nothing worth having is lost. Those are all root-table bindings, so a bare `,`
+# or `:` as the qb key would take that character away from every pane on the box
+# — a screen's user wants C-q or M-q, and a `#` is not a tmux key name at all.
+QB_KEY=$(qb_key)
+case "$QB_KEY" in
+  *[[:space:]]*|*"'"*|*'"'*|*'\'*|*';'*|*'#'*|*'$'*|*','*|*':'*|*'{'*|*'}'*)
+    die "QB_SEATS_KEY=$QB_KEY: a tmux key name — letters, digits, C-/M- and most
+       punctuation. Not whitespace, quotes, a backslash, or any of ; # \$ , : { }
+       — those either end the command the binding is written into or are
+       punctuation in the format that decides whether it fires. QB_SEATS_KEY=
+       (empty) is how to ask for no key at all." ;;
+esac
 
 # QB_SEATS is a contract with the user's shell rc, and it is not cosmetic — on
 # the machine this was written for it is the difference between a screen that
@@ -1290,6 +1510,13 @@ tmux set-option -t "$SESSION_ID:" @qb_seats_bin "$SELF"
 # key for the whole server. Everything it does is scoped to this session bar the
 # binding, and the binding no-ops everywhere else — see install_bar.
 [ "${QB_SEATS_BAR:-1}" = 0 ] || install_bar "$(beside_me qb-seat-click)"
+
+# The key is opt-out on its own knob rather than the bar's, because the two are
+# separate costs. The bar takes the status line and turns the mouse on; the key
+# takes one keystroke away from whatever a seat pane would have done with it, and
+# gives back everything the bar can do without the mouse. Wanting one and not the
+# other is an ordinary preference in both directions.
+[ -z "$QB_KEY" ] || install_key "$QB_KEY" "$(beside_me qb-seat-key)" "$SELF"
 
 # ROWS ARE BUILT, NOT CHOSEN. `select-layout tiled` picks its own arrangement
 # from the window's aspect ratio — six seats in a 240x60 window come out 2 across
