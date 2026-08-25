@@ -249,6 +249,32 @@ async def test_the_second_claimant_of_planned_work_is_still_refused_the_claim(cl
 
 # ----------------------------------------- naming the work
 
+async def test_a_plan_write_that_fails_does_not_take_the_claim_with_it(client, monkeypatch):
+    """The safety property the whole design rests on, forced rather than argued.
+
+    A claim that lands with no item costs a row on a dashboard. A claim REFUSED
+    because a plan write failed costs the duplicated work the claim exists to
+    prevent, and they are not close — so the failure is reported beside a claim
+    that stands, never instead of one."""
+    import app.api.plan as plan_api
+
+    async def boom(*a, **kw):
+        raise RuntimeError("the plan table is on fire")
+
+    monkeypatch.setattr(plan_api, "item_for_claim", boom)
+
+    repo = "acme/onfire"
+    out = await claim_issue(client, repo, 99, note="picking up regardless")
+    assert out["claimed"] is True
+    assert out["plan_item"] is None
+    assert "on fire" in out["plan_item_error"]
+
+    # And the claim is real: a second agent is still refused by it.
+    r = await client.post("/claim", json={
+        "ref": {"kind": "issue", "repo": repo, "value": "99"}}, headers=SERVER)
+    assert r.status_code == 409, r.text
+
+
 async def test_a_client_that_read_the_forge_may_pass_the_real_title(client):
     """The "clients enrich" half. The server cannot read GitHub (#327) and does
     not try; a caller that just ran `gh issue view` passes what it found."""
