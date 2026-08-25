@@ -546,6 +546,12 @@ async def take_claim(
     with ``plan_item_error`` saying why. A claim that landed with no item costs a
     row on a dashboard; a claim refused because a plan write failed costs the
     duplicated work the claim exists to prevent, and they are not close.
+
+    **A renew repairs.** Because the write can fail and the claim survives it
+    anyway, something has to be able to put it right afterwards, or "best-effort"
+    means "permanently invisible on the first bad day" — the exact state this
+    feature was built to abolish. So a renew runs the same write, which finds the
+    item already there and returns it, and writes it when it is not.
     """
     try:
         kind, key = body.resolve()
@@ -561,12 +567,17 @@ async def take_claim(
         out["note_on_key"] = (
             f"you asked for {body.kind}/{body.key!r}; the board keys that resource "
             f"as {kind}/{key!r}. Send `ref` instead and you never have to know.")
-    if not renewed:
-        # Only a fresh take. A renew is the same agent still holding the same
-        # work, and the item it implies was written the first time round.
-        out.update(await _plan_item_for(
-            session, kind=kind, key=key, holder=holder,
-            note=body.note, title=body.title))
+    # On a renew too, and that is a REPAIR rather than a second write. Gating this
+    # on a fresh take left the one state this feature exists to abolish with no way
+    # out of it: if the plan write failed once — a transient database fault, a
+    # deploy mid-migration — the claim was invisible on the plan for as long as it
+    # kept being renewed, because every renew skipped the only code that could have
+    # fixed it. `item_for_claim` is idempotent by construction (an existing open
+    # item is returned, not rewritten), so the repair costs one indexed SELECT on a
+    # renew that had nothing to fix.
+    out.update(await _plan_item_for(
+        session, kind=kind, key=key, holder=holder,
+        note=body.note, title=body.title))
     return out
 
 

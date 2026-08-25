@@ -885,8 +885,51 @@ def _next_caveat(nxt: dict | None, trust: dict, open_n: int) -> str | None:
     best one available, and an agent that reads nothing else should get it. What
     it must not get is unqualified confidence — this is the issue's sharpest
     complaint, and the minimum fix it asks for even if placement never landed.
+
+    Two separate things can qualify the answer and both are said when both apply:
+    the order was partly nobody's, and the row at the top of it is work somebody
+    abandoned (#427).
     """
-    if nxt is None or trust["trusted"]:
+    if nxt is None:
+        return None
+    parts = [p for p in (_abandoned_caveat(nxt), _unchosen_caveat(nxt, trust, open_n))
+             if p]
+    return " ".join(parts) or None
+
+
+def _abandoned_caveat(nxt: dict) -> str | None:
+    """Said when ``next`` is a pickup whose claim is gone. Never a silent promotion.
+
+    A ``picked-up`` row sits at rank 1 because an agent claimed the work, and that
+    is a true thing to say while the claim is live — it is what makes the promotion
+    harmless, since ``next`` skips claimed items and walks past it to the same free
+    item it would have found before.
+
+    **Being ``next`` at all is therefore proof the justification has expired**, and
+    that is why this needs no claim lookup: ``next`` is the first OPEN, UNCLAIMED,
+    unblocked item, so a ``picked-up`` row can only reach it once nobody holds it.
+    The rank then outranks a human's ordered list on the strength of a claim that
+    no longer exists, and the plan went on reporting ``trusted: true`` — which is
+    correct about the position (an action chose it) and misleading about the answer.
+
+    Not demoted, and not hidden. Work an agent started and put down is a genuinely
+    good thing to pick up next, and it is the first thing a human scanning the plan
+    should see. It just may not arrive as an unqualified recommendation.
+    """
+    if nxt["rank_source"] != "picked-up":
+        return None
+    return (
+        "This is at the top because an agent claimed it, and that claim is gone — "
+        "so it is work somebody started and put down, not a position anybody "
+        "ranked above the rest. That makes it a good pick and not a stated "
+        "priority: read its note, and check with whoever held it before you "
+        "assume it was abandoned rather than finished."
+    )
+
+
+def _unchosen_caveat(nxt: dict, trust: dict, open_n: int) -> str | None:
+    """The original caveat: how much of the order anybody actually decided."""
+    if trust["trusted"]:
         return None
     first = trust["first_unchosen"]
     # Says where the unchosen positions START and never that everything after

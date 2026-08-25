@@ -11,16 +11,21 @@ board" safe to do automatically:
 * **A fresh claim on an issue writes the item, at the top of that scope**, held by
   the claimer — because the claim it derives is byte-for-byte the one the item
   keys on (#172), so the two halves join with nothing to reconcile.
-* **It costs the human's order nothing.** Every picked-up row is claimed by
-  construction, and `next` skips claimed items, so the first free pick is exactly
-  what it was. This is the property that makes the whole feature safe.
+* **It costs the human's order nothing WHILE THE CLAIM IS LIVE.** Every picked-up
+  row is claimed at the moment it is written, and `next` skips claimed items, so
+  the first free pick is exactly what it was. The qualifier is the whole of it:
+  once the claim lapses or is released the row is a free item at rank 1 and it
+  DOES become `next`, ahead of the human's list. That is defensible — abandoned
+  work is a good thing to pick up — but it may not arrive silently, so `next`
+  carries a caveat saying what the row actually is.
 * **The vocabulary stays honest.** `picked-up` is its own `rank_source` and counts
   as chosen, so a busy fleet does not make the plan read as untrustworthy.
 * **It writes an item only for a unit of work.** A merge claim, a board object, a
   path key (#185) and the open namespace all write nothing — and that silence is
   a normal answer, not an error.
-* **The claim is what is guaranteed.** A renew adds nothing, a second claimant of
-  a planned issue is not refused, and the item never fails the claim.
+* **The claim is what is guaranteed, and a renew REPAIRS.** The item never fails
+  the claim — and because it can fail, a renew runs the same idempotent write, so
+  a claim whose item was lost to a transient fault is not invisible forever.
 """
 
 from __future__ import annotations
@@ -52,6 +57,25 @@ async def read(client, repo: str | None = None, headers=LAPTOP, **params) -> dic
                          headers=headers)
     assert r.status_code == 200, r.text
     return r.json()
+
+
+async def _expire(key: str) -> None:
+    """Age a live claim out, instead of waiting for the wall clock to do it."""
+    from datetime import UTC, datetime, timedelta
+
+    from sqlalchemy import update
+
+    from app.api.plan import CLAIM_KIND
+    from app.db import async_session
+    from app.models.resource_lease import ResourceLease
+
+    async with async_session() as s:
+        await s.execute(
+            update(ResourceLease)
+            .where(ResourceLease.kind == CLAIM_KIND, ResourceLease.key == key,
+                   ResourceLease.released_at.is_(None))
+            .values(expires_at=datetime.now(UTC) - timedelta(seconds=1)))
+        await s.commit()
 
 
 async def add(client, repo: str, title: str, headers=LAPTOP, **over) -> dict:
@@ -105,10 +129,13 @@ async def test_a_composed_key_writes_the_same_item_as_a_derived_one(client):
 
 # ----------------------------------------- it costs the human's order nothing
 
-async def test_a_picked_up_item_never_becomes_next(client):
-    """The property the whole feature rests on. Picked-up rows sit above the
-    human's list, and `next` walks straight past them because they are claimed —
-    so the first free pick is the same one it would have been."""
+async def test_a_held_pickup_does_not_displace_next(client):
+    """The property the feature rests on, stated with its qualifier. Picked-up rows
+    sit above the human's list and `next` walks straight past them BECAUSE THEY ARE
+    CLAIMED — so while they are held, the first free pick is the one it would have
+    been. What happens when the claim goes is a different answer, and it is
+    `test_an_abandoned_pickup_becomes_next_but_says_so`: this test is not evidence
+    for that one."""
     repo = "acme/nextsafe"
     human_top = await add(client, repo, "the thing Rich actually wants first",
                           ref_kind="issue", ref_value="63")
@@ -123,6 +150,66 @@ async def test_a_picked_up_item_never_becomes_next(client):
     # ...and it is still the answer.
     assert plan["next"]["item_id"] == human_top["item_id"]
     assert plan["next"]["rank"] == 3
+
+
+async def test_an_abandoned_pickup_becomes_next_but_says_so(client):
+    """The counterexample to the unqualified version of the safety claim, and the
+    reason `next` grew a second caveat.
+
+    A pickup is promoted to rank 1 on the strength of a live claim. When the claim
+    goes — the agent's box died, the TTL lapsed, somebody released it — the row is
+    open, unclaimed and unblocked at rank 1, so it becomes `next` ahead of a list a
+    human ordered. Being `next` at all is proof the justification expired, because
+    `next` skips anything claimed.
+
+    Not demoted and not hidden: work somebody started and put down is a good thing
+    to pick up. But it arrives as a qualified answer, because a silent promotion
+    over a human's stated order is the plan asserting a priority nobody set."""
+    repo = "acme/abandoned"
+    human = await add(client, repo, "Rich's actual top priority",
+                      ref_kind="issue", ref_value="63")
+    r = await client.post("/plan/reorder",
+                          json={"repo": repo, "order": [human["item_id"]]}, headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    out = await claim_issue(client, repo, 999, note="agent picks this up, then dies")
+    live = await read(client, repo)
+    assert live["next"]["ref"]["value"] == "63", "while held, the human's order stands"
+    assert live["next"]["caveat"] is None
+
+    await _expire(f"{repo}#999")
+
+    gone = await read(client, repo)
+    assert gone["next"]["item_id"] == out["plan_item"]["item_id"]
+    assert gone["next"]["ref"]["value"] == "999"
+    # The whole point: it is the answer AND it is qualified.
+    caveat = gone["next"]["caveat"]
+    assert caveat and "claim is gone" in caveat
+    assert "not a position anybody ranked" in caveat
+
+
+async def test_the_two_caveats_are_said_together_when_both_apply(client):
+    """An abandoned row at the top of an order nobody chose is two separate
+    problems, and a caveat that mentions one is read as absolving the other."""
+    repo = "acme/bothcaveats"
+    await add(client, repo, "appended, nobody chose this", ref_kind="issue", ref_value="63")
+    await claim_issue(client, repo, 999, note="picked up then dropped")
+    await _expire(f"{repo}#999")
+
+    plan = await read(client, repo)
+    caveat = plan["next"]["caveat"]
+    assert "claim is gone" in caveat, "the abandoned half"
+    assert "nobody chose those positions" in caveat, "the untrusted-order half"
+
+
+async def test_a_held_pickup_is_never_qualified(client):
+    """The caveat must not fire on the ordinary case, or it is noise on every read."""
+    repo = "acme/quiet"
+    human = await add(client, repo, "ordered", ref_kind="issue", ref_value="63")
+    await client.post("/plan/reorder", json={"repo": repo, "order": [human["item_id"]]},
+                      headers=HUMAN)
+    await claim_issue(client, repo, 999, note="in flight")
+    assert (await read(client, repo))["next"]["caveat"] is None
 
 
 async def test_the_newest_pickup_goes_on_top_of_the_older_one(client):
@@ -199,19 +286,54 @@ async def test_claiming_a_plan_item_does_not_write_a_second_item(client):
 
 # ----------------------------------------- the claim is what is guaranteed
 
-async def test_a_renew_adds_nothing(client):
-    """A renew is the same agent still holding the same work. The item it implies
-    was written the first time round, and a second one is refused by the database
-    anyway — but the point is that it is never attempted."""
+async def test_a_renew_returns_the_same_item_rather_than_a_second_one(client):
+    """A renew runs the same write, and the write is idempotent: one open item per
+    issue is the database's rule, so the existing row comes back untouched rather
+    than being rewritten with the renewing note."""
     repo = "acme/renew"
     first = await claim_issue(client, repo, 5, session="s1", note="mine")
     again = await claim_issue(client, repo, 5, session="s1", note="still mine")
 
     assert again["renewed"] is True
-    assert "plan_item" not in again
+    assert again["plan_item"]["item_id"] == first["plan_item"]["item_id"]
+    assert again["plan_item"]["title"] == "mine", "a renew must not rewrite the item"
     plan = await read(client, repo)
     assert len(plan["items"]) == 1
-    assert plan["items"][0]["item_id"] == first["plan_item"]["item_id"]
+
+
+async def test_a_renew_repairs_an_item_the_first_claim_failed_to_write(client, monkeypatch):
+    """The hole a `if not renewed` gate left, and the reason there is no such gate.
+
+    The plan write is best-effort, so it can fail — a transient database fault, a
+    deploy caught mid-migration. The claim survives that by design. But if only a
+    FRESH take could write the item, the claim was then invisible on the plan for
+    as long as it kept being renewed, and a renewing agent renews for hours. A
+    feature built to abolish claim-only invisibility would have manufactured a
+    durable instance of it on its first bad day."""
+    import app.api.plan as plan_api
+
+    real = plan_api.item_for_claim
+
+    async def boom(*a, **kw):
+        raise RuntimeError("transient: the plan table is unavailable")
+
+    repo = "acme/repair"
+    monkeypatch.setattr(plan_api, "item_for_claim", boom)
+    first = await claim_issue(client, repo, 7, session="s1", note="picking up")
+    assert first["claimed"] is True
+    assert first["plan_item"] is None
+    assert (await read(client, repo))["items"] == [], "nothing on the plan yet"
+
+    # The fault clears, and the agent does what a holding agent does: renews.
+    monkeypatch.setattr(plan_api, "item_for_claim", real)
+    again = await claim_issue(client, repo, 7, session="s1", note="picking up")
+    assert again["renewed"] is True
+    assert again["plan_item"] is not None, "the renew must repair, not skip"
+
+    plan = await read(client, repo)
+    assert len(plan["items"]) == 1
+    assert plan["items"][0]["ref"] == {"kind": "issue", "value": "7"}
+    assert plan["items"][0]["claim"]["holder"] == "laptop"
 
 
 async def test_claiming_an_issue_already_on_the_plan_returns_that_item(client):
