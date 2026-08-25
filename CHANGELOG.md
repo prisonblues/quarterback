@@ -17,6 +17,224 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.19 — a claim writes its own plan item, and the collision datum stops being blind where it matters most
+
+### the dash pane opens on the renderer you can actually click
+
+`qb-seats` built its dash pane with the plain `qb-dash`, under a comment saying in
+capitals that the plain one was not better and should give up the slot "the moment
+#209 is fixed". #209 and #208 closed on 2026-08-20 — the clickable renderer keys its
+seat rows on the tmux pane id now, which is unique box-wide, so two screens on one
+machine no longer turn that pane into a `DuplicateKey` traceback. Nothing pointed
+back at the decision the fix released, and the workaround outlived its bug.
+
+The default is now `qb-dash-tui`, falling back to `qb-dash` where `textual` cannot be
+imported. The fallback is automatic rather than an opt-in env var, and the probe is
+`qb-dash --can-tui`, which answers using the launcher's own interpreter search — so
+the question "can the clickable one run here" cannot be answered one way by the probe
+and another by the launch.
+
+#### REVIEW QUEUE reaches the clickable renderer
+
+Flipping the default would otherwise have taken a panel off the screen: **REVIEW
+QUEUE** existed only in the plain renderer, and it is the panel that showed six of
+eight open PRs had never been panelled while the newest round on the board was two
+and a half days old. It is now in both, with the depth and oldest wait on the caps
+line beside the budget a round would be spent out of.
+
+Rows nothing can act on keep their place, greyed, with the hold where the verb would
+go — a queue that hid them would report a depth of zero for a repo where everything
+is stuck. Clicking one names every reason it is waiting, not just the first. The ⚖ is
+live only where a panel round is what the entry is actually waiting for: on a
+conflicting branch it stays grey and explains itself, because spending a round there
+buys nothing but the news that it conflicts.
+
+A queue with nothing in it says which kind of nothing: a board that could not be
+reached gets a red row carrying the whole message, and a queue that is genuinely
+drained says so in the board's own words. They are different answers and a blank
+table was neither. The depth also rides the caps line even on a machine with no
+subscription caps to draw and in a pane too narrow for them — the two cases where
+there is least else on that line and the number is most worth having.
+
+#### The seats table sizes to its content
+
+`#seats` had an `fr` share like every other panel, and adding a seventh panel took the
+denominator from 10fr to 11fr — which cost it the ＋ row, the only way to add a seat
+with the mouse. It is the one table here whose length is bounded, so it now sizes to
+what it holds and the others share what is left, up to the tallest it can be: the
+header, the ten seats `qb-seats` will build, and the ＋.
+
+### picking work up puts it on the plan, at the top
+
+Claiming an issue and putting it on the plan were two separate acts, and only one of them
+was automatic. `hermes/seat-quarterback-1` filed #426 at 21:58:19 and claimed it eleven
+seconds later — both halves done properly — and the PLANS panel showed nothing, because
+nothing writes a plan item except `POST /plan/item`.
+
+The claim was keyed correctly the whole time. `claim_key()` derives, for an issue-backed
+item, byte-for-byte the key a bare `POST /claim` takes; that is #172's fix and it works.
+What was missing was the lookup, because `GET /plan` builds its key set *from the items it
+has* — so a claim with no item behind it was looked up by nobody and rendered nowhere. A
+plan item's claim was a work claim, and a work claim was not a plan item.
+
+Now a fresh claim on an issue or a PR writes that repo's plan item as well, at the top of
+the list, and hands it back as `plan_item`. Nothing else has to remember to: it is on the
+endpoint, so the MCP tool, `qb-claim`, the lifecycle hooks and `/fix-issue` all inherit it.
+
+#### While it is held, it costs the human's ordering nothing
+
+`next` is the first item that is open, **unclaimed** and unblocked, and every row this
+writes is claimed at the moment it is written. So a pickup sits above the ordered list and
+`next` walks straight past it to the same free item it would have found before.
+
+The qualifier is load-bearing. When the claim goes — the agent's box died, the TTL lapsed,
+somebody released it — the row is open and unclaimed at rank 1, and it *does* become
+`next`, ahead of the list a human ordered. Being `next` at all is proof the justification
+expired, since `next` skips anything claimed.
+
+That is left as it is rather than demoted, because work somebody started and put down is a
+good thing to pick up and the first thing a human scanning the plan should see. What it may
+not be is silent: a promotion over a stated order, on the strength of a claim that no longer
+exists, is the plan asserting a priority nobody set. So `next` carries a caveat saying what
+the row actually is, and says it alongside the existing one about unchosen positions rather
+than instead of it — an abandoned row at the top of an order nobody chose is two problems,
+and a caveat naming one reads as absolving the other.
+
+#### A renew repairs
+
+The plan write is best-effort and the claim survives its failure, so something has to be
+able to put it right afterwards. Were the write attempted only on a fresh take, a claim
+whose item was lost to a transient fault would be invisible on the plan for as long as it
+kept being renewed — and a holding agent renews for hours. A feature built to abolish
+claim-only invisibility would have manufactured a durable instance of it on its first bad
+day. So a renew runs the same write: it finds the row already there and returns it, and
+writes it when it is not.
+
+#### `picked-up` is its own answer to "who chose this position"
+
+Neither existing value was true about such a row. `placed` would claim an agent named a
+neighbour and chose a position relative to it; nobody did. `appended` would be worse than
+untrue — `order_trust` counts appended rows as the positions nobody chose, so every claim
+taken would have made the plan read as less trustworthy for the sole reason that agents
+were working, swamping the signal that the human's ordering has gaps in it.
+
+So it is a fifth `rank_source`, counted as chosen. What chose it is the act of picking the
+work up, which is a real decision made by a real agent at a real moment.
+
+#### What it will not do
+
+Write an item for anything that is not a unit of work — a `merge` claim on a base branch, a
+`plan:`/`item:` board object, a path key (#185), or the open namespace like
+`prisonblues/lexray:serving-row:32022R2554`. Fail a claim because the item already existed,
+or because writing it failed: the claim is what prevents duplicated work and the item is a
+consequence of it, so a claim that lands with no item comes back with `plan_item_error` and
+the claim still stands. Add anything on a renew. Close the item when the claim is released —
+stopping is not finishing, and `plan_done` stays explicit.
+
+The board still makes no outbound calls, so it cannot read an issue's title. The item is
+named by the claim's own `note` — already "one line on what you are doing with it", which is
+what a plan title is for — or by a `title` a client that read the forge passes; `qb-claim`
+now asks `gh` for one. Absent both it is the bare ref, which is visibly a placeholder rather
+than an invented summary.
+
+#### Also fixed, and not part of this
+
+A batch's `submitted` items were drawn on the plan page in the muted weight that means
+"nobody chose this position", while the server counted them as chosen. The model settles
+which half was wrong — "each submission leaves exactly one position nobody chose", and that
+one is the batch's first item, which is `appended`. The page now agrees with `order_trust`,
+and a test holds the two together so the next source added cannot drift them apart again.
+
+### the merge commit that collides with everything was the one thing collisions could not see
+
+`GET /review/collisions` answers "which other pull requests touch the files this one does",
+and it was blind in exactly the wrong place. The panel declines to review a merge, a promote
+or a format-the-world commit — those titles match `skip_title_patterns` and an LLM round on
+them buys nothing — and it used to return before telling the board anything at all. So the
+board held no file list for them, and a skipped pull request was **neither subject nor
+rival**: asking about it returned 404, and asking about anything else never mentioned it.
+
+Those are the changes that touch the most files, collide with the most work and get merged
+unattended most often. Ordering a backlog by this endpoint would confidently batch colliding
+work together, which is a benign-looking answer built on a measurement with a hole in it.
+
+The early return was not a mistake, and the fix is not to delete it. No review happened, and
+a non-event recorded as an event is a disease of its own — one this board has spent a dozen
+fixes on. What was missing was a way for the row to say so.
+
+#### a run that reviewed nothing now says which it is
+
+`review_runs` gains `reviewed` and `skip_reason`. The panel has been sending both on every
+exit for several releases; the board had nowhere to put them and dropped them on the floor.
+It stores them now, and the skip path records its run like any other — a row that carries
+what it **measured** (the pull request's changed-file list, its state, the commit it moved
+to) and denies having reviewed anything.
+
+A skipped run brings no `reviewers_selected` and no findings, so it contributes no scorecard
+and no finding row. Every per-reviewer number on `/panel` is untouched by construction rather
+than by a filter.
+
+That the field was being discarded had a consequence already, independent of any of this: the
+pre-flight refusal path sends `reviewed: false` **and is recorded**, so `review_runs` has been
+holding runs that reviewed nothing and counting every one of them as a review. Those rows now
+have a column able to describe them, though nothing backfills what they were.
+
+#### three states, and the third is why this was safe to ship
+
+`true` a panel ran; `false` this run reviewed nothing and says so; **`NULL` nobody said** —
+which is every run recorded before today, and the only honest value for them. Defaulting the
+column to `true` would have made a brand-new column knowingly wrong about the refusals already
+sitting in that population.
+
+So every query meaning "a review happened" asks `reviewed IS NOT FALSE`, never `IS TRUE`. The
+tempting one selects no legacy row at all and would have reported the entire board as never
+reviewed. As written, **no number that has already been published moves**: legacy rows sit
+exactly where they have always sat, and only runs that state outright that they reviewed
+nothing are held back — from `GET /reviews` (with `include_unreviewed` to see them), from
+`/review/stats`' run totals, and from `/review/spend`, where a merge that dispatched no seat
+would otherwise add runs and no cost to the ratio a spend ceiling is denominated in.
+
+#### and the false all-clear this could have shipped instead
+
+Making a skipped run visible also makes it the *newest* run for its pull request, and several
+readers take the newest run to mean the state of review. Left alone, recording one would have:
+
+- flipped **every outstanding finding on that pull request to `gone`** in `GET /review/findings`,
+  because a defect is open only while its last sighting is in the latest run — nobody
+  re-reviewed anything, and the record would have said the defects had stopped being found;
+- let a merge commit **round-cap the review it is asking for**, since the review queue counts
+  the cap off the newest run's round number;
+- reported plan items as clear of confirmed findings that are still outstanding.
+
+A second opinion over the finished diff found three more, all of the same family: with
+`limit=1` the skipped run spent the whole findings window and the real round's defects went
+from `open` to *absent*; a skipped round inherits its cycle id, so it supplied that cycle's
+ending from stop fields no stopping rule ever set, reporting a converged cycle as one nobody
+ruled on; and filtering plan evidence to reviewed runs threw away a genuinely newer *reading* —
+a PR merged since its last review still read `OPEN`.
+
+Each now asks its question of the right run. `GET /review/findings` traces rounds that
+reviewed. Plan evidence reads two runs rather than one: the readings (`pr_state`, `draft`,
+`ci`) from the newest observation of any kind, the findings and their provenance from the
+newest actual review — the seam that module already drew between them. A PR the board has only
+ever seen skipped reports its reading and is named as unreviewed, rather than counted as clear.
+
+Five of the eight defects in this change were found by a reviewer rather than by the author,
+which is the argument for asking.
+
+`GET /review/collisions` itself is untouched. Not one predicate was added to it: a skipped run
+is selected, joined and classified exactly like a reviewed one, because the file list came off
+the pull request's own metadata either way. Its `reviewed` and `skip_reason` ride on the row
+instead, so a caller can see that the four-hundred-file merge it is about to collide with has
+been read by nobody.
+
+#### what it does not do
+
+There is no backfill and none is possible. Every panel skipped before this release left no row
+and no file list anywhere — the payload existed only in the caller's `--json-file`, if it asked
+for one. The endpoint is complete from here forward, and anyone still holding one of those
+files can put it on the board with `qb record-review < PAYLOAD.json`.
+
 ## v3.18 — what gates what is written down, and the line can propose an order
 
 ### the merge queue proposes an order, and says what the order is worth
