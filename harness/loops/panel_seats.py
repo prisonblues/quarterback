@@ -2164,6 +2164,13 @@ def antigravity_args(model: str, effort: str, prompt: str,
     on the same failing prompt it is the difference between exit 1 and a findings
     array that names the gap instead of hunting for it.
 
+    **In BOTH prompts that reach this function**, which is the correction #459 made
+    to this paragraph: it was written as a fact about the seat while only the review
+    path had been given the brief, so an `--ask` still reached `agy` with the older,
+    milder sentence — no tools, but not that reaching for one ends the session — and
+    could still lose the seat on every invocation. `ASK_PROMPT` carries
+    `NO_TOOLS_RULE` now, which is the half of the brief that is not about findings.
+
     `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
     while run_cli is still patiently waiting out its own much longer bound — a
     reviewer that reads as dead when it was only slow. It takes a Go duration,

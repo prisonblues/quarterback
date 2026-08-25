@@ -1655,8 +1655,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # observation, `repo` is the pre-#165 wording verbatim. The manifest brief takes
     # no scope — it is already the narrowest question this panel asks, and its whole
     # instruction is "do not review the moved code".
+    # TWO briefs, not one, and the difference is only `repo` scope: that paragraph
+    # says "search the codebase, don't just review the diff", which a seat with no
+    # tools cannot do and — since #458 put NO_TOOLS_BRIEF in the same prompt — is
+    # told twice, in opposite directions. RELATED_CODE_SLOT exists because a bullet
+    # contradicting its own paragraph "is the contradiction a model resolves
+    # whichever way it likes", and on antigravity resolving it the wrong way is
+    # fatal rather than merely wasteful (#459).
     brief = (MOVE_MANIFEST_PROMPT if pre.verdict == "manifest"
              else reviewer_brief(dials.reviewer_scope))
+    brief_blind = (MOVE_MANIFEST_PROMPT if pre.verdict == "manifest"
+                   else reviewer_brief(dials.reviewer_scope, reads_code=False))
 
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
@@ -1672,7 +1681,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # applies to the PROMPT, and antigravity is both the seat this text is for
         # and the one seat the kernel can veto. Adding it in `antigravity_args`
         # would put ~1,100 bytes past the clamp that just measured the prompt.
-        return brief.format(n=pr_number, repo=gh_repo, base=base,
+        return (brief if reads_code else brief_blind).format(
+                            n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text, diff=review.material(budget)[0],
                             code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF)
 

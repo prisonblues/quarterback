@@ -744,7 +744,14 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
             # keeps "read" from meaning "run" in a contributor's checkout.
             prompt = prompt.replace(JUDGE_CODE_SLOT, CODE_ACCESS_BRIEF)
         else:
-            prompt = prompt.replace(JUDGE_CODE_SLOT, "")
+            # The same slot, and it had been left the one empty one (#459). The
+            # judge is a claude seat with `reads_code=False` here, so `claude_args`
+            # pins nothing and it holds its full default toolset in an empty
+            # sandbox — the most tool-capable code-blind seat on the panel, and the
+            # one whose loss is worst, since a dead judge takes every finding
+            # through UNADJUDICATED. It gets told what its situation is like
+            # everything else.
+            prompt = prompt.replace(JUDGE_CODE_SLOT, NO_TOOLS_BRIEF)
         # #67's question, and the empty string on every round that has no earlier
         # round to ask it about — which keeps a round-1 prompt byte-identical to
         # the one it has always been. Replaced unconditionally, like the slot
