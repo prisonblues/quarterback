@@ -1,0 +1,242 @@
+#!/usr/bin/env bash
+# qb-catchup — fast-forward this machine's worktrees onto what has already landed.
+#
+# Usage: qb-catchup [-C DIR] [--dry-run] [--quiet] [--no-fetch]
+#
+# Exit codes:
+#   0  the sweep ran — including when every worktree was skipped, which is a
+#      normal outcome and not a failure
+#   1  nothing to sweep (not in a repo), or a fast-forward that was attempted
+#      failed
+#   2  malformed arguments — a caller bug, and says so
+#
+# THE BOARD ALREADY KNOWS A PUSH LANDED AND ALREADY TELLS YOU (#83). `published`
+# is emitted when a push reaches the remote, and the lifecycle hook turns it into
+# a "⬇️ pull before you build on this checkout" advisory. That is the right
+# diagnosis and the wrong ending: whoever it reaches then does the
+# re-integration by hand, once per worktree, which was most of the eleven
+# integration merges it took to land six PRs on the day #80 was filed.
+#
+# This is the ending. It is deliberately the dullest thing that closes the gap:
+# it fast-forwards, and it refuses everything else.
+#
+# WHAT IT WILL NOT DO, AND WHY THAT IS THE FEATURE. Rewriting a checkout somebody
+# is working in is exactly the disaster #45 was filed for — an agent ran `git
+# rebase origin/main` inside a directory another agent held, and the holder found
+# its branch checked out at somebody else's commit with conflict markers in four
+# files. It reconstructed from the reflog whether its own work still existed. It
+# did, because the branch happened to be pushed: luck, not design.
+#
+# So every one of these is a refusal, not a best effort:
+#
+#   * a live holder (`worktree-holder` exit 3) — named, so the skip is somebody
+#     to talk to rather than a shrug
+#   * "could not tell" (exit 4). THIS IS THE OPPOSITE OF WHAT prune-worktrees
+#     DOES with the same code, and deliberately: there, refusing on a board
+#     outage means leaving real debris uncollected, so it proceeds. Here it would
+#     mean rewriting a live checkout because the board was down. A board that is
+#     unreachable must never become a licence.
+#   * a dirty tree, holder or not
+#   * unpushed commits — the failure #45 actually suffered. Said loudly, because
+#     a checkout whose only copy of some work is local is the one thing here that
+#     cannot be reconstructed from the remote.
+#   * a branch that has DIVERGED from its upstream. Fast-forward means
+#     fast-forward: if HEAD is not already a strict ancestor, this reports it and
+#     stops. Most re-integrations are fast-forwards; the interesting ones are
+#     exactly the ones an automaton should not attempt unattended.
+#
+# MACHINE-LOCAL BY CONSTRUCTION, which is the right scope and not a limitation: a
+# worktree can only be rewritten from the machine holding it, and the marker half
+# of `worktree-holder` is machine-local for the same reason. The board says THAT
+# a push landed; the machine decides what to do about its own checkouts.
+set -uo pipefail
+
+PROG=${0##*/}
+FETCH_TIMEOUT=20        # seconds; a slow remote must not hold a hook open
+DIR="."
+DRY=0
+QUIET=0
+FETCH=1
+
+die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) DIR=${2:-}; shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    --quiet|-q) QUIET=1; shift ;;
+    # For a caller that has just fetched, or has no network and wants the sweep
+    # to act on what it already has. The hook uses it after a merge it performed
+    # through the forge, where `gh` has already talked to the remote.
+    --no-fetch) FETCH=0; shift ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf 'usage: %s [-C DIR] [--dry-run] [--quiet] [--no-fetch]\n' "$PROG" >&2; exit 2 ;;
+  esac
+done
+
+git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $DIR"
+
+# ONE FETCH FOR EVERY WORKTREE, and that is a property of git rather than an
+# optimisation worth checking: linked worktrees share the common git directory,
+# so remote-tracking refs are shared too. Fetching once in any of them advances
+# `@{u}` for all of them. Bounded, because this runs from a hook: a remote that
+# hangs must cost the catch-up, never the turn.
+if [ "$FETCH" = 1 ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$FETCH_TIMEOUT" git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || true
+  else
+    git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || true
+  fi
+fi
+
+# Resolved once rather than per worktree — this loops over every one of them, and
+# `command -v` inside was pure repetition. Same resolution order as everywhere
+# else in the harness: PATH first so an installed copy wins, then a sibling of
+# $0, because the scripts install into one directory together.
+HOLDER_BIN=$(command -v worktree-holder 2>/dev/null || true)
+if [ -z "$HOLDER_BIN" ] && [ "$0" != "${0##*/}" ]; then
+  HOLDER_BIN="$(cd -P "$(dirname -- "$0")" && pwd)/worktree-holder"
+fi
+[ -n "$HOLDER_BIN" ] && [ -x "$HOLDER_BIN" ] || HOLDER_BIN=""
+
+# "Could not tell" is a property of the RUN — no board configured, or one that is
+# down — not of the directory, so the first 4 settles it for the whole sweep.
+# prune-worktrees learned this the expensive way: up to twenty `curl --max-time
+# 5` stalls on a plain dry run, and one identical warning per directory.
+GAVE_UP=0
+
+# ONE CALL, NOT TWO. `--json` carries the name AND exits with the same code as
+# `--quiet`, so asking twice would be a second board round trip per held worktree
+# — and worse, a second ANSWER: the holder can change between them, and the pair
+# that reported "held by nobody in particular" would be a skip with no one to
+# talk to. HOLDER_SAID is the body, the return is the code.
+HOLDER_SAID=""
+holder() {   # holder <dir> -> 0 free, 3 held, 4 could not tell; sets HOLDER_SAID
+  HOLDER_SAID=""
+  [ -n "$HOLDER_BIN" ] || return 4
+  [ "$GAVE_UP" = 1 ] && return 4
+  HOLDER_SAID=$("$HOLDER_BIN" --json "$1" 2>/dev/null)
+  local rc=$?
+  [ "$rc" = 4 ] && GAVE_UP=1
+  return "$rc"
+}
+
+holder_name() {   # who is in there, so a skip is somebody to talk to
+  [ -n "$HOLDER_SAID" ] || return 0
+  printf '%s' "$HOLDER_SAID" \
+    | jq -r '(.holders // [])[0] | (.holder // .session // empty)' 2>/dev/null
+}
+
+RC=0
+SWEPT=0; MOVED=0; SKIPPED=0
+dirty=""
+
+# `--porcelain` and the `worktree ` prefix, not the human listing: a path with a
+# space in it is one field there and three in the other.
+while IFS= read -r wt; do
+  [ -n "$wt" ] || continue
+  [ -d "$wt" ] || continue
+  SWEPT=$((SWEPT + 1))
+  name=${wt##*/}
+
+  branch=$(git -C "$wt" branch --show-current 2>/dev/null)
+  if [ -z "$branch" ]; then
+    say "  · $name — detached, left alone"
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+
+  up=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)
+  if [ -z "$up" ]; then
+    say "  · $name ($branch) — no upstream, nothing to catch up to"
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+
+  # THE CHEAP LOCAL FACTS FIRST, THE BOARD ONLY FOR A WORKTREE THAT COULD MOVE.
+  # Detached and no-upstream are two `git rev-parse`s; the holder is a round trip
+  # to the board, per worktree, and a machine carrying twenty of them would spend
+  # twenty of those establishing that nineteen were never candidates.
+  #
+  # What the order must guarantee is that nothing WRITES before the holder has
+  # answered, and nothing above this line does — they are reads of refs, not of
+  # the tree.
+  holder "$wt"
+  case $? in
+    3) who=$(holder_name)
+       say "  · $name ($branch) — held by ${who:-another live agent}, left alone"
+       SKIPPED=$((SKIPPED + 1)); continue ;;
+    4) say "  · $name ($branch) — cannot tell who is in it, left alone"
+       SKIPPED=$((SKIPPED + 1)); continue ;;
+  esac
+
+  # ASKED FOR THE STATUS AND THE EXIT CODE, because `set -u` without `-e` means a
+  # git that fails here returns an empty string — and an empty `--porcelain` is
+  # exactly what a CLEAN tree looks like. A worktree whose git could not answer
+  # would have been read as safe to rewrite, which is the one direction this must
+  # never fail in.
+  if ! dirty=$(git -C "$wt" status --porcelain 2>/dev/null); then
+    say "  · $name ($branch) — git would not say whether it is clean, left alone"
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+  if [ -n "$dirty" ]; then
+    say "  · $name ($branch) — uncommitted changes, left alone"
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+
+  # `--count` gives "behind<TAB>ahead" for @{u}...HEAD, which is the whole
+  # decision in one call: 0/0 current, n/0 fast-forwardable, 0/n unpushed, n/n
+  # diverged.
+  state=$(git -C "$wt" rev-list --left-right --count "$up...HEAD" 2>/dev/null) || state=""
+  behind=$(printf '%s' "$state" | cut -f1)
+  ahead=$(printf '%s' "$state" | cut -f2)
+  case "${behind:-x}${ahead:-x}" in *x*)
+      say "  · $name ($branch) — git would not say where it stands, left alone"
+      SKIPPED=$((SKIPPED + 1)); continue ;;
+  esac
+
+  if [ "$ahead" != 0 ] && [ "$behind" != 0 ]; then
+    say "  · $name ($branch) — $behind behind and $ahead ahead of $up: that is a rebase, not a fast-forward. Left alone."
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+  if [ "$ahead" != 0 ]; then
+    # LOUDLY. This is the one state where the only copy of somebody's work is in
+    # this directory, and it is the state #45 was actually in.
+    say "  · $name ($branch) — $ahead unpushed commit(s), left alone. Push them or they exist nowhere else."
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
+  if [ "$behind" = 0 ]; then
+    say "  · $name ($branch) — already current"
+    continue
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    say "  → $name ($branch) — would fast-forward $behind commit(s) to $up"
+    MOVED=$((MOVED + 1)); continue
+  fi
+
+  # `--ff-only` says the same thing the arithmetic above already established, and
+  # it is here anyway: between the count and this line another process can move
+  # the branch, and the flag is what makes that a refusal rather than a merge
+  # commit nobody asked for.
+  if err=$(git -C "$wt" merge --ff-only "$up" 2>&1 >/dev/null); then
+    say "  ✓ $name ($branch) — fast-forwarded $behind commit(s) to $up"
+    MOVED=$((MOVED + 1))
+  else
+    say "  ✗ $name ($branch) — fast-forward refused: $(printf '%s' "$err" | head -1)"
+    SKIPPED=$((SKIPPED + 1))
+    RC=1
+  fi
+done < <(git -C "$DIR" worktree list --porcelain 2>/dev/null \
+         | awk '/^worktree /{ print substr($0, 10) }')
+
+# A SWEEP THAT FOUND NOTHING IS A BUG, NOT AN EMPTY RESULT. `git worktree list`
+# returning nothing means it was not run inside a repo, or that it failed — and
+# reporting "0 worktrees, all current" for that would be the quietest possible
+# way to do nothing at all. prune-worktrees makes the same check for the same
+# reason.
+if [ "$SWEPT" = 0 ]; then
+  die "\`git worktree list\` returned nothing — run this from inside the repository"
+fi
+
+say "$PROG: $MOVED moved, $SKIPPED left alone, of $SWEPT worktree(s)"
+exit "$RC"

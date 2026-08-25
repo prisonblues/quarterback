@@ -150,22 +150,63 @@ board_config || cannot_tell "no board configured (QUARTERBACK_BASE_URL / token)"
 # ============================================
 MARKER_DIR="${QB_SESSION_CWD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-code/session-cwd}"
 
+_marker_of() {   # the worktree a session file names, trimmed
+    local content
+    content=$(<"$1")
+    content="${content//$'\n'/}"
+    content="${content%"${content##*[![:space:]]}"}"
+    content="${content#"${content%%[![:space:]]*}"}"
+    printf '%s' "$content"
+}
+
 marker_sessions() {
     local f content
     [[ -d "$MARKER_DIR" ]] || return 0
     for f in "$MARKER_DIR"/*; do
         [[ -f "$f" ]] || continue
-        content=$(<"$f")
-        content="${content//$'\n'/}"
-        content="${content%"${content##*[![:space:]]}"}"
-        content="${content#"${content%%[![:space:]]*}"}"
+        content=$(_marker_of "$f")
         [[ "$content" = "$WT_PATH" || "$content" = "$WT_LOGICAL" ]] && basename "$f"
+    done
+    return 0
+}
+
+# THE MARKERS ANSWER SUBTRACTIVELY TOO, and using them only additively left a
+# false positive on the one checkout that matters most.
+#
+# A lease records the directory an agent was LAUNCHED in, which for the worktree
+# workflow is the main checkout — that is the whole reason this file exists. So
+# `under($p)` is true of EVERY live agent in the repo when $p is the main
+# checkout, including the ones demonstrably working somewhere else. Measured on
+# hermes while #83 was being written: `worktree-holder <main checkout>` named
+# `hermes/seat-quarterback-5`, whose own marker said
+# `…/quarterback-fix-issue-458`. It was not in the main checkout and had not been
+# for an hour.
+#
+# That is benign for `remove-worktree` and `prune-worktrees`, which only ever ask
+# about a LINKED worktree and for which a false positive is a refusal to delete —
+# the safe direction. It is not benign for anything that wants to act ON the main
+# checkout: #83's catch-up would decline forever on any box with an agent
+# running, which is every box, which would make the feature inert.
+#
+# So a session whose marker names a DIFFERENT worktree is not here. A session
+# with NO marker keeps the cwd clause untouched: that is the agent launched
+# inside a checkout directly, which is the true positive this must never drop.
+marker_elsewhere() {
+    local f content
+    [[ -d "$MARKER_DIR" ]] || return 0
+    for f in "$MARKER_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        content=$(_marker_of "$f")
+        [[ -n "$content" && "$content" != "$WT_PATH" && "$content" != "$WT_LOGICAL" ]] \
+            && basename "$f"
     done
     return 0
 }
 
 MARKED=$(marker_sessions | jq -R . | jq -sc . 2>/dev/null) || MARKED='[]'
 [[ -z "$MARKED" ]] && MARKED='[]'
+ELSEWHERE=$(marker_elsewhere | jq -R . | jq -sc . 2>/dev/null) || ELSEWHERE='[]'
+[[ -z "$ELSEWHERE" ]] && ELSEWHERE='[]'
 
 # ============================================
 # BOARD HALF: WHICH OF THEM IS STILL LIVE
@@ -178,7 +219,8 @@ RESP=$(curl -sf --max-time 5 -H "Authorization: Bearer $QUARTERBACK_TOKEN" "$BAS
 MINE="${CLAUDE_CODE_SESSION_ID:-}"
 
 HOLDERS=$(jq -c \
-    --arg p "$WT_PATH" --arg pl "$WT_LOGICAL" --arg mine "$MINE" --argjson marked "$MARKED" '
+    --arg p "$WT_PATH" --arg pl "$WT_LOGICAL" --arg mine "$MINE" \
+    --argjson marked "$MARKED" --argjson elsewhere "$ELSEWHERE" '
     # $sess, not sess: a filter parameter would be re-evaluated against $marked
     # inside the pipe and index an array with a path expression.
     # A path-boundary match, not string equality. An agent launched from INSIDE
@@ -189,8 +231,13 @@ HOLDERS=$(jq -c \
     # tool must never give quietly. The trailing separator is what keeps
     # `…/proj-fix-issue-4` from matching `…/proj-fix-issue-43`.
     def under($dir): $dir != "" and (. == $dir or startswith($dir + "/"));
-    def here($sess): (.cwd | under($p)) or (.cwd | under($pl))
-                     or (($marked | index($sess)) != null);
+    # Marked for THIS worktree is here, full stop. Launched here is here too —
+    # unless the session is marked for a different one, in which case the lease
+    # cwd is the main checkout it was started from and says nothing about where
+    # the agent actually is. See marker_elsewhere for the measurement.
+    def here($sess): (($marked | index($sess)) != null)
+                     or ((((.cwd | under($p)) or (.cwd | under($pl))))
+                         and (($elsewhere | index($sess)) == null));
     # The lease branch is deliberately dropped: it is the branch of the dir the
     # agent was launched in (the main checkout), so reporting it here would
     # answer "on main" about a worktree that is on fix/issue-31. The real branch

@@ -243,3 +243,107 @@ def test_the_pane_is_stamped_with_its_session_so_a_button_can_end_it(hook):
     assert hook.wait_for(
         lambda: tmux_log.exists() and "@qb_session sid-pane" in tmux_log.read_text()
     ), tmux_log.read_text() if tmux_log.exists() else "tmux was never called"
+
+
+# ---------------------------------------------------------------------------
+# Acting on the origin-moved signal (#83)
+#
+# A merge through the forge is the one route that leaves the MERGING agent
+# stale: `gh pr merge` creates the commit server-side and runs no local push, so
+# nothing local moves and the session that landed the work is the one behind.
+# The hook already watches Bash calls for `git push`; this is the same seam.
+
+
+def stub_catchup(h: Hooked, text: str = "  ✓ proj (main) — fast-forwarded 4 commit(s)") -> Path:
+    """A qb-catchup on PATH that prints and records that it ran."""
+    log = h.root / "catchup.calls"
+    (h.stub / "qb-catchup").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> {log}\n'
+        f'printf "%s\\n" {json.dumps(text)}\n')
+    (h.stub / "qb-catchup").chmod(0o755)
+    return log
+
+
+def merged(h: Hooked, env=None, command="gh pr merge 428 --repo o/r --merge"):
+    return h.fire("PostToolUse", env=env, tool_name="Bash",
+                  tool_input={"command": command})
+
+
+def test_a_merge_through_the_forge_catches_this_machine_up(tmp_path):
+    """The trigger this issue is actually about. `git push` already had a reflex
+    here; a forge-side merge had none, and it is the common route."""
+    h = Hooked(tmp_path)
+    log = stub_catchup(h)
+    got = merged(h)
+
+    assert log.exists(), "a merge did not run the catch-up"
+    assert "-C" in log.read_text(), "the catch-up was not told which checkout"
+    assert "a merge landed" in got.stdout, got.stdout
+    assert "fast-forwarded 4 commit(s)" in got.stdout, "the report is the point"
+
+
+def test_the_report_is_one_json_document_and_not_two(tmp_path):
+    """`hookSpecificOutput` is a stream specified to carry ONE object, and the
+    courier already wrote to this stdout. Emitting a second alongside it drops
+    one silently, and only when both fire in the same tool call — so the notes
+    are accumulated and written once."""
+    h = Hooked(tmp_path)
+    stub_catchup(h)
+    got = merged(h)
+
+    assert got.stdout.strip(), "nothing was written at all"
+    parsed = json.loads(got.stdout)          # raises if a second object follows
+    assert parsed["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    assert "a merge landed" in parsed["hookSpecificOutput"]["additionalContext"]
+
+
+def test_an_ordinary_bash_call_catches_nothing_up(tmp_path):
+    """This runs on every tool call in every session. A sweep that fired on
+    unrelated commands would be a git fetch per `ls`."""
+    h = Hooked(tmp_path)
+    log = stub_catchup(h)
+    got = h.fire("PostToolUse", tool_name="Bash", tool_input={"command": "ls -la"})
+
+    assert not log.exists(), "an unrelated command ran the catch-up"
+    assert got.stdout.strip() == "", got.stdout
+
+
+def test_a_merge_of_something_else_is_not_a_pr_merge(tmp_path):
+    """`git merge` is a local operation that moves nothing on the remote, and
+    the matcher has to tell it from `gh pr merge`."""
+    h = Hooked(tmp_path)
+    log = stub_catchup(h)
+    h.fire("PostToolUse", tool_name="Bash", tool_input={"command": "git merge origin/main"})
+    assert not log.exists(), "a local git merge was mistaken for a forge merge"
+
+
+def test_the_knob_turns_the_catch_up_off(tmp_path):
+    """It rewrites checkouts, so it has to be refusable — and the refusal must
+    leave the rest of the hook working."""
+    h = Hooked(tmp_path)
+    log = stub_catchup(h)
+    got = merged(h, env=h.env(QB_CATCHUP="0"))
+
+    assert not log.exists(), "QB_CATCHUP=0 still ran it"
+    assert got.stdout.strip() == "", got.stdout
+
+
+def test_a_catch_up_that_says_nothing_adds_no_note(tmp_path):
+    """A sweep where every worktree was already current has nothing to report,
+    and an empty advisory is worse than none."""
+    h = Hooked(tmp_path)
+    (h.stub / "qb-catchup").write_text("#!/bin/sh\nexit 0\n")
+    (h.stub / "qb-catchup").chmod(0o755)
+    got = merged(h)
+    assert got.stdout.strip() == "", got.stdout
+
+
+def test_no_qb_catchup_on_path_is_not_an_error(tmp_path):
+    """A fleet member on an older harness has no such command, and the hook is
+    fail-open by contract — #422's shape is a remedy the stale thing cannot
+    perform."""
+    h = Hooked(tmp_path)
+    got = merged(h)                      # no stub installed
+    assert got.returncode == 0
+    assert got.stdout.strip() == "", got.stdout

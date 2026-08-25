@@ -196,6 +196,7 @@ _state() {   # _state <working|waiting|input>
 # Three jobs hang off this event and they want different things:
 #   task  → close the sub-agent record   (no git)
 #   push  → announce the commit          (git)
+#   merge → catch this machine's checkouts up (git)
 #   other → nothing at all, UNLESS the ask poll is due
 #
 # `agent_id` is present ONLY when the hook fires inside a sub-agent, and it is the
@@ -213,6 +214,7 @@ if [ "$EVENT" = "PostToolUse" ]; then
     printf '%s' "$IN" | jq -r '
       (if .tool_name == "Task" then "task"
        elif (.tool_name == "Bash" and ((.tool_input.command // "") | test("\\bgit\\b.*\\bpush\\b"))) then "push"
+       elif (.tool_name == "Bash" and ((.tool_input.command // "") | test("\\bgh\\b.*\\bpr\\b.*\\bmerge\\b"))) then "merge"
        else "other" end),
       (.agent_id // ""),
       (.session_id // ""),
@@ -557,7 +559,71 @@ _sync_note() {   # echo the board's advice for THIS checkout, or nothing
     --data-urlencode "dirty=$dirty" \
     ${behind:+--data-urlencode "behind=$behind"} ${ahead:+--data-urlencode "ahead=$ahead"} \
     2>/dev/null \
-  | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null
+  | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null \
+  | _catchup_offer
+}
+
+# THE ADVISORY'S ENDING (#83). "git pull" is the right diagnosis and a manual
+# ending, paid once per checkout — which was most of the eleven integration
+# merges it took to land six PRs on the day #80 was filed. Naming the command
+# that does it costs one line and turns N pulls into one.
+#
+# Appended here rather than sent from the board, because whether the command
+# EXISTS is a property of this machine: a fleet member on an older harness would
+# otherwise be told to run something it does not have, which is #422's shape
+# exactly — a remedy the stale thing cannot perform.
+#
+# It offers rather than acts. The merge trigger runs the sweep because the agent
+# asked for the merge; this arrives unbidden at the top of somebody's turn, and
+# rewriting checkouts nobody asked about is the disaster #45 was filed for even
+# when every individual refusal is correct.
+_catchup_offer() {
+  local line any=0
+  while IFS= read -r line; do any=1; printf '%s\n' "$line"; done
+  [ "$any" = 1 ] || return 0
+  command -v qb-catchup >/dev/null 2>&1 \
+    && printf '   `qb-catchup` fast-forwards every checkout here it safely can, and says why for the rest.\n'
+  return 0
+}
+
+# ---- acting on the origin-moved signal (#83) --------------------------------
+# A MERGE IS THE MOMENT THIS MACHINE'S OWN CHECKOUTS GO STALE, and unlike a push
+# it is the merging agent that goes stale — `gh pr merge` creates the commit
+# server-side and runs no local push, so the very session that landed the work is
+# the one now behind. The advisory half already handles "somebody else
+# published"; this is the half where the somebody is us.
+#
+# It is the ending #83 asks for. `qb-catchup` decides what is safe and refuses
+# everything else — held, cannot tell, dirty, unpushed, diverged — so this is a
+# trigger, not a policy.
+#
+# SYNCHRONOUS AND BOUNDED, unlike _publish_push next door. Its output is the
+# point: an agent that has just merged should be told what moved before it picks
+# up the next thing, and a backgrounded report would arrive after the turn it
+# belongs to. `timeout` is what keeps a slow remote from holding the hook open,
+# and a catch-up that times out costs the note rather than the turn.
+_catchup_note() {   # echo what was caught up, or nothing
+  [ "${QB_CATCHUP:-1}" = 0 ] && return 0
+  [ -n "$cwd" ] || return 0
+  local bin out
+  bin=$(command -v qb-catchup 2>/dev/null) || bin=""
+  # A sibling of $0 only when $0 HAS a directory: invoked by bare name, `${0%/*}`
+  # is the name itself and the fallback would be `qb-hook/qb-catchup`.
+  [ -n "$bin" ] || { case "$0" in */*) bin="${0%/*}/qb-catchup" ;; esac; }
+  [ -n "$bin" ] && [ -x "$bin" ] || return 0
+  # AND IT MUST FETCH, which is the opposite of what it looks like. `gh pr merge`
+  # talked to the remote, but it did so over HTTPS and created the commit THERE:
+  # no local ref moved, so `@{u}` still points at what this machine knew before
+  # the merge. Skipping the fetch would make the sweep decide "already current"
+  # about every checkout, which is the exact failure this exists to fix, and it
+  # would look like it worked.
+  if command -v timeout >/dev/null 2>&1; then
+    out=$(timeout 25 "$bin" -C "$cwd" 2>/dev/null) || true
+  else
+    out=$("$bin" -C "$cwd" 2>/dev/null) || true
+  fi
+  [ -n "$out" ] || return 0
+  printf '⬇️ quarterback: a merge landed, so this machine caught up:\n%s' "$out"
 }
 
 _publish_push() {   # announce HEAD if a push just put it on the tracking branch
@@ -807,16 +873,30 @@ case "$EVENT" in
       >/dev/null 2>&1 &
     ;;
   PostToolUse)
-    # (a) The courier (#107). First, and outside the kind switch, because it is
-    # the only thing here that writes to stdout and it must run whatever the tool
-    # was. $pt_kind / $ASK_POLL_DUE were decided by the hot-path guard at the top,
-    # which has already refused this in a sub-agent.
+    # ONE additionalContext, ACCUMULATED, not one per thing that has something to
+    # say. Two `hookSpecificOutput` objects on stdout is two JSON documents in a
+    # stream specified to carry one, and the second is the one that gets dropped
+    # — silently, and only when two of these fire in the same tool call. The
+    # courier was alone here until the catch-up note (#83) joined it, so this
+    # collects and emits once at the end.
+    note=""
+    # (a) The courier (#107). Runs whatever the tool was. $pt_kind /
+    # $ASK_POLL_DUE were decided by the hot-path guard at the top, which has
+    # already refused this in a sub-agent.
     if [ -n "${ASK_POLL_DUE:-}" ]; then
       a=$(_ask_note midturn)
-      [ -n "$a" ] && jq -nc --arg c "$a" \
-        '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$c}}'
+      [ -n "$a" ] && note=$a
     fi
     case "$pt_kind" in
+      merge)
+        # (b) The origin-moved signal, acted on rather than merely reported
+        # (#83). A merge through the forge is the one route that leaves the
+        # MERGING agent stale, because it runs no local push.
+        c=$(_catchup_note)
+        [ -n "$c" ] && note="${note:+$note
+
+}$c"
+        ;;
       push)
         # Publish reflex (v2.8): a push is the moment every other checkout in the
         # fleet goes stale, so announcing it must not depend on anyone remembering
@@ -835,6 +915,8 @@ case "$EVENT" in
           >/dev/null 2>&1 &
         ;;
     esac
+    [ -n "$note" ] && jq -nc --arg c "$note" \
+      '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$c}}'
     ;;
 esac
 exit 0

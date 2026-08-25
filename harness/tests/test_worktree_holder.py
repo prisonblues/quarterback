@@ -649,3 +649,78 @@ def test_a_held_worktree_is_protected_from_every_sweep_not_just_the_directory(
     assert "8091:fix/issue-43" not in r.stdout, "a held worktree's port was reclaimed"
     # …and the genuinely dead one still is, or the guard has swallowed the sweep.
     assert "8092:gone-for-good" in r.stdout
+
+
+# ------------------------------------------------- the markers, subtractively
+
+
+@pytest.fixture
+def main_checkout(tmp_path):
+    """The MAIN checkout — the directory every agent's lease reports as its cwd."""
+    d = tmp_path / "proj"
+    d.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True)
+    subprocess.run(["git", "-C", str(d), "config", "user.email", "t@example.com"], check=True)
+    subprocess.run(["git", "-C", str(d), "config", "user.name", "T"], check=True)
+    (tmp_path / "markers").mkdir(exist_ok=True)
+    return d
+
+
+def test_a_peer_marked_for_another_worktree_does_not_hold_the_main_checkout(
+    main_checkout, tmp_path, board
+):
+    """The markers have to answer subtractively, and using them only additively
+    left a false positive on the one checkout that matters most.
+
+    A lease records the directory an agent was LAUNCHED in, which for the
+    worktree workflow is the main checkout — that is the whole reason the markers
+    exist. So `under($p)` is true of EVERY live agent in the repo when $p is the
+    main checkout, including ones demonstrably working somewhere else.
+
+    Measured on hermes while #83 was being written: this tool named
+    `hermes/seat-quarterback-5` as holding the main checkout, while that
+    session's own marker said `…/quarterback-fix-issue-458`. Benign for
+    `remove-worktree`, which only ever asks about a linked worktree and for which
+    a false positive is a refusal to delete. Not benign for anything that wants
+    to act ON the main checkout: #83's catch-up would decline forever on any box
+    with an agent running, which is every box.
+    """
+    markers = tmp_path / "markers"
+    mark(markers, PEER, str(tmp_path / "proj-fix-issue-99"))
+    b = board(agents=[lease(PEER, cwd=str(main_checkout))])
+
+    done = run(main_checkout, board_url=b.url, markers=markers, args=("--json",))
+    assert done.returncode == 0, done.stderr
+    answer = json.loads(done.stdout)
+    assert answer["held"] is False, (
+        f"a session working in proj-fix-issue-99 was reported as holding the "
+        f"main checkout: {answer['holders']}")
+
+
+def test_a_peer_with_no_marker_still_holds_the_checkout_it_was_launched_in(
+    main_checkout, tmp_path, board
+):
+    """The true positive the subtraction must never drop: an agent started
+    directly inside a checkout has no marker at all, and its lease cwd is the
+    only evidence there is."""
+    markers = tmp_path / "markers"
+    b = board(agents=[lease(PEER, cwd=str(main_checkout))])
+
+    done = run(main_checkout, board_url=b.url, markers=markers, args=("--json",))
+    assert done.returncode == 3, f"an unmarked agent launched here was not seen: {done.stdout}"
+    answer = json.loads(done.stdout)
+    assert [h["session"] for h in answer["holders"]] == [PEER]
+
+
+def test_a_peer_marked_for_this_worktree_holds_it_wherever_it_was_launched(
+    wt, tmp_path, board
+):
+    """The additive half, unchanged: the marker is what says an agent is in a
+    worktree its lease knows nothing about."""
+    markers = tmp_path / "markers"
+    mark(markers, PEER, str(wt))
+    b = board(agents=[lease(PEER, cwd="/home/x/src/proj")])
+
+    done = run(wt, board_url=b.url, markers=markers, args=("--json",))
+    assert done.returncode == 3, done.stdout
+    assert [h["session"] for h in json.loads(done.stdout)["holders"]] == [PEER]
