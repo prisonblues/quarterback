@@ -359,10 +359,35 @@ def test_every_rank_source_the_server_sends_has_a_reason_on_the_page():
             if isinstance(c, ast.Constant) and isinstance(c.value, str)}
     # `reorder` writes it through a local, so it is not a keyword anywhere.
     sent.add("ordered")
-    known = set(re.findall(r"^  (\w+):", re.search(
+    # A key may be quoted, because a source may contain a hyphen (`picked-up`) and
+    # a bare hyphen is not a JS identifier. Matching only `\w+` silently skipped
+    # such a key, so the page could carry a sentence this test would not credit it
+    # with — a guard that fails OPEN is worse than no guard.
+    known = set(re.findall(r'^  "?([\w-]+)"?:', re.search(
         r"const RANK_WHY = \{(.*?)\n\};", PAGE.read_text(), re.S).group(1), re.M))
     assert sent, "could not find any rank_source the endpoint writes"
     assert sent <= known, f"the page has no reason for: {sent - known}"
+
+
+def test_the_page_and_order_trust_agree_on_which_positions_were_chosen(page):
+    """One question, answered in two places, and they have to give one answer.
+
+    `_order_trust` counts a position as unchosen if and only if its source is
+    `appended`; `RANK_CHOSEN` decides whether the row is drawn in the weight that
+    means somebody chose it. Nothing ties them together but this, and a new source
+    added to one and not the other is a plan reported as trusted while its rows
+    render muted — the two halves contradicting each other in front of the reader,
+    with neither side broken. #427 added the first source since both were written.
+    """
+    from app.models.plan_item import RANK_SOURCES
+
+    listed = re.search(r"const RANK_CHOSEN = new Set\(\[([^\]]*)\]\)", page)
+    assert listed, "the page must say which sources mean somebody chose the position"
+    chosen = set(re.findall(r'"([\w-]+)"', listed.group(1)))
+    assert chosen == {s for s in RANK_SOURCES if s != "appended"}, (
+        "RANK_CHOSEN and `_order_trust` disagree about which sources are a choice: "
+        f"page says {chosen}, the server's vocabulary is {set(RANK_SOURCES)} of "
+        "which only `appended` is unchosen")
 
 
 # ---- the picker remembers, so (all) is not where every visit starts ---------

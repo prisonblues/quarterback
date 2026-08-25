@@ -49,11 +49,21 @@ _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 #:   exactly one position nobody chose.
 #: * ``placed`` — an agent said where it goes, relative to a named neighbour.
 #: * ``ordered`` — a human set it with ``POST /plan/reorder``.
+#: * ``picked-up`` — nobody chose it either, and unlike ``appended`` that is not
+#:   a gap. ``POST /claim`` wrote the row because an agent took the work, and it
+#:   sits at the top because it is IN FLIGHT — a statement of fact about now, not
+#:   a judgement about merit (#427). It costs the human's order nothing, because
+#:   a claimed item is skipped by ``next``: the first free pick is unchanged.
 #:
 #: Only ``ordered`` is the plan's shared intent. The rest are how the row got
 #: there, and ``GET /plan`` says so rather than leaving a reader to infer it from
 #: a note somebody remembered to write.
-RANK_SOURCES = ("appended", "submitted", "placed", "ordered")
+#:
+#: ``appended`` is the only one that counts as UNCHOSEN in ``order_trust``. A
+#: ``picked-up`` row is at a position somebody's action decided even though no
+#: one ranked it, so a plan full of in-flight work is still a plan you can
+#: believe — see :func:`app.api.plan._order_trust`.
+RANK_SOURCES = ("appended", "submitted", "placed", "ordered", "picked-up")
 
 _RANK_SOURCE_LIST = ", ".join(f"'{s}'" for s in RANK_SOURCES)
 

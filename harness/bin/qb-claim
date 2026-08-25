@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import urllib.error
 
@@ -85,7 +86,13 @@ def main() -> int:
                     help="the checkout whose origin remote names the repo")
     ap.add_argument("--ttl", type=int, default=None, help="seconds to hold it")
     ap.add_argument("--note", default=None,
-                    help="what you are doing with it — shown to whoever is refused")
+                    help="what you are doing with it — shown to whoever is refused, "
+                         "and what names the plan item this writes")
+    ap.add_argument("--title", default=None,
+                    help="the issue's real title for the plan item. Read from `gh` "
+                         "when this is absent; --no-gh-title stops that")
+    ap.add_argument("--no-gh-title", action="store_true",
+                    help="do not ask `gh` for the issue title (offline, or in a hurry)")
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
                     help="your session id (default: $CLAUDE_CODE_SESSION_ID)")
     ap.add_argument("--json", action="store_true",
@@ -109,7 +116,11 @@ def main() -> int:
                 f"under two keys")
             return UNKNOWN
 
-    body: dict = {"note": args.note, "session": args.session}
+    title = args.title
+    if title is None and not args.no_gh_title and args.kind.lower() in ("issue", "pr"):
+        title = _gh_title(args.kind.lower(), args.value, repo)
+
+    body: dict = {"note": args.note, "session": args.session, "title": title}
     if args.ttl is not None:
         body["ttl"] = args.ttl
     body = {k: v for k, v in body.items() if v is not None}
@@ -189,6 +200,15 @@ def main() -> int:
         f"{answer.get('expires')}")
     if answer.get("note_on_key"):
         say(f"  {answer['note_on_key']}")
+    # The half a caller cannot see from the claim id: the board put this on the
+    # plan (#427), and saying so is what stops the next agent adding it by hand.
+    item = answer.get("plan_item")
+    if item:
+        say(f"  on the plan at rank {item.get('rank')} of "
+            f"{item.get('repo') or 'the fleet'}: {item.get('title')}")
+    elif answer.get("plan_item_error"):
+        say(f"  the claim is yours, but the plan item was NOT written: "
+            f"{answer['plan_item_error']}")
     # stdout carries exactly ONE thing, and which one is the caller's choice. The
     # bare id is what `claim/renew` and `claim/release` want, so it is the default
     # and it needs no parsing; `--json` replaces it with the whole answer, which
@@ -200,6 +220,33 @@ def main() -> int:
     elif not args.quiet:
         print(answer.get("claim_id", ""))
     return TAKEN
+
+
+def _gh_title(kind: str, value: str, repo: str | None) -> str | None:
+    """The issue's own name, if `gh` can be asked. Never raises, never blocks long.
+
+    The board cannot do this and never will — `app/` makes no outbound calls at
+    all, on purpose (#327) — so the forge coupling lives out here, which is where
+    the other twelve `gh` callers in this harness live too. Without it a plan item
+    is titled with whatever the claimer put in `--note`, which is a fine handle and
+    not the issue's name.
+
+    Best-effort in every direction: no `gh`, no network, a private repo, a number
+    that does not exist, or a slow answer all mean "no title", and the claim goes
+    on to be taken exactly as it would have been. A pickup that is nameless is a
+    cosmetic loss; a pickup that did not happen because a subprocess hung is the
+    duplicated work the claim exists to prevent.
+    """
+    if not repo or not str(value).lstrip("#").isdigit():
+        return None
+    try:
+        out = subprocess.run(                                     # noqa: S603
+            ["gh", kind, "view", str(value).lstrip("#"), "--repo", repo,
+             "--json", "title", "-q", ".title"],
+            capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None if out.returncode == 0 else None
 
 
 def _detail(e: urllib.error.HTTPError):

@@ -344,6 +344,10 @@ const RANK_WHY = {
   submitted: "the submitter chose the order within its plan; where that plan sits is still an append",
   placed: "placed by the agent that added it, relative to a named neighbour",
   ordered: "ordered by a human, here",
+  // Quoted because of the hyphen, and hyphenated because it names a past EVENT
+  // rather than a present state: the row outlives the claim that made it, so a
+  // lapsed pickup still reads truthfully as "somebody picked this up".
+  "picked-up": "an agent claimed the work, so the board put it on top — in flight, not ranked above what is below it",
 };
 // A source this page has no sentence for is an UNKNOWN, and an unknown may not be
 // rendered as one of the answers. Left to `|| ""` it came out as no explanation at
@@ -369,7 +373,18 @@ function rankWhy(it){
 // Three-valued, for the reason fleet.html's verdict is: `chosen` and `appended`
 // are things the board REPORTED, and `unclear` is the shape of an answer it gave
 // that this page cannot read. Neither of the first two, and not hidden.
-const RANK_CHOSEN = new Set(["ordered", "placed"]);
+// Everything the board can send EXCEPT `appended`, and that is the rule rather
+// than a list that happens to agree: `_order_trust` counts a position as unchosen
+// if and only if its source is `appended`, so a row drawn in the muted "nobody
+// chose this" weight while the board reports the plan as trusted is the two
+// halves contradicting each other in front of the reader, with neither broken.
+//
+// `submitted` was missing here from the start and is not part of #427 — a batch's
+// items after the first were drawn as unchosen while the server counted them as
+// chosen. The model settles it: "each submission leaves exactly one position
+// nobody chose", which is the batch's FIRST item, and that one is `appended`.
+// The rest had their order picked by the submitter.
+const RANK_CHOSEN = new Set(["ordered", "placed", "picked-up", "submitted"]);
 function rankClass(it){
   if(!(it.rank_source in RANK_WHY)) return " unclear";
   return RANK_CHOSEN.has(it.rank_source) ? " chosen" : "";

@@ -67,7 +67,7 @@ from app.api.claims import (
     may_mutate,
 )
 from app.auth import author, human, identify, reader
-from app.claimkey import WORK, BadRef, canonical_repo, derive
+from app.claimkey import WORK, BadRef, canonical_repo, derive, work_ref
 from app.db import get_session
 from app.identity import HUMAN, is_human, same_machine
 from app.models.order_proposal import OrderProposal
@@ -843,7 +843,7 @@ def _order_trust(open_views: list[dict]) -> dict:
     ``trusted`` is false while any open item sits where it was merely appended,
     ``by_source`` breaks the list down by who chose what, and ``first_unchosen``
     points at one row rather than declaring a boundary. A plan whose every
-    position was placed, submitted or ordered is trusted — nobody has to have used
+    position was placed, submitted, picked up or ordered is trusted — nobody has to have used
     the browser for the answer to be honest, only somebody has to have chosen.
 
     **``first_unchosen`` is an item and not a rank**, and the difference is a
@@ -885,8 +885,51 @@ def _next_caveat(nxt: dict | None, trust: dict, open_n: int) -> str | None:
     best one available, and an agent that reads nothing else should get it. What
     it must not get is unqualified confidence — this is the issue's sharpest
     complaint, and the minimum fix it asks for even if placement never landed.
+
+    Two separate things can qualify the answer and both are said when both apply:
+    the order was partly nobody's, and the row at the top of it is work somebody
+    abandoned (#427).
     """
-    if nxt is None or trust["trusted"]:
+    if nxt is None:
+        return None
+    parts = [p for p in (_abandoned_caveat(nxt), _unchosen_caveat(nxt, trust, open_n))
+             if p]
+    return " ".join(parts) or None
+
+
+def _abandoned_caveat(nxt: dict) -> str | None:
+    """Said when ``next`` is a pickup whose claim is gone. Never a silent promotion.
+
+    A ``picked-up`` row sits at rank 1 because an agent claimed the work, and that
+    is a true thing to say while the claim is live — it is what makes the promotion
+    harmless, since ``next`` skips claimed items and walks past it to the same free
+    item it would have found before.
+
+    **Being ``next`` at all is therefore proof the justification has expired**, and
+    that is why this needs no claim lookup: ``next`` is the first OPEN, UNCLAIMED,
+    unblocked item, so a ``picked-up`` row can only reach it once nobody holds it.
+    The rank then outranks a human's ordered list on the strength of a claim that
+    no longer exists, and the plan went on reporting ``trusted: true`` — which is
+    correct about the position (an action chose it) and misleading about the answer.
+
+    Not demoted, and not hidden. Work an agent started and put down is a genuinely
+    good thing to pick up next, and it is the first thing a human scanning the plan
+    should see. It just may not arrive as an unqualified recommendation.
+    """
+    if nxt["rank_source"] != "picked-up":
+        return None
+    return (
+        "This is at the top because an agent claimed it, and that claim is gone — "
+        "so it is work somebody started and put down, not a position anybody "
+        "ranked above the rest. That makes it a good pick and not a stated "
+        "priority: read its note, and check with whoever held it before you "
+        "assume it was abandoned rather than finished."
+    )
+
+
+def _unchosen_caveat(nxt: dict, trust: dict, open_n: int) -> str | None:
+    """The original caveat: how much of the order anybody actually decided."""
+    if trust["trusted"]:
         return None
     first = trust["first_unchosen"]
     # Says where the unchosen positions START and never that everything after
@@ -1158,6 +1201,126 @@ async def _place_rank(session: AsyncSession, repo: str | None, anchor: PlanItem,
         if item.rank != want:
             item.rank = want
     return above + 1
+
+
+async def _top_rank(session: AsyncSession, repo: str | None) -> int:
+    """The rank a picked-up item takes: above everything open in its scope.
+
+    :func:`_place_rank` with no anchor and ``above = 0``, and it renumbers for the
+    same reason — ranks are not guaranteed distinct, so arithmetic on ``min(rank)``
+    cannot reliably produce a position above two rows that share one. Reading the
+    order and writing it back from 2 puts the new row first and repairs any
+    duplicate on the way past, while every existing pair keeps the relative order
+    it was read in. Call under :func:`_lock_scope`, like its two siblings.
+
+    ``updated_at`` is untouched on the rows that move, exactly as in
+    :func:`_place_rank`: being renumbered is not attention paid to an item, and
+    bumping it would let a busy afternoon of claims make a fortnight-old plan read
+    as fresh.
+    """
+    items = await _scope_items(session, repo, exact=True, include_done=False)
+    for n, item in enumerate(items):
+        if item.rank != n + 2:
+            item.rank = n + 2
+    return 1
+
+
+async def item_for_claim(session: AsyncSession, *, kind: str, key: str, holder: str,
+                         note: str | None = None,
+                         title: str | None = None) -> PlanItem | None:
+    """The plan item a fresh claim implies, created at the top. None if the key names no work.
+
+    **Picking work up is the one act that should put it on the board, and it was
+    the only one that did not** (#427). The claim and the item were already two
+    halves of one fact — :func:`claim_key` derives, for an issue-backed item, the
+    very same ``(kind, key)`` a bare ``POST /claim`` takes — but the join only ran
+    one way: ``GET /plan`` builds its key set *from the items it has*, so a claim
+    with no item behind it was looked up by nobody and rendered nowhere.
+
+    Called from ``POST /claim`` and deliberately NOT from :func:`acquire`, which
+    :func:`claim_item` also goes through — an item claiming itself into existence
+    is a loop with nothing at the end of it.
+
+    Four things it will not do:
+
+    * **Write an item for a key that is not a unit of work.** That judgement is
+      :func:`~app.claimkey.work_ref`'s, and it declines merge claims, board
+      objects, path keys and the open namespace.
+    * **Fail because the item is already there.** The duplicate-ref index is the
+      authority and its answer is success: the second agent to claim a planned
+      issue gets the existing row back. The claim is the thing that prevents
+      duplicated work; the item is a consequence of it.
+    * **Invent a description.** The title is the claim's ``note`` — already
+      specified as "one line on what you are doing with it", which is what a plan
+      title is — or one a client that read the forge chose to pass. Absent both it
+      is the ref, because the server cannot read GitHub (#327, and on purpose) and
+      a made-up handle is worse than a bare one.
+    * **Belong to a plan.** ``plan_id`` stays NULL: which of a repo's plans this
+      work sits under is a judgement about the work, and nothing at claim time
+      knows it. A human can move it.
+    """
+    ref = work_ref(kind, key)
+    if ref is None:
+        return None
+    ref_kind, repo, number = ref
+
+    existing = await _open_item_for_ref(session, repo, ref_kind, number)
+    if existing is not None:
+        return existing
+
+    # Held to the commit for the same reason `add_item` holds it: `_top_rank` is a
+    # read-then-write over every open rank in the scope, and two claims landing
+    # together from one snapshot is a lost update with no unique index behind it.
+    await _lock_scope(session, repo)
+    item = PlanItem(
+        repo=repo, title=_pickup_title(title, note, number),
+        ref_kind=ref_kind, ref_value=number, plan_id=None,
+        note=f"Picked up by {holder}. Added by the claim, not by a human — its "
+             f"position says it is in flight, not that it outranks anything below "
+             f"it on merit (#427).",
+        depends_on=[], added_by=holder, rank=await _top_rank(session, repo),
+        rank_source="picked-up", placed_for=None,
+    )
+    session.add(item)
+    try:
+        await session.commit()
+    except IntegrityError as e:
+        await session.rollback()
+        if not is_unique_violation(e):
+            raise
+        # Lost the race to another claim or to a hand-written add. The row that
+        # won is the answer — same reason `acquire` re-reads its winner rather
+        # than reporting a generic failure.
+        return await _open_item_for_ref(session, repo, ref_kind, number)
+    await session.refresh(item)
+    return item
+
+
+def _pickup_title(title: str | None, note: str | None, number: str) -> str:
+    """A handle for work nobody has written a title for, in descending order of truth.
+
+    A client that read the forge knows the real one. Failing that the claim's own
+    note is what the holder said they were doing, which is the same sentence a
+    title wants. Failing both, the ref — short, true, and visibly a placeholder,
+    which is the point: a reader who sees it knows to open the issue rather than
+    believing a handle somebody's code made up.
+    """
+    for candidate in (title, note):
+        text = _norm_text(candidate)
+        if text:
+            return text[:MAX_TITLE]
+    return f"#{number}"
+
+
+async def _open_item_for_ref(session: AsyncSession, repo: str | None,
+                             ref_kind: str, ref_value: str) -> PlanItem | None:
+    """The open item for a ref in a scope, if there is one — the duplicate index's own shape."""
+    return await session.scalar(
+        select(PlanItem).where(
+            PlanItem.ref_kind == ref_kind, PlanItem.ref_value == ref_value,
+            PlanItem.state == "open",
+            PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo,
+        ).order_by(PlanItem.rank).limit(1))
 
 
 async def _counts_by_state(session: AsyncSession, repo: str | None,
@@ -1830,12 +1993,7 @@ async def add_item(
         # looking for an item that does not exist.
         if not is_unique_violation(e):
             raise
-        existing = await session.scalar(
-            select(PlanItem).where(
-                PlanItem.ref_kind == body.ref_kind, PlanItem.ref_value == ref_value,
-                PlanItem.state == "open",
-                PlanItem.repo.is_(None) if repo is None else PlanItem.repo == repo)
-        )
+        existing = await _open_item_for_ref(session, repo, body.ref_kind, ref_value)
         raise HTTPException(409, detail={
             "error": f"{body.ref_kind} {ref_value} is already in the plan",
             "item_id": str(existing.id) if existing else None,

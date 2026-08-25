@@ -489,3 +489,59 @@ def repo_of(kind: str, key: str) -> str | None:
                 # caller can ever name in a query.
                 return None
     return None
+
+
+def work_ref(kind: str, key: str) -> tuple[str, str, str] | None:
+    """The forge resource a work claim names — ``(ref_kind, repo, number)``, or None.
+
+    The partial inverse of :func:`derive`, and the join ``POST /claim`` needs to
+    answer a question the board could not answer before #427: *is this claim a
+    unit of work the plan can hold an item for?* Picking work up is the one act
+    that should put it on the board, and to do that the board has to read the
+    resource back out of the key it derived.
+
+    **None is a normal answer, not a failure.** Everything that is not an issue or
+    a PR in a repo returns it, and each for its own reason:
+
+    * a :data:`MERGE` claim — a base branch is not a unit of work (#318), and the
+      issue behind the land already has its own claim;
+    * ``plan:<uuid>`` / ``item:<uuid>`` — already board objects, so an item for
+      one would point at itself;
+    * the open namespace (``prisonblues/lexray:serving-row:32022R2554``) — the
+      module docstring's rule, unchanged: a key this board does not own is left
+      alone rather than guessed at;
+    * a path key (``<machine>:<worktree>:<relpath>``, #185) — contended by
+      agents sharing a directory, which is not a plan's subject.
+
+    **Total, for the same reason :func:`repo_of` is.** It runs on the claim path,
+    where the claim is the thing that prevents duplicated work and the plan item
+    is a consequence of it. A key it cannot read must therefore cost an unwritten
+    item and never a refused claim.
+
+    >>> work_ref("work", "prisonblues/quarterback#426")
+    ('issue', 'prisonblues/quarterback', '426')
+    >>> work_ref("issue", "PrisonBlues/Quarterback#426")
+    ('issue', 'prisonblues/quarterback', '426')
+    >>> work_ref("work", "prisonblues/quarterback!207")
+    ('pr', 'prisonblues/quarterback', '207')
+    >>> work_ref("merge", "prisonblues/quarterback:main") is None
+    True
+    >>> work_ref("work", "prisonblues/lexray:serving-row:32022R2554") is None
+    True
+    """
+    canon_kind, canon_key = _fold(kind, key)
+    if canon_kind != WORK:
+        return None
+    for ref_kind, pattern in (("issue", _ISSUE_KEY), ("pr", _PR_KEY)):
+        m = pattern.match(canon_key)
+        if not m:
+            continue
+        try:
+            return ref_kind, canonical_repo(m.group("repo")), str(_number(m.group("number")))
+        except BadRef:
+            # Matching the shape is not being one — the same looser-regex gap
+            # `_fold` documents. `acme/foo.git#12` is a real stored key and not a
+            # repo this board can name, so the truthful answer is "no resource I
+            # can put on a plan", which is exactly None.
+            return None
+    return None
