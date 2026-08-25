@@ -192,12 +192,32 @@ marker_sessions() {
 # with NO marker keeps the cwd clause untouched: that is the agent launched
 # inside a checkout directly, which is the true positive this must never drop.
 marker_elsewhere() {
-    local f content
+    local f content real
     [[ -d "$MARKER_DIR" ]] || return 0
     for f in "$MARKER_DIR"/*; do
         [[ -f "$f" ]] || continue
         content=$(_marker_of "$f")
-        [[ -n "$content" && "$content" != "$WT_PATH" && "$content" != "$WT_LOGICAL" ]] \
+        [[ -n "$content" ]] || continue
+        # ONLY A MARKER THAT STILL NAMES SOMETHING REAL MAY SUBTRACT, and this is
+        # the guard that keeps a convenience from becoming a false negative in a
+        # delete guard. A marker is written when a worktree is handed over and
+        # cleared when it is dropped — but it goes stale in between: the worktree
+        # is removed by hand, or the session moves on and nothing rewrites it.
+        # Subtracting on a stale one suppressed the lease-cwd evidence for a
+        # session that really was in this checkout, and `remove-worktree` reads
+        # that exit 0 as permission to `rm -rf`. Reproduced: a live agent whose
+        # lease cwd WAS the worktree came back `held: false` because its marker
+        # named a directory deleted an hour earlier.
+        [[ -d "$content" ]] || continue
+        # CANONICALISED BOTH SIDES, for the same reason. The target is compared
+        # in two spellings (physical and logical) and a marker written through a
+        # third symlink alias would compare unequal to both — classifying the
+        # session as "elsewhere" and suppressing evidence about the very
+        # directory it names. Textual equality is not path equality.
+        real=$(cd -P "$content" 2>/dev/null && pwd -P) || continue
+        [[ -n "$real" ]] || continue
+        [[ "$real" != "$WT_PATH" && "$real" != "$WT_LOGICAL" \
+           && "$content" != "$WT_PATH" && "$content" != "$WT_LOGICAL" ]] \
             && basename "$f"
     done
     return 0

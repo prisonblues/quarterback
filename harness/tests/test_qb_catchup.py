@@ -388,3 +388,20 @@ def test_the_board_is_not_asked_about_a_worktree_that_could_not_move_anyway(flee
     asked = fleet.holder_calls.read_text().splitlines()
     assert len(asked) == 1, f"the board was asked about a non-candidate: {asked}"
     assert "proj" in asked[0]
+
+
+def test_a_holder_check_that_crashed_is_not_permission(fleet):
+    """Listing the refusals and letting everything else fall through was
+    backwards: exit 1, 2, 126, 127 or a signal are what a safety check that
+    CRASHED looks like, and treating a crashed check as "nobody is there" is the
+    one direction this must never fail in."""
+    fleet.land_upstream()
+    git(fleet.main, "fetch", "-q", "origin")
+    before = fleet.head(fleet.main)
+
+    for rc in (1, 2, 127):
+        fleet.stub_holder(rc=rc)
+        done = fleet.run()
+        assert done.returncode == 0, done.stderr
+        assert "holder check itself failed" in done.stdout, f"rc={rc}: {done.stdout}"
+        assert fleet.head(fleet.main) == before, f"rc={rc} was treated as permission"

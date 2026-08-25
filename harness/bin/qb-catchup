@@ -160,12 +160,20 @@ while IFS= read -r wt; do
   # What the order must guarantee is that nothing WRITES before the holder has
   # answered, and nothing above this line does — they are reads of refs, not of
   # the tree.
+  # ONLY A CLEAN 0 PROCEEDS. Listing the refusals — 3 held, 4 could not tell —
+  # and letting everything else fall through was backwards: exit 1, 2, 126, 127
+  # or a signal are what a safety check that CRASHED looks like, and treating a
+  # crashed check as "nobody is there" is the one direction this must never fail
+  # in. A future contract change would land in the same hole.
   holder "$wt"
   case $? in
+    0) ;;
     3) who=$(holder_name)
        say "  · $name ($branch) — held by ${who:-another live agent}, left alone"
        SKIPPED=$((SKIPPED + 1)); continue ;;
     4) say "  · $name ($branch) — cannot tell who is in it, left alone"
+       SKIPPED=$((SKIPPED + 1)); continue ;;
+    *) say "  · $name ($branch) — the holder check itself failed ($?), left alone"
        SKIPPED=$((SKIPPED + 1)); continue ;;
   esac
 

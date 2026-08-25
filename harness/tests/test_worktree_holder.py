@@ -686,7 +686,12 @@ def test_a_peer_marked_for_another_worktree_does_not_hold_the_main_checkout(
     with an agent running, which is every box.
     """
     markers = tmp_path / "markers"
-    mark(markers, PEER, str(tmp_path / "proj-fix-issue-99"))
+    # The worktree it was handed has to EXIST, or the stale-marker guard below
+    # refuses to subtract on it — which is the whole point of that guard and was
+    # this test modelling the stale case by accident.
+    elsewhere = tmp_path / "proj-fix-issue-99"
+    elsewhere.mkdir()
+    mark(markers, PEER, str(elsewhere))
     b = board(agents=[lease(PEER, cwd=str(main_checkout))])
 
     done = run(main_checkout, board_url=b.url, markers=markers, args=("--json",))
@@ -724,3 +729,45 @@ def test_a_peer_marked_for_this_worktree_holds_it_wherever_it_was_launched(
     done = run(wt, board_url=b.url, markers=markers, args=("--json",))
     assert done.returncode == 3, done.stdout
     assert [h["session"] for h in json.loads(done.stdout)["holders"]] == [PEER]
+
+
+def test_a_stale_marker_does_not_suppress_a_real_holder(main_checkout, tmp_path, board):
+    """The false negative the subtraction could have introduced, in the guard
+    `remove-worktree` consults before `rm -rf`.
+
+    A marker is written when a worktree is handed over and cleared when it is
+    dropped — but it goes stale in between: the worktree is removed by hand, or
+    the session moves on and nothing rewrites it. Subtracting on a stale one
+    suppressed the lease-cwd evidence for a session that really was here, and
+    exit 0 is what `remove-worktree` reads as permission to destroy.
+
+    Reproduced before the guard: a live agent whose lease cwd WAS this checkout
+    came back `held: false`, because its marker named a directory deleted an hour
+    earlier.
+    """
+    markers = tmp_path / "markers"
+    mark(markers, PEER, str(tmp_path / "proj-deleted-long-ago"))   # never existed
+    b = board(agents=[lease(PEER, cwd=str(main_checkout))])
+
+    done = run(main_checkout, board_url=b.url, markers=markers, args=("--json",))
+    assert done.returncode == 3, (
+        f"a stale marker suppressed a live holder — this exit code is what "
+        f"remove-worktree reads as permission to rm -rf: {done.stdout}")
+    assert [h["session"] for h in json.loads(done.stdout)["holders"]] == [PEER]
+
+
+def test_a_marker_written_through_a_symlink_still_names_this_worktree(
+    main_checkout, tmp_path, board
+):
+    """Textual equality is not path equality. A marker written through another
+    alias for the same directory would compare unequal to both spellings the
+    target keeps, and be classified as 'elsewhere' — suppressing evidence about
+    the very directory it names."""
+    markers = tmp_path / "markers"
+    alias = tmp_path / "by-another-name"
+    alias.symlink_to(main_checkout)
+    mark(markers, PEER, str(alias))
+    b = board(agents=[lease(PEER, cwd=str(main_checkout))])
+
+    done = run(main_checkout, board_url=b.url, markers=markers, args=("--json",))
+    assert done.returncode == 3, f"a symlinked marker was read as elsewhere: {done.stdout}"
