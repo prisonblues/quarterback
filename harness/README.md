@@ -657,16 +657,32 @@ fixes while they were still writing them.
 `qb-hook` gates `Bash` at `PreToolUse`. Three facts have to be true **together**:
 
 - the command destroys uncommitted work — `git reset --hard|--merge`, `git checkout -- ` /
-  `-f` / `.`, `git restore`, `git clean -fd|--force`, `git worktree remove --force`;
-- this working tree actually holds some, **untracked files included** — `git clean -fd`
-  destroys precisely the files that `--untracked-files=no` would have hidden, and one of the
-  five was an untracked file;
-- and a peer is live in **this exact cwd**, which `GET /active?cwd=` has answered since v2.6.
+  `-f` / `.`, `git switch -f|--discard-changes`, `git restore`, `git clean -fd|--force`,
+  `git worktree remove --force`;
+- **the tree that command will actually touch** holds some, **untracked files included** —
+  `git clean -fd` destroys precisely the files that `--untracked-files=no` would have hidden,
+  and one of the five was an untracked file;
+- and a peer is live in that tree, which `GET /active?cwd=` has answered since v2.6.
 
 Take any one away and nothing happens. A clean tree is never refused. `git status` never
 reaches the board at all — the fast path is one regex against a string the hook already holds,
 which matters because this fires on every Bash call in every session on the box. Alone in a
-tree, your own uncommitted work stays yours to throw away.
+tree, your own uncommitted work stays yours to throw away. `--help` is never refused, and
+neither is a dry run: `git clean -n`, `-fdn` and `--dry-run` print what they would remove and
+remove nothing.
+
+**It guards the tree the command names, not the one you are standing in.**
+`git -C ../peer-tree reset --hard` is checked against `../peer-tree`, and an explicit
+`--work-tree=` is followed the same way. The first cut checked the payload cwd unconditionally,
+which is wrong in both directions: it would let a peer's checkout be destroyed from a clean cwd,
+and refuse a private checkout from a shared one. A target it cannot resolve — a quoted path, a
+`$VAR`, a `$(…)` — falls back to the cwd rather than being guessed at.
+
+**And it is the worktree ROOT, not the directory.** #185 says so in as many words: *"an agent
+sitting in `65lowther/viz` is in the same tree with a different cwd"*. Both sides are asked —
+the canonical root via `rev-parse --show-toplevel` under `cd -P`, and the raw cwd as well when
+they differ, because a peer's lease records whatever cwd their session started in and the board
+matches that string exactly. We can canonicalise our side; we cannot canonicalise theirs.
 
 **It matches the tree, not the repo.** Two agents in two worktrees of one repo are not in each
 other's way, and a gate that refused them would be refusing people who are free — which is how
@@ -674,7 +690,20 @@ a primitive gets learned around, and then it is worse than nothing.
 
 **`QB_ALLOW_SHARED_TREE=1`** in front of the command proceeds anyway, the same shape and the
 same reasoning as `QB_ALLOW_SHARED_STASH`. An advisory gate needs a way past or it gets turned
-off wholesale; putting the override in the command makes taking it deliberate and visible.
+off wholesale; putting the override in the command makes taking it deliberate and visible. It
+must be a real leading assignment — a bare substring test let `QB_ALLOW_SHARED_TREE=10 …` and a
+trailing `# QB_ALLOW_SHARED_TREE=1` comment through, which made the hatch quietly wider than the
+sentence documenting it.
+
+**What it cannot do, stated plainly.** It reads a command as text, so it cannot model shell
+evaluation: `bash -c 'git reset --hard'`, `${GIT:-git} reset --hard`, an alias, a shell function
+or `xargs` all go past it, and conversely `echo git reset --hard` is refused for saying the
+words. That is a tripwire's honest limit, not a bug to be fixed by a bigger regex — the threat
+model here is an accident between co-operating agents, not evasion, and the cost of a false
+positive is one refusal with a named escape hatch rather than a lost morning. It is also
+time-of-check-to-time-of-use: a peer can arrive in the tree after the check and before the
+command runs. The structural fix is one worktree per agent, which is what the ⚠️ startup note
+pushes people towards; this is defence in depth behind that.
 
 **`git stash` is not in that list**, though it belongs to the family. It is already refused by
 the `reference-transaction` hook above, which is strictly better for it: that one catches a
@@ -691,7 +720,9 @@ sharing a repo is company, sharing a tree gets its own line, its own names, and 
 `git worktree add` to get out of it.
 
 **Fail-open, unchanged.** Board unreachable, request timed out, answer will not parse, `cwd` is
-not a checkout: all let the command through. A coordination board is not in the critical path
+not a checkout: all let the command through. Both git calls are wrapped in `timeout` — they sit
+on the interactive hot path now, and `git status` can block indefinitely on a dead network mount
+or a slow `core.fsmonitor`. A coordination board is not in the critical path
 of anyone’s work, and a guard that failed closed would turn every board outage into a
 fleet-wide one. `harness/tests/test_qb_hook_shared_tree.py` pins all of it, including every
 command that must *not* be refused.

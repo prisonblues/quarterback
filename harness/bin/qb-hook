@@ -638,6 +638,11 @@ _publish_push() {   # announce HEAD if a push just put it on the tracking branch
 # is in the tree right now. A second gate on the same command would only give it
 # a second escape hatch under a different name. Use `qb-stash`.
 #
+# `git switch -f|--discard-changes` is the modern spelling of `checkout -f` and
+# was missing from the first cut of this list, which is exactly the failure mode
+# a verb list has: it ages against the tool it names. Anything added to git that
+# overwrites the working tree belongs here.
+#
 # `rm -rf` is not here either, and that one is a judgement rather than a
 # deferral: it would be far broader and far noisier than the evidence supports —
 # five incidents, five git commands. If a sixth is an `rm`, it can be added then,
@@ -655,6 +660,7 @@ _QB_DESTRUCTIVE="(^|[;&|]|[[:space:]])${_GITX}("\
 "|checkout([[:space:]]+${_TOK})*[[:space:]]+--([[:space:]]|\$)"\
 "|checkout[[:space:]]+(-f|--force)([[:space:]]|\$)"\
 "|checkout[[:space:]]+\\.(/${_TOK})?([[:space:]]|\$)"\
+"|switch[[:space:]]+(${_TOK}[[:space:]]+)*(-f|--force|--discard-changes)([[:space:]]|\$)"\
 "|restore([[:space:]]|\$)"\
 "|clean[[:space:]]+(${_TOK}[[:space:]]+)*(--force|-[A-Za-z]*[fdxFDX])"\
 "|worktree[[:space:]]+remove[[:space:]]+(${_TOK}[[:space:]]+)*(-f|--force)"\
@@ -668,8 +674,63 @@ _deny() {   # _deny <reason>: refuse this tool call, with a reason the agent can
   exit 0
 }
 
+# Flags that make a matched verb harmless. Both were false positives found by an
+# adversarial review of the first cut, and a false positive here costs more than
+# it looks: this runs on every Bash call in every session, and the guard that
+# cries wolf is the guard somebody turns off.
+#
+# `--dry-run` is scoped to `clean` deliberately. There, `-n` means "show me what
+# you would remove" and `-fdn` is a listing, not a deletion. Elsewhere `-n` means
+# other things, and an exemption that spanned every verb would be inventing a
+# rule git does not have.
+_QB_CLEAN='(^|[;&|]|[[:space:]])git([[:space:]]+-[^[:space:]]+)*[[:space:]]+clean([[:space:]]|$)'
+_QB_DRYRUN='(^|[[:space:]])(--dry-run|-[A-Za-z]*n[A-Za-z]*)([[:space:]]|$)'
+_QB_HELP='(^|[[:space:]])(--help|-h)([[:space:]]|$)'
+
+# An explicit target, when it is a plain literal we can actually resolve. A
+# quoted path, a `$VAR` or a `$(…)` is deliberately NOT guessed at: this is a
+# regex looking at a shell command, and a regex that pretended to resolve one
+# would be confidently wrong about where the damage is going to land.
+_QB_DASH_C='(^|[;&|]|[[:space:]])git([[:space:]]+-[^[:space:]]+)*[[:space:]]+-C[[:space:]]+([^[:space:]'"'"'"$;&|]+)'
+_QB_WORKTREE='--work-tree=([^[:space:]'"'"'"$;&|]+)'
+
+_deny() {   # _deny <reason>: refuse this tool call, with a reason the agent can act on
+  jq -nc --arg r "$1" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",
+                          permissionDecision:"deny",
+                          permissionDecisionReason:$r}}'
+  exit 0
+}
+
+_tree_root() {   # _tree_root <path>: the canonical worktree root, or nothing
+  # THE WORKTREE ROOT, NOT THE CWD, and #185 says so in as many words: "an agent
+  # sitting in 65lowther/viz is in the same tree with a different cwd". The first
+  # cut of this guard compared raw cwds, so a peer one directory down was
+  # invisible to it and `git reset --hard` from either of them wrecks the same
+  # tree. `-P` on top, since a symlinked path and its target are one tree and two
+  # strings.
+  local top
+  top=$(timeout 3 git -C "$1" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ -n "$top" ] || return 1
+  ( cd -P "$top" 2>/dev/null && pwd ) || printf '%s\n' "$top"
+}
+
+_tree_peers() {   # _tree_peers <path>: live peers whose lease names this path
+  # `peers_only` needs `mine` to know which lease is ours, or our OWN session
+  # comes back as its own collision. Sub-agents count: a peer's fan-out edits the
+  # peer's tree with the peer's hands, and losing its work loses the peer's.
+  local body
+  body=$(curl -sS --max-time 3 "${_auth[@]}" \
+           "$BASE/active?cwd=$(jq -rn --arg c "$1" '$c|@uri')&mine=$(jq -rn --arg s "$sid" '$s|@uri')&peers_only=true" \
+         2>/dev/null) || return 0
+  [ -n "$body" ] || return 0
+  printf '%s' "$body" \
+    | jq -r '[(.agents//[]),(.subagents//[])|.[]|(.holder//.label//"?")]|.[]' 2>/dev/null
+  return 0
+}
+
 _shared_tree_guard() {
-  local cmd dirty peers names n
+  local cmd target root cwdroot dirty names n explicit
   cmd=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
   [ -n "$cmd" ] || return 0
 
@@ -679,51 +740,90 @@ _shared_tree_guard() {
   # common case is the cost of this gate.
   printf '%s' "$cmd" | grep -Eq "$_QB_DESTRUCTIVE" || return 0
 
+  # Asking a verb to explain itself is not running it.
+  printf '%s' "$cmd" | grep -Eq "$_QB_HELP" && return 0
+  # `git clean -n|-fdn|--dry-run` prints what it would remove and removes nothing.
+  if printf '%s' "$cmd" | grep -Eq "$_QB_CLEAN"; then
+    printf '%s' "$cmd" | grep -Eq "$_QB_DRYRUN" && return 0
+  fi
+
   # The deliberate override, checked before anything expensive. Matched on the
   # command text rather than on this hook's own environment because the hook
   # does not inherit what the agent prefixes to a Bash invocation — the string
   # is the only place the intent is visible from here.
+  #
+  # It must be a real LEADING assignment. A bare substring test let
+  # `QB_ALLOW_SHARED_TREE=10 …` and a trailing `# QB_ALLOW_SHARED_TREE=1` comment
+  # through, which made the hatch quietly wider than the sentence documenting it.
   # Named to match `QB_ALLOW_SHARED_STASH`, the harness's other shared-resource
   # override: an agent that has met one should be able to guess the other.
-  case "$cmd" in *QB_ALLOW_SHARED_TREE=1*|*QB_ALLOW_SHARED_TREE=true*) return 0 ;; esac
+  printf '%s' "$cmd" \
+    | grep -Eq '^[[:space:]]*QB_ALLOW_SHARED_TREE=(1|true)([[:space:]]|$)' && return 0
 
   [ -n "$cwd" ] || return 0
-  git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1 || return 0
+
+  # WHICH TREE IS THIS COMMAND GOING TO TOUCH? Not necessarily the one we are
+  # standing in — `git -C ../peer-tree reset --hard` destroys somebody else's
+  # while the payload cwd stays clean and unshared. The first cut checked the
+  # cwd unconditionally, so it both missed that and refused the mirror image of
+  # it: a reset of a private tree, denied because the cwd happened to be shared.
+  target="$cwd"; explicit=""
+  if [[ "$cmd" =~ $_QB_DASH_C ]]; then
+    explicit="${BASH_REMATCH[3]}"
+  elif [[ "$cmd" =~ $_QB_WORKTREE ]]; then
+    explicit="${BASH_REMATCH[1]}"
+  fi
+  if [ -n "$explicit" ]; then
+    # A relative -C is relative to the cwd the command runs in.
+    case "$explicit" in /*) target="$explicit" ;; *) target="$cwd/$explicit" ;; esac
+  fi
+
+  root=$(_tree_root "$target") || return 0   # not a checkout → nothing to guard
+  [ -n "$root" ] || return 0
 
   # Is there anything to lose? A hard reset in a clean tree destroys nothing
   # uncommitted, and refusing it would be the gate crying wolf on the safest
   # possible instance of the verb it watches. Untracked files are INCLUDED
   # (no --untracked-files=no here, unlike gitctx.sync_state): `git clean -fd`
-  # destroys precisely those, and board 4004 was an untracked file.
-  dirty=$(git -C "$cwd" status --porcelain 2>/dev/null | head -c 4000)
+  # destroys precisely those, and board 4004 was an untracked file. `timeout`
+  # because this now sits on the interactive hot path and `git status` can block
+  # indefinitely on a dead network mount or a slow fsmonitor.
+  dirty=$(timeout 3 git -C "$root" status --porcelain 2>/dev/null | head -c 4000)
   [ -n "$dirty" ] || return 0
 
-  # Is anyone else in this exact tree? `cwd` is matched, not the repo: two
-  # agents in two worktrees of one repo are not in each other's way, and a gate
-  # that refused them would be refusing people who are free — which is the
-  # failure #185 warns about for the path key, in a different spelling.
-  # `peers_only` needs `mine` to know which lease is ours, or our OWN session
-  # comes back as its own collision.
-  peers=$(curl -sS --max-time 3 "${_auth[@]}" \
-            "$BASE/active?cwd=$(jq -rn --arg c "$cwd" '$c|@uri')&mine=$(jq -rn --arg s "$sid" '$s|@uri')&peers_only=true" \
-          2>/dev/null) || return 0
-  [ -n "$peers" ] || return 0
-  # Sub-agents count. A peer's fan-out edits the peer's tree with the peer's
-  # hands, and losing its work loses the peer's work.
-  names=$(printf '%s' "$peers" \
-          | jq -r '[(.agents//[]),(.subagents//[])|.[]|(.holder//.label//"?")]|unique|join(", ")' 2>/dev/null) || return 0
-  [ -n "$names" ] && [ "$names" != "null" ] || return 0
+  # Is anyone else in this tree? The ROOT, not the repo: two agents in two
+  # worktrees of one repo are not in each other's way, and a gate that refused
+  # them would be refusing people who are free — the failure #185 warns about for
+  # the path key, in a different spelling.
+  #
+  # Asked twice when our cwd is a DIFFERENT SPELLING OF THE SAME TREE, because a
+  # lease records whatever cwd its session started in and the board matches that
+  # string exactly. We can canonicalise our own side; we cannot canonicalise
+  # theirs, so a peer who started one directory down is only found by asking for
+  # their spelling too.
+  #
+  # Guarded on the roots being equal, and that guard is the whole correctness of
+  # it: without the check, `git -C ../private-tree reset --hard` typed from a
+  # shared cwd picks up the SHARED tree's peers and refuses a command that cannot
+  # touch them. Which is the same bug as checking the cwd in the first place,
+  # moved one line down.
+  cwdroot=$(_tree_root "$cwd" 2>/dev/null) || cwdroot=""
+  names=$( { _tree_peers "$root"
+             [ "$cwdroot" = "$root" ] && [ "$cwd" != "$root" ] && _tree_peers "$cwd"
+             :; } \
+           | sed '/^$/d;/^null$/d' | sort -u | paste -sd', ' - )
+  [ -n "$names" ] || return 0
 
   n=$(printf '%s' "$dirty" | grep -c '' 2>/dev/null || echo 0)
   _deny "quarterback: refusing this in a SHARED working tree.
 
-$cwd has $n uncommitted change(s), and these agents are live in it right now: $names
+$root has $n uncommitted change(s), and these agents are live in it right now: $names
 
 This command destroys uncommitted work, and in a shared checkout some of that work is theirs — that has now happened five times on this fleet, most recently tonight (board 6236/6241), where a hard reset here took a peer's in-flight review fixes.
 
 What to do instead, cheapest first:
   1. Work somewhere else: git worktree add ../<repo>-<branch> -b <branch>
-  2. Ask first: board_post(type='ask', to='<peer>', summary='about to reset $cwd — anything of yours in it?')
+  2. Ask first: board_post(type='ask', to='<peer>', summary='about to reset $root — anything of yours in it?')
   3. Save theirs and yours before you swing: git stash -u   (or git diff > /tmp/tree.patch)
 
 If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of the command and it will run."
@@ -795,7 +895,7 @@ case "$EVENT" in
         sharers=$(curl -sS --max-time 6 "${_auth[@]}" -G "$BASE/active" \
           --data-urlencode "cwd=$cwd" --data-urlencode "mine=$sid" --data-urlencode "peers_only=true" \
           2>/dev/null \
-          | jq -rc '[(.agents//[])[] | "  • " + .holder
+          | jq -rc '[(.agents//[]),(.subagents//[]) | .[] | "  • " + (.holder//.label//"?")
                       + (if .title then " — \""+.title+"\"" else "" end)] | unique | join("\n")' 2>/dev/null)
         if [ -n "$sharers" ]; then
           shared=$(jq -nr --arg c "$cwd" --arg l "$sharers" \

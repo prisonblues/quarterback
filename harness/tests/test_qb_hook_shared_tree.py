@@ -48,6 +48,7 @@ import os
 import shutil
 import subprocess
 import time
+from urllib.parse import quote
 from pathlib import Path
 
 import pytest
@@ -96,18 +97,29 @@ class Guarded:
         self.stub.mkdir()
         self.calls = tmp_path / "curl.log"
         self.reply = tmp_path / "active.json"
+        self.match = tmp_path / "peer-query.txt"
         self.rc = tmp_path / "curl.rc"
         self.reply.write_text(json.dumps(ALONE))
+        self.match.write_text("cwd=\ncwd=\n")   # by default, any tree
         self.rc.write_text("0")
-        # Scriptable: logs every call, answers `/active` from a file, and can be
-        # told to fail outright — which is how "the board is down" is tested,
-        # and that case must never cost anybody a command.
+        # THE STUB ANSWERS THE QUESTION IT WAS ASKED. The first version of this
+        # returned the peer list for every `/active` call whatever its query, so
+        # every test below named "this exact tree" proved only that the regex had
+        # matched — the guard could have asked about any path at all and passed.
+        # An adversarial review caught that, and it is the reason the target-tree
+        # tests further down can mean anything.
         (self.stub / "curl").write_text(
             "#!/bin/sh\n"
             f'printf "%s\\n" "$*" >> {self.calls}\n'
             f'rc=$(cat {self.rc})\n'
             '[ "$rc" != "0" ] && exit "$rc"\n'
-            f'case "$*" in *"/active"*) cat {self.reply} ;; esac\n'
+            f'want=$(sed -n 1p {self.match}); raw=$(sed -n 2p {self.match})\n'
+            'case "$*" in\n'
+            f'  *"/active"*"repo="*) cat {self.reply} ;;\n'
+            f'  *"/active"*"$want"*) cat {self.reply} ;;\n'
+            f'  *"/active"*"$raw"*) cat {self.reply} ;;\n'
+            '  *"/active"*) printf \'{"agents":[],"subagents":[]}\' ;;\n'
+            'esac\n'
             "exit 0\n"
         )
         (self.stub / "curl").chmod(0o755)
@@ -131,8 +143,23 @@ class Guarded:
         self._git("commit", "-qm", "seed")
         return f
 
-    def peers(self, payload: dict) -> None:
+    def peers(self, payload: dict, in_tree: Path | str | None = None) -> None:
+        """Who the board reports, and — optionally — the ONE tree it reports them
+        in. `in_tree` is what makes "does the guard ask about the right path?"
+        a question the stub can actually answer."""
         self.reply.write_text(json.dumps(payload))
+        self.match.write_text(
+            f"cwd={quote(str(in_tree), safe='')}\ncwd={in_tree}\n"
+            if in_tree is not None else "cwd=\ncwd=\n"
+        )
+
+    def other_checkout(self, name: str = "private") -> Path:
+        """A second, independent git checkout — the tree a `git -C` points at."""
+        d = self.root / name
+        d.mkdir()
+        subprocess.run(["git", "-C", str(d), "init", "-q", "-b", "main"],
+                       check=True, capture_output=True)
+        return d
 
     def board_down(self) -> None:
         self.rc.write_text("7")  # curl's "couldn't connect"
@@ -192,7 +219,7 @@ def shared(guard):
     """The situation on 2026-08-25: a dirty tree with a live peer in it."""
     guard.commit("app.py", "original\n")
     (guard.cwd / "app.py").write_text("a peer's in-flight edit\n")
-    guard.peers(PEER)
+    guard.peers(PEER, in_tree=guard.cwd)
     return guard
 
 
@@ -225,7 +252,7 @@ def test_the_refusal_says_what_to_do_instead(shared):
 def test_a_peers_subagent_counts_as_a_peer(shared):
     """A peer's fan-out edits the peer's tree with the peer's hands. Losing its
     work loses the peer's work, so `subagents` is not a separate, softer case."""
-    shared.peers({"agents": [], "subagents": [{"label": "Explore: audit", "cwd": "/shared"}]})
+    shared.peers({"agents": [], "subagents": [{"label": "Explore: audit"}]}, in_tree=shared.cwd)
     d = shared.decision(shared.bash("git clean -fd"))
     assert d["permissionDecision"] == "deny"
     assert "Explore: audit" in d["permissionDecisionReason"]
@@ -242,7 +269,8 @@ def test_a_peers_subagent_counts_as_a_peer(shared):
     "git clean --force",
     "git worktree remove --force ../wt",
     "cd /tmp && git reset --hard",              # not at the start of the line
-    "git -C /shared reset --hard",              # …and reached through -C
+    "git switch -f main",                       # the modern spelling of checkout -f
+    "git switch --discard-changes main",
 ])
 def test_the_verbs_that_destroy_a_peers_uncommitted_work(shared, cmd):
     assert shared.decision(shared.bash(cmd))["permissionDecision"] == "deny", cmd
@@ -280,7 +308,7 @@ def test_a_clean_tree_is_never_refused(guard):
     """Nothing uncommitted, nothing to lose. Refusing here would be the gate
     crying wolf on the safest possible instance of the verb it watches."""
     guard.commit("app.py", "committed and clean\n")
-    guard.peers(PEER)
+    guard.peers(PEER, in_tree=guard.cwd)
     assert guard.decision(guard.bash("git reset --hard")) is None
 
 
@@ -289,7 +317,7 @@ def test_an_untracked_file_counts_as_something_to_lose(guard):
     everyone's red build. `git clean -fd` destroys precisely the files that
     `--untracked-files=no` would have hidden from this check."""
     (guard.cwd / "fitout.yaml").write_text("half-written\n")
-    guard.peers(PEER)
+    guard.peers(PEER, in_tree=guard.cwd)
     assert guard.decision(guard.bash("git clean -fd"))["permissionDecision"] == "deny"
 
 
@@ -353,7 +381,7 @@ def test_a_cwd_that_is_not_a_checkout_is_not_guarded(guard):
     """Nothing here to be anyone's working tree."""
     outside = guard.root / "elsewhere"
     outside.mkdir()
-    guard.peers(PEER)
+    guard.peers(PEER, in_tree=guard.cwd)
     got = guard.fire("PreToolUse", cwd=str(outside), tool_name="Bash",
                      tool_input={"command": "git reset --hard"})
     assert guard.decision(got) is None
@@ -408,7 +436,7 @@ def test_a_peer_in_your_tree_is_not_reported_as_a_peer_in_your_repo(session):
     minutes later (boards 6236, 6241) described them as sharing a *repo* and
     closed by saying not to hold off. It was answering a different question from
     the one that mattered, in a voice that sounded like it had answered it."""
-    session.peers(PEER)
+    session.peers(PEER, in_tree=session.cwd)
     note = session.start()
     assert "SHARING a working tree" in note, note
     assert "hermes/seat-quarterback-4" in note
@@ -418,7 +446,7 @@ def test_the_shared_tree_note_says_the_opposite_of_the_repo_note(session):
     """Two overlaps, two instructions. Sharing a repo is company and the note
     says so; sharing a tree is not free and the note must not inherit that
     sentence, which is precisely what it did on the night."""
-    session.peers(PEER)
+    session.peers(PEER, in_tree=session.cwd)
     note = session.start()
     shared = note.split("SHARING a working tree", 1)[1]
     assert "no need to hold off" not in shared
@@ -428,7 +456,7 @@ def test_the_shared_tree_note_says_the_opposite_of_the_repo_note(session):
 def test_the_repo_note_keeps_its_own_voice(session):
     """The fix must not make the ordinary case alarming. Working the same repo
     from two worktrees is what the board is for, and it still reads that way."""
-    session.peers(PEER)
+    session.peers(PEER, in_tree=session.cwd)
     note = session.start()
     assert "Working the same area is fine" in note
 
@@ -436,15 +464,176 @@ def test_the_repo_note_keeps_its_own_voice(session):
 def test_alone_in_your_tree_there_is_no_second_note(session):
     """`GET /active?cwd=` answers about this tree; an empty answer is silence,
     not a softer warning."""
-    session.peers(ALONE)
+    session.peers(ALONE, in_tree=session.cwd)
     assert "SHARING a working tree" not in session.start()
 
 
 def test_both_questions_are_asked_not_one(session):
     """The repo question and the tree question are different questions and the
     hook now asks both. Collapsing them back into one scope is the bug."""
-    session.peers(PEER)
+    session.peers(PEER, in_tree=session.cwd)
     session.start()
     active = [c for c in session.sent() if "/active" in c]
     assert any("repo=" in c for c in active), active
     assert any("cwd=" in c for c in active), active
+
+
+# ------------------------------------------------- which tree does it actually touch?
+#
+# The sharpest finding of the adversarial review, and the one the first cut got
+# wrong in both directions. The guard used to check the payload `cwd`
+# unconditionally, while the command is free to name a different tree — so it
+# would let a peer's checkout be destroyed from a clean cwd, and refuse a private
+# checkout from a shared one. Neither is a near-miss; they are the two halves of
+# checking the wrong thing.
+
+
+def test_a_reset_aimed_at_a_peers_tree_is_refused_from_a_clean_cwd(guard):
+    """`git -C <peer-tree> reset --hard`, run from somewhere quiet. Nothing about
+    the cwd is alarming; the tree in the command is somebody's morning."""
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "wip.py").write_text("a peer's in-flight edit\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash(f"git -C {peer_tree} reset --hard"))
+    assert d is not None and d["permissionDecision"] == "deny"
+    assert str(peer_tree) in d["permissionDecisionReason"]
+
+
+def test_the_work_tree_flag_is_followed_too(guard):
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "wip.py").write_text("in flight\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash(f"git --work-tree={peer_tree} --git-dir={peer_tree}/.git reset --hard"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_a_private_tree_is_not_refused_because_the_cwd_is_shared(shared):
+    """The mirror image, and the one that would have taught people to ignore the
+    guard: standing in a shared tree does not make every command you type
+    dangerous. The reset lands on a checkout nobody else is in."""
+    private = shared.other_checkout("private")
+    (private / "scratch.txt").write_text("mine alone\n")
+    assert shared.decision(shared.bash(f"git -C {private} reset --hard")) is None
+
+
+def test_a_relative_target_is_resolved_against_the_cwd(guard):
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "wip.py").write_text("in flight\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash("git -C ../peer reset --hard"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_a_target_we_cannot_resolve_falls_back_to_the_cwd(shared):
+    """A quoted path, a `$VAR` or a `$(…)` is not something a regex resolves, and
+    guessing at one would be confidently wrong about where the damage lands. The
+    honest move is to guard the tree we are standing in and say nothing about the
+    other — which is what the first cut did for every command."""
+    d = shared.decision(shared.bash('git -C "$SOME_DIR" reset --hard'))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+# ----------------------------------------------------- the tree, not the directory
+
+
+def test_a_peer_one_directory_down_is_still_in_your_tree(guard):
+    """#185 says this in as many words — "an agent sitting in 65lowther/viz is in
+    the same tree with a different cwd" — and the first cut compared raw cwds, so
+    it could not see them. `git reset --hard` from either directory wrecks the
+    same working tree."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("a peer's edit\n")
+    sub = guard.cwd / "subdir"
+    sub.mkdir()
+    # The peer's lease names the ROOT; we are standing one level down.
+    guard.peers(PEER, in_tree=guard.cwd)
+    got = guard.fire("PreToolUse", cwd=str(sub), tool_name="Bash",
+                     tool_input={"command": "git reset --hard"})
+    d = guard.decision(got)
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_a_peer_whose_lease_names_a_subdirectory_is_found_too(guard):
+    """The other direction, and the reason the guard asks twice. A lease records
+    whatever cwd its session started in and the board matches that string
+    exactly. We can canonicalise our own side; we cannot canonicalise theirs."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("my edit\n")
+    sub = guard.cwd / "viz"
+    sub.mkdir()
+    guard.peers(PEER, in_tree=sub)          # the peer started down there
+    got = guard.fire("PreToolUse", cwd=str(sub), tool_name="Bash",
+                     tool_input={"command": "git reset --hard"})
+    assert guard.decision(got)["permissionDecision"] == "deny"
+
+
+# ------------------------------------------------------------- false positives
+
+
+@pytest.mark.parametrize("cmd", [
+    "git clean -fdn",                 # -n is a dry run however it is clustered
+    "git clean -ndf",
+    "git clean --dry-run --force",
+    "git restore --help",             # asking a verb to explain itself
+    "git reset --hard --help",
+    "git clean -fd -h",
+])
+def test_a_command_that_destroys_nothing_is_not_refused(shared, cmd):
+    """Each of these was refused by the first cut. A false positive costs more
+    here than it looks: this runs on every Bash call in every session, and the
+    guard that cries wolf is the guard somebody turns off."""
+    assert shared.decision(shared.bash(cmd)) is None, cmd
+
+
+# --------------------------------------------------------- the escape hatch, exactly
+
+
+def test_the_hatch_must_be_a_real_leading_assignment(shared):
+    """A bare substring test made the hatch quietly wider than the sentence
+    documenting it. All three of these used to walk straight through."""
+    for cmd in (
+        "QB_ALLOW_SHARED_TREE=10 git reset --hard",       # not the value
+        "git reset --hard # QB_ALLOW_SHARED_TREE=true",   # a comment, not an assignment
+        "echo QB_ALLOW_SHARED_TREE=1; git reset --hard",  # assigns nothing at all
+    ):
+        d = shared.decision(shared.bash(cmd))
+        assert d is not None and d["permissionDecision"] == "deny", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "QB_ALLOW_SHARED_TREE=1 git reset --hard",
+    "QB_ALLOW_SHARED_TREE=true git clean -fd",
+    "  QB_ALLOW_SHARED_TREE=1 git reset --hard",
+])
+def test_the_documented_spelling_still_works(shared, cmd):
+    assert shared.decision(shared.bash(cmd)) is None, cmd
+
+
+# ------------------------------------------------------------------ hot path
+
+
+def test_the_git_calls_are_bounded(shared):
+    """`curl` has always had `--max-time`; the git calls had nothing, and they now
+    sit on the interactive hot path where `git status` can block indefinitely on a
+    dead network mount or a slow fsmonitor. Asserted on the source because a test
+    that actually hung would be indistinguishable from a slow one."""
+    hook = (BIN / "qb-hook").read_text()
+    guard = hook.split("_shared_tree_guard() {", 1)[1].split("\n}", 1)[0]
+    root = hook.split("_tree_root() {", 1)[1].split("\n}", 1)[0]
+    for body in (guard, root):
+        for line in body.splitlines():
+            if "git -C" in line and not line.strip().startswith("#"):
+                assert "timeout" in line, line
+
+
+# --------------------------------------------------- the note and the gate agree
+
+
+def test_the_startup_note_counts_a_peers_subagent(session):
+    """The guard counts agents AND sub-agents, because a peer's fan-out edits the
+    peer's tree with the peer's hands. The note counted only agents, so a tree
+    occupied by a sub-agent warned nobody at startup and then refused them at the
+    first destructive verb. Two answers to one question."""
+    session.peers({"agents": [], "subagents": [{"label": "Explore: audit"}]},
+                  in_tree=session.cwd)
+    assert "SHARING a working tree" in session.start()
