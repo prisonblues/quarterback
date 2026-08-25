@@ -405,3 +405,41 @@ def test_a_holder_check_that_crashed_is_not_permission(fleet):
         assert done.returncode == 0, done.stderr
         assert "holder check itself failed" in done.stdout, f"rc={rc}: {done.stdout}"
         assert fleet.head(fleet.main) == before, f"rc={rc} was treated as permission"
+
+
+def test_an_upstream_that_was_deleted_is_named_as_such(fleet):
+    """RED/GREEN. The ordinary state of a worktree left lying around after its PR
+    merged and the remote branch was deleted.
+
+    `rev-parse --abbrev-ref --symbolic-full-name '@{u}'` does three things at
+    once there: it writes the fatal to stderr, writes the literal string `@{u}`
+    to STDOUT, and exits non-zero. So an emptiness test on the output passes, the
+    "no upstream" branch never fires, and the failure falls through to the
+    catch-all guard one step later — which refuses safely and then reports "git
+    would not say where it stands" about a repository that is perfectly fine.
+
+    Nothing unsafe ever happened; the diagnosis was wrong, and the diagnosis is
+    what this tool is for. Found on the first run against real checkouts.
+    """
+    wt = fleet.worktree("feat/landed")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    # The remote branch goes, exactly as a merge-and-delete leaves it.
+    git(fleet.main, "push", "-q", "origin", "--delete", "feat/landed")
+    git(fleet.main, "fetch", "-q", "--prune", "origin")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "its upstream is gone" in done.stdout, done.stdout
+    assert "would not say where it stands" not in done.stdout, (
+        "the catch-all guard answered for a case that has a real name")
+
+
+def test_a_branch_that_never_had_an_upstream_still_says_so(fleet):
+    """The two are worth telling apart: a branch that never had an upstream is
+    somebody's local work in progress, while one whose upstream has been deleted
+    is almost always finished with. The useful next move differs."""
+    fleet.worktree("feat/never-pushed")
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "no upstream, nothing to catch up to" in done.stdout, done.stdout
+    assert "upstream is gone" not in done.stdout
