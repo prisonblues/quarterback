@@ -113,7 +113,11 @@ def test_the_strip_covers_every_vendor_the_panel_can_seat(tmp_path):
     convention file fails here rather than in a review nobody can see."""
     for name in ("CLAUDE.md", "AGENTS.md", "GEMINI.md"):
         assert name in panel.CONVENTION_FILES, name
-    for name in (".claude", ".codex", ".gemini", ".antigravity"):
+    # grok reads six spellings of four names and the title-case pair is its alone,
+    # so the shouted spellings above do not cover it (#292).
+    for name in ("Agents.md", "Claude.md", "CLAUDE.local.md", "AGENT.md"):
+        assert name in panel.CONVENTION_FILES, name
+    for name in (".claude", ".codex", ".gemini", ".antigravity", ".grok"):
         assert name in panel.CONVENTION_DIRS, name
 
 

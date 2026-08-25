@@ -59,7 +59,7 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #: Which seats may be handed the PR's own tree to read, when
 #: `review_panel.reviewer_code_access` is on (#113).
 #:
-#: An allowlist of ONE, and the other three are absences with reasons rather than
+#: An allowlist of ONE, and the other four are absences with reasons rather than
 #: omissions. The bar is a CLI that can express "read but do not execute", because
 #: #92 answered "may reviewers execute?" with no and this issue is reading. Each
 #: verdict below was checked by running the CLI, which is the standard
@@ -86,6 +86,16 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #:   tree is that headless print mode cannot prompt for a permission, so any tool
 #:   needing one is auto-denied; `antigravity_args` is explicit that `--mode plan`
 #:   is not the guarantee.
+#: * **grok** — the only absence here that is not about the mechanism. `--tools`
+#:   names an exact read-only set (`read_file,grep,list_dir`) and `--sandbox
+#:   strict` bounds READS to the cwd under Landlock — verified on 1.0.3, a read
+#:   outside the sandbox comes back "Permission denied" — which is the
+#:   working-directory boundary codex lacked and the property this bar asks for.
+#:   It is off the list because the SEAT is unproven, not the sandbox: #292
+#:   measured this CLI's argv, its tool injection and its refusals, and no live
+#:   review. A seat that has not yet returned findings should not also be the one
+#:   handed a checkout, so the tree is a separate change from the seat. Its
+#:   convention files are in the denylist above already, for when that happens.
 #:
 #: A seat NOT on this list keeps its empty sandbox even when the setting is on.
 #: That is deliberate and is not what #113 describes ("each seat's cwd is a
@@ -112,8 +122,14 @@ SEAT_READS_CODE = frozenset({"claude"})
 #: file it is looking at, so stripping only the top level leaves every nested one
 #: live — and a PR touching a subdirectory is exactly where a nested file would be
 #: added.
+#: CASE IS PART OF THE NAME on the filesystems this runs on, and one vendor makes
+#: that matter: grok's documented list is `Agents.md`, `Claude.md`, `CLAUDE.md`,
+#: `CLAUDE.local.md`, `AGENT.md`, `AGENTS.md` — six spellings of four files, and the
+#: two title-case ones are files nothing else here reads. A strip that matched only
+#: the shouted spellings would leave them live.
 CONVENTION_FILES = frozenset({
-    "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENT.md", "GEMINI.md",
+    "CLAUDE.md", "CLAUDE.local.md", "Claude.md", "AGENTS.md", "Agents.md",
+    "AGENT.md", "GEMINI.md",
     "copilot-instructions.md", ".windsurfrules", ".clinerules", ".cursorrules",
     ".aider.conf.yml", ".goosehints", ".junie",
 })
@@ -123,7 +139,7 @@ CONVENTION_FILES = frozenset({
 #: Removed entire rather than filtered: the interesting failure is a hook, and a
 #: hook is whatever file the vendor decides to run next release.
 CONVENTION_DIRS = frozenset({
-    ".claude", ".codex", ".gemini", ".antigravity", ".cursor", ".windsurf",
+    ".claude", ".codex", ".gemini", ".antigravity", ".grok", ".cursor", ".windsurf",
     ".aider", ".github/copilot", ".continue", ".roo", ".kilocode",
 })
 
@@ -2813,7 +2829,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: because either alone is wrong: the caller must have prepared a tree
         #: (`reviewer_code_access` on, the fetch and the strip both succeeded), AND
         #: this vendor must be able to express "read but do not execute" —
-        #: `SEAT_READS_CODE` records per vendor why three of the four cannot. A seat
+        #: `SEAT_READS_CODE` records per vendor why four of the five cannot. A seat
         #: that cannot read gains nothing from standing in the tree and still pays
         #: the instruction-file channel for it, so it keeps the empty sandbox.
         reads_code = code_tree is not None and cmd_name in SEAT_READS_CODE
