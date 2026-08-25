@@ -17,6 +17,195 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.20 — an existing backlog can be ordered, and an actionable issue can be picked up
+
+### the issue watcher can act now, and four yeses in four places have to agree first
+
+The watcher shipped in v2.86 reading the tracker and declining: it named an action for
+each open issue — `/investigate`, `/fix-issue`, or nothing — and then did nothing with
+it, because the rung above it did not exist yet. `qb-start` (#277) landed since. This is
+the wire between them, which is the half #63 explicitly left open.
+
+`issue_watch.py --start` hands each actionable issue to `qb-start --via watch`. Reaching
+a session takes four yeses, and no two of them are written down in the same place:
+
+| | says | lives in |
+|---|---|---|
+| the repo | may a loop choose work here at all? | `issue_pickup.enabled`, off by default |
+| the issue | is this one settled? | no held signal, and `epic.triage` confirming |
+| the run | may I act this time, and how much? | `--start`, off; `--start-max`, 1 |
+| **the machine** | does this box start sessions? | `qb-start`'s policy file |
+
+Be precise about what the last one buys, because it is easy to oversell. It lives in the
+user's config directory, ships absent, fails closed, and **nothing here reads
+repository-controlled content as policy** — no file in a checkout is consulted to decide
+whether a session may start. That is what stops the tracker becoming an authorisation
+channel, which is what #63 was filed about.
+
+It does not stop a party that already has arbitrary execution as this user. A `CLAUDE.md`
+is repository content read by an agent holding a shell, and that agent could write
+`spawn.json` itself, shadow `qb-start` on `PATH`, or run the agent binary directly. No
+same-UID permission gate closes that; `qb-start` makes the same argument about
+`XDG_CONFIG_HOME`. Moving the boundary means an authority outside this UID, which is a
+separate issue rather than something this change should pretend to have done.
+
+`HARNESS_UNATTENDED=1` refuses to spawn unless the repo has said loops may act unwatched.
+The plan's instruction for this feature was "start it with a human watching", and this is
+that sentence encoded rather than left as advice — reusing the switch a repo has already
+answered for unattended writes, because two switches for one question is how they come to
+disagree.
+
+#### `/investigate` became spawnable, which narrows what a trigger can do
+
+`qb-start`'s allowlist held `/fix-issue` and not `/investigate`. Under a watcher whose
+default rung on a close call is the read-only one, that had the ladder upside down: the
+cautious answer would have been the unstartable one, leaving "write code" and "do nothing"
+as the only two options a trigger could pick between.
+
+#### The audit got narrower rather than deleted
+
+`test_issue_watch.py` read every subprocess call off the module's syntax tree and failed
+unless the command was literally `gh`. That property could not survive a module that
+reaches a session, so it was replaced rather than relaxed: the permitted set is now `gh`
+and `qb_start_path()`, a resolver asserted to **take no argument** — one with a parameter
+is one a caller could aim while the audit still passed.
+
+The resolver audit also bounds what the function may *call* and forbids a subscript,
+because the literal check alone was not enough: `return os.environ[QB_START]` introduces
+no string constant and passed every assertion in the first version. That counter-example
+came from the codex review and is now a case the test rejects.
+
+Worth saying plainly what this audit is: a **drift guard**, not a security control. It
+catches the accident the file is one careless edit away from — a command assembled from a
+computed string, which it did catch during development — and it is not a boundary against
+a hostile committer, who would edit the test in the same commit.
+
+#### Two budgets, because one counts the wrong thing
+
+`--start-max` (default 1) counts **sessions started**; `--attempt-max` (default 5) counts
+**spawn requests**, started or refused. Neither is `qb-start`'s own cap, which bounds how
+many spawns may be *live* on a box.
+
+"Spawn requests" rather than "calls to `qb-start`", because a second codex pass caught that
+wording being false by exactly one: the once-per-run `--policy` probe is a question — it
+posts nothing, claims nothing, reads only a local file — so it sits outside the budget, and
+`--attempt-max 5` permits five requests plus the probe. A run whose budget is zero now
+returns before probing, so the one place "asks nothing" is claimed is the one place it is
+true; the test asserting it was strengthened from *no spawns* to *no calls at all*.
+
+The second exists because the first could not express the runaway it claimed to prevent.
+A refusal about a single issue — somebody else holds it — correctly does not stop the
+sweep and correctly starts nothing, so it spends none of `--start-max`. Thirty held issues
+therefore produced thirty invocations and thirty board posts while `--start-max 1` looked
+like it was holding: exactly the failure the flag's own docstring said it prevented. Found
+by a codex second opinion on this branch and measured before and after.
+
+A refusal about the **box** (not enabled, at cap, paced, full, no tmux) stops the sweep.
+One about a single **issue** does not. One about a **command** — this machine's policy does
+not allow `/fix-issue` — is now remembered rather than re-asked once per issue, since
+unlike a held issue there is no chance the next one answers differently.
+
+Both ceilings refuse a negative value at the CLI instead of absorbing it. `--start-max -1`
+used to be accepted and failed closed, reporting "this run's --start-max of -1 is spent" —
+safe, and still wrong: an operator who writes `-1` meaning *no limit* got the opposite
+without being told. `0` is a legitimate freeze and stays legal.
+
+Every actionable issue now carries what became of it — `started`, the refusal in full, or
+`not attempted` with the reason the sweep never reached it — on the report and in `--json`.
+"The watcher declined this" and "it ran out of room" are different answers to *why did
+nothing happen*, which is what #63's acceptance asks to be answerable after the fact.
+
+### the collision datum can be recovered from the forge, for a backlog that was already open
+
+#94 fixed the collision blind spot going forward and said plainly that it could not fix it
+backwards — every panel skipped before it left no row and no file list anywhere. That was true
+of *replaying those payloads*, which are gone. It was not true of the underlying fact: GitHub
+still knows which files every open pull request touches.
+
+Which mattered because of what #80 does with a gap. `suggested_order` is published only when
+**every** queued PR's evidence is attested, so one branch panelled before #94 turned the ranking
+off for the whole queue — and a repository with thirty open PRs is thirty chances to be that one.
+The field was null on this repo and on `lexray`, and would have stayed null on any backlog that
+predates the fix.
+
+`qb-backfill` reads a different source into the shape #94 already built for it.
+
+```
+qb-backfill                     dry run over this checkout's repo
+qb-backfill --repo owner/name   an explicit repo — any repo, not this one
+qb-backfill --apply             write the rows
+qb-backfill --pr 12 --pr 34     just these open PRs
+qb-backfill --json              the whole answer as a document
+```
+
+For each open pull request it reads the head commit and the changed-file list off the forge and
+records a run that says *these are the files, and nobody reviewed them*.
+
+#### It never claims a review
+
+The row carries `reviewed: false`, a `skip_reason` naming the tool, the issue and the commit it
+read, and nothing else that could be read as a verdict: no findings, no scorecards, no stop, no
+confidence. `GET /reviews` hides it by default, `/review/stats`, `/review/spend` and
+`/review/findings` exclude it under #94's `reviewed IS NOT FALSE` rule, and the plan's evidence
+still takes its findings from the newest run that actually reviewed. The one thing it changes is
+the one it exists for: the newest run per PR now holds a file list, so the ranking can attest it.
+
+The absences are load-bearing rather than tidy. A single finding beside `reviewed: false` makes
+the board drop the flag to NULL — "nobody said" — which is precisely the pre-#94 state these rows
+exist to leave.
+
+#### A short list is recorded as short
+
+`changed_files_total` is GitHub's own `changedFiles` and is never `len(files)`. Agreeing by
+construction is not evidence, and one derived from the other would delete the comparison
+`files_complete` is built on — turning every truncated list into an attested complete one.
+
+Four ways the stored list could be a prefix, and all four are reported: GitHub caps a file list at
+3,000; a paged read that dies partway is refused outright rather than recorded short; the board's
+own `changed_files_dropped` is read back off the write and believed over what was sent; and the
+head is re-read after the list, because the two `gh` calls are not one snapshot and a push between
+them would store commit B's paths under commit A's sha — which reads complete whenever the two
+commits happen to touch the same number of files. A prefix leaves the PR unattested and the run
+exits 1, which is the correct outcome: it keeps `suggested_order` null instead of ranking a branch
+by files it never listed.
+
+It reads the file list from `gh api --paginate .../pulls/N/files` rather than
+`gh pr view --json files`, which asks GraphQL for `files(first: 100)` and does not page: a
+322-file pull request comes back as 100 paths and exit 0.
+
+One hole is left open and reported rather than closed. GitHub counts a rename as one changed file,
+so a row holding only the destination path is `complete` while another PR editing the source path
+collides with it invisibly. `review_run_files` has one path column and no notion of an alias, so
+storing the old path too would make the count exceed GitHub's and fail #80's `counts_agree` — the
+PR would go unattested for having read more than anyone else does. The panel has the same hole.
+This counts renames per PR so an operator can see where the grain runs out; the grain is #453.
+
+#### A re-run on an unchanged PR moves nothing
+
+Four guards, for four different failures. Before writing at all, a PR whose newest run already
+carries a complete list at the head the forge reports now is left alone, so it never shadows a run
+that already answered — and one whose newest run is a backfill of this tool's own at that head is
+left alone too, because re-reading the same forge would store the same shortfall. The `run_key`
+carries the repo, the PR, the head and the run this one supersedes, so a second write of the same
+fact meets the board's unique index; that is the guard that holds when two agents run it at the
+same moment. And a write refused as a duplicate is not taken as done: the newest run is read again
+and the PR is only reported answered if it now attests.
+
+A PR that pushes gets a new head, the guards open, and the new commit is recorded. That is not a
+tidiness point: #80 attests a file list only against the commit the queue has the PR on, so a row
+recorded against a head the branch has left is worth less than nothing.
+
+#### And it refuses rather than guesses
+
+`--repo`, or the origin of the checkout it was run in, and if neither says then it stops rather
+than falling back to a default and reporting a confident nothing-to-do about a repository it
+never found (#414). Dry run by default; `--apply` is the only thing that writes; an argument it
+does not understand is refused rather than treated as consent.
+
+`GET /review/collisions` is untouched. It gained no predicate in #94 and gains none here — a
+backfilled run enters the same unconditional newest-run selection as any other, and is classified
+afterwards like any other.
+
 ## v3.19 — a claim writes its own plan item, and the collision datum stops being blind where it matters most
 
 ### the dash pane opens on the renderer you can actually click

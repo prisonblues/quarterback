@@ -1746,6 +1746,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.18** — what gates what is written down, and the line can propose an order.
 - **v3.19** — a claim writes its own plan item, and the collision datum stops being blind where it
   matters most.
+- **v3.20** — an existing backlog can be ordered, and an actionable issue can be picked up.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
