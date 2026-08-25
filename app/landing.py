@@ -82,6 +82,38 @@ def post_repos(refs: list[dict[str, Any]] | None) -> set[str]:
     return found
 
 
+def merge_announced(post: dict[str, Any]) -> tuple[str, int] | None:
+    """``(repo, pr number)`` this post announces as merged, or None.
+
+    **One qualified repository, or nothing.** A post that names two — an agent's
+    announcement carrying a commit ref in one repository and an issue ref in
+    another — cannot say which of them `Merge pull request #40` belongs to, and
+    synthesising the number against both would resolve an edge in a repository
+    the merge never touched. That is the precise failure the qualified-spelling
+    rule exists to prevent, arriving through a second door, so ambiguity is
+    dropped here exactly as a bare name is.
+    """
+    if post.get("type") != LANDING_POST_TYPE:
+        return None
+    match = MERGE_RE.match(str(post.get("summary") or "").strip())
+    if match is None:
+        return None
+    repos = post_repos(post.get("refs"))
+    if len(repos) != 1:
+        return None
+    return next(iter(repos)), int(match.group(1))
+
+
+def _earlier(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    """Whichever post is older, tolerating a missing timestamp."""
+    ats, bts = a.get("ts"), b.get("ts")
+    if ats is None:
+        return b
+    if bts is None:
+        return a
+    return a if ats <= bts else b
+
+
 def announced_merges(posts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """``{pr claim key: the earliest post that announced it}``.
 
@@ -89,18 +121,19 @@ def announced_merges(posts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     an agent that pulled it announces it again (board 4910 and 4920 are one
     merge) — and the fact being recorded is *when it landed*, not when the second
     witness got round to saying so.
+
+    It is compared rather than taken from arrival order, because the query that
+    feeds this is newest-first: "the first one I saw" is the *latest* duplicate,
+    which is the opposite of what this promises.
     """
     seen: dict[str, dict[str, Any]] = {}
     for post in posts:
-        if post.get("type") != LANDING_POST_TYPE:
+        found = merge_announced(post)
+        if found is None:
             continue
-        match = MERGE_RE.match(str(post.get("summary") or "").strip())
-        if match is None:
-            continue
-        for repo in post_repos(post.get("refs")):
-            key = f"{repo}{PR_SIGIL}{int(match.group(1))}"
-            if key not in seen:
-                seen[key] = post
+        repo, number = found
+        key = f"{repo}{PR_SIGIL}{number}"
+        seen[key] = post if key not in seen else _earlier(seen[key], post)
     return seen
 
 
@@ -114,28 +147,39 @@ def landings_since(posts: list[dict[str, Any]], repo: str, since: Any) -> int:
     word — the board can answer it from posts it already holds, with no GitHub
     client and no second store of a fact GitHub owns (#229).
 
+    **It counts merges, not announcements of merges.** Board 4910 and 4920 are
+    one landing said twice, by CI and by the agent that pulled it, and a reader
+    told two PRs had gone past it when one had would draw exactly the wrong
+    conclusion about how stale its branch is. So the pull request NUMBER is the
+    unit, and each one is counted once at the earliest moment anybody said it —
+    which also stops a merge that landed before this node entered the graph from
+    being counted because its second witness spoke afterwards.
+
     Repository matching is by basename here, and only here, because this is a
     **count** rather than a resolution: over-counting says "more has landed than
     you think, go and look", which is the safe direction, while the same laxity
     applied to :func:`announced_merges` would clear an edge that is still real.
     """
     want = repo_key(repo)
-    n = 0
+    first: dict[int, Any] = {}
     for post in posts:
         if post.get("type") != LANDING_POST_TYPE:
             continue
-        if not MERGE_RE.match(str(post.get("summary") or "").strip()):
-            continue
-        ts = post.get("ts")
-        if since is not None and ts is not None and ts <= since:
+        match = MERGE_RE.match(str(post.get("summary") or "").strip())
+        if match is None:
             continue
         names = {repo_key(r) for r in post_repos(post.get("refs"))}
         for ref in post.get("refs") or []:
             if isinstance(ref, dict) and ref.get("kind") == "repo":
                 names.add(repo_key(str(ref.get("value") or "")))
-        if want in names:
-            n += 1
-    return n
+        if want not in names:
+            continue
+        number, ts = int(match.group(1)), post.get("ts")
+        if number not in first or (ts is not None and first[number] is not None
+                                   and ts < first[number]):
+            first[number] = ts
+    return sum(1 for ts in first.values()
+               if since is None or ts is None or ts > since)
 
 
 def adjacency(edges: list[tuple[str, str]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:

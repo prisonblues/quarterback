@@ -576,3 +576,212 @@ def test_depth_is_none_for_every_member_of_a_cycle_and_a_number_below_it():
     d = depths(blockers)
     assert d["a"] is None and d["b"] is None and d["c"] is None
     assert d["d"] == 0 and d["e"] == 1
+
+
+# ======================================================================
+# Codex round 1 — seven findings, each with the test that would have gone red.
+# ======================================================================
+
+#: A browser read: authorised by `reader`, but carrying no identity anybody
+#: vouched for. `app.auth.reader`'s own docstring is the specification — a
+#: spoofed one "buys a caller a *read* of a board every enrolled agent can
+#: already read" — so it must buy exactly that and no committed write.
+UNPROVED_BROWSER = {"Remote-User": "somebody"}
+
+
+async def test_a_merge_post_naming_TWO_repositories_resolves_neither(client):
+    """An agent's announcement can carry a commit ref in one repository and an
+    issue ref in another. `Merge pull request #40` on such a post belongs to one
+    of them and the board cannot say which, so synthesising the number against
+    both would clear an edge in a repository the merge never touched — the
+    qualified-spelling rule defeated through a second door."""
+    a, b = "acme/ambig-one", "acme/ambig-two"
+    await must_gate(client, node(a, "issue", 41), node(a, "pr", 40))
+    await must_gate(client, node(b, "issue", 41), node(b, "pr", 40))
+    await publish(client, "Merge pull request #40 from acme/whichever",
+                  [{"kind": "commit", "repo": a, "value": "abc1234"},
+                   {"kind": "issue", "repo": b, "value": "7"}])
+    assert (await graph(client, a))["counts"]["edges"] == 1
+    assert (await graph(client, b))["counts"]["edges"] == 1
+
+
+async def test_one_merge_announced_twice_has_gone_past_you_ONCE(client):
+    """Board 4910 (ci) and 4920 (the agent that pulled it) are one landing said
+    twice. A branch told two PRs had gone past it when one had would draw the
+    wrong conclusion about how stale it is — and `passed_by` is the rot datum
+    #80's ranking reads."""
+    repo = "acme/dup-passed"
+    await must_gate(client, node(repo, "issue", 99), node(repo, "pr", 90))
+    ref = [{"kind": "commit", "repo": repo, "value": "sha265"}]
+    await publish(client, "Merge pull request #265 from acme/unrelated", ref)
+    await publish(client, "Merge pull request #265 from acme/unrelated", ref)
+    assert find(await graph(client, repo), f"{repo}#99")["passed_by"] == 1
+
+
+async def test_a_merge_first_announced_before_the_edge_never_counts_as_passing_it(client):
+    """The duplicate is the trap: a merge that landed before this node entered
+    the graph, re-announced afterwards by whoever pulled it, is still a merge
+    that happened first. Counting the later witness would inflate every
+    long-lived node's rot the moment somebody pulled."""
+    repo = "acme/dup-before"
+    ref = [{"kind": "commit", "repo": repo, "value": "shaold"}]
+    await publish(client, "Merge pull request #1 from acme/before", ref)
+    await must_gate(client, node(repo, "issue", 50), node(repo, "pr", 49))
+    await publish(client, "Merge pull request #1 from acme/before", ref)
+    assert find(await graph(client, repo), f"{repo}#50")["passed_by"] == 0
+
+
+async def test_re_asserting_an_edge_that_has_been_resolved_makes_a_NEW_one(client):
+    """The idempotent path renews a LIVE edge. Resolved is not live, and reviving
+    a row somebody cleared would silently undo their decision and lose the
+    history of it — so the assert falls through to a fresh edge."""
+    repo = "acme/reassert"
+    first = await must_gate(client, node(repo, "pr", 2), node(repo, "pr", 1))
+    await client.post("/landing/clear",
+                      json={"blocker": node(repo, "pr", 1), "resolution": "dropped"},
+                      headers=LAPTOP)
+    again = await must_gate(client, node(repo, "pr", 2), node(repo, "pr", 1))
+    assert again["created"] is True and again["edge_id"] != first["edge_id"]
+    assert (await graph(client, repo))["counts"]["edges"] == 1
+
+
+async def test_the_sweep_never_overwrites_a_decision_somebody_else_made(client):
+    """`dropped` says a human decided the constraint was mistaken; `landed` says
+    the work happened. A sweep that wrote over a resolved row would turn the
+    first into the second — destroying the exact distinction the vocabulary
+    exists for, and doing it silently, in a GET."""
+    repo = "acme/no-clobber"
+    await must_gate(client, node(repo, "issue", 2), node(repo, "pr", 1))
+    await client.post("/landing/clear",
+                      json={"blocker": node(repo, "pr", 1), "resolution": "dropped"},
+                      headers=LAPTOP)
+    await publish(client, "Merge pull request #1 from acme/x",
+                  [{"kind": "commit", "repo": repo, "value": "abc9999"}])
+    await graph(client, repo)
+
+    async with async_session() as s:
+        from sqlalchemy import select
+
+        from app.models.landing import LandingEdge
+        edge = await s.scalar(select(LandingEdge).where(
+            LandingEdge.blocker_key == f"{repo}!1"))
+        assert edge.resolution == "dropped" and edge.resolved_by != "board:post/0"
+        assert not str(edge.resolved_by).startswith("board:post/")
+
+
+async def test_a_watch_stood_down_on_purpose_is_never_re_marked_as_lapsed(client):
+    """"The watcher finished waiting" and "the watcher vanished" are the two facts
+    the `lapsed` column exists to keep apart, and the sweep runs after both."""
+    repo = "acme/no-clobber-watch"
+    sess = "sess-noclobber-294"
+    lease = await client.post("/lease", json={"session": sess, "device": "laptop",
+                                              "ttl": 300}, headers=LAPTOP)
+    await client.post("/landing/mind", json={"node": node(repo, "pr", 3),
+                                             "session": sess}, headers=LAPTOP)
+    await client.post("/landing/unmind", json={"node": node(repo, "pr", 3)},
+                      headers=LAPTOP)
+    await client.post("/lease/release", json={"lease_id": lease.json()["lease_id"]},
+                      headers=LAPTOP)
+    await graph(client, repo)
+
+    async with async_session() as s:
+        from sqlalchemy import select
+
+        from app.models.landing import LandingWatch
+        watch = await s.scalar(select(LandingWatch).where(
+            LandingWatch.node_key == f"{repo}!3"))
+        assert watch.lapsed is False
+
+
+async def test_a_browser_read_sees_the_swept_graph_and_writes_nothing(client):
+    """`reader` lets an unproved `Remote-User` look, and its docstring says that
+    is all a spoofed one may buy. So the answer is identical either way — the
+    finished rows are filtered out of every view — and only an authenticated
+    caller writes the sweep down."""
+    repo = "acme/browser-sweep"
+    await must_gate(client, node(repo, "issue", 2), node(repo, "pr", 1))
+    await publish(client, "Merge pull request #1 from acme/x",
+                  [{"kind": "commit", "repo": repo, "value": "abc4321"}])
+
+    seen = await graph(client, repo, headers=UNPROVED_BROWSER)
+    # Same answer: the edge is over, so it is not in the graph.
+    assert seen["counts"]["edges"] == 0
+    assert seen["swept"] == {"edges": 0, "watches": 0, "persisted": False, "over": 1}
+
+    async with async_session() as s:
+        from sqlalchemy import select
+
+        from app.models.landing import LandingEdge
+        edge = await s.scalar(select(LandingEdge).where(
+            LandingEdge.blocker_key == f"{repo}!1"))
+        assert edge.resolved_at is None, "a browser read committed a write"
+
+    agent = await graph(client, repo, headers=LAPTOP)
+    assert agent["swept"] == {"edges": 1, "watches": 0, "persisted": True, "over": 1}
+
+
+async def test_a_chain_that_leaves_the_repository_comes_back_whole(client):
+    """The finding that mattered most. `?repo=` used to return only edges with an
+    end in that repo, so `board!290 → fleet#23 → fleet!31` truncated at the
+    boundary: `fleet#23` came back with no blockers — `landable: true, depth: 0`
+    — when something gated it, and `board!290`'s depth was 1 instead of 2. A
+    confident wrong answer about the cross-repository case is the one failure
+    this primitive must not have."""
+    board, fleet = "acme/closure-board", "acme/closure-fleet"
+    await must_gate(client, node(board, "pr", 290), node(fleet, "issue", 23))
+    await must_gate(client, node(fleet, "issue", 23), node(fleet, "pr", 31))
+
+    g = await graph(client, board)
+    far = find(g, f"{fleet}#23")
+    assert far["landable"] is False
+    assert [b["key"] for b in far["blocked_by"]] == [f"{fleet}!31"]
+    assert find(g, f"{board}!290")["depth"] == 2
+    assert find(g, f"{fleet}!31")["depth"] == 0
+
+
+async def test_the_answer_says_which_nodes_you_asked_for_and_which_it_dragged_in(client):
+    """Context is not your list. A renderer needs to tell "this is yours" from
+    "this is why yours is stuck", and inferring it by comparing repository names
+    is wrong the moment a chain leaves your repo and comes back."""
+    board, fleet = "acme/scope-board", "acme/scope-fleet"
+    await must_gate(client, node(board, "pr", 1), node(fleet, "issue", 2))
+    g = await graph(client, board)
+    assert find(g, f"{board}!1")["in_scope"] is True
+    assert find(g, f"{fleet}#2")["in_scope"] is False
+
+
+async def test_asking_about_one_node_still_returns_the_chain_below_it(client):
+    repo = "acme/node-chain"
+    await must_gate(client, node(repo, "pr", 3), node(repo, "pr", 2))
+    await must_gate(client, node(repo, "pr", 2), node(repo, "pr", 1))
+    r = await client.get("/landing", params={"node": f"{repo}!3"}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    g = r.json()
+    assert find(g, f"{repo}!3")["depth"] == 2
+    assert {n["key"] for n in g["nodes"]} == {f"{repo}!1", f"{repo}!2", f"{repo}!3"}
+
+
+def test_the_earliest_announcement_wins_even_though_the_query_is_newest_first():
+    """`_wire` orders newest-first, so "the first one I saw" is the LATEST
+    duplicate — the opposite of the evidence this promises to record."""
+    refs = [{"kind": "commit", "repo": "prisonblues/quarterback", "value": "abc"}]
+    early = {"id": 4910, "type": "published", "refs": refs,
+             "ts": datetime(2026, 8, 24, 10, 0, tzinfo=UTC),
+             "summary": "Merge pull request #268 from prisonblues/feat/issue-255"}
+    late = {"id": 4920, "type": "published", "refs": refs,
+            "ts": datetime(2026, 8, 24, 11, 0, tzinfo=UTC),
+            "summary": "Merge pull request #268 from prisonblues/feat/issue-255"}
+    landed = announced_merges([late, early])   # newest-first, as the query returns
+    assert landed["prisonblues/quarterback!268"]["id"] == 4910
+
+
+def test_a_post_naming_two_repositories_announces_neither():
+    from app.landing import merge_announced
+    assert merge_announced({
+        "id": 1, "type": "published", "summary": "Merge pull request #40 from acme/x",
+        "refs": [{"kind": "commit", "repo": "acme/one", "value": "a"},
+                 {"kind": "issue", "repo": "acme/two", "value": "7"}]}) is None
+    assert merge_announced({
+        "id": 2, "type": "published", "summary": "Merge pull request #40 from acme/x",
+        "refs": [{"kind": "commit", "repo": "acme/one", "value": "a"}]}) == (
+            "acme/one", 40)

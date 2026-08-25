@@ -123,17 +123,18 @@ needed a line of this file to be different.
 from __future__ import annotations
 
 import re
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, and_, func, or_, select
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import clean_session, is_unique_violation
-from app.auth import identify, reader
+from app.auth import identify, optional_identity, reader
 from app.claimkey import (
     REPO_NAME_RE,
     REPO_SHAPE,
@@ -173,6 +174,14 @@ MAX_WATCH_TTL = 30 * 24 * 3600
 #: and this stops a graph somebody left lying around for a month from turning
 #: every board read into a full table scan.
 MAX_WIRE_POSTS = 2000
+
+#: The most live edges or live watches one read will consider. The live set is
+#: bounded by design — an edge exists only while something is actually waiting,
+#: and one landing clears a batch of them — so this is not expected to bind. It
+#: exists because the read is a graph closure rather than a row filter, and the
+#: honest failure for a graph that has grown past what a closure can carry is to
+#: say `truncated` rather than to return a page and let it read as the whole.
+MAX_LIVE_ROWS = 5000
 
 #: What a node may be. Closed, and adding to it is a code change for the reason
 #: :data:`app.claimkey.REF_KINDS` is closed: every kind needs a key shape that
@@ -306,44 +315,55 @@ def _watch_view(w: LandingWatch) -> dict:
     }
 
 
-def _repo_where(stmt: Select, columns: tuple, repo: str) -> Select:
-    """Narrow to one repository, however the caller spelled it.
+def _repo_match(repo: str):
+    """A predicate over a stored ``owner/name``, however the caller spelled it.
 
     The two-tier rule ``GET /worktrees`` settled on: ``owner/name`` is folded and
     compared exactly, a **bare** name is compared by basename, and anything that
-    is neither is a 422 rather than an empty list — an empty list reads as
+    is neither is a 422 rather than an empty answer — an empty answer reads as
     "nothing gates anything here" when it means "I could not tell what you asked
     about", which is the false-clean #326 is about.
 
-    The columns are OR'd, and for an edge that is both of them. A scoped read has
-    to show an edge with only its FAR end in this repository, or ``quarterback``
-    would never learn that ``nix-fleet#40``'s step 0 is sitting behind #290 —
-    which is the exact blindness #294 opens with.
+    A predicate rather than a SQL ``WHERE`` because the scope of this read is a
+    graph closure rather than a row filter — see :func:`read_graph`. One
+    implementation either way, so the two tiers cannot come to disagree.
     """
     try:
         want = canonical_repo(repo)
-        return stmt.where(or_(*(c == want for c in columns)))
+        return lambda stored: stored == want
     except BadRef:
         pass
     asked = repo.strip()
     if not REPO_NAME_RE.match(asked):
         raise HTTPException(422, detail={"error": REPO_SHAPE, "repo": repo})
     bare = repo_key(asked)
-    return stmt.where(or_(*(func.substring(c, "[^/]*$") == bare for c in columns)))
+    return lambda stored: repo_key(stored) == bare
 
 
-async def _live_edges(session: AsyncSession, repo: str | None) -> list[LandingEdge]:
-    stmt = select(LandingEdge).where(LandingEdge.resolved_at.is_(None))
-    if repo is not None:
-        stmt = _repo_where(stmt, (LandingEdge.blocked_repo, LandingEdge.blocker_repo), repo)
-    return list(await session.scalars(stmt.order_by(LandingEdge.created_at, LandingEdge.id)))
+async def _live_edges(session: AsyncSession) -> list[LandingEdge]:
+    """Every unresolved edge. Whole, and the scope is applied above this.
+
+    A row filter cannot answer a scoped question here. ``?repo=quarterback`` has
+    to return the chain ``quarterback!290 → nix-fleet#23 → nix-fleet!31``, not
+    its first hop — stopping at the boundary would report ``nix-fleet#23`` as
+    landable when three things gate it, which is a confident wrong answer about
+    exactly the cross-repository case this primitive exists for.
+
+    Reading the live set whole is what :func:`app.api.plan.read_plan` does with
+    the open items, for the same reason: the live set is bounded by design (an
+    edge exists only while something is actually waiting, and every landing
+    clears a batch) while *history* is what grows, and history is excluded by
+    ``resolved_at IS NULL`` at the index.
+    """
+    return list(await session.scalars(
+        select(LandingEdge).where(LandingEdge.resolved_at.is_(None))
+        .order_by(LandingEdge.created_at, LandingEdge.id).limit(MAX_LIVE_ROWS + 1)))
 
 
-async def _live_watches(session: AsyncSession, repo: str | None) -> list[LandingWatch]:
-    stmt = select(LandingWatch).where(LandingWatch.released_at.is_(None))
-    if repo is not None:
-        stmt = _repo_where(stmt, (LandingWatch.node_repo,), repo)
-    return list(await session.scalars(stmt.order_by(LandingWatch.created_at, LandingWatch.id)))
+async def _live_watches(session: AsyncSession) -> list[LandingWatch]:
+    return list(await session.scalars(
+        select(LandingWatch).where(LandingWatch.released_at.is_(None))
+        .order_by(LandingWatch.created_at, LandingWatch.id).limit(MAX_LIVE_ROWS + 1)))
 
 
 async def _wire(session: AsyncSession, since: datetime | None) -> list[dict[str, Any]]:
@@ -386,48 +406,58 @@ async def _presence(session: AsyncSession, keys: set[str],
     return ever, live
 
 
-async def _sweep(session: AsyncSession, edges: list[LandingEdge],
-                 watches: list[LandingWatch], wire: list[dict[str, Any]],
-                 now: datetime) -> dict[str, int]:
-    """Clear what the board can already see is over. Passive, and it commits.
+async def _over(session: AsyncSession, edges: list[LandingEdge],
+                watches: list[LandingWatch], wire: list[dict[str, Any]],
+                now: datetime) -> tuple[dict[uuid.UUID, int], set[uuid.UUID]]:
+    """What the board can already see is over — decided, not yet written.
 
-    **A read that writes**, deliberately, and it is the same passive-expiry
-    design ``ResourceLease`` uses rather than a new one: there is no reaper
-    anywhere in this codebase and adding one for this would be a second
-    implementation of "notice that a thing has ended". Sweeping on the write
-    paths alone was the alternative and it is worse — a fleet that only *reads*
-    the graph (which is most of what a graph is for) would never see an edge
-    close, and the store would be reliably wrong for the majority of its callers.
-
-    Two sweeps, and they are different facts:
-
-    * a **watch** whose TTL ran out, or whose session has stopped being present.
-      ``lapsed=True``, because "the watcher finished waiting" and "the watcher
-      vanished" must stay distinguishable — that distinction is what makes
-      *blocked and unattended* readable at all.
-    * an **edge** whose blocker has been announced as merged, with the post that
-      said so recorded as the resolver.
+    ``({edge id: the post that landed it}, {watch ids that have lapsed})``. Pure
+    with respect to the graph: nothing the caller sent reaches this, which is
+    what makes it safe to run for a reader who may not write (see
+    :func:`read_graph`).
     """
-    swept = {"edges": 0, "watches": 0}
+    landed = announced_merges(wire)
+    resolved = {e.id: landed[e.blocker_key]["id"] for e in edges
+                if e.blocker_key in landed}
 
     ever, live = await _presence(session, {w.session for w in watches if w.session}, now)
-    for watch in watches:
-        vanished = (watch.session is not None and watch.session in ever
-                    and watch.session not in live)
-        if watch.expires_at <= now or vanished:
-            watch.released_at = now
-            watch.lapsed = True
-            swept["watches"] += 1
+    lapsed = {w.id for w in watches
+              if w.expires_at <= now
+              or (w.session is not None and w.session in ever and w.session not in live)}
+    return resolved, lapsed
 
-    landed = announced_merges(wire)
-    for edge in edges:
-        post = landed.get(edge.blocker_key)
-        if post is not None:
-            edge.resolved_at = now
-            edge.resolved_by = f"board:post/{post['id']}"
-            edge.resolution = "landed"
-            swept["edges"] += 1
 
+async def _sweep(session: AsyncSession, resolved: dict[uuid.UUID, int],
+                 lapsed: set[uuid.UUID], now: datetime) -> dict[str, int]:
+    """Write down what :func:`_over` decided. Passive, guarded, and it commits.
+
+    **Every write is conditioned on the row still being live**, and that is not
+    belt-and-braces. The rows were read some milliseconds ago; between then and
+    now a peer may have cleared an edge as ``dropped`` or stood a watch down
+    deliberately. An unconditional ORM assignment would overwrite both — turning
+    "somebody decided this constraint was mistaken" into "it landed", and "the
+    watcher finished waiting" into "the watcher vanished". Those are precisely
+    the two distinctions this table exists to keep, so the sweep must lose that
+    race rather than win it, and a guarded UPDATE is how it does.
+
+    Statement-level updates rather than attribute assignment for the same reason:
+    an ORM instance mutated here would flush whatever it holds, guard or no
+    guard.
+    """
+    swept = {"edges": 0, "watches": 0}
+    for edge_id, post_id in resolved.items():
+        result = await session.execute(
+            update(LandingEdge)
+            .where(LandingEdge.id == edge_id, LandingEdge.resolved_at.is_(None))
+            .values(resolved_at=now, resolved_by=f"board:post/{post_id}",
+                    resolution="landed"))
+        swept["edges"] += result.rowcount or 0
+    for watch_id in lapsed:
+        result = await session.execute(
+            update(LandingWatch)
+            .where(LandingWatch.id == watch_id, LandingWatch.released_at.is_(None))
+            .values(released_at=now, lapsed=True))
+        swept["watches"] += result.rowcount or 0
     if swept["edges"] or swept["watches"]:
         await session.commit()
     return swept
@@ -484,38 +514,54 @@ async def assert_gate(
         })
 
     now = _utcnow()
-    existing = await session.scalar(
-        select(LandingEdge).where(LandingEdge.blocked_key == blocked_key,
-                                  LandingEdge.blocker_key == blocker_key,
-                                  LandingEdge.resolved_at.is_(None)))
-    if existing is not None:
-        if body.note is not None:
-            existing.note = body.note
-        existing.updated_at = now
-        await session.commit()
-        return {**_edge_row(existing), "created": False, "advice": _advice(existing)}
-
-    edge = LandingEdge(
-        blocked_key=blocked_key, blocked_repo=blocked_repo,
-        blocker_key=blocker_key, blocker_repo=blocker_repo,
-        note=body.note, asserted_by=author, created_at=now, updated_at=now)
-    session.add(edge)
-    try:
-        await session.commit()
-    except IntegrityError as e:
-        # Lost the race to a co-tenant asserting the same fact. Not an error: the
-        # edge exists, which is all the caller wanted.
-        await session.rollback()
-        if not is_unique_violation(e):
-            raise
-        again = await session.scalar(
+    # Two ways to lose a race here and they need different answers, so the whole
+    # thing loops rather than branching once. Renewing an edge a peer resolves in
+    # the same instant must NOT report a live edge that is not there — the update
+    # is guarded on `resolved_at IS NULL` and a miss falls through to insert a
+    # fresh one, which is what the caller actually asked for. Inserting one a
+    # peer creates first is not an error at all: the fact exists, which is all
+    # anybody wanted.
+    for _ in range(3):
+        existing = await session.scalar(
             select(LandingEdge).where(LandingEdge.blocked_key == blocked_key,
                                       LandingEdge.blocker_key == blocker_key,
                                       LandingEdge.resolved_at.is_(None)))
-        if again is None:
-            raise
-        return {**_edge_row(again), "created": False, "advice": _advice(again)}
-    return {**_edge_row(edge), "created": True, "advice": _advice(edge)}
+        if existing is not None:
+            values = {"updated_at": now}
+            if body.note is not None:
+                values["note"] = body.note
+            result = await session.execute(
+                update(LandingEdge)
+                .where(LandingEdge.id == existing.id, LandingEdge.resolved_at.is_(None))
+                .values(**values))
+            await session.commit()
+            if result.rowcount:
+                refreshed = await session.get(LandingEdge, existing.id)
+                return {**_edge_row(refreshed), "created": False,
+                        "advice": _advice(refreshed)}
+            continue  # it resolved underneath us; assert it again
+
+        edge = LandingEdge(
+            blocked_key=blocked_key, blocked_repo=blocked_repo,
+            blocker_key=blocker_key, blocker_repo=blocker_repo,
+            note=body.note, asserted_by=author, created_at=now, updated_at=now)
+        session.add(edge)
+        try:
+            await session.commit()
+        except IntegrityError as e:
+            await session.rollback()
+            if not is_unique_violation(e):
+                raise
+            continue  # a peer got there first; go and read theirs
+        return {**_edge_row(edge), "created": True, "advice": _advice(edge)}
+
+    # Three rounds of losing to a peer that is both creating and resolving this
+    # exact edge. Saying so beats a fourth attempt or a fabricated success.
+    raise HTTPException(409, detail={
+        "error": "this edge is being created and resolved at the same time",
+        "blocked": blocked_key, "blocker": blocker_key,
+        "hint": "a peer is contending on it right now — read `GET /landing` and retry",
+    })
 
 
 def _edge_row(edge: LandingEdge) -> dict:
@@ -693,16 +739,45 @@ async def unmind_node(
             **_watch_view(watch)}
 
 
+def _reachable(seeds: set[str], blockers: dict[str, set[str]],
+               blocks: dict[str, set[str]]) -> set[str]:
+    """Every node connected to a seed by live edges, in either direction.
+
+    **The closure, not the first hop**, and this is the correctness of a scoped
+    read rather than a nicety. ``?repo=quarterback`` over
+    ``quarterback!290 → nix-fleet#23 → nix-fleet!31`` truncated at the boundary
+    would report ``nix-fleet#23`` with no blockers — ``landable: true``,
+    ``depth: 0`` — when three things gate it, and would take a cycle that leaves
+    the repository and comes back for an ordinary chain. A confident wrong answer
+    about the cross-repository case is the one failure this primitive must not
+    have, since crossing repositories is the whole reason it exists.
+
+    Both directions, because both halves are load-bearing: downstream tells you
+    what is still in your way, upstream tells you what landing this would free.
+    """
+    reached, pending = set(seeds), list(seeds)
+    while pending:
+        key = pending.pop()
+        for nxt in blockers.get(key, ()) | blocks.get(key, ()):
+            if nxt not in reached:
+                reached.add(nxt)
+                pending.append(nxt)
+    return reached
+
+
 @router.get("/landing")
 async def read_graph(
     repo: str | None = Query(default=None,
-                             description="`owner/name`, or the bare name. An edge with "
-                                         "EITHER end in this repo is in scope — that is "
-                                         "the point of a cross-repo graph."),
+                             description="`owner/name`, or the bare name. Scope is the "
+                                         "CLOSURE from this repo's nodes, so a chain that "
+                                         "leaves it comes back whole — that is the point "
+                                         "of a cross-repo graph."),
     node: str | None = Query(default=None,
-                             description="one node's key, e.g. `prisonblues/quarterback!290`"),
+                             description="one node's key, e.g. `prisonblues/quarterback!290`, "
+                                         "and everything its chain reaches"),
     session: AsyncSession = Depends(get_session),
-    _reader: str = Depends(reader),
+    reader_name: str = Depends(reader),
+    bearer: str | None = Depends(optional_identity),
 ) -> dict:
     """The graph: every node with a live edge or a live minder, and what it is waiting on.
 
@@ -715,34 +790,71 @@ async def read_graph(
     suggested merge order is #80's half of the problem and it consumes this rather
     than living in it.
 
-    The read sweeps first — see :func:`_sweep` — so an edge whose blocker was
-    announced on the wire is already gone by the time you read the answer, and a
-    watch whose holder stopped being present already reads as unminded.
+    ## Scope is a closure, and `in_scope` says which nodes you asked for
+
+    ``?repo=`` seeds on that repository's nodes and then follows the chain
+    wherever it goes, so a blocker two hops away in another repository is in the
+    answer with its own blockers intact. Nodes reached that way carry
+    ``in_scope: false`` — they are context rather than your list, and a renderer
+    may grey them — but their `depth` and `landable` are computed from the whole
+    chain, because a number computed from half a chain is worse than none.
+
+    ## An edge that is over is filtered for everyone and written down by agents
+
+    Whether the caller may WRITE decides only whether the sweep is *persisted*,
+    never what the answer says. :func:`_over` is pure with respect to the request
+    — nothing the caller sent reaches it — so a browser gets the same graph, with
+    the finished rows filtered out of its view and left in the table for the next
+    agent read to clear.
+
+    That split is :func:`app.auth.reader`'s own rule, honoured rather than
+    quietly widened. A ``Remote-User`` here is asserted by the edge and, as that
+    docstring says, a spoofed one "buys a caller a *read* of a board every
+    enrolled agent can already read" — so it must not also buy a committed write.
+    Persisting on the bearer path alone costs nothing in freshness: every
+    ``landing_graph`` call an agent makes is bearer-authenticated, and they are
+    the overwhelming majority of reads.
     """
     now = _utcnow()
-    if repo is not None:
-        # Validate the spelling once, here, so a bad one is a 422 rather than an
-        # empty graph — see `_repo_where`.
-        _repo_where(select(LandingEdge), (LandingEdge.blocked_repo,), repo)
+    match = _repo_match(repo) if repo is not None else None
+    wanted = node.strip().lower() if node else None
 
-    edges = await _live_edges(session, repo)
-    watches = await _live_watches(session, repo)
-    oldest = min([e.created_at for e in edges] or [now]) if edges else None
+    edges = await _live_edges(session)
+    watches = await _live_watches(session)
+    truncated = len(edges) > MAX_LIVE_ROWS or len(watches) > MAX_LIVE_ROWS
+    edges, watches = edges[:MAX_LIVE_ROWS], watches[:MAX_LIVE_ROWS]
+
+    oldest = min([e.created_at for e in edges], default=None)
     wire = await _wire(session, oldest)
-    swept = await _sweep(session, edges, watches, wire, now)
-    if swept["edges"] or swept["watches"]:
-        edges = await _live_edges(session, repo)
-        watches = await _live_watches(session, repo)
 
-    if node is not None:
-        wanted = node.strip().lower()
-        edges = [e for e in edges if wanted in (e.blocked_key, e.blocker_key)]
-        watches = [w for w in watches if w.node_key == wanted]
+    resolved, lapsed = await _over(session, edges, watches, wire, now)
+    # Filtered for every caller; written down only by one that may write.
+    edges = [e for e in edges if e.id not in resolved]
+    watches = [w for w in watches if w.id not in lapsed]
+    if bearer is not None and (resolved or lapsed):
+        swept = await _sweep(session, resolved, lapsed, now)
+    else:
+        swept = {"edges": 0, "watches": 0}
+    swept["persisted"] = bearer is not None
+    swept["over"] = len(resolved) + len(lapsed)
 
     blockers, blocks = adjacency([(e.blocked_key, e.blocker_key) for e in edges])
     for watch in watches:
         blockers.setdefault(watch.node_key, set())
         blocks.setdefault(watch.node_key, set())
+
+    if match is None and wanted is None:
+        seeds = set(blockers)
+    else:
+        seeds = {k for k in blockers
+                 if (wanted is not None and k == wanted)
+                 or (match is not None and match(_parse_key(k)["repo"]))}
+    scope = _reachable(seeds, blockers, blocks) if (match or wanted) else set(blockers)
+    blockers = {k: v & scope for k, v in blockers.items() if k in scope}
+    blocks = {k: v & scope for k, v in blocks.items() if k in scope}
+    edges = [e for e in edges
+             if e.blocked_key in scope and e.blocker_key in scope]
+    watches = [w for w in watches if w.node_key in scope]
 
     depth = depths(blockers)
     loops = cycles(blockers)
@@ -778,6 +890,10 @@ async def read_graph(
             "landable": not blockers.get(key),
             "depth": depth.get(key),
             "in_cycle": key in stuck,
+            # What you asked for, versus what its chain dragged in. Said out loud
+            # rather than left to be worked out by comparing repos, because a
+            # node reached through a cycle can be in your repo AND not a seed.
+            "in_scope": key in seeds if (match or wanted) else True,
             "minders": [_watch_view(w) for w in mine],
             "minded": bool(mine),
             "since": first_seen[key].isoformat() if key in first_seen else None,
@@ -793,12 +909,16 @@ async def read_graph(
         "repo": repo,
         "node": node,
         "generated": now.isoformat(),
+        "read_by": reader_name,
         "nodes": nodes,
         # Named rather than refused — see `assert_gate`. A cycle is a real
         # deadlock somebody has to break, and `depth` is null for its members
         # because there is no honest distance to publish.
         "cycles": loops,
         "swept": swept,
+        # A page of a graph is a different graph, so a reader is told rather than
+        # left to infer it from a count that looks complete.
+        "truncated": truncated,
         "counts": {
             "nodes": len(nodes),
             "edges": len(edges),

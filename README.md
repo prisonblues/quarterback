@@ -405,17 +405,25 @@ GET   /plan/view         (browser view — the plan, and where a human reorders 
 # the landing graph — what gates what, across repos, and who is minding it (#294)
 GET   /landing           ?repo=&node=
                           -> {nodes:[{key, repo, kind, value, blocked_by:[…], blocks:[…],
-                              landable, depth, in_cycle, minders:[…], minded, since,
-                              passed_by, claim}], cycles, swept, counts}
+                              landable, depth, in_cycle, in_scope, minders:[…], minded,
+                              since, passed_by, claim}], cycles, swept, truncated, counts}
                           a node IS a claim key (`prisonblues/quarterback!290`), so the
                           repository is inside the identity and an edge crosses repos
-                          without any column being about that. ?repo= is in scope for an
-                          edge with EITHER end there — the whole point of a cross-repo
-                          graph. `depth` is landings until landable (0 = go now, null
-                          inside a cycle); `passed_by` is merges that have landed on this
-                          repo since the graph first heard about the node, which is what
-                          an unsequenced graph costs, counted. It DECIDES nothing: no
-                          order, no recommendation, no `next` — #80 consumes this
+                          without any column being about that. ?repo= seeds on that repo's
+                          nodes and returns the CLOSURE — a chain that leaves the repo
+                          comes back whole, because truncating it at the boundary reports
+                          the far node as landable when three things gate it. Nodes the
+                          chain dragged in carry `in_scope: false`. `depth` is landings
+                          until landable (0 = go now, null in or behind a cycle);
+                          `passed_by` is merges landed on this repo since the graph first
+                          heard about the node — counted per PR, so one merge announced
+                          by both CI and an agent is one. It DECIDES nothing: no order,
+                          no recommendation, no `next` — #80 consumes this.
+                          The read SWEEPS: it filters edges whose blocker has been
+                          announced merged and watches whose holder stopped being
+                          present, for every caller, and PERSISTS that only for an
+                          authenticated one — `reader` lets an unproved Remote-User look,
+                          and a spoofed one must not also buy a committed write
 POST  /landing/gate      { blocked:{kind,value,repo}, blocker:{…}, note? } -> 201
                           idempotent over live rows. A cycle is recorded and reported,
                           never refused: a real deadlock a store will not hold goes back
