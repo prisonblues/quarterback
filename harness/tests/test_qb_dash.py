@@ -2268,3 +2268,116 @@ def test_a_refusal_is_reported_in_qb_starts_own_words():
 def test_an_answer_with_no_words_at_all_still_names_the_exit():
     module = _load_app()
     assert "9" in module.spawn_answer("fix-issue-7", _done(9, "not json", ""))
+
+
+# ---- the dials, in the clickable renderer (#477) ------------------------------
+#
+# The panel this dashboard did not have, and the one nothing anywhere had: a dial
+# was set from an endpoint and read back by one function in `panel_seats.py`, so
+# the values governing every round on the fleet were invisible on every screen a
+# person or an agent actually looks at.
+#
+# What these pin is the half the panel CANNOT do. `POST /dials` takes
+# `app.auth.human` and this program holds the machine bearer token every agent on
+# the box holds, so the ✎ is a door and not a control — and a door nobody can find
+# is the same as no door (#443).
+
+DIALS = {
+    "asked": True,
+    "error": None,
+    "shadowed": [{"dial": "tempo", "value": "eager", "repo": None, "scope": "fleet",
+                  "reason": "fleet default", "set_by": "human/rich",
+                  "set_at": "2026-08-25T10:00:00+00:00", "expires_at": None}],
+    "dials": [
+        {"dial": "tempo", "value": "held", "repo": "prisonblues/quarterback",
+         "scope": "repo", "reason": "this repo is mid-release", "set_by": "human/rich",
+         "set_at": "2026-08-25T10:00:00+00:00", "expires_at": None},
+        {"dial": "review_panel.max_rounds", "value": 2, "repo": None, "scope": "fleet",
+         "reason": "the window is at 94%", "set_by": "human/rich",
+         "set_at": "2026-08-25T10:00:00+00:00",
+         "expires_at": "2099-01-01T00:00:00+00:00"},
+    ],
+}
+
+
+async def _drive_dials(offset=None, key=None):
+    """Render the dials, then click at `offset` or press `key`."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    opened: list = []
+    app.open_url = lambda url: opened.append(url)
+
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_dials(DIALS)
+        await pilot.pause()
+        table = app.query_one("#dials")
+        rows = [_cells(table, i) for i in range(table.row_count)]
+        title = str(app.query_one("#t_dials").content)
+        bar = str(app.query_one("#limits").content)
+        if offset is not None:
+            await _click_row(pilot, table, offset)
+            await pilot.pause(0.3)
+        if key is not None:
+            await pilot.press(key)
+            await pilot.pause(0.3)
+        return rows, title, opened, app.detail_text, bar
+
+
+def test_the_dials_panel_says_which_layer_answered_and_for_how_long():
+    """Three cells and each is a distinct fact: the value, the layer it came from,
+    and whether anything will ever take it off. A repo dial beats a fleet dial, so
+    the overridden one is counted in the title rather than drawn as in force."""
+    rows, title, _, _, _ = asyncio.run(_drive_dials())
+    assert rows[0][2] == "tempo" and rows[0][3] == "held", rows[0]
+    assert rows[0][4] == "quarterback", rows[0]
+    # The two expiry states, side by side, not rendering alike (#244's rule).
+    assert rows[0][5] == "no end", rows[0]
+    assert rows[1][5] not in ("no end", ""), rows[1]
+    assert "2 in force" in title and "1 overridden" in title, title
+
+
+def test_the_dials_panel_always_offers_the_door():
+    """The last row is the page a person turns a dial on, whether or not there is
+    a dial above it — the reader who most needs it is the one who has just found
+    out that nothing is set."""
+    rows, _, _, _, _ = asyncio.run(_drive_dials())
+    assert any("dials/view" in "".join(r) for r in rows), rows
+
+
+def test_the_pencil_opens_the_board_and_says_why_it_had_to():
+    """It does not pretend to turn the dial. `POST /dials` wants a person, and
+    this dashboard holds the token every agent on the box holds."""
+    module = _load_app()
+    _, _, opened, detail, _ = asyncio.run(
+        _drive_dials(offset=(module.Dash.EDIT_COLUMN + 2, 1)))
+    assert opened and opened[0].endswith("/dials/view?repo=" + module.qd.REPO), opened
+    assert "browser" in detail and "machine token" in detail, detail
+
+
+def test_a_dial_row_explains_itself_rather_than_opening_anything():
+    """The row is six narrow cells and the argument does not fit in one of them —
+    the board requires a reason on every write precisely so there is one."""
+    _, _, opened, detail, _ = asyncio.run(_drive_dials(offset=(60, 1)))
+    assert not opened, "clicking the row itself is a read, not a door"
+    assert "this repo is mid-release" in detail, detail
+    assert "set indefinitely" in detail, detail
+
+
+def test_d_opens_the_dials_page_from_wherever_you_are():
+    """A dial governs every table on the screen, so the key is not tied to one."""
+    _, _, opened, _, _ = asyncio.run(_drive_dials(key="d"))
+    assert opened and "/dials/view" in opened[0], opened
+
+
+def test_the_tempo_rides_the_caps_line_in_the_clickable_renderer():
+    """Drawn on the limits clock, which is an hour long — so a new dials answer
+    has to redraw it, or the cell up there keeps last hour's tempo while the panel
+    below shows this minute's."""
+    _, _, _, _, bar = asyncio.run(_drive_dials())
+    assert "TEMPO" in bar and "held" in bar, bar

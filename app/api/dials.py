@@ -44,6 +44,18 @@ What IS enforced here is only what the board can see for itself — a dial name 
 is not blank and not absurdly long, a reason that exists, an expiry in the future,
 and a value small enough to store.
 
+## Where a person actually sees one (#477)
+
+For its first releases this endpoint reached **no screen**. A dial was set with
+curl and read back by one function in ``harness/loops/panel_seats.py``, so the
+value governing every round on the fleet was invisible on ``qb-dash``,
+``qb-dash-tui``, ``qb-board`` and the web board alike — tolerable while a dial
+configured a review, and not once ``tempo`` (#474) is the answer to "is this fleet
+working right now". Three surfaces read it now: both dashboards draw a DIALS panel
+off ``GET /dials`` (``harness/bin/qbdata.py``, ``fetch_dials``), and
+:func:`app.api.board_view.dials_view` serves the page at ``/dials/view`` that the
+dashboards print the URL of — because they cannot write here and say so instead.
+
 ## Writes are human-only, and that is the security argument
 
 ``harness_rules``' two-ref rule exists so that a poisoned pull request cannot

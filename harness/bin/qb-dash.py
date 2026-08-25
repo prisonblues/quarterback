@@ -49,11 +49,13 @@ from rich.text import Text
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
     LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_counts, ci_state,
-    claim_label, claim_repo, clip, elsewhere, fetch_board, fetch_issues, fetch_limits, fetch_plan,
+    claim_label, claim_repo, clip, dial_life, dial_value, dial_where, dials_url, elsewhere,
+    fetch_board, fetch_dials, fetch_issues, fetch_limits, fetch_plan,
     fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells,
     plan_head_bits, plan_items, plan_next_id, plan_rank, plan_ref, plan_state, plan_who,
     queue_cell, queue_oldest, repo_arg, repo_colour,
-    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, stage_cell, until, waited,
+    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, stage_cell, tempo_cell,
+    until, waited,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
@@ -61,6 +63,10 @@ GH_EVERY = 90.0         # gh is a network round trip, and PRs/issues are not liv
 ISSUE_ROWS = 12         # a printed panel cannot scroll; the rest is a count
 PLAN_ROWS = 10          # the same, for the plan: running items first, then a count
 QUEUE_ROWS = 8          # the same again, for the review queue: oldest first
+# The same again for the dials. Two lines each — the value and the argument for it
+# — so this is a shorter cap than the panels above: a fleet with more than five
+# dials in force has a config question, not a dashboard question.
+DIAL_ROWS = 5
 
 # Repo → colour, so the same project is the same colour everywhere on the panel.
 # ---- panels ------------------------------------------------------------------
@@ -448,6 +454,119 @@ def panel_issues(issues: list[dict], held: dict[int, dict], err: str | None,
                  padding=(0, 1))
 
 
+def dial_row(row: dict, name_room: int, show_repo: bool = True) -> Text:
+    """One dial as a single padded line: `tempo   eager   quarterback   1h28m`.
+
+    Composed by hand rather than by `Table.grid`, which is the opposite of every
+    other panel in this file and is the one place it is right. Rich has no
+    colspan, so a grid whose columns fit four cells cannot also carry a line that
+    runs the panel's whole width — and the two lines that MUST run the whole width
+    are the two this panel exists for: the argument for a value being in force,
+    and the URL a person has to type to change it. Clipped to 40 characters, a
+    reason reads as a fragment and a link cannot be typed at all.
+
+    So the table is one column wide and the alignment is done here. `name_room` is
+    passed in rather than measured because every row has to agree about it.
+    """
+    where, where_style = dial_where(row, show_repo)
+    life, life_style = dial_life(row)
+    out = Text()
+    out.append(f"{clip(row.get('dial'), name_room):<{name_room}}", style="bold white")
+    out.append(f" {dial_value(row, 12):<12}", style="cyan")
+    room = 11 if show_repo else 5
+    out.append(f" {where:<{room}}", style=where_style)
+    out.append(f" {life:>6}", style=life_style)
+    return out
+
+
+def panel_dials(dials: dict, width: int, cfg=None, scope: Scope | None = None) -> Panel:
+    """Which dials are in force, which layer answered, why, and for how long — #477.
+
+    The panel this dashboard was missing, and the one nothing anywhere had: a dial
+    is set from a browser endpoint and read back by one function in
+    `panel_seats.py`, so the values governing every round on the fleet were
+    invisible on every screen a person or an agent actually looks at.
+
+    **Above the fleet rather than below the issues**, and for the caps line's own
+    reason: this is the configuration every panel underneath it is running under.
+    It is short — a fleet with nothing set is two rows — and it is the one thing on
+    the screen a reader wants BEFORE the rows rather than after them.
+
+    **It always draws, even with nothing in force**, because the empty state is
+    where the last row earns its place: the URL is most wanted by the person who
+    has just discovered the tempo is not what they want, and a hint that appeared
+    only once a dial existed would be missing exactly then.
+    """
+    show_repo = scope is None or scope.column
+    rows = dials.get("dials") or []
+    err = dials.get("error")
+    t = Table.grid(padding=(0, 1), expand=True)
+    t.add_column(ratio=1, no_wrap=True)
+    # The panel's border and padding cost 4, `padding=(0, 1)` costs nothing on a
+    # single column, and the fixed cells take the rest.
+    body = max(20, width - 4)
+    name_room = max(10, body - (12 + (11 if show_repo else 5) + 6 + 3))
+
+    for row in rows[:DIAL_ROWS]:
+        t.add_row(dial_row(row, name_room, show_repo))
+        # The REASON, on a line of its own under the value it argues for. A dial
+        # whose argument nobody can read is one nobody can decide to remove —
+        # which is why the board refuses to store a dial without one. Who set it
+        # and when ride with it: "human/rich · 4h" is what turns a value somebody
+        # has to decide about into one they can go and ask about.
+        by = " · ".join(x for x in (row.get("set_by"), ago(row.get("set_at"))) if x)
+        # Indented OUTSIDE the clip: `clip` collapses runs of whitespace, so an
+        # indent built into its argument is one it eats — and the indent is what
+        # makes this line read as belonging to the row above it rather than as
+        # another dial.
+        t.add_row(Text("  " + clip((row.get("reason") or "")
+                                   + (f"  ({by})" if by else ""), body - 2),
+                       style="grey50"))
+    if len(rows) > DIAL_ROWS:
+        t.add_row(Text(f"…and {len(rows) - DIAL_ROWS} more", style="grey50"))
+    if err:
+        t.add_row(Text(clip(f"! {err}", body), style="red"))
+    if not rows and not err:
+        # THREE empty states, and none of them is the others. A board that has not
+        # been asked yet does not know that nothing is set; a board that answered
+        # with nothing does. Collapsing them is the same mistake as a queue that
+        # reports depth zero for a repo it never queried (#244).
+        #
+        # And the answered one is not "no dials": every dial HAS a value, and this
+        # is the state where the repo's own default is the one in force. A panel
+        # that said "none" would read as "nothing is configured", which is never
+        # true of a harness that ships defaults for everything.
+        t.add_row(Text("every dial at its repo default" if dials.get("asked")
+                       else "asking the board…", style="grey50"))
+    # WHERE TO TURN ONE, and it says browser rather than merely printing a link.
+    # `POST /dials` takes `app.auth.human`; this dashboard holds a machine bearer
+    # token, which is the credential that gate exists to refuse. #443 is the record
+    # of what happens when a surface reads a thing, says the change is yours to
+    # make, and does not say where: "i don't know how to re-order".
+    t.add_row(Text(clip(f"set in a browser: {dials_url(cfg)}", body), style="grey50"))
+
+    # A COUNT IS A CLAIM. "0 in force" over an unreachable board says the fleet is
+    # running on its defaults, which is the one thing an unanswered read cannot
+    # establish — the dials may all be set and the reader has simply not been told.
+    if err:
+        # Left open, like the two branches below it: the `[/]` that closes this is
+        # appended with the title, and a second one here closes nothing and takes
+        # the whole panel down with a MarkupError.
+        head = "[bold]DIALS[/] [red]unreadable"
+    elif not dials.get("asked"):
+        head = "[bold]DIALS[/] [grey50]asking"
+    else:
+        head = f"[bold]DIALS[/] [grey50]{len(rows)} in force"
+    shadowed = len(dials.get("shadowed") or [])
+    if shadowed:
+        # A fleet dial this screen's repos all override. Counted rather than drawn,
+        # because it is NOT in force here — but silence would leave a reader who
+        # set it fleet-wide unable to see that anything had happened to it.
+        head += f" · {shadowed} overridden"
+    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
+                 padding=(0, 1))
+
+
 def limits_line(limits: list[dict], width: int, stale: bool = False) -> Text:
     """The shared subscription's caps, as bars: `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
 
@@ -493,9 +612,34 @@ def queue_line(queue: dict) -> Text:
     return out
 
 
+def tempo_line(dials: dict | None) -> Text:
+    """`TEMPO eager 40m` — how hard the fleet is meant to be working, in one cell.
+
+    On the caps line rather than in the panel below because that is the question
+    it answers: the caps say what the seats MAY spend and this says whether they
+    are supposed to be spending it at all. A reader glancing at one is asking
+    about the other.
+
+    Empty only before the first fetch has answered. After that every state draws,
+    including `unset` — a cell that vanished when no dial was in force could not
+    be told apart from a dashboard that never asked, and "nothing is throttling
+    the fleet" is precisely the answer somebody is looking for at 94% of a window.
+    """
+    out = Text()
+    cell = tempo_cell(dials or {})
+    if cell is None:
+        return out
+    label, value, life, colour = cell
+    out.append(label, style="bold grey70")
+    out.append(f" {value}", style=f"bold {colour}")
+    if life:
+        out.append(f" {life}", style="grey50")
+    return out
+
+
 def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
            stale: bool = False, scope: Scope | None = None,
-           queue: dict | None = None) -> Panel:
+           queue: dict | None = None, dials: dict | None = None) -> Panel:
     host = (cfg.agent or "?").split("/", 1)[0]
     now = datetime.now().strftime("%H:%M:%S")
     state = Text("● board up", style="green")
@@ -515,18 +659,26 @@ def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
     # the caps say what the seats may spend, this says what is waiting to be
     # spent on. Measured first so the bars are sized for the room that is left.
     review = queue_line(queue or {})
-    room = width - 4 - (len(review.plain) + 3 if review.plain else 0)
+    # The throttle rides the same line as the budget it protects (#477). Measured
+    # with the queue and BEFORE the bars, for the same reason: the caps are the
+    # only elastic thing here, so everything that is not elastic takes its room
+    # first or the bars are sized for a line they do not fit on.
+    tempo = tempo_line(dials)
+    room = width - 4 - sum(len(cell.plain) + 3 for cell in (review, tempo) if cell.plain)
     caps = limits_line(limits or [], room, stale)
-    if caps.plain and review.plain:
-        caps.append("   ")
-    caps.append_text(review)
+    for cell in (review, tempo):
+        if not cell.plain:
+            continue
+        if caps.plain:
+            caps.append("   ")
+        caps.append_text(cell)
     if caps.plain:
         parts.insert(0, Align.left(caps))
     return Panel(Group(*parts), border_style="grey35", padding=(0, 1))
 
 
 def fetch_state(client) -> dict:
-    """The board's own three answers in one dict: presence, claims, and the plan.
+    """The board's own answers in one dict: presence, claims, the plan, the dials.
 
     The plan rides the board clock rather than the `gh` one — it is a call to the
     same host as /active, it changes when an agent claims an item, and a plan
@@ -538,6 +690,11 @@ def fetch_state(client) -> dict:
     # about the list — next, how much of the order anybody chose, the counts,
     # whether this is all of it — is the half the panel could not say before.
     data["plan"], data["plan_err"] = fetch_plan(client)
+    # On the board clock and not the `gh` one, like the plan and for a sharper
+    # version of the plan's reason: a dial is a human decision that takes effect
+    # the moment it is made, and a throttle a screen would not show for ninety
+    # seconds is a throttle nobody watching that screen can trust.
+    data["dials"] = fetch_dials(client)
     return data
 
 
@@ -582,8 +739,10 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
     # would show that issue as free and send the next seat straight into it.
     held = claims_by_issue(data.get("claims", []))
     queue = gh.get("queue") or {}
+    dials = data.get("dials") or {}
     parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error")), scope,
-                    queue),
+                    queue, dials),
+             panel_dials(dials, width, cfg, scope),
              panel_agents(data, width, scope),
              panel_claims(data, width, scope),
              panel_plan(data.get("plan") or {}, data.get("plan_err"), width, scope),
