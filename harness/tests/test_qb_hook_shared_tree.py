@@ -172,6 +172,28 @@ class Guarded:
     def board_down(self) -> None:
         self.rc.write_text("7")  # curl's "couldn't connect"
 
+    def bare_path(self) -> str:
+        """A PATH carrying only the tools `qb-hook` actually calls.
+
+        `command -v create-worktree` cannot fail on a box that has the harness
+        installed, so the fallback branch is unreachable from a test that
+        inherits the real PATH — and an unreachable branch tested by reading the
+        source is the weak form this repo does not accept. Symlink what the hook
+        needs into a directory of our own and the absence becomes real.
+        """
+        need = ("jq", "curl", "git", "timeout", "sed", "grep", "sort", "tr", "cat",
+                "date", "stat", "basename", "dirname", "cut", "sha256sum", "bash",
+                "sh", "mktemp", "tail", "head", "python3", "rm", "printf", "env",
+                "uname", "wc", "awk", "id", "readlink", "paste")
+        d = self.root / "barebin"
+        d.mkdir(exist_ok=True)
+        for tool in need:
+            found = shutil.which(tool)
+            if found and not (d / tool).exists():
+                (d / tool).symlink_to(found)
+        assert shutil.which("create-worktree", path=str(d)) is None
+        return f"{self.stub}:{d}"
+
     def env(self, **over) -> dict:
         base = {k: v for k, v in os.environ.items()
                 if k not in ("TMUX", "TMUX_PANE", "QUARTERBACK_INSTANCE")}
@@ -184,12 +206,14 @@ class Guarded:
     def bash(self, command: str) -> subprocess.CompletedProcess:
         return self.fire("PreToolUse", tool_name="Bash", tool_input={"command": command})
 
-    def fire(self, event: str, **payload) -> subprocess.CompletedProcess:
+    def fire(self, event: str, _path: str | None = None,
+             **payload) -> subprocess.CompletedProcess:
         body = {"session_id": "sid-1", "cwd": str(self.cwd),
                 "transcript_path": "", **payload}
+        env = self.env(PATH=_path) if _path else self.env()
         got = subprocess.run([str(self.bin / "qb-hook"), event],
                              input=json.dumps(body), capture_output=True, text=True,
-                             env=self.env(), timeout=60)
+                             env=env, timeout=60)
         # Fail-open is a contract, not an aspiration: whatever this hook decides,
         # it exits 0. A non-zero exit is Claude Code's "the hook is broken".
         assert got.returncode == 0, got.stderr
@@ -253,7 +277,7 @@ def test_the_refusal_says_what_to_do_instead(shared):
     """The agent has a real need — it wants a clean tree. Refusing without a way
     to get one is how a gate gets worked around instead of used."""
     reason = shared.decision(shared.bash("git reset --hard"))["permissionDecisionReason"]
-    assert "git worktree add" in reason
+    assert "Work somewhere else:" in reason
     # `qb-stash push`, not `git stash`: every worktree of a repo shares one
     # `refs/stash`, and the harness installs a hook that refuses the shared one
     # outright — so advice to `git stash -u` sent the reader into a second
@@ -423,8 +447,8 @@ class Started(Guarded):
     """`SessionStart` in a real checkout, where `repo` is non-empty — which is the
     condition under which the occupancy note has never once asked about a tree."""
 
-    def start(self) -> str:
-        got = self.fire("SessionStart")
+    def start(self, path: str | None = None) -> str:
+        got = self.fire("SessionStart", _path=path)
         out = got.stdout.strip()
         if not out:
             return ""
@@ -461,7 +485,7 @@ def test_the_shared_tree_note_says_the_opposite_of_the_repo_note(session):
     note = session.start()
     shared = note.split("SHARING a working tree", 1)[1]
     assert "no need to hold off" not in shared
-    assert "git worktree add" in shared
+    assert "your own tree" in shared
 
 
 def test_the_repo_note_keeps_its_own_voice_for_a_peer_elsewhere(session):
@@ -722,3 +746,89 @@ def test_staging_everything_is_refused_and_naming_your_files_is_not(shared):
     assert shared.decision(shared.bash("git add -A"))["permissionDecision"] == "deny"
     assert shared.decision(shared.bash("git add app.py")) is None
     assert shared.decision(shared.bash("git commit -m 'only what I staged'")) is None
+
+
+# ------------------------------------------- composing with #178's mode note (#464)
+#
+# Two notes landed within an hour of each other and both told the reader to take
+# a worktree. Duplication was the smaller half: they gave two DIFFERENT commands
+# for the same act, and `create-worktree` is not a synonym for `git worktree add`
+# — it also does the database isolation, the claim and the hook install. An agent
+# following the raw-git spelling got a worktree without any of that, in a repo
+# that had just said it wants all of it.
+
+
+class Moded(Started):
+    """A session whose `qb-mode` reports a violation — #178's note firing."""
+
+    def with_mode_note(self, violation: str = "You are in the SHARED checkout") -> None:
+        (self.stub / "qb-mode").write_text(
+            "#!/bin/sh\n"
+            'printf \'{"label":"CLEANROOM","glyph":"C","how":"one tree per agent",'
+            f'"violation":"{violation}"}}\'\n'
+        )
+        (self.stub / "qb-mode").chmod(0o755)
+
+    def without_mode_note(self) -> None:
+        (self.stub / "qb-mode").write_text('#!/bin/sh\nprintf \'{"label":null}\'\n')
+        (self.stub / "qb-mode").chmod(0o755)
+
+
+@pytest.fixture
+def moded(tmp_path):
+    g = Moded(tmp_path)
+    g._git("remote", "add", "origin", "git@github.com:prisonblues/quarterback.git")
+    g.commit("app.py", "seed\n")
+    g.peers(PEER, in_tree=g.cwd)
+    return g
+
+
+def test_the_remedy_is_stated_once_when_the_mode_note_gave_it(moded):
+    """#178 owns the remedy — it is about POLICY, true with nobody else here and
+    still true after they leave. This note keeps the thing the mode note cannot
+    say: who is in the tree with you, by name."""
+    moded.with_mode_note()
+    note = moded.start()
+    assert "SHARING a working tree" in note          # this note still fires
+    assert "hermes/seat-quarterback-4" in note       # …and still names the peer
+    assert "Give yourself your own tree" not in note  # …and defers the remedy
+    assert note.count("create-worktree") <= 1
+
+
+def test_the_remedy_is_kept_when_the_mode_note_is_silent(moded):
+    """A jungle repo, or an undeclared one where this checkout is not primary.
+    Nothing else will say it, so this note must."""
+    moded.without_mode_note()
+    note = moded.start()
+    assert "Give yourself your own tree" in note
+
+
+def test_there_is_one_spelling_of_taking_a_worktree(moded):
+    """`create-worktree` wherever it exists — it is not a synonym for `git
+    worktree add`, and the fleet shipped both for an hour."""
+    moded.without_mode_note()
+    (moded.stub / "create-worktree").write_text("#!/bin/sh\nexit 0\n")
+    (moded.stub / "create-worktree").chmod(0o755)
+    note = moded.start()
+    assert "create-worktree <branch>" in note
+    assert "git worktree add" not in note
+
+
+def test_the_raw_git_form_is_the_fallback_where_the_command_is_absent(moded):
+    """A host that has not installed the harness still gets something it can run.
+
+    Exercised against a PATH holding only what the hook calls, because this box
+    HAS `create-worktree` and the branch is otherwise unreachable."""
+    moded.without_mode_note()
+    note = moded.start(path=moded.bare_path())
+    assert "git worktree add" in note
+    assert "create-worktree" not in note
+
+
+def test_the_note_names_both_harms_now(moded):
+    """#185 landed a second harm class after this note was written, so it was
+    describing half of what the guard refuses."""
+    moded.without_mode_note()
+    note = moded.start()
+    assert "git commit -a" in note
+    assert "take it into YOUR commit" in note

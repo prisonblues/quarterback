@@ -752,6 +752,15 @@ stash typed outside Claude Code entirely, and it does not wait for a peer to be 
 a shared `refs/stash` stack is a hazard either way. Two gates on one command would only mean
 two escape hatches under different names.
 
+**One spelling of "take a worktree", and one note says it (#464).** #178's mode note and this one
+both told the reader to take a worktree, in two different commands — and `create-worktree` is not a
+synonym for `git worktree add`: it also does the database isolation, the claim and the hook
+install. The two notes answer different questions and both stay — #178 is about POLICY (this repo
+says work belongs in a worktree and you are not in one, true whether or not anyone else is here),
+this one is about PEOPLE (somebody is in the tree with you now, by name). So when the mode note has
+fired, this one keeps the names and drops the remedy; when it is silent, this one keeps it. Either
+way the act is spelled `create-worktree` wherever that command exists.
+
 **And the note that precedes it was wrong in the same place.** The SessionStart occupancy note
 scopes by `repo` when there is one — which, inside a git repo, is always — so it never asked
 about a working tree. On the night, it named the very agents whose work was about to be
