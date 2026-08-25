@@ -1392,6 +1392,91 @@ out of reach, and that is accepted: the slash commands that drive worktree teard
 (`/wt`, `/drop-worktree`, `/tree-shake`) tell the model to ask first, and an agent
 running raw git was never going to be caught by tooling it did not invoke.
 
+### `qb-catchup` — the ending the ⬇️ advisory never had
+
+The board already knows a push landed and already tells you: `published` is emitted when a
+push reaches the remote, and the lifecycle hook turns it into a **⬇️ pull before you build
+on this checkout** advisory. That is the right diagnosis and a manual ending — whoever it
+reaches then does the re-integration by hand, once per worktree, which was most of the
+eleven integration merges it took to land six PRs on the day [#80] was filed.
+
+```bash
+qb-catchup                 # sweep every worktree of this repo on this machine
+qb-catchup --dry-run       # say what would move, move nothing
+qb-catchup --no-fetch      # act on the refs already here
+```
+
+**It fast-forwards, and it refuses everything else.** That is the feature, not a first cut
+waiting to grow. Rewriting a checkout somebody is working in is exactly the disaster [#45]
+was filed for — an agent ran `git rebase origin/main` inside a directory another agent
+held, and the holder found its branch at somebody else's commit with conflict markers in
+four files. It reconstructed from the reflog whether its own work still existed. It did,
+because the branch happened to be pushed: luck, not design.
+
+| State | What happens |
+|---|---|
+| behind by a clean fast-forward | **moved**, and said |
+| a live holder (`worktree-holder` exit 3) | left alone, holder **named** |
+| "could not tell" (exit 4) | left alone |
+| uncommitted changes | left alone |
+| unpushed commits | left alone, **loudly** |
+| diverged from upstream | left alone — "that is a rebase, not a fast-forward" |
+| detached, or no upstream | left alone |
+
+**Exit 4 is a refusal here and permission in `prune-worktrees`**, which is worth stating
+because it looks like an inconsistency and is the opposite. There, refusing on a board
+outage means leaving real debris uncollected. Here it would mean rewriting a live checkout
+*because the board was down*. An unreachable board must never become a licence.
+
+**One fetch covers every worktree**, which is a property of git rather than an
+optimisation: linked worktrees share the common git directory, so remote-tracking refs are
+shared too and fetching once in any of them advances `@{u}` for all.
+
+#### Two triggers, and only one of them acts
+
+- **A merge this machine performed** — `gh pr merge` is matched in `qb-hook`'s `PostToolUse`
+  the same way `git push` already is, and the sweep runs. This is the trigger that bites:
+  a forge merge creates the commit **server-side and runs no local push**, so the very
+  session that landed the work is the one now stale, and nothing local moved to tell it.
+  (Which is also why the sweep must *fetch* here even though `gh` just talked to the
+  remote: nothing local moved. Skipping it would make every checkout report "already
+  current", and it would look like it worked.) `QB_CATCHUP=0` turns it off.
+- **Somebody else published** — the advisory *offers* the command rather than running it.
+  Acting unbidden at the top of somebody's turn is [#45]'s disaster class even when every
+  individual refusal is correct, and the advisory fires on every prompt while behind, so
+  acting would mean a `git fetch` per prompt. The offer costs a line and turns N pulls into
+  one command.
+
+The offer is appended locally rather than sent from the board, because whether the command
+*exists* is a property of this machine — a fleet member on an older harness would otherwise
+be told to run something it does not have, which is [#422]'s shape exactly.
+
+#### The markers had to start answering subtractively
+
+`worktree-holder` unioned two sources and used the markers only *additively*, which left a
+false positive on the one checkout that matters most here. A lease records the directory an
+agent was **launched** in, which for the worktree workflow is the main checkout — so
+"launched under this path" is true of *every live agent in the repo* when the path is the
+main checkout, including ones demonstrably working elsewhere.
+
+Measured on hermes while this was being written: `worktree-holder <main checkout>` named
+`hermes/seat-quarterback-5`, whose own marker said `…/quarterback-fix-issue-458`. It had not
+been in the main checkout for an hour.
+
+That is benign for `remove-worktree` and `prune-worktrees`, which only ever ask about a
+*linked* worktree and for which a false positive is a refusal to delete — the safe
+direction. It is not benign for anything that wants to act **on** the main checkout: the
+catch-up would decline forever on any box with an agent running, which is every box, which
+would make the feature inert.
+
+So a session whose marker names a **different** worktree is not here. A session with **no**
+marker keeps the lease-cwd clause untouched — that is the agent launched inside a checkout
+directly, and it is the true positive this must never drop.
+
+[#45]: https://github.com/prisonblues/quarterback/issues/45
+[#80]: https://github.com/prisonblues/quarterback/issues/80
+[#422]: https://github.com/prisonblues/quarterback/issues/422
+
 ### `qb-seat` — one pane, one seat, one identity
 
 Starting a fleet is the part that never scaled: open a terminal, `cd`, run the agent, read
