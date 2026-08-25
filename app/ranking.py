@@ -110,32 +110,68 @@ Four tiers, and they are :data:`app.collisions.CLASSES` rather than a second
 vocabulary, because a PR that the collision endpoint calls ``partial`` and a
 ranking that calls it "probably fine" is the same fact told two ways.
 
-1. :data:`~app.collisions.DISJOINT` — a complete, attested file list that shares
-   nothing with any other queued PR. **First**, and it is free to put them there:
-   a PR that collides with nobody contributes zero to the sum above from any
-   position, so its placement is unconstrained by cost — and every land it waits
-   through is exposure to the base moving under it for reasons unrelated to it.
+1. :data:`~app.collisions.DISJOINT` — sharing nothing with any other queued PR,
+   where **every** queued PR's evidence is attested (see below). **First**, and it
+   is free to put them there: a PR that collides with nobody contributes zero to
+   the sum above from any position, so its placement is unconstrained by cost —
+   and every land it waits through is exposure to the base moving under it for
+   reasons unrelated to it.
 2. :data:`~app.collisions.COLLIDES` — heaviest first, per the exchange argument.
-3. :data:`~app.collisions.PARTIAL` — measured, sharing nothing *found*, and its
-   list is a prefix, so it cannot be called disjoint. Sorted like a collider,
-   ranked below the proven ones, and its row says it may belong a tier up.
+   A found collision outranks every doubt, as it does in
+   :func:`app.collisions.classify`, because filing a definite shared path under
+   "might share something" hides a fact behind a doubt.
+3. :data:`~app.collisions.PARTIAL` — measured, nothing shared *found*, and
+   something in the way of calling that none. Sorted like a collider, which is
+   where an unproven one belongs: a wrong ``disjoint`` costs a bad merge and this
+   costs a position.
 4. :data:`~app.collisions.UNANSWERABLE` — no usable list at all. **Not ranked at
    any position**, because every position would be invented.
 
+Attested, and why a row cannot decide it alone
+==============================================
+
+A PR's evidence is **attested** when four things hold, and each of them was a way
+this could have been confidently wrong:
+
+* **measured** — some run recorded a file list. Without one there is no evidence,
+  only silence, and silence is not disjointness (#101's whole finding).
+* **complete** — :func:`app.collisions.files_complete`: somebody counted and the
+  board holds that many. An uncounted list is not complete either.
+* **pinned** — the run reviewed *the commit the queue says this PR is on*. The
+  queue's one guarantee over an agent's memory is that a claim names the commit
+  it is about; a file list read without that check throws it away. A PR reviewed
+  at commit A and pushed to B is answered for by A's list, which describes a diff
+  that is not the one landing — and two such PRs can be reported disjoint on the
+  strength of two lists that were both true and are both about somewhere else.
+* **consistent** — the sender's own count reaches the number of paths it stored.
+  ``files_complete`` tolerates the reverse deliberately; a *ranking* cannot,
+  because the count is the weight, and a run claiming one changed file while
+  storing a hundred paths would sort a huge branch behind everything it collides
+  with.
+
+**And ``disjoint`` needs all four of every OTHER queued PR too.** That is the one
+verdict here that is a safety claim rather than a description, and it is a claim
+about a population: a peer whose list is a prefix may touch, on the files it never
+reported, exactly what this PR touches. So one unattested row anywhere in the
+queue means no row is disjoint — every no-overlap-found row is
+:data:`~app.collisions.PARTIAL` instead, saying which peers it could not rule out.
+
 And the gates on the confident answer, which are the point of the exercise:
 
-* A queue containing an unanswerable PR gets **no** ``suggested_order``. Not a
-  best guess with a footnote — null, with the PRs it could not see named. This is
-  the #94 hole and it is not a small one: the panel's title-skip path records no
-  files, so merges, promotes and format-the-world commits are invisible here —
+* ``suggested_order`` is published **only when every queued PR is attested**. Not
+  a best guess with a footnote somewhere else in the payload — null, with the
+  reason and the rows named. A consumer that reads the convenience field alone
+  must not be able to receive an order the evidence does not support, and it is
+  the convenience field that gets read.
+* Everything else still comes back, as ``partial_order`` with its trust attached
+  at the same level. A queue the board cannot fully answer for yields its per-PR
+  evidence to a human or to a later consensus step rather than yielding nothing.
+* The biggest reason it will be null is #94: the panel's title-skip path records
+  no files, so merges, promotes and format-the-world commits are invisible here —
   which under the cost model above are exactly the PRs that should land *first*.
-  A ranking that silently drops them to the bottom would make its largest
-  possible error on its most important rows, quietly.
-* A queue whose lists are all present but some are prefixes gets an order with
-  :attr:`Ranking.trusted` false and a caveat naming them. The direction of that
-  error is known — more collisions than were seen, never fewer — so the order is
-  still the best evidence available, and it says so out loud rather than in a
-  docstring.
+  A ranking that silently dropped them to the bottom would make its largest
+  possible error on its most important rows, quietly. So the field's nullness is
+  itself the measurement: it says how blind the board currently is.
 """
 
 from __future__ import annotations
@@ -220,6 +256,20 @@ class Candidate:
     #: is. ``None`` when no run of this PR recorded anything.
     run_id: int | None = None
     run_ts: str | None = None
+    #: The commit the QUEUE says this PR is on, and the commit the RUN says it
+    #: reviewed. The queue's whole guarantee over an agent's memory is that a
+    #: claim names the commit it is about (``ready_sha``/``head_sha``), and a file
+    #: list read without that comparison throws it away: the list describes the
+    #: diff at ``run_head``, and if the branch has moved it describes a diff that
+    #: is not the one about to land. ``run_head`` is ``None`` for every run
+    #: recorded before v2.26 stored it.
+    queue_head: str | None = None
+    run_head: str | None = None
+    #: The branch the queue is landing onto, and the branch the run was taken
+    #: against. A PR retargeted between bases keeps its head and changes its
+    #: three-dot diff, so the two are compared when the run recorded one.
+    queue_base: str | None = None
+    run_base: str | None = None
     #: Which :data:`SHARED_RESOURCES` this PR touches, via
     #: :func:`shared_resource_keys`.
     resources: frozenset[str] = frozenset()
@@ -235,20 +285,77 @@ class Candidate:
         return not (self.changed_files_total is None and self.files_recorded == 0)
 
     @property
+    def counts_agree(self) -> bool:
+        """Does the sender's own count reach the number of paths it stored?
+
+        ``files_complete`` accepts ``recorded > total`` deliberately — for a
+        completeness verdict, holding more than GitHub counted is a sender bug and
+        not a prefix. For a *ranking* it is worse than a bug, because
+        :attr:`weight` reads the count: a run claiming ``changed_files_total: 1``
+        with a hundred paths stored would be weighed as the lightest thing in the
+        queue and sorted behind branches a fraction of its size. So the
+        disagreement is named here, the weight below takes the larger of the two,
+        and a row it fires on is not attested.
+        """
+        return (self.changed_files_total is None
+                or self.files_recorded <= self.changed_files_total)
+
+    @property
+    def pinned(self) -> bool:
+        """Is the run answering for this PR about the commit the queue is on?
+
+        The defect this property exists to close: a PR reviewed at commit A and
+        pushed to commit B is answered for by A's file list, which describes a
+        diff that is not the one landing. Two PRs can be reported disjoint on the
+        strength of two lists that were both true and are both about somewhere
+        else. Nothing in the payload could have shown a consumer that, because
+        the run's own head was never read.
+
+        ``None`` on either side means nobody said, and that is **not** a pass: the
+        precedent is :func:`app.collisions.files_complete` refusing to call an
+        uncounted list complete. Nothing says it is stale; nothing says it is not,
+        either, and this is the test standing in front of the one verdict a caller
+        may act on as a safety claim.
+        """
+        if self.queue_head is None or self.run_head is None:
+            return False
+        if self.run_head != self.queue_head:
+            return False
+        # The base is compared only when the run recorded one — it is nullable for
+        # the same reason `head_sha` is, and a PR that never moved bases is the
+        # overwhelmingly common case.
+        return not (self.run_base and self.queue_base and self.run_base != self.queue_base)
+
+    @property
     def complete(self) -> bool:
+        """Is the stored list attested complete *for this PR alone*?
+
+        List completeness only. Whether the list is about the right commit is
+        :attr:`pinned`, and whether the PR may be called disjoint needs both of
+        those **and** the same of every other PR in the queue — which is a fact
+        about the population and so is decided in :func:`rank`, not here.
+        """
         return files_complete(self.changed_files_total, self.files_recorded)
+
+    @property
+    def attested(self) -> bool:
+        """Everything this row can say for itself: measured, complete, pinned,
+        and internally consistent. Necessary for a ``disjoint`` verdict and not
+        sufficient — see :func:`rank`."""
+        return self.measured and self.complete and self.pinned and self.counts_agree
 
     @property
     def weight(self) -> int:
         """``w`` — the price of putting this branch through one more integration.
 
-        GitHub's count where there is one; otherwise the number of paths the
-        board holds, which is a **floor** and is reported as such. Zero for an
-        unmeasured PR, which never reaches a comparison anyway.
+        The LARGER of GitHub's count and the paths actually stored. Ordinarily
+        they agree or the count is the bigger of the two (a prefix), and then this
+        is GitHub's count. Where a sender has contradicted itself the larger is
+        the only safe reading: under-weighing a branch sorts it late, which is the
+        end of a colliding pair that pays, so a wrong small weight costs a real
+        re-integration and a wrong large one costs a position.
         """
-        if self.changed_files_total is not None:
-            return self.changed_files_total
-        return self.files_recorded
+        return max(self.changed_files_total or 0, self.files_recorded)
 
 
 @dataclass(frozen=True)
@@ -312,9 +419,24 @@ class Row:
     #: cost. Cost is the ordered sum in the module docstring.
     shared_total: int
     ready: bool
+    #: The stored list is not a prefix. About the list alone.
     files_complete: bool
+    #: The run answering is about the commit the queue says this PR is on. Kept
+    #: apart from :attr:`files_complete` because "a truncated list" and "a
+    #: complete list about last week's commit" are different faults with different
+    #: fixes, and a single boolean would send a reader looking for the wrong one.
+    evidence_pinned: bool
+    #: The sender's own count reaches the number of paths it stored.
+    counts_agree: bool
     run_id: int | None
     run_ts: str | None
+    #: The commit the answering run reviewed, beside the commit the queue is on,
+    #: so a consumer can see a mismatch rather than take :attr:`evidence_pinned`
+    #: on trust.
+    run_head: str | None
+    queue_head: str | None
+    #: Everything above at once: this row may stand behind a safety claim.
+    attested: bool
     #: One line a reader or a board post can quote.
     reason: str
     collides_with: tuple[dict, ...] = field(default_factory=tuple)
@@ -330,9 +452,11 @@ class Ranking:
     #: Queued PRs given no position, in FIFO order.
     unranked: tuple[int, ...]
     rows: tuple[Row, ...]
-    #: True when every queued PR has a complete, attested file list. False makes
-    #: the order advisory-with-a-caveat rather than worthless: the direction of
-    #: the error is known.
+    #: True when every queued PR's evidence is attested: measured, complete,
+    #: internally consistent, and about the commit the queue says that PR is on.
+    #: It is the gate on ``suggested_order`` itself — not a footnote under one —
+    #: because a consumer that reads the convenience field alone must not be able
+    #: to receive an order the evidence does not support.
     trusted: bool
     #: True when every queued PR could be ranked at all, so :attr:`order` is a
     #: permutation of the queue and may be published as ``suggested_order``.
@@ -365,50 +489,96 @@ def _sort_key(c: Candidate, tier: str, shared_total: int) -> tuple:
     )
 
 
+def _weight_basis(c: Candidate) -> str:
+    """Where ``w`` came from, because a count and a floor must not read alike."""
+    if not c.counts_agree:
+        return (f"{c.files_recorded} stored paths, above the {c.changed_files_total} "
+                f"its sender counted — the larger of two numbers that disagree")
+    if c.changed_files_total is not None:
+        return "github's changed-file count"
+    return f"{c.files_recorded} stored paths — nobody counted, so this is a floor"
+
+
+def _doubt(c: Candidate) -> str | None:
+    """Why this PR's own evidence is not attested, in a phrase, or None.
+
+    One sentence per fault and never a merged one, because the three faults have
+    three different repairs: run a panel round, wait for a list that is not
+    truncated, or re-review the commit the PR is actually on.
+    """
+    if not c.counts_agree:
+        return (f"its sender stored {c.files_recorded} paths while counting "
+                f"{c.changed_files_total} — the run contradicts itself, so it is "
+                f"weighed at the larger of the two and trusted for nothing")
+    if not c.pinned:
+        if c.run_head is None:
+            return ("the run answering for it never recorded which commit it "
+                    "reviewed, so nothing can show the list is about the commit "
+                    "the queue is on")
+        if c.queue_head is not None and c.run_head != c.queue_head:
+            return (f"the run answering for it reviewed {c.run_head[:12]} and the "
+                    f"queue has it on {c.queue_head[:12]} — the list describes a "
+                    f"diff that is not the one landing")
+        return (f"the run answering for it was taken against base "
+                f"{c.run_base!r}, not {c.queue_base!r}")
+    if not c.complete:
+        counted = "no count" if c.changed_files_total is None else str(c.changed_files_total)
+        return (f"{c.files_recorded} paths stored against {counted} — the list is "
+                f"a prefix, so no shared path being found is not evidence of none")
+    return None
+
+
 def _reason(c: Candidate, tier: str, shared_total: int, partners: Sequence[int],
-            answerable: int, blind: int) -> str:
+            *, peers: int, unattested_peers: Sequence[int]) -> str:
     """One line a reader or a board post can quote, and every claim in it bounded.
 
-    ``answerable`` and ``blind`` are the size of the population the verdict was
-    reached over and the size of the population it was not. A ``disjoint`` row
+    ``peers`` is how many other PRs are in the queue and ``unattested_peers`` is
+    which of them the verdict could not be reached over. A ``disjoint`` row
     especially must carry them: "shares nothing with any other queued PR" is a
-    safety claim, "shares nothing with the four the board can answer for, and
-    there is a fifth it cannot" is a description — and the first sentence in a
-    queue holding an unanswerable PR is the exact confident-on-partial-data
-    failure this module exists to refuse.
+    safety claim, and it is only true if every other PR's list is complete, about
+    the right commit, and internally consistent. A row that made the claim while
+    a peer's list was a prefix would be the confident-on-partial-data failure in
+    one sentence — the caveat elsewhere in the payload does not undo a sentence a
+    reader can quote out of the row itself.
     """
     named = ", ".join(f"#{p}" for p in partners[:4])
     if len(partners) > 4:
         named += f" and {len(partners) - 4} more"
-    # Two different sentences, because the doubt cuts two different ways. On a
-    # `disjoint` row the hidden population makes a safety claim into a
-    # description; on a `collides` row it makes an already-true collision count a
-    # floor, which changes nothing about the verdict and only about its size.
-    unseen = (f", and {blind} more the board cannot answer for at all — so this "
-              f"describes what was seen and is not a safety claim" if blind else "")
-    floor = (f". {blind} further queued PR(s) recorded no list, so this count is a "
-             f"floor on what #{c.pr} actually collides with" if blind else "")
+    unsure = ", ".join(f"#{p}" for p in unattested_peers[:4])
+    if len(unattested_peers) > 4:
+        unsure += f" and {len(unattested_peers) - 4} more"
+    # The doubt cuts two ways and gets two sentences. On a row claiming no
+    # overlap, an unattested peer turns a safety claim into a description; on a
+    # colliding row it leaves the verdict untouched and makes the count a floor.
+    floor = (f". {len(unattested_peers)} queued PR(s) ({unsure}) are not attested, "
+             f"so this count is a floor on what #{c.pr} actually collides with"
+             if unattested_peers else "")
+    mine = _doubt(c)
     if tier == UNANSWERABLE:
         return (f"no run of #{c.pr} recorded a changed-file list, so it is not "
                 f"ranked at all: every position would be invented. A panel round "
                 f"on it fills this in; the panel's skip path never will until #94")
     if tier == DISJOINT:
-        return (f"a list of {c.weight} file(s), attested complete, sharing no path "
-                f"with any of the {answerable} other queued PR(s) the board can "
-                f"answer for{unseen} — landing it disturbs nothing it can see "
-                f"here, so it costs nobody anything from any position and is "
-                f"placed where it waits least")
+        return (f"a list of {c.weight} file(s), attested complete and taken at the "
+                f"commit the queue has it on, sharing no path with any of the "
+                f"{peers} other queued PR(s) — every one of which is attested too, "
+                f"which is what makes this a claim about the queue and not only "
+                f"about what was seen. It costs nobody anything from any position, "
+                f"so it is placed where it waits least")
     if tier == COLLIDES:
         return (f"collides with {named}: {shared_total} shared-path collision(s) "
                 f"across {len(partners)} PR(s), a path counted once per pair. At "
                 f"{c.weight} changed files it is the more expensive end of those "
                 f"pairs to re-integrate later, so it is ranked ahead of the "
                 f"lighter ones it collides with{floor}")
-    return (f"{c.files_recorded} paths stored against "
-            f"{'no count' if c.changed_files_total is None else c.changed_files_total} "
-            f"— the list is a prefix, so no shared path being found is not "
-            f"evidence of none. Ranked as a collider of weight {c.weight}; it may "
-            f"belong a tier up{floor}")
+    # PARTIAL — no overlap FOUND, and something in the way of calling that none.
+    why = mine or (f"{len(unattested_peers)} other queued PR(s) ({unsure}) are not "
+                   f"attested, so nothing shared being found here is a statement "
+                   f"about them and not about this PR")
+    return (f"no shared path found, and it cannot be called disjoint: {why}. "
+            f"Ranked as a collider of weight {c.weight}, which is where an "
+            f"unproven one belongs — the error a wrong `disjoint` causes is a bad "
+            f"merge, and the error this causes is a position")
 
 
 def rank(candidates: Sequence[Candidate],
@@ -463,34 +633,43 @@ def rank(candidates: Sequence[Candidate],
         partners[o.a].append(o)
         partners[o.b].append(o)
 
-    # The population every verdict below is reached OVER, and the population it
-    # is not. A `disjoint` claim is only as wide as the first of these, and a row
-    # that did not say so would be the confident-on-partial-data failure in one
-    # sentence.
-    blind = sum(1 for c in candidates if not c.measured)
+    # **`disjoint` is a claim about a POPULATION, not about a row**, and this is
+    # the line that makes it one. A PR whose own list is complete, pinned and
+    # consistent still cannot be called disjoint from a peer whose list is a
+    # prefix: the peer may touch, on the files it never reported, exactly what
+    # this PR touches. So the safety claim requires every OTHER queued PR to be
+    # attested as well, and where one is not, a row with no overlap found is
+    # `partial` — the same verdict `app.collisions` gives a rival it cannot rule
+    # out, arrived at for the population's reason instead of the row's.
+    unattested = [c.pr for c in candidates if not c.attested]
     rows: list[tuple[tuple, Row]] = []
     unranked: list[Row] = []
     for c in candidates:
         mine = sorted(partners[c.pr], key=lambda o: (-o.shared, o.other(c.pr)))
         shared_total = sum(o.shared for o in mine)
+        peers_unattested = [pr for pr in unattested if pr != c.pr]
         if not c.measured:
             tier = UNANSWERABLE
         elif mine:
+            # A found collision outranks every doubt: `app.collisions`' ladder,
+            # and for its reason — filing a definite shared path under "might
+            # share something" hides a fact behind a doubt, and a ranking is
+            # exactly the caller that reads only the collision tier.
             tier = COLLIDES
-        elif not c.complete:
-            tier = PARTIAL
-        else:
+        elif c.attested and not peers_unattested:
             tier = DISJOINT
+        else:
+            tier = PARTIAL
         row = Row(
             pr=c.pr, rank=None, tier=tier, moved=None, weight=c.weight,
-            weight_basis=("github's changed-file count"
-                          if c.changed_files_total is not None
-                          else f"{c.files_recorded} stored paths — nobody counted, "
-                               f"so this is a floor"),
+            weight_basis=_weight_basis(c),
             shared_total=shared_total, ready=c.ready, files_complete=c.complete,
+            evidence_pinned=c.pinned, counts_agree=c.counts_agree,
             run_id=c.run_id, run_ts=c.run_ts,
+            run_head=c.run_head, queue_head=c.queue_head, attested=c.attested,
             reason=_reason(c, tier, shared_total, [o.other(c.pr) for o in mine],
-                           answerable=len(candidates) - blind - 1, blind=blind),
+                           peers=len(candidates) - 1,
+                           unattested_peers=peers_unattested),
             collides_with=tuple(
                 {"pr": o.other(c.pr), "shared": o.shared, "files": list(o.sample),
                  "files_dropped": max(0, o.shared - len(o.sample)),
@@ -529,10 +708,12 @@ def rank(candidates: Sequence[Candidate],
         order=order,
         unranked=tuple(r.pr for r in unranked),
         rows=(*ordered, *unranked),
-        # A prefix list means the overlap found is a floor, so `disjoint` is not
-        # provable for anybody: one incomplete list is enough to make the whole
-        # proposal advisory rather than attested.
-        trusted=not unranked and all(c.complete for c in candidates),
+        # Every PR's evidence attested, or none of it is trusted. One prefix
+        # list, one run taken at a commit the branch has since left, or one
+        # sender contradicting its own count is enough — because each of those
+        # makes `disjoint` unprovable for every OTHER row too, and an order whose
+        # free lands might not be free is not the order this computed.
+        trusted=not unranked and all(c.attested for c in candidates),
         covers_all=not unranked,
         differs=bool(order) and order != fifo,
         counts=counts,

@@ -787,12 +787,15 @@ def merge_queue(ctx: Context, base: str, repo_path: str = ".",
     the queue while trying to land makes the queue one more shared thing to fight
     over.
 
-    Read `suggestion.order_trust` before you act on `suggested_order`, and expect
-    it to be null: it is withheld entirely while the board holds no changed-file
-    list for some queued PR, since an order that skipped a PR nobody can measure
-    would be a confident answer built on a partial measurement. `suggestion` still
-    carries the per-PR reasoning either way — which PRs collide on which paths,
-    what each weighs, and the caveat naming what it could not see.
+    **Expect `suggested_order` to be null, and read `suggestion` when it is.** It
+    is published only when every queued PR's evidence is attested: some run
+    recorded a complete file list, that run's own count agrees with it, and the
+    run reviewed the commit the queue says the PR is on. A list taken three
+    pushes ago is complete and describes a diff that is not the one landing, so
+    it does not count. `suggestion.partial_order` carries the ranking anyway with
+    its own `trusted` beside it, and `suggestion.order_trust.blind_spots` names
+    every PR that is holding the order back and what would fix it — usually "run
+    a panel round on it", because the panel's skip path records no files (#94).
 
     The order it proposes lands the provably disjoint PRs first (they cost nobody
     anything from any position) and then the heaviest colliders: a re-integration

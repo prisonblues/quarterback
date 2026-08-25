@@ -68,13 +68,24 @@ def repo(request) -> str:
 
 
 def cand(pr: int, position: int, *, total: int | None = 1, recorded: int | None = None,
-         ready: bool = True, resources: frozenset[str] = frozenset()) -> Candidate:
-    """A candidate whose stored list is complete unless a case says otherwise."""
+         ready: bool = True, resources: frozenset[str] = frozenset(),
+         run_head: str | None = "", queue_head: str | None = "") -> Candidate:
+    """A candidate whose evidence is fully attested unless a case says otherwise.
+
+    ``run_head``/``queue_head`` default to the SAME per-PR oid, so the ordinary
+    case is a run taken at the commit the queue is on and a test has to opt in to
+    staleness. The alternative — defaulting to unpinned — would have made every
+    existing assertion about tiers pass for the wrong reason.
+    """
+    same = SHA[pr % 9 + 1]
     return Candidate(
         pr=pr, position=position, ready=ready,
         changed_files_total=total,
         files_recorded=(total or 0) if recorded is None else recorded,
         run_id=pr, run_ts="2026-08-24T00:00:00+00:00", resources=resources,
+        queue_head=same if queue_head == "" else queue_head,
+        run_head=same if run_head == "" else run_head,
+        queue_base="main", run_base="main",
     )
 
 
@@ -136,7 +147,9 @@ def test_an_unmeasured_pr_is_ranked_at_no_position_and_suppresses_the_order():
     assert out.order == (1,)
     assert out.covers_all is False
     assert out.trusted is False
-    assert [r.tier for r in out.rows] == [DISJOINT, UNANSWERABLE]
+    # And #1 is NOT disjoint: it shares nothing with the PR the board can see,
+    # and there is one it cannot.
+    assert [r.tier for r in out.rows] == [PARTIAL, UNANSWERABLE]
     assert out.rows[1].rank is None
     assert "#94" in out.rows[1].reason
 
@@ -149,8 +162,9 @@ def test_an_unmeasured_pr_cannot_make_anybody_else_collide():
         [cand(1, 1, total=5), cand(2, 2, total=None, recorded=0)],
         [Overlap(a=1, b=2, shared=9, sample=("x.py",))],
     )
-    assert out.rows[0].tier == DISJOINT
+    assert out.rows[0].tier != COLLIDES
     assert out.rows[0].shared_total == 0
+    assert out.rows[0].collides_with == ()
 
 
 def test_a_prefix_list_leaves_the_order_standing_and_untrusted():
@@ -233,24 +247,33 @@ def test_a_sample_longer_than_its_count_is_refused():
         Overlap(a=1, b=2, shared=1, sample=("a.py", "b.py"))
 
 
-def test_disjoint_never_reads_as_a_safety_claim_over_a_population_it_could_not_see():
+def test_disjoint_is_a_claim_about_the_queue_and_not_about_one_row():
     """The sharpest version of "do not be confident on partial data", because it
-    is the one that would survive every other guard: `suggested_order` is already
-    null here, and a row still saying "shares no path with any other queued PR"
-    would be a false safety claim a reader could quote. The verdict is real — it
-    is what the measured population supports — and the sentence has to be as wide
-    as that population and no wider."""
-    out = rank([cand(1, 1, total=3),
-                cand(2, 2, total=None, recorded=0),
-                cand(3, 3, total=None, recorded=0)])
-    lone = out.rows[0]
-    assert lone.tier == DISJOINT
-    assert "2 more the board cannot answer for" in lone.reason
-    assert "not a safety claim" in lone.reason
+    is the one that survives every other guard: `suggested_order` is already null
+    in all three cases below, and a row still labelled `disjoint` would be a false
+    safety claim a reader could quote out of the payload on its own.
 
-    # And with nothing hidden, no such hedge is attached.
-    clean = rank([cand(1, 1, total=3), cand(2, 2, total=3)])
-    assert "safety claim" not in clean.rows[0].reason
+    A PR's own list being complete, pinned and consistent is not enough. The peer
+    it is being compared against may touch, on the files it never reported,
+    exactly what this PR touches — so one unattested row anywhere in the queue
+    means no row is disjoint."""
+    perfect = cand(1, 1, total=3)
+
+    # (a) a peer nobody has any list for.
+    assert rank([perfect, cand(2, 2, total=None, recorded=0)]).rows[0].tier == PARTIAL
+    # (b) a peer whose list is a prefix.
+    assert rank([perfect, cand(2, 2, total=2500, recorded=2)]).rows[0].tier == PARTIAL
+    # (c) a peer answered for by a run taken at a commit it has since left.
+    stale = cand(2, 2, total=3, run_head=SHA[7], queue_head=SHA[8])
+    row = rank([perfect, stale]).rows[0]
+    assert row.tier == PARTIAL
+    assert "#2" in row.reason and "not attested" in row.reason
+
+    # And with the whole queue attested, the claim is made and says so.
+    clean = rank([perfect, cand(2, 2, total=3)])
+    assert clean.rows[0].tier == DISJOINT
+    assert "every one of which is attested too" in clean.rows[0].reason
+    assert clean.trusted is True
 
 
 def test_movement_is_measured_against_the_population_that_was_ranked():
@@ -286,11 +309,23 @@ def files(*paths: str) -> list[dict]:
     return [{"path": p, "additions": 10, "deletions": 2} for p in paths]
 
 
+def head_of(pr: int) -> str:
+    """One full oid per PR, so a run and a queue entry can be pinned together."""
+    return f"{pr:040x}"
+
+
 async def record(client, repo: str, pr: int, paths: list[str] | None = None,
                  **over) -> dict:
-    """One panel round, recorded the way `harness/loops/panel.py` records one."""
+    """One panel round, recorded the way `harness/loops/panel.py` records one.
+
+    ``head_sha`` defaults to :func:`head_of` — the same oid :func:`join` enqueues
+    the PR at — because a run that never said which commit it reviewed is not
+    attested, and a suite whose every fixture was unattested could not test the
+    attested path at all.
+    """
     body = {
         "repo": repo, "pr": pr, "judged": True, "judge_model": "opus",
+        "head_sha": head_of(pr), "base_branch": "main",
         "reviewers_selected": ["claude"],
         "reviewers": {"claude": {"model": "opus", "ran": True}},
         "to_fix": [], "dismissed": [], "sonar_findings": [],
@@ -303,9 +338,10 @@ async def record(client, repo: str, pr: int, paths: list[str] | None = None,
     return r.json()
 
 
-async def join(client, repo: str, pr: int, head: str, **over) -> dict:
+async def join(client, repo: str, pr: int, head: str | None = None, **over) -> dict:
     r = await client.post("/merge-queue/enqueue", headers=AGENT, json={
-        "repo": repo, "base": "main", "pr": pr, "head": head, **over})
+        "repo": repo, "base": "main", "pr": pr,
+        "head": head or head_of(pr), **over})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -325,7 +361,7 @@ async def test_the_queue_is_ranked_from_the_boards_own_file_lists(client, repo):
     await record(client, repo, 502, ["panel.py"])
     await record(client, repo, 503, ["docs/README.md"])
     for pr in (501, 502, 503):
-        await join(client, repo, pr, SHA[1], verdict="ready")
+        await join(client, repo, pr, verdict="ready")
 
     view = await read(client, repo)
     # The live queue is arrival order and the proposal did not touch it.
@@ -354,12 +390,12 @@ async def test_the_suggestion_never_becomes_the_queue(client, repo):
     existing — `may_integrate: false`, and the PR it is actually behind."""
     await record(client, repo, 601, ["a.py"] * 1 + [f"f{i}.py" for i in range(40)])
     await record(client, repo, 602, ["a.py"])
-    await join(client, repo, 601, SHA[1], verdict="ready")
-    await join(client, repo, 602, SHA[2], verdict="ready")
+    await join(client, repo, 601, verdict="ready")
+    await join(client, repo, 602, verdict="ready")
     # 602 arrived second; ranked first it is not, but 601 is much heavier, so the
     # proposal puts 601 in front — and 602 is second in BOTH orders. Take the one
     # the proposal actually moved.
-    view = await read(client, repo, pr=602, head=SHA[2])
+    view = await read(client, repo, pr=602, head=head_of(602))
     assert view["active_order"] == [601, 602]
     assert view["you"]["is_head"] is False
     assert view["you"]["may_integrate"] is False
@@ -383,7 +419,7 @@ async def test_one_unmeasurable_pr_suppresses_the_whole_order(client, repo):
     # 703 reaches the queue having been skipped: a run exists for the repo, but
     # none for this PR.
     for pr in (701, 702, 703):
-        await join(client, repo, pr, SHA[3], verdict="ready")
+        await join(client, repo, pr, verdict="ready")
 
     view = await read(client, repo)
     assert view["active_order"] == [701, 702, 703]
@@ -397,8 +433,10 @@ async def test_one_unmeasurable_pr_suppresses_the_whole_order(client, repo):
     assert trust["trusted"] is False
     assert trust["measured"] == 2 and trust["unmeasured"] == 1
     assert trust["blind_spots"] == [
-        {"pr": 703, "class": UNANSWERABLE,
-         "why": "no run of this PR recorded a changed-file list", "issue": 94}]
+        {"pr": 703, "fault": "no-file-list", "issue": 94,
+         "why": "no run of this PR recorded a changed-file list",
+         "fix": "run a panel round on it; the panel's title-skip path will not "
+                "record one until #94"}]
     assert "#703" in trust["caveat"] and "#94" in trust["caveat"]
     # A blind PR is one shortfall, not two: it is `unmeasured`, and counting it
     # under `incomplete_lists` as well would stop the numbers reconciling against
@@ -407,22 +445,93 @@ async def test_one_unmeasurable_pr_suppresses_the_whole_order(client, repo):
     assert trust["measured"] + trust["unmeasured"] == sum(s["counts"].values())
 
 
-async def test_a_prefix_list_keeps_the_order_and_loses_the_attestation(client, repo):
+async def test_a_prefix_list_withholds_the_order_and_keeps_the_reasoning(client, repo):
     """GitHub caps a PR's file list at 3,000 and the panel records what it read,
     so `changed_files_total` disagreeing with the stored count is the only
-    evidence a list is a prefix. The order survives — the error runs one way —
-    and `trusted` does not."""
+    evidence a list is a prefix — and a prefix is a partial measurement. The
+    convenience field is withheld, because it is the field a consumer reads
+    without reading anything else; `partial_order` carries the same list with its
+    `trusted` beside it, which is where a caveated answer belongs."""
     await record(client, repo, 801, ["one.py"], changed_files_total=2500)
     await record(client, repo, 802, ["two.py"])
-    await join(client, repo, 801, SHA[1], verdict="ready")
-    await join(client, repo, 802, SHA[2], verdict="ready")
+    await join(client, repo, 801, verdict="ready")
+    await join(client, repo, 802, verdict="ready")
 
     view = await read(client, repo)
-    assert view["suggested_order"] is not None
-    trust = view["suggestion"]["order_trust"]
-    assert trust["trusted"] is False
+    assert view["suggested_order"] is None
+    s = view["suggestion"]
+    # Every PR was rankable — this is a trust refusal, not a coverage one.
+    assert s["covers_all"] is True
+    assert s["partial_order"] == [801, 802]
+    assert s["trusted"] is False
+    trust = s["order_trust"]
     assert trust["unmeasured"] == 0 and trust["incomplete_lists"] == 1
-    assert "#801" in trust["caveat"] and "FLOOR" in trust["caveat"]
+    assert trust["blind_spots"] == [
+        {"pr": 801, "fault": "prefix-list", "issue": None,
+         "why": "the stored file list is a prefix of what the PR touches, so a "
+                "shared-path count is a floor",
+         "fix": "nothing to do here — GitHub caps a PR's file list at 3,000 and "
+                "this PR is over it"}]
+    assert "#801" in trust["caveat"]
+
+
+async def test_a_run_taken_at_a_commit_the_branch_has_left_is_not_evidence(client, repo):
+    """The defect a second-opinion review found, and the one that would have been
+    invisible: a PR reviewed at commit A and pushed to B is answered for by A's
+    file list, which is complete, attested and about a diff that is not the one
+    landing. Two such PRs could be reported disjoint on the strength of two lists
+    that were both true and both about somewhere else.
+
+    The queue already holds the commit — its whole guarantee over an agent's
+    memory is that a claim names the commit it is about — so the check is a
+    comparison the endpoint simply was not making."""
+    await record(client, repo, 901, ["a.py"])          # recorded at head_of(901)
+    await record(client, repo, 902, ["b.py"])
+    await join(client, repo, 901, verdict="ready")
+    # #902 pushed since its round: the queue is on a commit the run never saw.
+    await join(client, repo, 902, head="f" * 40, verdict="queued")
+
+    view = await read(client, repo)
+    assert view["suggested_order"] is None
+    s = view["suggestion"]
+    assert s["covers_all"] is True and s["trusted"] is False
+    rows = {r["pr"]: r for r in s["prs"]}
+    # The stale row keeps its list — the file list is a floor, not a fiction —
+    # and loses only its right to stand behind a safety claim.
+    assert rows[902]["files_complete"] is True
+    assert rows[902]["evidence_pinned"] is False
+    assert rows[902]["attested"] is False
+    assert rows[902]["run_head"] == head_of(902) and rows[902]["queue_head"] == "f" * 40
+    # And #901, whose own evidence is perfect, is not disjoint either.
+    assert rows[901]["attested"] is True
+    assert rows[901]["tier"] == PARTIAL
+    assert [b["fault"] for b in s["order_trust"]["blind_spots"]] == ["evidence-not-at-head"]
+    assert s["order_trust"]["stale_evidence"] == 1
+
+
+async def test_a_sender_that_contradicts_its_own_count_is_weighed_at_the_larger(client, repo):
+    """`files_complete` tolerates `recorded > total` deliberately — for a
+    completeness verdict that is a sender bug and not a prefix. A ranking cannot,
+    because the count is the WEIGHT: a run claiming one changed file while storing
+    forty paths would be sorted behind every branch it collides with, which is the
+    end of a colliding pair that pays."""
+    await record(client, repo, 1001, [f"f{i}.py" for i in range(40)],
+                 changed_files_total=1)
+    await record(client, repo, 1002, ["f0.py"])
+    await join(client, repo, 1001, verdict="ready")
+    await join(client, repo, 1002, verdict="ready")
+
+    view = await read(client, repo)
+    assert view["suggested_order"] is None
+    s = view["suggestion"]
+    rows = {r["pr"]: r for r in s["prs"]}
+    assert rows[1001]["counts_agree"] is False
+    assert rows[1001]["weight"] == 40, "the larger of two numbers that disagree"
+    assert rows[1001]["attested"] is False
+    # And it is still ranked ahead of the PR it collides with, which is what
+    # taking the count at face value would have got wrong.
+    assert s["partial_order"] == [1001, 1002]
+    assert [b["fault"] for b in s["order_trust"]["blind_spots"]] == ["inconsistent-counts"]
 
 
 async def test_the_newest_run_answers_and_nothing_older_does(client, repo):
@@ -436,8 +545,8 @@ async def test_the_newest_run_answers_and_nothing_older_does(client, repo):
     # Round 2 recorded nothing — a skipped round, or a round before v2.23.
     await record(client, repo, 901, None, round=2)
     await record(client, repo, 902, ["shared.py"])
-    await join(client, repo, 901, SHA[1], verdict="ready")
-    await join(client, repo, 902, SHA[2], verdict="ready")
+    await join(client, repo, 901, verdict="ready")
+    await join(client, repo, 902, verdict="ready")
 
     view = await read(client, repo)
     assert view["suggested_order"] is None, "the newest run of #901 answered, and it said nothing"
@@ -451,8 +560,8 @@ async def test_two_migrations_are_contended_end_to_end(client, repo):
     """Two branches, no shared path, one alembic head."""
     await record(client, repo, 1001, ["migrations/0100_a.py", "app/one.py"])
     await record(client, repo, 1002, ["migrations/0101_b.py"])
-    await join(client, repo, 1001, SHA[1], verdict="ready")
-    await join(client, repo, 1002, SHA[2], verdict="ready")
+    await join(client, repo, 1001, verdict="ready")
+    await join(client, repo, 1002, verdict="ready")
 
     view = await read(client, repo)
     rows = {row["pr"]: row for row in view["suggestion"]["prs"]}
@@ -466,7 +575,7 @@ async def test_a_queue_of_one_is_not_ranked(client, repo):
     null says the ranking did not run, which is a different fact from a ranking
     that ran and refused — and `order_trust` is where the second one lives."""
     await record(client, repo, 1101, ["a.py"])
-    await join(client, repo, 1101, SHA[1], verdict="ready")
+    await join(client, repo, 1101, verdict="ready")
     view = await read(client, repo)
     assert view["suggestion"] is None
     assert view["suggested_order"] is None
@@ -479,8 +588,8 @@ async def test_the_axes_it_does_not_weigh_are_named_in_the_payload(client, repo)
     modelled whether one gates the other" — and the second one is #294."""
     await record(client, repo, 1201, ["a.py"])
     await record(client, repo, 1202, ["b.py"])
-    await join(client, repo, 1201, SHA[1], verdict="ready")
-    await join(client, repo, 1202, SHA[2], verdict="ready")
+    await join(client, repo, 1201, verdict="ready")
+    await join(client, repo, 1202, verdict="ready")
 
     axes = (await read(client, repo))["suggestion"]["axes_not_weighed"]
     assert 294 in [a["issue"] for a in axes]
