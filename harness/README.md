@@ -2159,6 +2159,116 @@ enough. A layout threshold is not forgiving in the same way — a pane that cros
 stopped would sit in the wrong layout until the next resize — which is how the older bug
 came to light.
 
+#### The dash full screen — `z`, `C-q z`, and the ⛶
+
+The wide layout is only worth having if the pane can be made wide, and 78 columns down the
+right of a seat screen never will be. `z` inside the dash, `C-q z` from anywhere on the
+screen, and the ⛶ on the top line all reach one verb — `qb-seat-key expand` — which
+**breaks the dash out into a window of its own**, and puts it back on the next press.
+
+**It is `break-pane`, and deliberately not `resize-pane -Z`.** Zoom was the obvious answer
+and is the wrong one: zoom is a property of the window and tmux drops it on any layout
+change, which this screen makes constantly — `select-layout -E` when a seat is closed, and
+the `window-resized` hook reasserting `@qb_dash_width` on every client attach. A dash zoomed
+to read would pop back to 78 columns the moment somebody attached a phone, with nothing on
+screen to say why. It is also not a `display-popup` running a second dashboard: that is a
+second board poll, a second `gh` poll, and a cold start whose ISSUES panel says "waiting for
+gh" for up to a minute. `break-pane` moves the pane the process is already in.
+
+It is the same move `d` makes, minus the `-d` that leaves the pane parked where nobody is
+looking — so it inherits everything that was hard about that one, including the rule that
+the widths are recorded **before** the break. That rule bites differently here and it cost a
+test to find: `hide_pane` is handed its size by a caller that read it first, while
+`expand_dash` does its own break, so reading afterwards is one line away and looks
+identical. It is not — after the break the pane fills its new window, so the recorded size
+is the whole terminal, and the join back asks for a 240-column pane inside a 240-column
+window and fails with `create pane failed: pane too small`.
+
+**Two toggles over three states**, and the crossings are decided rather than accidental. `d`
+means "in the row or not"; `z` means "full screen or not".
+
+| | `d` | `z` |
+|---|---|---|
+| in the row | → hidden | → expanded |
+| hidden | → in the row | → **expanded** |
+| expanded | → in the row | → in the row |
+
+The middle row is the one worth stating. Somebody pressing `z` on a hidden dash is asking
+for a dash they can read, and a hidden one is one step from that rather than in the wrong
+state for it — so it is shown rather than restored to its column, and rather than refused.
+It is also the cheap direction: the pane is already alone in a window, so that crossing is a
+rename and a `select-window` and no geometry moves at all. A `break-pane` there would fail
+outright, having nothing to break.
+
+Both routes out of the row record the same state and come back through the same
+`restore_dash`, so there is one way back however it left — which is why `@qb_dash_expanded`
+is cleared there rather than in `expand_dash`. `>` and `<` refuse while it is out, and say
+which of the two states they are refusing for: "hidden" about a dash filling the screen in
+front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
+state.
+
+**Nothing had to be taught about this mode for the resize hook to leave it alone.**
+`qb-seats`' own `dash_pane` looks in `$SESSION_ID:seats` and nowhere else, so an expanded
+dash is outside its reach and cannot be shrunk back to 78 columns by an attaching client.
+That is a property of where the pane went, not a special case anybody wrote.
+
+What the dash does with the room is its own business and is not arranged here: it is a
+Textual app that lays out to the width it is given, so a window-wide pane simply crosses the
+threshold above and goes two columns across. This verb moves a pane.
+
+#### Moving a plan item from the pane (#443)
+
+The plan has been readable from the terminal and orderable only from a browser. The ⇕ in
+the PLANS panel closes that: click it on an item to take it, click it on the row it should
+go above to place it, or press `[` / `]` to move the selected row one place. `u` puts back
+the last move **this pane** made.
+
+**It goes through a different door from everything else on this screen, and it has to.**
+`POST /plan/reorder` is `app.auth.human`, which no bearer token satisfies — and the agent
+vhost strips `X-Edge-Auth`, so the call cannot be made against `QUARTERBACK_BASE_URL`
+however it is authenticated. `qbdata.HumanClient` is that second door: the **browser**
+vhost (`QUARTERBACK_HUMAN_URL`) with a signed-in session cookie
+(`QUARTERBACK_EDGE_COOKIE`), and deliberately without the bearer token, because the
+reference deployment is one where the two never arrive together. It is the same handshake
+`qb-doctor`'s edge row already probes.
+
+Both of those live in the config file and nowhere else, which is why `resolve_config` had
+to learn about them: the condition that decides whether to source the file asked only about
+the URL and the token, so a host carrying **those** in its environment never read the file
+at all and the human credential sitting in it was invisible.
+
+**What this widens is not the plan's order.** The cookie is in a file readable by every
+process running as the user, so anything on the box can make any human-only write — the
+dials, an exemption grant, a scope declaration. That is `app.auth.human`'s own argument
+turned around, it is a deliberate choice rather than a consequence of this feature, and
+[#479](https://github.com/prisonblues/quarterback/issues/479) is the record of what it
+costs and the menu for narrowing it again.
+
+Four things the panel refuses rather than guesses at:
+
+- **A move between scopes.** Two scopes are two lists, and `plan.html`'s guarantee that a
+  reorder of one "can never renumber [another's] by accident" is a property of sending one
+  scope's whole order and nothing else — not of the endpoint. So the ⇕ goes grey on rows a
+  held item cannot land on, and a crossing says so.
+- **A no-op.** An order identical to the one in force is still a write, and `rank_source`
+  becomes `ordered` for every item in it — so a move that changes nothing would claim a
+  person had chosen positions they had not (#183's argument, one surface along).
+- **A move whose plan changed underneath it.** If either end is missing from the list by
+  the time the second click lands, nothing is sent.
+- **Anything at all with no cookie.** The icon is grey and says which variable to set,
+  rather than looking live and failing at the POST — against a board that is perfectly
+  healthy, because what is missing is on this host.
+
+`u` is one deep and in memory. It reaches the reorder this pane sent and nothing else: not
+a move made in the browser, not one made by an agent's tools, and not anything at all after
+the pane is closed. A stored previous order on the board is the real version and it is
+#479's, not this.
+
+**It is not a sort and it is not unbidden.** The verb moves the item a person clicked to
+the place the same person clicked. An agent forming an order from `plan_order` and applying
+it is [#478](https://github.com/prisonblues/quarterback/issues/478), is a different
+question about a different credential, and is not this.
+
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
 PLANS every repo's list — while a screen is built for one repository. So most rows were

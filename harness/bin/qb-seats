@@ -774,10 +774,21 @@ install_bar() {
 # dimmer and prefixed `~`, which is the mark the dashboard already uses for "at
 # most this long ago" — a stale ceiling is still the best estimate anyone has,
 # and blanking it would throw that away to avoid looking confident.
+#
+# THE ⛶ IS THE FIRST WIDGET ON THIS LINE, and it is on THIS line rather than the
+# seat bar because that bar is about seats — every cell on it names one, and a
+# control for the pane down the right-hand side would be the exception a reader
+# has to learn. `#[range=…]` is honoured in status-format and nowhere else, which
+# is the whole reason a clickable control can live on a status line at all; see
+# install_bar for the binding that turns a range into an action, and note that
+# this one is NOT confirmed — expanding a pane is as reversible as an act gets,
+# and the same click puts it back.
 top_line() {
   local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
   printf '%s' \
-"#[fill=$BAR_BG]#[align=left]$ground #{@qb_top}"\
+"#[fill=$BAR_BG]#[align=left]"\
+"#[range=user|expand]#[fg=colour110]#[bg=$BAR_BG] ⛶ $ground#[norange]"\
+" #{@qb_top}"\
 "#[align=right]"\
 "#{?@qb_pace,"\
 "#{?#{==:#{@qb_pace_sev},stale},#[fg=colour248]#[bg=$BAR_BG]~,#{?#{==:#{@qb_pace_sev},critical},#[fg=colour210]#[bg=$BAR_BG],#{?#{==:#{@qb_pace_sev},warning},#[fg=colour214]#[bg=$BAR_BG],#[fg=colour108]#[bg=$BAR_BG]}}}"\
@@ -948,6 +959,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$dd close $here\\\"\"" \
     "t|show or hide the tape|run-shell -b \"$d tape $here\"" \
     "d|show or hide the dash|run-shell -b \"$d dash $here\"" \
+    "z|the dash full screen, and back|run-shell -b \"$d expand $here\"" \
     "=|the dash back to the width it asked for|run-shell -b \"$d fit $here\"" \
     ">|the dash wider|run-shell -b \"$d wider $here\"" \
     "<|the dash narrower|run-shell -b \"$d narrower $here\"" \
@@ -955,7 +967,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
     "||" \
     "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$dd kill $here\\\"\"" \
-    "?|these keys, in full|display-popup -w 72 -h 27 \"$d guide\""
+    "?|these keys, in full|display-popup -w 72 -h 28 \"$d guide\""
   # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
   # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
   # the guide asks tmux which session it is in instead. `display-message -p` with

@@ -474,6 +474,7 @@ class Dash(App):
         # shows the screen's own, and a person who wants to compare two projects
         # wants the page. The ✎ on a row is the control; this is the map.
         ("d", "open_dials", "dials"),
+        ("z", "expand", "expand"),
         ("question_mark", "help", "keys"),
     ]
 
@@ -1694,6 +1695,24 @@ class Dash(App):
             return
         self.seat_click("add", session, f"add a seat to {session}?")
 
+    def action_expand(self) -> None:
+        """`z` — this pane to a window of its own, and back.
+
+        THROUGH `qb-seat-click`, exactly as the ＋ and the ✕ do, and for their
+        reason: the ⛶ on the top line, `C-q z` and this key are three front ends
+        onto ONE definition of what expanding means, which is `qb-seat-key
+        expand`. Two copies of the break-and-rejoin would be two places for the
+        geometry lore to drift.
+
+        NOT CONFIRMED, unlike the ✕. Nothing is killed, no process is touched —
+        the dash keeps polling across the move — and the same key puts it back.
+        """
+        session = self.seat_session()
+        if not session:
+            self.say("no seat screen on this server — nothing to expand into")
+            return
+        self.run_seat_click("expand", session)
+
     def jump_pane(self, seat: dict) -> None:
         """Move the tmux cursor to a seat's pane, by pane id.
 
@@ -2313,7 +2332,8 @@ class Dash(App):
 
     def action_help(self) -> None:
         self.say("o open on GitHub · p panel-review · f fix the selected issue or "
-                 "plan item · d the board's dials page · s this project's rows or the "
+                 "plan item · d the board's dials page · z this pane full screen "
+                 "and back · s this project's rows or the "
                  "whole fleet's · r refresh · q quit · click ⚖ to review, ⚒ to fix, "
                  "✎ to set or clear a dial (ctrl+s saves, ctrl+x clears), a plan row "
                  "for why it is there, a seat to jump to its pane")
