@@ -1312,6 +1312,64 @@ def render(report: Report) -> str:
 MAX_POST_REFS = 10
 
 
+def report_findings(report: Report) -> None:
+    """Hand the board this pass's findings, per scope, so `plan_read` can carry them.
+
+    **Separate from the board post, and both are wanted.** The post is for people
+    and for the stream — one line, suppressed when it would repeat itself. This is
+    for `plan_read`: structured, per ref, and carrying the CONDITION, which a post
+    cannot. `Ref` is a generic dev-context link with four fields, so a
+    `done_candidate` and a `dropped_candidate` arrive through the post identical —
+    and those two are the pair that must never be confused, one being a record
+    already overtaken and the other a judgement somebody has to make (#463).
+
+    **Sent on every pass, and NOT gated on the digest.** The write replaces a
+    scope's set, so an empty report is the message that says a scope has nothing
+    outstanding — skip it because "nothing changed" and rows for work that was
+    finished hours ago stay on the board for ever. Idempotent by construction,
+    which is what makes re-sending an unchanged report cost nothing and two hosts
+    reporting the same pass harmless.
+
+    **Per scope, because that is the unit the write replaces.** A pass covering
+    two repos that posted them together would have to say which of the two an
+    absent ref was absent from, and the answer would be "both" — silently
+    resolving the other repo's findings.
+
+    Best-effort, like the post beside it: a pass whose report reached the log has
+    done its job, and telemetry that can fail the thing it reports on is worse
+    than none.
+    """
+    by_repo: dict[str, list[dict]] = {repo: [] for repo in report.repos}
+    for finding in report.findings:
+        kind, _, value = (finding.ref or "").partition("#")
+        if kind not in ("pr", "issue") or not value or not finding.repo:
+            continue
+        by_repo.setdefault(finding.repo, []).append({
+            "ref_kind": kind, "ref_value": value,
+            "condition": finding.condition,
+            # The pass's own sentence, so the plan quotes what was observed rather
+            # than paraphrasing it a second time on the other side.
+            "said": finding.summary,
+        })
+    if not by_repo:
+        return
+    try:
+        client, _cfg = client_once()
+    except Exception as exc:                                # noqa: BLE001
+        print(f"qb-reconcile: report stands, but the board is unreachable: {exc}",
+              file=sys.stderr)
+        return
+    for repo, findings in by_repo.items():
+        try:
+            client.post("/plan/reconcile", {"repo": repo, "findings": findings})
+        except Exception as exc:                            # noqa: BLE001
+            # NAMED, not swallowed: an older board has no such endpoint, and a
+            # silent 404 every fifteen minutes is how a feature comes to be
+            # believed dead. One line per scope is cheap and says which.
+            print(f"qb-reconcile: {repo}'s findings were not recorded on the "
+                  f"plan: {exc}", file=sys.stderr)
+
+
 def post_refs(report: Report) -> list[dict]:
     """Dev-context links for the board post: the repos, then the findings' own refs.
 
@@ -1500,6 +1558,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report.as_dict(), indent=2))
     elif not (args.quiet and not has_content):
         print(render(report))
+
+    if args.post:
+        # BEFORE the digest gate and outside it. The gate is about not repeating a
+        # post nobody needs to read twice; the plan's copy is a state the board
+        # holds, and an unchanged state still has to be re-asserted for the empty
+        # case to mean anything. See report_findings.
+        report_findings(report)
 
     if args.post and has_content:
         digest = post_digest(report)

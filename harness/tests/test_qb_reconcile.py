@@ -898,6 +898,23 @@ def test_the_board_is_only_asked_about_a_pr_whose_note_makes_a_claim():
     assert [u.condition for u in report.unknowns] == []
 
 
+def board_post_recorder(posts):
+    """A board double that records the BOARD POST and ignores the other write.
+
+    `--post` makes two now: the `finding` every test in this section is about, and
+    the structured hand-off to `/plan/reconcile` that lets `plan_read` carry the
+    pass's conditions (#463). The second is deliberately outside the digest gate —
+    it re-asserts a state rather than repeating a message, and its empty form is
+    what resolves rows — so a recorder that counted both would make every
+    suppression test here read 2 and pin nothing.
+    """
+    class Recording:
+        def post(self, path, body):
+            if path == "/post":
+                posts.append((path, body))
+    return Recording()
+
+
 class FakeBoard:
     """A board that answers the three GETs `run` makes, and records them."""
 
@@ -1344,7 +1361,7 @@ def test_the_unchanged_post_notice_never_lands_in_the_json_payload(capsys):
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report(
         items=[item()], open_prs=[])
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         qr.main(["--json", "--post"])
         capsys.readouterr()
@@ -1363,7 +1380,7 @@ def test_the_pass_does_not_post_unless_asked(capsys):
     posts = []
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report()
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         qr.main([])
         assert posts == []
@@ -1527,7 +1544,7 @@ def test_post_says_nothing_at_all_on_a_clean_complete_report(capsys):
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report(
         items=[item(ref=None)], open_prs=[])
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         report = qr.run()
         assert report.findings == [] and report.unknowns == []
@@ -1548,7 +1565,7 @@ def test_an_unchanged_report_is_not_posted_a_second_time(capsys):
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report(
         items=[item()], open_prs=[])
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         qr.main(["--post"])
         assert len(posts) == 1
@@ -1574,7 +1591,7 @@ def test_an_unchanged_report_is_posted_again_once_it_has_aged_out(capsys):
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report(
         items=[item()], open_prs=[])
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         qr.main(["--post"])
         assert len(posts) == 1
@@ -1626,7 +1643,7 @@ def test_a_report_that_changed_is_posted_again(capsys):
                            open_prs=[])]
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: reports.pop(0)
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         qr.main(["--post"])
         qr.main(["--post"])
@@ -1672,7 +1689,7 @@ def test_a_tick_whose_only_content_is_skipped_prs_still_prints_and_posts(capsys)
 
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: report
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         assert qr.main(["--post", "--quiet"]) == 0
         out = capsys.readouterr().out
@@ -1693,7 +1710,7 @@ def test_a_wholly_empty_tick_is_still_silent_under_quiet(capsys):
 
     saved_run, qr.run = qr.run, lambda _repo=None, **_k: report
     saved_client, qr.board_client = qr.board_client, lambda: (
-        type("C", (), {"post": lambda _s, p, b: posts.append((p, b))})(), None)
+        board_post_recorder(posts), None)
     try:
         assert qr.main(["--post", "--quiet"]) == 0
         assert capsys.readouterr().out == ""
@@ -1723,8 +1740,11 @@ def test_the_board_client_is_built_once_for_the_reads_and_the_write(capsys):
     saved_prs, qr.fetch_open_prs = qr.fetch_open_prs, lambda repo: ([], None)
     try:
         assert qr.main(["--post"]) == 0
-        assert [p for p, _ in board.posts] == ["/post"]
-        assert built == [1], "one client for three GETs and the POST"
+        # BOTH writes, and one client for them: the plan hand-off (#463) goes
+        # first, so a second client here would be a second secret-fetch before the
+        # `finding` even starts.
+        assert [p for p, _ in board.posts] == ["/plan/reconcile", "/post"]
+        assert built == [1], "one client for three GETs and both POSTs"
     finally:
         qr.board_client, qr.fetch_ref_state, qr.fetch_open_prs = (
             saved_client, saved_ref, saved_prs)
@@ -1907,3 +1927,102 @@ def test_a_filter_naming_a_repo_the_plan_does_not_have_still_asks_about_it(wired
     finally:
         qr.fetch_open_prs = saved
     assert asked == ["acme/notontheplan"]
+
+
+# ---------------------------------------------- handing the findings to the plan (#463)
+
+
+class PostingBoard(FakeBoard):
+    """A board that also records what was POSTed, and can be told to refuse one path."""
+
+    def __init__(self, *a, refuse=None, **kw):
+        super().__init__(*a, **kw)
+        self.posts: list[tuple[str, dict]] = []
+        self.refuse = refuse
+
+    def post(self, path, body):
+        if self.refuse and path.startswith(self.refuse):
+            raise RuntimeError("404 Not Found")
+        self.posts.append((path, body))
+        return {}
+
+
+def _wire_board(monkeypatch, board):
+    monkeypatch.setattr(qr, "_CLIENT", None)
+    monkeypatch.setattr(qr, "board_client", lambda: (board, None))
+
+
+def test_the_findings_reach_the_plan_one_scope_at_a_time(monkeypatch):
+    """Per scope, because the write REPLACES a scope's set.
+
+    Reported together, a ref absent from the payload would be absent from both —
+    silently resolving findings for a repo this pass never spoke about.
+    """
+    board = PostingBoard({"items": []})
+    _wire_board(monkeypatch, board)
+    report = qr.Report(generated="now", repos=["acme/one", "acme/two"], findings=[
+        qr.Finding(condition="done_candidate", subject="s", summary="issue#1 is closed",
+                   repo="acme/one", ref="issue#1"),
+        qr.Finding(condition="stale_claim", subject="s", summary="claim is stale",
+                   repo="acme/two", ref="pr#9"),
+    ])
+
+    qr.report_findings(report)
+
+    sent = {body["repo"]: body["findings"] for path, body in board.posts
+            if path == "/plan/reconcile"}
+    assert set(sent) == {"acme/one", "acme/two"}
+    assert sent["acme/one"] == [{"ref_kind": "issue", "ref_value": "1",
+                                 "condition": "done_candidate",
+                                 "said": "issue#1 is closed"}]
+    assert sent["acme/two"][0]["ref_kind"] == "pr"
+
+
+def test_a_scope_with_nothing_to_report_is_still_reported(monkeypatch):
+    """The empty report is the message. Silence would leave resolved rows for ever.
+
+    A pass reports what it STILL finds, so a scope it checked and had nothing to
+    say about has to say that — it is what deletes the rows from the pass before.
+    """
+    board = PostingBoard({"items": []})
+    _wire_board(monkeypatch, board)
+
+    qr.report_findings(qr.Report(generated="now", repos=["acme/quiet"], findings=[]))
+
+    assert [b for _p, b in board.posts] == [{"repo": "acme/quiet", "findings": []}]
+
+
+def test_a_finding_with_nothing_the_plan_can_key_on_is_left_out(monkeypatch):
+    """`untracked_pr` carries a ref; a finding about a scope as a whole need not.
+
+    The plan keys on (repo, kind, value), so a finding without all three has no
+    row to be — and inventing one would put a ref on the board that no item and no
+    forge object answers to.
+    """
+    board = PostingBoard({"items": []})
+    _wire_board(monkeypatch, board)
+    report = qr.Report(generated="now", repos=["acme/partial"], findings=[
+        qr.Finding(condition="done_candidate", subject="s", summary="no ref at all",
+                   repo="acme/partial"),
+        qr.Finding(condition="done_candidate", subject="s", summary="no repo",
+                   ref="issue#4"),
+        qr.Finding(condition="note_contradicted", subject="s", summary="kept",
+                   repo="acme/partial", ref="issue#5"),
+    ])
+
+    qr.report_findings(report)
+
+    assert [f["ref_value"] for _p, b in board.posts for f in b["findings"]] == ["5"]
+
+
+def test_a_board_that_refuses_the_endpoint_says_so_and_does_not_stop_the_pass(monkeypatch,
+                                                                             capsys):
+    """An older board has no such endpoint, and a silent 404 every fifteen minutes
+    is how a feature comes to be believed dead. The pass's own report still stands."""
+    board = PostingBoard({"items": []}, refuse="/plan/reconcile")
+    _wire_board(monkeypatch, board)
+
+    qr.report_findings(qr.Report(generated="now", repos=["acme/old"], findings=[]))
+
+    assert board.posts == []
+    assert "acme/old" in capsys.readouterr().err

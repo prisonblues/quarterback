@@ -50,7 +50,8 @@ from typing import Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import func, or_, select, text, tuple_, update
+from sqlalchemy import case, delete, func, or_, select, text, tuple_, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,6 +74,7 @@ from app.identity import HUMAN, is_human, same_machine
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
+from app.models.plan_reconcile import PlanReconcile
 from app.models.plan_scope import PlanScope
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
@@ -781,10 +783,50 @@ def _review_view(item: PlanItem) -> dict | None:
     }
 
 
+async def _reconcile_for(session: AsyncSession,
+                         items: list[PlanItem]) -> dict[tuple[str, str, str], PlanReconcile]:
+    """What the last pass said about these items' refs, keyed the way a ref is addressed.
+
+    Only refs, and only the ones on this page: an item with no ref cannot be
+    reconciled against anything, and a fleet read would otherwise load every row
+    the table has to answer about twenty.
+    """
+    keys = {(i.repo, i.ref_kind, i.ref_value)
+            for i in items if i.repo and i.ref_kind and i.ref_value}
+    if not keys:
+        return {}
+    rows = await session.scalars(
+        select(PlanReconcile).where(
+            tuple_(PlanReconcile.repo, PlanReconcile.ref_kind,
+                   PlanReconcile.ref_value).in_(keys)))
+    return {(r.repo, r.ref_kind, r.ref_value): r for r in rows}
+
+
+def _reconcile_view(row: PlanReconcile | None, now: datetime) -> dict | None:
+    """What a reader gets: the condition, the pass's own words, and how long.
+
+    ``days`` is the one thing no single pass can report — it holds no history, so
+    "flagged for two days" only exists because `first_seen` survives the passes
+    that followed. It is also the number that decides how a reader should feel
+    about it: minutes old is a race, two days old is a plan nobody is maintaining.
+    """
+    if row is None:
+        return None
+    return {
+        "condition": row.condition,
+        "said": row.said,
+        "since": row.first_seen.isoformat(),
+        "last_seen": row.last_seen.isoformat(),
+        "days": round((now - row.first_seen).total_seconds() / 86400, 1),
+        "reported_by": row.reported_by,
+    }
+
+
 def _item_view(item: PlanItem, claim: ResourceLease | None,
                blockers: list[PlanItem], now: datetime,
                plan: Plan | None = None, plan_claim: ResourceLease | None = None,
-               mine: str | None = None, session_id: str | None = None) -> dict:
+               mine: str | None = None, session_id: str | None = None,
+               reconciled: PlanReconcile | None = None) -> dict:
     idle = (now - item.updated_at).total_seconds() / 86400
     return {
         "item_id": str(item.id),
@@ -807,6 +849,10 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
         # consumer greping prose. `null` on anything that is not a PR item,
         # because the marker means nothing there (#335).
         "review": _review_view(item),
+        #: What the last reconcile pass found about this item's ref, or null when
+        #: it found nothing and when no pass has run (#463). NOT a state: the item
+        #: is still whatever somebody set it to, and `next` still returns it.
+        "reconcile": _reconcile_view(reconciled, now),
         "depends_on": list(item.depends_on or []),
         # Only OPEN dependencies block: a dropped one will never be done, and
         # waiting on it forever would be the plan quietly lying about "next".
@@ -886,15 +932,72 @@ def _next_caveat(nxt: dict | None, trust: dict, open_n: int) -> str | None:
     it must not get is unqualified confidence — this is the issue's sharpest
     complaint, and the minimum fix it asks for even if placement never landed.
 
-    Two separate things can qualify the answer and both are said when both apply:
-    the order was partly nobody's, and the row at the top of it is work somebody
-    abandoned (#427).
+    Three separate things can qualify the answer and all are said when all apply:
+    the last reconcile pass found this item's work already finished (#463), the row
+    at the top is work somebody abandoned (#427), and the order was partly nobody's.
+
+    **In that order, and it is not arbitrary.** A reader who stops after one
+    sentence should have been told the thing that changes what they do next, and
+    "this is already done" changes it completely, while "the ranks below rank 21
+    are unchosen" changes it hardly at all.
     """
     if nxt is None:
         return None
-    parts = [p for p in (_abandoned_caveat(nxt), _unchosen_caveat(nxt, trust, open_n))
+    parts = [p for p in (_reconciled_caveat(nxt), _abandoned_caveat(nxt),
+                         _unchosen_caveat(nxt, trust, open_n))
              if p]
     return " ".join(parts) or None
+
+
+def _reconciled_caveat(nxt: dict) -> str | None:
+    """Said when the last pass found this item's work already finished, or unlike itself.
+
+    The failure this exists for, with its own times on it: at 10:40Z a plan read
+    answered ``next: #449``; #449 had been closed as completed at 07:33Z; and the
+    reconcile pass seven minutes earlier had said so, naming it by rank. Both facts
+    were on this board and no reader saw them together — so the caveat that DID
+    fire was ``_abandoned_caveat``, telling the reader to go and ask the agent who
+    put it down whether it had been finished. The board already knew.
+
+    **It does not skip the item, and nothing here marks it done.** That is the
+    distinction `qb-reconcile` draws and this keeps: `done_candidate` on a closed
+    issue is a record that has been overtaken, but `dropped_candidate` is a
+    judgement about abandoned work, and a reader has to make it. So both are said
+    and neither is acted on. The plan is still what somebody set it to.
+
+    ``days`` is quoted for the same reason it is stored. One of the three items
+    this was written for had been closed for over two days while the pass named it
+    every fifteen minutes, and "since Sunday" is what tells a reader they are
+    looking at an unmaintained list rather than a race they lost by seconds.
+    """
+    found = nxt.get("reconcile")
+    if not found:
+        return None
+    days = found["days"]
+    lately = ("in the last hour" if days < 0.05 else
+              f"for {days:g} day{'' if days == 1 else 's'}")
+    said = found.get("said")
+    quoted = f" — {said}" if said else ""
+    if found["condition"] == "done_candidate":
+        return (
+            f"THE LAST RECONCILE PASS SAYS THIS IS ALREADY FINISHED{quoted}. It has "
+            f"said so {lately}, and the plan has not caught up — the item is open "
+            f"here because nobody called `plan_done`, not because the work is "
+            f"outstanding. Check the issue before you start; if it is closed, this "
+            f"is a plan to tidy rather than work to do."
+        )
+    if found["condition"] == "dropped_candidate":
+        return (
+            f"The last reconcile pass says the work behind this was abandoned rather "
+            f"than completed{quoted} ({lately}). Whether that means the item should "
+            f"be dropped is a decision nobody has made — it is deliberately not made "
+            f"for you here, and it is worth making before starting."
+        )
+    return (
+        f"The last reconcile pass flagged this item as `{found['condition']}`"
+        f"{quoted} ({lately}). It is still offered as next; read what the pass "
+        f"found before treating the row as accurate."
+    )
 
 
 def _abandoned_caveat(nxt: dict) -> str | None:
@@ -1010,6 +1113,7 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
     anything: a plan claim held by the caller covers nothing from the caller.
     """
     plans = await _plans_for(session, items)
+    reconciled = await _reconcile_for(session, items)
     open_items = [i for i in items if i.state == "open"]
     claims = await _claims_for(
         session,
@@ -1037,6 +1141,7 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
             plan=plan_of(item),
             plan_claim=plan_claim_of(plan_of(item)) if item.state == "open" else None,
             mine=mine, session_id=session_id,
+            reconciled=reconciled.get((item.repo, item.ref_kind, item.ref_value)),
         )
         for item in items
     ]
@@ -1695,6 +1800,125 @@ def _scope_view(scope: PlanScope) -> dict:
         "added_by": scope.added_by,
         "created": scope.created_at.isoformat(),
     }
+
+
+class ReconcileFindingIn(BaseModel):
+    """One ref a pass had something to say about.
+
+    ``condition`` is not constrained to a known set on purpose. The list belongs
+    to `qb-reconcile` and will grow there first, on a host that updates when its
+    harness does — and a board that rejected a whole pass for carrying one word it
+    had not been taught would fail closed on exactly the day somebody added a
+    condition. An unknown one is stored and shown; :func:`_reconciled_caveat` says
+    what it can about it and no more.
+    """
+
+    ref_kind: Literal["issue", "pr"]
+    ref_value: str = Field(min_length=1, max_length=64)
+    condition: str = Field(min_length=1, max_length=64)
+    #: The pass's own sentence. Quoted back rather than re-derived, so the plan
+    #: reports what was observed and not this board's paraphrase of it.
+    said: str | None = Field(default=None, max_length=2000)
+
+
+class ReconcileIn(BaseModel):
+    """One scope's reconcile pass, entire.
+
+    **Entire is the contract**: what arrives replaces what that scope had. A pass
+    reports what it still finds, so a ref that has stopped being reported has
+    stopped being true — resolution needs no separate call and cannot be forgotten
+    in one. It also makes the write idempotent, which matters more than it sounds:
+    two hosts run this timer and report the same pass minutes apart, and under
+    append semantics the board would slowly fill with two of everything.
+    """
+
+    repo: str = Field(min_length=1, max_length=MAX_SCOPE)
+    findings: list[ReconcileFindingIn] = Field(default_factory=list, max_length=500)
+
+
+@router.post("/plan/reconcile")
+async def report_reconcile(
+    body: ReconcileIn,
+    reporter: str = Depends(author),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Record what a reconcile pass found about one scope's refs (#463).
+
+    **The board cannot compute this.** It has no forge and #327 says it should not
+    grow one, so whether an issue is closed is knowable only to a client holding
+    `gh`. This is the door that observation comes through.
+
+    **It changes no plan state, and that is the design rather than a limitation.**
+    Nothing here marks an item done, drops it, or reorders anything: `next` still
+    returns a flagged item rather than skipping it, and `state` stays whatever a
+    person or an agent set. `qb-reconcile`'s own refusal to write is right about
+    the conditions that are decisions — `dropped_candidate` in particular, where
+    "the work was abandoned" is a judgement and inferring it would erase the
+    distinction the plan's model exists to keep. What was missing was never the
+    decision; it was that the observation and the plan were two facts on one board
+    that never met. `plan_read` carries this now, and says it in `next.caveat`.
+
+    Agent-authenticated, unlike the plan's ORDER, which is human-only. Ordering is
+    the fleet's shared intent and an agent rewriting it makes the plan thrash;
+    reporting what GitHub says about a ref is not intent, and the only agent that
+    can report it is one somebody already trusted with a machine token.
+    """
+    now = datetime.now(UTC)
+    seen: dict[tuple[str, str], ReconcileFindingIn] = {}
+    for finding in body.findings:
+        # LAST ONE WINS, and a pass that names a ref twice is not an error worth a
+        # 400: `untracked_pr` and `note_contradicted` can both be true of one PR,
+        # and refusing the report would lose the other four findings with it.
+        seen[(finding.ref_kind, finding.ref_value)] = finding
+
+
+    # ON CONFLICT, not read-then-write. Two hosts hold this timer and their passes
+    # can land together, and the read above cannot see a row a concurrent request
+    # is inserting — so the plain version loses the race on the unique constraint
+    # and 500s, which the client reports as "not recorded" and the next tick
+    # silently repairs. `first_seen` is deliberately absent from the update:
+    # SURVIVING is what makes it mean "since", and it is the reason these are rows
+    # and not a blob per pass — "a done candidate since Sunday" is the sentence
+    # that turns a report into an argument, and no single pass can say it.
+    for finding in seen.values():
+        await session.execute(
+            pg_insert(PlanReconcile)
+            .values(repo=body.repo, ref_kind=finding.ref_kind,
+                    ref_value=finding.ref_value, condition=finding.condition,
+                    said=finding.said, first_seen=now, last_seen=now,
+                    reported_by=reporter)
+            .on_conflict_do_update(
+                constraint="uq_plan_reconcile_ref",
+                set_={"condition": finding.condition, "said": finding.said,
+                      "last_seen": now, "reported_by": reporter,
+                      # RESTARTED WHEN THE CONDITION CHANGES. `since` is quoted in
+                      # the caveat as how long THIS has been true, so carrying it
+                      # across a ref that was a stale claim on Monday and a done
+                      # candidate on Wednesday would date the second from the
+                      # first — a false sentence, and the one a reader would act
+                      # on hardest. Unqualified here is the EXISTING row, and
+                      # `excluded` would be the proposed one.
+                      "first_seen": case(
+                          (PlanReconcile.condition == finding.condition,
+                           PlanReconcile.first_seen), else_=now)}))
+    stored = len(seen)
+
+    # ONE statement, evaluated against the table rather than against a list this
+    # request read a moment ago. Two passes can land together — two hosts hold this
+    # timer — and a read-then-delete lets each miss the other's inserts, leaving a
+    # union of two reports that neither pass made. Deleting by "not in what I was
+    # given" makes the loser's rows go with it: the outcome is one pass's set,
+    # which is what replacing a scope's findings is supposed to mean.
+    gone = await session.execute(
+        delete(PlanReconcile).where(
+            PlanReconcile.repo == body.repo,
+            tuple_(PlanReconcile.ref_kind, PlanReconcile.ref_value).notin_(seen)
+            if seen else text("true")))
+    resolved = gone.rowcount or 0
+
+    await session.commit()
+    return {"repo": body.repo, "stored": stored, "resolved": resolved,
+            "reported_by": reporter, "at": now.isoformat()}
 
 
 @router.get("/plan/scopes")

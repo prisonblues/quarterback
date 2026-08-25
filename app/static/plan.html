@@ -83,6 +83,11 @@
   .chip.hold { color:#9fddc7; border-color:#2e5c48; }
   .chip.block { color:#f0b429; border-color:#5c4a1e; }
   .chip.stale { color:#e5484d; border-color:#5c2626; }
+  /* What the last reconcile pass found (#463). Amber like the other "somebody has
+     to look at this" chips rather than red: the item is not broken, the plan is
+     just behind the work — and this page is where the person who can fix that is
+     standing. */
+  .chip.reconciled { color:#f0b429; border-color:#5c4a1e; }
   .chip.plan { color:#c9b6f5; border-color:#3a2f56; }
   .chip.covered { color:#e0c890; border-color:#4a3b1e; }
   .chip.fleet { color:#8fb4e8; border-color:#31435c; }
@@ -416,6 +421,11 @@ function ctl(ok, refusal, does){
 function rv(it){ return it.review || {}; }
 
 function row(it, s){
+  /* What the pass said, for the tooltip AND for the tap. A phone has no hover, so
+     a `title` alone is an explanation only some readers can reach — the rule this
+     page's own test enforces on every row. */
+  const reconWhy = it => `${it.reconcile.condition.replace(/_/g," ")}, seen ${
+    it.reconcile.days}d ago${it.reconcile.said?": "+it.reconcile.said:""}`;
   const el = document.createElement("div");
   const held = it.claim, blocked = (it.blocked_by||[]).length;
   // Only an OPEN row of the exact scope on screen has an order this page can rewrite:
@@ -508,6 +518,10 @@ function row(it, s){
         ${!rv(it).exempt&&rv(it).requested?`<span class="chip asked" data-why="${
           esc(askedWhy)}" title="${esc(askedWhy)}">exemption asked for by ${
           rv(it).requested_by?who(rv(it).requested_by):"somebody"}</span>`:""}
+        ${it.reconcile?`<span class="chip reconciled" data-why="${esc(reconWhy(it))}"
+          title="${esc(reconWhy(it))}">${
+          it.reconcile.condition==="done_candidate"?"looks finished"
+          :esc(it.reconcile.condition.replace(/_/g," "))} · ${it.reconcile.days}d</span>`:""}
         ${it.stale?`<span class="chip stale">stale ${it.idle_days}d</span>`:""}
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
