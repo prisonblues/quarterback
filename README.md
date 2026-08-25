@@ -400,6 +400,14 @@ GET   /plan/scopes       -> {scopes:[{scope, label, note, added_by, created}], s
 POST  /plan/scope        { name, note? }  -> 201 {scope, created}      ← human-only
                           declare a scope with no repo behind it. Idempotent: declaring
                           one that exists returns it with created=false
+POST  /plan/reconcile    { repo, findings:[{ref_kind, ref_value, condition, said?}] }
+                          what a reconcile pass found about one scope's refs (#463).
+                          REPLACES that scope's set, so a ref the pass stops naming is
+                          resolved and an empty report is the message that says so.
+                          Changes no plan state: `next` still returns a flagged item,
+                          `state` stays what somebody set, and the read carries the
+                          finding in `items[].reconcile` and says it in `next.caveat`.
+                          The board has no forge (#327) and cannot check this itself
 GET   /plan/view         (browser view — the plan, and where a human reorders it)
 
 # the landing graph — what gates what, across repos, and who is minding it (#294)
