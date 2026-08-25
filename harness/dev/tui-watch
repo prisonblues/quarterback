@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""tui-watch — run a quarterback terminal client from THIS CHECKOUT and restart
+it the moment its source changes.
+
+The problem it solves is not "Textual has no hot reload" — it is that the thing
+on the seat screen is not the thing you are editing. `qb-dash` on PATH resolves
+to /nix/store/…-quarterback-harness/bin/qb-dash.py, so an edit to
+harness/bin/qb-dash-tui.py is invisible until a home-manager switch. This runs
+the launcher OUT OF THE CHECKOUT instead, where the same script finds
+../../mcp/.venv/bin/python beside itself and imports the source you just saved.
+
+Restart, not reload: Textual can live-reload CSS, but only from a CSS_PATH file,
+and both apps here declare `CSS = \"\"\"…\"\"\"` inline — so there is nothing on
+disk for it to watch, and a full relaunch is the honest mechanism. It costs the
+app's cursor position and selected pane, which is the trade being made.
+
+  harness/dev/tui-watch dash      the clickable dashboard  (harness/bin/qb-dash --tui)
+  harness/dev/tui-watch board     the full-screen board client (harness/bin/qb-board)
+  harness/dev/tui-watch plain     the non-Textual dash, for comparing the two halves
+  harness/dev/tui-watch dash --scope all      trailing args go to the target
+  harness/dev/tui-watch -- ./some/other/thing extra args
+
+Needs mcp/.venv to carry rich and textual, which is not the default build —
+the `tui` extra is opt-in and `rich` is not a dependency of the mcp package at
+all. If the launcher says no Python here can import what it needs:
+
+    uv pip install --python mcp/.venv/bin/python -e './mcp[tui,dev]' rich
+
+Ctrl-C quits the watcher and the app together, which is also what Ctrl-C means
+inside both apps, so there is no second thing to learn.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent.parent
+
+#: Poll rather than inotify. No watcher binary is installed on any fleet host —
+#: not entr, watchexec, inotifywait or fswatch — and adding one to the closure to
+#: save a stat() per file per 400ms on a few dozen files is the wrong trade for a
+#: developer tool that only ever runs while somebody is looking at it.
+POLL_SECONDS = 0.4
+
+#: Escape sequences Textual writes on a CLEAN exit and cannot write when it is
+#: killed: leave the alternate screen, stop mouse reporting (all four modes it
+#: may have enabled), show the cursor. Without these a restart leaves the pane
+#: with an invisible cursor that reports every mouse move as garbage input.
+RESET = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h"
+
+#: What each preset runs, and what a change to it means a restart. Sources are
+#: repo-relative; a directory is walked, a file is watched as itself.
+TARGETS = {
+    "dash": {
+        "cmd": ["harness/bin/qb-dash", "--tui"],
+        "watch": ["harness/bin/qb-dash-tui.py", "harness/bin/qbdata.py", "harness/bin/qb-dash"],
+    },
+    "board": {
+        "cmd": ["harness/bin/qb-board"],
+        "watch": ["mcp/mcp_server/board", "mcp/mcp_server/client.py", "harness/bin/qb-board"],
+    },
+    "plain": {
+        "cmd": ["harness/bin/qb-dash"],
+        "watch": ["harness/bin/qb-dash.py", "harness/bin/qbdata.py", "harness/bin/qb-dash"],
+    },
+}
+
+#: Extensions worth restarting for when a watched entry is a directory. A
+#: directory listing is otherwise dominated by __pycache__ and .pyc files, whose
+#: mtimes move as a CONSEQUENCE of the restart — watching those is a loop.
+SUFFIXES = {".py", ".tcss", ".css"}
+
+
+def sources(watch: list[str]) -> list[Path]:
+    """Every file a change to which should relaunch, resolved once at startup.
+
+    Resolved once and not rescanned: a new file appearing mid-session is rare,
+    and rescanning the tree every 400ms to catch it would cost more than the
+    Ctrl-C it saves.
+    """
+    found: list[Path] = []
+    for entry in watch:
+        path = REPO / entry
+        if path.is_dir():
+            found += [p for p in sorted(path.rglob("*")) if p.suffix in SUFFIXES and p.is_file()]
+        elif path.is_file():
+            found.append(path)
+    return found
+
+
+def stamp(paths: list[Path]) -> dict[Path, float]:
+    """mtimes, tolerating a file that vanishes between the listing and the stat
+    — an editor that writes by rename makes that window real."""
+    out = {}
+    for p in paths:
+        try:
+            out[p] = p.stat().st_mtime
+        except OSError:
+            pass
+    return out
+
+
+def stop(proc: subprocess.Popen) -> None:
+    """End the child and put the terminal back the way it was found.
+
+    SIGTERM then SIGKILL: Textual handles the first and unwinds its driver, but
+    an app wedged in a blocked worker thread will not, and a watcher that hangs
+    forever on the restart you asked for is worse than a hard kill.
+    """
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    sys.stdout.write(RESET)
+    sys.stdout.flush()
+
+
+def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Everything before the first bare `--`, and everything after it.
+
+    Done by hand rather than with argparse.REMAINDER because argparse CONSUMES
+    the first `--` before any of its own parsing, so `tui-watch -- ./thing` had
+    argparse reading `./thing` as the target name and rejecting it. Splitting
+    first is what lets `--` keep the one meaning it has here: stop reading
+    targets, the rest is a command line.
+    """
+    if "--" in argv:
+        cut = argv.index("--")
+        return argv[:cut], argv[cut + 1 :]
+    return argv, []
+
+
+def main(argv: list[str] | None = None) -> int:
+    head, tail = split_argv(list(sys.argv[1:] if argv is None else argv))
+
+    if not head and tail:
+        # `tui-watch -- ./anything args`: watch the union of every preset's
+        # sources, since nothing here knows what an arbitrary command imports.
+        cmd = tail
+        watch = sorted({w for t in TARGETS.values() for w in t["watch"]})
+    else:
+        parser = argparse.ArgumentParser(
+            prog="tui-watch",
+            description="run a quarterback terminal client from this checkout, restarting it on save",
+            epilog="use `-- CMD ...` to watch this repo while running some other command",
+        )
+        parser.add_argument(
+            "target",
+            nargs="?",
+            default="dash",
+            choices=sorted(TARGETS),
+            help="dash (clickable dashboard), board (full-screen board client), "
+            "plain (the non-Textual dash). Default: dash",
+        )
+        parser.add_argument(
+            "passthrough",
+            nargs="*",
+            help="arguments handed to the target",
+        )
+        args = parser.parse_args(head)
+        target = TARGETS[args.target]
+        cmd = [str(REPO / target["cmd"][0]), *target["cmd"][1:], *args.passthrough, *tail]
+        watch = target["watch"]
+
+    paths = sources(watch)
+    if not paths:
+        print(f"tui-watch: nothing to watch under {REPO}", file=sys.stderr)
+        return 1
+
+    print(f"tui-watch: {' '.join(cmd)}", file=sys.stderr)
+    print(f"tui-watch: watching {len(paths)} files — save to restart, Ctrl-C to quit", file=sys.stderr)
+
+    def launch() -> subprocess.Popen:
+        """Start the target, or say which word was not a program.
+
+        Wrapped because the bare Popen traceback names subprocess.py five frames
+        deep and buries the only fact that matters — that `cmd[0]` is not there.
+        The `--` form makes that a routine typo rather than an impossible one.
+        """
+        try:
+            return subprocess.Popen(cmd, cwd=REPO)
+        except OSError as exc:
+            sys.exit(f"tui-watch: cannot run {cmd[0]}: {exc.strerror}")
+
+    seen = stamp(paths)
+    proc = launch()
+    try:
+        while True:
+            time.sleep(POLL_SECONDS)
+            now = stamp(paths)
+            changed = [p for p, m in now.items() if seen.get(p) != m]
+            if changed:
+                seen = now
+                names = ", ".join(p.relative_to(REPO).name for p in changed[:3])
+                more = f" +{len(changed) - 3}" if len(changed) > 3 else ""
+                stop(proc)
+                print(f"tui-watch: {names}{more} changed — restarting", file=sys.stderr)
+                proc = launch()
+                continue
+            if proc.poll() is not None:
+                # The app exited on its own — `q`, or a traceback. Either way the
+                # developer is looking at the result, so exiting here rather than
+                # relaunching is what keeps a crash READABLE instead of scrolling
+                # the same traceback past them every 400ms.
+                sys.stdout.write(RESET)
+                sys.stdout.flush()
+                return proc.returncode or 0
+    except KeyboardInterrupt:
+        # SIGINT already reached the child: it shares this process group, so it is
+        # tearing itself down cleanly as we arrive here. stop() is the backstop
+        # for the case where it does not.
+        stop(proc)
+        return 130
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())
