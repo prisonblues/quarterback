@@ -1500,6 +1500,36 @@ does not format-expand its command**, so the popup was handed the literal `#{ses
 guide asks tmux which session it is in instead — `display-message -p` with no `-t` answers with
 the client's current one, which inside a popup is the client that opened it.
 
+**The bar paints its own colours and never borrows the theme's**, which is a correctness matter
+rather than taste. Every span used to set a *foreground* only and inherit whatever `status-style`
+was — and on a stock tmux that is `bg=green,fg=black`. Read off the wire with a real client
+attached, this is what the terminal was actually being sent:
+
+```
+ESC[38;5;108m ESC[42m   ＋ seat     green on green      2.08:1
+ESC[38;5;167m ESC[42m   ✕           dull red on green   1.39:1
+ESC[38;5;109m ESC[42m   seat 2      pale cyan on green  2.15:1
+```
+
+4.5:1 is the readable floor, so none of it cleared. The bar now names a background on every
+span and picks foregrounds against *that*: colour109 at 6.33:1, colour108 at 6.13:1, colour214
+at 8.20:1, colour176 at 6.01:1, and the ✕ moved from colour167 (4.10:1 — the one that still
+fell short of the floor on the new ground) to colour210 at 6.53:1. The active cells were
+already explicit pairs and were already fine: black on colour214 is 11.38:1.
+
+Two traps worth knowing if you edit it. **`#[default]` is not a reset** — it jumps back to
+`status-style`, i.e. back to the green — so the gaps between cells set the ground explicitly
+too, and a `#[default]` left in one is a green notch between two dark cells. And **`#[fill=…]`
+is what makes it a strip** rather than a row of dark patches: tmux pre-fills the whole status
+line with `status-style` and draws the format over it, so without a fill the cells are islands.
+
+Neither of those is checked by reading colours off the rendered line, because what makes the
+old version wrong is a colour the bar never names. `test_the_bar_never_borrows_the_themes_background`
+looks for a foreground with no background beside it, and
+`test_every_colour_pair_on_the_bar_is_legible` computes the WCAG ratio for every pair the format
+sets — so which colours the bar uses stays a taste that can move, while their being readable does
+not.
+
 **The guide is wrapped to fit the popup it opens in**, and the width is not a guess: `?` opens
 it in a `display-popup -w N` whose border takes two columns of that, and a line longer than the
 rest wraps. It shipped at 79 columns inside a 78-column popup and the last paragraph folded.

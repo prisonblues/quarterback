@@ -1673,6 +1673,111 @@ def test_a_digit_jumps_from_the_key_and_the_menu_leads_back_to_it(screen):
             f"the menu's seat row did not lead back to the digits: {active()}"
 
 
+# ---- the bar's colours ------------------------------------------------------
+# These pin a PROPERTY rather than a palette: every foreground the bar sets has a
+# background set beside it, and every resulting pair is legible. Which colours
+# they are is a taste that may move; that they are readable is not.
+
+_STYLE = re.compile(r"#\[(fg|bg)=([A-Za-z0-9]+)\]")
+_XTERM_BASIC = [
+    (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128),
+    (0, 128, 128), (192, 192, 192), (128, 128, 128), (255, 0, 0), (0, 255, 0),
+    (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+]
+_NAMED = {"black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5,
+          "cyan": 6, "white": 7}
+
+
+def _rgb(name):
+    """An xterm-256 colour as RGB, or None for one this cannot resolve."""
+    if name in _NAMED:
+        name = f"colour{_NAMED[name]}"
+    if not name.startswith("colour"):
+        return None
+    n = int(name[len("colour"):])
+    if n < 16:
+        return _XTERM_BASIC[n]
+    if n < 232:
+        n -= 16
+        level = [0, 95, 135, 175, 215, 255]
+        return (level[n // 36], level[(n // 6) % 6], level[n % 6])
+    v = 8 + (n - 232) * 10
+    return (v, v, v)
+
+
+def _contrast(fg, bg):
+    """WCAG contrast ratio between two xterm colours. 4.5:1 is the readable floor."""
+    def lum(c):
+        def channel(x):
+            x /= 255
+            return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+        r, g, b = c
+        return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    a, b = lum(_rgb(fg)), lum(_rgb(bg))
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def bar_pairs(fmt):
+    """[(fg, bg)] for every foreground the format sets, in order.
+
+    A `#[fg=…]` with no `#[bg=…]` beside it yields a bg of None — which is the
+    bug this exists for, not an omission in the parser: it means the span takes
+    whatever `status-style` happens to be.
+    """
+    styles = _STYLE.findall(fmt)
+    pairs, i = [], 0
+    while i < len(styles):
+        kind, value = styles[i]
+        if kind == "fg":
+            nxt = styles[i + 1] if i + 1 < len(styles) else None
+            if nxt and nxt[0] == "bg":
+                pairs.append((value, nxt[1])); i += 2; continue
+            pairs.append((value, None))
+        i += 1
+    return pairs
+
+
+def test_the_bar_never_borrows_the_themes_background(screen):
+    """Every span used to set a foreground only and inherit `status-style`, which
+    on a stock tmux is `bg=green,fg=black`. Read off the wire with a real client
+    attached, the terminal was being sent `ESC[38;5;108m ESC[42m` for the ＋ —
+    green on green — and `ESC[38;5;167m ESC[42m` for the ✕.
+
+    A foreground without a background is the whole defect, so that is what this
+    looks for. It cannot be checked by reading colours off the rendered line,
+    because what makes it wrong is a colour the bar never names.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    naked = [fg for fg, bg in bar_pairs(fmt) if bg is None]
+    assert not naked, (
+        f"these set a foreground and take whatever status-style is: {naked}")
+    # And the line itself, or the cells are dark islands in the theme's green:
+    # tmux pre-fills the status line with status-style and draws the format over
+    # it, so only `fill=` makes the bar a strip.
+    assert "#[fill=" in fmt, f"the bar does not paint its own line: {fmt}"
+
+
+def test_every_colour_pair_on_the_bar_is_legible(screen):
+    """4.5:1 is the readable floor. What shipped was 1.39:1 to 2.78:1 throughout,
+    because every pair had the theme's green on one side of it.
+
+    The ratios are computed rather than the colour numbers asserted: which colours
+    the bar uses is a taste that may move, and that they are readable is not.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    checked = 0
+    for fg, bg in bar_pairs(fmt):
+        if bg is None or _rgb(fg) is None or _rgb(bg) is None:
+            continue        # the naked-foreground case is the test above
+        ratio = _contrast(fg, bg)
+        assert ratio >= 4.5, f"{fg} on {bg} is {ratio:.2f}:1, and 4.5:1 is the floor"
+        checked += 1
+    assert checked >= 6, f"only {checked} pairs were checked; the parser has drifted"
+
+
 def test_the_bar_says_the_key_table_is_waiting(screen):
     """Pressing the key switches the client into a key table and tmux says
     nothing about it — its own prefix is the same and its users know. Here nobody
@@ -1690,11 +1795,12 @@ def test_the_bar_says_the_key_table_is_waiting(screen):
     # NO COMMA IN THE HINT. `,` separates a conditional's arms, so one would end
     # the arm early and print the rest of the strip unconditionally — in every
     # session on the box, since status-format is read per client.
-    hint = fmt.split("#{==:#{client_key_table},qb},", 1)[1]
-    hint = hint[:hint.index("#[default]")]
-    assert "," not in hint, f"a comma in the hint ends the conditional early: {hint!r}"
+    arm = fmt.split("#{==:#{client_key_table},qb},", 1)[1]
+    arm = arm[:arm.rindex(",}")]          # the conditional's own closing arm
+    said = re.sub(r"#\[[^\]]*\]", "", arm)   # the literal text, styles removed
+    assert "," not in said, f"a comma in the hint ends the conditional early: {said!r}"
     for key in ("a add", "x close", "1-9 seat", "t tape", "d dash", "? keys"):
-        assert key in hint, f"the hint does not teach {key!r}: {hint}"
+        assert key in said, f"the hint does not teach {key!r}: {said}"
 
 
 def test_the_hint_appears_while_the_key_waits_and_goes_when_it_is_used(screen):

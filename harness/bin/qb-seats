@@ -112,6 +112,8 @@ STAGED=0                # 1 = pane waits on Enter before starting its agent
 YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
 BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
 KEY_DEFAULT="C-q"       # the qb key, when QB_SEATS_KEY does not say otherwise
+BAR_BG=colour235        # the seat bar's OWN ground — see seat_bar for why it
+BAR_FG=colour109        # cannot borrow the theme's status-style
 DASH_SIZE="${QB_SEATS_DASH_SIZE:-78}"   # dash width in columns, down the right of
                         # the window. 78 is what the dashboard's own table wants
                         # before it starts wrapping, not a taste in proportions
@@ -535,12 +537,17 @@ dash_hooks() {
 # Each arm is a whole literal style string rather than a format substituted INTO
 # one (`#[fg=#{@qb_state}]`-style): style parsing and format expansion are
 # different passes in tmux and the nested spelling is the one that survives both.
+#
+# EVERY ARM NAMES A BACKGROUND, including the idle ones, and that is the fix for
+# the contrast — see seat_bar. An idle cell used to set a foreground only and
+# take whatever the status line's own background was, which on a stock tmux
+# (`status-style bg=green,fg=black`) meant colour109 on green at 2.15:1.
 seat_state_style() {   # <active|idle>
   local on="$1"
   if [ "$on" = active ]; then
     printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=black]#[bg=colour214],#{?#{==:#{@qb_state},input},#[fg=black]#[bg=colour176],#[fg=black]#[bg=colour109]}}'
   else
-    printf '%s' '#{?#{==:#{@qb_state},waiting},#[fg=colour214],#{?#{==:#{@qb_state},input},#[fg=colour176],#[fg=colour109]}}'
+    printf '%s' "#{?#{==:#{@qb_state},waiting},#[fg=colour214]#[bg=$BAR_BG],#{?#{==:#{@qb_state},input},#[fg=colour176]#[bg=$BAR_BG],#[fg=$BAR_FG]#[bg=$BAR_BG]}}"
   fi
 }
 
@@ -555,34 +562,61 @@ seat_state_style() {   # <active|idle>
 # `#{client_key_table}` is the whole fix and it costs one conditional: the bar
 # already redraws on every change, so the strip appears the instant the key is
 # pressed and goes as soon as the next one lands. It is the mode indicator AND
-# the cheatsheet, which is what the menu was carrying alone.
+# the cheatsheet, which the menu was carrying alone.
 #
 # NO COMMAS IN IT. `,` separates a format conditional's arms, so the separator
 # here is `·` — a comma would end the arm early and print the rest of the hint
 # unconditionally, in every session on the box.
 #
-# APPENDED AND RIGHT-ALIGNED rather than replacing the cells. Wrapping the whole
-# bar in the conditional would nest the seat cells' own `#{?...}` commas inside
-# another arm, which is the same hazard one level deeper; and a seat row that
-# vanished whenever you reached for a key would lose the state colours at exactly
-# the moment you are deciding which seat to act on.
+# SIX KEYS AND NOT ELEVEN, because this has to fit beside the seat cells on a
+# window somebody actually has. The full list is one keystroke away at `?`, and
+# the first spelling of this ran the bar past 120 columns with three seats on it:
+# tmux clips the overflow, and it clipped the `qb` badge and the first item —
+# i.e. exactly the part that says the key took, which is what the strip is for.
 key_hint() {
   printf '%s' \
-'#[align=right]#{?#{==:#{client_key_table},qb},'\
-'#[fg=black]#[bg=colour109] qb '\
-'#[fg=colour109]#[bg=default] a add · x close · 1-9 seat · t tape · d dash '\
-'· = fit · > < size · s screens · K kill · ? keys #[default],}'
+"#{?#{==:#{client_key_table},qb},"\
+"#[fg=black]#[bg=$BAR_FG] qb "\
+"#[fg=$BAR_FG]#[bg=$BAR_BG] a add · x close · 1-9 seat · t tape · d dash · ? keys "\
+"#[fg=$BAR_FG]#[bg=$BAR_BG],}"
 }
 
+# THE BAR PAINTS ITS OWN COLOURS AND NEVER BORROWS THE THEME'S, which is a
+# correctness matter rather than taste. Every span here used to set a FOREGROUND
+# only and inherit whatever `status-style` was, and on a stock tmux that is
+# `bg=green,fg=black`. Read off the wire with a real client attached, that is
+# what the terminal was being sent:
+#
+#     ESC[38;5;108m ESC[42m  ＋ seat      green on green,   2.08:1
+#     ESC[38;5;167m ESC[42m  ✕            dull red on green, 1.39:1
+#     ESC[38;5;109m ESC[42m  seat 2       pale cyan on green, 2.15:1
+#
+# 4.5:1 is the readable floor. So the bar names a background on every span, and
+# the colours are chosen against THAT rather than against a green nobody chose:
+# colour109 6.33:1, colour108 6.13:1, colour214 8.20:1, colour176 6.01:1, and the
+# ✕ moved from colour167 (4.10:1, the one that still fell short) to colour210 at
+# 6.53:1. The active cells were already explicit pairs and are already fine —
+# black on colour214 is 11.38:1.
+#
+# `#[default]` IS NOT A RESET HERE, it is a jump back to status-style — i.e. back
+# to the green. So the gaps between cells set the ground explicitly too; a
+# `#[default]` left in one of them is a green notch between two dark cells.
+#
+# `#[fill=…]` IS WHAT MAKES IT A STRIP rather than a row of dark patches. tmux
+# pre-fills the whole status line with status-style and then draws the format
+# over it, so without a fill the cells are islands in the theme's green. fill
+# paints the line the bar's own colour first.
 seat_bar() {
+  local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
   printf '%s' \
+"#[fill=$BAR_BG]"\
 '#[align=left]'\
 '#{P:#{?@qb_seat,'\
 '#[range=user|seat#{@qb_seat}]'"#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
-' seat #{@qb_seat} #[default]#[norange]'\
-'#[range=user|kill#{@qb_seat}]#[fg=colour167] ✕ #[default]#[norange] '\
+" seat #{@qb_seat} $ground#[norange]"\
+"#[range=user|kill#{@qb_seat}]#[fg=colour210]#[bg=$BAR_BG] ✕ $ground#[norange] "\
 ',}}'\
-'#[range=user|add]#[fg=colour108] ＋ seat #[default]#[norange]'\
+"#[range=user|add]#[fg=colour108]#[bg=$BAR_BG] ＋ seat $ground#[norange]"\
 "$(key_hint)"
 }
 
