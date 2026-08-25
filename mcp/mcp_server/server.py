@@ -135,12 +135,18 @@ async def app_lifespan(server: FastMCP):
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
     if not base_url:
         raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
+    # The browser vhost and a signed-in session cookie, for the writes
+    # `app.auth.human` gates. Both optional: absent, every human-gated tool
+    # refuses with the remedy rather than failing at the network. See #479 for
+    # what having them here widens, and `qb-mcp` for where they are exported.
     client = QuarterbackClient(
         base_url,
         token,
         key=resolve_key(),
         requested_name=resolve_requested_name(),
         session=resolve_session(),
+        human_url=os.environ.get("QUARTERBACK_HUMAN_URL", "").strip() or None,
+        edge_cookie=os.environ.get("QUARTERBACK_EDGE_COOKIE", "").strip() or None,
     )
     try:
         yield AppContext(client=client)
@@ -1584,6 +1590,87 @@ def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
             "depends", {"item_id": item_id, "depends_on": depends_on})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_depends")
+
+
+@mcp.tool()
+def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dict:
+    """Put an order into force. **A human's decision, which you may be asked to apply.**
+
+    `plan_order` computes what the rules imply and cannot apply it; this is the
+    call that does. It goes to the browser vhost as the signed-in person, so it
+    needs `QUARTERBACK_HUMAN_URL` and `QUARTERBACK_EDGE_COOKIE` — without either
+    it refuses and says which is missing, rather than failing at the network.
+
+    **Only when you were asked.** #479 is the standing record that this door is
+    deliberately open wider than the boundary it crosses, and the thing it is
+    open for is a person saying "sort it". Reordering because you formed an
+    opinion is the failure `app/api/plan.py` rule 3 describes: *"two agents
+    disagreeing about whether #80 outranks #83 and rewriting each other is how
+    the plan stops being the shared intent it exists to be."* Nothing here can
+    stop you; that is the point of the issue, not permission.
+
+    Two things worth doing every time, because nothing enforces either:
+
+    * **Start from `plan_order`.** Its `apply.body.order` is already this
+      argument's shape, and its `basis`/`reasons` are how anybody checks the
+      result afterwards. Read `counts` first — on a plan of unstarted issues
+      `preference` is often 0 and `interchangeable` near-total, which means the
+      dependency graph pinned the ends and the human's priorities are doing the
+      real work.
+    * **Say on the board that you did it, and on whose say-so.** The order
+      arrives as `rank_source: "ordered"` — indistinguishable from one a person
+      typed — so the board post is the only provenance there is until #479's
+      item 6 lands.
+
+    Args:
+        order: item ids, in the order wanted. Items in scope you leave out keep
+            their relative order and follow the listed ones; the reply names them
+            in `appended`.
+        repo: the scope, EXACTLY — `owner/name` or `project:<name>`. Omit for the
+            fleet-wide list. This is not widened for you: passing the wrong scope
+            reorders a different list.
+    """
+    try:
+        return _get_client(ctx).plan_reorder({"repo": repo, "order": order})
+    except RuntimeError as e:
+        raise ToolError(f"plan_reorder: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_reorder")
+
+
+@mcp.tool()
+def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
+                     note: str | None = None, plan: str | None = None,
+                     state: str | None = None) -> dict:
+    """Retitle, re-reason, move or drop one item. Same human gate as `plan_reorder`.
+
+    The verb for a note that has gone stale — which is the common case and the
+    honest one: an agent writes an item's reasoning when it adds it, the issue
+    then moves on, and until this tool existed nobody could correct the note but
+    a person in a browser. Correcting your own reasoning overrides no one.
+
+    `state="dropped"` is not `done`: one says the work happened, the other that a
+    person decided it should not. Treat it as a person's call and not yours —
+    a `done` item cannot be dropped at all, and the board refuses it.
+
+    Args:
+        item_id: the item.
+        title: replace the title. Blank is refused.
+        note: replace the reasoning. This is the field worth using.
+        plan: move it to a named plan; "" detaches it from the one it is in.
+        state: "open" or "dropped".
+    """
+    body: dict = {"item_id": item_id}
+    for key, value in (("title", title), ("note", note),
+                       ("plan", plan), ("state", state)):
+        if value is not None:
+            body[key] = value
+    try:
+        return _get_client(ctx).plan_item_update(body)
+    except RuntimeError as e:
+        raise ToolError(f"plan_item_update: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_item_update")
 
 
 @mcp.tool()

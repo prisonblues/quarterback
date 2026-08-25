@@ -36,6 +36,13 @@ QB_ENV="$(qb_env_path "$0")" \
 qb_load_config
 qb_require_base_url || exit 1
 export QUARTERBACK_BASE_URL
+# The browser vhost and a signed-in session cookie, for the writes app.auth.human
+# gates (plan_reorder, plan_item_update). Sourced from the config like everything
+# else, and exported here because qb_load_config only sets shell variables — the
+# server reads its whole world from the environment. Both are optional and both
+# are usually unset: the tools that need them refuse with the remedy, and every
+# other tool is unaffected. #479 records what having them widens.
+export QUARTERBACK_HUMAN_URL QUARTERBACK_EDGE_COOKIE
 
 REPO="${QUARTERBACK_REPO:-$HOME/source/quarterback}"
 

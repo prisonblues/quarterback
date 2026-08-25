@@ -77,9 +77,20 @@ class QuarterbackClient:
         requested_name: str | None = None,
         session: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        human_url: str | None = None,
+        edge_cookie: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
+        # The BROWSER vhost and the session cookie that authenticates a person on
+        # it. Both optional and both usually absent: every read and almost every
+        # write in this client goes to the agent host with a bearer token, and
+        # this pair exists only for the handful of endpoints `app.auth.human`
+        # gates. See :meth:`_human_post` for why it cannot be the same host.
+        self._human_url = (human_url or "").rstrip("/") or None
+        self._edge_cookie = edge_cookie or None
+        self._human_http: httpx.Client | None = None
+        self._transport = transport
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
         # host that has no credential: every authed call 401s, and ``health()``
@@ -108,6 +119,80 @@ class QuarterbackClient:
 
     def close(self) -> None:
         self._http.close()
+        if self._human_http is not None:
+            self._human_http.close()
+
+    # ------------------------------------------------------------------ human
+
+    #: What to tell a caller that has no cookie. Long because it is the entire
+    #: remedy: this fails on every box until somebody does it once, and a
+    #: "403 Forbidden" would send them to the board's auth code instead.
+    NO_COOKIE = (
+        "this call needs a signed-in person, and this host has no session. "
+        "Set QUARTERBACK_EDGE_COOKIE to a browser session cookie for "
+        "{url} (sign in there, copy the session cookie), and "
+        "QUARTERBACK_HUMAN_URL to the browser vhost. `qb-doctor` reports the "
+        "same thing as its `edge` row."
+    )
+
+    def _human_client(self) -> httpx.Client:
+        """The client for writes only a person may make.
+
+        **A second client, and a second host, neither of which is an accident.**
+        ``app/auth.py``: *"the browser vhost has no token and the agent vhost
+        strips ``X-Edge-Auth``"* — so a human-gated write aimed at
+        ``QUARTERBACK_BASE_URL`` cannot succeed however it is authenticated, and
+        the split is the deployment's, not this client's.
+
+        It carries the cookie and **not** the bearer. Sending the machine token
+        to a host that has no use for it would hand a second vhost a credential
+        it never needs to see, and the token is the one that names this machine
+        everywhere else.
+        """
+        if self._human_http is None:
+            self._human_http = httpx.Client(
+                timeout=30,
+                headers={"Cookie": self._edge_cookie or ""},
+                transport=self._transport,
+                # A 302 from forward-auth is the answer, not a redirect to
+                # follow: chasing it lands on Authelia's login page and returns
+                # 200 with HTML, which is the one way this can look like success
+                # while having authenticated nobody.
+                follow_redirects=False,
+            )
+        return self._human_http
+
+    def _human_post(self, path: str, body: dict) -> dict:
+        """POST to the browser vhost as the signed-in person.
+
+        Raises :class:`RuntimeError` for every way this fails to *reach* a
+        person — no URL, no cookie, or a forward-auth bounce — because those are
+        one missing setup step and not an answer about the request. A real
+        refusal from the app still arrives as an ``HTTPStatusError``, so callers
+        keep telling "you may not" apart from "you are nobody".
+        """
+        if not self._human_url:
+            raise RuntimeError(
+                "QUARTERBACK_HUMAN_URL is not set: this write goes to the "
+                "browser vhost, which cannot be derived from the agent host")
+        if not self._edge_cookie:
+            raise RuntimeError(self.NO_COOKIE.format(url=self._human_url))
+        resp = self._human_client().post(f"{self._human_url}{path}", json=body)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            raise RuntimeError(
+                f"the browser vhost answered {resp.status_code} — forward-auth "
+                "bounced this request, so the cookie is missing, wrong or "
+                f"expired. {self.NO_COOKIE.format(url=self._human_url)}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def plan_reorder(self, body: dict) -> dict:
+        """``POST /plan/reorder`` — set the order. Human-gated (#479)."""
+        return self._human_post("/plan/reorder", body)
+
+    def plan_item_update(self, body: dict) -> dict:
+        """``POST /plan/item/update`` — retitle, move, re-reason, drop. Human-gated."""
+        return self._human_post("/plan/item/update", body)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
