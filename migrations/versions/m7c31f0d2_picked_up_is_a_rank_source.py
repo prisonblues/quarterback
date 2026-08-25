@@ -35,7 +35,7 @@ deal with rows this vocabulary allowed and the old one did not, and it maps them
 to `appended` — see below.
 
 Revision ID: m7c31f0d2
-Revises: m4355ba48
+Revises: mef441e81
 Create Date: 2026-08-24
 
 """
@@ -45,7 +45,7 @@ from __future__ import annotations
 from alembic import op
 
 revision: str = "m7c31f0d2"
-down_revision: str | None = "m4355ba48"
+down_revision: str | None = "mef441e81"
 branch_labels = None
 depends_on = None
 
