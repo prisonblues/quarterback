@@ -1421,7 +1421,17 @@ because the branch happened to be pushed: luck, not design.
 | uncommitted changes | left alone |
 | unpushed commits | left alone, **loudly** |
 | diverged from upstream | left alone — "that is a rebase, not a fast-forward" |
+| its upstream was deleted | left alone — *"the branch was probably merged and deleted"* |
 | detached, or no upstream | left alone |
+
+**Ask git for the exit status, not the output.** `rev-parse --abbrev-ref --symbolic-full-name
+'@{u}'` on a branch whose upstream ref is *gone* — the ordinary state of a worktree left lying
+around after its PR merged and the remote branch was deleted — writes the fatal to stderr,
+writes the literal string `@{u}` to **stdout**, and exits non-zero. An emptiness test on the
+output therefore passes, and the failure surfaces one step later as "git would not say where it
+stands" about a repository that is perfectly fine. Nothing unsafe happens; the catch-all guard
+refuses either way. But the diagnosis is what this tool is *for*, and "its upstream is gone"
+tells you to drop the worktree where the other reading sends you hunting for a fault.
 
 **Exit 4 is a refusal here and permission in `prune-worktrees`**, which is worth stating
 because it looks like an inconsistency and is the opposite. There, refusing on a board

@@ -146,7 +146,35 @@ while IFS= read -r wt; do
     SKIPPED=$((SKIPPED + 1)); continue
   fi
 
-  up=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)
+  # THE EXIT STATUS, NOT THE OUTPUT, and the difference is a whole second case.
+  # `rev-parse --abbrev-ref --symbolic-full-name '@{u}'` on a branch whose
+  # upstream ref is GONE — the ordinary state of a worktree left lying around
+  # after its PR merged and the remote branch was deleted — does all three of
+  # these at once:
+  #
+  #     stderr:  fatal: ambiguous argument '@{u}': unknown revision …
+  #     stdout:  @{u}
+  #     exit:    non-zero
+  #
+  # stdout is not empty, it is the literal string `@{u}`. So an emptiness test
+  # passes, `up` becomes `@{u}`, and the rev-list below fails for the same reason
+  # and lands in the catch-all guard — which refuses safely and reports "git
+  # would not say where it stands" about a repository that is perfectly fine.
+  # Nothing was ever rewritten; the diagnosis was simply wrong, and the diagnosis
+  # is what this tool is for.
+  if ! up=$(git -C "$wt" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
+    # Configured but missing, or not configured at all — worth telling apart,
+    # because they call for different things. A branch that never had an upstream
+    # is somebody's local work in progress; one whose upstream has been deleted
+    # is almost always finished with, and the useful next move is to drop the
+    # worktree rather than to go looking for a fault.
+    if git -C "$wt" config --get "branch.$branch.merge" >/dev/null 2>&1; then
+      say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with"
+    else
+      say "  · $name ($branch) — no upstream, nothing to catch up to"
+    fi
+    SKIPPED=$((SKIPPED + 1)); continue
+  fi
   if [ -z "$up" ]; then
     say "  · $name ($branch) — no upstream, nothing to catch up to"
     SKIPPED=$((SKIPPED + 1)); continue
