@@ -1526,6 +1526,275 @@ variable are the same mechanism, so they cannot drift.
 branch until it has claimed), does not assign work, and does not drive the agents past
 starting them.
 
+#### The top line — who this screen is, and what is left to spend
+
+`status 2` makes room for the seat bar, and tmux numbers those two lines 0 and 1. `install_bar`
+only ever wrote index 1 — and **writing one index of an array option at session level stops tmux
+inheriting the global array**, so index 0, which nothing set, resolved to empty. Every screen has
+therefore carried a full-width blank strip in whatever `status-style` is (green, on a stock tmux)
+since the bar shipped. Measured both ways: drop our `status-format[1]` and line 0 renders tmux's
+own status line again; set index 0 alongside ours and it renders whatever we put there. Nothing
+was relying on it, which is unusual — it makes this a free line rather than a trade.
+
+**Identity on the left, the ceiling on the right.** The seat bar says what the seats are *doing*
+and nothing said whose they were, so the left is `quarterback: <repo>` — `QB_SEATS_TOP` says
+something else, and `QB_SEATS_TOP=` (empty) means no words of ours there at all. The right is
+`qb-pace`'s verdict, because the shared subscription's five-hour and weekly caps are the only
+hard ceiling this fleet has and their one on-screen home was the dash — which the qb key has
+just made hideable with a single keystroke. A ceiling you can hide is not a brake.
+
+**No `#()` in the format**, and that is the whole reason `qb-seat-top` is a loop rather than a
+format. A status line re-expands every `status-interval` — 15s by default, *per attached client*
+— and a `#(shell command)` in one runs on that cadence. `qb-seat-top` is awake on its own timer
+anyway, so it writes the answers into session options and the format merely reads them:
+`#{@qb_pace}` costs nothing to expand however many clients are looking. The severity picks its
+colour through a conditional over literal styles rather than `#[fg=#{@qb_pace_sev}]`, for the
+reason `seat_state_style` gives — style parsing and format expansion are different passes.
+
+**A reading that could not be refreshed is not a current one.** `pace()` returned quietly on a
+missing binary, a timeout, an error or an empty answer, which left the last reading on screen
+looking live — a `STOP` from twenty minutes ago read exactly like a `STOP` from now, on the one
+number the line exists to carry. The reading is *kept*, because a stale ceiling is still the best
+estimate anyone has and blanking it would throw that away to avoid looking confident; it is
+marked `stale` instead, and drawn dimmer and prefixed `~` — the same `~` the dashboard already
+uses for "at most this long ago".
+
+**The reveal is an aesthetic and says so.** It is lexray's `decrypt_text.js` effect with the same
+parameters — a 40ms tick, one character settling every second tick, left to right, spaces left
+alone — replaying every `QB_SEATS_TOP_EVERY` seconds (30 by default; `0` draws the line once and
+leaves nothing running). Nothing depends on it: `QB_SEATS_TOP_ANIMATE=0` writes the text straight
+out, and the reveal settles on precisely what that would have shown, which is what
+`test_the_reveal_settles_on_exactly_the_static_text` pins.
+
+A status line is not obviously capable of an animation, so it was measured before it was written.
+One `tmux set-option` round trip is **3.5ms** — a ceiling of about 286 frames a second — and a
+24-character reveal is 50 frames, **all 50 of which reached the terminal with none coalesced**, at
+21fps. The cost is 175ms of tmux calls per replay against a build that already spends forty of
+them, which is what makes a 30-second replay reasonable and a continuous loop not.
+
+**Neither test catches a frame**, and that is deliberate. A frame is on screen for 40ms, so a
+test that polls for one races it — the first spelling did, passing locally, passing in the flake
+sandbox, and failing in the flake sandbox on the same commit for no reason but load. So the
+effect is read rather than caught: `qb-seat-top --frames TEXT` prints every frame of the reveal
+with no tmux and no clock anywhere near it, and the assertions are arithmetic — one character
+settles every second tick, so frame *i* has `(i + 1) // 2` of them settled and those must be
+right whatever the scrambled tail rolled. (Measuring the settled prefix instead of computing it
+is its own flake: a random character that lands on the right one inflates the count, which failed
+about one run in ten.) That it runs *at all* on a live screen is answered by `@qb_top_reveals`, a
+count of completed reveals — still true a minute later, where a frame is not.
+
+Three things the effect needed that the browser version does not:
+
+- **Single-width characters only.** `decrypt_text.js` scrambles with `∞ ∑ ∏ √ ∫ ≤ ≥ ≈ ≠ ± × ÷`,
+  which are East Asian *ambiguous* width — a terminal may draw them two columns wide, and several
+  do. In a browser that is nothing; on a status line it means one frame is a column wider than the
+  last, so the line jitters sideways all the way through the reveal. The box-drawing glyphs that
+  replace them are unambiguously narrow.
+- **No fork per character.** `out="$out$(rand_char)"` is a subshell for every scrambled column of
+  every frame — about 580 of them per reveal, twice a minute, for an animation. Inline, all 50
+  frames generate in 40ms, and the reveal keeps the 40ms tick it is supposed to have rather than
+  drifting to whatever the forks cost.
+- **A detached screen is not animated to.** One tmux query per interval buys that, against fifty
+  `set-option`s played to an empty socket — a screen left over a weekend would play thousands.
+
+**A missing `qb-seat-top` must not take the build down**, which is `dash_hooks`' rule arriving
+again. During a rollout PATH's harness and a checkout disagree about which scripts exist, so
+`beside_me` answers with a path that is not there — and a `run-shell -b` on a missing command does
+*not* fail quietly: measured as `no current client` and `not in a mode` on stderr and a non-zero
+exit, which under `set -e` killed `qb-seats` with the session, the seats and the tape already
+created, on an error naming none of them. So the copy is asked for before it is run, and a screen
+that cannot refresh its top line still draws it once and says on stderr why it will not change.
+
+#### The qb key — every seat-level action, without the mouse
+
+The seat bar is clickable and until #248 that was the *only* way in: adding a seat from the
+keyboard meant dropping to a shell for `qb-seats --add`, killing the screen meant `--kill` in
+the same shell, and the tape and the dash could not be got out of the way at all without
+dragging borders. Turning the bar on also costs `mouse on`, i.e. shift-less text selection,
+which is a real price for the only door.
+
+**`C-q` is the qb key.** Press it, then:
+
+| key | what it does |
+|---|---|
+| `a` | add a seat |
+| `x` | close this seat — the agent in it goes too, so it asks first |
+| `1`–`9` | jump to that seat |
+| `t` / `d` | show or hide the tape / the dash |
+| `=` | put the dash back to the width the screen asked for |
+| `>` / `<` | the dash eight columns wider / narrower, and remember it |
+| `s` | the screens that are up, in a popup |
+| `K` | kill this screen — every agent on it goes too, so it asks first |
+| `?` | the list above, in a popup |
+
+**A key table, not a menu key** — `bind-key -n C-q switch-client -T qb` plus `bind-key -T qb`,
+which is how tmux implements its own prefix. `C-q t` is one chord whether or not a menu was
+drawn, and a menu drawn on every press is a flash across the screen you were looking at. What
+the menu is for is the press where you *do not know* the key, so it is bound to `Any`: a key
+the table does not have opens the menu rather than being swallowed, and the menu carries the
+same accelerators. You reach the teaching by not knowing, which is the only time you want it.
+Both the bindings and the menu are generated from one table in `qb-seats`, and
+`test_every_menu_accelerator_is_a_key_in_the_table` is what stops the menu becoming a liar
+about the shortcut it exists to teach.
+
+**The bar says the key is waiting, and that is not decoration.** Switching into a key table is
+invisible in tmux — its own prefix is the same, and its users know. Here nobody did: the first
+press looked like a dead key, so the natural next move was to press it again, that lands on
+`Any` and opens the menu, and a `display-menu` has no digit accelerators — so `1`-`9` did
+nothing while the menu's own title promised they jumped to a seat. **One invisible state,
+reported as three separate bugs.** `#{client_key_table}` is the whole fix and costs one
+conditional in the seat bar, which already redraws on every change: press the key and a strip
+appears carrying every key it accepts, and it goes as soon as the next one lands. It is the
+mode indicator *and* the cheatsheet, which the menu had been carrying alone.
+
+The hint holds no comma — `,` separates a format conditional's arms, so one would end the arm
+early and print the rest of the strip unconditionally, in every session on the box. It is
+appended and right-aligned rather than replacing the seat cells: wrapping the whole bar in the
+conditional would nest the cells' own `#{?...}` commas one level deeper, and a seat row that
+vanished whenever you reached for a key would lose the state colours exactly when you are
+deciding which seat to act on. With `QB_SEATS_BAR=0` there is no bar and so no hint — the key
+still works, silently, the way tmux's own prefix does.
+
+The menu's title no longer promises the digits. Instead it carries a `j` row whose command is
+`switch-client -T qb`, which hands you back to the table — the one place a digit means a seat.
+
+**A key table is server-wide**, exactly as `MouseDown1Status` is, so the binding cannot simply
+act: it reads `@qb_key`, which is set on this session and on nothing else, and in the other
+branch does verbatim what tmux would have done — sends the key on to the pane. Press `C-q` in
+a session that is not a screen and nothing has changed. That fall-through is the whole of why
+a bare `bind-key -n` was not enough: a keystroke silently eaten in every other session on the
+box is a worse bug than a missing feature.
+
+`C-q` has prior claims worth stating rather than discovering: it is XON under `stty ixon`, and
+readline and emacs bind it to quoted-insert. Inside a seat pane tmux sees it first, so on a
+screen the agent loses it. **`QB_SEATS_KEY=M-q`** picks another; **`QB_SEATS_KEY=`** (empty)
+binds none at all. Empty means *none* and unset means *pick for me* — the same `${VAR+set}`
+spelling as `QB_SEATS_DASH`, because those are different answers. Your own tmux prefix is left
+entirely alone either way, and `QB_SEATS_BAR` and `QB_SEATS_KEY` are separate knobs because
+they are separate costs: the bar takes the status line and the mouse, the key takes one
+keystroke inside the panes.
+
+**Hiding a pane is `break-pane -d` to a holding window and `join-pane` back**, so nothing
+about the process in it changes — the tape keeps following the board across a round trip and
+the dash keeps polling. What is hard is the geometry coming back, and two things that look
+like the answer are not. Saving `#{window_layout}` and handing it to `select-layout` restores
+the shape and *reassigns the panes*, because its leaves are pane indexes and a rejoined pane
+lands at a different one: measured on 3.6a as a restore that put the tape in seat 2's cell and
+seat 3 in the strip along the bottom, exiting 0 while doing it. `select-layout -E` evens the
+whole row *including* the dash, which then reclaims its 78 columns from one neighbour and
+leaves seats of 50, 49 and 20 where they had been 39, 39 and 41. So the widths are recorded by
+pane id before the break and reasserted after the join, left to right, which converges exactly
+— the row is a fixed total, so setting each pane in turn leaves the last one no choice.
+
+Showing the dash **replays the build order** for the same reason the dash is split before the
+tape in the first place: `qb-seats` takes the dash off the whole window first, so it spans both
+rows of a ten-seat grid, and takes the tape's strip off the bottom afterwards. Join the dash
+back with the tape already in place and `-f` gives it the full height of the window instead —
+a 78x44 dash down the side of a 121-column tape, where it had been 78x32 over a full-width
+one. So the tape steps out, the dash goes in, the tape comes back. Which pane is hidden is
+recorded on the **session** (`@qb_hidden_tape`, `@qb_hidden_dash`) and never on the server:
+two screens must be able to disagree about whether their tape is showing.
+
+**A path crosses two parsers, and `sh_quote` alone is not enough.** The dispatcher's path is
+written into a tmux command string, so it needs `sh_quote` *and* `tmux_quote` — the rule
+`tmux_quote` itself states, and which the first cut of `qb_actions` did not follow. The failure
+is the silent one: a checkout under `a$Bdir` bound every key to `/…/a/qb-seat-key`, because tmux
+expanded `$Bdir` to nothing. The screen builds, the bar draws, the table installs, and every key
+does nothing at all. A `"` in the path is the loud version — `syntax error`, and a half-built
+screen.
+
+The two halves of the escaping do not scale together, which is why `tmux_quote_n` exists beside
+`tmux_quote`. `\`, `"` and `$` are consumed by tmux's *parser*, once per pass, so a value inside
+a string inside a string needs them escaped twice — and a confirmed action is exactly that, since
+`confirm-before`'s command is stored by `bind-key` and parsed again when the answer comes back.
+`#` is not: parsing never touches it, and it is the single *format expansion* at the end that
+turns `##` into `#`, so doubling it per pass gives `####` and the wrong path. Two parses, one
+expansion. `test_the_key_works_from_a_checkout_full_of_metacharacters` presses a plain action and
+a confirmed one through a real keystroke from a directory called `a$B"c\d#e f'g`, because nothing
+short of that covers the whole chain.
+
+**A key press runs the copy its own screen was built with.** `bind-key -T qb` is server-wide and
+holds one path: the root key is gated per screen, but the table is not, so the last screen built
+writes it and a key pressed on an older screen arrives in the newer screen's `qb-seat-key`. Only
+wrong during a rollout, and exactly then that it matters — the same question `dash_hooks` answers
+for the resize hook. So the screen records `@qb_key_bin` and the dispatcher hands over, once,
+marked in the environment: a recorded path can be stale or can be this file under another name,
+and a hand-off that could hand off again is a loop a `run-shell -b` would hide completely.
+
+**A toggle does not move the cursor.** `join-pane` leaves the joined pane active, so showing the
+tape landed you *in* the tape — the next thing typed went to a board follower instead of the
+agent being worked with, and the next `C-q x` refused with "that pane is not a seat", correctly
+and confusingly. A toggle is about what is on the screen, never about where you are on it.
+
+**The screen and the pane travel in the binding**, expanded by tmux as the key is pressed —
+where `qb-seat-click` has to stash them in a server option and read them back. That stash exists
+because `#{mouse_status_range}` is scoped to a mouse *event* and expands to nothing by the time
+`confirm-before` runs its command; a session and a pane are *client* state, so a binding can
+simply pass them. Measured on 3.6a against a real client and a real keystroke, from a plain
+binding and from behind a y/n alike. It is the better answer as well as the shorter one: a
+server option is a race between two clients pressing the key on one server, and an argument
+cannot be. The **id** and not the name, because the value crosses tmux's expansion into a shell
+command line, where a session called `it's` would leave an unterminated quote there — `$0` is a
+dollar and digits and can be neither.
+
+The one exception is `?`, and it is a tmux limitation rather than a choice: **`display-popup`
+does not format-expand its command**, so the popup was handed the literal `#{session_id}`. The
+guide asks tmux which session it is in instead — `display-message -p` with no `-t` answers with
+the client's current one, which inside a popup is the client that opened it.
+
+**The bar paints its own colours and never borrows the theme's**, which is a correctness matter
+rather than taste. Every span used to set a *foreground* only and inherit whatever `status-style`
+was — and on a stock tmux that is `bg=green,fg=black`. Read off the wire with a real client
+attached, this is what the terminal was actually being sent:
+
+```
+ESC[38;5;108m ESC[42m   ＋ seat     green on green      2.08:1
+ESC[38;5;167m ESC[42m   ✕           dull red on green   1.39:1
+ESC[38;5;109m ESC[42m   seat 2      pale cyan on green  2.15:1
+```
+
+4.5:1 is the readable floor, so none of it cleared. The bar now names a background on every
+span and picks foregrounds against *that*: colour109 at 6.33:1, colour108 at 6.13:1, colour214
+at 8.20:1, colour176 at 6.01:1, and the ✕ moved from colour167 (4.10:1 — the one that still
+fell short of the floor on the new ground) to colour210 at 6.53:1. The active cells were
+already explicit pairs and were already fine: black on colour214 is 11.38:1.
+
+Two traps worth knowing if you edit it. **`#[default]` is not a reset** — it jumps back to
+`status-style`, i.e. back to the green — so the gaps between cells set the ground explicitly
+too, and a `#[default]` left in one is a green notch between two dark cells. And **`#[fill=…]`
+is what makes it a strip** rather than a row of dark patches: tmux pre-fills the whole status
+line with `status-style` and draws the format over it, so without a fill the cells are islands.
+
+Neither of those is checked by reading colours off the rendered line, because what makes the
+old version wrong is a colour the bar never names. `test_the_bar_never_borrows_the_themes_background`
+looks for a foreground with no background beside it, and
+`test_every_colour_pair_on_the_bar_is_legible` computes the WCAG ratio for every pair the format
+sets — so which colours the bar uses stays a taste that can move, while their being readable does
+not.
+
+**The guide is wrapped to fit the popup it opens in**, and the width is not a guess: `?` opens
+it in a `display-popup -w N` whose border takes two columns of that, and a line longer than the
+rest wraps. It shipped at 79 columns inside a 78-column popup and the last paragraph folded.
+`test_the_guide_fits_the_popup_it_is_opened_in` reads the width out of the binding and checks
+every line against it — in characters rather than bytes, since the text carries an em dash and
+an ellipsis — so the two cannot drift apart again.
+
+**A real keystroke is tested**, which the seat bar's click never could be: synthesising a click
+means SGR mouse bytes and a status line whose geometry the test has to work out, while `C-q t`
+is two bytes written to a pty. `test_a_real_keystroke_reaches_the_action` attaches a client,
+presses the chord and watches the tape go — the only assertion that covers the join between the
+key table and the actions, and the only one that fails if the root binding never matches, the
+gate is always false, or `switch-client -T` names a table that is not there.
+
+**The actions live in `qb-seat-key`, not in the bindings**, for `qb-seat-click`'s reason one
+surface along: each is three or four tmux commands with a condition over them, and a menu
+cannot be driven headless any more than a keystroke can — but the actions underneath both can,
+and they are the part that breaks. `add`, `close` and jump-to-seat are `qb-seat-click`'s own
+three ranges under different names and are **delegated** to it rather than written out again,
+which is not tidiness: that path ends the agent's board session before it kills the pane
+(#277), and a second copy would be a second place for that to fall out of step — the keyboard
+would close a seat and leave the board holding its lease for the rest of a TTL.
+
 #### The dash — WORK IN PROGRESS
 
 `qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane

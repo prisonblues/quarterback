@@ -27,6 +27,7 @@ import fcntl
 import os
 import pty
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -157,6 +158,17 @@ def screen(tmp_path):
         # ABOUT the note turn it back on and put a stub qb-pace ahead of the real
         # one on PATH.
         "QB_SEATS_PACE": "off",
+        # AND NO TOP-LINE LOOP, for the fourth time and the same reason as the
+        # three above. `qb-seat-top` is started by every screen these tests build
+        # — a hundred and twenty of them in a run — and each would sit in a sleep
+        # loop for the life of its session replaying a decrypt animation. Worse
+        # than the waste, it WRITES to the session while the assertions read it:
+        # a test that captures the bar mid-reveal is a test that fails once a
+        # fortnight for a reason nobody will find. 0 replays means one pass and
+        # nothing left running, and the tests that are ABOUT the line turn it
+        # back on.
+        "QB_SEATS_TOP_EVERY": "0",
+        "QB_SEATS_TOP_ANIMATE": "0",
     }
 
     def _run(*args, name="t", exe=None):
@@ -319,6 +331,18 @@ def wait_for_dash_width(run, want, name="t", timeout=20):
     return got
 
 
+def wait_until(predicate, timeout=20):
+    """Poll until a predicate holds. The actions a key fires go through
+    `run-shell -b`, i.e. in the background, so they land some moments after the
+    keystroke does — the same shape wait_for_dash_width exists for."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.2)
+    return False
+
+
 @contextlib.contextmanager
 def attached_client(run, cols, rows, name="t"):
     """A REAL tmux client attached at a size of the test's choosing.
@@ -334,6 +358,12 @@ def attached_client(run, cols, rows, name="t"):
     size under test. The master end has to be drained continuously or tmux blocks
     writing its first redraw into a full pty buffer and the window never resizes at
     all — hence the pump thread.
+
+    It yields a `press`, which is what the qb key's end-to-end test needs and what
+    the bar can never have: synthesising a CLICK means SGR mouse bytes and a
+    status line whose geometry the test would have to compute, while a key is one
+    byte written to the master. Nothing before #248 had a caller for it, which is
+    why this used to yield the Popen — nothing read that either.
     """
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -368,7 +398,21 @@ def attached_client(run, cols, rows, name="t"):
                 break
             time.sleep(0.2)
         assert got == str(cols), f"the client never resized the window to {cols}: {got}"
-        yield client
+
+        def press(*keys, gap=0.4):
+            """Type keys into the client's terminal, one at a time.
+
+            The gap is not a sleep-until-it-passes. A key table is a state machine
+            and tmux reads its input in chunks: the two bytes of `C-q t` arriving
+            in one read are one paste, not a chord, and the table has to have been
+            switched into before the second byte is looked up in it.
+            """
+            for key in keys:
+                os.write(master, key.encode() if isinstance(key, str) else key)
+                time.sleep(gap)
+
+        press.client = client
+        yield press
     finally:
         stop.set()
         run.tmux("detach-client", "-s", f"={name}")
@@ -1088,6 +1132,26 @@ def test_the_bar_works_on_a_screen_whose_name_tmux_keeps_verbatim(screen):
     assert sorted(int(n) for _, n in panes(screen, real) if n) == [1, 3, 4], done.stderr
 
 
+def test_the_cross_works_on_a_screen_that_is_not_the_last_one_on_the_server(screen):
+    """`session_id` used to leave the pipeline non-zero unless the screen it was
+    asked about happened to be listed LAST.
+
+    Its loop body was `[ "${line#* }" = "$1" ] && printf …`, so a final line that
+    did not match made the `while` exit 1 — and under `pipefail` that is the
+    status of the whole pipeline, and so of the command substitution around it.
+    `sid=$(session_id "$session") || sid=""` then threw away the id it had just
+    been handed, and every button on the bar reported "no screen named 'one' is
+    up" about a screen tmux was listing on the line above. One screen on a server
+    could never show it, which is why it shipped.
+    """
+    screen("-n", "2", name="one")
+    screen("-n", "2", name="two")
+    assert click(screen, "kill2", "one", name="one").returncode == 0
+    assert sorted(n for _, n in panes(screen, "one") if n) == ["1"]
+    assert sorted(n for _, n in panes(screen, "two") if n) == ["1", "2"], \
+        "the click reached the wrong screen"
+
+
 def test_a_click_naming_a_screen_that_is_gone_says_so(screen):
     """It used to present as "seat 1 has no pane", which names the wrong thing.
 
@@ -1134,6 +1198,1176 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
         done = click(screen, junk, "t")
         assert done.returncode in (0, 1), f"{junk!r} → {done.returncode} {done.stderr}"
     assert panes(screen) == before, "an unknown range moved the furniture"
+
+
+# ---- the top line -----------------------------------------------------------
+#
+# `status 2` makes room for the seat bar and tmux numbers the two lines 0 and 1;
+# install_bar only ever wrote index 1. Writing ONE index of an array option at
+# session level stops tmux inheriting the global array, so index 0 resolved to
+# empty and every screen carried a full-width blank strip in whatever
+# status-style is. Nothing was relying on it, which is what makes it a free line
+# rather than a trade.
+
+def top_format(run, name="t"):
+    return run.tmux("show-options", "-v", "-t", f"={name}:", "status-format[0]").stdout.strip()
+
+
+def test_the_top_line_is_not_blank(screen):
+    """The regression, stated as the thing that was wrong: a screen's line 0 was
+    empty, so it drew as a full-width bar of `status-style` and nothing else."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert fmt, "line 0 is empty again — the screen has a blank strip across the top"
+    assert "#{@qb_top}" in fmt, f"the line says nothing about this screen: {fmt}"
+
+
+def test_the_top_line_says_which_screen_this_is(screen):
+    """The seat bar says what the seats are doing; nothing said whose they were."""
+    screen("-n", "2")
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", said
+
+
+def test_the_top_line_takes_words_of_your_own(screen):
+    """`${VAR+set}`, so an EMPTY QB_SEATS_TOP is a deliberate "no words of ours
+    there" and an unset one means "pick for me" — the same two different answers
+    QB_SEATS_DASH draws, and the same spelling."""
+    screen.env["QB_SEATS_TOP"] = "the fleet, at rest"
+    try:
+        screen("-n", "2")
+    finally:
+        del screen.env["QB_SEATS_TOP"]
+    assert screen.tmux("show-options", "-v", "-t", "=t:",
+                       "@qb_top_text").stdout.strip() == "the fleet, at rest"
+
+    screen.env["QB_SEATS_TOP"] = ""
+    try:
+        screen("-n", "2", name="bare")
+    finally:
+        del screen.env["QB_SEATS_TOP"]
+    assert screen.tmux("show-options", "-v", "-t", "=bare:",
+                       "@qb_top_text").stdout.strip() == ""
+
+
+def test_the_top_line_runs_no_shell_on_every_redraw(screen):
+    """A status line re-expands every `status-interval` — 15s by default, PER
+    ATTACHED CLIENT — and a `#(shell command)` in one runs on that cadence. So
+    the ceiling is not `#(qb-pace)`: qb-seat-top is awake on its own timer
+    anyway, writes the answer into a session option, and the format reads it.
+    """
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert "#(" not in fmt, f"the top line shells out on every redraw: {fmt}"
+    assert "#{@qb_pace}" in fmt, f"the ceiling is not on the line at all: {fmt}"
+
+
+def test_the_top_line_paints_its_own_colours_too(screen):
+    """The same rule the seat bar has, and for the same reason — this line sits
+    on the identical `status-style` green."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    naked = [fg for fg, bg in bar_pairs(fmt) if bg is None]
+    assert not naked, f"these take whatever status-style is: {naked}"
+    assert "#[fill=" in fmt, "the top line does not paint its own line"
+    for fg, bg in bar_pairs(fmt):
+        if bg is None or _rgb(fg) is None or _rgb(bg) is None:
+            continue
+        ratio = _contrast(fg, bg)
+        assert ratio >= 4.5, f"{fg} on {bg} is {ratio:.2f}:1, and 4.5:1 is the floor"
+
+
+def test_a_toggle_does_not_steal_the_cursor(screen):
+    """`join-pane` leaves the joined pane ACTIVE — measured on 3.6a — and that is
+    not what a toggle should do.
+
+    Showing the tape again landed the cursor in the tape, so the next thing typed
+    went to a board follower instead of the agent being worked with, and the next
+    `C-q x` refused with "that pane is not a seat" — correctly, and confusingly.
+    A toggle is about what is on the screen, never about where you are on it.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    seat2 = next(p for p, n in panes(screen) if n == "2")
+    screen.tmux("select-pane", "-t", seat2)
+
+    def where():
+        return screen.tmux("display-message", "-p", "-t", "=t:",
+                           "#{pane_id}").stdout.strip()
+
+    for action in ("tape", "tape", "dash", "dash"):
+        assert seat_key(screen, action, "t").returncode == 0
+        assert where() == seat2, f"{action} moved the cursor to {where()} (was {seat2})"
+
+
+def test_the_key_works_from_a_checkout_full_of_metacharacters(screen, tmp_path):
+    """RED/GREEN. `sh_quote` alone left `$`, `"`, `\\` and `#` live for tmux's OWN
+    parser, and the failure was the silent one: a checkout under `a$Bdir` bound
+    every key to `/…/a/qb-seat-key`, because tmux expanded `$Bdir` to nothing.
+    The screen builds, the bar draws, the table installs, and every key does
+    nothing at all — `run-shell -b` discards both streams. A `"` in the path is
+    the loud version: `syntax error`, and a half-built screen.
+
+    Driven through a real keystroke, because that is the only thing that proves
+    the whole chain: the bind-time parse, the confirm-time second parse, the
+    format expansion, and the shell that finally runs it. A PLAIN action crosses
+    one tmux parse and a CONFIRMED one crosses two, so both are pressed.
+    """
+    odd = tmp_path / "a$B\"c\\d#e f'g"
+    odd.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key", "qb-seat-top"):
+        copy = odd / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+
+    done = screen("-n", "2", exe=[str(odd / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert pane_id(screen, "tape"), "no tape to toggle"
+
+    with attached_client(screen, 140, 40) as press:
+        press("\x11", "t")                      # plain: one tmux parse
+        assert wait_until(lambda: pane_id(screen, "tape") is None), \
+            "C-q t did nothing — the bound path is not the real one"
+        press("\x11", "t")
+        assert wait_until(lambda: pane_id(screen, "tape") is not None)
+
+        # The cursor has to be on a seat for `close` to have one to close, and
+        # the toggle above deliberately left it where it was.
+        seat1 = next(p for p, n in panes(screen) if n == "1")
+        screen.tmux("select-pane", "-t", seat1)
+        press("\x11", "x", "y")                 # confirmed: two tmux parses
+        assert wait_until(lambda: sorted(n for _, n in panes(screen) if n) == ["2"]), \
+            "C-q x y did nothing — the confirmed path lost a quoting layer"
+
+
+def test_a_key_press_runs_the_copy_its_own_screen_was_built_with(screen, tmp_path):
+    """`bind-key -T qb` is SERVER-WIDE and holds one path. The root key is gated
+    per screen, but the table is not: the last screen built writes it, so a key
+    pressed on an older screen arrives in the newer screen's qb-seat-key. That is
+    only wrong during a rollout, and it is exactly then that it matters — the
+    same "which copy of itself" question dash_hooks answers for the resize hook.
+
+    So the screen records @qb_key_bin and the dispatcher hands over. The marker
+    proves the hand-off happened rather than the wrong copy quietly coping.
+    """
+    marker = tmp_path / "handed-off"
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    for name in ("qb-seat-key", "qb-seat-click", "qb-seats", "qb-seat-top"):
+        copy = theirs / name
+        text = (BIN / name).read_text()
+        if name == "qb-seat-key":
+            text = text.replace("set -euo pipefail\n",
+                                f"set -euo pipefail\n: > {marker}\n", 1)
+        copy.write_text(text)
+        copy.chmod(0o755)
+
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+    assert screen("-n", "2", exe=[str(theirs / "qb-seats")]).returncode == 0
+    recorded = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_key_bin").stdout.strip()
+    assert recorded == str(theirs / "qb-seat-key"), recorded
+
+    # Now press it with the OTHER copy — which is what a second screen built from
+    # a different checkout leaves in the shared table.
+    marker.unlink(missing_ok=True)
+    done = subprocess.run([str(BIN / "qb-seat-key"), "tape", "t"],
+                          env=click_env(screen), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert marker.exists(), "the wrong copy handled the key instead of handing over"
+    assert aux_panes(screen) == [], "the tape did not hide"
+
+
+def test_a_pace_reading_that_could_not_be_refreshed_says_so(screen, tmp_path):
+    """A verdict that could not be refreshed is not a current one. `pace()` used
+    to return quietly on a missing binary, a timeout, an error or an empty
+    answer, which left the last reading on screen looking live — so a `STOP` from
+    twenty minutes ago read exactly like a `STOP` from now, on the one number the
+    line exists to carry.
+
+    The reading is KEPT, because a stale ceiling is still the best estimate
+    anyone has; it is marked, and the format draws a marked one dimmer and
+    prefixed `~`.
+    """
+    paceb = tmp_path / "paceb"
+    paceb.mkdir()
+    stub = paceb / "qb-pace"
+    stub.write_text("#!/bin/sh\necho 'pace: STOP — 5h at 99% (critical); resets in 12m'\n")
+    stub.chmod(0o755)
+    screen.env["PATH"] = f"{paceb}:{screen.env['PATH']}"
+    screen.env["QB_SEATS_PACE"] = "on"
+    screen.env["QB_SEATS_TOP_EVERY"] = "0"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_PACE"] = "off"
+
+    def opt(name):
+        return screen.tmux("show-options", "-v", "-t", "=t:", name).stdout.strip()
+
+    assert wait_until(lambda: opt("@qb_pace_sev") == "critical"), opt("@qb_pace_sev")
+    said = opt("@qb_pace")
+    assert "STOP" in said, said
+
+    # Now qb-pace stops answering, exactly as a timeout or an outage would.
+    stub.write_text("#!/bin/sh\nexit 1\n")
+    done = subprocess.run([str(BIN / "qb-seat-top"), "$0", "--once"],
+                          env={**click_env(screen), "PATH": f"{paceb}:{screen.env['PATH']}"},
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert opt("@qb_pace_sev") == "stale", \
+        f"a reading that could not be refreshed still reads as current: {opt('@qb_pace_sev')}"
+    assert opt("@qb_pace") == said, "the last known reading was thrown away"
+
+
+def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
+    """The partial-install case, and it used to take the whole build down.
+
+    During a rollout PATH's harness and a checkout disagree about which scripts
+    exist, so `beside_me` answers with a path that is not there — and a
+    `run-shell -b` on a missing command does NOT fail quietly. Measured on 3.6a
+    as `no current client` and `not in a mode` on stderr and a non-zero exit,
+    which under `set -e` killed qb-seats with the session, the seats and the tape
+    already created, on an error naming none of that. Same shape as the resize
+    hook's version of this, and the same answer: ask first.
+
+    What the screen loses is only that the line refreshes. The line itself is set
+    before the probe, so it still says which screen this is.
+    """
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key"):
+        copy = lonely / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    # BIN off PATH, or beside_me finds the ordinary qb-seat-top there.
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+
+    done = screen("-n", "2", exe=[str(lonely / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
+    assert "qb-seat-top" in done.stderr, \
+        f"nothing said why the line will not refresh: {done.stderr}"
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", \
+        f"the line is not even drawn once: {said!r}"
+
+
+def test_the_reveal_is_the_same_shape_as_the_answer(screen):
+    """The effect itself, read rather than caught.
+
+    A frame is on screen for 40ms, so a test that polls for one is a test that
+    races it — and that is not theoretical: the first spelling of this passed
+    locally, passed in the flake sandbox, and failed in the flake sandbox on the
+    same commit, for no reason but load. `--frames` prints the reveal with no
+    tmux and no clock anywhere near it, so everything the effect promises is
+    asserted by reading:
+
+      * every frame is exactly as wide as the answer, or the line jitters
+        sideways all the way through the reveal;
+      * spaces are never scrambled, which is what makes it read as decryption
+        rather than as noise — the shape of the words is there from frame one;
+      * characters settle left to right and never come unsettled;
+      * the last frame is the text itself.
+    """
+    text = "quarterback: a-repo"
+    done = subprocess.run([str(BIN / "qb-seat-top"), "--frames", text],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    frames = done.stdout.splitlines()
+    assert len(frames) > len(text), f"only {len(frames)} frames for {len(text)} characters"
+
+    for frame in frames:
+        assert len(frame) == len(text), f"{frame!r} is {len(frame)} wide, not {len(text)}"
+        for i, c in enumerate(text):
+            if c == " ":
+                assert frame[i] == " ", f"a space was scrambled in {frame!r}"
+
+    # THE SETTLED PREFIX IS COMPUTED, NOT MEASURED, and that distinction is the
+    # whole of why this test is not flaky. `commonprefix(frame, text)` counts a
+    # SCRAMBLED character that happens to land on the right one, so the measured
+    # prefix jumps around and a monotonicity assertion over it fails roughly one
+    # run in ten — which is exactly how this test first shipped. The reveal's
+    # contract is arithmetic: one character settles every second tick, so frame i
+    # has (i + 1) // 2 of them and those must be right whatever the tail rolled.
+    settle_every = 2                      # decrypt_text.js's settleEvery
+    for i, frame in enumerate(frames[:-1]):
+        revealed = (i + 1) // settle_every
+        assert frame[:revealed] == text[:revealed], (
+            f"frame {i} should have settled {revealed} characters: {frame!r}")
+    assert frames[-1] == text, f"the reveal ended on {frames[-1]!r}"
+
+
+def test_the_line_reveals_on_a_screen_somebody_is_looking_at(screen):
+    """That it runs at all, which is the only part a live screen has to answer —
+    and it is answered with a COUNT rather than by catching a frame, because a
+    count is still true a minute later.
+
+    A detached screen is deliberately not animated to: fifty `set-option`s played
+    to an empty socket buys nothing, and a screen left over a weekend would play
+    thousands. So this needs a real client, and the count must not move before
+    one arrives.
+    """
+    screen.env["QB_SEATS_TOP_EVERY"] = "5"
+    screen.env["QB_SEATS_TOP_ANIMATE"] = "1"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_TOP_EVERY"] = "0"
+        screen.env["QB_SEATS_TOP_ANIMATE"] = "0"
+
+    def reveals():
+        said = screen.tmux("show-options", "-v", "-t", "=t:",
+                           "@qb_top_reveals").stdout.strip()
+        return int(said) if said.isdigit() else 0
+
+    assert reveals() == 0, "a detached screen was animated to"
+    with attached_client(screen, 120, 30):
+        assert wait_until(lambda: reveals() >= 1, timeout=40), \
+            "the line never revealed on a screen with a client on it"
+        assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip() \
+            == f"quarterback: {screen.repo.name}", "the reveal did not settle on the text"
+
+
+def test_a_screen_still_builds_when_qb_seat_top_is_missing(screen, tmp_path):
+    """The partial-install case, and it used to take the whole build down.
+
+    During a rollout PATH's harness and a checkout disagree about which scripts
+    exist, so `beside_me` answers with a path that is not there — and a
+    `run-shell -b` on a missing command does NOT fail quietly. Measured on 3.6a
+    as `no current client` and `not in a mode` on stderr and a non-zero exit,
+    which under `set -e` killed qb-seats with the session, the seats and the tape
+    already created, on an error naming none of that. Same shape as the resize
+    hook's version of this, and the same answer: ask first.
+
+    What the screen loses is only that the line refreshes. The line itself is set
+    before the probe, so it still says which screen this is.
+    """
+    lonely = tmp_path / "lonely"
+    lonely.mkdir()
+    for name in ("qb-seats", "qb-seat-click", "qb-seat-key"):
+        copy = lonely / name
+        copy.write_text((BIN / name).read_text())
+        copy.chmod(0o755)
+    # BIN off PATH, or beside_me finds the ordinary qb-seat-top there.
+    screen.env["PATH"] = path_with_no_dash_on_it(tmp_path, screen)
+
+    done = screen("-n", "2", exe=[str(lonely / "qb-seats")])
+    assert done.returncode == 0, f"the screen did not build: {done.stderr}"
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2"]
+    assert "qb-seat-top" in done.stderr, \
+        f"nothing said why the line will not refresh: {done.stderr}"
+    said = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_top").stdout.strip()
+    assert said == f"quarterback: {screen.repo.name}", \
+        f"the line is not even drawn once: {said!r}"
+
+
+def test_the_reveal_settles_on_exactly_the_static_text(screen):
+    """The animation is an aesthetic and nothing may depend on it, so the thing
+    worth pinning is that it is INVISIBLE in the outcome: the reveal ends on
+    precisely the text a screen with QB_SEATS_TOP_ANIMATE=0 would have shown.
+
+    It also has to actually animate, or this passes against a line that never
+    moved — hence the intermediate frames. A detached screen is deliberately not
+    animated to, so this needs a real client.
+    """
+    screen.env["QB_SEATS_TOP_EVERY"] = "5"
+    screen.env["QB_SEATS_TOP_ANIMATE"] = "1"
+    try:
+        screen("-n", "2")
+    finally:
+        screen.env["QB_SEATS_TOP_EVERY"] = "0"
+        screen.env["QB_SEATS_TOP_ANIMATE"] = "0"
+
+    settled = f"quarterback: {screen.repo.name}"
+    with attached_client(screen, 120, 30):
+        seen = set()
+        deadline = time.time() + 25
+        while time.time() < deadline and len(seen - {settled, ""}) < 3:
+            seen.add(screen.tmux("show-options", "-v", "-t", "=t:",
+                                 "@qb_top").stdout.strip())
+            time.sleep(0.03)
+        frames = seen - {settled, ""}
+        assert frames, f"the line never moved: {seen}"
+        # Every frame is the same width as the answer, or the line would jitter
+        # sideways all the way through the reveal.
+        for frame in frames:
+            assert len(frame) == len(settled), f"{frame!r} is not {len(settled)} wide"
+        assert wait_until(
+            lambda: screen.tmux("show-options", "-v", "-t", "=t:",
+                                "@qb_top").stdout.strip() == settled), \
+            "the reveal did not settle on the text it was decrypting to"
+
+
+# ---- the qb key --------------------------------------------------------------
+#
+# The keyboard half of the bar (#248). Until it existed every seat-level action
+# was a click: adding a seat from the keyboard meant dropping to a shell for
+# `qb-seats --add`, and the tape and the dash could not be got out of the way at
+# all without dragging borders.
+#
+# The same split as the bar's tests and for the same reason — a keystroke cannot
+# be synthesised here any more than a click can, and a `display-menu` cannot be
+# opened headless at all. So these test the two halves either side of the press:
+# that the table and the menu offer the right keys, and that `qb-seat-key` does
+# the right thing when handed an action. The join between them is the one
+# `bind-key` line asserted below.
+#
+# WHAT IS WORTH THE TROUBLE OF ASSERTING is the geometry. A toggle that puts a
+# pane back in the WRONG place still puts it back, so every wrong answer here
+# looks like a working feature until somebody compares it with what they had —
+# which is how `pane_top == 0` (the seat bar makes it 1) shipped in a draft,
+# recording no widths at all and restoring none.
+
+QB_TABLE = re.compile(r"^\s*bind-key\s+-T\s+qb\s+(\S+)\s+(.*)$")
+
+
+def seat_key(run, *args, name="t"):
+    return subprocess.run([str(BIN / "qb-seat-key"), *args], env=click_env(run, name),
+                          capture_output=True, text=True, timeout=60)
+
+
+def qb_table(run, name="t"):
+    """{key: the command bound to it} in the `qb` key table."""
+    got = {}
+    for line in run.tmux("list-keys", "-T", "qb").stdout.splitlines():
+        found = QB_TABLE.match(line)
+        if found:
+            got[found.group(1)] = found.group(2)
+    return got
+
+
+def qb_menu(run, name="t"):
+    """[(key, label, command)] for the menu the `Any` binding opens.
+
+    tmux re-quotes a stored command when it lists it, in a dialect shlex reads:
+    the items come back as the flat `name key command …` argv display-menu was
+    given, so the triples are recovered by position after `-y`'s value.
+    """
+    words = shlex.split(qb_table(run, name)["Any"])
+    items = words[words.index("-y") + 2:]
+    assert len(items) % 3 == 0, f"the menu is not whole triples: {items}"
+    return [(items[i + 1], items[i], items[i + 2]) for i in range(0, len(items), 3)]
+
+
+def action_of(command):
+    """The qb-seat-key action a bound command runs, or None."""
+    found = re.search(r"qb-seat-key'? (\w+)", command)
+    return found.group(1) if found else None
+
+
+def geometry(run, name="t"):
+    """{pane_id: (left, top, width, height)} — the whole screen, exactly."""
+    out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
+                   "#{pane_id}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}"
+                   ).stdout
+    got = {}
+    for line in out.splitlines():
+        if line:
+            pane, *rest = line.split("\t")
+            got[pane] = tuple(int(v) for v in rest)
+    return got
+
+
+def test_the_qb_key_is_bound_and_gated_on_being_this_screens_key(screen):
+    """A key table is SERVER-wide, exactly as MouseDown1Status is.
+
+    So the binding cannot simply act: it compares @qb_key — set on this session
+    and on nothing else — against the key it is bound to, and in the other branch
+    does verbatim what tmux would have done, which for a key is to send it on to
+    the pane. A session that is not a screen is therefore not quietly missing a
+    keystroke, which is the failure a bare `bind-key -n` has.
+    """
+    screen("-n", "2")
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_key").stdout.strip() == "C-q"
+
+    # The WHOLE root table, filtered here rather than queried key by key: tmux
+    # 3.7b answers the one-key query form for some keys with empty output and
+    # exit 0, which is what made the bar's equivalent assertion fail on 3.7b
+    # while passing on 3.6a (#259).
+    table = screen.tmux("list-keys", "-T", "root").stdout
+    lines = [ln for ln in table.splitlines() if re.search(r"-T\s+root\s+C-q\s", ln)]
+    assert len(lines) == 1, f"expected one root C-q binding, got {lines}"
+    bound = lines[0]
+    assert "#{==:#{@qb_key},C-q}" in bound, f"the binding is not gated on ITS key: {bound}"
+    assert "switch-client -T qb" in bound, f"the binding opens no key table: {bound}"
+    assert "send-keys C-q" in bound, f"nothing falls through elsewhere: {bound}"
+
+
+def test_two_screens_with_different_keys_do_not_answer_for_each_other(screen):
+    """Nothing UNBINDS the first screen's key when a second is built with another
+    one, so a server ends up carrying both.
+
+    Gated on merely *being* a screen, both conditions are then true on both
+    screens — and C-q would open the key table on the screen whose user had asked
+    for M-q precisely to get C-q back for their emacs. Each binding compares
+    @qb_key against the key it is bound to instead, so it answers for its own
+    screen and falls through everywhere else.
+    """
+    screen("-n", "2", name="cq")
+    screen.env["QB_SEATS_KEY"] = "M-q"
+    try:
+        screen("-n", "2", name="mq")
+    finally:
+        del screen.env["QB_SEATS_KEY"]
+
+    table = screen.tmux("list-keys", "-T", "root").stdout
+    for key in ("C-q", "M-q"):
+        lines = [ln for ln in table.splitlines() if re.search(rf"-T\s+root\s+{re.escape(key)}\s", ln)]
+        assert len(lines) == 1, f"{key}: {lines}"
+        assert f"#{{==:#{{@qb_key}},{key}}}" in lines[0], \
+            f"{key} fires on any screen, not only on one whose key it is: {lines[0]}"
+
+    assert screen.tmux("show-options", "-v", "-t", "=cq:", "@qb_key").stdout.strip() == "C-q"
+    assert screen.tmux("show-options", "-v", "-t", "=mq:", "@qb_key").stdout.strip() == "M-q"
+
+
+def test_a_session_that_is_not_a_screen_carries_nothing_for_the_gate_to_find(screen):
+    """The other half of the gate, on the same server: the binding is there, and
+    the option it reads is not — so the condition is false and the key goes to
+    the pane. This is the assertion that a screen cannot take C-q away from the
+    rest of somebody's tmux."""
+    screen("-n", "2")
+    screen.tmux("new-session", "-d", "-s", "plain")
+    assert screen.tmux("show-options", "-v", "-t", "=plain:", "@qb_key").stdout.strip() == ""
+
+
+def test_the_key_can_be_turned_off(screen):
+    """It costs one keystroke inside every pane of the screen, and C-q in
+    particular is XON under `stty ixon` and quoted-insert in readline and emacs.
+    Refusing has to leave the screen itself working."""
+    screen.env["QB_SEATS_KEY"] = ""
+    try:
+        screen("-n", "2", name="nokey")
+    finally:
+        del screen.env["QB_SEATS_KEY"]
+    got = panes(screen, "nokey")
+    assert sorted(n for _, n in got if n) == ["1", "2"], "the screen still builds"
+    assert screen.tmux("show-options", "-v", "-t", "=nokey:", "@qb_key").stdout.strip() == ""
+    assert qb_table(screen, "nokey") == {}, "a key table was installed anyway"
+
+
+def test_the_key_can_be_a_different_one(screen):
+    """`${VAR+set}`, so EMPTY means none and unset means pick for me — the same
+    spelling as QB_SEATS_DASH, and the reason the two answers stay different."""
+    screen.env["QB_SEATS_KEY"] = "M-q"
+    try:
+        screen("-n", "2")
+    finally:
+        del screen.env["QB_SEATS_KEY"]
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_key").stdout.strip() == "M-q"
+    table = screen.tmux("list-keys", "-T", "root").stdout
+    lines = [ln for ln in table.splitlines() if re.search(r"-T\s+root\s+M-q\s", ln)]
+    assert len(lines) == 1, f"M-q was not bound: {lines}"
+    assert "send-keys M-q" in lines[0], f"the fall-through sends the wrong key: {lines[0]}"
+
+
+def test_a_key_that_would_end_the_tmux_command_is_refused_before_anything_is_built(screen):
+    """The value is written into a `bind-key` command line, and `bind-key` is one
+    of the last things the script does — so a key tmux will not take would refuse
+    with the session, the seats, the dash and the tape already built. Same
+    argument, and the same place, as QB_SEATS_DASH_SIZE's check."""
+    # Two places the value lands and the format is the strict one: `#`, `}`, `,`
+    # and `:` are the gate's own punctuation, and a key carrying one of them does
+    # not fail loudly — `#{==:#{@qb_key},<key>}` still parses, as something else,
+    # and the gate then answers a question nobody asked.
+    for bad in ("a;b", "a b", "a'b", 'a"b', "a$b", "a#b", "a,b", "a:b", "a}b"):
+        screen.env["QB_SEATS_KEY"] = bad
+        try:
+            done = screen("-n", "2", name="badkey")
+        finally:
+            del screen.env["QB_SEATS_KEY"]
+        assert done.returncode == 1, f"{bad!r} was accepted: {done}"
+        assert "QB_SEATS_KEY" in done.stderr, done.stderr
+        assert screen.tmux("has-session", "-t", "=badkey").returncode != 0, \
+            f"a screen was built for {bad!r}, which was then refused"
+
+
+def test_every_menu_accelerator_is_a_key_in_the_table(screen):
+    """The claim the menu makes is that it teaches the shortcut it replaces, and
+    two lists of keys is how that becomes a lie. Both are generated from one
+    table in the script; this is what keeps it that way."""
+    screen("-n", "2")
+    table = qb_table(screen)
+    for key, label, command in qb_menu(screen):
+        if not key:
+            continue                      # a separator: an empty name, no key
+        assert key in table, f"the menu offers {key!r} ({label!r}) and nothing binds it"
+        # AS WORDS, SORTED, and both halves of that are tmux's doing rather than
+        # slack. A command stored as a binding is re-quoted when it is listed and
+        # its flags come back in tmux's own order (`-w 76 -h 16` prints as
+        # `-h 16 -w 76`), while the same command sitting inside the menu is an
+        # opaque argument that is only parsed when the item is chosen — so it
+        # keeps the spelling it was given. What must match is which script runs
+        # with which arguments, and that survives both.
+        assert sorted(shlex.split(table[key])) == sorted(shlex.split(command)), (
+            f"{key!r} does something else on the menu than in the table:\n"
+            f"  table: {table[key]}\n  menu:  {command}")
+
+
+def test_the_menu_carries_every_action_a_key_does(screen):
+    """The other direction: a key bound in the table and absent from the menu is
+    undiscoverable, which is what the menu exists to prevent. The nine seat
+    digits are the deliberate exception — ten more rows would be a worse menu,
+    and the title says what they do instead."""
+    screen("-n", "2")
+    table = {k: v for k, v in qb_table(screen).items()
+             if k != "Any" and not k.isdigit()}
+    on_menu = {key for key, _, _ in qb_menu(screen) if key}
+    assert set(table) == on_menu, f"table {sorted(table)} vs menu {sorted(on_menu)}"
+    title = qb_table(screen)["Any"]
+    assert "1-9" in title, f"nothing tells a reader what the digits do: {title}"
+
+
+def test_the_digits_jump_to_seats(screen):
+    """Bound flat 1 to 9 rather than one per seat that exists. A screen grows and
+    shrinks under `--add` and the ✕, and a table rebuilt on every change is a
+    table that is stale between them; a digit naming a seat that is not there
+    reports it the way the bar's cells do."""
+    screen("-n", "2")
+    table = qb_table(screen)
+    for n in range(1, 10):
+        assert str(n) in table, f"{n} is not bound"
+        assert action_of(table[str(n)]) == f"seat{n}", table[str(n)]
+
+
+def test_the_tape_toggle_puts_the_screen_back_exactly(screen):
+    """Hidden with `break-pane -d` to a holding window, brought back with
+    `join-pane`. The `-v -f -l` is verbatim what qb-seats' own split is, so the
+    tape comes back as a strip off the bottom of the WHOLE window."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+    tape = pane_id(screen, "tape")
+    assert tape, "no tape to toggle"
+
+    assert seat_key(screen, "tape", "t").returncode == 0
+    hidden = geometry(screen)
+    assert tape not in hidden, "the tape is still in the window"
+    assert len(hidden) == len(before) - 1
+    state = screen.tmux("show-options", "-v", "-t", "=t:", "@qb_hidden_tape").stdout.split()
+    assert state[0] == tape, state
+    assert state[2:], "no widths were recorded, so nothing can be put back"
+
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert geometry(screen) == before, "the tape came back to a different screen"
+    assert screen.tmux("show-options", "-v", "-t", "=t:",
+                       "@qb_hidden_tape").stdout.strip() == ""
+
+
+def test_the_dash_comes_back_above_the_tape_and_not_beside_it(screen):
+    """The regression this toggle is most likely to have, and the reason showing
+    the dash replays the build order rather than simply joining it.
+
+    qb-seats splits the dash off the whole window FIRST and takes the tape's
+    strip off the bottom afterwards, which is what leaves the dash above the tape
+    rather than beside it. Join the dash back with the tape already in place and
+    `-f` gives it the full height of the window instead: measured as a 78x44 dash
+    down the side of a 121-column tape, on a screen whose dash had been 78x32
+    over a full-width one. It looks almost right, which is the problem.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert pane_id(screen, "dash") not in geometry(screen)
+
+    assert seat_key(screen, "dash", "t").returncode == 0
+    got = labels(screen)
+    dash_w, dash_top = got["dash"]
+    tape_w, tape_top = got["tape"]
+    assert dash_top < tape_top, "the dash came back beside the tape, not above it"
+    assert tape_w > dash_w, "the tape stopped spanning the full width"
+    assert geometry(screen) == before, "the dash came back to a different screen"
+
+
+def test_a_hidden_pane_keeps_the_process_that_was_in_it(screen):
+    """Which is the whole reason this is `break-pane` and not "kill it and split a
+    new one": a tape that restarted would lose everything it had followed, and a
+    dash would come back to a blank pane and a poll interval.
+
+    THE PID, NOT THE TEXT ON SCREEN. This asserted that the stub's output was
+    still in the pane, which is a proxy for the claim and a fragile one — the
+    board stub `printf`s without a newline, so the shell's prompt lands on the
+    same line and readline redraws it from column 0, wiping the output. That
+    depends on the shell, the width and the timing: it passed 139 runs locally
+    and in the flake sandbox, and failed once on CI. The pane's pid is the claim
+    itself, and it cannot be redrawn away.
+    """
+    screen("-n", "2")
+
+    def the_tape():
+        return pane_id(screen, "tape") or [p for p, n in panes(screen) if not n][0]
+
+    def pid_of(pane):
+        return screen.tmux("display-message", "-p", "-t", pane,
+                           "#{pane_pid}").stdout.strip()
+
+    tape = the_tape()
+    was = pid_of(tape)
+    assert was.isdigit(), f"the tape has no process at all: {was!r}"
+
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert the_tape() == tape, "the pane was replaced rather than moved"
+    assert pid_of(tape) == was, "the pane came back with a different process in it"
+
+
+def test_the_tape_toggle_works_on_a_screen_with_no_dash(screen):
+    """qb-seats labels the tape `tape` only when there is a dash to tell it apart
+    FROM — on a one-auxiliary-pane screen the border has said `board` since that
+    script existed. So a lookup by label alone finds nothing on exactly the
+    screens most likely to want the toggle, and the fallback is the pane that is
+    neither a seat nor labelled anything."""
+    screen("-n", "2")                     # the fixture builds no dash by default
+    assert pane_id(screen, "tape") is None, "this screen was supposed to have no dash"
+    before = geometry(screen)
+    assert len(aux_panes(screen)) == 1
+
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert aux_panes(screen) == [], "the unlabelled tape was not found"
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert geometry(screen) == before
+
+
+def test_two_screens_disagree_about_whether_their_tape_is_showing(screen):
+    """Which is why the state is a SESSION option and not a server one. A server
+    option would make the second screen to toggle answer for the first, and the
+    two are different screens on purpose."""
+    screen("-n", "2", name="one")
+    screen("-n", "2", name="two")
+    assert seat_key(screen, "tape", "one", name="one").returncode == 0
+    assert aux_panes(screen, "one") == []
+    assert len(aux_panes(screen, "two")) == 1, "hiding one screen's tape hid the other's"
+    assert screen.tmux("show-options", "-v", "-t", "=two:",
+                       "@qb_hidden_tape").stdout.strip() == ""
+
+
+def test_a_nudge_records_the_width_it_landed_at(screen):
+    """@qb_dash_width is what the window-resized hook puts the dash back to on
+    every attach and every terminal resize, so a nudge that did not write it
+    would be undone by the next one — which is not what somebody pressing `>`
+    four times is asking for. What LANDED is recorded rather than what was asked
+    for: tmux clamps quietly as well as refusing loudly, and recording the
+    request would have the hook asking for a width already turned down."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen.env["QB_SEATS_DASH_SIZE"] = "60"
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    assert labels(screen)["dash"][0] == 60
+
+    assert seat_key(screen, "wider", "t").returncode == 0
+    got = labels(screen)["dash"][0]
+    assert got > 60, f"`>` did not widen the dash: {got}"
+    recorded = screen.tmux("show-options", "-p", "-t", dash, "-v",
+                           "@qb_dash_width").stdout.strip()
+    assert recorded == str(got), f"the dash is {got} wide and asks for {recorded}"
+
+    assert seat_key(screen, "narrower", "t").returncode == 0
+    assert labels(screen)["dash"][0] == 60, "`<` did not undo one `>`"
+
+
+def test_a_nudge_refuses_while_the_dash_is_hidden(screen):
+    """Resizing a pane that is parked in the holding window would succeed and
+    change nothing anybody can see, and the recorded width would then be one
+    chosen against a window of the wrong size."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert seat_key(screen, "dash", "t").returncode == 0
+    done = seat_key(screen, "wider", "t")
+    assert done.returncode == 1
+    assert "hidden" in done.stderr, done.stderr
+
+
+def test_close_acts_on_the_pane_the_key_was_pressed_in(screen):
+    """The ✕ knows which seat it is because the click named one; a key knows only
+    where it was pressed, so the seat number comes off the pane's own @qb_seat."""
+    screen("-n", "3")
+    wait_for_log(screen.log, 3)
+    pane = next(p for p, n in panes(screen) if n == "2")
+    assert seat_key(screen, "close", "t", pane).returncode == 0
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3"]
+
+
+def test_close_refuses_a_pane_that_is_not_a_seat(screen):
+    """Press it in the tape or the dash and the honest answer is that there is no
+    seat here. Closing the board pane is what a missing guard did to
+    qb-seat-click, on a screen whose whole point is having one."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    before = panes(screen)
+    for label in ("dash", "tape"):
+        pane = pane_id(screen, label)
+        done = seat_key(screen, "close", "t", pane)
+        assert done.returncode == 1, f"closing the {label} was allowed"
+        assert "not a seat" in done.stderr, done.stderr
+    assert panes(screen) == before, "something moved anyway"
+
+
+def test_close_ends_the_agents_session_before_the_pane_goes(screen, tmp_path):
+    """The keyboard has to do what the ✕ does, and this is the assertion that it
+    is the SAME code rather than a second copy of it.
+
+    A `kill-pane` SIGHUPs the agent, and Claude Code's SessionEnd hook is not
+    documented to survive that — so a close that skipped the qb-end call would
+    leave the board holding a live lease and every claim that session had taken,
+    for the rest of their TTL (#277). Nothing would look wrong while it happened,
+    which is exactly why the key delegates to qb-seat-click rather than
+    reimplementing the path.
+    """
+    screen("-n", "2")
+    wait_for_log(screen.log, 2)
+    pane = next(p for p, n in panes(screen) if n == "1")
+    screen.tmux("set-option", "-p", "-t", pane, "@qb_session", "sid-of-seat-1")
+
+    log, env = stub_qb_end(screen, tmp_path)
+    done = subprocess.run([str(BIN / "qb-seat-key"), "close", "t", pane], env=env,
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+
+    assert log.exists(), "the key closed the pane without telling the board"
+    said = log.read_text()
+    assert "sid-of-seat-1" in said
+    assert "--reason killed" in said
+    assert sorted(n for _, n in panes(screen) if n) == ["2"]
+
+
+def test_the_bindings_hand_each_action_the_screen_and_the_pane(screen):
+    """Where qb-seat-click reads a server option back, this passes arguments.
+
+    The ✕ has to stash because `#{mouse_status_range}` is scoped to a mouse EVENT
+    and expands to nothing by the time `confirm-before` runs its command. A
+    session and a pane are CLIENT state, so a binding can expand them and pass
+    them — which is also the better answer, because a server option is a race
+    between two clients pressing the key on one server and an argument cannot be.
+
+    The id and not the name: the value crosses tmux's expansion into a shell
+    command line, where a session called `it's` would leave an unterminated quote.
+    """
+    screen("-n", "2")
+    for key, cmd in qb_table(screen).items():
+        if key == "Any" or "qb-seat-key" not in cmd:
+            continue
+        if action_of(cmd) == "guide":
+            # The one that cannot be handed anything: `display-popup` does not
+            # format-expand its command, so the guide asks tmux instead.
+            assert "#{" not in cmd, f"the guide is a popup and cannot be told: {cmd}"
+            continue
+        assert "'#{session_id}'" in cmd, f"{key!r} is told no screen: {cmd}"
+        assert "'#{pane_id}'" in cmd, f"{key!r} is told no pane: {cmd}"
+        assert "#{session_name}" not in cmd, (
+            f"{key!r} carries a NAME, which a session called `it's` breaks: {cmd}")
+
+
+def test_an_action_takes_the_screens_id_as_well_as_its_name(screen):
+    """The id is what the bindings pass; the name is what `list` prints and what
+    `qb-seat-click` and `qb-seats -s` take. Both have to reach the same screen."""
+    screen("-n", "3")
+    wait_for_log(screen.log, 3)
+    sid = screen.tmux("display-message", "-p", "-t", "=t:", "#{session_id}").stdout.strip()
+    assert sid.startswith("$"), sid
+    pane = next(p for p, n in panes(screen) if n == "2")
+    assert seat_key(screen, "close", sid, pane).returncode == 0
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3"]
+
+
+def test_a_digit_jumps_from_the_key_and_the_menu_leads_back_to_it(screen):
+    """The exact path a user took, end to end, because every part of it worked in
+    isolation and the whole did not.
+
+    Press the key, see nothing happen, press it again — that lands on `Any` and
+    opens the menu, which has no digit accelerators, so `2` does nothing at all.
+    `C-q 2` on its own was always fine. So: the digit works from the key, the
+    double press still reaches the menu, and the menu's `j` hands you back to the
+    table where a digit means a seat.
+    """
+    screen("-n", "3")
+    wait_for_log(screen.log, 3)
+
+    def active():
+        return screen.tmux("display-message", "-p", "-t", "t:seats",
+                           "#{@qb_seat}").stdout.strip()
+
+    with attached_client(screen, 200, 50) as press:
+        press("\x11", "2")                       # straight from the key
+        assert wait_until(lambda: active() == "2"), f"C-q 2 did not jump: {active()}"
+
+        press("\x11", "\x11")                    # the double press: the menu
+        press("j")                               # ...which leads back to the table
+        press("3")
+        assert wait_until(lambda: active() == "3"), \
+            f"the menu's seat row did not lead back to the digits: {active()}"
+
+
+# ---- the bar's colours ------------------------------------------------------
+# These pin a PROPERTY rather than a palette: every foreground the bar sets has a
+# background set beside it, and every resulting pair is legible. Which colours
+# they are is a taste that may move; that they are readable is not.
+
+_STYLE = re.compile(r"#\[(fg|bg)=([A-Za-z0-9]+)\]")
+_XTERM_BASIC = [
+    (0, 0, 0), (128, 0, 0), (0, 128, 0), (128, 128, 0), (0, 0, 128), (128, 0, 128),
+    (0, 128, 128), (192, 192, 192), (128, 128, 128), (255, 0, 0), (0, 255, 0),
+    (255, 255, 0), (0, 0, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255),
+]
+_NAMED = {"black": 0, "red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5,
+          "cyan": 6, "white": 7}
+
+
+def _rgb(name):
+    """An xterm-256 colour as RGB, or None for one this cannot resolve."""
+    if name in _NAMED:
+        name = f"colour{_NAMED[name]}"
+    if not name.startswith("colour"):
+        return None
+    n = int(name[len("colour"):])
+    if n < 16:
+        return _XTERM_BASIC[n]
+    if n < 232:
+        n -= 16
+        level = [0, 95, 135, 175, 215, 255]
+        return (level[n // 36], level[(n // 6) % 6], level[n % 6])
+    v = 8 + (n - 232) * 10
+    return (v, v, v)
+
+
+def _contrast(fg, bg):
+    """WCAG contrast ratio between two xterm colours. 4.5:1 is the readable floor."""
+    def lum(c):
+        def channel(x):
+            x /= 255
+            return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+        r, g, b = c
+        return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+    a, b = lum(_rgb(fg)), lum(_rgb(bg))
+    hi, lo = max(a, b), min(a, b)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def bar_pairs(fmt):
+    """[(fg, bg)] for every foreground the format sets, in order.
+
+    A `#[fg=…]` with no `#[bg=…]` beside it yields a bg of None — which is the
+    bug this exists for, not an omission in the parser: it means the span takes
+    whatever `status-style` happens to be.
+    """
+    styles = _STYLE.findall(fmt)
+    pairs, i = [], 0
+    while i < len(styles):
+        kind, value = styles[i]
+        if kind == "fg":
+            nxt = styles[i + 1] if i + 1 < len(styles) else None
+            if nxt and nxt[0] == "bg":
+                pairs.append((value, nxt[1])); i += 2; continue
+            pairs.append((value, None))
+        i += 1
+    return pairs
+
+
+def test_the_bar_never_borrows_the_themes_background(screen):
+    """Every span used to set a foreground only and inherit `status-style`, which
+    on a stock tmux is `bg=green,fg=black`. Read off the wire with a real client
+    attached, the terminal was being sent `ESC[38;5;108m ESC[42m` for the ＋ —
+    green on green — and `ESC[38;5;167m ESC[42m` for the ✕.
+
+    A foreground without a background is the whole defect, so that is what this
+    looks for. It cannot be checked by reading colours off the rendered line,
+    because what makes it wrong is a colour the bar never names.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    naked = [fg for fg, bg in bar_pairs(fmt) if bg is None]
+    assert not naked, (
+        f"these set a foreground and take whatever status-style is: {naked}")
+    # And the line itself, or the cells are dark islands in the theme's green:
+    # tmux pre-fills the status line with status-style and draws the format over
+    # it, so only `fill=` makes the bar a strip.
+    assert "#[fill=" in fmt, f"the bar does not paint its own line: {fmt}"
+
+
+def test_every_colour_pair_on_the_bar_is_legible(screen):
+    """4.5:1 is the readable floor. What shipped was 1.39:1 to 2.78:1 throughout,
+    because every pair had the theme's green on one side of it.
+
+    The ratios are computed rather than the colour numbers asserted: which colours
+    the bar uses is a taste that may move, and that they are readable is not.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    checked = 0
+    for fg, bg in bar_pairs(fmt):
+        if bg is None or _rgb(fg) is None or _rgb(bg) is None:
+            continue        # the naked-foreground case is the test above
+        ratio = _contrast(fg, bg)
+        assert ratio >= 4.5, f"{fg} on {bg} is {ratio:.2f}:1, and 4.5:1 is the floor"
+        checked += 1
+    assert checked >= 6, f"only {checked} pairs were checked; the parser has drifted"
+
+
+def test_the_bar_says_the_key_table_is_waiting(screen):
+    """Pressing the key switches the client into a key table and tmux says
+    nothing about it — its own prefix is the same and its users know. Here nobody
+    did: the first press looked like a dead key, the natural next move was to
+    press it again, that lands on `Any` and opens the menu, and the menu has no
+    digit accelerators — so `1`-`9` did nothing while the menu's title promised
+    they jumped to a seat. One invisible state, reported as three bugs.
+
+    `#{client_key_table}` is the whole fix, and the bar already redraws on every
+    change, so the strip appears the instant the key is pressed.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    assert "#{==:#{client_key_table},qb}" in fmt, f"the bar says nothing about the key: {fmt}"
+    # NO COMMA IN THE HINT. `,` separates a conditional's arms, so one would end
+    # the arm early and print the rest of the strip unconditionally — in every
+    # session on the box, since status-format is read per client.
+    arm = fmt.split("#{==:#{client_key_table},qb},", 1)[1]
+    arm = arm[:arm.rindex(",}")]          # the conditional's own closing arm
+    said = re.sub(r"#\[[^\]]*\]", "", arm)   # the literal text, styles removed
+    assert "," not in said, f"a comma in the hint ends the conditional early: {said!r}"
+    for key in ("a add", "x close", "1-9 seat", "t tape", "d dash", "? keys"):
+        assert key in said, f"the hint does not teach {key!r}: {said}"
+
+
+def test_the_hint_appears_while_the_key_waits_and_goes_when_it_is_used(screen):
+    """The bar is a format, so this is the only way to see what it renders: with
+    a client attached and the key actually pressed."""
+    screen("-n", "2")
+    with attached_client(screen, 200, 50) as press:
+        assert "qb" not in bar(screen).split("＋ seat")[-1], "the hint is up before any key"
+        press("\x11")                     # C-q, and nothing after it
+        assert wait_until(lambda: "1-9 seat" in bar(screen)), \
+            f"the bar does not say the key is waiting: {bar(screen)}"
+        press("t")                        # spend the key
+        assert wait_until(lambda: "1-9 seat" not in bar(screen)), \
+            "the hint stayed up after the key was used"
+
+
+def test_the_guide_fits_the_popup_it_is_opened_in(screen):
+    """A line longer than the popup wraps, and a wrapped cheatsheet is worse than
+    none. This shipped at 79 columns inside a 78-column popup — whose border
+    takes two more — and the last paragraph folded. The width is read out of the
+    binding rather than written here, so the text and the popup cannot drift.
+    """
+    screen("-n", "2")
+    opens = qb_table(screen)["?"]
+    words = shlex.split(opens)
+    cols = int(words[words.index("-w") + 1])
+    rows = int(words[words.index("-h") + 1])
+
+    said = seat_key(screen, "guide", "t")
+    assert said.returncode == 0, said.stderr
+    lines = said.stdout.splitlines()
+    # CHARACTERS, not bytes: the guide carries an em dash and an ellipsis, and
+    # `len()` on the encoded form would call a fitting line too wide.
+    widest = max(len(line) for line in lines)
+    assert widest <= cols - 2, (
+        f"the guide is {widest} columns wide and the popup is {cols} "
+        f"({cols - 2} inside its border)")
+    assert len(lines) <= rows - 2, (
+        f"the guide is {len(lines)} lines and the popup holds {rows - 2}")
+
+
+def test_the_menu_does_not_promise_what_a_menu_cannot_do(screen):
+    """Its title said "1-9 jumps to a seat". A `display-menu` has no digit
+    accelerators, so pressing one did nothing at all — which is how the digits
+    came to be reported as broken when they worked perfectly from the key.
+
+    The honest version is a row that hands you back to the table, which is the
+    one place a digit means a seat.
+    """
+    screen("-n", "2")
+    # The -T argument alone, not the whole binding: one of the menu ROWS says
+    # "then 1-9" and is meant to.
+    words = shlex.split(qb_table(screen)["Any"])
+    title = words[words.index("-T") + 1]
+    assert "1-9" not in title, f"the menu still promises the digits: {title!r}"
+    back = [(k, label, cmd) for k, label, cmd in qb_menu(screen)
+            if cmd == "switch-client -T qb"]
+    assert len(back) == 1, f"nothing on the menu leads to the digits: {qb_menu(screen)}"
+    key, label, _ = back[0]
+    assert key not in ("", None) and "seat" in label, (key, label)
+
+
+def test_a_real_keystroke_reaches_the_action(screen):
+    """The one thing nothing else here can prove: that the binding FIRES.
+
+    Every other test in this section drives `qb-seat-key` directly or reads the
+    key table back, and all of them would pass with a root binding that never
+    matched, a gate that was always false, or a `switch-client -T` naming a table
+    that is not there. This is the join, and it is testable for the reason the
+    bar's click is not: a click means SGR mouse bytes and a status line whose
+    geometry the test would have to work out, while `C-q t` is two bytes written
+    to a pty.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert pane_id(screen, "tape"), "no tape to hide"
+    with attached_client(screen, 200, 50) as press:
+        press("\x11", "t")                  # C-q, then t
+        assert wait_until(lambda: pane_id(screen, "tape") is None), \
+            "C-q t did not hide the tape"
+        press("\x11", "t")
+        assert wait_until(lambda: pane_id(screen, "tape") is not None), \
+            "C-q t did not bring the tape back"
+
+
+def test_a_key_this_does_not_know_changes_nothing(screen):
+    """`Any` hands the unbound key over so the menu can teach it, and an action
+    this script has never heard of must not fill the status line with a complaint
+    about it."""
+    screen("-n", "2")
+    before = geometry(screen)
+    for junk in ("floop", "seat", "seatx", "", "--help"):
+        done = seat_key(screen, junk, "t")
+        assert done.returncode in (0, 1, 2), f"{junk!r} → {done.returncode} {done.stderr}"
+    assert geometry(screen) == before, "an unknown action moved the furniture"
+
+
+def test_the_guide_names_the_key_this_screen_uses(screen):
+    """A cheatsheet for somebody else's keyboard is worse than none, so it is read
+    off @qb_key rather than written into the text. It is also the one action that
+    needs no server — `display-popup` runs it in a pane, a human runs it in a
+    shell to find out what the key does, and this reads it."""
+    screen.env["QB_SEATS_KEY"] = "M-q"
+    try:
+        screen("-n", "2")
+    finally:
+        del screen.env["QB_SEATS_KEY"]
+    said = seat_key(screen, "guide", "t")
+    assert said.returncode == 0, said.stderr
+    assert "M-q is the qb key" in said.stdout, said.stdout
+    for key in ("a", "x", "t", "d", "?"):
+        assert re.search(rf"^\s+{re.escape(key)}\s", said.stdout, re.M), \
+            f"{key!r} is bound and the guide does not mention it:\n{said.stdout}"
+
+    # No server, no session, and it still answers — with the default, which is
+    # what a screen this user has not reconfigured will be using.
+    bare = subprocess.run([str(BIN / "qb-seat-key"), "guide"],
+                          env={k: v for k, v in screen.env.items() if k != "TMUX"},
+                          capture_output=True, text=True, timeout=60)
+    assert bare.returncode == 0, bare.stderr
+    assert "C-q is the qb key" in bare.stdout
+
+
+def test_killing_a_named_screen_needs_no_repo(screen):
+    """`K` reaches `qb-seats --kill` through a `run-shell`, whose cwd is the tmux
+    SERVER's — wherever that server was started, which need not be a repo at all.
+    A kill that was told which screen must therefore not need one, the same way
+    `list`, `resume` and `--dash-fit` do not: all four are about a screen that
+    already exists. It used to refuse with "not in a git repo" against a screen it
+    could see."""
+    screen("-n", "2")
+    outside = tempfile.mkdtemp(prefix="qb-notarepo-")
+    try:
+        done = subprocess.run([str(QB_SEATS), "--kill", "-s", "t"], cwd=outside,
+                              env=screen.env, capture_output=True, text=True, timeout=60)
+        assert done.returncode == 0, f"{done.returncode}: {done.stderr}"
+        assert screen.tmux("has-session", "-t", "=t").returncode != 0, "the screen is still up"
+    finally:
+        shutil.rmtree(outside, ignore_errors=True)
 
 
 # ---- the dash pane -----------------------------------------------------------
@@ -2141,8 +3375,14 @@ def test_a_new_screen_says_what_its_seats_are_about_to_spend(screen):
                      'echo "estimate  3 seats x 1 round ~ 851,385 tokens"\n')
     result = screen("-n", "3")
     assert result.returncode == 0
-    assert log.read_text().strip() == "asked --estimate 3", \
-        "the note was not asked about THIS screen"
+    # The ESTIMATE line, not the whole log. The top line asks the same binary a
+    # different question a moment later — `qb-pace` with no arguments, for the
+    # verdict it puts on the right of the screen — and both reads hit qb-pace's
+    # own three-minute cache. What this test is about is which N the note asked
+    # for.
+    asked = [ln for ln in log.read_text().splitlines() if "--estimate" in ln]
+    assert asked == ["asked --estimate 3"], \
+        f"the note was not asked about THIS screen: {log.read_text()!r}"
     assert "qb-seats: pace: SLOW — 5h at 74%; resets in 47m" in result.stderr
     assert "qb-seats: estimate  3 seats x 1 round ~ 851,385 tokens" in result.stderr
 

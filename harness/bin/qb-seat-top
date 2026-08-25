@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+# qb-seat-top — the screen's own top line: who this is, and what is left to spend.
+#
+# Usage: qb-seat-top SESSION-ID          the loop, started by qb-seats
+#        qb-seat-top SESSION-ID --once   one pass, for a test or by hand
+#        qb-seat-top --frames TEXT       every frame of the reveal, one per line
+#
+# Exit codes:
+#   0  the session went away, or --once finished
+#   2  malformed arguments — a caller bug, and says so
+#
+# WHY THIS LINE EXISTS AT ALL. `qb-seats` sets `status 2` to make room for the
+# seat bar, and tmux numbers those lines 0 and 1. install_bar only ever wrote
+# `status-format[1]`, and writing ONE index of an array option at session level
+# stops tmux inheriting the global array — so index 0, which nothing set, came
+# out empty. Every screen has therefore carried a full-width blank strip in
+# whatever `status-style` happens to be (green, on a stock tmux) since the bar
+# shipped. It was never a design decision; it was a line nobody had written.
+#
+# WHAT GOES IN IT. The left is identity — which screen this is, since the seat
+# bar says what the seats are doing and nothing said whose they were. The right
+# is `qb-pace`'s verdict: the shared subscription's five-hour and weekly caps are
+# the only hard ceiling this fleet has, and until now the only place on a screen
+# that showed them was the dash — which #248 has just made hideable with one
+# keystroke. A ceiling you can hide is not a brake.
+#
+# NO `#()` IN THE STATUS LINE, and that is the whole reason this is a loop rather
+# than a format. A status line re-expands every `status-interval` — 15s by
+# default, per attached client — and a `#(shell command)` in it runs on that
+# cadence. This process is already awake on its own timer, so it writes the
+# answers into session options and the format merely reads them: `#{@qb_pace}`
+# costs nothing to expand, however many clients are looking at it.
+#
+# THE ANIMATION IS AN AESTHETIC AND SAYS SO. Nothing depends on it, it is off
+# with QB_SEATS_TOP_ANIMATE=0, and the line reads identically when it is off —
+# the effect settles on exactly the text a static line would have shown. It is
+# the decrypt reveal from lexray's decrypt_text.js, same parameters: a 40ms tick,
+# one character settling every second tick, left to right, spaces left alone.
+#
+# Measured on 3.6a with a real client attached before it was written, because a
+# status line is not obviously capable of it: one `tmux set-option` round trip is
+# 3.5ms, so the ceiling is ~286 frames a second; a 24-character reveal is 50
+# frames, all 50 of which reached the terminal with none coalesced, at 21fps. The
+# cost is 175ms of tmux calls per replay — against a build that already spends
+# forty of them — which is what makes a 30-second replay reasonable and a
+# continuous loop not.
+set -euo pipefail
+
+PROG=${0##*/}
+TICK=0.04               # ms per scramble frame, as decrypt_text.js has it
+SETTLE_EVERY=2          # settle one character every N frames, likewise
+
+# SINGLE-WIDTH CHARACTERS ONLY, which is the one place this departs from
+# decrypt_text.js and it is not a taste. That set carries `∞ ∑ ∏ √ ∫ ≤ ≥ ≈ ≠ ± ×
+# ÷`, which are East Asian AMBIGUOUS width — a terminal is free to draw them two
+# columns wide, and several do. In a browser that is nothing; on a status line it
+# means a frame is a column wider than the frame before it, so the whole line
+# jitters sideways all the way through the reveal. The box-drawing glyphs below
+# are unambiguously narrow, and so is every ASCII one.
+SCRAMBLE='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+SCRAMBLE=$SCRAMBLE'§¶•/\|[]{}<>░▒▓█▌▐─│┌┐└┘├┤┬┴┼═║╔╗╚╝'
+SYMBOL_BIAS=7           # out of 10, as decrypt_text.js's 0.7
+
+usage() {
+  printf 'usage: %s SESSION-ID [--once] | %s --frames TEXT\n' "$PROG" "$PROG" >&2
+  exit 2
+}
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+FRAMES=0
+ONCE=0
+case "$1" in
+  --frames) FRAMES=1; [ $# -eq 2 ] || usage ;;
+  *) SID=$1
+     [ "${2:-}" = "--once" ] && ONCE=1
+     [ $# -eq 1 ] || [ "$ONCE" = 1 ] || usage ;;
+esac
+
+# EVERY READ IS TOLERATED, and for dash_resize's reason rather than a taste for
+# defensive code: this runs detached from any command line, for as long as the
+# screen does, and the screen can end between any two lines of it. A tmux that
+# exits 1 because the server has gone is the ordinary way this stops, not an
+# error — and under `set -e` an untolerated read would take the loop down a
+# fraction of a second before the check that was about to end it anyway.
+opt() {   # opt <name> — a session option, or empty
+  tmux show-options -v -t "$SID:" "$1" 2>/dev/null || true
+}
+
+alive() { tmux has-session -t "$SID" 2>/dev/null; }
+
+# A DETACHED SCREEN IS NOT ANIMATED TO. It costs one tmux query per interval to
+# find that out, against fifty set-options to play a reveal nobody is looking at
+# — and a screen left running over a weekend would play several thousand of them
+# to an empty socket.
+attached() {
+  local n
+  n=$(tmux display-message -p -t "$SID:" '#{session_attached}' 2>/dev/null) || return 1
+  [ -n "$n" ] && [ "$n" != 0 ]
+}
+
+# What the line says on the left. QB_SEATS_TOP is recorded on the session by
+# qb-seats rather than read from the environment here, for the reason every other
+# knob is: this process is started by `run-shell`, whose environment is the tmux
+# SERVER's and not the one the screen was built in.
+identity() {
+  local said repo
+  said=$(opt @qb_top_text)
+  [ -n "$said" ] && { printf '%s' "$said"; return; }
+  repo=$(opt @qb_repo)
+  printf 'quarterback: %s' "${repo##*/}"
+}
+
+# NOT ONE FORK PER CHARACTER, which is what this was for a draft and is why it
+# is spelt so plainly. `out="$out$(rand_char)"` forks a subshell for every
+# scrambled column of every frame — 24 characters over 50 frames is about 580
+# forks per reveal, twice a minute, for an ANIMATION. The same arithmetic inline
+# costs nothing and the reveal then actually keeps decrypt_text.js's 40ms tick
+# rather than drifting to whatever the forks took.
+#
+# The result goes in a global rather than being printed, for the same reason one
+# level up: `$(frame …)` would put a fork back on every frame.
+#
+# The bias is done with the INDEX rather than a second draw — the first 62
+# characters are the alphanumerics and the rest are symbols — so it stays
+# decrypt_text.js's 0.7 however the two sets are sized.
+FRAME=""
+make_frame() {   # make_frame <text> <revealed>   -> FRAME
+  local text=$1 revealed=$2 i c j n=${#SCRAMBLE} alpha=62 out
+  out=${text:0:revealed}
+  i=$revealed
+  while [ "$i" -lt "${#text}" ]; do
+    c=${text:i:1}
+    # A space is always a space, so the shape of the words is there from the
+    # first frame and only the letters resolve. That is decrypt_text.js's rule
+    # and it is what makes the effect read as decryption rather than as noise.
+    if [ "$c" = " " ]; then
+      out="$out "
+    else
+      if [ $(( RANDOM % 10 )) -lt "$SYMBOL_BIAS" ]; then
+        j=$(( alpha + RANDOM % (n - alpha) ))
+      else
+        j=$(( RANDOM % alpha ))
+      fi
+      out="$out${SCRAMBLE:j:1}"
+    fi
+    i=$((i + 1))
+  done
+  FRAME=$out
+}
+# THE REVEAL AS A PURE FUNCTION, printed rather than played. Every frame of it,
+# one per line, with no tmux and no clock anywhere near — so what the effect DOES
+# (every frame the width of the answer, characters settling left to right, spaces
+# never scrambled, the last frame the text itself) is asserted by reading, and
+# only that it runs at all is left to a live screen.
+if [ "$FRAMES" = 1 ]; then
+  text=$2
+  revealed=0
+  tick=0
+  while [ "$revealed" -lt "${#text}" ]; do
+    tick=$((tick + 1))
+    [ $(( tick % SETTLE_EVERY )) -eq 0 ] && revealed=$((revealed + 1))
+    make_frame "$text" "$revealed"
+    printf '%s\n' "$FRAME"
+  done
+  printf '%s\n' "$text"
+  exit 0
+fi
+
+
+# Whether `sleep` here takes a fraction, asked once rather than assumed. GNU and
+# busybox coreutils differ, and a `sleep 0.04` that errors would otherwise do so
+# fifty times a replay into a stream nobody reads — leaving an animation that
+# runs flat out, which looks like a glitch rather than a reveal.
+FRACTIONAL_SLEEP=1
+sleep "$TICK" 2>/dev/null || FRACTIONAL_SLEEP=0
+
+reveal() {   # reveal <text>
+  local text=$1 revealed=0 tick=0 total n
+  total=${#text}
+  if [ "$FRACTIONAL_SLEEP" = 0 ]; then
+    tmux set-option -t "$SID:" @qb_top "$text" 2>/dev/null || true
+    return 0
+  fi
+  while [ "$revealed" -lt "$total" ]; do
+    tick=$((tick + 1))
+    [ $(( tick % SETTLE_EVERY )) -eq 0 ] && revealed=$((revealed + 1))
+    make_frame "$text" "$revealed"
+    tmux set-option -t "$SID:" @qb_top "$FRAME" 2>/dev/null || return 0
+    sleep "$TICK"
+  done
+  # Settled explicitly rather than left on the last frame, which is one character
+  # short of the truth whenever the loop above exits on the count.
+  tmux set-option -t "$SID:" @qb_top "$text" 2>/dev/null || true
+  # A COUNT OF COMPLETED REVEALS, which exists so that nothing has to catch one.
+  # A frame is on screen for 40ms; a test that polls for one is a test that races
+  # it, and that is not theoretical — the first spelling of this passed locally
+  # and in the flake sandbox and failed in the flake sandbox, on the same commit,
+  # for no reason but load. A counter is still true a minute later.
+  n=$(tmux show-options -v -t "$SID:" @qb_top_reveals 2>/dev/null) || n=0
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  tmux set-option -t "$SID:" @qb_top_reveals "$((n + 1))" 2>/dev/null || true
+}
+
+# THE CEILING, REFRESHED ON THIS LOOP'S TIMER AND NOT THE STATUS LINE'S. qb-pace
+# holds a machine-wide cache with a three-minute floor, so polling it every
+# interval is nearly free and never stampedes — but a `#(qb-pace)` in the format
+# would run once per attached client per `status-interval`, which is a different
+# and much worse shape.
+#
+# THE SEVERITY IS ITS OWN OPTION because a style cannot be built out of a format.
+# `#[fg=#{@qb_pace_fg}]` does not work — style parsing and format expansion are
+# different passes in tmux — so the colour is chosen by a conditional over this,
+# exactly as seat_state_style picks a seat's colour. Same reason, same spelling.
+# A VERDICT THAT COULD NOT BE REFRESHED IS NOT A CURRENT ONE. This used to
+# return quietly on a missing binary, a timeout, an error or an empty answer,
+# which left the last reading on screen looking live — so a `STOP` from twenty
+# minutes ago read exactly like a `STOP` from now, on the one number this line
+# exists to carry. The reading is KEPT rather than cleared, because a stale
+# ceiling is still the best estimate anyone has and blanking it would lose that;
+# it is marked instead, and the format draws a marked one dimmer and prefixed
+# `~` — the same `~` the dashboard already uses for "at most this long ago".
+stale() {
+  [ -n "$(opt @qb_pace)" ] || return 0
+  tmux set-option -t "$SID:" @qb_pace_sev stale 2>/dev/null || true
+}
+
+pace() {
+  local bin line verdict
+  # QB_SEATS_PACE=off, recorded on the session by qb-seats. One knob for "do not
+  # ask about the subscription" rather than two — it already silences the
+  # estimate a new screen prints, and it is what a test sets so that a suite does
+  # not read the developer's real usage fifty times a run.
+  [ "$(opt @qb_top_pace)" = 0 ] && return 0
+  bin=$(command -v qb-pace 2>/dev/null) || bin="$(cd -P "$(dirname -- "$0")" && pwd)/qb-pace"
+  [ -x "$bin" ] || { stale; return 0; }
+  if command -v timeout >/dev/null 2>&1; then
+    line=$(timeout 20 "$bin" 2>/dev/null) || line=""
+  else
+    line=$("$bin" 2>/dev/null) || line=""
+  fi
+  [ -n "$line" ] || { stale; return 0; }
+  # `pace: SLOW — 7d at 83% (warning); resets in 24h33m` is one line and the
+  # prefix is this line's own label, so it goes.
+  line=${line#pace: }
+  verdict=${line%% *}
+  case "$verdict" in
+    STOP|stop)      tmux set-option -t "$SID:" @qb_pace_sev critical 2>/dev/null || true ;;
+    SLOW|slow)      tmux set-option -t "$SID:" @qb_pace_sev warning  2>/dev/null || true ;;
+    *)              tmux set-option -t "$SID:" @qb_pace_sev ok       2>/dev/null || true ;;
+  esac
+  tmux set-option -t "$SID:" @qb_pace "$line" 2>/dev/null || true
+}
+
+pass() {
+  local text every
+  text=$(identity)
+  pace
+  if [ "$(opt @qb_top_animate)" = 0 ] || ! attached; then
+    tmux set-option -t "$SID:" @qb_top "$text" 2>/dev/null || true
+  else
+    reveal "$text"
+  fi
+}
+
+pass
+[ "$ONCE" = 1 ] && exit 0
+
+# `every` is read INSIDE the loop, so a screen can be retimed while it is up
+# without restarting anything: `tmux set-option -t <screen> @qb_top_every 300`
+# takes effect on the next pass.
+while alive; do
+  every=$(opt @qb_top_every)
+  case "$every" in ''|*[!0-9]*) every=30 ;; esac
+  [ "$every" -ge 5 ] || every=5
+  sleep "$every"
+  alive || break
+  pass
+done
+exit 0
