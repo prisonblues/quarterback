@@ -15,7 +15,9 @@ board reconnects them.**
   `/drop-worktree`, `/tree-shake`, …)
 - `bin/` — the bash the worktree commands drive (`create-worktree`, `remove-worktree`,
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
-  stage a session is in for the statusline, `qb-seat`, which turns one pane of a
+  stage a session is in for the statusline, `qb-mode`, which says which of the two
+  ways of working a repo uses — `⌂ CLEANROOM` or `~ JUNGLE` — and exits 3 when the
+  tree you are standing in contradicts it, `qb-seat`, which turns one pane of a
   multiplexer into a fleet seat with its own board identity, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
   on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass

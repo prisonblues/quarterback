@@ -55,7 +55,11 @@ stdenvNoCC.mkDerivation {
   # `/get-involved` calls by name and which is also what a person types to ask
   # the board what to pick up — the one entry point here that answers "what
   # should I do" rather than being told (#424), so a path they would have to
-  # look up defeats it exactly as it defeats the doctor; and the board client's
+  # look up defeats it exactly as it defeats the doctor; `qb-mode`, which answers
+  # which of the two ways of working a repo uses and whether the tree you are in
+  # agrees (#178) — on PATH because its three readers cannot share a library: a
+  # status line is a shell script, `qb-hook` is bash, and the third is a person
+  # in a checkout they have never seen before; and the board client's
   # own four (#230) — `qb-hook`, which ~/.claude/settings.json names by absolute
   # path, `qb-mcp`, which ~/.claude.json does, `qb-claude-setup`, which writes
   # both of those from the home-manager activation, and `qb` for a human.
