@@ -108,6 +108,54 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
+async def _click_row(pilot, table, offset) -> None:
+    """Click `table` at `offset`, once the pane has stopped moving under it.
+
+    `row_count` says the rows are IN the table; it does not say the pane has
+    finished deciding where the table is. `Pilot.click` resolves the widget's
+    position when it is CALLED, so a click aimed while something above is still
+    arriving is delivered a row high — onto the header, which
+    `ClickTable.on_click` refuses as `row: -1`. That reads as a click that did
+    nothing, and it cost about two failures in six runs of
+    `test_a_plan_row_explains_itself…` on main.
+
+    THE REAL FIX IS UPSTREAM OF THIS AND IS IN EVERY DRIVER: whatever grows or
+    appears mid-run is stubbed, so the layout is settled before the first click
+    rather than settling around it. This is the backstop for what that cannot
+    reach — the pane's own first layout pass — and it is deliberately not written
+    against any particular mover. Waiting for the caps line specifically was the
+    first cut and it was wrong twice over: it went the moment `display` flipped,
+    which is a style flag and not a completed layout, and where no caps line was
+    ever coming it spent its whole bound learning that.
+
+    So: the same coordinate `Pilot.click` will compute, held still across two
+    consecutive reads with a real row under it. Two rather than one because a
+    single read cannot tell a settled pane from one between passes. Bounded at
+    3s and it clicks anyway when that runs out — a table that genuinely never
+    drew should fail on the assertion that names it, not time out in here — and
+    it costs 0.1s when nothing is moving, which is the normal case.
+    """
+    previous, still = None, 0
+    for _ in range(60):
+        region = table.region
+        x, y = region.offset.x + offset[0], region.offset.y + offset[1]
+        on_a_row = table.screen.get_style_at(x, y).meta.get("row", -1) >= 0
+        still = still + 1 if on_a_row and region == previous else 0
+        if still >= 2:
+            break
+        previous = region
+        await pilot.pause(0.05)
+    else:
+        # It clicks anyway — but a click that never found a settled row is not the
+        # same event as one that did, and silence makes them the same in the log.
+        # Reachable on an ordinary day: a fixed y=2 offset addresses no row on a
+        # repo with one open PR, and the driver then reports whatever the empty
+        # click did or did not do, under the name of the thing it meant to test.
+        print(f"_click_row: {table.id} never settled with a row at {offset} "
+              f"— clicking anyway, region {table.region}")
+    await pilot.click(table, offset=offset)
+
+
 @needs_live_data
 def test_a_single_click_acts_on_the_row_under_the_pointer():
     assert asyncio.run(_drive()) == []
@@ -155,6 +203,18 @@ async def _drive() -> list[str]:
     # the click is already in flight. Off for every test here: none of them is
     # about the caps, and a test that reached the network would be its own bug.
     app.refresh_limits = lambda: None
+    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # (`#detail` is a third and is left alone: the drivers move that one
+    # themselves, by clicking, and several of them assert on what it says.)
+    # The caps line APPEARS — `display: none` until the first answer — and SEATS
+    # GROWS, being the one table sized to its content (`height: auto`), so tmux
+    # answering adds a row per pane. Either reflows every panel below it, mid-click
+    # if a click is already in flight. `refresh_limits` was already off for exactly
+    # this reason; #426 gave the caps line a SECOND source — the review queue rides
+    # the gh clock and `render_queue` calls `render_limits` — so that guard stopped
+    # covering it. None of these tests is about the caps, the queue or the seats.
+    app.refresh_seats = lambda: None
+    app.render_queue = lambda *a, **k: None
 
     opened: list[int] = []
     jumped: list[int] = []
@@ -182,18 +242,18 @@ async def _drive() -> list[str]:
         # ONE click, on a row that is not the cursor's, is the whole point.
         # x=30 is the title column: the first columns are the CI glyph and the
         # ⚖, which mean something else and are covered by the test below.
-        await pilot.click(prs, offset=(30, 1))
+        await _click_row(pilot, prs, (30, 1))
         await pilot.pause(0.2)
         if not opened:
             failures.append("a click on a PR row did not open it")
 
-        await pilot.click(fleet, offset=(4, 1))
+        await _click_row(pilot, fleet, (4, 1))
         await pilot.pause(0.2)
         if not app.detail_text or app.detail_text.startswith("click a row"):
             failures.append("a click on an agent row changed nothing")
 
         if claims.row_count:
-            await pilot.click(claims, offset=(4, 1))
+            await _click_row(pilot, claims, (4, 1))
             await pilot.pause(0.2)
 
         opened.clear()                             # and the keyboard path still works
@@ -210,6 +270,9 @@ async def _drive_issues() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
+    # The caps line and SEATS both move everything under them — see _drive.
+    app.refresh_seats = lambda: None
+    app.render_queue = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     opened: list[int] = []
@@ -226,9 +289,21 @@ async def _drive_issues() -> list[str]:
     async with app.run_test(size=(90, 50)) as pilot:
         for _ in range(40):
             await pilot.pause(0.25)
-            if app.query_one("#issues").row_count:
+            if (app.held is not None and app.issues is not None
+                    and app.query_one("#issues").row_count):
                 break
         issues = app.query_one("#issues")
+        # #433 GAVE AN EMPTY TABLE A THIRD MEANING and `_need_rows` knows two:
+        # nothing open, or `gh` refusing. "The board has not answered, so nothing
+        # has been painted yet" is neither, and it reaches `_need_rows` as an
+        # empty table with no `gh` error — i.e. as `skip("no open issues")`,
+        # which would report a board that was slow as a repo that was quiet and
+        # silently skip the test this change is named for.
+        if app.held is None or app.issues is None:
+            raise AssertionError(
+                f"the wait ran out with {'the board' if app.held is None else 'gh'} "
+                f"still unanswered, so ISSUES never painted — this is not "
+                f"'nothing to click'")
         _need_rows(issues, "issues", app.issue_err)
         # Read the number off the RENDERED first row rather than re-deriving the
         # order here: what the click has to match is the row a human sees. Found
@@ -238,7 +313,7 @@ async def _drive_issues() -> list[str]:
         top = int(_numbered_cell(issues.get_row_at(0)))
 
         # The ⚒ column asks first, the same as the ⚖ does.
-        await pilot.click(issues, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await _click_row(pilot, issues, (app_module.Dash.FIX_COLUMN + 2, 1))
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a fix with no confirmation")
@@ -256,7 +331,7 @@ async def _drive_issues() -> list[str]:
 
         # A click anywhere else on the row still means "open it on GitHub".
         started.clear()
-        await pilot.click(issues, offset=(30, 1))
+        await _click_row(pilot, issues, (30, 1))
         await pilot.pause(0.3)
         if opened != [top]:
             failures.append(f"clicking the title opened {opened}, expected [{top}]")
@@ -280,6 +355,9 @@ async def _drive_plan() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600)
     app.refresh_limits = lambda: None
+    # The caps line and SEATS both move everything under them — see _drive.
+    app.refresh_seats = lambda: None
+    app.render_queue = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     app.spawn_refusal = lambda command: None
@@ -296,7 +374,7 @@ async def _drive_plan() -> list[str]:
         _need_rows(plan, "plan items", app.plan_err)
 
         # Anywhere but the ⚒: the detail line, and it must name the row clicked.
-        await pilot.click(plan, offset=(40, 1))
+        await _click_row(pilot, plan, (40, 1))
         await pilot.pause(0.3)
         # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
         # `scope.column` (#261), so column 4 is the title on a wide pane and the
@@ -325,7 +403,7 @@ async def _drive_plan() -> list[str]:
         await pilot.pause(0.3)
         landed = ordered[plan.scroll_offset.y]
 
-        await pilot.click(plan, offset=(app_module.Dash.FIX_COLUMN + 2, 1))
+        await _click_row(pilot, plan, (app_module.Dash.FIX_COLUMN + 2, 1))
         await pilot.pause(0.3)
         issue = qd.plan_issue(landed)
         if started:
@@ -352,6 +430,18 @@ async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
+    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # (`#detail` is a third and is left alone: the drivers move that one
+    # themselves, by clicking, and several of them assert on what it says.)
+    # The caps line APPEARS — `display: none` until the first answer — and SEATS
+    # GROWS, being the one table sized to its content (`height: auto`), so tmux
+    # answering adds a row per pane. Either reflows every panel below it, mid-click
+    # if a click is already in flight. `refresh_limits` was already off for exactly
+    # this reason; #426 gave the caps line a SECOND source — the review queue rides
+    # the gh clock and `render_queue` calls `render_limits` — so that guard stopped
+    # covering it. None of these tests is about the caps, the queue or the seats.
+    app.refresh_seats = lambda: None
+    app.render_queue = lambda *a, **k: None
 
     started: list[tuple[str, str]] = []
     windowed: list[tuple[str, str]] = []
@@ -383,7 +473,7 @@ async def _drive_panel() -> list[str]:
         app.wrong_repo = lambda repo, what: None
 
         # The ⚖ column asks first and starts nothing by itself.
-        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 1))
+        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, 1))
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a review with no confirmation")
@@ -399,17 +489,23 @@ async def _drive_panel() -> list[str]:
             if windowed:
                 failures.append("the review opened a window, not a seat-row pane")
 
-        # Cancelling starts nothing.
+        # Cancelling starts nothing — and the dialog has to have been THERE, or
+        # this passes on a click that missed. Row 2 is a second PR the repos need
+        # not have today, and a click that lands on nothing leaves `started` empty
+        # and the escape a no-op, which reads exactly like a cancel that worked.
         started.clear()
-        await pilot.click(prs, offset=(app_module.Dash.PANEL_COLUMN + 2, 2))
+        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, 2))
         await pilot.pause(0.3)
-        await pilot.press("escape")
-        await pilot.pause(0.3)
-        if started:
-            failures.append("cancelling still started a review")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ⚖ on the second row raised no confirmation to cancel")
+        else:
+            await pilot.press("escape")
+            await pilot.pause(0.3)
+            if started:
+                failures.append("cancelling still started a review")
 
         # A click anywhere else on the row still means "open on GitHub".
-        await pilot.click(prs, offset=(30, 1))
+        await _click_row(pilot, prs, (30, 1))
         await pilot.pause(0.3)
         if not opened:
             failures.append("clicking the title did not open the PR")
@@ -960,6 +1056,297 @@ async def _drive_queue_state(queue) -> tuple[list[list[str]], str, list, str]:
                 str(app.query_one("#t_queue").content), [], app.detail_text)
 
 
+async def _drive_held_race() -> tuple[list[str], list[str]]:
+    """`gh` answering before the board — the order the race can actually take.
+
+    Both are started from `on_mount` with nothing sequencing them, and `gh issue
+    list` is the slow one, so the board usually wins and the bug usually hides.
+    Driven by hand here rather than waited for, because a test that reproduced
+    this by racing two real calls would be the flake it is meant to replace.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+
+    issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
+               "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426, 422)]
+    # The newest issue is the held one, so a sort that knows about claims puts it
+    # LAST and a sort that does not puts it FIRST. Any weaker fixture and the two
+    # orders coincide and the test proves nothing.
+    claims = [{"kind": "work", "key": f"{qd.REPO}#427", "holder": "hermes/x",
+               "expires": None}]
+
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.render_issues(issues, None)
+        await pilot.pause()
+        table = app.query_one("#issues")
+        first = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+        app.render_board({"agents": [], "claims": claims})
+        await pilot.pause()
+        after = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+        return first, after
+
+
+def _quiet_dash():
+    """A Dash with every background worker off, for panels driven by hand.
+
+    The scaffolding three #433 tests were each carrying a copy of. It is the
+    convention the rest of this file already follows for its `_drive_*` families;
+    a fourth copy would only make the next one cheaper to write than to share.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    return app_module, app
+
+
+def _issues_for(*numbers):
+    """The panel's issue fixture: newest first, so a claims-aware sort moves them."""
+    return [{"number": n, "title": f"issue {n}", "repo": _load_app().qd.REPO,
+             "updatedAt": "2026-08-25T00:00:00Z"} for n in numbers]
+
+
+def test_a_board_outage_does_not_turn_every_held_issue_free():
+    """A failed poll is not an answer, and it arrives shaped like one.
+
+    `fetch_board` reports an outage as `{"claims": [], "error": …}` — the same
+    shape as "nobody holds anything". Taking it as one overwrites a real prior
+    answer with `{}`, re-sorts every held issue up into the free rows, and
+    defeats the ⚒'s guard, which reads `held` and cannot see WHY it is empty. The
+    head line does say `● board unreachable`, but that is a different widget from
+    the row under the pointer.
+
+    So: the rows do not move, the title stops claiming a free count it cannot
+    know, and the ⚒ refuses. Three assertions because the collapse shows up in
+    three places and a fix that only reached the rows would still spend a claim.
+    """
+    async def drive() -> tuple[list[str], str, bool, list]:
+        app_module, app = _quiet_dash()
+        qd = app_module.qd
+        started: list = []
+        app.spawn_refusal = lambda command: None
+        app.run_spawn = lambda name, argv: started.append((name, argv))
+        claims = [{"kind": "work", "key": f"{qd.REPO}#427", "holder": "hermes/x",
+                   "expires": None}]
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.repo_slug = qd.REPO
+            app.render_issues(_issues_for(427, 426), None)
+            app.render_board({"agents": [], "claims": claims})
+            await pilot.pause()
+            app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
+            await pilot.pause()
+            table = app.query_one("#issues")
+            rows = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+            app.fix_issue({"number": 426, "repo": qd.REPO})
+            await pilot.pause()
+            return (rows, str(app.query_one("#t_issues", app_module.Static).content),
+                    isinstance(app.screen, app_module.Confirm), started)
+
+    rows, title, confirmed, started = asyncio.run(drive())
+    assert rows == ["426", "427"], f"the outage re-sorted the held issue as free: {rows}"
+    assert "claims unknown" in title and "free" not in title, title
+    assert started == [] and not confirmed, "the ⚒ spent a claim during an outage"
+
+
+def test_a_board_that_is_down_from_the_start_still_releases_the_panel():
+    """The gate may not hang, and an outage is the case that could make it.
+
+    Holding the paint until the board answers is only safe because every answer
+    releases it, and the emptiest one — a board that has never answered and is
+    down — has no last-good claims to fall back on. It paints anyway, in `gh`'s
+    order, and says the claims are unknown rather than counting them as free.
+    """
+    async def drive() -> tuple[list[str], str]:
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_issues(_issues_for(427, 426), None)
+            await pilot.pause()
+            app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
+            await pilot.pause()
+            table = app.query_one("#issues")
+            return ([_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)],
+                    str(app.query_one("#t_issues", app_module.Static).content))
+
+    rows, title = asyncio.run(drive())
+    assert rows == ["427", "426"], f"a board outage left the panel waiting: {rows}"
+    assert "claims unknown" in title, title
+
+
+def test_the_issue_panel_does_not_count_issues_gh_has_not_listed_yet():
+    """The board answering FIRST must not paint a confident zero.
+
+    The other half of #433, and the same rule read from the other end. `gh` has
+    its own "not asked yet", and the board usually wins — that is the ordinary
+    order, a board POST against `gh issue list` — so the first answer used to
+    reach `render_issues` with `self.issues` still empty and paint `ISSUES · 0`.
+    Nothing was wrong with the repo; `gh` had not spoken. An absent signal drawn
+    as a present good one is exactly what the claims side was fixed for, and
+    qbdata states the rule for #324/#244 in as many words.
+
+    The title has to say which answer is missing, so the assertion is on the
+    word and on the absence of a count — a zero here is the defect itself.
+    """
+    async def drive() -> str:
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_board({"agents": [], "claims": []})
+            await pilot.pause()
+            return str(app.query_one("#t_issues", app_module.Static).content)
+
+    title = asyncio.run(drive())
+    assert "waiting for gh" in title, title
+    assert "0" not in title, f"a count painted before gh answered: {title!r}"
+
+
+def test_the_wait_for_the_board_does_not_swallow_a_gh_failure():
+    """`gh` failing while the board is slow must still say `gh` failed.
+
+    The error is stored before the gate and the gate writes its own title, so the
+    one thing a reader needs — which end is broken — was the thing dropped. A
+    panel that blames the board for `gh`'s failure sends them to the wrong end of
+    it, and this is the window in which somebody is most likely to be looking at
+    a stalled panel and wondering.
+
+    `gh` answering with an empty list AND an error is an answer, so only the
+    board is outstanding here: the title names the board as what it waits for and
+    carries the `gh` error beside it.
+    """
+    async def drive() -> str:
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_issues([], "HTTPError: 502")
+            await pilot.pause()
+            return str(app.query_one("#t_issues", app_module.Static).content)
+
+    title = asyncio.run(drive())
+    assert "waiting for the board" in title, title
+    assert "HTTPError" in title, f"the gh failure was dropped: {title!r}"
+
+
+def test_the_hammer_refuses_while_the_board_has_not_said_what_is_claimed():
+    """Unknown is not free, at the one click that spends money.
+
+    `fix_issue` read `self.held or {}`, which is the collapse #433 is about
+    arriving at the worst place for it: `{}` means nobody holds this, and a click
+    on that reading starts a session and takes a claim. It is reachable rather
+    than theoretical — the PLANS ⚒ comes through here on its own worker, and that
+    panel can be live while ISSUES is still waiting.
+
+    The refusal is the whole assertion: no confirmation is raised, and the line
+    says what is missing rather than reporting the issue as free.
+    """
+    async def drive() -> tuple[bool, str]:
+        app_module, app = _quiet_dash()
+        started: list = []
+        app.spawn_refusal = lambda command: None
+        app.run_spawn = lambda name, argv: started.append((name, argv))
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.repo_slug = app_module.qd.REPO
+            app.fix_issue({"number": 433, "repo": app_module.qd.REPO})
+            await pilot.pause()
+            return isinstance(app.screen, app_module.Confirm), app.detail_text, started
+
+    confirmed, said, started = asyncio.run(drive())
+    # NOTHING WAS LAUNCHED is the statement worth making, and `not confirmed` is
+    # not it: QB_DASH_CONFIRM=0 is supported, and on a box with it set a fix_issue
+    # that fell through would reach `run_spawn` with no dialog ever raised — which
+    # this test would have called a pass, under its own name.
+    assert started == [], f"the hammer started work: {started}"
+    assert not confirmed, "the hammer asked to start work it could not know was free"
+    assert "has not answered" in said, said
+
+
+def test_the_first_paint_waits_rather_than_drawing_an_order_it_will_rearrange():
+    """#433: the FIRST paint waits rather than drawing an order it will rearrange.
+
+    `self.held` was `{}` before the board answered and `{}` when the board said
+    nothing is held, so the panel could not tell "not asked yet" from an answer.
+    When `gh` won the race it painted every issue as free and re-sorted the moment
+    the claims arrived — #427 drawn at the top, then moved to the bottom, and a
+    click on the top row taking #426 instead.
+
+    The fix is not a faster board or a lock: it is that an order this panel is
+    about to rearrange is worth less than no order at all, so it draws nothing
+    until it can draw the right one. Hence the two assertions — the first paint is
+    EMPTY, and the paint that follows is already final.
+
+    The renewal guard on `render_board` cannot cover this and is not at fault: it
+    compares holders, and the transition here is `{}` → `{}` whenever nothing is
+    held, which compares equal.
+
+    WHAT IS PINNED IS THE FIRST PAINT, which is what the name now says. A claim
+    taken or dropped later re-sorts the table and is meant to: that is a real
+    change in the answer, and the renewal guard exists to let the real ones
+    through while stopping a renewal's moving expiry from doing the same. An
+    earlier name here read as a promise that rows never move at all, which is
+    neither true nor wanted.
+    """
+    first, after = asyncio.run(_drive_held_race())
+    assert first == [], f"the table painted before it knew what was claimed: {first}"
+    assert after == ["426", "422", "427"], after
+
+
+def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
+    """The empty answer is still an answer: no claims must paint, not stall.
+
+    The other half of #433. Holding the paint until the board answers is only safe
+    if EVERY answer releases it, and the emptiest one is the easy one to miss:
+    `render_board` compares holders, and with nothing claimed anywhere that is `{}`
+    against `{}`, which is not a change. A fix that released the paint on a holder
+    change alone would trade an intermittent wrong row for an ISSUES panel that a
+    quiet fleet never sees at all.
+
+    Kept separate from the reorder test because it fails for a different reason and
+    would otherwise be masked by it: this one is red against the naive fix and green
+    against no fix at all, which is exactly the pairing that says the release
+    condition — not merely the gate — is the part being pinned.
+    """
+    async def drive() -> tuple[int, list[str]]:
+        app_module, app = _quiet_dash()
+        qd = app_module.qd
+        issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
+                   "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426)]
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_issues(issues, None)
+            await pilot.pause()
+            table = app.query_one("#issues")
+            before = table.row_count
+            app.render_board({"agents": [], "claims": []})
+            await pilot.pause()
+            return before, [_numbered_cell(table.get_row_at(i))
+                            for i in range(table.row_count)]
+
+    # BEFORE, then after. With no claims in the fixture the sorted order and the
+    # plain `gh` order are the same list, so the final rows alone say nothing
+    # about whether the empty answer released anything — an implementation that
+    # never repainted would produce them too, and so would the code from before
+    # #433. The empty first paint is the only part that can tell those apart.
+    before, after = asyncio.run(drive())
+    assert before == 0, f"the table painted before the board answered: {before} rows"
+    assert after == ["427", "426"], after
+
+
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
     """#262: `who state stage what ttl`, and the stage cell is column 2.
 
@@ -1020,6 +1407,11 @@ async def _drive_icons() -> list[str]:
     async with app.run_test(size=(90, 44)) as pilot:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.repo_slug = qd.REPO                            # what this checkout is
+        # The board has answered and nothing is held. Said rather than assumed:
+        # `held` is None until it answers and ISSUES deliberately paints nothing
+        # then (#433), so a driver that renders the table by hand has to stand in
+        # for the board as well.
+        app.held = {}
         app.render_prs([{"number": 1, "title": "ours", "repo": qd.REPO,
                          "isDraft": False, "statusCheckRollup": []},
                         {"number": 2, "title": "theirs", "repo": "someone/else",
@@ -1352,6 +1744,9 @@ async def _drive_two_repos() -> list[str]:
     app.refresh_plan = lambda: None
     app.refresh_prs = lambda: None
     app.refresh_issues = lambda: None
+
+    # As above: the board answered, nothing is held (#433).
+    app.held = {}
 
     opened: list[str] = []
     app.open_pr = lambda pr: opened.append(f"{pr.get('repo')}#{pr.get('number')}")

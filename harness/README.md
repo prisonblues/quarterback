@@ -1538,6 +1538,22 @@ reason it is still waiting. `qb-dash` is the same views rendered without
 interaction, for a box that cannot import `textual` — which is the whole of what
 it is for since #426. It is not a lesser default any more; it is the fallback.
 
+**ISSUES waits before it paints, and says what it is waiting for.** The rows come from
+`gh issue list` and their order comes from the board's claims — free issues above held
+ones — and the two arrive on separate workers with nothing sequencing them. Painting on
+whichever lands first draws an order the panel is then about to rearrange, and a row that
+moves is a row somebody clicks by mistake ([#433](https://github.com/prisonblues/quarterback/issues/433)).
+So until both have answered the panel says `ISSUES · waiting for the board`, `· waiting for
+gh`, or names both — with any `gh` error carried beside it, since the one thing worth
+knowing about a stalled panel is which end is stalled. It cannot hang — a board that is down
+and a `gh` that fails both count as answers — but "cannot hang" is not "is quick": a board on
+a black-holed network answers by timing out, and `fetch_board` makes two sequential calls at
+30s each, so the worst case is a caption on screen for about a minute. The usual case is a
+fraction of a second, which is why the caption names what it is waiting for rather than
+leaving a reader to guess whether anything is coming. What it does
+NOT do is freeze the order afterwards — a claim taken or dropped later is a real change and
+still re-sorts the table.
+
 **The CI column has six states, and only one of them is quiet.** `gh pr view` reports a
 PR's checks as a rollup, and an empty rollup means two things that are not remotely alike:
 no run has been created for this head, or a run *has* and is parked behind GitHub's
@@ -1757,6 +1773,12 @@ is worse than the answer. The message names the release that makes the work take
 source, because `held` is the board's answer from up to one poll ago and a claim released two
 seconds back is still on it. `qb-claim` stays the authority: it is what settles the race the
 other way, where the panel shows an issue as free and the spawn is refused at exit 8.
+
+**And a third refusal, for when there is no snapshot to read.** Until the board has answered
+— and while it is unreachable, which is not the same as an answer of "nobody holds anything"
+— the ⚒ says `the board has not answered … so nothing here knows whether it is claimed` and
+starts nothing. It is the same rule as the panel's own gate one level down: unknown is not
+free, least of all at the click that spends a claim.
 
 The confirmation is deliberate: a panel review costs money, comments on a public PR and
 pushes a fix commit, and `/fix-issue` writes a branch and opens a PR — so a stray click in a
