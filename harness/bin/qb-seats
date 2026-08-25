@@ -268,7 +268,17 @@ board_cmd() {
 # crash-prone renderer the default on exactly the boxes least able to afford it.
 # With the crash fixed, the remaining question is whether `textual` is importable
 # here, and `qb-dash --can-tui` answers it using the same interpreter search the
-# launch itself will use, so the probe cannot disagree with the launch.
+# launch itself will use.
+#
+# ONE BINARY ANSWERS AND THE SAME BINARY RUNS, which is why this emits
+# `qb-dash --tui` and not `qb-dash-tui`. The first cut emitted the latter, and
+# `qb-dash-tui` is a name rather than an implementation: it execs the `qb-dash`
+# BESIDE IT, ignoring PATH. So a box with the two entry points in two directories
+# — a checkout's bin ahead of the installed profile, which this comment calls
+# normal three paragraphs down — probed one launcher and launched another, and
+# the probe could hand a yes for an install that was not the one about to run.
+# Resolving once removes the second lookup rather than trying to keep two in
+# step. (Found by a review of #426 before it landed.)
 #
 # A `qb-dash` OLDER THAN THE PROBE answers 2, not 0: it does not know the flag,
 # passes it to the renderer and argparse rejects it. Nonzero is "not the TUI", so
@@ -283,8 +293,8 @@ board_cmd() {
 dash_cmd() {
   if [ -n "${QB_SEATS_DASH+set}" ]; then printf '%s' "$QB_SEATS_DASH"; return; fi
   if command -v qb-dash >/dev/null 2>&1; then
-    if command -v qb-dash-tui >/dev/null 2>&1 && qb-dash --can-tui >/dev/null 2>&1; then
-      printf 'qb-dash-tui'
+    if qb-dash --can-tui >/dev/null 2>&1; then
+      printf 'qb-dash --tui'
     else
       # Reached on a box with rich but no textual — a checkout whose mcp/.venv
       # was built without the `tui` extra, which is not a broken install and

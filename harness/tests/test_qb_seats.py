@@ -1147,7 +1147,7 @@ def test_a_range_that_means_nothing_here_changes_nothing(screen):
 DASH_STUB = "printf dash-stub; sleep 300"
 
 
-def dash_stubs(tmp_path, *names, can_tui=True):
+def dash_stubs(tmp_path, *names, can_tui=True, dir=None):
     """A bin directory holding a stub for each name, each printing its own marker.
 
     Every other dash test pins QB_SEATS_DASH to a command, which says nothing about
@@ -1161,15 +1161,21 @@ def dash_stubs(tmp_path, *names, can_tui=True):
     rather than answering it, in a helper whose whole job is to answer without
     consulting the machine. `can_tui=False` is how a box with rich but no textual
     is simulated, which is the fallback path and cannot otherwise be reached here.
+
+    THE MARKER CARRIES THE ARGUMENTS, because since the review of #426 the two
+    renderers are one binary and a flag — `qb-dash --tui` rather than a separate
+    `qb-dash-tui` — so the name alone no longer says which one was asked for.
+    `dir=` puts the stubs somewhere other than the default, which is how a PATH
+    carrying two half-installs is built.
     """
-    d = tmp_path / "dashbin"
+    d = tmp_path / (dir or "dashbin")
     d.mkdir(parents=True, exist_ok=True)
     for name in names:
         stub = d / name
         stub.write_text(
             "#!/bin/sh\n"
             f'[ "$1" = --can-tui ] && exit {0 if can_tui else 1}\n'
-            f"printf {name}-ran\nexec sleep 300\n")
+            f'printf "{name}-ran $*"\nexec sleep 300\n')
         stub.chmod(0o755)
     return d
 
@@ -1210,13 +1216,17 @@ def test_the_default_dash_is_the_tui_when_textual_is_there(screen, tmp_path):
     outlived its bug by four days because nothing pointed back at this decision.
 
     Both installed, so this pins the PREFERENCE ORDER rather than availability.
+
+    Asserted on the FLAG rather than on the binary: the review of #426 collapsed
+    the launch onto the same `qb-dash` the probe ran, so what says "the clickable
+    one" is `--tui` and not a second name.
     """
     del screen.env["QB_SEATS_DASH"]
     bindir = dash_stubs(tmp_path, "qb-dash", "qb-dash-tui")
     screen.env["PATH"] = f"{bindir}:{screen.env['PATH']}"
     screen("-n", "1")
-    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-tui-ran")
-    assert "qb-dash-tui-ran" in seen, seen
+    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
+    assert "qb-dash-ran --tui" in seen, seen
 
 
 def test_without_textual_the_default_falls_back_to_the_plain_dash(screen, tmp_path):
@@ -1234,7 +1244,34 @@ def test_without_textual_the_default_falls_back_to_the_plain_dash(screen, tmp_pa
     screen("-n", "1")
     seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
     assert "qb-dash-ran" in seen, seen
-    assert "qb-dash-tui-ran" not in seen, "the TUI ran without textual to run it on"
+    assert "--tui" not in seen, "the TUI ran without textual to run it on"
+
+
+def test_the_install_that_answers_the_probe_is_the_install_that_runs(screen, tmp_path):
+    """One resolution, not two — the defect a review of #426 caught before it landed.
+
+    `dash_cmd` asked `qb-dash --can-tui` and then launched `qb-dash-tui`, resolving
+    the name a second time. That is not the same question twice: `qb-dash-tui` is a
+    name rather than an implementation and execs the `qb-dash` BESIDE IT, ignoring
+    PATH entirely. So a box carrying the two entry points in two directories — a
+    checkout's bin ahead of the installed profile, which the comment above
+    `dash_cmd` calls the normal case — probed one install and ran another, and the
+    yes it acted on was about neither the interpreter nor the renderer that came up.
+
+    Built here as the skew it actually is: a `qb-dash` that says yes in the first
+    directory, a `qb-dash-tui` from some other install further down. Nothing from
+    the second may run.
+    """
+    del screen.env["QB_SEATS_DASH"]
+    first = dash_stubs(tmp_path, "qb-dash", dir="checkout-bin")
+    second = dash_stubs(tmp_path, "qb-dash-tui", dir="installed-bin")
+    screen.env["PATH"] = \
+        f"{first}:{second}:{path_with_no_dash_on_it(tmp_path, screen)}"
+    screen("-n", "1")
+    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
+    assert "qb-dash-ran --tui" in seen, seen
+    assert "qb-dash-tui-ran" not in seen, \
+        "the probe answered for one install and the launch ran another"
 
 
 def test_a_qb_dash_too_old_to_know_the_probe_falls_back_instead_of_hanging(screen,

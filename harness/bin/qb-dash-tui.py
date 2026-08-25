@@ -237,8 +237,10 @@ class Dash(App):
 
     CSS = """
     Screen { background: $surface; }
-    /* Hidden until the first fetch says there is something to show: an install
-       with no subscription token gets no blank row. */
+    /* Hidden until the first fetch says there is something to show — and since
+       #426 "something" is the caps OR the review-queue cell that rides beside
+       them, so an install with no subscription token still gets the queue depth
+       rather than losing the row it sits on. See render_limits. */
     #limits { height: 1; padding: 0 1; background: $panel; color: $text;
               display: none; }
     #head { height: 1; padding: 0 1; background: $panel; color: $text; }
@@ -257,9 +259,14 @@ class Dash(App):
        is bounded by the seats in the row plus the ＋, so an fr share buys it
        nothing and costs it the ＋ the moment another panel appears: adding
        REVIEW QUEUE took the denominator from 10fr to 11fr and the ＋ row, the
-       only way to add a seat with the mouse, fell off a 50-row screen. The cap
-       is the backstop for a screen with more seats than anyone should have. */
-    #seats  { height: auto; max-height: 8; }
+       only way to add a seat with the mouse, fell off a 50-row screen.
+
+       12 IS NOT A ROUND NUMBER, it is the tallest this table can be: the header,
+       MAX_SEATS=10 from qb-seats, and the ＋. A smaller cap would scroll the
+       ＋ out of view on a full screen and reintroduce the bug above four seats
+       below the ceiling the script already enforces — a cap and a maximum have to
+       be quoted from the same place or one of them silently wins. */
+    #seats  { height: auto; max-height: 12; }
     #fleet  { height: 2fr; }
     #claims { height: 1fr; }
     #plan   { height: 2fr; }
@@ -580,8 +587,13 @@ class Dash(App):
         A failed call keeps the last figures rather than blanking the line: they
         are minutes old and still roughly true, and a line that vanished on every
         hiccup would read as "no limits", which is the opposite of what it means.
-        An install with no subscription token has nothing here to show, and the
-        row is hidden outright rather than left blank.
+
+        THE ROW IS HIDDEN WHEN IT HAS NOTHING TO SAY, and since #426 that is both
+        halves empty rather than the caps half. An install with no subscription
+        token has no cells — and neither does a pane under 20 columns, which is
+        `limit_cells`' own floor and one `C-q <` away — so gating the whole row on
+        the caps took the review depth off the screen in exactly the two cases the
+        queue cell was put here to survive.
         """
         if limits:
             self.limits = limits
@@ -591,8 +603,8 @@ class Dash(App):
         except Exception:                         # noqa: BLE001 — a resize before mount
             return
         cells = qd.limit_cells(self.limits, max(20, self.size.width - 2))
-        bar.display = bool(cells)
-        if not cells:
+        bar.display = bool(cells or self.queue)
+        if not (cells or self.queue):
             return
         text = Text()
         for i, (label, glyphs, pct, reset, colour) in enumerate(cells):
@@ -604,7 +616,10 @@ class Dash(App):
             text.append(f" {pct}", style=f"bold {colour}")
             if reset:
                 text.append(f" {reset}", style="grey50")
-        if err:
+        # The `?` annotates the caps, so it needs caps to annotate: on a line
+        # carrying only the queue cell it would be a mark against a number that
+        # is not there.
+        if err and cells:
             text.append(" ?", style="grey50")
         # The queue's depth and age ride the caps line beside the budget they
         # would be spent out of — a panel round costs tokens, and "3 waiting" is
@@ -614,7 +629,8 @@ class Dash(App):
         # a dashboard that never asked.
         if self.queue:
             label, depth, age, colour = qd.queue_cell(self.queue)
-            text.append("   ")
+            if text.plain:                        # no caps to sit beside: no gap
+                text.append("   ")
             text.append(label, style="bold grey70")
             text.append(f" {depth}", style=f"bold {colour}")
             if age:
@@ -920,6 +936,33 @@ class Dash(App):
             ).value
             self.rows[str(key)] = e
 
+        # THE TWO STATES THAT ARE NOT ENTRIES, both of which the plain renderer
+        # draws as rows (qb-dash.py:377-382) and the first cut of this port did
+        # not. Neither is registered in `self.rows`: a key with nothing behind it
+        # is dropped by dispatch_row, which is what a row with no verb wants.
+        #
+        # An error is a ROW and no longer a suffix on the title. The title is
+        # bounded by the pane's width and was clipping the message to 24
+        # characters — a panel whose job is saying WHY something is waiting must
+        # not truncate the one message that says why it cannot tell you.
+        err = queue.get("error")
+        blank = [Text("")] * (1 if self.scope.column else 0)
+        if err:
+            table.add_row(Text("!", style="red"), Text(""), *blank,
+                          Text(""), Text(""), Text(""),
+                          Text(qd.clip(err, 30 if self.scope.column else 42),
+                               style="red"),
+                          key="queue:error")
+        # "Nothing is waiting" and "nothing could be fetched" are different
+        # answers and the board supplies its own wording for the first, so the
+        # fallback here is only for a board too old to send one.
+        if not entries and not err:
+            table.add_row(Text(""), Text(""), *blank,
+                          Text(""), Text(""), Text(""),
+                          Text(queue.get("idle") or "nothing waiting on review",
+                               style="grey50"),
+                          key="queue:idle")
+
         depth = queue.get("depth") or 0
         held = max(0, (queue.get("open") or 0) - depth)
         title = f"REVIEW QUEUE · {depth} waiting"
@@ -928,8 +971,6 @@ class Dash(App):
         age, oldest_held = qd.queue_oldest(queue)
         if age:
             title += f" · {'held' if oldest_held else 'oldest'} {age}"
-        if queue.get("error"):
-            title += f" · {qd.clip(queue['error'], 24)}"
         self.query_one("#t_queue", Static).update(title)
         # The caps line carries this same depth, and it is drawn on the limits
         # clock — an hour long. Without this the cell up there would keep last

@@ -521,6 +521,48 @@ def test_the_seats_panel_jumps_closes_and_adds():
     assert asyncio.run(_drive_seats()) == []
 
 
+def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
+    """The ＋ survives the CAP, not just the panel that made the cap necessary.
+
+    `#seats` stopped sharing the pane in `fr` because a seventh panel took the ＋
+    off the bottom — but a `max-height` small enough to scroll it out of view
+    reintroduces exactly that, only at a seat count instead of a panel count. The
+    cap has to be quoted from the same place as the ceiling `qb-seats` enforces:
+    MAX_SEATS=10, plus the header, plus this row.
+
+    Driven by clicking rather than by measuring, because "on screen" is not the
+    claim — the claim is that the mouse can still reach it, and a row scrolled
+    below the fold answers a click at that offset with a different row.
+    """
+    async def drive() -> list:
+        app_module = _load_app()
+        app = app_module.Dash(interval=3600, gh_interval=3600)
+        app.refresh_limits = lambda: None
+        app.refresh_seats = lambda: None
+        clicked: list = []
+        app.run_seat_click = lambda tag, session: clicked.append((tag, session))
+        app.jump_pane = lambda seat: clicked.append(("jump", seat["pane"]))
+        # MAX_SEATS in qb-seats — the most a screen can hold, so the most this
+        # table can ever be asked to draw.
+        full = [{"pane": f"%{n}", "seat": str(n), "session": "seats-demo",
+                 "window": "0", "command": "claude", "path": "/tmp/demo"}
+                for n in range(1, 11)]
+        async with app.run_test(size=(90, 50)) as pilot:
+            app.render_seats(full)
+            await pilot.pause(0.2)
+            seats = app.query_one("#seats")
+            assert seats.row_count == len(full) + 1, seats.row_count
+            await pilot.click(seats, offset=(4, len(full) + 1))
+            await pilot.pause(0.3)
+            if isinstance(app.screen, app_module.Confirm):
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+            return clicked
+
+    assert asyncio.run(drive()) == [("add", "seats-demo")], \
+        "the ＋ row was not what a click at its offset reached"
+
+
 # ---- the scope (#261) -------------------------------------------------------
 #
 # Board data as literals, so this runs wherever textual does: the question is not
@@ -815,6 +857,107 @@ def test_the_caps_line_carries_the_queue_depth():
 
     line = asyncio.run(drive())
     assert "REVIEW" in line and "1 waiting" in line, line
+
+
+async def _drive_caps(limits, queue) -> tuple[bool, str]:
+    """The caps line with whatever halves it is given — `(is it shown, what it says)`."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.render_queue(queue)
+        app.render_limits(limits, None)
+        await pilot.pause()
+        bar = app.query_one("#limits")
+        return bar.display, str(bar.content)
+
+
+def test_the_queue_cell_survives_a_box_with_no_caps_to_show():
+    """The row is hidden when it has NOTHING to say, not when the caps are empty.
+
+    `render_limits` gated the whole line on `limit_cells`, which returns nothing
+    for an install with no subscription token — and, less obviously, for any pane
+    under 20 columns, which is one `C-q <` away. Either took the review depth off
+    the screen with the caps, in the two cases the cell was put on this line to
+    survive. The panel's own reasoning says a depth of zero still draws because a
+    cell that vanished when it was true could not be told apart from a dashboard
+    that never asked; a cell that vanished with the caps is the same failure.
+    """
+    shown, line = asyncio.run(_drive_caps([], QUEUE))
+    assert shown, "the caps line was hidden, taking the queue cell with it"
+    assert "REVIEW" in line and "1 waiting" in line, line
+    # No caps to sit beside means no gap to sit after.
+    assert not line.startswith(" "), repr(line)
+
+
+def test_with_neither_caps_nor_queue_the_row_is_still_hidden():
+    """The half of the old rule that was right: an empty line is not a line."""
+    shown, _ = asyncio.run(_drive_caps([], {}))
+    assert not shown, "a row with nothing in it was drawn anyway"
+
+
+def test_a_queue_that_could_not_be_fetched_says_so_in_a_row():
+    """A board failure is a ROW, at the width of the panel — not a title suffix.
+
+    The first cut of this port put the error in `#t_queue`, clipped to 24
+    characters, and drew no row at all. The title is bounded by the pane, and a
+    panel whose entire job is saying WHY something is waiting must not truncate
+    the one message that says why it cannot tell you. The plain renderer has
+    drawn this as a row since #273 (qb-dash.py:377) and parity is the whole
+    argument for flipping the default in #426.
+    """
+    err = "board unreachable: HTTPConnectionPool(host='board.invalid', port=80)"
+    rows, title, _, _ = asyncio.run(
+        _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": err}))
+    assert len(rows) == 1, rows
+    assert "board unreachable" in rows[0][-1], rows[0]
+    # The message is in the row now, so the title is back to being a count.
+    assert "HTTPConnectionPool" not in title, title
+
+
+def test_a_drained_queue_says_it_is_drained_rather_than_going_blank():
+    """"Nothing waiting" and "nothing fetched" are different answers.
+
+    An empty table said neither: the title's `0 waiting` is a count, and a reader
+    who cannot tell a quiet queue from a broken one will read the wrong one as
+    the other. The board supplies its own wording in `idle`, which is why the
+    literal here is only the fallback for a board too old to send one.
+    """
+    rows, _, _, _ = asyncio.run(
+        _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": None,
+                            "idle": "every open PR has had a round"}))
+    assert len(rows) == 1, rows
+    assert "every open PR has had a round" in rows[0][-1], rows[0]
+
+
+def test_a_queue_with_neither_entries_nor_a_board_falls_back_to_words():
+    """A board too old to send `idle` still gets a sentence, not a blank."""
+    rows, _, _, _ = asyncio.run(
+        _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": None,
+                            "idle": None}))
+    assert len(rows) == 1, rows
+    assert "nothing waiting on review" in rows[0][-1], rows[0]
+
+
+async def _drive_queue_state(queue) -> tuple[list[list[str]], str, list, str]:
+    """`_drive_queue` without the click — the states that offer nothing to click."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.render_queue(queue)
+        await pilot.pause()
+        table = app.query_one("#queue")
+        return ([_cells(table, i) for i in range(table.row_count)],
+                str(app.query_one("#t_queue").content), [], app.detail_text)
 
 
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
