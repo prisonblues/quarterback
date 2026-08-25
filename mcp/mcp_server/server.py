@@ -800,10 +800,27 @@ def merge_queue(ctx: Context, base: str, repo_path: str = ".",
     here to sometimes name a holder who never enqueued at all — a human merging in
     the UI is entitled to, and this queue is advisory like everything else here.
 
-    Ordering is strict FIFO by arrival. `suggested_order` is always null: ordering
-    proposals are the unfinished half of #227, deliberately absent because an
-    agent rewriting the queue while trying to land makes the queue one more shared
-    thing to fight over.
+    **`active_order` is the line and `suggested_order` is an opinion about it**
+    (#80). The line is strict FIFO by arrival and nothing reorders it: a rank is
+    not a place in it, and being ranked first is not being at the head. Putting a
+    proposal into force stays #227's unfinished half, because an agent rewriting
+    the queue while trying to land makes the queue one more shared thing to fight
+    over.
+
+    **Expect `suggested_order` to be null, and read `suggestion` when it is.** It
+    is published only when every queued PR's evidence is attested: some run
+    recorded a complete file list, that run's own count agrees with it, and the
+    run reviewed the commit the queue says the PR is on. A list taken three
+    pushes ago is complete and describes a diff that is not the one landing, so
+    it does not count. `suggestion.partial_order` carries the ranking anyway with
+    its own `trusted` beside it, and `suggestion.order_trust.blind_spots` names
+    every PR that is holding the order back and what would fix it — usually "run
+    a panel round on it", because the panel's skip path records no files (#94).
+
+    The order it proposes lands the provably disjoint PRs first (they cost nobody
+    anything from any position) and then the heaviest colliders: a re-integration
+    is work done on the LATE PR, so the big branch lands clean and the small ones
+    rebase onto it rather than the other way round.
 
     Args:
         base: the branch being landed ONTO — `main`, `release/2.x`. One queue per

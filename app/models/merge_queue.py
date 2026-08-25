@@ -60,13 +60,18 @@ class MergeQueueEntry(Base):
     now" is the outcome #99 was filed to avoid, and a queue that also held the
     resource would have been the second one.
 
-    **Strict FIFO, by arrival, and only by arrival.** Every cleverer input the
-    issue lists — file overlap, size, risk flags, plan dependencies — is
-    deliberately absent, because #227's own argument is that *"agents may propose
-    order; they must not silently rewrite the queue while also trying to land…
-    otherwise the queue itself becomes another shared resource every agent
-    thrashes."* A deterministic order cannot thrash. Ordering proposals are the
-    second half of the issue and are not implemented here.
+    **Strict FIFO, by arrival, and only by arrival.** No column here records a
+    ranking and no write path reorders one. The cleverer inputs the issue lists —
+    file overlap, size, risk flags — are read at request time by
+    :mod:`app.ranking` and published as ``suggested_order``, which is an opinion
+    published beside the line and never the line: nothing derived from them is
+    stored, so there is no state for two agents to disagree about. That is #227's
+    own argument taken literally — *"agents may propose order; they must not
+    silently rewrite the queue while also trying to land… otherwise the queue
+    itself becomes another shared resource every agent thrashes."* A proposal that
+    is recomputed from evidence on every read and written nowhere cannot become a
+    shared resource. Putting one into force is still the second half of the issue
+    and is not implemented.
 
     **Position is fixed at arrival and re-enqueueing does not move you.**
     ``entered_at`` is written once and never bumped; ``updated_at``, ``head_sha``

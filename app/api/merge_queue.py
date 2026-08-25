@@ -21,16 +21,28 @@ pretending the queue outranks them. Two implementations of "who has this right
 now" is the outcome #99 was filed to avoid, and a queue that also held the
 resource would have been the second one.
 
-**Strict FIFO, and only FIFO.** ``GET /merge-queue`` reports ``active_order`` and
-a permanently null ``suggested_order``. Every richer input the issue lists — file
-overlap from #82, PR size, risk flags, plan dependencies — and the
-``order-proposal`` / ``reorder`` endpoints that would carry them are deliberately
-not here, because #227's own argument against them is the strongest thing in it:
-*"agents may propose order; they must not silently rewrite the queue while also
-trying to land… otherwise the queue itself becomes another shared resource every
-agent thrashes."* A deterministic arrival order cannot thrash, and it is the only
-kind of order that can be shipped before the machinery that decides which
-proposals are accepted. #227 stays open for that half.
+**Strict FIFO, and only FIFO — for ``active_order``.** The live queue is arrival
+order and nothing in this module reorders it. What #80 added is a second,
+strictly advisory field beside it: ``suggested_order``, computed in
+:mod:`app.ranking` from the file overlap between the queued PRs (#82's changed
+lists, #101's classification) weighted by how expensive each PR is to
+re-integrate late. It is an opinion, published where an opinion is visibly not
+the queue, and #227's own argument is why the separation is absolute rather than
+tidy: *"agents may propose order; they must not silently rewrite the queue while
+also trying to land… otherwise the queue itself becomes another shared resource
+every agent thrashes."* So a rank is not a place in the line, being ranked first
+is not being at the head, and nothing merges on a suggestion's say-so. Mutation
+still needs a human or an accepted proposal, and the ``order-proposal`` /
+``reorder`` endpoints that would carry an accepted one are still not here. #227
+stays open for that half.
+
+**And the suggestion refuses to be confident on partial data.** It is null unless
+every queued PR has a changed-file list the board can read, because a PR nobody
+can measure has no honest position — and the largest such hole (#94: the panel's
+title-skip path records no files, so merges, promotes and format-the-world
+commits are invisible) is exactly the set that the cost model says should land
+*first*. The evidence still comes back either way, with an ``order_trust`` block
+in the ``plan_read`` shape saying what the order is worth.
 
 **The board takes testimony, not measurements.** It cannot run preland, read CI or
 ask GitHub whether a PR is a draft. What ``verdict`` and ``head`` do is pin the
@@ -47,16 +59,29 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, literal, select, text, update
+from sqlalchemy import Text, func, literal, or_, select, text, update
+from sqlalchemy.dialects.postgresql import ARRAY, aggregate_order_by
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.api.claims import clean_session, is_unique_violation, live_claim
 from app.auth import identify, optional_identity, reader
 from app.claimkey import BadRef, derive
+from app.collisions import UNANSWERABLE
 from app.db import get_session
 from app.models.merge_queue import PROCEEDS, VERDICTS, MergeQueueEntry
 from app.models.resource_lease import ResourceLease
+from app.models.review import ReviewRun, ReviewRunFile
+from app.ranking import (
+    SHARED_RESOURCES,
+    SHARED_SAMPLE_CAP,
+    Candidate,
+    Overlap,
+    Ranking,
+    rank,
+    shared_resource_keys,
+)
 
 router = APIRouter(tags=["merge-queue"])
 
@@ -414,6 +439,346 @@ def _claim_view(claim: ResourceLease | None, key: str) -> dict:
     }
 
 
+#: Below this many live entries there is nothing to order, so none of the work
+#: below is done at all. A queue of one has exactly one arrangement, and this
+#: endpoint is polled in a loop by an automated lander whose queue is usually
+#: that long — so the cost of the ranking is paid only where an order could
+#: differ from the arrival order.
+MIN_RANKABLE = 2
+
+
+async def _evidence(session: AsyncSession, repo: str,
+                    entries: list[MergeQueueEntry]) -> tuple[list[Candidate], list[Overlap]]:
+    """Everything :func:`app.ranking.rank` weighs, read once, for one queue.
+
+    **Each PR's newest run answers for it, and there is no fallback to an older
+    one.** ``GET /review/collisions`` lets its *subject* fall back to the newest
+    file-bearing run, on the grounds that a caller naming a PR wants that PR
+    answered for; every entry here is one somebody named, so the same argument
+    would apply to all of them — and it is refused anyway. A stale list produces
+    a confident wrong answer (a PR ranked disjoint on the files it touched three
+    rounds ago); no list produces a loud unanswerable one that suppresses
+    ``suggested_order`` entirely. Loud beats silent, so the newest run answers or
+    nothing does.
+
+    No time window either. ``days`` on the collisions endpoint bounds which
+    *rivals* are current enough to be worth considering; here the population is
+    already bounded — it is the live queue — and a PR queued to land today is in
+    play whenever its last panel ran. The run's ``ts`` rides along on every row so
+    a reader can see the age of the evidence rather than have it silently
+    filtered.
+    """
+    prs = [e.pr for e in entries]
+    # One unconditional DISTINCT ON per queued PR: this repo, these PRs, and
+    # nothing else. The selection rule is `app.collisions`' — any predicate in
+    # front of it can resurrect an older run and hand back its answer in a
+    # confident voice.
+    newest = (
+        select(ReviewRun.id.label("run_id"), ReviewRun.pr.label("pr"),
+               ReviewRun.ts.label("ts"),
+               ReviewRun.changed_files_total.label("total"),
+               # WHICH COMMIT the list is about, and which base it was taken
+               # against. Selected, never filtered on: a predicate on either in
+               # front of the DISTINCT ON would resurrect an older run that
+               # happened to match, which is #101's defect twice over. The
+               # comparison is made afterwards, per selected run, in
+               # `app.ranking.Candidate.pinned` — and a mismatch makes the
+               # evidence unattested rather than absent, so the row keeps its
+               # collisions and loses only its right to be called disjoint.
+               ReviewRun.head_sha.label("head_sha"),
+               ReviewRun.base_branch.label("base_branch"))
+        .where(ReviewRun.repo == repo, ReviewRun.pr.in_(prs))
+        .distinct(ReviewRun.pr)
+        .order_by(ReviewRun.pr, ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .subquery()
+    )
+    # A correlated count, not a join: a run that recorded no paths must come back
+    # as 0 and stay in the population, because it is precisely the row whose
+    # absence would read as "answered, and disjoint".
+    recorded = (
+        select(func.count()).select_from(ReviewRunFile)
+        .where(ReviewRunFile.run_id == newest.c.run_id).scalar_subquery()
+    )
+    answered = {
+        row.pr: row
+        for row in (await session.execute(
+            select(newest.c.pr, newest.c.run_id, newest.c.ts, newest.c.total,
+                   newest.c.head_sha, newest.c.base_branch,
+                   recorded.label("recorded"))
+        )).all()
+    }
+    run_ids = [row.run_id for row in answered.values()]
+
+    # Which of the queue's runs touch a shared resource. Fetched as paths and put
+    # through `shared_resource_keys` rather than classified in SQL, so the query
+    # and the ranking cannot drift about what a `migrations/` path is.
+    resources: dict[int, list[str]] = {}
+    overlaps: list[Overlap] = []
+    if run_ids:
+        for run_id, path in (await session.execute(
+            select(ReviewRunFile.run_id, ReviewRunFile.path)
+            .where(ReviewRunFile.run_id.in_(run_ids),
+                   or_(*[ReviewRunFile.path.like(f"{key}%") for key in SHARED_RESOURCES]))
+        )).all():
+            resources.setdefault(run_id, []).append(path)
+
+        # The overlap, as a self-join on path, aggregated per PAIR. Whole path
+        # sets are never read out of Postgres: a PR may hold 3,000 of them and a
+        # queue holds several PRs, so what crosses the wire is one row per
+        # colliding pair. `ix_review_run_files_path` is (path, run_id) exactly so
+        # this join is answered from the index.
+        #
+        # `a.run_id < b.run_id` gives each pair once and drops the self-pairs;
+        # the count is untrimmed and the sample is sliced in the database, the
+        # same split `GET /review/collisions` makes between the number a ranking
+        # weighs by and the paths a person reads.
+        by_run = {row.run_id: pr for pr, row in answered.items()}
+        mine = aliased(ReviewRunFile)
+        theirs = aliased(ReviewRunFile)
+        sample = func.array_agg(
+            aggregate_order_by(mine.path, mine.path.asc()), type_=ARRAY(Text),
+        )[1:SHARED_SAMPLE_CAP]
+        for a_run, b_run, shared, paths in (await session.execute(
+            select(mine.run_id, theirs.run_id, func.count(), sample)
+            .join(theirs, theirs.path == mine.path)
+            .where(mine.run_id.in_(run_ids), theirs.run_id.in_(run_ids),
+                   mine.run_id < theirs.run_id)
+            .group_by(mine.run_id, theirs.run_id)
+        )).all():
+            overlaps.append(Overlap(a=by_run[a_run], b=by_run[b_run],
+                                    shared=shared, sample=tuple(paths or ())))
+
+    candidates = []
+    for position, e in enumerate(entries, start=1):
+        row = answered.get(e.pr)
+        candidates.append(Candidate(
+            pr=e.pr, position=position, ready=is_ready(e),
+            changed_files_total=row.total if row else None,
+            files_recorded=row.recorded if row else 0,
+            run_id=row.run_id if row else None,
+            run_ts=row.ts.isoformat() if row else None,
+            # The queue's commit against the run's. Both sides store a full,
+            # lower-cased oid — `_norm_sha` here and `app.api.reviews._sha_or_none`
+            # there — so an equality is exact and a garbled value on either side
+            # was already refused or dropped before it reached a column.
+            queue_head=e.head_sha, run_head=row.head_sha if row else None,
+            queue_base=e.base, run_base=row.base_branch if row else None,
+            resources=shared_resource_keys(
+                resources.get(row.run_id, ()) if row else ()),
+        ))
+    return candidates, overlaps
+
+
+#: The axes #227 lists that this ranking does not weigh, each with the reason and
+#: the issue that would close it. In the payload rather than only in
+#: :mod:`app.ranking`'s docstring, because a consumer deciding how much of its
+#: landing decision to hand over needs to see the shape of what was left out —
+#: and "file overlap said they are disjoint" is a very different claim from "file
+#: overlap said they are disjoint and nothing modelled whether one gates the
+#: other".
+UNWEIGHED_AXES = (
+    {"axis": "plan dependencies / the landing graph", "issue": 294,
+     "why": "which PRs gate which — fanning out and in, ACROSS repos, with hard "
+            "temporal edges — has no representation anywhere yet. It is the axis "
+            "file overlap structurally cannot see: two PRs can be perfectly "
+            "disjoint in files and still have a strict landing order"},
+    {"axis": "hunk-level overlap", "issue": None,
+     "why": "review_run_files stores paths, not ranges. Two PRs editing different "
+            "functions of one file are counted as colliding here and usually merge "
+            "cleanly, so a collision is an upper bound on the conflict"},
+    {"axis": "CI status", "issue": None,
+     "why": "the board takes testimony, not measurements — it cannot read a check "
+            "run, and an order weighted by a fact nobody can verify is an order "
+            "nobody can check"},
+    {"axis": "preland readiness", "issue": None,
+     "why": "MEASURED and deliberately not ranked on: it is reported per row and "
+            "excluded from the sort. A verdict is invalidated by every push, so "
+            "tiering on it would reshuffle the proposal each time the head does "
+            "the one thing its slot is for — the trade active_order already "
+            "refuses, in `a head change invalidates readiness, and does not cost "
+            "the slot`"},
+    {"axis": "release-number contention", "issue": 168,
+     "why": "every branch takes its number from main at land time, so two PRs "
+            "carrying an unstamped vNEXT collide on a resource no file list names. "
+            "The pre-push hook refuses a branch that edits CHANGELOG.md, so the "
+            "collision is not visible in review_run_files at all"},
+)
+
+
+def _caveat(ranking: Ranking, rows: list[dict]) -> str | None:
+    """What the order must say about itself when the evidence behind it is thin.
+
+    ``plan_read``'s ``next.caveat`` set the precedent and the argument is the
+    same one: the answer is still the best available and an agent that reads
+    nothing else should get it — what it must not get is unqualified confidence.
+    Returned in the payload, never left in a docstring, because a consumer cannot
+    read a docstring.
+    """
+    if ranking.trusted:
+        return None
+    named = ", ".join(f"#{r['pr']}" for r in rows if not r["attested"])
+    n_bad = sum(1 for r in rows if not r["attested"])
+    head = (
+        f"there is NO suggested_order. {n_bad} of {len(rows)} queued PRs "
+        f"({named}) {'is' if n_bad == 1 else 'are'} not attested, and `disjoint` is "
+        f"a claim about the whole queue rather than about one row — a PR whose "
+        f"list is a prefix, or was taken at a commit the branch has since left, "
+        f"may touch exactly what another PR touches on the files it never "
+        f"reported. So no free land in this queue can be shown to be free, and an "
+        f"order whose first tier might not be free is not the order this computed."
+    )
+    tail = (
+        f" The ranking still comes back as `partial_order` over the "
+        f"{len(ranking.order)} PR(s) that could be ranked at all, with the reason "
+        f"per row — read those, not the order, and see `blind_spots` for what each "
+        f"one would take to fix."
+    )
+    if ranking.unranked:
+        n_out = len(ranking.unranked)
+        tail += (
+            f" A further {n_out} {'is' if n_out == 1 else 'are'} in no position at "
+            f"all, because the board holds no changed-file list for "
+            f"{'it' if n_out == 1 else 'them'}: a PR lands there "
+            f"either because no panel ever ran on it, or because the panel SKIPPED "
+            f"it — and the skip path catches merges, promotes and "
+            f"format-the-world commits (#94), which under this cost model are the "
+            f"PRs that should land FIRST. That is the largest error this ranking "
+            f"can make and it is why the order is withheld rather than footnoted."
+        )
+    return head + tail
+
+
+def _blind_spots(rows: list[dict]) -> list[dict]:
+    """Every row the order could not be built on, with the repair for each.
+
+    One list and three faults, rather than one fault and a count: "no panel has
+    run on this" wants a panel round, "the list is a prefix" wants nothing but
+    patience, and "the run reviewed a commit this branch has left" wants a
+    re-review of the head the queue is on. A caller told only that N rows were
+    untrusted cannot act on any of them.
+    """
+    out = []
+    for r in rows:
+        if r["attested"]:
+            continue
+        if r["tier"] == UNANSWERABLE:
+            out.append({"pr": r["pr"], "fault": "no-file-list", "issue": 94,
+                        "why": "no run of this PR recorded a changed-file list",
+                        "fix": "run a panel round on it; the panel's title-skip "
+                               "path will not record one until #94"})
+        elif not r["counts_agree"]:
+            out.append({"pr": r["pr"], "fault": "inconsistent-counts", "issue": None,
+                        "why": "the answering run stored more paths than its own "
+                               "changed-file count admits to",
+                        "fix": "re-record the run; it is weighed at the larger of "
+                               "the two numbers meanwhile"})
+        elif not r["evidence_pinned"]:
+            out.append({"pr": r["pr"], "fault": "evidence-not-at-head", "issue": None,
+                        "why": f"the answering run reviewed {r['run_head']} and "
+                               f"the queue has this PR on {r['queue_head']}",
+                        "fix": "re-review at the head the queue is on — the list "
+                               "on file describes a diff that is not the one landing"})
+        else:
+            out.append({"pr": r["pr"], "fault": "prefix-list", "issue": None,
+                        "why": "the stored file list is a prefix of what the PR "
+                               "touches, so a shared-path count is a floor",
+                        "fix": "nothing to do here — GitHub caps a PR's file list "
+                               "at 3,000 and this PR is over it"})
+    return out
+
+
+def _suggestion(ranking: Ranking) -> dict:
+    """The proposal and its provenance, in one block a consumer can act on.
+
+    Split from ``suggested_order`` at the top level on purpose. That field is the
+    confident artefact and #227's acceptance criterion, so it is null whenever the
+    order would not be a permutation of the queue; this block always carries the
+    reasoning, so a queue the board cannot fully answer for still yields its
+    per-PR evidence to a human or to a later consensus step instead of yielding
+    nothing.
+    """
+    rows = [
+        {
+            "pr": r.pr, "rank": r.rank, "tier": r.tier, "moved": r.moved,
+            "weight": r.weight, "weight_basis": r.weight_basis,
+            "shared_total": r.shared_total,
+            # First-hand, pinned to a commit, and NOT an input to the sort. Here
+            # so a reader can apply it themselves.
+            "ready": r.ready,
+            # Three separate facts, because they have three separate repairs and
+            # a reader chasing the wrong one wastes a panel round. `attested` is
+            # all of them at once, and is what `disjoint` needs of every row.
+            "files_complete": r.files_complete,
+            "evidence_pinned": r.evidence_pinned,
+            "counts_agree": r.counts_agree,
+            "attested": r.attested,
+            "run_id": r.run_id, "run_ts": r.run_ts,
+            # The run's commit beside the queue's, so a consumer can check
+            # `evidence_pinned` rather than take it on trust.
+            "run_head": r.run_head, "queue_head": r.queue_head,
+            "reason": r.reason,
+            "collides_with": list(r.collides_with),
+        }
+        for r in ranking.rows
+    ]
+    return {
+        # The ranked subset, always — a permutation of the queue only when
+        # `covers_all`, which is exactly when `suggested_order` above is non-null.
+        "partial_order": list(ranking.order),
+        # The same boolean as `order_trust.trusted`, repeated here beside the
+        # list it qualifies. A caller that took `partial_order` and dropped the
+        # block around it is the caller this whole design is about, and one field
+        # duplicated is cheaper than that caller being right to.
+        "trusted": ranking.trusted,
+        "unranked": list(ranking.unranked),
+        "covers_all": ranking.covers_all,
+        "differs_from_active": ranking.differs,
+        "counts": dict(ranking.counts),
+        "cost_model": (
+            "reordering CANNOT reduce #80's integration count — every colliding "
+            "pair pays one re-integration whichever end lands first, so the total "
+            "is a property of the collision graph and is invariant under "
+            "permutation. What an order changes is which end pays. The work falls "
+            "on the LATER PR (merge the moved base into it, re-run its CI, re-run "
+            "its panel round), so cost(order) = sum over colliding pairs i-before-j "
+            "of shared(i,j) * w(j), and that is minimised for every pair at once by "
+            "landing the heaviest first: the big branch lands clean and the small "
+            "ones rebase onto it, instead of the big one being re-merged against a "
+            "base that moved under it. w is the changed-file count, which is a "
+            "proxy for how expensive a re-integration is and not a measurement of "
+            "it. Disjoint PRs cost nothing from any position, so they are placed "
+            "where they wait least"),
+        "tiers": (
+            "disjoint (complete list, shares nothing with any other queued PR) "
+            "first, then collides (heaviest first), then partial (list is a "
+            "prefix, so `no shared path found` is not evidence of none), then "
+            "unanswerable — which is not ranked at any position"),
+        "order_trust": {
+            # `trusted` is about the EVIDENCE, not about whether the sort ran.
+            "trusted": ranking.trusted,
+            "measured": len(ranking.order),
+            "unmeasured": len(ranking.unranked),
+            # Measured rows only. A PR with no list at all is already counted as
+            # `unmeasured`, and letting it into this number too would report one
+            # blind PR as two different shortfalls — a caller adding them up to
+            # check the population against `counts` would find they do not.
+            "incomplete_lists": sum(1 for r in rows
+                                    if r["tier"] != UNANSWERABLE and not r["files_complete"]),
+            "stale_evidence": sum(1 for r in rows
+                                  if r["tier"] != UNANSWERABLE and not r["evidence_pinned"]),
+            "blind_spots": _blind_spots(rows),
+            "caveat": _caveat(ranking, rows),
+        },
+        "axes_not_weighed": [dict(axis) for axis in UNWEIGHED_AXES],
+        "advisory": (
+            "a proposal, and nothing acts on it. It does not mutate active_order, "
+            "it is not permission to merge, and the queue stays FIFO by arrival "
+            "unless a human reorders it. Being ranked first is not being at the "
+            "head"),
+        "prs": rows,
+    }
+
+
 def decide(entries: list[MergeQueueEntry], pr: int,
            at_head: str | None = None) -> dict:
     """What may this PR do right now, and why — the whole point of the queue.
@@ -588,10 +953,39 @@ async def read_queue(
 ) -> dict:
     """The line for one base: who is next, who is waiting, and what each waits on.
 
-    ``suggested_order`` is always ``null`` and that is not an omission — it is the
-    distinction #227 asks for, present from the first cut so a later ordering
-    proposal has somewhere to go that is visibly *not* the live order. Nothing in
-    this release can populate it.
+    **``active_order`` is the queue. ``suggested_order`` is an opinion about it**
+    (#80), and the two never touch: nothing here reorders, and being ranked first
+    is not being at the head. The queue is FIFO by arrival and stays that way
+    unless a human acts, which is #227's own condition for an ordering proposal
+    existing at all — *"agents may propose order; they must not silently rewrite
+    the queue while also trying to land."*
+
+    ``suggested_order`` is **null unless every queued PR's evidence is attested** —
+    measured, complete, internally consistent, and taken at the commit the queue
+    says that PR is on. Not a best guess with a footnote elsewhere in the payload:
+    this is the field a consumer reads without reading anything else, so trust is
+    a gate on it rather than an annotation beside it. Two of those four conditions
+    are the ones that would otherwise let this be confidently wrong — a file list
+    that is a prefix of what the PR touches, and a file list that is complete
+    about a commit the branch has since left — and both leave a row looking
+    perfectly answerable.
+
+    The reasoning still comes back regardless. ``suggestion`` carries the per-PR
+    evidence, the pairwise collisions, a ``partial_order`` over the PRs that could
+    be ranked with its own ``trusted`` beside it, and an ``order_trust`` block
+    whose ``blind_spots`` name every row that is not attested, which fault it has,
+    and what would fix it. That is the ``plan_read``/``order_trust`` precedent and
+    the same argument: an order whose sound and unsound parts are
+    indistinguishable gets trusted uniformly, and usually too much.
+
+    The commonest reason for a null is #94 — the panel's title-skip path records
+    no files, so merges, promotes and format-the-world commits reach the queue
+    invisible, and under :mod:`app.ranking`'s cost model those are exactly the PRs
+    that should land *first*. The nullness is therefore a measurement in its own
+    right: it says how blind the board currently is about its own queue.
+
+    Both are computed only from :data:`MIN_RANKABLE` live entries up: a queue of
+    one has one arrangement, and this endpoint is polled in a loop.
 
     Expired-but-unswept entries are filtered out on the way past rather than swept,
     so this view and the unique index can briefly disagree about one lapsed row, and
@@ -615,19 +1009,40 @@ async def read_queue(
                if pr is not None else None)
     entries = await _live_entries(session, canon_repo, canon_base, now)
     claim = await live_claim(session, "merge", key, now)
+    ranking = None
+    if len(entries) >= MIN_RANKABLE:
+        candidates, overlaps = await _evidence(session, canon_repo, entries)
+        ranking = rank(candidates, overlaps)
     out = {
         "repo": canon_repo,
         "base": canon_base,
         "generated": now.isoformat(),
+        # What the LIVE queue is ordered by, and it is not affected by anything
+        # below. A caller reading one field to learn what happens next reads this
+        # one.
         "ordering": "fifo",
         "active_order": [e.pr for e in entries],
-        # Not a placeholder for something this endpoint sometimes fills in: see
-        # the module docstring on why ordering proposals are #227's second half.
-        "suggested_order": None,
+        # A proposal, and only when it covers every queued PR — see the
+        # docstring. Null is a real answer here and `suggestion.order_trust`
+        # says which of the two reasons produced it.
+        # Gated on `trusted`, not merely on coverage. An order over every queued
+        # PR built partly from prefix lists or from runs taken at commits those
+        # branches have left is still an order derived from a partial
+        # measurement, and this is the field a consumer reads without reading
+        # anything else. `suggestion.partial_order` carries the same list with
+        # its trust attached at the same level, which is where a caveated answer
+        # belongs.
+        "suggested_order": (list(ranking.order)
+                            if ranking is not None and ranking.trusted else None),
+        "suggestion": _suggestion(ranking) if ranking is not None else None,
         "note_on_ordering": (
-            "strict FIFO by arrival (#227, first cut). Ordering proposals — file "
-            "overlap, size, risk, plan dependencies — are not implemented, and "
-            "nothing here mutates the order automatically"),
+            "active_order is strict FIFO by arrival and nothing here mutates it. "
+            "suggested_order is advisory (#80): file overlap between the queued "
+            "PRs, weighted by how expensive each is to re-integrate late, with "
+            "the axes it does not weigh named in `suggestion.axes_not_weighed`. "
+            "It is null while the board cannot answer for every queued PR, "
+            "because an order derived from a partial measurement must not be "
+            "presented as a confident one"),
         "head": entry_view(entries[0], 1) if entries else None,
         "entries": [entry_view(e, i) for i, e in enumerate(entries, start=1)],
         "claim": _claim_view(claim, key),
