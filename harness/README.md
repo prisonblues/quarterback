@@ -2126,6 +2126,39 @@ nothing records when a head moved or when a branch started conflicting, so those
 measured from the round or from the PR's opening. Nothing here starts a review — the panel
 is a reader, and the thing that would act on it is #53.
 
+**Above 157 columns the panels go TWO ACROSS, and what that buys is height.** Seven
+panels dividing one column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a
+50-row screen while four others get five each; the same seven over four grid rows are
+between two and five times that, and no panel's share was taken from another's. The
+threshold is quoted rather than chosen: 78 columns is what one of these tables wants
+before it wraps — `QB_SEATS_DASH_SIZE`'s default, from `qb-seats` — so two side by side
+plus the gutter is the narrowest pane on which the second column is not paid for out of
+the first. Below it nothing changes at all, which is the point: the pane `qb-seats`
+splits off is 78 columns and must come out exactly as it did before this existed.
+`QB_DASH_WIDE` moves it, and a value that is not a positive number of columns is ignored
+rather than fatal.
+
+SEATS spans both columns — it is its content in either layout, and a second column would
+only move the ＋, which is the one widget here that has already fallen off a screen once.
+The other placement is the part CSS could not do. **A grid fills row by row in DOM
+order**, so the order that puts REVIEW QUEUE directly under OPEN PRs above lays them into
+different rows the moment there are two of them, and the pairing #273 asked for is gone.
+So `Dash.relayout` moves PLANS down one when it goes wide: `under` becomes `beside`, and
+PLANS pairs with the ISSUES its items point at. It moves back on the way down, exactly —
+`>` and `<` nudge by eight columns, so crossing the threshold twice in a minute is
+ordinary. The reorder is `move_child` and never a remount: a DataTable carries a cursor, a
+scroll offset and the row keys every click resolves through, and a pane getting wider is
+not news worth losing your place over.
+
+**Take the width off the resize EVENT, never off `self.size`.** Measured on textual 8.2:
+`on_resize` runs before the app's own size is updated, so a `self.size.width` read in
+there is the width the pane had *before* the resize being handled. The caps bar had been
+laying itself out one resize behind since it was first sized to the pane, and nobody
+noticed because dragging a border emits a stream of resizes and the last-but-one is near
+enough. A layout threshold is not forgiving in the same way — a pane that crossed once and
+stopped would sit in the wrong layout until the next resize — which is how the older bug
+came to light.
+
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
 PLANS every repo's list — while a screen is built for one repository. So most rows were
