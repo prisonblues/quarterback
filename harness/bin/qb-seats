@@ -249,32 +249,65 @@ board_cmd() {
 # shell where the same URL works. That cost real debugging time while this was
 # scaffolding in dev/seats-extras.sh (since removed); it arrives here with the lesson.
 #
-# THE PLAIN RENDERER IS THE DEFAULT, AND NOT BECAUSE IT IS BETTER. qb-dash-tui is
-# the nicer of the two — clickable rows, and the seat bar has already turned the
-# mouse on for them — and it should take this slot the moment #209 is fixed.
-# Today it cannot: it keys its seat rows by seat name, two screens both number
-# their seats from 1, so the second screen anywhere on the box turns this pane into
-# a Textual traceback (DuplicateKey). A pane that is meant to be what you look at
-# when something is wrong must not be the thing that breaks first, and a default
-# has to work on the second screen as well as the first. QB_SEATS_DASH=qb-dash-tui
-# opts in meanwhile.
+# THE CLICKABLE RENDERER IS THE DEFAULT, and it took a while to get here. It was
+# `qb-dash` until #426, under a comment that said in capitals that the plain one
+# was not better and should give up this slot "the moment #209 is fixed" — the
+# TUI keyed its seat rows by seat NAME, both screens number their seats from 1,
+# and a second screen anywhere on the box turned this pane into a Textual
+# DuplicateKey traceback. A pane you look at when something is wrong must not be
+# the thing that breaks first.
 #
-# The underlying collision is #208: seat identities are machine-wide while the
-# numbering is per-screen.
+# #209 and #208 closed on 2026-08-20: seat rows key on the tmux pane id now,
+# which is unique box-wide. The workaround then outlived its bug by four days
+# because nothing pointed back here. That is the whole of why this paragraph
+# names the issues rather than the symptom.
 #
-# ONLY qb-dash IS PROBED, and that follows from the paragraph above rather than
-# contradicting it: falling through to qb-dash-tui when qb-dash happens to be
-# missing — a partial install, or a PATH carrying only the TUI entry point — would
-# make the crash-prone renderer the default on exactly the boxes least able to
-# afford it. If #209 disqualifies it as a default it is disqualified here too, so
-# the not-found message names it as the explicit opt-in instead.
+# THE PROBE IS NOW A DEPENDENCY CHECK, NOT A CRASH CHECK, and the inversion is
+# deliberate. The old rule was that ONLY `qb-dash` is probed — falling through to
+# the TUI when the plain one happened to be missing would have made the
+# crash-prone renderer the default on exactly the boxes least able to afford it.
+# With the crash fixed, the remaining question is whether `textual` is importable
+# here, and `qb-dash --can-tui` answers it using the same interpreter search the
+# launch itself will use.
+#
+# ONE BINARY ANSWERS AND THE SAME BINARY RUNS, which is why this emits
+# `qb-dash --tui` and not `qb-dash-tui`. The first cut emitted the latter, and
+# `qb-dash-tui` is a name rather than an implementation: it execs the `qb-dash`
+# BESIDE IT, ignoring PATH. So a box with the two entry points in two directories
+# — a checkout's bin ahead of the installed profile, which this comment calls
+# normal three paragraphs down — probed one launcher and launched another, and
+# the probe could hand a yes for an install that was not the one about to run.
+# Resolving once removes the second lookup rather than trying to keep two in
+# step. (Found by a review of #426 before it landed.)
+#
+# A `qb-dash` OLDER THAN THE PROBE answers 2, not 0: it does not know the flag,
+# passes it to the renderer and argparse rejects it. Nonzero is "not the TUI", so
+# such a box comes up on the plain renderer and heals itself on the next rebuild.
+# Both ship in one derivation, so the window is narrow — but a checkout's
+# `qb-seats` against an installed `qb-dash` is exactly how it is hit in practice.
+#
+# `qb-dash` ON PATH IS STILL THE GATE. A partial install that carries only the
+# TUI entry point falls to the placeholder rather than being promoted, which is
+# the surviving half of the old rule and worth keeping for the same reason: a
+# half-installed harness should say so, not improvise.
 dash_cmd() {
   if [ -n "${QB_SEATS_DASH+set}" ]; then printf '%s' "$QB_SEATS_DASH"; return; fi
-  command -v qb-dash >/dev/null 2>&1 && { printf 'qb-dash'; return; }
+  if command -v qb-dash >/dev/null 2>&1; then
+    if qb-dash --can-tui >/dev/null 2>&1; then
+      printf 'qb-dash --tui'
+    else
+      # Reached on a box with rich but no textual — a checkout whose mcp/.venv
+      # was built without the `tui` extra, which is not a broken install and
+      # should not read as one. The plain renderer is a real fallback here, not
+      # a lesser default.
+      printf 'qb-dash'
+    fi
+    return
+  fi
   placeholder_cmd \
     'dash pane: qb-dash is not on PATH, so there is nothing to show here yet.' \
-    'Set QB_SEATS_DASH to a command to run here — QB_SEATS_DASH=qb-dash-tui if' \
-    'that is the one you have installed — or QB_SEATS_DASH= for no dash at all.'
+    'Set QB_SEATS_DASH to a command to run here — QB_SEATS_DASH=qb-dash-tui for' \
+    'the clickable one — or QB_SEATS_DASH= for no dash at all.'
 }
 
 # The dash is addressed by its label, never by index: it is created after the
