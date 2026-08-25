@@ -324,6 +324,11 @@ def test_a_rank_nobody_chose_is_marked_as_one():
     assert qd.plan_rank({"rank": 12, "rank_source": "appended"})[0] == "~12"
     assert qd.plan_rank({"rank": 12})[0] == "~12", "no source is not a chosen one"
     assert qd.plan_rank({})[0] == ""
+    # #427: a claim put it there, which is a position somebody's ACTION decided.
+    # The tilde counts the same rows the panel title calls unchosen, and the board
+    # counts only `appended` — so a tilde here would put a number in the column
+    # that the title beside it contradicts.
+    assert qd.plan_rank({"rank": 1, "rank_source": "picked-up"})[0] == "1"
 
 
 def test_a_covered_item_does_not_get_the_free_to_take_glyph():

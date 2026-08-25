@@ -44,6 +44,7 @@ rows is not a deletion.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -73,6 +74,10 @@ from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
 
 router = APIRouter(tags=["claim"])
+
+#: The plan item a claim writes is best-effort, so its failures have to land
+#: somewhere a person can find them — the caller is told, and told once.
+_log = logging.getLogger("app.claim")
 
 #: Default hold, in seconds. A land takes minutes and a unit of work is held from
 #: "I have picked this up" to "the PR merged", which on this repo has run to
@@ -339,8 +344,16 @@ class ClaimIn(BaseModel):
     ttl: int = Field(default=DEFAULT_TTL, ge=1, le=MAX_TTL)
     session: str | None = Field(default=None, max_length=MAX_SESSION)
     #: What you are doing with it. Optional, and worth sending: it is what the
-    #: next agent is shown instead of a bare refusal.
+    #: next agent is shown instead of a bare refusal — and, absent `title`, what
+    #: names the plan item this claim writes.
     note: str | None = Field(default=None, max_length=500)
+    #: A better handle for the plan item, when the caller has one. The server is
+    #: forge-free on purpose (#327) so it cannot read an issue's real title; a
+    #: client that just ran `gh issue view` can, and passing it here is the whole
+    #: of the "clients enrich" half of #427. Ignored when the key names no unit of
+    #: work, and ignored on a renew. Bounded to the plan's own title length —
+    #: `_pickup_title` truncates too, so this only stops a megabyte arriving.
+    title: str | None = Field(default=None, max_length=200)
 
     @model_validator(mode="after")
     def _one_way_or_the_other(self) -> ClaimIn:
@@ -513,12 +526,32 @@ async def take_claim(
     holder: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Claim a named resource, or be told who has it.
+    """Claim a named resource, and put it on the plan.
 
     Send ``ref`` and the board derives the key. Send ``kind``/``key`` and it is
     canonicalised onto the same value — and the response says so, because an agent
     that believes it holds ``issue/<repo>#163`` while the row reads
     ``work/<repo>#163`` is the #172 defect with the parties swapped.
+
+    **A fresh claim on an issue or a PR also writes the plan item for it, at the
+    top of that repo's list** (#427). Picking work up is the one act that says
+    what the fleet is actually doing, and until this it was the only one that left
+    the plan unchanged — #426 was filed and claimed within eleven seconds and the
+    PLANS panel showed nothing, because the claim/item join only ran item-first.
+    The new row is returned as ``plan_item`` so the caller need not go and look.
+
+    It is best-effort by design and it is the *claim* that is guaranteed. The item
+    is a second commit — :func:`acquire` commits, so it cannot be one — and if
+    that commit fails the claim still stands and ``plan_item`` comes back null
+    with ``plan_item_error`` saying why. A claim that landed with no item costs a
+    row on a dashboard; a claim refused because a plan write failed costs the
+    duplicated work the claim exists to prevent, and they are not close.
+
+    **A renew repairs.** Because the write can fail and the claim survives it
+    anyway, something has to be able to put it right afterwards, or "best-effort"
+    means "permanently invisible on the first bad day" — the exact state this
+    feature was built to abolish. So a renew runs the same write, which finds the
+    item already there and returns it, and writes it when it is not.
     """
     try:
         kind, key = body.resolve()
@@ -534,7 +567,51 @@ async def take_claim(
         out["note_on_key"] = (
             f"you asked for {body.kind}/{body.key!r}; the board keys that resource "
             f"as {kind}/{key!r}. Send `ref` instead and you never have to know.")
+    # On a renew too, and that is a REPAIR rather than a second write. Gating this
+    # on a fresh take left the one state this feature exists to abolish with no way
+    # out of it: if the plan write failed once — a transient database fault, a
+    # deploy mid-migration — the claim was invisible on the plan for as long as it
+    # kept being renewed, because every renew skipped the only code that could have
+    # fixed it. `item_for_claim` is idempotent by construction (an existing open
+    # item is returned, not rewritten), so the repair costs one indexed SELECT on a
+    # renew that had nothing to fix.
+    out.update(await _plan_item_for(
+        session, kind=kind, key=key, holder=holder,
+        note=body.note, title=body.title))
     return out
+
+
+async def _plan_item_for(session: AsyncSession, **kw: object) -> dict:
+    """:func:`item_for_claim`, with its failure kept away from the claim.
+
+    Imported here rather than at module scope because ``app.api.plan`` imports
+    this module — it reuses :func:`acquire` so that "who has this right now" has
+    one implementation (#99) — and the plan is the natural home for a function
+    that writes a plan item. One deferred import is the cheaper of the two ways
+    out; the other is a third module holding the rank helpers, which would move
+    ``_lock_scope`` and ``_scope_items`` away from the only other things that use
+    them.
+    """
+    from app.api.plan import item_for_claim  # noqa: PLC0415 — see docstring
+
+    try:
+        item = await item_for_claim(session, **kw)  # type: ignore[arg-type]
+    except Exception as e:  # noqa: BLE001 — the claim is what must survive
+        # Rolled back so the caller's session is usable: this runs after
+        # `acquire` has committed, so nothing of the CLAIM is at risk here.
+        await session.rollback()
+        _log.warning("claim %s/%s: plan item not written: %s", kw.get("kind"),
+                     kw.get("key"), e, exc_info=True)
+        return {"plan_item": None, "plan_item_error": str(e)}
+    if item is None:
+        # Not a failure: `work_ref` declined the key, because a merge claim, a
+        # board object or a row in somebody's database is not a unit of work the
+        # plan can hold. Silent, because saying so on every such claim would be
+        # noise on the many paths this is true of.
+        return {"plan_item": None}
+    return {"plan_item": {"item_id": str(item.id), "rank": item.rank,
+                          "rank_source": item.rank_source, "title": item.title,
+                          "repo": item.repo}}
 
 
 @router.post("/claim/renew")
