@@ -182,6 +182,46 @@ class ReviewRun(Base):
     #: collide with. Separate from `pr_state` because GitHub's `state` does not
     #: encode it — a draft's state is `OPEN`.
     is_draft: Mapped[bool | None] = mapped_column(Boolean)
+    #: Did a reviewer read anything on this run (#94)? Three states, and the
+    #: third is the one that makes the column safe to add to a table with
+    #: history in it:
+    #:
+    #: * ``True`` — a panel ran. Every seat's account is in
+    #:   :class:`ReviewReviewer` and the findings are real observations.
+    #: * ``False`` — this run reviewed nothing and says so. The title-pattern
+    #:   skip (a merge, a promote, a format-the-world commit) and the pre-flight
+    #:   refusal both exit here. The row exists for what it MEASURED — the PR's
+    #:   changed-file list, its state, the head it moved to — not for a verdict
+    #:   it never reached.
+    #: * ``NULL`` — nobody said. Every row recorded before this column, and the
+    #:   only honest value for them: the board holds refusals among those rows
+    #:   and cannot tell which they are, so asserting ``True`` would make a new
+    #:   column knowingly wrong about a known class of row.
+    #:
+    #: **The reading rule, because the two are not interchangeable.** A question
+    #: whose wrong answer is a false all-clear asks ``reviewed IS TRUE`` — it
+    #: must not be satisfied by a row nobody can vouch for. A count that exists
+    #: to match what has already been published asks ``reviewed IS NOT FALSE``,
+    #: which keeps every legacy row where it has always been and excludes only
+    #: the runs that state outright that they reviewed nothing. Sites doing the
+    #: second are marked; every other reader wants the first.
+    #:
+    #: Not derivable, which is why it is stored. "No scorecards and no findings"
+    #: is also what a pre-v2.15 payload looks like when its reviewers were
+    #: inferred from finding attribution, so a derivation would have to guess
+    #: over exactly the history this column refuses to guess about.
+    reviewed: Mapped[bool | None] = mapped_column(Boolean)
+    #: Why nothing was reviewed, in the panel's own words — ``title matches skip
+    #: pattern /^Merge /``, or a pre-flight refusal's reason. NULL wherever
+    #: ``reviewed`` is not ``False``.
+    #:
+    #: A second column rather than a richer ``reviewed``, because the two are
+    #: read by different people. ``reviewed`` is a predicate a query filters on;
+    #: this is a sentence a human reads off a collision row to decide whether a
+    #: 400-file merge is worth looking at by hand. The panel has sent it on both
+    #: non-review exits since long before this release and the board discarded it
+    #: — storing it invents nothing.
+    skip_reason: Mapped[str | None] = mapped_column(Text)
     diff_chars: Mapped[int | None] = mapped_column(Integer)
     diff_truncated: Mapped[bool | None] = mapped_column(Boolean)
 
@@ -262,6 +302,19 @@ class ReviewRun(Base):
         CheckConstraint('"round" >= 1', name="ck_review_runs_round_positive"),
         CheckConstraint("new_findings >= 0",
                         name="ck_review_runs_new_findings_non_negative"),
+        # A run that reviewed nothing cannot also have earned a confident stop
+        # (#94). `stop_confident` is what `preland --require-earned-stop` reads
+        # and what the review queue calls convergence, so the one combination
+        # that must be unrepresentable is "no reviewer read anything, and the
+        # cycle stopped confidently" — a non-event certifying a PR as done.
+        #
+        # At the boundary rather than only at ingest, for the reason the round
+        # and repo constraints above give: the API is not the only writer, and a
+        # write path added later must not be able to reintroduce it quietly.
+        # NULL on either side passes — `reviewed IS NULL` is every legacy row and
+        # `stop_confident IS NULL` is "the panel didn't say".
+        CheckConstraint("NOT (reviewed IS FALSE AND stop_confident IS TRUE)",
+                        name="ck_review_runs_unreviewed_not_confident"),
         # One repository, one stored spelling — at the boundary, so that the API
         # is not the only thing that remembers (#326, migration 0033).
         #

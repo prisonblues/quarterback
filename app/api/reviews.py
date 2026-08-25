@@ -1877,6 +1877,28 @@ class ReviewIn(BaseModel):
         return s if s in PR_STATES else None
     diff_truncated: bool | None = None
 
+    #: Did a reviewer read anything on this run (#94)? The panel has sent this on
+    #: every exit for several releases and the board discarded it; storing it is
+    #: what lets a title-skipped merge contribute its changed-file list to
+    #: ``GET /review/collisions`` without a review being recorded.
+    #:
+    #: Absent is **NULL, not True**. "Nobody said" is the truth about every run
+    #: recorded before this field existed, and it is the only value that does not
+    #: assert something about the pre-flight refusals already sitting in that
+    #: population. See :attr:`app.models.review.ReviewRun.reviewed` for the
+    #: reading rule the query sites are written to.
+    reviewed: bool | None = None
+    #: Why nothing was reviewed, in the panel's own words. Trimmed to one line
+    #: like every other free-text field here; NULL where the panel said nothing.
+    skip_reason: str | None = None
+    #: Set by the validator, never by the caller: a ``reviewed: false`` this
+    #: board refused to believe, because the same payload carried findings.
+    reviewed_dropped: bool = False
+    #: Set by the validator: a confident stop taken off a run that reviewed
+    #: nothing. Reported rather than stored, and reported rather than 500ing on
+    #: the CHECK that would otherwise refuse the row.
+    stop_confidence_dropped: bool = False
+
     judged: bool = False
     judge_model: str | None = None
     judge_skip: str | None = None
@@ -1934,6 +1956,52 @@ class ReviewIn(BaseModel):
     @classmethod
     def _new_findings(cls, v: object) -> int | None:
         return _count_or_none(v)
+
+    @field_validator("skip_reason", mode="before")
+    @classmethod
+    def _skip_reason(cls, v: object) -> str | None:
+        return _trimmed_or_none(v)
+
+    @model_validator(mode="after")
+    def _no_review_claims_nothing_else(self) -> ReviewIn:
+        """Two claims a run that reviewed nothing is not allowed to also make.
+
+        Neither is a 422. This module's standing rule is that recording is
+        best-effort — a payload is never refused over one field, because refusing
+        it loses the findings, the scorecards and the accounts along with the bad
+        value. So the unbelievable half is dropped, the response names the drop,
+        and everything else is stored.
+
+        **Which half is the unbelievable one is decided by consequence, not by
+        symmetry.**
+
+        *Findings beside* ``reviewed: false``. The findings are concrete —
+        reporters, files, a judge's verdict — and the flag is one boolean. A
+        payload carrying findings was produced by a panel that ran, so the flag
+        is what goes. It is dropped to NULL rather than corrected to ``True``:
+        this board did not watch the run, and "nobody credibly said" is a value
+        it already has a meaning for.
+
+        *A confident stop beside* ``reviewed: false``. Here the flag stays and the
+        confidence goes, because the two errors are not the same size.
+        ``stop_confident`` is what ``preland --require-earned-stop`` reads and
+        what the review queue calls convergence, so believing it would let a
+        non-event certify a pull request as done. It is set to ``False`` — an
+        unearned stop, which is exactly what a stop by a run that read nothing
+        is — and not to NULL, because NULL means the stopping rule never spoke
+        and this payload's did. ``ck_review_runs_unreviewed_not_confident``
+        refuses the pair at the boundary as well; without this the row would 500
+        on an IntegrityError instead of being recorded with a note.
+        """
+        if self.reviewed is False and (self.to_fix or self.dismissed
+                                       or self.sonar_findings):
+            self.reviewed = None
+            self.reviewed_dropped = True
+        if (self.reviewed is False and self.round_stop is not None
+                and self.round_stop.confident):
+            self.round_stop.confident = False
+            self.stop_confidence_dropped = True
+        return self
 
 
 def _verdict(f: FindingIn, judged: bool) -> str:
@@ -2336,6 +2404,15 @@ async def record_review(
         is_draft=body.is_draft,
         diff_chars=body.diff_chars,
         diff_truncated=body.diff_truncated,
+        # Stored AS SENT, NULL included, and NULL is the commonest value on this
+        # table rather than an edge case: it is every run recorded before the
+        # field existed. `body.reviewed or False` would have collapsed that onto
+        # "reviewed nothing" and rewritten the board's whole history into
+        # non-events; `body.reviewed is not False` would have collapsed it the
+        # other way and certified runs nobody can vouch for. Neither collapse —
+        # see the column's docstring for which readers ask which question.
+        reviewed=body.reviewed,
+        skip_reason=body.skip_reason,
         judged=body.judged,
         judge_model=body.judge_model or None,
         judge_skip=body.judge_skip,
@@ -2535,6 +2612,17 @@ async def record_review(
     # across.
     if body.head_sha_dropped is not None:
         dropped["head_sha_dropped"] = body.head_sha_dropped
+    # Two claims a run that reviewed nothing made and this board did not take —
+    # see `ReviewIn._no_review_claims_nothing_else` for which half of each pair
+    # goes and why. Reported for the reason every drop on this path is: a value
+    # refused in silence is indistinguishable from one never sent, and these two
+    # are the ones whose silent refusal would leave a consumer believing the
+    # board agrees with it.
+    if body.reviewed_dropped:
+        dropped["reviewed_dropped"] = "findings were sent with reviewed: false"
+    if body.stop_confidence_dropped:
+        dropped["stop_confidence_dropped"] = (
+            "a confident stop was sent with reviewed: false")
     # ...and the base end, each named rather than one flag for "a commit id was
     # refused". These two are what a pre-land verdict resolves against the repo,
     # so a producer sending a base it thinks was stored has to be told it was not.
@@ -3320,6 +3408,15 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "is_draft": r.is_draft,
         "diff_chars": r.diff_chars,
         "diff_truncated": r.diff_truncated,
+        # Whether anybody read anything, and why not (#94). First of the three
+        # verdict-shaped keys and deliberately ahead of `judged`, because it
+        # governs how the other two are read: `judged: false` on a reviewed run
+        # means the panel ran and nobody adjudicated it, and on a run with
+        # `reviewed: false` it means nothing at all. Three states, unmasked —
+        # NULL is every run recorded before the field and must not read as either
+        # answer.
+        "reviewed": r.reviewed,
+        "skip_reason": r.skip_reason,
         "judged": r.judged,
         "judge_model": r.judge_model,
         "judge_skip": r.judge_skip,
@@ -3578,6 +3675,37 @@ def _since_clause(since: str | None, days: int | None):
     return None
 
 
+def _review_happened():
+    """``reviewed IS NOT FALSE`` — "not known to be a non-review" (#94).
+
+    One predicate, used everywhere a query means "a review happened", and the
+    reason it is this one rather than ``reviewed IS TRUE`` is the whole argument
+    for making the column nullable.
+
+    ``IS TRUE`` is the predicate you reach for first, and it is wrong against this
+    table. Every row recorded before today carries NULL, so ``IS TRUE`` selects
+    none of them: the leaderboard would publish zero runs, the review queue would
+    report every pull request as never reviewed, and a fix for a blind spot would
+    have blanked the history it was meant to complete. ``IS NOT FALSE`` keeps
+    every legacy row exactly where it has always been and excludes only the runs
+    that state outright that they reviewed nothing — so nothing already published
+    moves, which is the property that made it safe to start recording
+    title-skipped runs at all.
+
+    What it does **not** claim is that a NULL row was reviewed. It says nobody
+    has said otherwise, and that is the strongest thing this board can say about
+    a row it did not watch being made. The direction of the remaining error is
+    the survivable one: a legacy refusal still counts as a run, exactly as it has
+    counted since the day it was recorded.
+
+    Not a module constant: SQLAlchemy expressions are reusable, but a shared
+    object handed to six statements is one `.where()` mutation away from a bug
+    that only shows up in the sixth, and this is a predicate whose failure mode
+    is a count that quietly stops matching a published one.
+    """
+    return ReviewRun.reviewed.isnot(False)
+
+
 @router.get("/reviews")
 async def list_reviews(
     _reader: str = Depends(reader),
@@ -3587,12 +3715,32 @@ async def list_reviews(
     since: str | None = Query(None, description="ISO timestamp"),
     days: int | None = Query(None, ge=1, le=3650),
     limit: int = Query(50, ge=1, le=500),
+    include_unreviewed: bool = Query(
+        False, description="also list runs that recorded no review — a title-skipped "
+                           "merge, a pre-flight refusal"),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict]:
-    """Recorded panel runs, newest first."""
+    """Recorded panel runs, newest first.
+
+    **Runs that reviewed nothing are not listed by default** (#94). Since the
+    board started recording title-skipped panels, this table holds rows whose
+    purpose is the changed-file list they carry rather than a review they
+    performed, and the commonest thing done with this endpoint's answer is to
+    take its length. A merge commit appearing as a run of a repository would make
+    "this PR was reviewed N times" wrong in the direction that reads reassuring.
+
+    The default is ``reviewed IS NOT FALSE``, so **no row that was listed before
+    this release has stopped being listed**: every one of them is NULL. Only runs
+    that say outright they reviewed nothing are held back, and
+    ``include_unreviewed`` shows them — with ``reviewed`` and ``skip_reason`` on
+    every row either way, so a caller that wants them all can tell which is which
+    rather than having to infer it from an empty reviewer list.
+    """
     # The run, plus its unread-path COUNT computed in the database. The column
     # itself is deferred and deliberately not fetched here — see `_run_view`.
     stmt = select(ReviewRun, _UNREAD_COUNT)
+    if not include_unreviewed:
+        stmt = stmt.where(_review_happened())
     if repo is not None:
         stmt = stmt.where(ReviewRun.repo == _asked_repo(repo))  # #326
     if pr is not None:
@@ -3709,7 +3857,16 @@ async def review_spend(
             )
             .select_from(ReviewRun)
             .outerjoin(ReviewReviewer, ReviewReviewer.run_id == ReviewRun.id)
-            .where(*where)
+            # #94: and NOT the runs that reviewed nothing. The LEFT join above
+            # exists so an uninstrumented run still counts as a run — it cost
+            # whatever it cost — but a title-skipped merge cost nothing by
+            # construction: it fetched metadata and dispatched no seat. Counted,
+            # it would add runs and no spend to the very ratio #55's ceiling is
+            # denominated in, and loosen the ceiling on exactly the repositories
+            # that merge most often. Counting, so `IS NOT FALSE`: no legacy row
+            # moves, and the already-recorded refusals keep costing what they
+            # have always been recorded as costing.
+            .where(_review_happened(), *where)
         )
 
     out: dict = {
@@ -3817,6 +3974,14 @@ async def review_stats(
         filters.append(ReviewRun.ts >= cutoff)
     if judged_only:
         filters.append(ReviewRun.judged.is_(True))
+    # #94: a title-skipped run has no scorecards and no findings, so every
+    # per-reviewer aggregate below is untouched by it either way. The run-level
+    # totals are not — `count(ReviewRun.id)` and the distinct `repo#pr` would
+    # both grow — and `provenance_runs`, the coverage marker this page publishes
+    # so a window of pre-v2.26 runs is not read as a panel that never caught a
+    # regression, would grow a denominator made of rounds that read nothing.
+    # Counting, so it is `IS NOT FALSE`: no legacy row moves.
+    filters.append(_review_happened())
 
     totals = (
         await session.execute(
@@ -4565,6 +4730,15 @@ async def pr_finding_history(
     cycle-less run is the newest in the window, the ending still comes from the
     cycle's last round rather than from the run that happened to land after it.
 
+    **Rounds that reviewed nothing are not traced** (#94). Since the board started
+    recording title-skipped panels, a pull request's newest run may be a merge
+    commit nobody read — and this endpoint is entirely about what rounds FOUND, so
+    such a run has nothing to contribute to any chain and three ways to corrupt
+    the answer: it would consume a slot of ``limit``, it would become the round a
+    defect must appear in to count as ``open``, and it would supply the cycle's
+    ending from stop fields no stopping rule ever set. ``GET /reviews`` with
+    ``include_unreviewed`` lists them; ``rounds`` here counts rounds that ran.
+
     ``cycles: 0`` is a real answer, not an absent one: every traced run predates the
     column or was a one-shot read, there is nothing to misattribute between, and the
     window summarises — which is what keeps the pre-cycle archive reading as it
@@ -4616,7 +4790,31 @@ async def pr_finding_history(
     fetched_rows = list(
         (await session.execute(
             select(ReviewRun, _UNREAD_COUNT)
-            .where(ReviewRun.repo == repo, ReviewRun.pr == pr)
+            # Rounds that REVIEWED, and the filter is in front of the window on
+            # purpose (#94). This is not the newest-run-per-PR selection the
+            # collision endpoint guards; it is "the last N rounds of ONE pull
+            # request", every one of which is returned, so narrowing the
+            # population cannot promote a stale answer — there is no per-PR
+            # winner to promote.
+            #
+            # Placed here rather than applied to the fetched rows because `limit`
+            # bounds what is FETCHED. A PR that collects several skipped merges
+            # would otherwise spend its whole window on rounds with no findings
+            # in them, and the real rounds would fall off the end — their defects
+            # not `gone` but simply absent, which reads emptier still. `limit=1`
+            # after one skipped merge is the sharp case: it returned nothing at
+            # all.
+            #
+            # It also settles `last` further down. A skipped round carries the
+            # cycle id it inherited, so it qualifies as "the newest run of this
+            # cycle" and would supply the cycle's ending from its own NULL
+            # `stopped` / `stop_confident` — reporting a converged cycle as one
+            # nobody ever ruled on.
+            #
+            # `IS NOT FALSE`: every round recorded before the column is NULL, and
+            # `IS TRUE` would empty this endpoint for the entire archive.
+            .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+                   _review_happened())
             .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
             .limit(limit + 1)
         )).all()
@@ -4637,6 +4835,14 @@ async def pr_finding_history(
     runs = list(reversed(fetched[:limit]))  # chronological: a chain reads left to right
     order = {r.id: i for i, r in enumerate(runs)}
     ts_by_run = {r.id: r.ts for r in runs}
+    # Every run in the window reviewed something — the query above says so — so
+    # this is the newest ROUND, and a defect last seen in it is still open while
+    # one last seen earlier is `gone`. That is only true because of that filter:
+    # read off the newest run outright, a title-skipped merge recorded after a
+    # real round would flip every outstanding finding on the PR to `gone` with
+    # nobody having re-reviewed anything. A false all-clear manufactured by the
+    # fix that made skipped runs visible, which is this issue's own disease
+    # arriving inside its repair.
     latest_id = runs[-1].id
 
     findings = list(
@@ -5039,7 +5245,8 @@ def _capped(paths: list[str], total: int) -> dict:
     }
 
 
-def _rival_view(rival: Rival, verdict: Verdict, pr_title: str | None, ts: datetime) -> dict:
+def _rival_view(rival: Rival, verdict: Verdict, pr_title: str | None, ts: datetime,
+                reviewed: bool | None, skip_reason: str | None) -> dict:
     """One rival, in the SAME shape whichever bucket it landed in.
 
     Uniform on purpose. The bug this endpoint was pulled for is a rival being
@@ -5057,6 +5264,14 @@ def _rival_view(rival: Rival, verdict: Verdict, pr_title: str | None, ts: dateti
         "ts": ts.isoformat(),
         "pr_state": rival.pr_state,
         "is_draft": rival.is_draft,
+        # Whether anybody actually READ this rival, and why not (#94). Carried
+        # beside the verdict and deliberately not inside it: it changes nothing
+        # about the overlap — the file list came off the PR's own metadata whether
+        # or not a seat ran — but a caller ordering a drain wants to know that the
+        # 400-file merge it is about to collide with has been read by nobody.
+        # NULL is every rival panelled before the column existed.
+        "reviewed": reviewed,
+        "skip_reason": skip_reason,
         "class": verdict.cls,
         "excluded_because": verdict.because,
         # GitHub's count against what the board holds, and the verdict the two of
@@ -5165,11 +5380,21 @@ async def pr_collisions(
     which is #80's to decide on; until then an empty ``collides`` means "none of
     the PRs I have seen", never "none exist". It is said in the response and not
     only here, because it is the one limit a caller cannot discover from the
-    numbers. Two known holes inside even that population: a panel *skipped* run
-    never reaches the board at all (#94), so merges and format-the-world commits —
-    the highest-collision changes there are — are invisible in both directions;
-    and ``pr_state`` is as of each rival's last panel, never live, which is why
-    every row carries its run's ``ts``.
+    numbers. One known hole inside even that population: ``pr_state`` is as of
+    each rival's last panel, never live, which is why every row carries its run's
+    ``ts``.
+
+    **A title-skipped panel is a rival like any other, since #94.** A merge, a
+    promote or a format-the-world commit is not worth an LLM review, so the panel
+    declines to run one — and used to return before telling the board anything,
+    which made the highest-collision changes there are invisible here in both
+    directions. It records the run now, marked ``reviewed: false`` with the reason
+    beside it, and **nothing in this handler tests that field.** The row is
+    selected, joined and classified exactly like a reviewed one, because for this
+    endpoint's question it is worth precisely as much: the file list came off the
+    PR's own metadata either way. A rival's ``reviewed`` and ``skip_reason`` ride
+    on its row so a caller can see that no human or model has read the thing it is
+    about to collide with, which is a fact about the PR and not about the overlap.
 
     Caps are per class and each says what it dropped, ``unanswerable`` included:
     it is by construction the *largest* list — on the day this ships, every PR the
@@ -5252,6 +5477,14 @@ async def pr_collisions(
         ReviewRun.pr_title.label("pr_title"), ReviewRun.ts.label("ts"),
         ReviewRun.changed_files_total.label("total"),
         ReviewRun.pr_state.label("pr_state"), ReviewRun.is_draft.label("is_draft"),
+        # Carried, never tested (#94). `reviewed` appears in the SELECT list and
+        # in no WHERE clause anywhere in this handler — a run that reviewed
+        # nothing is as good an answer to "which files does this PR touch" as one
+        # that did, and making it a predicate here would be a filter in front of
+        # the selection, which is the defect this endpoint was rewritten twice to
+        # remove.
+        ReviewRun.reviewed.label("reviewed"),
+        ReviewRun.skip_reason.label("skip_reason"),
     ).where(ReviewRun.repo == repo, ReviewRun.pr != pr)
     if cutoff is not None:
         newest = newest.where(ReviewRun.ts >= cutoff)
@@ -5286,7 +5519,8 @@ async def pr_collisions(
     )
     rows = (await session.execute(
         select(newest.c.pr, newest.c.pr_title, newest.c.run_id, newest.c.ts,
-               newest.c.total, newest.c.pr_state, newest.c.is_draft, recorded)
+               newest.c.total, newest.c.pr_state, newest.c.is_draft,
+               newest.c.reviewed, newest.c.skip_reason, recorded)
         .order_by(newest.c.pr)
     )).all()
     run_ids = [run_id for _pr, _title, run_id, *_rest in rows]
@@ -5345,7 +5579,8 @@ async def pr_collisions(
 
     # ---- 2. CLASSIFY: each SELECTED run into exactly one bucket.
     buckets: dict[str, list[dict]] = {cls: [] for cls in CLASSES}
-    for pr_no, pr_title, run_id, ts, total, pr_state, is_draft, recorded in rows:
+    for (pr_no, pr_title, run_id, ts, total, pr_state, is_draft,
+         reviewed, skip_reason, recorded) in rows:
         rival = Rival(
             pr=pr_no, run_id=run_id, pr_state=pr_state, is_draft=is_draft,
             changed_files_total=total, files_recorded=recorded,
@@ -5354,7 +5589,8 @@ async def pr_collisions(
         )
         verdict = classify(rival, include_closed=include_closed,
                            exclude_drafts=exclude_drafts)
-        buckets[verdict.cls].append(_rival_view(rival, verdict, pr_title, ts))
+        buckets[verdict.cls].append(
+            _rival_view(rival, verdict, pr_title, ts, reviewed, skip_reason))
 
     # Most shared files first — a description of the overlap, not a recommendation
     # about it. Every other bucket keeps the query's ascending `pr`, which is the
@@ -5373,6 +5609,11 @@ async def pr_collisions(
         "ts": subject.ts.isoformat(),
         "pr_state": subject.pr_state,
         "is_draft": subject.is_draft,
+        # The subject's own answer to the same question (#94). A caller may well
+        # be asking about a merge commit it is holding: the overlap is as good as
+        # any, and "nobody reviewed this" is worth knowing before landing it.
+        "reviewed": subject.reviewed,
+        "skip_reason": subject.skip_reason,
         # The subject's own three numbers, and `files_complete` is the one to read
         # first: GitHub caps a PR's file list at 3,000, and a subject whose list is
         # a prefix under-reports its OWN collisions — a shortfall no per-rival

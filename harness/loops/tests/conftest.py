@@ -95,6 +95,7 @@ os.environ.setdefault("QUARTERBACK_DIALS", "")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — the `gh` seam every stub here replaces
+import panel_seats  # noqa: E402  — where `record_run` is defined
 
 
 @pytest.fixture(autouse=True)
@@ -420,3 +421,42 @@ def _no_escalation_posts(monkeypatch):
     stubbed opener — see `test_needs_human.py`.
     """
     monkeypatch.setenv("QUARTERBACK_NEEDS_HUMAN", "off")
+
+
+@pytest.fixture(autouse=True)
+def recorded_runs(monkeypatch):
+    """No test records a real run on a real board (#94), and here is the list of
+    what it would have recorded.
+
+    Autouse and unconditional, on the same argument as `_no_escalation_posts`
+    above: `record_run` pipes the payload to `qb record-review`, `qb` resolves
+    the board out of THIS host's site config, and `qb` is on the PATH of every
+    enrolled workstation. A test that reaches it on such a machine writes a run
+    to the live board — green suite, real data — while in the nix sandbox, which
+    carries no `qb`, nothing happens at all. So the suite would be quietly
+    correct on the one box nobody develops on.
+
+    It was survivable before only by accident: the two exits that recorded were
+    the reviewed one and the pre-flight refusal, and the modules exercising those
+    happened to stub `record_run` per test. Since the title-pattern skip records
+    too, the exits that reach the board are no longer the ones a test author
+    thinks about, and "remember to stub it" is not a guard.
+
+    Yielding the list rather than a bare no-op, because the assertion this fixture
+    exists to make possible is the one #94 turns on: that the skip path reaches
+    the board at all. Returns "" — what a successful record returns — so a caller
+    appending its result to `config_notes` gets a run recorded cleanly, which is
+    the ordinary case; a test wanting the failure branch overrides it itself.
+    """
+    seen: list[dict] = []
+
+    def _record(payload: dict) -> str:
+        seen.append(payload)
+        return ""
+
+    # Both names: `panel` imports it into its own namespace, and `panel_seats` is
+    # where it is defined. A test that patches one and a call site that reads the
+    # other is exactly how a guard like this comes to cover nothing.
+    monkeypatch.setattr(panel, "record_run", _record)
+    monkeypatch.setattr(panel_seats, "record_run", _record)
+    return seen

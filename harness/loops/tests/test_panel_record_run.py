@@ -25,6 +25,8 @@ payload is written) is the part a later edit is most likely to undo.
 import json
 import subprocess
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -42,6 +44,33 @@ QB_OK = "recorded review run 41\n"
 #: And its failure branch: exit **0** — deliberately, so a down board cannot fail
 #: a review — with the reason on stderr and stdout left empty.
 QB_DOWN = "qb: review not recorded (curl: (7) Failed to connect)\n"
+
+#: The real function, captured at import — before conftest's `recorded_runs`
+#: fixture has had a chance to replace it on either module.
+_REAL_RECORD_RUN = panel_seats.record_run
+
+
+@pytest.fixture(autouse=True)
+def _the_real_record_run(monkeypatch, recorded_runs):
+    """This module is the one that must NOT have `record_run` stubbed away.
+
+    `conftest.recorded_runs` replaces it everywhere, autouse, so that no test on
+    an enrolled workstation can pipe a run to the live board. This module's whole
+    subject is that function, and its own guard is lower down and stronger: it
+    stubs `panel_seats.shutil.which` and `panel_seats.subprocess.run`, so the
+    real `record_run` executes and reaches a `qb` that does not exist.
+
+    So the real one goes back, on both names. Depending on `recorded_runs`
+    explicitly rather than relying on fixture ordering: it makes this a
+    documented override of a named fixture instead of a coincidence of
+    declaration order, which is what would silently stop holding if either moved.
+
+    Every test here that reaches the panel goes through `_run`, which stubs `qb`
+    first — a test that forgot would fail on the missing stub rather than reach a
+    board, because `_qb` is also what makes the assertions possible.
+    """
+    monkeypatch.setattr(panel_seats, "record_run", _REAL_RECORD_RUN)
+    monkeypatch.setattr(panel, "record_run", _REAL_RECORD_RUN)
 
 
 def _qb(monkeypatch, *, present=True, returncode=0, stdout="", stderr="",
