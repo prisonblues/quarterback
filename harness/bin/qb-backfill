@@ -1,0 +1,668 @@
+#!/usr/bin/env python3
+"""qb-backfill — record what each open PR touches, from the forge, for any repo (#449).
+
+  qb-backfill                     dry run over this checkout's repo: say what it would record
+  qb-backfill --repo owner/name   an explicit repo, for a checkout that is not it
+  qb-backfill --apply             write the rows
+  qb-backfill --pr 12 --pr 34     just these open PRs, and nothing else
+  qb-backfill --json              the whole answer as a document
+
+  0  every open PR is answered for — recorded, or already attested, or knowably empty
+  1  ran, and at least one PR is NOT answered for: the forge would not say, the board
+     refused it, or GitHub's own list came back short of GitHub's own count
+  2  could not start — no repo, no `gh`, no board. NOT a statement about any PR
+
+**#94 said no backfill was possible and was right about the thing it meant.** Every
+panel skipped before it left no row, and those payloads are gone. This does not
+resurrect them. It reads a *different* source that is still there — the forge knows
+which files every open PR touches right now — and writes it into the shape #94 built
+for exactly this: a row with `reviewed: false` and a `skip_reason`, carrying a real
+file list while stating plainly that nobody reviewed it.
+
+Why it has to exist at all: `suggested_order` (#80) is published only when EVERY
+queued PR's evidence is attested, so one PR panelled before #94 turns the ranking off
+for the whole queue. A backlog of thirty is thirty chances to be that one.
+
+**IT NEVER CLAIMS A REVIEW.** The row it writes carries `reviewed: false`, a
+`skip_reason` naming this tool and the commit it read, no findings, no scorecards, no
+stop and no confidence. `GET /reviews` hides it by default; `/review/stats`,
+`/review/spend` and `/review/findings` exclude it by #94's `reviewed IS NOT FALSE`
+rule; and `app.api.plan._pr_evidence` still takes its findings from the newest run
+that actually reviewed. What the row changes is the one thing it is for: the newest
+run per PR now holds a file list, so `app.ranking` can attest it.
+
+**A SHORT LIST IS RECORDED AS SHORT, NEVER AS WHOLE.** `changed_files_total` is
+GitHub's own `changedFiles` and is never `len(files)` — agreeing by construction is
+not evidence, and `app.collisions.files_complete` exists to compare the two. Four
+things could make the stored list a prefix, all four are reported and none is
+smoothed: GitHub caps a PR's file list at 3,000; a paged read that fails partway is
+refused outright rather than recorded short; the board's own `changed_files_dropped`
+is read back off the write and believed over what was sent; and the head is re-read
+AFTER the list, because the two `gh` calls are not one snapshot and a push between
+them stores commit B's paths under commit A's sha — which reads complete whenever the
+two commits happen to touch the same number of files. A prefix leaves the PR
+unattested, which is the correct outcome: it keeps `suggested_order` null instead of
+ranking a branch by files it never listed.
+
+`gh api --paginate .../pulls/N/files` and not `gh pr view --json files`, which is
+where this differs from `harness/loops/panel.py`: `pr view` asks GraphQL for
+`files(first: 100)` and does not page, so a 322-file PR arrives as 100 paths and
+exits 0 (measured, on kubernetes/kubernetes#141360). The panel compares that list
+against `changedFiles` and prints a note, which is survivable when the list is a side
+effect of a review; here the list is the whole product, so it is read to the end.
+
+**One hole is left open and is reported rather than closed: renames (#453).** GitHub
+counts a rename as one changed file, so a row holding only the destination path satisfies
+`files_complete` while another PR editing the SOURCE path collides with it invisibly.
+`review_run_files` has one path column and no notion of an alias, so storing the old
+path as well would make `files_recorded` exceed GitHub's count and fail #80's
+`counts_agree` — the PR would go unattested for having read more than anyone else.
+The panel has the same hole and says so. This counts them, per PR, so an operator can
+see where the grain runs out.
+
+**A RE-RUN ON AN UNCHANGED PR MOVES NOTHING.** Four guards, answering for different
+failures. Before writing at all, a PR whose newest run already carries a complete file
+list at the head the forge reports now is skipped as `already`, so this never shadows
+a run that already answered — and a PR whose newest run is a backfill of this tool's
+own at that head is skipped too, because re-reading the same forge would store the
+same shortfall. The `run_key` carries the repo, the PR, the head and the run this one
+supersedes, so a second write of the same fact meets the board's unique index —
+that is the guard that holds when two agents run this at the same moment, which no
+read-then-write check can cover. And a write refused as a duplicate is not taken as
+"done": the newest run is read again and the PR is only reported answered if it now
+attests.
+
+A PR that pushes gets a new head, the guards open, and the new commit is recorded —
+which is the point, because `app.ranking.Candidate` attests a list only against the
+commit the queue has the PR on.
+
+**What it assumes and cannot check:** that GitHub's `changedFiles` is right. A count
+that is wrong AND equal to the number of paths returned is indistinguishable from a
+complete list by any means available here.
+
+**IT REFUSES RATHER THAN GUESSES** (#414). `--repo`, or the origin of the checkout it
+was run in, and if neither says then it stops — it does not fall back to a default and
+report a confident nothing-to-do about a repository it never found. An argument it
+does not understand is refused by argparse rather than ignored, because an argument
+nobody read is not consent. `--apply` is the only thing that writes.
+
+Nothing here touches `GET /review/collisions`. It gained no predicate in #94 and gains
+none here: a backfilled run enters the same unconditional newest-run selection as any
+other, and is classified afterwards like any other.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+DONE, INCOMPLETE, UNKNOWN = 0, 1, 2
+
+#: Bumped when the CONTENT of a backfill row changes in a way that should make an
+#: existing row stale. Part of the `run_key`, so a repo backfilled by an older
+#: version is re-recorded once by a newer one rather than skipped forever on a key
+#: that no longer describes what this writes.
+KEY_VERSION = "v1"
+
+#: How a row of this tool's own identifies itself on read. `run_key` is stored and
+#: never published, so `skip_reason` is the only marker a reader gets — and one
+#: decision rests on it: whether re-recording could produce anything different from
+#: what is already there (see :func:`is_backfill`).
+MARKER = "qb-backfill (#449)"
+
+#: What one PR came to. Six of them, because "the board refused it", "GitHub's list is
+#: a prefix" and "somebody already answered" are three different things to do next,
+#: and one number covering all three would tell an operator to re-run a whole repo to
+#: fix one PR.
+RECORDED = "recorded"          #: a row was written
+WOULD = "would-record"         #: dry run: a row would be written
+ALREADY = "already"            #: the newest run already attests this head
+DUPLICATE = "duplicate"        #: this exact head was already backfilled
+PARTIAL = "partial"            #: the list is knowably short of GitHub's own count
+FAILED = "failed"              #: not answered for — the forge or the board would not say
+
+#: Outcomes that leave the PR answered for. Everything else makes the run exit 1.
+#: `PARTIAL` is deliberately NOT here: a prefix is recorded, and the PR is still
+#: unattested afterwards, so a run that produced one has not finished the job.
+GOOD = {RECORDED, WOULD, ALREADY, DUPLICATE}
+
+#: `gh pr list --limit`. A list that comes back exactly this long may have been cut,
+#: and a truncated PR list backfilling only part of a backlog while reporting a clean
+#: sweep is the same disease this tool exists to refuse. So a run that hits it says so
+#: and exits 1.
+DEFAULT_LIMIT = 200
+
+PR_FIELDS = ("number,title,headRefOid,baseRefName,baseRefOid,"
+             "changedFiles,additions,deletions,state,isDraft")
+
+
+def _gh(args: list[str], *, timeout: int = 180) -> tuple[str, str | None]:
+    """One `gh` call. Returns ``(stdout, error)`` — never raises, never half-answers.
+
+    The failure is a string rather than an exception because every caller here has
+    something of its own to say about which PR it was about, and an exception would
+    have to be caught and re-described at each of them.
+    """
+    try:
+        got = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return "", "gh is not on PATH"
+    except subprocess.TimeoutExpired:
+        return "", f"gh timed out after {timeout}s"
+    except Exception as exc:                        # noqa: BLE001
+        return "", f"{type(exc).__name__}: {exc}"
+    if got.returncode != 0:
+        tail = (got.stderr or "").strip().splitlines()
+        return "", (tail[-1][:200] if tail else f"gh exited {got.returncode}")
+    return got.stdout, None
+
+
+def changed_files(repo: str, pr: int) -> tuple[list[dict], int, str | None]:
+    """Every path this PR touches, from the REST files endpoint, paged to the end.
+
+    Returns ``(files, renames, error)``.
+
+    **A paged read that fails partway returns an error, not the pages it got.** `gh
+    --paginate` exits non-zero when a page fails, and handing back the prefix would
+    produce a short list caused by a network fault rather than by GitHub's cap — the
+    two indistinguishable afterwards, and the first with no business being recorded
+    at all.
+
+    A renamed file is recorded under its DESTINATION path only, as
+    ``harness/loops/panel.py``'s ``_changed_files`` does — and ``renames`` counts them,
+    because that parity is a known hole rather than a solved problem. GitHub counts a
+    rename as ONE changed file, so a run storing only the destination satisfies
+    ``files_complete`` while another PR editing the source path collides with it
+    invisibly. This endpoint is the only producer that could see it: it carries
+    ``previous_filename`` where `gh pr view` does not.
+
+    Storing the previous path anyway would be worse than the hole. ``review_run_files``
+    has one path column and no notion of an alias, so an extra row would make
+    ``files_recorded`` exceed GitHub's count, fail #80's ``counts_agree``, and leave
+    the PR unattested for having read MORE than anyone else does. Diverging from the
+    panel here would also put two spellings of one field in the harness, which is the
+    fault this repo keeps closing. So the count is reported, the operator is told, and
+    the grain itself is #453.
+    """
+    out, err = _gh(["gh", "api", "--paginate",
+                    f"repos/{repo}/pulls/{pr}/files",
+                    "--jq", ".[] | {path: .filename, additions, deletions, "
+                            "was: .previous_filename}"])
+    if err is not None:
+        return [], 0, f"cannot read the file list: {err}"
+    files, renames = [], 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return [], 0, "the file list came back in a shape this cannot read"
+        path = row.get("path")
+        if not isinstance(path, str) or not path.strip():
+            # Not tolerated the way the board tolerates it. The board coerces a bad
+            # entry into a droppable row because refusing the payload would cost a
+            # real panel its findings; there are no findings to protect here, and a
+            # path GitHub could not name means the list is not the list.
+            return [], 0, "the file list carried an entry with no usable path"
+        if isinstance(row.get("was"), str) and row["was"].strip():
+            renames += 1
+        files.append({"path": path.strip(),
+                      # `.get`, not `or 0`: nobody-said and zero are different facts,
+                      # and the board's columns are nullable to keep them apart.
+                      "additions": row.get("additions"),
+                      "deletions": row.get("deletions")})
+    files.sort(key=lambda f: f["path"])
+    return files, renames, None
+
+
+def still_at(repo: str, pr: int, head: str, total: object) -> str | None:
+    """Did the branch hold still while its file list was being read?
+
+    The race this closes, and it produces a row that is confidently wrong rather than
+    obviously wrong. `gh pr list` reads the head and GitHub's changed-file count off
+    commit A; `gh api .../pulls/N/files` is a SEPARATE call against an endpoint that is
+    not pinned to a commit, so a push landing between the two returns B's paths. Those
+    are then stored under A's sha with A's count — and when the two commits happen to
+    touch the same NUMBER of files, ``files_complete`` reads true and #80 pins the row
+    to A. A ranking then weighs commit A by files it does not touch.
+
+    So the head and the count are read again afterwards and the PR is refused unless
+    both are unchanged. Refused rather than retried: a branch being pushed to while
+    this runs is a branch somebody is working on, and the answer is to run again in a
+    minute, not to loop against a moving target.
+
+    This does not make the two reads atomic — nothing available here can — it makes a
+    non-atomic read detectable. A push that lands and is reverted to the same sha and
+    the same count inside one PR's read window is not distinguishable, and is not worth
+    the third call it would take to narrow further.
+    """
+    out, err = _gh(["gh", "pr", "view", str(pr), "--repo", repo,
+                    "--json", "headRefOid,changedFiles"])
+    if err is not None:
+        return f"cannot re-read the head to check the branch held still: {err}"
+    try:
+        now = json.loads(out or "{}")
+    except ValueError:
+        return "the head re-read came back in a shape this cannot read"
+    if (now.get("headRefOid") or "").lower() != head.lower():
+        return (f"the branch moved while its file list was being read "
+                f"({head[:8]} -> {(now.get('headRefOid') or '?')[:8]}); nothing "
+                f"recorded, run again")
+    if now.get("changedFiles") != total:
+        return (f"GitHub's changed-file count moved while the list was being read "
+                f"({total} -> {now.get('changedFiles')}); nothing recorded, run again")
+    return None
+
+
+def newest_run(client, repo: str, pr: int) -> tuple[dict | None, str | None]:
+    """The board's newest run for this PR, whatever kind it is.
+
+    ``include_unreviewed`` on purpose: the run this most needs to see is precisely the
+    one `GET /reviews` hides by default. A repo backfilled an hour ago has one at the
+    top of every PR, and a read that could not see it would re-record the whole
+    backlog on every invocation.
+    """
+    try:
+        rows = client.get("/reviews", {"repo": repo, "pr": pr, "limit": 1,
+                                       "include_unreviewed": "true"})
+    except urllib.error.HTTPError as exc:
+        return None, f"the board refused a read of this PR's runs: HTTP {exc.code}"
+    except Exception as exc:                        # noqa: BLE001
+        return None, f"the board could not be asked about this PR: {type(exc).__name__}"
+    if not isinstance(rows, list) or not rows:
+        return None, None
+    return (rows[0] if isinstance(rows[0], dict) else None), None
+
+
+def run_files(client, run_id: int) -> tuple[int | None, str | None]:
+    """How many paths that run actually stored. ``None`` means the board did not say.
+
+    A second call, because the run LIST publishes ``changed_files_total`` and not the
+    paths — deliberately, so a page of runs is not a file dump. It is paid only where
+    the answer could still be "complete"; see :func:`one_pr`.
+    """
+    try:
+        run = client.get(f"/review/{run_id}")
+    except Exception as exc:                        # noqa: BLE001
+        return None, (f"the board could not be asked about run {run_id}: "
+                      f"{type(exc).__name__}")
+    files = run.get("changed_files")
+    return (len(files) if isinstance(files, list) else None), None
+
+
+def attested(run: dict | None, recorded: int | None, head: str, base: str | None) -> bool:
+    """Does the run the board already holds answer for THIS head, completely?
+
+    :class:`app.ranking.Candidate`'s four conditions, asked here so this can leave a
+    PR alone rather than shadow a run that already answers for it: measured, complete,
+    internally consistent, and taken at the commit the PR is on now.
+
+    Deliberately the same test whoever wrote that run. A panel that recorded a full
+    list is skipped for exactly the reason a previous backfill is, and neither is
+    skipped when its list is a prefix or its head has moved. Nothing here reads
+    ``reviewed`` — whether a seat ran is not what makes a file list usable, and a rule
+    that spared reviewed runs would leave the pre-#94 population (real reviews, no
+    file list) permanently unanswerable, which is the whole population this is for.
+    """
+    if not run:
+        return False
+    if (run.get("head_sha") or "").lower() != (head or "").lower():
+        return False
+    if run.get("base") != base:
+        return False
+    total = run.get("changed_files_total")
+    if not isinstance(total, int) or recorded is None:
+        return False
+    # `files_complete` and `counts_agree` at once, which is why this is `==` where
+    # `app.collisions.files_complete` is `>=`: a run holding MORE paths than GitHub
+    # counted fails #80's `counts_agree` and is not attested either, so treating it as
+    # settled here would skip a PR that is still turning the ranking off.
+    return recorded == total
+
+
+def is_backfill(run: dict | None) -> bool:
+    """Was this run written by this tool?
+
+    Read off ``skip_reason``, which is the only marker the board publishes — ``run_key``
+    is stored and never returned. A sentence rather than a flag is a weak identifier and
+    it is used for exactly one decision, taken in :func:`one_pr`: whether re-recording
+    could produce anything different from what is already there.
+    """
+    return isinstance(run, dict) and str(run.get("skip_reason") or "").startswith(MARKER)
+
+
+def payload(repo: str, meta: dict, files: list[dict], truncated: bool,
+            supersedes: object) -> dict:
+    """The run to record: a file list, and the plainest possible statement of nothing else.
+
+    Every field that could be read as a verdict is absent, and that is the design. No
+    ``to_fix``, no ``dismissed``, no ``sonar_findings``, no ``reviewers``, no
+    ``round_stop`` — which also means the board's own
+    ``ReviewIn._no_review_claims_nothing_else`` has nothing to take away, so
+    ``reviewed: false`` arrives and stays ``false`` rather than being dropped to NULL
+    as it would be beside a single finding. NULL is "nobody said", and this row is
+    saying something.
+
+    ``skip_reason`` names the tool, the issue and the commit it read. #94 put that
+    column there for a sentence a human reads off a collision row to decide whether a
+    400-file rival is worth a look, and "a merge nobody reviewed" and "a file list
+    copied off GitHub by a script" are two very different things to find there.
+
+    ``changed_files_total`` is GitHub's ``changedFiles`` or nothing at all. Never
+    ``len(files)``: that is the fallback ``_changed_files`` in the panel argues
+    against at length, and it is the one line that would turn every truncated list
+    this ever records into an attested complete one.
+    """
+    head = meta["headRefOid"]
+    total = meta.get("changedFiles")
+    reason = (f"{MARKER}: this PR's changed-file list, read from the forge "
+              f"at {head[:8]}. No reviewer ran; nothing in this run is a review")
+    if truncated:
+        reason += (f". GitHub listed {len(files):,} paths against its own count of "
+                   f"{total if isinstance(total, int) else 'unknown'}, so what is "
+                   f"stored here is a PREFIX and this PR is not attested")
+    return {
+        "github": repo,
+        "pr": meta["number"],
+        "title": meta.get("title"),
+        "base": meta.get("baseRefName"),
+        # The commit the list is about, and load-bearing rather than decorative: #80
+        # attests a list only against the commit the queue has the PR on, so a row
+        # without this is worth nothing and a row against a head the branch has left
+        # is worth less than nothing.
+        "head_sha": head,
+        # The PR's base commit as GitHub stores it — which is not the merge base and
+        # is not recorded as one (#241). Free off metadata already in hand; the true
+        # fork point costs another call and nothing here reads it. `base_sha` (the
+        # base branch's live tip) is not sent for the same reason the panel's skip
+        # path does not buy one: this run reviews nothing, so it has nothing to date.
+        "merge_base": meta.get("baseRefOid") or None,
+        # `ci_status` is deliberately ABSENT, and it is the one reading a caller
+        # might expect to find. It is not free: `gh pr checks` is a call per PR and
+        # `panel_scope.review_ci` maps it onto five states with a second fetch for
+        # the `blocked` case — reimplementing that here would put two spellings of
+        # one field in the harness, and importing it would give bin/ a dependency on
+        # loops/ that the packaging does not have (only bin/ lands on PATH). So this
+        # run records NULL, which is what the column means by "nobody said". The
+        # consequence is visible and bounded: `app.ordering._open_work` treats NULL
+        # exactly as it treats the `"unknown"` the panel's own skip path writes, and
+        # `_ready` goes false — a PR that was known green reads as not-known-green
+        # until something measures it again, which is the direction this repo errs in.
+        # The real repair is on the READ side and is #454: `_pr_evidence` takes its
+        # three readings off one run whole, so a producer that measured two of them
+        # writes NULL over the third.
+        "changed_files": files,
+        # GitHub's count, verbatim, beside a list that may not reach it. The
+        # comparison between the two is what tells every downstream reader the list is
+        # a prefix; deriving either from the other deletes the comparison.
+        "changed_files_total": total,
+        "changed_lines": (meta.get("additions") or 0) + (meta.get("deletions") or 0),
+        "pr_state": meta.get("state"),
+        "is_draft": meta.get("isDraft"),
+        "reviewed": False,
+        "skip_reason": reason,
+        # Deterministic, so two agents backfilling one repo in the same moment write
+        # one row rather than two — the race no read-then-write check can cover. It
+        # carries the head, so a push opens it again, which is exactly when a
+        # re-backfill is wanted.
+        #
+        # …and the run this one SUPERSEDES, which is the part that took a second pass
+        # to get right. Keyed on the head alone, this sequence exits 0 with the PR
+        # still unattested: backfill at head A, then a panel runs at A and records a
+        # PREFIX list (`gh pr view` caps at 100 paths), so the newest run no longer
+        # attests — and the re-run's write is refused as a duplicate of its own older
+        # row, which is no longer the one being read. Naming the superseded run makes
+        # that a different fact and a different key. Re-recording over a backfill of
+        # this tool's own is refused earlier, in `one_pr`, so this cannot ratchet.
+        "run_key": (f"qb-backfill:{KEY_VERSION}:{repo}:{meta['number']}:{head}"
+                    f":{supersedes if supersedes is not None else 'none'}"),
+    }
+
+
+def one_pr(client, repo: str, meta: dict, *, apply: bool) -> dict:
+    """Backfill one PR, or say why not. Never raises."""
+    pr = meta.get("number")
+    head = meta.get("headRefOid")
+    base = meta.get("baseRefName")
+    row: dict = {"pr": pr, "head_sha": head, "base": base,
+                 "title": (meta.get("title") or "")[:80],
+                 "pr_state": meta.get("state"), "is_draft": meta.get("isDraft"),
+                 "changed_files_total": meta.get("changedFiles")}
+    if not head:
+        # The one field this cannot proceed without: a PR whose head GitHub will not
+        # name is a PR no file list can ever be pinned to.
+        return {**row, "outcome": FAILED, "why": "GitHub named no head commit for it"}
+
+    run, err = newest_run(client, repo, pr)
+    if err is not None:
+        return {**row, "outcome": FAILED, "why": err}
+    # The detail fetch is paid only where the answer could still be "complete". A run
+    # at a different head, or one with no `changed_files_total`, cannot be complete
+    # whatever its paths say, so there is nothing to count.
+    recorded = None
+    if run and (run.get("head_sha") or "").lower() == head.lower():
+        recorded, err = run_files(client, run["id"])
+        if err is not None:
+            return {**row, "outcome": FAILED, "why": err}
+    if attested(run, recorded, head, base):
+        return {**row, "outcome": ALREADY, "run_id": run["id"],
+                "files_recorded": recorded, "complete": True,
+                "why": (f"run {run['id']} already holds {recorded:,} path(s) at "
+                        f"{head[:8]}, which is GitHub's whole count")}
+    if apply and is_backfill(run) and (run.get("head_sha") or "").lower() == head.lower():
+        # A backfill of this tool's own already answers for this commit and did not
+        # attest. Re-recording it would read the same forge, send the same list and
+        # store the same shortfall — a second identical row, and a third next time.
+        # The shortfall is GitHub's cap or the board's dedup, and neither is something
+        # running again can move; say which run and stop.
+        return {**row, "outcome": PARTIAL, "run_id": run["id"],
+                "files_recorded": recorded, "complete": False,
+                "why": (f"run {run['id']} is already this tool's backfill of "
+                        f"{head[:8]} and does not attest ({recorded} path(s) against "
+                        f"GitHub's {run.get('changed_files_total')}). Running again "
+                        f"would record the same shortfall")}
+
+    files, renames, err = changed_files(repo, pr)
+    if err is not None:
+        return {**row, "outcome": FAILED, "why": err}
+    total = meta.get("changedFiles")
+    # Read the head and the count AGAIN, and refuse the PR if either moved. The two
+    # `gh` calls above are not one snapshot, and a push between them stores commit B's
+    # paths under commit A's sha — which reads complete whenever the two commits happen
+    # to touch the same number of files. See `still_at`.
+    moved = still_at(repo, pr, head, total)
+    if moved is not None:
+        return {**row, "outcome": FAILED, "why": moved}
+    # The truncation test, and the only place it is decided. `!=` rather than `<`,
+    # because holding MORE paths than GitHub counted is a disagreement too: it fails
+    # #80's `counts_agree`, and calling it complete because the list is long would be
+    # the same error facing the other way.
+    truncated = not isinstance(total, int) or len(files) != total
+    row["files_listed"] = len(files)
+    row["complete"] = not truncated
+    if renames:
+        # Reported, never smoothed. GitHub counts a rename as one changed file and the
+        # board has one path column, so this row is `complete` while another PR editing
+        # the SOURCE path collides with it invisibly. That hole is the panel's too and
+        # is not made here — but it is at its worst exactly where this tool is used, on
+        # a backlog full of refactors.
+        row["renames"] = renames
+
+    body = payload(repo, meta, files, truncated, run.get("id") if run else None)
+    if not apply:
+        return {**row, "outcome": PARTIAL if truncated else WOULD,
+                "run_key": body["run_key"], "why": body["skip_reason"]}
+    try:
+        got = client.post("/review", body)
+    except urllib.error.HTTPError as exc:
+        return {**row, "outcome": FAILED,
+                "why": f"the board refused the write: HTTP {exc.code}"}
+    except Exception as exc:                        # noqa: BLE001
+        return {**row, "outcome": FAILED,
+                "why": f"the board could not be written to: {type(exc).__name__}"}
+    if not isinstance(got, dict):
+        return {**row, "outcome": FAILED,
+                "why": "the board answered the write in a shape this cannot read"}
+    if not got.get("recorded", True):
+        # Nothing was written, so the question "is this PR answered for?" is still
+        # open — and it is asked again rather than assumed. A duplicate normally means
+        # a peer wrote the identical row a moment ago, in which case the PR now
+        # attests and this run is done; it must not be allowed to mean "the write was
+        # refused, so we are finished" while the PR stays unattested.
+        again, err = newest_run(client, repo, pr)
+        held = None
+        if err is None and again:
+            held, err = run_files(client, again["id"])
+        if err is None and attested(again, held, head, base):
+            return {**row, "outcome": DUPLICATE, "run_id": again["id"],
+                    "files_recorded": held, "complete": True,
+                    "why": (f"an identical row was already there — the board says "
+                            f"{got.get('reason')}. Run {again['id']} holds "
+                            f"{held:,} path(s) at {head[:8]}; nothing was written")}
+        return {**row, "outcome": FAILED, "run_id": got.get("id"),
+                "why": (f"the board refused the write as a duplicate "
+                        f"({got.get('reason')}) and this PR still does not attest. "
+                        f"Nothing this tool can do repairs that; a panel round on "
+                        f"{head[:8]} would")}
+
+    # What the BOARD says it stored, believed over what was sent. It folds repeated
+    # paths and caps the list at MAX_CHANGED_FILES, and either makes the stored list
+    # shorter than the one posted — the last place a prefix could still slip through
+    # reading as whole.
+    stored = got.get("changed_files")
+    if isinstance(stored, int):
+        row["files_recorded"] = stored
+        if stored != total:
+            truncated, row["complete"] = True, False
+    dropped = got.get("changed_files_dropped")
+    if dropped:
+        truncated, row["complete"] = True, False
+        row["board_dropped"] = dropped
+    held = row.get("files_recorded", len(files))
+    return {**row, "outcome": PARTIAL if truncated else RECORDED,
+            "run_id": got.get("id"),
+            "why": (f"recorded {held:,} path(s) at {head[:8]} against GitHub's count "
+                    f"of {total} — the stored list is a PREFIX, so this PR is still "
+                    f"not attested" if truncated else
+                    f"recorded {held:,} path(s) at {head[:8]}, reviewed: false")}
+
+
+def open_prs(repo: str, limit: int, only: list[int]) -> tuple[list[dict], str | None, bool]:
+    """This repo's open PRs. Returns ``(rows, error, list_may_be_short)``.
+
+    One `gh pr list` for the whole population rather than a `gh pr view` per PR, and
+    `--pr` filters that list rather than reaching past it: a number that is not in the
+    open list comes back as "not an open PR of this repo", where a `pr view` would
+    have cheerfully fetched a merged one and backfilled a PR that cannot land.
+    """
+    out, err = _gh(["gh", "pr", "list", "--repo", repo, "--state", "open",
+                    "--limit", str(limit), "--json", PR_FIELDS])
+    if err is not None:
+        return [], f"cannot list {repo}'s open pull requests: {err}", False
+    try:
+        rows = json.loads(out or "[]")
+    except ValueError:
+        return [], f"`gh pr list` for {repo} came back in a shape this cannot read", False
+    if not isinstance(rows, list):
+        return [], f"`gh pr list` for {repo} did not return a list", False
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("number"), int)]
+    # Reported whether or not `--pr` narrowed the run afterwards: a `--pr 1760` that
+    # silently found nothing because the number sat past the limit would read as "not
+    # an open PR", which is a different and wrong answer.
+    maybe_short = len(rows) >= limit
+    if only:
+        rows = [r for r in rows if r["number"] in set(only)]
+    rows.sort(key=lambda r: r["number"])
+    return rows, None, maybe_short
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-backfill", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--repo", default=None,
+                    help="owner/name. Default: the origin of the checkout at --path")
+    ap.add_argument("--path", default=".",
+                    help="the checkout to read the repo from, when --repo is absent")
+    ap.add_argument("--pr", action="append", type=int, default=[], metavar="N",
+                    help="only this open PR. Repeatable")
+    ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                    help=f"how many open PRs to list (default {DEFAULT_LIMIT})")
+    ap.add_argument("--apply", action="store_true",
+                    help="write the rows. Without it, nothing is written")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="the whole answer on stdout, not just the summary")
+    # `parse_args`, never `parse_known_args`. An argument this does not understand is
+    # a caller asking for something it cannot do, and running anyway is how a flag
+    # meant to hold a tool back gets ignored by the tool it was aimed at.
+    args = ap.parse_args()
+
+    if args.limit < 1:
+        ap.error("--limit is how many open PRs to list, so it is at least 1")
+
+    repo = args.repo or repo_slug(args.path)
+    if not repo or repo.count("/") != 1 or not all(repo.split("/")):
+        # #414's rule. A default here would let this report a confident
+        # nothing-to-do about a repository it never found, which is the failure
+        # `qb-bump` was filed for, one command across.
+        print(f"qb-backfill: no repository. --repo was not given and "
+              f"{os.path.abspath(args.path)} has no origin remote naming one as "
+              f"owner/name. Refusing rather than guessing (#414).", file=sys.stderr)
+        return UNKNOWN
+
+    try:
+        client, cfg = board_client()
+    except Exception as exc:                        # noqa: BLE001
+        print(f"qb-backfill: no board — {exc}", file=sys.stderr)
+        return UNKNOWN
+
+    rows, err, maybe_short = open_prs(repo, args.limit, args.pr)
+    if err is not None:
+        print(f"qb-backfill: {err}", file=sys.stderr)
+        return UNKNOWN
+
+    seen = {r["number"] for r in rows}
+    results = [{"pr": n, "outcome": FAILED, "why": "not an open PR of this repo"}
+               for n in sorted(set(args.pr) - seen)]
+    for meta in rows:
+        results.append(one_pr(client, repo, meta, apply=args.apply))
+    results.sort(key=lambda r: r["pr"])
+
+    counts: dict[str, int] = {}
+    for r in results:
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    unfinished = [r for r in results if r["outcome"] not in GOOD]
+    answer = {"repo": repo, "board": cfg.base_url, "applied": bool(args.apply),
+              "open_prs": len(rows), "counts": counts,
+              "pr_list_may_be_short": maybe_short, "prs": results}
+    if args.as_json:
+        print(json.dumps(answer, indent=2))
+    else:
+        verb = "recorded against" if args.apply else "a DRY RUN against"
+        print(f"qb-backfill {repo} — {len(results)} PR(s), {verb} {cfg.base_url}")
+        for r in results:
+            print(f"  #{r['pr']:<6} {r['outcome']:<13} {r.get('why', '')}")
+        print("  " + ", ".join(f"{n} {k}" for k, n in sorted(counts.items())))
+        if not args.apply:
+            print("  nothing was written — pass --apply to record these")
+    if maybe_short:
+        print(f"qb-backfill: `gh pr list` returned exactly --limit ({args.limit}) "
+              f"rows, so {repo} may have open PRs this run never saw. Raise --limit "
+              f"and run again before reading this as a whole-repo sweep.",
+              file=sys.stderr)
+    if unfinished or maybe_short:
+        return INCOMPLETE
+    return DONE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

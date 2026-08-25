@@ -126,7 +126,14 @@ COULD_NOT_START = 9
 #: The claim kind is here and not in the policy for the same reason. It is what
 #: makes a spawn countable, and a command whose unit of work nobody has worked
 #: out is a command that cannot be started — not one that is started uncounted.
+#: `/investigate` is here for #63's sake and it is the SAFEST entry, not a
+#: widening: it reads, writes up what it found, and implements nothing. Leaving
+#: it out while `/fix-issue` was in had the ladder upside down — the issue
+#: watcher's default rung is the read-only one precisely so that a close call
+#: costs a writeup instead of a PR, and a spawn allowlist that admitted only the
+#: rung that writes code would have made the safe answer the unstartable one.
 SPAWNABLE = {
+    "/investigate": "issue",
     "/fix-issue": "issue",
     "/fix-and-review": "issue",
     "/fix-and-land": "issue",
@@ -144,9 +151,18 @@ SPAWNABLE = {
 #:
 #: The default is `cli`, because a person at a prompt is the only caller that
 #: needs no explaining, and it is the one this shipped with.
+#:
+#: `watch` is not a peer of the other two and should not be read as one. `cli`
+#: and `dash` both have a human at the far end — a prompt somebody typed, a
+#: button somebody clicked — and the provenance question they answer is only
+#: *which* human. `watch` has none: it is the issue watcher acting on text it
+#: read, and it is the first trigger here where the answer to "what started
+#: this" is "nobody, a timer did". That is the whole of what #63 was nervous
+#: about, so it is worth being able to grep the board for it by name.
 TRIGGERS = {
     "cli": "a person typed it",
     "dash": "the ⚒ on qb-dash-tui, on a click somebody made",
+    "watch": "the issue watcher, on an issue it found actionable (#63)",
 }
 DEFAULT_VIA = "cli"
 

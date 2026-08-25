@@ -1158,8 +1158,15 @@ is what makes a spawn countable:
 
 | command | claims |
 |---|---|
+| `/investigate` | `issue <n>` |
 | `/fix-issue`, `/fix-and-review`, `/fix-and-land` | `issue <n>` |
 | `/review-pr`, `/panel-review-pr` | `pr <n>` |
+
+`/investigate` is the read-only rung and it is listed first deliberately. It was added for
+#63's watcher, and it *narrows* what a trigger can do rather than widening it: the watcher's
+default answer on a close call is understanding rather than a PR, so an allowlist holding
+`/fix-issue` and not `/investigate` would have left the safe action the unstartable one and
+the dangerous action the only one available.
 
 **Everything it starts is counted, claimed, attachable and endable.** In that order, and the
 order is the feature — a refusal costs nothing to unwind only while nothing has been taken:
@@ -1195,7 +1202,8 @@ session's own `create-worktree` renews and that the land step, the teardown and 
 back.
 
 **And what pulled it is recorded, which is the question a session nobody started raises.**
-`--via` names the caller — `cli` for a person at a prompt, `dash` for the dashboard's ⚒ —
+`--via` names the caller — `cli` for a person at a prompt, `dash` for the dashboard's ⚒,
+`watch` for the issue watcher (#63) —
 and it lands on the claim note, on the board post (spawns *and* refusals) and on the pane as
 `@qb_spawn_via`, so `tmux list-panes -a -F '#{@qb_spawn_via}'` answers it for a window
 somebody has found and does not recognise. The set is closed for the same reason the command
@@ -1224,7 +1232,7 @@ the plan, picks an item, or tells an agent what to work on. It is told a command
 by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
 agent takes stays the agent's own choice, self-selected and claimed atomically.
 
-**What pulls it: the dashboard's ⚒, and nothing else yet (#371).** The primitive landed with
+**What pulls it: the dashboard's ⚒ (#371), and the issue watcher (#63).** The primitive landed with
 no caller at all, which made the loop readable and still unstartable. The first caller is the
 cheapest one there is — `qb-dash-tui`'s ⚒, which is still a human click, so it needed no new
 safety: the gates, the machine cap, the allowlist and the claim are all here, at the
@@ -1233,11 +1241,30 @@ spawn lacked: a session inside `qb-admit`'s window, holding a claim taken before
 existed, endable by session id from the moment the pane appears, and posted to the board as
 `via dash`.
 
+**The second caller is the first one with no human at the end of it.** `issue_watch.py
+--start` (#63) hands `qb-start` an issue its survey found actionable, `via watch`. Nothing
+about the primitive changed to allow it, which is the point of having put the gates here:
+the machine policy, the cap, `qb-pace`, `qb-admit`, the allowlist and the claim all apply to
+the watcher exactly as they do to a click. What is genuinely new is that the answer to *what
+started this* is no longer a person, which is why `watch` is its own trigger name rather than
+being folded into `cli` — a board someone is scanning for surprises needs that to be greppable.
+
+The watcher adds brakes of its own on top, because the ones at the primitive are per-spawn and
+it is the end of the chain that reads a **public tracker**: `--start` is off, so a survey still
+starts nothing unless a run asks it to; `--start-max` (default 1) bounds sessions started; and
+`--attempt-max` (default 5) bounds spawn requests whether they start anything or not (the
+once-per-run `--policy` probe is a question, not a request, and sits outside it).
+The second ceiling is not redundant — a refusal about one issue starts nothing and so spends
+none of the first, which let a backlog of held issues make one call each while `--start-max 1`
+appeared to hold. Details in `harness/loops/README.md`.
+
 **A hook or a cron floor is still not built, and that is the deliberate part.** The button
-is paced by a person; the other two are not, and a trigger nobody is watching is the thing
-that turns a bug into an overnight incident. A `SessionEnd` hook also has a question to
-answer first that the button does not — *what is next* — and answering it by reading the
-plan and handing an agent the first item is the dispatch this whole design refuses.
+is paced by a person; a hook and a cron are not, and a trigger nobody is watching is the thing
+that turns a bug into an overnight incident. `--start` does not change that: it is a flag on a
+command, so somebody still runs it, and putting *that* on a timer is a decision made in a
+crontab where it can be read — not a default anything here ships. A `SessionEnd` hook also has
+a question to answer first that the button does not — *what is next* — and answering it by
+reading the plan and handing an agent the first item is the dispatch this whole design refuses.
 
 ### `qb-status` — the pane's answer, the agent's answer, and the gap
 
@@ -2129,6 +2156,102 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
+
+### `qb-backfill` — the collision datum, recovered from the forge (#449)
+
+`suggested_order` (#80) is published only when **every** queued PR's evidence is attested:
+measured, complete, internally consistent, and taken at the commit the queue has that PR on.
+So one branch panelled before #94 — a real review that recorded no file list, because nothing
+stored one then — turns the ranking off for the whole queue. A repository with thirty open PRs
+is thirty chances to be that one, and the field was null on both this repo and `lexray`.
+
+#94 said no backfill was possible and was right about the thing it meant: those panel payloads
+are gone. The underlying fact is not. The forge still knows which files every open PR touches,
+and #94's own nullable columns exist to carry a file list on a row that states no review
+happened.
+
+```bash
+qb-backfill                     # dry run over this checkout's repo
+qb-backfill --repo owner/name   # an explicit repo — any repo, not this one
+qb-backfill --apply             # write the rows
+qb-backfill --pr 12 --pr 34     # just these open PRs
+qb-backfill --json              # the whole answer as a document
+```
+
+```
+0  every open PR is answered for
+1  at least one is not: the forge would not say, the board refused it, or GitHub's own
+   list came back short of GitHub's own count
+2  could not start — no repo, no `gh`, no board. NOT a statement about any PR
+```
+
+**It never claims a review.** The row carries `reviewed: false`, a `skip_reason` naming the
+tool, the issue and the commit it read, and nothing that could be read as a verdict — no
+findings, no scorecards, no stop, no confidence. `GET /reviews` hides it by default;
+`/review/stats`, `/review/spend` and `/review/findings` exclude it under #94's
+`reviewed IS NOT FALSE` rule; `app.api.plan._pr_evidence` still takes its findings from the
+newest run that actually reviewed. What changes is the one thing it is for: the newest run per
+PR now holds a file list, so `app.ranking` can attest it.
+
+The absences are load-bearing. A single finding beside `reviewed: false` makes the board drop
+the flag to NULL — "nobody said" — which is exactly the pre-#94 state these rows exist to
+leave.
+
+**A short list is recorded as short.** `changed_files_total` is GitHub's own `changedFiles`
+and never `len(files)`: agreeing by construction is not evidence, and deriving one from the
+other would delete the comparison `app.collisions.files_complete` is built on. Four ways the
+stored list could be a prefix, all four reported — GitHub caps a file list at 3,000; a paged
+read that dies partway is refused outright rather than recorded short; the board's own
+`changed_files_dropped` is read back off the write and believed over what was sent; and the
+head is re-read AFTER the list, because the two `gh` calls are not one snapshot and a push
+between them would store commit B's paths under commit A's sha — which reads complete whenever
+the two commits happen to touch the same number of files. A prefix leaves the PR unattested and
+the run exits 1, which is the right outcome: it keeps `suggested_order` null rather than ranking
+a branch by files it never listed.
+
+**One hole is left open and reported rather than closed: renames.** GitHub counts a rename as
+one changed file, so a row holding only the destination path is `complete` while another PR
+editing the SOURCE path collides with it invisibly. `review_run_files` has one path column and
+no notion of an alias, so storing the old path too would make `files_recorded` exceed GitHub's
+count and fail #80's `counts_agree` — the PR would go unattested for having read more than
+anyone else does. `loops/panel.py` has the same hole and says so. This counts them per PR, so
+an operator can see where the grain runs out; the grain itself is #453.
+
+The list comes from `gh api --paginate .../pulls/N/files`, not `gh pr view --json files`.
+`pr view` asks GraphQL for `files(first: 100)` and does not page, so a 322-file PR arrives as
+100 paths and exit 0 (measured, on `kubernetes/kubernetes#141360`). `loops/panel.py` lives with
+that because its list is a side effect of a review and it prints a note when the two counts
+disagree; here the list is the whole product.
+
+**A re-run on an unchanged PR moves nothing.** Four guards, for four different failures.
+Before writing at all, a PR whose newest run already carries a complete list at the head the
+forge reports now is left alone as `already`, so it never shadows a run that already answered —
+and one whose newest run is a backfill of this tool's own at that head is left alone too,
+because re-reading the same forge would store the same shortfall. The `run_key` carries the
+repo, the PR, the head and the run this one supersedes, so a second write of the same fact
+meets the board's unique index; that is the guard that holds when two agents run this against
+one repo at the same moment, which no read-then-write check can cover. And a write refused as a
+duplicate is not taken as done: the newest run is read again and the PR is only reported
+answered if it now attests.
+
+The `already` check reads the stored list and deliberately not `reviewed`: whether a seat ran
+is not what makes a file list usable, and sparing reviewed runs would leave the pre-#94
+population permanently unanswerable.
+
+A PR that pushes gets a new head, both guards open, and the new commit is recorded. #80 attests
+a list only against the commit the queue has the PR on, so a row recorded against a head the
+branch has left is worth less than nothing — expect to re-run this on a busy queue.
+
+**It refuses rather than guesses** (#414): `--repo`, or the origin of the checkout at `--path`,
+and if neither says then it stops rather than falling back to a default and reporting a
+confident nothing-to-do about a repository it never found. A `gh pr list` that comes back
+exactly `--limit` long says so and exits 1, because a partial sweep must not read as a whole
+one. Dry run by default, `--apply` is the only thing that writes, and an argument it does not
+understand is refused rather than treated as consent.
+
+`GET /review/collisions` is untouched. It gained no predicate in #94 and gains none here — a
+backfilled run enters the same unconditional newest-run selection as any other, and is
+classified afterwards like any other.
 
 ### `qb-doctor` — is this host wired up, and can work land from it?
 
