@@ -656,10 +656,12 @@ fixes while they were still writing them.
 
 `qb-hook` gates `Bash` at `PreToolUse`. Three facts have to be true **together**:
 
-- the command destroys uncommitted work — `reset --hard|--merge`, `checkout` of a path or with
-  `-f`, `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
-  `rm -f`, `worktree remove --force`, `read-tree --reset -u`, `checkout-index -f`, and the
-  `--abort` of an in-progress merge/rebase/cherry-pick;
+- the command entangles you with a peer's uncommitted work, in one of **two** ways:
+  - it **destroys** it — `reset --hard|--merge`, `checkout` of a path or with `-f`,
+    `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
+    `rm -f`, `worktree remove --force`, the `--abort` of an in-progress merge/rebase/cherry-pick;
+  - or it **absorbs** it — `commit -a`, `add .`/`-A`/`-u`. In a shared tree you cannot tell your
+    uncommitted files from theirs, so staging "everything" stages theirs;
 - **the tree that command will actually touch** holds some, **untracked files included** —
   `git clean -fd` destroys precisely the files that `--untracked-files=no` would have hidden,
   and one of the five was an untracked file;
@@ -709,10 +711,32 @@ must be a real leading assignment — a bare substring test let `QB_ALLOW_SHARED
 trailing `# QB_ALLOW_SHARED_TREE=1` comment through, which made the hatch quietly wider than the
 sentence documenting it.
 
+**The bar is the accident, not the adversary — and that is a decision, not a caveat.**
+A second panel round found thirteen more P1 "bypasses" (a `cd` in an earlier clause, `env git`,
+`sudo git`, a `$VAR` target, `git clean -i`, `git submodule deinit -f`). Those are not thirteen
+defects either; they are the next premise — that a *static* reading of command text can determine
+what a command will do. It cannot, because the shell is Turing-complete, and chasing it produces
+an unbounded list of spellings.
+
+Counting #185's own five incidents by mechanism settles what the bar should be instead:
+
+| incident | mechanism | covered by the first cut? |
+|---|---|---|
+| board 3860 | *"whoever runs `git commit -a` first sweeps up the other's half-finished work"* | no |
+| board 3879 | exactly that — an in-flight `clash.py` committed by another agent as `409bae0` | no |
+| board 4004 | a half-wired include, everyone's red build | no — not a command |
+| board 3853 | a claim race | no — not a command |
+| 2026-08-25 ×2 | `git reset --hard` in a shared checkout | yes |
+
+Two of five. The commonest mechanism on that list was not in the verb list at all, which is why
+there are two harm classes now rather than one. Two rounds and eighty-four findings went into
+hardening the 2-of-5 case against spellings that have never occurred; the coverage win was one
+verb.
+
 **What it still cannot do, stated plainly.** Tokenising closed most of what a regex could not
 reach — nested shells, quoting, clause scoping, `echo`ing the words — but not the parts that need
-a shell to actually run: `${GIT:-git} reset --hard`, an alias, a shell function, a command
-assembled by `xargs`. A target it cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown*
+a shell to actually run: `${GIT:-git} reset --hard`, `env git`, `sudo git`, a `cd` in an earlier
+clause, an alias, a shell function, a command assembled by `xargs`. All documented, none chased. A target it cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown*
 and falls back to the cwd, which is the conservative half of being wrong rather than a fix. It is
 also time-of-check-to-time-of-use: a peer can arrive in the tree between the check and the
 command. The threat model is an accident between co-operating agents, not evasion, and the cost

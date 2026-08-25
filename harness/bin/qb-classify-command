@@ -33,9 +33,47 @@ to do with git — costs one `grep` and no fork at all. Only when it fires does 
 hook pay for this, which is a Python start-up on a command that was going to
 touch a repository anyway.
 
+## What this is for, and the bar it is held to
+
+**It is a tripwire for an ACCIDENT, not a gate against an adversary**, and that
+sentence is a decision (Rich, 2026-08-25) rather than a caveat. A second panel
+round found thirteen more P1 "bypasses" — a `cd` earlier in the command, `env
+git`, `sudo git`, a `$VAR` target, `git clean -i`, `git submodule deinit -f` —
+and they are not thirteen defects either. They are the next premise: that a
+STATIC reading of command text can determine what a command will do. It cannot,
+because the shell is Turing-complete, and an unbounded list of spellings is what
+chasing it produces.
+
+So the bar is the accident that actually happens, and the evidence says what
+that is. Counting #185's own five incidents by mechanism:
+
+  * board 3860 — "whoever runs `git commit -a` first sweeps up the other's
+    half-finished work"
+  * board 3879 — exactly that: an in-flight `clash.py` committed by somebody
+    else as `409bae0`, under a message saying the work was not theirs
+  * board 4004 — a half-wired `annex.yaml` include, everyone's red build. Not a
+    command at all
+  * board 3853 — a claim race. Not a command either
+  * 2026-08-25, twice — `git reset --hard` in a shared checkout
+
+The first cut of this guard covered the last row and nothing else: two of five.
+The commonest mechanism on that list is `git commit -a`, and it was not in the
+verb list at all. That is what this now covers, and it is why there are two
+classes below rather than one — the harm in a shared tree comes in two shapes,
+destroying a peer's uncommitted work and ABSORBING it, and only the first had
+ever been guarded.
+
+What it deliberately does NOT do is win an argument with a determined caller.
+`env git reset --hard`, `sudo git …`, a `$VAR` target, a `cd` in an earlier
+clause, an alias, a shell function, `xargs` — all documented, none chased. The
+threat model is two co-operating agents in one tree, the cost of a miss is the
+same as before this existed, and the cost of the arms race is two rounds and
+eighty-four findings that never touched three of the five incidents.
+
 Reads the command on stdin. Writes one JSON object on stdout:
 
-    {"destructive": bool,       # does a clause destroy uncommitted work?
+    {"destructive": bool,       # does a clause destroy OR absorb uncommitted work?
+     "harm": str|null,          # "destroys" or "sweeps" — they need different words
      "target": str|null,        # the tree that clause names (-C / --work-tree), if any
      "verb": str|null,          # what it was, for the refusal message
      "allowed_by": str|null,    # the escape hatch, if the matched clause carried it
@@ -233,19 +271,38 @@ def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
         return _has(args, "-f", "--force") or "f" in flags
     if verb == "worktree":
         return positional[:1] == ["remove"] and (_has(args, "-f", "--force") or "f" in flags)
-    if verb == "checkout-index":
-        return _has(args, "-f", "--force") or "f" in flags
-    if verb == "read-tree":
-        return _has(args, "--reset") and (_has(args, "-u") or "u" in flags)
     if verb in ("merge", "rebase", "am", "cherry-pick", "revert"):
         # An abort restores the pre-operation state, discarding whatever was
         # written into the tree while the conflict was being resolved.
         return _has(args, "--abort")
+    # `checkout-index -f` and `read-tree --reset -u` were here and are gone. Both
+    # are real, and neither has ever happened: they were reach, and reach is what
+    # the second round's thirteen P1s were made of.
+    return False
+
+
+def _sweeps(verb: str, args: list[str]) -> bool:
+    """Does `git <verb> <args>` take work that is not yours INTO your commit?
+
+    The other half of the harm, and the half that was missing. In a shared tree
+    you cannot tell your uncommitted files from a peer's, so a command that
+    stages or commits "everything" stages theirs. Board 3879 is one agent's
+    in-flight file committed by another under a message saying the work was not
+    theirs — no bytes destroyed, and the author of that work still lost it.
+    """
+    flags = _short_flags(args)
+    positional = [a for a in args if not a.startswith("-")]
+    if verb == "commit":
+        return _has(args, "--all") or "a" in flags
+    if verb == "add":
+        if _has(args, "-A", "--all", "-u", "--update"):
+            return True
+        return any(p == "." or p.startswith("./") or p == ":/" for p in positional)
     return False
 
 
 def classify(command: str, depth: int = 0) -> dict:
-    miss = {"destructive": False, "target": None, "verb": None,
+    miss = {"destructive": False, "harm": None, "target": None, "verb": None,
             "allowed_by": None, "parsed": True}
 
     # LINE BY LINE FIRST, and this is not a nicety. `shlex` counts a newline as
@@ -298,8 +355,10 @@ def classify(command: str, depth: int = 0) -> dict:
         if _has(rest, "--help", "-h") or "--help" in globals_ or "-h" in globals_:
             continue
         tree = _target(globals_)
-        if _destroys(verb, rest, tree):
-            return {"destructive": True, "target": tree, "verb": verb,
+        harm = ("destroys" if _destroys(verb, rest, tree)
+                else "sweeps" if _sweeps(verb, rest) else None)
+        if harm:
+            return {"destructive": True, "harm": harm, "target": tree, "verb": verb,
                     "allowed_by": hatch, "parsed": True}
     return miss
 

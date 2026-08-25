@@ -292,8 +292,6 @@ def test_the_verbs_that_destroy_a_peers_uncommitted_work(shared, cmd):
 @pytest.mark.parametrize("cmd", [
     "git status",
     "git diff",
-    "git add .",
-    "git commit -am 'mine'",
     "git reset HEAD~1",                          # mixed reset keeps the worktree
     "git reset --soft HEAD~1",
     "git checkout -b feat/x",
@@ -704,3 +702,23 @@ def test_an_install_without_the_classifier_lets_everything_through(shared):
     which is why this one asserts the behaviour instead of leaving it implied."""
     (shared.bin / "qb-classify-command").unlink()
     assert shared.decision(shared.bash("git reset --hard")) is None
+
+
+def test_a_commit_dash_a_in_a_shared_tree_is_refused_and_says_the_right_thing(shared):
+    """The mechanism in two of #185's five incidents, and the one the verb list
+    did not cover at all. It must not be told it "destroys" anything — nothing is
+    destroyed when your commit absorbs a peer's in-flight file, and its author
+    has still lost it."""
+    d = shared.decision(shared.bash("git commit -a -m wip"))
+    assert d is not None and d["permissionDecision"] == "deny"
+    reason = d["permissionDecisionReason"]
+    assert "takes their half-finished work into your commit" in reason
+    assert "destroys uncommitted work" not in reason
+    assert "3879" in reason
+
+
+def test_staging_everything_is_refused_and_naming_your_files_is_not(shared):
+    assert shared.decision(shared.bash("git add ."))["permissionDecision"] == "deny"
+    assert shared.decision(shared.bash("git add -A"))["permissionDecision"] == "deny"
+    assert shared.decision(shared.bash("git add app.py")) is None
+    assert shared.decision(shared.bash("git commit -m 'only what I staged'")) is None

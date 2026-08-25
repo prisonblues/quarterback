@@ -838,6 +838,26 @@ _shared_tree_guard() {
            | sort -u | tr -d '\000-\037' | sed '/^$/d' | tr '\n' '@' | sed 's/@$//; s/@/, /g' )
   [ -n "$names" ] || return 0
 
+  # Two harms, two sentences. The guard knew only one — destroying a peer's
+  # uncommitted work — and #185's own evidence says the commoner one is ABSORBING
+  # it: board 3879 is an agent's in-flight file committed by somebody else under
+  # a message saying the work was not theirs. Nothing was destroyed and its
+  # author still lost it. Telling that caller their commit will "destroy" work
+  # would be wrong, and being wrong here is how a guard gets read as noise.
+  if [ "$(printf '%s' "$verdict" | jq -r '.harm // "destroys"' 2>/dev/null)" = "sweeps" ]; then
+    _deny "quarterback: refusing this in a SHARED working tree.
+
+$root has $n uncommitted change(s), and these agents are live in it right now: $names
+
+This stages or commits EVERYTHING uncommitted, and in a shared checkout you cannot tell your files from theirs — so it takes their half-finished work into your commit, under your message. That is board 3879: one agent's in-flight clash.py committed by another as 409bae0, with a message saying the work was not theirs. Nothing was destroyed and its author still lost it.
+
+What to do instead, cheapest first:
+  1. Work somewhere else: git worktree add ../<repo>-<branch> -b <branch>
+  2. Name your files: git add <the paths you actually changed>   — never . or -A here
+  3. Look first: git status --porcelain   — anything there you did not write is theirs
+
+If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of the command and it will run."
+  fi
   _deny "quarterback: refusing this in a SHARED working tree.
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names

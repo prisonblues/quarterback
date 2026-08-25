@@ -146,13 +146,13 @@ def test_a_nested_shell_is_looked_inside():
     ("git worktree remove ../wt", False),
     ("git merge --abort", True),
     ("git rebase --abort", True),
-    ("git read-tree --reset -u HEAD", True),
-    ("git checkout-index -a -f", True),
     ("git rm -f app.py", True),
     ("git status", False),
     ("git diff", False),
-    ("git add .", False),
-    ("git commit -am 'ok'", False),
+    ("git add .", True),             # sweeps — see the harm table below
+    ("git commit -am 'ok'", True),
+    ("git add app.py", False),
+    ("git commit -m 'just mine'", False),
     ("git reset --soft HEAD~1", False),
     ("git reset HEAD~1", False),
     ("git checkout main && git status", False),
@@ -193,3 +193,38 @@ def test_echoing_the_words_is_not_doing_it():
     """The one thing the prefilter cannot decide and the tokeniser can."""
     assert not destructive("echo 'git reset --hard'")
     assert not destructive("# git reset --hard")
+
+
+# ------------------------------------------------------- the harm that was missing
+
+
+@pytest.mark.parametrize("cmd,harm", [
+    ("git reset --hard", "destroys"),
+    ("git clean -fd", "destroys"),
+    ("git commit -a -m wip", "sweeps"),
+    ("git commit -am wip", "sweeps"),
+    ("git add .", "sweeps"),
+    ("git add -A", "sweeps"),
+    ("git add -u", "sweeps"),
+    ("git add ./src", "sweeps"),
+    ("git commit -m 'only what I staged'", None),
+    ("git add one.py two.py", None),
+])
+def test_the_two_harms_are_told_apart(cmd, harm):
+    """The guard knew one harm and #185's evidence says the commoner one is the
+    other. Counted by mechanism, the five incidents are: `git commit -a` sweeping
+    up a peer's work (3860), exactly that happening (3879), a half-wired include
+    breaking everyone's build (4004, not a command), a claim race (3853, not a
+    command), and two hard resets. The verb list covered the last row alone.
+
+    They need different words as well as different coverage: nothing is destroyed
+    when your commit absorbs somebody's in-flight file, and its author has still
+    lost it."""
+    assert classify(cmd)["harm"] == harm, cmd
+
+
+def test_a_named_path_is_not_a_sweep():
+    """The distinction that keeps this usable. `git add .` in a shared tree stages
+    whatever a peer left lying about; `git add app.py` stages what you named."""
+    assert not destructive("git add app.py")
+    assert destructive("git add .")

@@ -22,8 +22,10 @@ for. Use them to reach out when it helps; never to hold off. The last two are di
 concrete instructions. Pull before you build on that checkout. And get yourself out of a shared
 tree before you edit anything — a peer's uncommitted edits are in the same files as yours, every
 build you run there compiles their half-finished work as if it were yours, and `git reset --hard`,
-`git checkout --`, `git clean`, `git switch -f` and `git restore` destroy it outright. Those are
-refused while a peer is live in the tree — the full list is in `harness/README.md`, and it is read
+`git checkout --`, `git clean`, `git switch -f` and `git restore` destroy it outright — and
+`git commit -a`, `git add .` and `git add -A` quietly take it into YOUR commit, which is how an
+agent's in-flight file once landed under someone else's message. Those are refused while a peer is
+live in the tree — the full list is in `harness/README.md`, and it is read
 by a tokeniser rather than matched as text, so the wrapping and quoting do not change the answer.
 `QB_ALLOW_SHARED_TREE=1` in front of the command is the override, once you have actually talked to
 them.
