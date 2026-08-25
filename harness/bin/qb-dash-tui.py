@@ -357,6 +357,10 @@ class Dash(App):
         # panel sorts on. See `render_issues` for what the distinction buys and
         # for its limit — it is the FIRST paint that is protected, not every one.
         self.held: dict | None = None
+        # Why `held` looks the way it does. Set while the last poll FAILED, so a
+        # `{}` that means "the board is unreachable" is never read as a `{}` that
+        # means "nothing is claimed" — see render_board.
+        self.claims_err: str | None = None
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
         # Where launched work runs, what it runs, and whether it asks first.
@@ -750,12 +754,32 @@ class Dash(App):
         # held by an agent working out of another repo's checkout, is still held.
         # Narrowing here would draw it as free and send the next seat into it.
         held = qd.claims_by_issue(claims)
+        # A FAILED POLL ANSWERS NOTHING ABOUT CLAIMS, and it arrives shaped exactly
+        # like an answer: `fetch_board` reports an outage as `{"claims": [],
+        # "error": …}`, which is indistinguishable here from "nobody holds
+        # anything". Taking it as one overwrites a real prior answer with `{}`,
+        # repaints every issue as free, and defeats the ⚒'s guard below — which
+        # reads `held` and cannot see WHY it is empty. `● board unreachable` is on
+        # the head line, but that is a different widget from the row being clicked.
+        stale, self.claims_err = self.claims_err, data.get("error")
+        if self.claims_err:
+            # The last good answer stands; only its freshness changed. Except when
+            # there is no last good answer — then this is the first one, and the
+            # panel has to be released rather than left waiting on a board that is
+            # down. `{}` is the only order available then, and `claims_err` is what
+            # stops it being read as knowledge: the title says so and the ⚒ refuses.
+            if self.held is None:
+                self.held = {}
+            self.render_issues(self.issues, self.issue_err)
+            return
         # `self.held is None` is its own reason to render: the FIRST answer has
         # to reach the table even when it is empty, and comparing holders alone
         # cannot see that transition — {} and {} are equal. That is the case the
-        # renewal guard above was never written for. `render_issues` decides
-        # whether that first answer is enough to paint on; it is not, on its own.
-        if self.held is None or holders(held) != holders(self.held):
+        # renewal guard above was never written for. A board that has just COME
+        # BACK is the same shape of transition — the rows are unchanged and what
+        # they are worth is not — hence `stale` here. `render_issues` decides
+        # whether that answer is enough to paint on; it is not, on its own.
+        if self.held is None or stale or holders(held) != holders(self.held):
             self.held = held
             self.render_issues(self.issues, self.issue_err)
 
@@ -1024,7 +1048,12 @@ class Dash(App):
             title = f"ISSUES · waiting for {waiting}"
             if err:
                 title += f" · gh: {qd.clip(err, 24)}"
-            self.query_one("#t_issues", Static).update(title)
+            # Text(), not str: `gh`'s stderr goes in here and a bracketed token
+            # in it — `ConnectionRefusedError: [Errno 111] …`, which survives the
+            # clip — is a Rich style tag to a Static that parses markup. The panel
+            # that exists to explain a stalled state would raise MarkupError from
+            # inside a call_from_thread instead.
+            self.query_one("#t_issues", Static).update(Text(title))
             return
         table = self.query_one("#issues", DataTable)
         table.clear()
@@ -1049,10 +1078,16 @@ class Dash(App):
                 key=key,
             ).value
             self.rows[str(key)] = issue
-        title = f"ISSUES · {len(issues)}" + (f" · {free} free" if issues else "")
+        title = f"ISSUES · {len(issues)}"
+        # Not "N free" while the board is unreachable: `free` is counted off claims
+        # that are stale or were never fetched, and stating it would be the same
+        # collapse this change exists to undo, one panel up from the rows.
+        if issues:
+            title += (f" · claims unknown: {qd.clip(self.claims_err, 20)}"
+                      if self.claims_err else f" · {free} free")
         if err:
             title += f" · gh: {qd.clip(err, 24)}"
-        self.query_one("#t_issues", Static).update(title)
+        self.query_one("#t_issues", Static).update(Text(title))   # markup: see above
 
     def say(self, text: str) -> None:
         # Kept on the app as well as in the widget: a Static does not hand back
@@ -1384,9 +1419,10 @@ class Dash(App):
         # that spends money — reachable, because the PLANS ⚒ arrives on its own
         # worker and can be live while ISSUES is still waiting. The wait is a
         # poll long and `r` shortens it.
-        if self.held is None:
-            self.say(f"#{number}: the board has not answered yet, so nothing here "
-                     f"knows whether it is claimed — `r` re-reads it")
+        if self.held is None or self.claims_err:
+            self.say(f"#{number}: the board has not answered"
+                     + (f" ({qd.clip(self.claims_err, 40)})" if self.claims_err else " yet")
+                     + ", so nothing here knows whether it is claimed — `r` re-reads it")
             return
         if (holder := holders(self.held).get(qd.issue_key(issue))):
             self.say(f"#{number} is claimed by {holder} (the board's last answer, "

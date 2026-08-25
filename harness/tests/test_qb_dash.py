@@ -145,6 +145,14 @@ async def _click_row(pilot, table, offset) -> None:
             break
         previous = region
         await pilot.pause(0.05)
+    else:
+        # It clicks anyway — but a click that never found a settled row is not the
+        # same event as one that did, and silence makes them the same in the log.
+        # Reachable on an ordinary day: a fixed y=2 offset addresses no row on a
+        # repo with one open PR, and the driver then reports whatever the empty
+        # click did or did not do, under the name of the thing it meant to test.
+        print(f"_click_row: {table.id} never settled with a row at {offset} "
+              f"— clicking anyway, region {table.region}")
     await pilot.click(table, offset=offset)
 
 
@@ -195,7 +203,9 @@ async def _drive() -> list[str]:
     # the click is already in flight. Off for every test here: none of them is
     # about the caps, and a test that reached the network would be its own bug.
     app.refresh_limits = lambda: None
-    # THE TWO THINGS ON THIS SCREEN THAT MOVE EVERYTHING UNDER THEM, both off.
+    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # (`#detail` is a third and is left alone: the drivers move that one
+    # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
     # GROWS, being the one table sized to its content (`height: auto`), so tmux
     # answering adds a row per pane. Either reflows every panel below it, mid-click
@@ -279,7 +289,8 @@ async def _drive_issues() -> list[str]:
     async with app.run_test(size=(90, 50)) as pilot:
         for _ in range(40):
             await pilot.pause(0.25)
-            if app.held is not None and app.query_one("#issues").row_count:
+            if (app.held is not None and app.issues is not None
+                    and app.query_one("#issues").row_count):
                 break
         issues = app.query_one("#issues")
         # #433 GAVE AN EMPTY TABLE A THIRD MEANING and `_need_rows` knows two:
@@ -288,10 +299,11 @@ async def _drive_issues() -> list[str]:
         # empty table with no `gh` error — i.e. as `skip("no open issues")`,
         # which would report a board that was slow as a repo that was quiet and
         # silently skip the test this change is named for.
-        if app.held is None:
+        if app.held is None or app.issues is None:
             raise AssertionError(
-                "the board did not answer inside the wait, so ISSUES never painted "
-                "— this is not 'nothing to click'")
+                f"the wait ran out with {'the board' if app.held is None else 'gh'} "
+                f"still unanswered, so ISSUES never painted — this is not "
+                f"'nothing to click'")
         _need_rows(issues, "issues", app.issue_err)
         # Read the number off the RENDERED first row rather than re-deriving the
         # order here: what the click has to match is the row a human sees. Found
@@ -418,7 +430,9 @@ async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
-    # THE TWO THINGS ON THIS SCREEN THAT MOVE EVERYTHING UNDER THEM, both off.
+    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # (`#detail` is a third and is left alone: the drivers move that one
+    # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
     # GROWS, being the one table sized to its content (`height: auto`), so tmux
     # answering adds a row per pane. Either reflows every panel below it, mid-click
@@ -475,14 +489,20 @@ async def _drive_panel() -> list[str]:
             if windowed:
                 failures.append("the review opened a window, not a seat-row pane")
 
-        # Cancelling starts nothing.
+        # Cancelling starts nothing — and the dialog has to have been THERE, or
+        # this passes on a click that missed. Row 2 is a second PR the repos need
+        # not have today, and a click that lands on nothing leaves `started` empty
+        # and the escape a no-op, which reads exactly like a cancel that worked.
         started.clear()
         await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, 2))
         await pilot.pause(0.3)
-        await pilot.press("escape")
-        await pilot.pause(0.3)
-        if started:
-            failures.append("cancelling still started a review")
+        if not isinstance(app.screen, app_module.Confirm):
+            failures.append("the ⚖ on the second row raised no confirmation to cancel")
+        else:
+            await pilot.press("escape")
+            await pilot.pause(0.3)
+            if started:
+                failures.append("cancelling still started a review")
 
         # A click anywhere else on the row still means "open on GitHub".
         await _click_row(pilot, prs, (30, 1))
@@ -1089,6 +1109,82 @@ def _quiet_dash():
     return app_module, app
 
 
+def _issues_for(*numbers):
+    """The panel's issue fixture: newest first, so a claims-aware sort moves them."""
+    return [{"number": n, "title": f"issue {n}", "repo": _load_app().qd.REPO,
+             "updatedAt": "2026-08-25T00:00:00Z"} for n in numbers]
+
+
+def test_a_board_outage_does_not_turn_every_held_issue_free():
+    """A failed poll is not an answer, and it arrives shaped like one.
+
+    `fetch_board` reports an outage as `{"claims": [], "error": …}` — the same
+    shape as "nobody holds anything". Taking it as one overwrites a real prior
+    answer with `{}`, re-sorts every held issue up into the free rows, and
+    defeats the ⚒'s guard, which reads `held` and cannot see WHY it is empty. The
+    head line does say `● board unreachable`, but that is a different widget from
+    the row under the pointer.
+
+    So: the rows do not move, the title stops claiming a free count it cannot
+    know, and the ⚒ refuses. Three assertions because the collapse shows up in
+    three places and a fix that only reached the rows would still spend a claim.
+    """
+    async def drive() -> tuple[list[str], str, bool, list]:
+        app_module, app = _quiet_dash()
+        qd = app_module.qd
+        started: list = []
+        app.spawn_refusal = lambda command: None
+        app.run_spawn = lambda name, argv: started.append((name, argv))
+        claims = [{"kind": "work", "key": f"{qd.REPO}#427", "holder": "hermes/x",
+                   "expires": None}]
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.repo_slug = qd.REPO
+            app.render_issues(_issues_for(427, 426), None)
+            app.render_board({"agents": [], "claims": claims})
+            await pilot.pause()
+            app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
+            await pilot.pause()
+            table = app.query_one("#issues")
+            rows = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+            app.fix_issue({"number": 426, "repo": qd.REPO})
+            await pilot.pause()
+            return (rows, str(app.query_one("#t_issues", app_module.Static).content),
+                    isinstance(app.screen, app_module.Confirm), started)
+
+    rows, title, confirmed, started = asyncio.run(drive())
+    assert rows == ["426", "427"], f"the outage re-sorted the held issue as free: {rows}"
+    assert "claims unknown" in title and "free" not in title, title
+    assert started == [] and not confirmed, "the ⚒ spent a claim during an outage"
+
+
+def test_a_board_that_is_down_from_the_start_still_releases_the_panel():
+    """The gate may not hang, and an outage is the case that could make it.
+
+    Holding the paint until the board answers is only safe because every answer
+    releases it, and the emptiest one — a board that has never answered and is
+    down — has no last-good claims to fall back on. It paints anyway, in `gh`'s
+    order, and says the claims are unknown rather than counting them as free.
+    """
+    async def drive() -> tuple[list[str], str]:
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.render_issues(_issues_for(427, 426), None)
+            await pilot.pause()
+            app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
+            await pilot.pause()
+            table = app.query_one("#issues")
+            return ([_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)],
+                    str(app.query_one("#t_issues", app_module.Static).content))
+
+    rows, title = asyncio.run(drive())
+    assert rows == ["427", "426"], f"a board outage left the panel waiting: {rows}"
+    assert "claims unknown" in title, title
+
+
 def test_the_issue_panel_does_not_count_issues_gh_has_not_listed_yet():
     """The board answering FIRST must not paint a confident zero.
 
@@ -1167,9 +1263,14 @@ def test_the_hammer_refuses_while_the_board_has_not_said_what_is_claimed():
             app.repo_slug = app_module.qd.REPO
             app.fix_issue({"number": 433, "repo": app_module.qd.REPO})
             await pilot.pause()
-            return isinstance(app.screen, app_module.Confirm), app.detail_text
+            return isinstance(app.screen, app_module.Confirm), app.detail_text, started
 
-    confirmed, said = asyncio.run(drive())
+    confirmed, said, started = asyncio.run(drive())
+    # NOTHING WAS LAUNCHED is the statement worth making, and `not confirmed` is
+    # not it: QB_DASH_CONFIRM=0 is supported, and on a box with it set a fix_issue
+    # that fell through would reach `run_spawn` with no dialog ever raised — which
+    # this test would have called a pass, under its own name.
+    assert started == [], f"the hammer started work: {started}"
     assert not confirmed, "the hammer asked to start work it could not know was free"
     assert "has not answered" in said, said
 
@@ -1219,14 +1320,9 @@ def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
     against no fix at all, which is exactly the pairing that says the release
     condition — not merely the gate — is the part being pinned.
     """
-    async def drive() -> list[str]:
-        app_module = _load_app()
+    async def drive() -> tuple[int, list[str]]:
+        app_module, app = _quiet_dash()
         qd = app_module.qd
-        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
-                              scope=qd.Scope([qd.REPO]))
-        for name in ("refresh_limits", "refresh_seats", "refresh_board",
-                     "refresh_plan", "refresh_prs", "refresh_issues"):
-            setattr(app, name, lambda: None)
         issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
                    "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426)]
         async with app.run_test(size=(100, 50)) as pilot:
@@ -1234,12 +1330,21 @@ def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
                                                  agent="host")
             app.render_issues(issues, None)
             await pilot.pause()
+            table = app.query_one("#issues")
+            before = table.row_count
             app.render_board({"agents": [], "claims": []})
             await pilot.pause()
-            table = app.query_one("#issues")
-            return [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
+            return before, [_numbered_cell(table.get_row_at(i))
+                            for i in range(table.row_count)]
 
-    assert asyncio.run(drive()) == ["427", "426"]
+    # BEFORE, then after. With no claims in the fixture the sorted order and the
+    # plain `gh` order are the same list, so the final rows alone say nothing
+    # about whether the empty answer released anything — an implementation that
+    # never repainted would produce them too, and so would the code from before
+    # #433. The empty first paint is the only part that can tell those apart.
+    before, after = asyncio.run(drive())
+    assert before == 0, f"the table painted before the board answered: {before} rows"
+    assert after == ["427", "426"], after
 
 
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
