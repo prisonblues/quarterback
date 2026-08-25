@@ -60,6 +60,10 @@ class Board:
         self.dropped = dropped
         self.posted: list[dict] = []
         self.detail_reads: list[int] = []
+        #: Run at the moment a write arrives, so a test can stage what a PEER did
+        #: between this tool's pre-check and its POST — the only way the duplicate
+        #: refusal happens for the reason it usually happens.
+        self.on_post = None
 
     def reviews(self, params: dict) -> list[dict]:
         pr = int(params.get("pr", ["0"])[0])
@@ -78,6 +82,8 @@ class Board:
     def record(self, body: dict) -> dict:
         with self.lock:
             self.posted.append(body)
+            if self.on_post is not None:
+                self.on_post()
             if self.duplicate:
                 return {"id": 1, "recorded": False, "reason": "duplicate run_key"}
             n = self.stored if self.stored is not None else len(body.get("changed_files", []))
@@ -139,12 +145,18 @@ def serve():
 
 
 def gh_stub(tmp_path: Path, prs: list[dict], files: dict[int, list[dict]],
-            *, files_fail: set[int] | None = None) -> Path:
-    """A `gh` on a PATH holding nothing else, answering the two calls this tool makes.
+            *, files_fail: set[int] | None = None,
+            after: dict[int, dict] | None = None) -> Path:
+    """A `gh` on a PATH holding nothing else, answering the three calls this tool makes.
 
     `files_fail` makes `gh api --paginate` exit non-zero for those PRs, which is the
     shape of a paged read that died partway — the case whose prefix must never be
     recorded.
+
+    `after` overrides what `gh pr view` reports for a PR on the re-read that follows
+    the file listing. That is the only way to stage the race the re-read exists for:
+    a push landing between the metadata call and the file call, so the paths belong to
+    a commit the recorded sha does not name.
     """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -152,6 +164,8 @@ def gh_stub(tmp_path: Path, prs: list[dict], files: dict[int, list[dict]],
     (tmp_path / "files.json").write_text(json.dumps(
         {str(k): v for k, v in files.items()}))
     (tmp_path / "fail.json").write_text(json.dumps(sorted(files_fail or ())))
+    (tmp_path / "after.json").write_text(json.dumps(
+        {str(k): v for k, v in (after or {}).items()}))
     # The interpreter by absolute path: PATH here holds `gh` and nothing else, on
     # purpose, so `env python3` in a shebang would not resolve.
     script = f'''#!{sys.executable}
@@ -160,6 +174,13 @@ root = {str(tmp_path)!r}
 argv = sys.argv[1:]
 if argv[:2] == ["pr", "list"]:
     print(json.dumps(json.load(open(root + "/prs.json"))))
+    raise SystemExit(0)
+if argv[:2] == ["pr", "view"]:
+    pr = int(argv[2])
+    meta = next(p for p in json.load(open(root + "/prs.json")) if p["number"] == pr)
+    now = {{"headRefOid": meta["headRefOid"], "changedFiles": meta["changedFiles"]}}
+    now.update(json.load(open(root + "/after.json")).get(str(pr), {{}}))
+    print(json.dumps(now))
     raise SystemExit(0)
 if argv[:2] == ["api", "--paginate"]:
     pr = int(re.search(r"/pulls/(\\d+)/files", argv[2]).group(1))
@@ -335,18 +356,148 @@ def test_a_paged_read_that_failed_records_nothing_at_all(tmp_path, serve):
     assert got.returncode == 1
 
 
-def test_a_second_run_on_an_unchanged_pr_moves_no_number(tmp_path, serve):
-    """The board refuses the repeat on the run_key, and the tool reports it as such
-    rather than as a fresh row."""
+def test_a_duplicate_write_is_confirmed_against_the_board_before_it_counts(tmp_path, serve):
+    """A peer wrote the identical row a moment ago. Nothing was written by this run —
+    so whether the PR is answered for is asked again rather than assumed."""
+    existing = {"id": 31, "head_sha": HEAD, "base": "main",
+                "changed_files_total": 1, "reviewed": False,
+                "skip_reason": "qb-backfill (#449): read at aaaaaaaa",
+                "_files": [{"path": "a.py"}]}
     board = Board(duplicate=True)
     url = serve(board)
     bin_dir = gh_stub(tmp_path, [pr_meta(7, 1)], {7: paths("a.py")})
+    # The row is there only AFTER the write is attempted, which is what a peer racing
+    # this one looks like: the pre-check saw nothing, the write met the unique index.
+    board.on_post = lambda: board.runs.setdefault(7, [existing])
 
     got = run(tmp_path, url, bin_dir, "--apply", "--json")
 
     (row,) = json.loads(got.stdout)["prs"]
-    assert row["outcome"] == "duplicate"
-    assert got.returncode == 0, "a duplicate is the guard working, not a failure"
+    assert row["outcome"] == "duplicate" and row["run_id"] == 31
+    assert row["complete"] is True
+    assert got.returncode == 0, "a duplicate that left the PR attested is the guard working"
+
+
+def test_a_duplicate_that_leaves_the_pr_unattested_is_not_reported_as_done(tmp_path, serve):
+    """The hole a `run_key` keyed on the head alone would have left open.
+
+    Backfill at head A; a panel then runs at A and records a PREFIX list, so the newest
+    run no longer attests; the re-run's write is refused as a duplicate of this tool's
+    OWN older row, which is not the row being read any more. Reporting that as `already
+    done` would exit 0 over a PR that still turns the ranking off.
+
+    Naming the superseded run in the key means the write normally goes through, so this
+    is the belt: whatever the board says, the answer is re-read and the PR is only
+    called done if it now attests.
+    """
+    board = Board(duplicate=True,
+                  runs={7: [{"id": 40, "head_sha": HEAD, "base": "main",
+                             "changed_files_total": 9, "reviewed": True,
+                             "_files": [{"path": "a.py"}]}]})
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 9)],
+                      {7: paths(*[f"f{i}.py" for i in range(9)])})
+
+    got = run(tmp_path, url, bin_dir, "--apply", "--json")
+
+    (row,) = json.loads(got.stdout)["prs"]
+    assert row["outcome"] == "failed"
+    assert "still does not attest" in row["why"]
+    assert got.returncode == 1
+
+
+def test_the_key_names_the_run_it_supersedes(tmp_path, serve):
+    """So a repair over a newer non-attesting run is a different fact, and a different
+    key, from the backfill it replaces."""
+    board = Board(runs={7: [{"id": 40, "head_sha": HEAD, "base": "main",
+                             "changed_files_total": 9, "reviewed": True,
+                             "_files": [{"path": "a.py"}]}]})
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 9)],
+                      {7: paths(*[f"f{i}.py" for i in range(9)])})
+
+    run(tmp_path, url, bin_dir, "--apply")
+
+    (body,) = board.posted
+    assert body["run_key"].endswith(f":{HEAD}:40")
+
+
+def test_it_does_not_re_record_over_its_own_backfill_of_the_same_head(tmp_path, serve):
+    """A PR past GitHub's file cap can never attest, and running again reads the same
+    forge and stores the same shortfall. Without this the superseded-run key would make
+    every run write one more identical row than the last."""
+    board = Board(runs={7: [{"id": 41, "head_sha": HEAD, "base": "main",
+                             "changed_files_total": 4000, "reviewed": False,
+                             "skip_reason": "qb-backfill (#449): read at aaaaaaaa",
+                             "_files": [{"path": "a.py"}]}]})
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 4000)], {7: paths("a.py")})
+
+    got = run(tmp_path, url, bin_dir, "--apply", "--json")
+
+    assert board.posted == []
+    (row,) = json.loads(got.stdout)["prs"]
+    assert row["outcome"] == "partial"
+    assert "would record the same shortfall" in row["why"]
+    assert got.returncode == 1
+
+
+def test_a_push_between_the_two_reads_records_nothing(tmp_path, serve):
+    """The race that produces a confidently wrong row rather than an obviously wrong
+    one. The metadata call reads head A and its count; the file call is a separate,
+    unpinned request that returns B's paths. Store those under A's sha and — whenever
+    the two commits touch the same NUMBER of files — the row reads complete, pins to A,
+    and a ranking weighs A by files it does not touch."""
+    board = Board()
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 2)], {7: paths("a.py", "b.py")},
+                      after={7: {"headRefOid": OTHER_HEAD, "changedFiles": 2}})
+
+    got = run(tmp_path, url, bin_dir, "--apply", "--json")
+
+    assert board.posted == [], "the counts agreed, and the commits did not"
+    (row,) = json.loads(got.stdout)["prs"]
+    assert row["outcome"] == "failed"
+    assert "the branch moved" in row["why"] and "run again" in row["why"]
+    assert got.returncode == 1
+
+
+def test_a_count_that_moved_between_the_two_reads_records_nothing(tmp_path, serve):
+    """The same guard on the other field: a head that held still while GitHub's own
+    count changed under it means the two reads did not see one PR."""
+    board = Board()
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 2)], {7: paths("a.py", "b.py")},
+                      after={7: {"changedFiles": 5}})
+
+    got = run(tmp_path, url, bin_dir, "--apply", "--json")
+
+    assert board.posted == []
+    (row,) = json.loads(got.stdout)["prs"]
+    assert row["outcome"] == "failed"
+    assert "changed-file count moved" in row["why"]
+
+
+def test_a_rename_is_counted_and_said(tmp_path, serve):
+    """GitHub counts a rename as one changed file and `review_run_files` has one path
+    column, so a row storing only the destination is `complete` while a PR editing the
+    SOURCE path collides with it invisibly. The hole is the panel's too and is not
+    closed here — but a run that met one says so, rather than handing back a clean
+    number over a known blind spot."""
+    board = Board()
+    url = serve(board)
+    moved = [{"path": "new.py", "additions": 1, "deletions": 0,
+              "was": "old.py"}]
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 1)], {7: moved})
+
+    got = run(tmp_path, url, bin_dir, "--apply", "--json")
+
+    (body,) = board.posted
+    assert [f["path"] for f in body["changed_files"]] == ["new.py"]
+    assert "was" not in body["changed_files"][0], "the board has no column for it"
+    (row,) = json.loads(got.stdout)["prs"]
+    assert row["renames"] == 1
+    assert row["outcome"] == "recorded" and row["complete"] is True
 
 
 def test_the_run_key_is_the_same_twice_and_different_after_a_push(tmp_path, serve):

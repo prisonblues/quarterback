@@ -2085,12 +2085,23 @@ leave.
 
 **A short list is recorded as short.** `changed_files_total` is GitHub's own `changedFiles`
 and never `len(files)`: agreeing by construction is not evidence, and deriving one from the
-other would delete the comparison `app.collisions.files_complete` is built on. Three ways the
-stored list could be a prefix, all three reported — GitHub caps a file list at 3,000; a paged
-read that dies partway is refused outright rather than recorded short; and the board's own
-`changed_files_dropped` is read back off the write and believed over what was sent. A prefix
-leaves the PR unattested and the run exits 1, which is the right outcome: it keeps
-`suggested_order` null rather than ranking a branch by files it never listed.
+other would delete the comparison `app.collisions.files_complete` is built on. Four ways the
+stored list could be a prefix, all four reported — GitHub caps a file list at 3,000; a paged
+read that dies partway is refused outright rather than recorded short; the board's own
+`changed_files_dropped` is read back off the write and believed over what was sent; and the
+head is re-read AFTER the list, because the two `gh` calls are not one snapshot and a push
+between them would store commit B's paths under commit A's sha — which reads complete whenever
+the two commits happen to touch the same number of files. A prefix leaves the PR unattested and
+the run exits 1, which is the right outcome: it keeps `suggested_order` null rather than ranking
+a branch by files it never listed.
+
+**One hole is left open and reported rather than closed: renames.** GitHub counts a rename as
+one changed file, so a row holding only the destination path is `complete` while another PR
+editing the SOURCE path collides with it invisibly. `review_run_files` has one path column and
+no notion of an alias, so storing the old path too would make `files_recorded` exceed GitHub's
+count and fail #80's `counts_agree` — the PR would go unattested for having read more than
+anyone else does. `loops/panel.py` has the same hole and says so. This counts them per PR, so
+an operator can see where the grain runs out.
 
 The list comes from `gh api --paginate .../pulls/N/files`, not `gh pr view --json files`.
 `pr view` asks GraphQL for `files(first: 100)` and does not page, so a 322-file PR arrives as
@@ -2098,15 +2109,20 @@ The list comes from `gh api --paginate .../pulls/N/files`, not `gh pr view --jso
 that because its list is a side effect of a review and it prints a note when the two counts
 disagree; here the list is the whole product.
 
-**A re-run on an unchanged PR moves nothing.** Two guards, for two different failures. The
-`run_key` carries the repo, the PR and the head, so a second write of the same fact meets the
-board's unique index and comes back `recorded: false` — the guard that holds when two agents
-run this against one repo at the same moment, which no read-then-write check can cover. And
-before writing at all, a PR whose newest run already carries a complete list at the head the
-forge reports now is left alone as `already`, so it never shadows a run that already answered.
-That check reads the stored list and deliberately not `reviewed`: whether a seat ran is not
-what makes a file list usable, and sparing reviewed runs would leave the pre-#94 population
-permanently unanswerable.
+**A re-run on an unchanged PR moves nothing.** Four guards, for four different failures.
+Before writing at all, a PR whose newest run already carries a complete list at the head the
+forge reports now is left alone as `already`, so it never shadows a run that already answered —
+and one whose newest run is a backfill of this tool's own at that head is left alone too,
+because re-reading the same forge would store the same shortfall. The `run_key` carries the
+repo, the PR, the head and the run this one supersedes, so a second write of the same fact
+meets the board's unique index; that is the guard that holds when two agents run this against
+one repo at the same moment, which no read-then-write check can cover. And a write refused as a
+duplicate is not taken as done: the newest run is read again and the PR is only reported
+answered if it now attests.
+
+The `already` check reads the stored list and deliberately not `reviewed`: whether a seat ran
+is not what makes a file list usable, and sparing reviewed runs would leave the pre-#94
+population permanently unanswerable.
 
 A PR that pushes gets a new head, both guards open, and the new commit is recorded. #80 attests
 a list only against the commit the queue has the PR on, so a row recorded against a head the
