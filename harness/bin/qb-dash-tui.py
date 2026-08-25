@@ -343,17 +343,19 @@ class Dash(App):
         # redraws from it, and it rides the gh clock so a re-fetch on a toggle
         # would cost a `gh pr list` for a decision already made.
         self.queue: dict = {}
-        self.issues: list[dict] = []
+        # NONE UNTIL `gh` HAS ANSWERED, for the reason `self.held` is (#433): an
+        # empty list is an answer this panel counts and sorts, so standing it in
+        # for "not asked yet" is how a panel comes to state something it does not
+        # know. `render_issues` paints when BOTH answers are in and not before.
+        self.issues: list[dict] | None = None
         self.issue_err: str | None = None
         self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None
-        # 'owner/repo#n' → the claim on it. NONE UNTIL THE BOARD HAS ANSWERED,
-        # and the distinction is the whole of #433: `{}` means "the board says
-        # nothing is held", which is an answer, and this panel sorts on it. An
-        # empty dict standing in for "not asked yet" made those two the same, so
-        # the table painted every issue as free and re-sorted when the truth
-        # arrived — moving rows out from under a pointer already aimed at them.
+        # 'owner/repo#n' → the claim on it, and NONE UNTIL THE BOARD HAS ANSWERED:
+        # `{}` means "the board says nothing is held", which is an answer this
+        # panel sorts on. See `render_issues` for what the distinction buys and
+        # for its limit — it is the FIRST paint that is protected, not every one.
         self.held: dict | None = None
         self.detail_text = ""
         self.last_dispatch: tuple[str, float] | None = None
@@ -751,7 +753,8 @@ class Dash(App):
         # `self.held is None` is its own reason to render: the FIRST answer has
         # to reach the table even when it is empty, and comparing holders alone
         # cannot see that transition — {} and {} are equal. That is the case the
-        # renewal guard above was never written for.
+        # renewal guard above was never written for. `render_issues` decides
+        # whether that first answer is enough to paint on; it is not, on its own.
         if self.held is None or holders(held) != holders(self.held):
             self.held = held
             self.render_issues(self.issues, self.issue_err)
@@ -987,23 +990,41 @@ class Dash(App):
         # hour's number while the panel down here showed this minute's.
         self.render_limits(self.limits, self.limits_err)
 
-    def render_issues(self, issues: list[dict], err: str | None) -> None:
+    def render_issues(self, issues: list[dict] | None, err: str | None) -> None:
         """Open issues, free ones first, the held ones greyed and named.
 
         A free issue is the one a seat should take next, so it is what this
         panel is for: the ⚒ on its row starts /fix-issue on it.
+
+        NOTHING IS PAINTED UNTIL BOTH ANSWERS ARE IN — `gh`'s issues and the
+        board's claims — because either alone draws a table this panel is then
+        about to rearrange, and the rearrangement is #433: a reader picks a row
+        by looking at it, and it has to still be there when the click lands.
+
+        WHAT THIS DOES NOT DO, since the title of the change reads wider than the
+        code: it protects the FIRST paint. A claim taken or dropped later is a
+        real change in the answer and still re-sorts the table, exactly as the
+        renewal guard in `render_board` was written to allow. Holding an order
+        that has gone stale would be the opposite mistake.
+
+        Neither wait can hang. `fetch_board` returns a state rather than raising,
+        so a board that is DOWN still arrives here and releases the paint, and a
+        `gh` that fails answers with an empty list and an error — which is an
+        answer, and is counted and shown as one.
         """
         self.issues, self.issue_err = issues, err
-        if self.held is None:
-            # `gh` answered before the board did. Painting now would order every
-            # issue as free and then rearrange, and the rearrangement is the bug:
-            # a reader picks a row by looking at it, and it has to still be there
-            # when the click lands. The rows are kept and `render_board` paints
-            # them the moment it knows — which is a fraction of a second, against
-            # a `gh` call that has already taken seconds. A board that ERRORS
-            # still gets here: `fetch_board` returns a state rather than raising,
-            # so `render_board` always runs and this never waits for ever.
-            self.query_one("#t_issues", Static).update("ISSUES · waiting for the board")
+        if self.held is None or self.issues is None:
+            # WHICH answer is missing, and the `gh` error if there is one: the
+            # title is the only place a stalled panel explains itself, and
+            # blaming the board for a `gh` failure it already knows about would
+            # send a reader to the wrong end of the problem.
+            waiting = " and ".join(w for w, missing in
+                                   (("the board", self.held is None),
+                                    ("gh", self.issues is None)) if missing)
+            title = f"ISSUES · waiting for {waiting}"
+            if err:
+                title += f" · gh: {qd.clip(err, 24)}"
+            self.query_one("#t_issues", Static).update(title)
             return
         table = self.query_one("#issues", DataTable)
         table.clear()
@@ -1358,7 +1379,16 @@ class Dash(App):
         if (why := self.wrong_repo(issue.get("repo"), f"#{number}")):
             self.say(why)
             return
-        if (holder := holders(self.held or {}).get(qd.issue_key(issue))):
+        # UNKNOWN IS NOT FREE. `self.held` is None until the board answers, and
+        # `or {}` here would read that as "nothing is claimed" at the one click
+        # that spends money — reachable, because the PLANS ⚒ arrives on its own
+        # worker and can be live while ISSUES is still waiting. The wait is a
+        # poll long and `r` shortens it.
+        if self.held is None:
+            self.say(f"#{number}: the board has not answered yet, so nothing here "
+                     f"knows whether it is claimed — `r` re-reads it")
+            return
+        if (holder := holders(self.held).get(qd.issue_key(issue))):
             self.say(f"#{number} is claimed by {holder} (the board's last answer, "
                      f"`r` re-reads it) — the spawn takes that claim, so "
                      f"`qb-release issue {number}` is what frees it")

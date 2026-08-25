@@ -1538,6 +1538,18 @@ reason it is still waiting. `qb-dash` is the same views rendered without
 interaction, for a box that cannot import `textual` — which is the whole of what
 it is for since #426. It is not a lesser default any more; it is the fallback.
 
+**ISSUES waits before it paints, and says what it is waiting for.** The rows come from
+`gh issue list` and their order comes from the board's claims — free issues above held
+ones — and the two arrive on separate workers with nothing sequencing them. Painting on
+whichever lands first draws an order the panel is then about to rearrange, and a row that
+moves is a row somebody clicks by mistake ([#433](https://github.com/prisonblues/quarterback/issues/433)).
+So until both have answered the panel says `ISSUES · waiting for the board`, `· waiting for
+gh`, or names both — with any `gh` error carried beside it, since the one thing worth
+knowing about a stalled panel is which end is stalled. It is a fraction of a second, and it
+cannot hang: a board that is down and a `gh` that fails both count as answers. What it does
+NOT do is freeze the order afterwards — a claim taken or dropped later is a real change and
+still re-sorts the table.
+
 **The CI column has six states, and only one of them is quiet.** `gh pr view` reports a
 PR's checks as a rollup, and an empty rollup means two things that are not remotely alike:
 no run has been created for this head, or a run *has* and is parked behind GitHub's
