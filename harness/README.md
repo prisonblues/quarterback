@@ -1426,6 +1426,27 @@ Both the bindings and the menu are generated from one table in `qb-seats`, and
 `test_every_menu_accelerator_is_a_key_in_the_table` is what stops the menu becoming a liar
 about the shortcut it exists to teach.
 
+**The bar says the key is waiting, and that is not decoration.** Switching into a key table is
+invisible in tmux — its own prefix is the same, and its users know. Here nobody did: the first
+press looked like a dead key, so the natural next move was to press it again, that lands on
+`Any` and opens the menu, and a `display-menu` has no digit accelerators — so `1`-`9` did
+nothing while the menu's own title promised they jumped to a seat. **One invisible state,
+reported as three separate bugs.** `#{client_key_table}` is the whole fix and costs one
+conditional in the seat bar, which already redraws on every change: press the key and a strip
+appears carrying every key it accepts, and it goes as soon as the next one lands. It is the
+mode indicator *and* the cheatsheet, which the menu had been carrying alone.
+
+The hint holds no comma — `,` separates a format conditional's arms, so one would end the arm
+early and print the rest of the strip unconditionally, in every session on the box. It is
+appended and right-aligned rather than replacing the seat cells: wrapping the whole bar in the
+conditional would nest the cells' own `#{?...}` commas one level deeper, and a seat row that
+vanished whenever you reached for a key would lose the state colours exactly when you are
+deciding which seat to act on. With `QB_SEATS_BAR=0` there is no bar and so no hint — the key
+still works, silently, the way tmux's own prefix does.
+
+The menu's title no longer promises the digits. Instead it carries a `j` row whose command is
+`switch-client -T qb`, which hands you back to the table — the one place a digit means a seat.
+
 **A key table is server-wide**, exactly as `MouseDown1Status` is, so the binding cannot simply
 act: it reads `@qb_key`, which is set on this session and on nothing else, and in the other
 branch does verbatim what tmux would have done — sends the key on to the pane. Press `C-q` in
@@ -1478,6 +1499,13 @@ The one exception is `?`, and it is a tmux limitation rather than a choice: **`d
 does not format-expand its command**, so the popup was handed the literal `#{session_id}`. The
 guide asks tmux which session it is in instead — `display-message -p` with no `-t` answers with
 the client's current one, which inside a popup is the client that opened it.
+
+**The guide is wrapped to fit the popup it opens in**, and the width is not a guess: `?` opens
+it in a `display-popup -w N` whose border takes two columns of that, and a line longer than the
+rest wraps. It shipped at 79 columns inside a 78-column popup and the last paragraph folded.
+`test_the_guide_fits_the_popup_it_is_opened_in` reads the width out of the binding and checks
+every line against it — in characters rather than bytes, since the text carries an em dash and
+an ellipsis — so the two cannot drift apart again.
 
 **A real keystroke is tested**, which the seat bar's click never could be: synthesising a click
 means SGR mouse bytes and a status line whose geometry the test has to work out, while `C-q t`

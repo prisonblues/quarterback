@@ -1645,6 +1645,118 @@ def test_an_action_takes_the_screens_id_as_well_as_its_name(screen):
     assert sorted(n for _, n in panes(screen) if n) == ["1", "3"]
 
 
+def test_a_digit_jumps_from_the_key_and_the_menu_leads_back_to_it(screen):
+    """The exact path a user took, end to end, because every part of it worked in
+    isolation and the whole did not.
+
+    Press the key, see nothing happen, press it again — that lands on `Any` and
+    opens the menu, which has no digit accelerators, so `2` does nothing at all.
+    `C-q 2` on its own was always fine. So: the digit works from the key, the
+    double press still reaches the menu, and the menu's `j` hands you back to the
+    table where a digit means a seat.
+    """
+    screen("-n", "3")
+    wait_for_log(screen.log, 3)
+
+    def active():
+        return screen.tmux("display-message", "-p", "-t", "t:seats",
+                           "#{@qb_seat}").stdout.strip()
+
+    with attached_client(screen, 200, 50) as press:
+        press("\x11", "2")                       # straight from the key
+        assert wait_until(lambda: active() == "2"), f"C-q 2 did not jump: {active()}"
+
+        press("\x11", "\x11")                    # the double press: the menu
+        press("j")                               # ...which leads back to the table
+        press("3")
+        assert wait_until(lambda: active() == "3"), \
+            f"the menu's seat row did not lead back to the digits: {active()}"
+
+
+def test_the_bar_says_the_key_table_is_waiting(screen):
+    """Pressing the key switches the client into a key table and tmux says
+    nothing about it — its own prefix is the same and its users know. Here nobody
+    did: the first press looked like a dead key, the natural next move was to
+    press it again, that lands on `Any` and opens the menu, and the menu has no
+    digit accelerators — so `1`-`9` did nothing while the menu's title promised
+    they jumped to a seat. One invisible state, reported as three bugs.
+
+    `#{client_key_table}` is the whole fix, and the bar already redraws on every
+    change, so the strip appears the instant the key is pressed.
+    """
+    screen("-n", "2")
+    fmt = screen.tmux("show-options", "-v", "-t", "=t:", "status-format[1]").stdout
+    assert "#{==:#{client_key_table},qb}" in fmt, f"the bar says nothing about the key: {fmt}"
+    # NO COMMA IN THE HINT. `,` separates a conditional's arms, so one would end
+    # the arm early and print the rest of the strip unconditionally — in every
+    # session on the box, since status-format is read per client.
+    hint = fmt.split("#{==:#{client_key_table},qb},", 1)[1]
+    hint = hint[:hint.index("#[default]")]
+    assert "," not in hint, f"a comma in the hint ends the conditional early: {hint!r}"
+    for key in ("a add", "x close", "1-9 seat", "t tape", "d dash", "? keys"):
+        assert key in hint, f"the hint does not teach {key!r}: {hint}"
+
+
+def test_the_hint_appears_while_the_key_waits_and_goes_when_it_is_used(screen):
+    """The bar is a format, so this is the only way to see what it renders: with
+    a client attached and the key actually pressed."""
+    screen("-n", "2")
+    with attached_client(screen, 200, 50) as press:
+        assert "qb" not in bar(screen).split("＋ seat")[-1], "the hint is up before any key"
+        press("\x11")                     # C-q, and nothing after it
+        assert wait_until(lambda: "1-9 seat" in bar(screen)), \
+            f"the bar does not say the key is waiting: {bar(screen)}"
+        press("t")                        # spend the key
+        assert wait_until(lambda: "1-9 seat" not in bar(screen)), \
+            "the hint stayed up after the key was used"
+
+
+def test_the_guide_fits_the_popup_it_is_opened_in(screen):
+    """A line longer than the popup wraps, and a wrapped cheatsheet is worse than
+    none. This shipped at 79 columns inside a 78-column popup — whose border
+    takes two more — and the last paragraph folded. The width is read out of the
+    binding rather than written here, so the text and the popup cannot drift.
+    """
+    screen("-n", "2")
+    opens = qb_table(screen)["?"]
+    words = shlex.split(opens)
+    cols = int(words[words.index("-w") + 1])
+    rows = int(words[words.index("-h") + 1])
+
+    said = seat_key(screen, "guide", "t")
+    assert said.returncode == 0, said.stderr
+    lines = said.stdout.splitlines()
+    # CHARACTERS, not bytes: the guide carries an em dash and an ellipsis, and
+    # `len()` on the encoded form would call a fitting line too wide.
+    widest = max(len(line) for line in lines)
+    assert widest <= cols - 2, (
+        f"the guide is {widest} columns wide and the popup is {cols} "
+        f"({cols - 2} inside its border)")
+    assert len(lines) <= rows - 2, (
+        f"the guide is {len(lines)} lines and the popup holds {rows - 2}")
+
+
+def test_the_menu_does_not_promise_what_a_menu_cannot_do(screen):
+    """Its title said "1-9 jumps to a seat". A `display-menu` has no digit
+    accelerators, so pressing one did nothing at all — which is how the digits
+    came to be reported as broken when they worked perfectly from the key.
+
+    The honest version is a row that hands you back to the table, which is the
+    one place a digit means a seat.
+    """
+    screen("-n", "2")
+    # The -T argument alone, not the whole binding: one of the menu ROWS says
+    # "then 1-9" and is meant to.
+    words = shlex.split(qb_table(screen)["Any"])
+    title = words[words.index("-T") + 1]
+    assert "1-9" not in title, f"the menu still promises the digits: {title!r}"
+    back = [(k, label, cmd) for k, label, cmd in qb_menu(screen)
+            if cmd == "switch-client -T qb"]
+    assert len(back) == 1, f"nothing on the menu leads to the digits: {qb_menu(screen)}"
+    key, label, _ = back[0]
+    assert key not in ("", None) and "seat" in label, (key, label)
+
+
 def test_a_real_keystroke_reaches_the_action(screen):
     """The one thing nothing else here can prove: that the binding FIRES.
 

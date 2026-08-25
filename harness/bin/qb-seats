@@ -544,6 +544,36 @@ seat_state_style() {   # <active|idle>
   fi
 }
 
+# WHAT THE QB KEY LOOKS LIKE WHILE IT IS WAITING, and it is not decoration.
+# Pressing the key switches the client into a key table and tmux says NOTHING
+# about that — its own prefix is the same, and its users know. Here nobody did:
+# the first press looked like a dead key, so the natural next move was to press
+# it again, which lands on `Any` and opens the menu. The menu then has no digit
+# accelerators, so `1`-`9` did nothing while the menu's own title promised they
+# jumped to a seat. One invisible state, reported as three bugs.
+#
+# `#{client_key_table}` is the whole fix and it costs one conditional: the bar
+# already redraws on every change, so the strip appears the instant the key is
+# pressed and goes as soon as the next one lands. It is the mode indicator AND
+# the cheatsheet, which is what the menu was carrying alone.
+#
+# NO COMMAS IN IT. `,` separates a format conditional's arms, so the separator
+# here is `·` — a comma would end the arm early and print the rest of the hint
+# unconditionally, in every session on the box.
+#
+# APPENDED AND RIGHT-ALIGNED rather than replacing the cells. Wrapping the whole
+# bar in the conditional would nest the seat cells' own `#{?...}` commas inside
+# another arm, which is the same hazard one level deeper; and a seat row that
+# vanished whenever you reached for a key would lose the state colours at exactly
+# the moment you are deciding which seat to act on.
+key_hint() {
+  printf '%s' \
+'#[align=right]#{?#{==:#{client_key_table},qb},'\
+'#[fg=black]#[bg=colour109] qb '\
+'#[fg=colour109]#[bg=default] a add · x close · 1-9 seat · t tape · d dash '\
+'· = fit · > < size · s screens · K kill · ? keys #[default],}'
+}
+
 seat_bar() {
   printf '%s' \
 '#[align=left]'\
@@ -552,7 +582,8 @@ seat_bar() {
 ' seat #{@qb_seat} #[default]#[norange]'\
 '#[range=user|kill#{@qb_seat}]#[fg=colour167] ✕ #[default]#[norange] '\
 ',}}'\
-'#[range=user|add]#[fg=colour108] ＋ seat #[default]#[norange]'
+'#[range=user|add]#[fg=colour108] ＋ seat #[default]#[norange]'\
+"$(key_hint)"
 }
 
 # One binding for every widget on the bar, because tmux delivers every
@@ -697,10 +728,11 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "=|the dash back to the width it asked for|run-shell -b \"$d fit $here\"" \
     ">|the dash wider|run-shell -b \"$d wider $here\"" \
     "<|the dash narrower|run-shell -b \"$d narrower $here\"" \
+    "j|jump to a seat — then 1-9|switch-client -T qb" \
     "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
     "||" \
     "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$d kill $here\\\"\"" \
-    "?|these keys, in full|display-popup -w 78 -h 24 \"$d guide\""
+    "?|these keys, in full|display-popup -w 72 -h 27 \"$d guide\""
   # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
   # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
   # the guide asks tmux which session it is in instead. `display-message -p` with
@@ -728,12 +760,17 @@ install_key() {
     menu+=("$label" "$k" "$cmd")
   done < <(qb_actions "$dispatch" "$seats")
 
-  # The nine seat keys are bound and are deliberately NOT on the menu. A screen
-  # can have ten seats and a menu with ten more rows on it is a worse menu, while
-  # the digits are the one group nobody has to be taught — so the title carries
-  # them instead. A digit naming a seat that is not there reports it the way the
-  # bar's cells do, through qb-seat-click, rather than being bound per screen and
-  # going stale the moment a seat is added or closed.
+  # The nine seat keys are bound and are deliberately NOT rows on the menu: a
+  # screen can have ten seats and a menu with ten more rows is a worse menu, and
+  # rows built per screen would go stale the moment a seat is added or closed. A
+  # digit naming a seat that is not there reports it the way the bar's cells do,
+  # through qb-seat-click.
+  #
+  # THE MENU MUST NOT PROMISE THEM EITHER. Its title said "1-9 jumps to a seat"
+  # and a menu has no digit accelerators, so pressing one did nothing at all —
+  # which is how the digits got reported as broken when they worked perfectly
+  # from the key. The `j` row is the honest version: it puts you back in the
+  # table, which is the one place a digit means a seat.
   n=1
   while [ "$n" -le 9 ]; do
     tmux bind-key -T qb "$n" \
@@ -749,7 +786,7 @@ install_key() {
   # tmux takes a whole command handed to it as ONE argument and it takes a
   # pre-split argv, and mixing the two is a third thing that is neither.
   tmux bind-key -T qb Any \
-    display-menu -T '#[align=centre] qb — 1-9 jumps to a seat ' -x C -y C \
+    display-menu -T '#[align=centre] qb keys ' -x C -y C \
     "${menu[@]}"
 
   # GATED ON THIS KEY, not merely on this being a screen. `#{!=:#{@qb_key},}`

@@ -124,28 +124,38 @@ if [ "$ACTION" = guide ]; then
     [ -z "${sid:-}" ] || key=$(tmux show-options -v -t "$sid:" @qb_key 2>/dev/null || true)
   fi
   [ -n "$key" ] || key="C-q"
+  # WRAPPED TO FIT, and the width is not a guess: `?` opens this in a
+  # `display-popup -w GUIDE_COLS`, whose border takes two columns of it. A line
+  # longer than the rest wraps, and a wrapped cheatsheet is a worse cheatsheet
+  # than none — this shipped at 79 columns inside a 78-column popup and the last
+  # paragraph folded. test_the_guide_fits_the_popup_it_is_opened_in reads the
+  # width out of the binding and checks every line against it, so the two cannot
+  # drift apart again.
   cat <<EOF
   $key is the qb key. Press it, then one of:
 
-    a          add a seat
-    x          close this seat — the agent in it goes too (asks first)
-    1 … 9      jump to that seat
+    a        add a seat
+    x        close this seat (asks — the agent in it goes too)
+    1 … 9    jump to that seat
 
-    t          show or hide the tape (the board along the bottom)
-    d          show or hide the dash (the fleet down the right)
-    =          put the dash back to the width the screen asked for
-    > / <      the dash $NUDGE columns wider / narrower, and remember it
+    t        show or hide the tape (the board along the bottom)
+    d        show or hide the dash (the fleet down the right)
+    =        the dash back to the width the screen asked for
+    >  <     the dash $NUDGE columns wider / narrower, and keep it
 
-    s          the screens that are up
-    K          kill this screen — every agent on it goes too (asks first)
-    ?          this list
+    s        the screens that are up
+    K        kill this screen (asks — every agent on it goes)
+    ?        this list
 
-  Anything else opens the menu, which carries these same keys, and so does
-  pressing $key twice.
+  While $key is waiting, the seat bar carries these same keys —
+  that strip is how you know the key took. Anything the key does
+  not know opens the menu, and so does $key twice; the digits jump
+  from the key itself, not from the menu.
 
-  The key is server-wide, so it is gated on this being a qb screen: press it
-  anywhere else and tmux gets the keystroke it always did. QB_SEATS_KEY picks a
-  different one and QB_SEATS_KEY= (empty) means no key at all.
+  The key is server-wide, so it is gated on this being a qb screen:
+  press it anywhere else and tmux gets the keystroke it always did.
+  QB_SEATS_KEY picks a different one, and QB_SEATS_KEY= (empty)
+  means no key at all.
 EOF
   exit 0
 fi
