@@ -29,16 +29,39 @@ Both must say yes before an action is even *named*. The survey half runs
 regardless, because "these six are waiting on you, here is what each needs" is
 useful work on a repo whose gate is shut — which is every repo, by default.
 
-IT STARTS NOTHING, and that is structural rather than promised.
+IT STARTS NOTHING UNLESS TWO SEPARATE PARTIES BOTH SAY SO.
 
-`issue_pickup.enabled` is false in `harness_rules.DEFAULTS` and false in this
-repo's `.harness-rules.sample`, so `action` is `none` for every issue here today.
-But a default can be flipped, so the stronger property is that this module has no
-way to act even if it were: the only external command it runs is `gh`, asserted
-by `test_issue_watch.py` off the module's own syntax tree. Starting a session is
-`qb-start`'s job (#277) — a machine-level permission that ships off and that a
-repository cannot grant itself — and wiring a trigger to it is #63's follow-up,
-deliberately not built while nobody is watching.
+It used to start nothing at all, and the docstring here said so as a structural
+property: the only command the module could run was `gh`. That was the first cut
+of #63 on purpose — the survey half is useful on a repo whose gate is shut, which
+is every repo by default — and this is the follow-up it deferred, so the property
+is now narrower and worth stating exactly.
+
+`--start` hands an actionable issue to `qb-start` (#277) and nothing else does.
+Reaching a session takes FOUR independent yeses, held by different parties:
+
+    THE REPO      `issue_pickup.enabled`, false in `harness_rules.DEFAULTS` and
+                  in this repo's `.harness-rules.sample`. Decides whether a loop
+                  may CHOOSE work here at all.
+    THE ISSUE     no held signal, and `epic.triage` confirming an agent can do
+                  it. Decides whether THIS issue is settled.
+    THE OPERATOR  `--start`, which is off, plus `--start-max`. Decides whether
+                  THIS RUN may act.
+    THE MACHINE   `qb-start`'s policy file, which lives in the user's config
+                  directory outside any repository, ships absent, and fails
+                  closed. Decides whether this BOX starts sessions.
+
+The last one is the one that matters most and is the one a repository cannot
+reach: nothing in a checkout — an issue body, a CLAUDE.md, a rules file — can
+grant it. So a poisoned repo that flipped every switch it owns still starts
+nothing, which is the property the other three cannot provide.
+
+What survives of the old structural claim is the shape of the audit rather than
+its content: `test_issue_watch.py` still reads every subprocess call off this
+module's syntax tree, and the set it permits is now exactly `gh` and
+`qb_start_path()` — a resolver that takes no argument and can therefore only ever
+name one program. A command built from a string this module computed would still
+fail that test, which is the part that was actually protecting anything.
 
 The judge is the one thing that costs money, so it runs LAST: only for an issue
 the gate admitted and no signal held. That ordering is also the security
@@ -54,6 +77,8 @@ Usage:
     python3 issue_watch.py --repo quarterback --json        # machine-readable
     python3 issue_watch.py --repo quarterback --announce     # say so on the board
     python3 issue_watch.py --repo quarterback --comment      # ...and on the issue
+    python3 issue_watch.py --repo quarterback --start --dry-run   # every refusal, nothing started
+    python3 issue_watch.py --repo quarterback --start        # ...and act on the actionable
 """
 
 from __future__ import annotations
@@ -86,6 +111,20 @@ SURVEY_FIELDS = "number,title,body,author,labels,comments,url,state"
 #: different program, and the honest version of that is paging, not a bigger
 #: number here.
 DEFAULT_LIMIT = 30
+
+#: How many sessions ONE `--start` run may begin. One, deliberately, and it is
+#: not the same ceiling as `qb-start`'s own.
+#:
+#: `qb-start` caps how many spawns may be LIVE on a box; this caps how many a
+#: single sweep may ask for, and the two answer different questions. Without
+#: this, a first run against a backlog where the gate has just been opened would
+#: ask for a session per actionable issue and be refused by the cap thirty times
+#: — thirty board posts, thirty claims attempted, to start the one session the
+#: box had room for. The number that cannot surprise anybody is the smallest one
+#: that does something, which is `qb-start`'s argument for its own default and
+#: is more forceful here: this is the end of the chain that reads a public
+#: tracker.
+DEFAULT_START_MAX = 1
 
 #: Left in the comment this writes, so a second run recognises its own work. It
 #: carries a digest of the signals, not just a marker: an issue whose open
@@ -130,6 +169,12 @@ class Assessment:
     human_class: str = ""
     action: str = "none"
     why: str = ""
+    #: What became of `action` — the record #63 asks for by name, so that "why
+    #: did nothing happen" is answerable after the fact rather than reconstructed
+    #: from a pane that may not exist. Empty on a survey, because a run that was
+    #: never asked to start anything did not decline to: absent and refused are
+    #: different answers and this field must not conflate them.
+    started: str = ""
     #: The thread as `gh` handed it over, kept so `--comment` can recognise this
     #: watcher's own earlier comment without a second round trip. Not in
     #: `as_dict`: it is the input the assessment was made from, and a JSON
@@ -149,6 +194,7 @@ class Assessment:
             "doable": self.doable, "triage_reason": self.reason,
             "needs_human": self.human_class,
             "action": self.action, "why": self.why,
+            "started": self.started,
         }
 
 
@@ -692,11 +738,175 @@ def may_write_on(cfg: dict, a: Assessment) -> tuple[bool, str]:
     return False, f"{who.reason} [{who.setting}]"
 
 
+# ------------------------------------------------------------------- acting
+
+
+#: The one program this module may start besides `gh`, named once so that the
+#: audit in `test_issue_watch.py` has a single constant to check rather than a
+#: string repeated at each call site.
+QB_START = "qb-start"
+
+
+def qb_start_path() -> str:
+    """`qb-start`, on PATH or beside this checkout's `harness/bin`.
+
+    Takes no arguments ON PURPOSE, and that is the property the audit rests on
+    rather than a style choice. A resolver with a parameter is one an issue body
+    could eventually reach through — the caller passes a name, the name comes
+    from somewhere, and "somewhere" on a public tracker is a stranger. With no
+    parameter there is exactly one program this can ever return, and the module
+    keeps the shape #63 asked for: a spawn surface that is an allowlist rather
+    than a prompt.
+
+    Same two-step resolution as `qb-start.sibling` and for its reason: a
+    home-manager install has PATH, a bare checkout has only the file.
+    """
+    from shutil import which
+    return which(QB_START) or str(
+        Path(__file__).resolve().parent.parent / "bin" / QB_START)
+
+
+#: What each of `qb-start`'s refusals means here, and — the load-bearing half —
+#: whether it is worth trying the NEXT issue after seeing it.
+#:
+#: The distinction is per-issue versus per-machine. `HELD` means somebody else
+#: has that one issue and the next may be free; `NOT_ALLOWED` means this machine
+#: permits some commands and not this one, so an `/investigate` may still start
+#: where a `/fix-issue` did not. Everything else is a fact about the box — not
+#: enabled, out of slots, paced, no tmux — and re-asking it once per issue would
+#: turn one refusal into thirty identical board posts, which is how a watcher
+#: becomes the thing people mute.
+STOP, GO = True, False
+START_EXITS = {
+    0: ("started", GO),
+    2: ("qb-start rejected the arguments — that is a bug here, not a refusal", STOP),
+    3: ("spawning is not enabled on this machine", STOP),
+    4: ("this machine's policy does not allow that command", GO),
+    5: ("this machine is at its spawn cap", STOP),
+    6: ("the shared window is spent", STOP),
+    7: ("this repo's in-flight window is full", STOP),
+    8: ("somebody already holds that work", GO),
+    9: ("could not start it — no tmux, or the pane could not be stamped", STOP),
+}
+
+
+def start_one(a: Assessment, repo_path: str,
+              dry_run: bool = False) -> tuple[str, bool]:
+    """Ask `qb-start` for a session on `a.action`. Returns `(what happened, stop)`.
+
+    Every gate that matters is somebody else's and is left that way. The pickup
+    gate already said this issue may be chosen, the judge already said an agent
+    can do it, and no signal is holding it — that is what `a.held` being false
+    means. What is NOT re-decided here is whether this machine may start a
+    session at all: that is `qb-start`'s policy file, it lives outside any
+    repository, and a second copy of the check in here would be a second thing to
+    keep in step with it. So this asks and reports the answer.
+    """
+    # The list is written out HERE rather than built above and passed in, and
+    # that is the audit's requirement rather than a preference: a call whose argv
+    # arrived as a variable cannot be read off the syntax tree, so
+    # `test_issue_watch.py` refuses one — which is the whole value of the check.
+    try:
+        code = subprocess.run(
+            [qb_start_path(), "--via", "watch", a.action, str(a.number),
+             "--repo-path", repo_path, "--quiet",
+             *(("--dry-run",) if dry_run else ())],
+            stdin=subprocess.DEVNULL, timeout=120).returncode
+    except Exception as e:                                        # noqa: BLE001
+        # Named rather than swallowed: "nothing started" with no reason is the
+        # silent-watcher failure #63 is largely about, and a missing install
+        # reads very differently from a refusal.
+        return f"qb-start did not run — {e.__class__.__name__}: {e}", STOP
+    label, stop = START_EXITS.get(code, (f"qb-start exited {code}", STOP))
+    if code == 0 and dry_run:
+        return "would start (--dry-run)", GO
+    return label, stop
+
+
+def run_starts(assessments: list[Assessment], cfg: dict, *,
+               limit: int = 1, dry_run: bool = False) -> None:
+    """Hand the actionable issues to `qb-start`, in order, up to `limit`.
+
+    Records the outcome on every actionable assessment — including the ones it
+    never reached, which get `not attempted` rather than being left blank. That
+    is the difference between "the watcher declined this" and "the watcher ran
+    out of room before it got here", and #63's acceptance asks for the second to
+    be answerable too.
+    """
+    actionable = [a for a in assessments if not a.held]
+    if not actionable:
+        return
+    # "Start it with a human watching" is the plan's own instruction about this
+    # feature, and this is where it is encoded rather than left as advice. An
+    # unattended run may still survey, report and announce — none of that starts
+    # anything — but it does not spawn unless the repo has said loops may act
+    # here with nobody looking. Reusing `may_write` rather than adding a switch:
+    # a repo has answered this question once already, and two switches for one
+    # question is how they come to disagree.
+    attended, unattended_why = may_write(cfg)
+    if not attended:
+        for a in actionable:
+            a.started = f"not started — {unattended_why}"
+        return
+    enabled, why = spawning_enabled()
+    if not enabled:
+        for a in actionable:
+            a.started = why
+        return
+    started = 0
+    stopped = ""
+    for a in actionable:
+        if stopped:
+            a.started = f"not attempted — {stopped}"
+            continue
+        if started >= limit:
+            a.started = f"not attempted — this run's --start-max of {limit} is spent"
+            continue
+        a.started, stop = start_one(a, str(cfg.get("path") or "."),
+                                    dry_run=dry_run)
+        if a.started in ("started", "would start (--dry-run)"):
+            started += 1
+        if stop:
+            stopped = a.started
+
+
+def spawning_enabled() -> tuple[bool, str]:
+    """Does this machine start sessions at all? Asked once, before the loop.
+
+    Takes no repo path because the answer does not depend on one: the policy is
+    a property of the machine, and a repository cannot grant it.
+
+    `qb-start --policy` exists for exactly this caller — it is the question a
+    trigger asks before it offers somebody a button, it consults nothing but the
+    policy file, and it is the SAME `read_policy` the spawn path uses, so it can
+    never answer yes to a machine the spawn would refuse. Asking it once turns
+    the commonest outcome by far — a machine that never opted in — into one line
+    instead of one refusal per actionable issue.
+    """
+    try:
+        code = subprocess.run([qb_start_path(), "--policy", "--quiet"],
+                              stdin=subprocess.DEVNULL, timeout=30).returncode
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"qb-start did not run — {e.__class__.__name__}: {e}"
+    if code == 0:
+        return True, ""
+    return False, ("spawning is not enabled on this machine (qb-start --policy "
+                   f"exited {code}) — nothing will be started")
+
+
 # ------------------------------------------------------------------ output
 
 
-def render(assessments: list[Assessment], repo: str) -> str:
-    """The report a human reads: what each issue is waiting on."""
+def render(assessments: list[Assessment], repo: str,
+           starting: bool = False) -> str:
+    """The report a human reads: what each issue is waiting on.
+
+    The closing line is computed rather than fixed. It read "Nothing was
+    started" unconditionally while nothing could be, which was true then and
+    would be a lie the moment `--start` existed — and a footer that says the
+    opposite of the lines above it is worse than no footer, because it is the
+    part somebody skims.
+    """
     actionable = [a for a in assessments if not a.held]
     lines = [f"{repo} — {len(assessments)} open issue(s), "
              f"{len(actionable)} actionable"]
@@ -706,8 +916,15 @@ def render(assessments: list[Assessment], repo: str) -> str:
         lines.append(f"      {a.why}")
         for s in a.signals:
             lines.append(f"      · {s.name}: {s.detail}")
-    lines += ["", "Nothing was started. This watcher reports: acting on an issue "
-                  "is `qb-start`'s job and it is off."]
+        if a.started:
+            lines.append(f"      → {a.started}")
+    if not starting:
+        lines += ["", "Nothing was started: this run was not asked to (--start). "
+                      "Acting on an issue is `qb-start`'s job."]
+    else:
+        began = [a for a in assessments if a.started == "started"]
+        lines += ["", f"{len(began)} session(s) started of {len(actionable)} "
+                      "actionable."]
     return "\n".join(lines)
 
 
@@ -737,6 +954,17 @@ def main(argv: list[str] | None = None) -> int:
                     help="say on the issue itself what decision is missing")
     ap.add_argument("--json", action="store_true", dest="as_json",
                     help="machine-readable assessments on stdout")
+    ap.add_argument("--start", action="store_true",
+                    help="hand each actionable issue to qb-start. Off by "
+                         "default, and refused anyway unless this machine's "
+                         "spawn policy is enabled — see qb-start --policy")
+    ap.add_argument("--start-max", type=int, default=DEFAULT_START_MAX,
+                    metavar="N",
+                    help=f"how many sessions one run may start (default "
+                         f"{DEFAULT_START_MAX})")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --start: make every refusal and print what would "
+                         "run, but start nothing")
     args = ap.parse_args(argv)
 
     cfg = _load(args.repo)
@@ -746,11 +974,16 @@ def main(argv: list[str] | None = None) -> int:
     got = survey(cfg, limit=args.limit, only=args.issue,
                  model=resolve_ceiling(cfg, args.model), use_judge=args.triage)
 
+    # BEFORE either report, so that what happened to each issue is in the report
+    # rather than in a second stream a reader has to interleave by hand.
+    if args.start:
+        run_starts(got, cfg, limit=args.start_max, dry_run=args.dry_run)
+
     if args.as_json:
         print(json.dumps({"repo": repo,
                           "issues": [a.as_dict() for a in got]}, indent=2))
     else:
-        print(render(got, repo))
+        print(render(got, repo, starting=args.start))
 
     if args.announce or args.comment:
         attended, unattended_why = may_write(cfg)

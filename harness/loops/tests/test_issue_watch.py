@@ -120,15 +120,15 @@ def _subprocess_calls(tree: ast.AST) -> list[ast.Call]:
     return out
 
 
-def test_the_watcher_can_run_nothing_but_gh():
-    """The strong form of "it starts nothing": not a default, a property.
+def test_the_watcher_can_run_nothing_but_gh_and_qb_start():
+    """The strong form of "it starts nothing on its own": a property, not a default.
 
-    A default can be flipped by a config file. What cannot be flipped is that
-    this module has no code path that launches anything but `gh` — so the claim
-    is read off the module's own syntax tree rather than asserted in prose.
-    Starting a session is `qb-start`'s job (#277): a machine-level permission
-    that ships off, that a repository cannot grant itself, and that nothing here
-    reaches for.
+    This module may now reach a session (#63's follow-up), so the audit is
+    narrower than it was rather than gone. Two programs are permitted and they
+    are named here: `gh`, and `qb-start` via a resolver that TAKES NO ARGUMENT.
+    Everything else — in particular a command built out of a string this module
+    computed, which is the shape an issue body could eventually reach through —
+    still fails.
     """
     tree = ast.parse(Path(iw.__file__).read_text())
     calls = _subprocess_calls(tree)
@@ -141,8 +141,38 @@ def test_the_watcher_can_run_nothing_but_gh():
         assert isinstance(first, ast.List) and first.elts, \
             f"a command built dynamically cannot be audited: {rendered[:80]}"
         head = first.elts[0]
-        assert isinstance(head, ast.Constant) and head.value == "gh", \
-            f"this module may run gh and nothing else: {rendered[:80]}"
+        if isinstance(head, ast.Constant):
+            assert head.value == "gh", \
+                f"the only constant command here is gh: {rendered[:80]}"
+            continue
+        assert ast.unparse(head) == "qb_start_path()", \
+            (f"a command head that is neither 'gh' nor qb_start_path() cannot be "
+             f"audited: {rendered[:80]}")
+
+
+def test_the_qb_start_resolver_cannot_be_pointed_at_anything_else():
+    """`qb_start_path` takes no argument, and that is what the audit above rests on.
+
+    A resolver with a parameter is one a caller could aim: the audit would still
+    see `qb_start_path(...)` at the call site and pass, while the program that
+    actually ran came from wherever the argument did. On a public tracker the
+    honest worst case for "wherever" is a stranger's issue body. So the
+    no-parameter shape is asserted rather than left to review, along with the
+    only program name it may mention.
+    """
+    tree = ast.parse(Path(iw.__file__).read_text())
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "qb_start_path"), None)
+    assert fn is not None, "qb_start_path is what the audit names — it must exist"
+    a = fn.args
+    assert not (a.args or a.posonlyargs or a.kwonlyargs or a.vararg or a.kwarg), \
+        "qb_start_path must take no argument: a parameter is a way to aim it"
+    body = fn.body[1:] if ast.get_docstring(fn) else fn.body
+    names = {n.value for stmt in body for n in ast.walk(stmt)
+             if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    assert names <= {"bin", ""}, \
+        (f"qb_start_path may name no program but QB_START: stray literals {names}")
+    assert iw.QB_START == "qb-start"
 
 
 def test_a_survey_says_it_started_nothing(monkeypatch):
@@ -635,3 +665,235 @@ def test_an_empty_allowlist_still_means_nobody_through_the_new_door():
     """The helper is a second entry point to one allowlist, not a second
     allowlist — so it must fail closed in exactly the same place."""
     assert appetite.author_verdict({}, "prisonblues").allowed is False
+
+
+# ================================================================ AND THE
+# ================================================================ ACTING HALF
+
+#: Two issues that WILL come back actionable, so the tests below are about the
+#: start pass rather than about the gate refusing before it.
+def _actionable(n, title="Thing is broken"):
+    return issue(n, title=title, labels=("p0",), author="prisonblues",
+                 body="## Steps to reproduce\n\nRun it.\n\n## Acceptance\n\n"
+                      "It stops doing that, and a test covers it.\n")
+
+
+@pytest.fixture
+def spawns(monkeypatch):
+    """Records what reached `qb-start`, and answers with whatever exits are queued.
+
+    Patches `subprocess.run` inside the module rather than `start_one`, so the
+    argv the real code builds is what gets asserted — a double at the `start_one`
+    seam would let the `--via`/command/number wiring rot untested.
+    """
+    calls, exits = [], []
+
+    class Done:
+        def __init__(self, code):
+            self.returncode = code
+
+    def fake(argv, **_kw):
+        calls.append(list(argv))
+        if argv[1:2] == ["--policy"]:
+            return Done(exits.pop(0) if exits else 0)
+        return Done(exits.pop(0) if exits else 0)
+
+    monkeypatch.setattr(iw.subprocess, "run", fake)
+    monkeypatch.setattr(iw, "qb_start_path", lambda: "/usr/bin/qb-start")
+    return type("S", (), {"calls": calls, "exits": exits})()
+
+
+def _starts(spawns):
+    """Only the spawn calls — `--policy` is a question, not a start."""
+    return [c for c in spawns.calls if "--policy" not in c]
+
+
+def test_a_survey_starts_nothing_unless_it_is_asked_to(monkeypatch):
+    """`--start` is off, and the proof is that the door is never knocked on.
+
+    `spawning_enabled` raises: a run that consulted the machine's spawn policy at
+    all — even to be told no — would be one line away from acting on a default,
+    and #63's whole argument is that acting is the thing that needs asking for.
+    """
+    monkeypatch.setattr(iw, "_load", lambda spec: open_cfg())
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    monkeypatch.setattr(iw, "spawning_enabled", raises)
+    monkeypatch.setattr(iw, "start_one", raises)
+    assert iw.main([]) == 0
+
+
+def test_a_machine_that_never_opted_in_is_asked_once_not_once_per_issue(spawns,
+                                                                       monkeypatch):
+    """The commonest outcome by far, and it must cost one line.
+
+    `qb-start --policy` answers no, so no spawn is attempted at all — and the
+    reason lands on every actionable issue rather than on the first one.
+    """
+    monkeypatch.setattr(iw, "_load", lambda spec: open_cfg())
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json",
+                        lambda *a, **k: [_actionable(7), _actionable(8)])
+    monkeypatch.setattr(iw, "triage", doable)
+    spawns.exits.append(3)                     # --policy: NOT_ENABLED
+    assert iw.main(["--start"]) == 0
+    assert len(spawns.calls) == 1, "the policy question must be asked once"
+    assert _starts(spawns) == [], "nothing may be started on an opted-out machine"
+
+
+def test_what_reaches_qb_start_is_the_action_the_number_and_the_watch_trigger(
+        spawns, monkeypatch):
+    """The wiring itself: provenance is `watch`, and the brief is a named command.
+
+    `--via watch` is the point. A session that appears on a box nobody is
+    watching raises exactly one question, and this is the argv that has to be
+    able to answer it.
+    """
+    monkeypatch.setattr(iw, "_load", lambda spec: dict(open_cfg(), path="/w/r"))
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    assert iw.main(["--start"]) == 0
+    (argv,) = _starts(spawns)
+    assert argv[0] == "/usr/bin/qb-start"
+    assert argv[1:3] == ["--via", "watch"]
+    assert "/fix-issue" in argv and "7" in argv
+    assert argv[argv.index("--repo-path") + 1] == "/w/r"
+
+
+def test_a_dry_run_starts_nothing_and_says_that_is_why(spawns, monkeypatch,
+                                                       capsys):
+    monkeypatch.setattr(iw, "_load", lambda spec: open_cfg())
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    assert iw.main(["--start", "--dry-run"]) == 0
+    (argv,) = _starts(spawns)
+    assert "--dry-run" in argv
+    assert "would start" in capsys.readouterr().out
+
+
+def test_one_run_starts_at_most_start_max_and_says_so_on_the_rest(spawns,
+                                                                  monkeypatch):
+    """The ceiling this module owns, which is not the one qb-start owns.
+
+    The issues past the cap are recorded as `not attempted` rather than left
+    blank: "the watcher declined this" and "the watcher ran out of room" are
+    different answers to "why did nothing happen".
+    """
+    monkeypatch.setattr(iw, "_load", lambda spec: open_cfg())
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json",
+                        lambda *a, **k: [_actionable(n) for n in (7, 8, 9)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(open_cfg(), limit=9)
+    iw.run_starts(got, open_cfg(), limit=1)
+    assert [a.started for a in got][0] == "started"
+    assert all("--start-max" in a.started for a in got[1:])
+    assert len(_starts(spawns)) == 1
+
+
+def test_a_refusal_about_the_box_stops_the_sweep(spawns, monkeypatch):
+    """At-cap is a fact about the machine, so asking again per issue is noise.
+
+    Thirty identical refusals is how a watcher becomes the thing people mute —
+    and each one would have posted to the board and attempted a claim.
+    """
+    monkeypatch.setattr(iw, "gh_json",
+                        lambda *a, **k: [_actionable(n) for n in (7, 8, 9)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(open_cfg(), limit=9)
+    spawns.exits.extend([0, 5])                # --policy ok, then AT_CAP
+    iw.run_starts(got, open_cfg(), limit=5)
+    assert len(_starts(spawns)) == 1, "a per-box refusal is asked once"
+    assert "spawn cap" in got[0].started
+    assert all("not attempted" in a.started for a in got[1:])
+
+
+def test_a_refusal_about_one_issue_does_not_stop_the_sweep(spawns, monkeypatch):
+    """Somebody holding #7 says nothing about #8, so the next one is still tried."""
+    monkeypatch.setattr(iw, "gh_json",
+                        lambda *a, **k: [_actionable(7), _actionable(8)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(open_cfg(), limit=9)
+    spawns.exits.extend([0, 8, 0])             # --policy ok, HELD, then started
+    iw.run_starts(got, open_cfg(), limit=5)
+    assert len(_starts(spawns)) == 2
+    assert "already holds" in got[0].started
+    assert got[1].started == "started"
+
+
+def test_a_held_issue_is_never_handed_to_qb_start(spawns, monkeypatch):
+    """The signals are the brake, and --start does not reach past them.
+
+    The tempting issue with an open question on it: agent-doable, owner-authored,
+    correctly labelled, and a human decision still owed.
+    """
+    body = TEMPTING["body"] + "\n## Open questions\n\n- Which of the three?\n"
+    monkeypatch.setattr(iw, "gh_json",
+                        lambda *a, **k: [issue(7, labels=("p0",), body=body)])
+    monkeypatch.setattr(iw, "triage", raises)
+    got = iw.survey(open_cfg(), limit=9)
+    iw.run_starts(got, open_cfg(), limit=5)
+    assert got[0].held and got[0].action == "none"
+    assert spawns.calls == [], "a held issue must not even raise the policy question"
+
+
+def test_a_strangers_issue_is_never_handed_to_qb_start(spawns, monkeypatch):
+    """The allowlist bounds the acting half too, and it is checked before the judge."""
+    stranger = dict(_actionable(7), author={"login": "a-stranger"})
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [stranger])
+    monkeypatch.setattr(iw, "triage", raises)
+    got = iw.survey(open_cfg(), limit=9)
+    iw.run_starts(got, open_cfg(), limit=5)
+    assert got[0].action == "none"
+    assert spawns.calls == []
+
+
+def test_what_became_of_the_action_is_in_the_json(spawns, monkeypatch, capsys):
+    """#63 asks for the verdict to be recorded, and JSON is what a consumer reads."""
+    monkeypatch.setattr(iw, "_load", lambda spec: open_cfg())
+    monkeypatch.setattr(iw, "describe", lambda cfg: "acme/r")
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    assert iw.main(["--start", "--json"]) == 0
+    got = json.loads(capsys.readouterr().out)["issues"][0]
+    assert got["action"] == "/fix-issue" and got["started"] == "started"
+
+
+def test_a_survey_that_did_not_start_records_absent_not_refused(monkeypatch):
+    """Blank means "never asked", and that must not read as a refusal."""
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(open_cfg(), limit=9)
+    assert got[0].started == ""
+    assert got[0].as_dict()["started"] == ""
+
+
+def test_an_unattended_run_surveys_but_does_not_spawn(spawns, monkeypatch):
+    """"Start it with a human watching" — the plan's instruction, encoded.
+
+    `HARNESS_UNATTENDED=1` with a repo that has not said loops may write here
+    unwatched: the survey still happens and still reports, and the machine's
+    spawn policy is never even consulted.
+    """
+    monkeypatch.setenv("HARNESS_UNATTENDED", "1")
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(open_cfg(), limit=9)
+    assert got[0].action == "/fix-issue", "the survey half is unaffected"
+    iw.run_starts(got, open_cfg(), limit=5)
+    assert spawns.calls == [], "an unattended run must not consult the spawn policy"
+    assert "unattended" in got[0].started
+
+
+def test_an_unattended_run_may_spawn_where_the_repo_allowed_it(spawns, monkeypatch):
+    """The same switch the repo already answered for writing, not a second one."""
+    monkeypatch.setenv("HARNESS_UNATTENDED", "1")
+    cfg = dict(open_cfg(), issue_filing={"unattended": True})
+    monkeypatch.setattr(iw, "gh_json", lambda *a, **k: [_actionable(7)])
+    monkeypatch.setattr(iw, "triage", doable)
+    got = iw.survey(cfg, limit=9)
+    iw.run_starts(got, cfg, limit=5)
+    assert got[0].started == "started"

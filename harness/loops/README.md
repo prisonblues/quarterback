@@ -1741,20 +1741,51 @@ python3 ~/.claude/loops/issue_watch.py --repo quarterback            # survey th
 python3 ~/.claude/loops/issue_watch.py --repo quarterback --issue 63 # one issue (exits 3 if held)
 python3 ~/.claude/loops/issue_watch.py --repo quarterback --json     # machine-readable
 python3 ~/.claude/loops/issue_watch.py --repo quarterback --announce --comment
+python3 ~/.claude/loops/issue_watch.py --repo quarterback --start --dry-run  # every refusal, nothing started
+python3 ~/.claude/loops/issue_watch.py --repo quarterback --start           # ...and act on the actionable
 ```
 
 Reads a repo's open issues and says, for each one, **what it is waiting on** — a human
-decision, an open dependency, a triage ruling, or nothing. It writes no code, opens no
-PR and starts no session.
+decision, an open dependency, a triage ruling, or nothing. With `--start` it hands the
+ones waiting on nothing to `qb-start`; without it — the default — it writes no code,
+opens no PR and starts no session.
 
-**It reports; it does not act, and that is the deliverable rather than a stage it has
-not reached yet.** #63 measured why: of the twenty-one issues filed here on one day,
-several existed precisely to force a decision, and an agent handed one of those with
-`/fix-issue` does not stop — it picks an architecture, implements it, opens a PR, and
-the decision has been made by whichever model was cheapest that morning. So the refusal
-is the default and acting is what needs justifying. The rung above this one is
-`qb-start` (#277), a per-machine permission that ships off and that a repository cannot
-grant itself; wiring a trigger to it is the follow-up, and it is deliberately not built.
+**The refusal is still the deliverable, and acting is still what needs justifying.** #63
+measured why: of the twenty-one issues filed here on one day, several existed precisely to
+force a decision, and an agent handed one of those with `/fix-issue` does not stop — it
+picks an architecture, implements it, opens a PR, and the decision has been made by
+whichever model was cheapest that morning. So the survey half runs on every repo and the
+acting half runs on almost none.
+
+### Reaching a session takes four yeses, held by four different parties
+
+`--start` is the follow-up #63 deferred, and what makes it safe is not this flag — it is
+that this flag is the *only* one of the four a run can supply for itself:
+
+| | says | lives in |
+|---|---|---|
+| the repo | may a loop choose work here at all? | `issue_pickup.enabled`, off by default |
+| the issue | is this one settled? | no held signal, and `epic.triage` confirming |
+| the run | may I act this time, and how much? | `--start`, off; `--start-max`, 1 |
+| **the machine** | does this box start sessions? | `qb-start`'s policy file |
+
+The last is the one that matters and the one **a repository cannot reach**: it lives in the
+user's config directory, ships absent, and fails closed. A poisoned checkout that flipped
+every switch it owns — its rules file, its CLAUDE.md, an issue body — still starts nothing.
+
+`--start-max` defaults to **1** and is not the same ceiling as `qb-start`'s. `qb-start` caps
+how many spawns may be *live* on a box; this caps how many one *sweep* may ask for. Without
+it, a first run against a backlog whose gate had just been opened would ask for a session per
+actionable issue and be refused thirty times over the box's single slot — thirty board posts
+and thirty attempted claims to start the one session there was room for. A refusal that is
+about the **box** (not enabled, at cap, paced, full, no tmux) stops the sweep for that reason;
+one about a single **issue** (somebody holds it, this command is not allowed here) does not.
+
+Every actionable issue comes back carrying what became of it — `started`, the refusal in
+full, or `not attempted` with the reason the sweep never reached it — on the report and in
+`--json`. "The watcher declined this" and "the watcher ran out of room" are different
+answers to *why did nothing happen*, which #63's acceptance asks to be answerable after the
+fact.
 
 ### The two questions, and why they are not one
 
@@ -1826,11 +1857,16 @@ allowlist rather than a filter — a filter is a list of the phrasings somebody 
 thought of. A stranger's issue is surveyed and reported and its text never reaches a
 judge.
 
-At the end of the ladder the watcher names an action; it does not run one.
+At the end of the ladder the watcher names an action, and runs it only under `--start`.
 `/investigate` is the default rung and `/fix-issue` the escalation, because
 `/investigate` produces understanding and writes no code, so it is the safer answer
 whenever the choice is close. Escalating wants evidence that somebody wrote down what
 "fixed" means — an *Acceptance*, *Steps to reproduce* or *Expected/Actual* heading.
+
+That ladder is why `/investigate` was added to `qb-start`'s `SPAWNABLE` alongside this
+work. The allowlist previously held `/fix-issue` and not `/investigate`, which would have
+made the safe rung the unstartable one: a close call would have had the choice between
+writing code and doing nothing, with the cautious answer unavailable.
 
 ### Saying so
 

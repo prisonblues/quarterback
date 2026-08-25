@@ -50,6 +50,7 @@ let
   # ever disagree, which is the same guard `test_in_flight_drift.py` puts between
   # `qb-admit` and `harness_rules.DEFAULTS`.
   spawnableCommands = [
+    "/investigate"
     "/fix-issue" "/fix-and-review" "/fix-and-land" "/review-pr" "/panel-review-pr"
   ];
 
