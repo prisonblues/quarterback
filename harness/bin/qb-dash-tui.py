@@ -440,17 +440,22 @@ class Dash(App):
 
        DIALS AND SEATS SPAN BOTH, and for one reason said twice: they are the two
        panels whose height is their CONTENT, so a column of their own would buy
-       them nothing and cost the panels beside them half their width. DIALS keeps
+       them nothing and cost the panel beside them half its width. DIALS keeps
        its place at the top for the reason it was put there — it is the
        configuration every panel below is running under — and SEATS keeps the ＋
        findable, which is the one thing that panel has to do (see the cap above).
+       They are also the only `auto` rows: the three under them divide what is
+       left.
 
-       So the two `auto` rows are the two spanning ones, and the three under them
-       divide what is left, weighted the way the narrow shares are — CLAIMED and
-       REVIEW QUEUE ride in the shallower row because they are the two short
-       panels, and pairing them with a tall one would waste the taller half of
-       both cells. */
-    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto auto 2fr 3fr 3fr;
+       THE WEIGHTS ARE THE NARROW ONES, PAIRED. A row is as tall as the taller of
+       the two panels in it wants to be, and narrow that is 2fr for all three
+       pairs — (FLEET, CLAIMED), (OPEN PRs, REVIEW QUEUE), (PLANS, ISSUES) — so
+       equal thirds is the faithful translation. PLANS and ISSUES get the extra
+       because they are the two panels that are always long: the plan is every
+       repo's list and the issue list is every open issue, while OPEN PRs is
+       usually under ten and is often zero. Both short panels ride with a long
+       one rather than with each other, so no row is dead space on a quiet day. */
+    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto auto 2fr 2fr 3fr;
                   grid-gutter: 0 1; }
     #body.-wide .panel { height: 100%; }
     #body.-wide #p_dials { column-span: 2; height: auto; }
