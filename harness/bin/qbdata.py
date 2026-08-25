@@ -1727,9 +1727,15 @@ def plan_rank(item: dict) -> tuple[str, str]:
     to answer it (`rank`, `rank_source`) has been on every row all along.
 
     `~12` means rank 12 is where the item landed because appending was all the
-    endpoint could do — nobody put it there. A bare `12` was placed, submitted or
-    ordered by somebody. The tilde is the same mark the panel title counts with,
-    so `~5 unchosen` in the title and five tildes down the column are one fact.
+    endpoint could do — nobody put it there. A bare `12` was placed, submitted,
+    ordered or picked up by somebody. The tilde is the same mark the panel title
+    counts with, so `~5 unchosen` in the title and five tildes down the column are
+    one fact.
+
+    A `picked-up` row (#427) is deliberately on the bare side of that line. It is
+    at the top because an agent claimed the work, which is a position somebody's
+    action decided — and the holder is already in the `who` column beside it, so
+    the row says who and why without spending the rank cell on it.
     """
     rank = item.get("rank")
     if rank is None:

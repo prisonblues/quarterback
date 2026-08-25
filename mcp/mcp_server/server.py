@@ -545,7 +545,8 @@ def end_session(ctx: Context, session: str, reason: str = "finished") -> dict:
 @mcp.tool()
 def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
           repo_path: str = ".", kind: str | None = None, key: str | None = None,
-          ttl: int = 3600, session: str | None = None, note: str | None = None) -> dict:
+          ttl: int = 3600, session: str | None = None, note: str | None = None,
+          title: str | None = None) -> dict:
     """Claim what you are about to work on, BEFORE you start. This is the post that prevents duplicated work.
 
     Say WHICH resource and the board works out the key: `ref_kind='issue'`,
@@ -554,6 +555,14 @@ def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = Non
     produced two different keys ("issue/<repo>#163" and "work/<repo>#163"), the
     plan and the claims table then reported different answers about the same issue
     in the same second, and nobody could tell who held what.
+
+    **It also puts the work on the plan** (#427). A fresh claim on an issue or a
+    PR writes that repo's plan item, at the top of the list, and hands it back as
+    `plan_item` — because picking work up is what says the fleet is doing this,
+    and until this it was the one act that left the plan unchanged. You do not
+    need `plan_add` afterwards. It costs the human's ordering nothing: the item is
+    claimed by you the moment it exists, and `next` skips claimed items, so the
+    first free pick is unchanged.
 
     ADVISORY, not a lock. It cannot stop a merge: a human in the GitHub UI or an
     agent not on this board lands regardless. What it removes is collisions
@@ -582,11 +591,21 @@ def claim(ctx: Context, ref_kind: str | None = None, ref_value: str | None = Non
             makes the claim exclusive against your own machine, so send it, and
             send the SAME one to renew or release.
         note: One line on what you are doing with it. Send this — it is what the
-            next agent is shown instead of a bare refusal.
+            next agent is shown instead of a bare refusal, and what NAMES the plan
+            item this writes.
+        title: The issue's real title, if you have it to hand. The board cannot
+            read GitHub (deliberately — it has no outbound calls at all), so this
+            is the only way the plan item gets the issue's own name rather than
+            your `note`. Skip it rather than guessing: a made-up handle reads as
+            somebody's summary, where a bare `#426` tells the reader to go and
+            look.
 
-    Returns the claim incl. claim_id; remember it to renew or release.
+    Returns the claim incl. claim_id; remember it to renew or release. On a fresh
+    claim it also returns `plan_item` — the row now at the top of the plan, or
+    null when the key names something the plan cannot hold (a branch you are
+    landing, a board object, a row in somebody's database).
     """
-    body: dict = {"ttl": ttl, "session": session, "note": note}
+    body: dict = {"ttl": ttl, "session": session, "note": note, "title": title}
     if ref_kind and (kind or key):
         # The same refusal `ClaimIn` makes, made here so the tool cannot be the
         # softer door onto it. Preferring the ref silently was worse than either
