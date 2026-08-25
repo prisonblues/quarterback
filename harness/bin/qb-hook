@@ -114,12 +114,67 @@ qb_load_config
 if ! command -v qb_requested_name >/dev/null 2>&1; then
   qb_requested_name() { :; }
 fi
-[ -n "${QUARTERBACK_BASE_URL:-}" ] || exit 0   # unconfigured → no-op, never a guess
-
-command -v jq  >/dev/null 2>&1 || exit 0
-command -v curl >/dev/null 2>&1 || exit 0
-
+# jq and the payload come FIRST, ahead of anything about the board, because one
+# thing this hook says needs neither. jq is this file's parser — every branch
+# below reads the payload with it, including #185's Bash escape — and stdin has
+# to be drained on every path, including the ones that exit early.
+command -v jq >/dev/null 2>&1 || exit 0
 IN=$(cat 2>/dev/null || true)
+
+# ---- the one note that never needed a board ---------------------------------
+# WHICH WAY THIS REPO IS WORKED (#178), and whether the tree you are standing in
+# agrees. Defined up here, above the board checks, because it is a LOCAL fact:
+# `qb-mode` reads the repo's declared mode out of the repo. Below those checks it
+# was unreachable on a host with no board configured, no token, or no curl — none
+# of which has anything to do with the question, and all of which left the guard
+# silent on exactly the hosts least likely to have anyone watching.
+#
+# It resolves NOTHING itself. `qb-mode` goes through the same `harness_rules`
+# layering every other setting does, so this hook cannot become a second place
+# the answer is worked out and quietly differ.
+#
+# Fail-open like everything else here, and one silence on purpose: an absent
+# `qb-mode` says nothing at all rather than guessing. A note that appeared on
+# boxes carrying the harness and vanished on boxes without it would teach people
+# that the absence means "jungle", and it means nothing of the kind.
+#
+# These are DEFINITIONS, which is what lets them sit on #185's hot path without
+# costing it anything: the Bash escape below still leaves before a subprocess is
+# spawned, a token is resolved or a board client is built.
+_mode_note() {   # _mode_note <cwd>: the mode line, plus the remedy if it is contradicted
+  local dir="${1:-}" js
+  [ -n "$dir" ] || return 0
+  command -v qb-mode >/dev/null 2>&1 || return 0
+  # Exit code deliberately ignored: 3 IS the interesting answer and it carries the
+  # body we want. Emptiness is the only failure this can act on.
+  js=$(qb-mode --json "$dir" 2>/dev/null)
+  [ -n "$js" ] || return 0
+  printf '%s' "$js" | jq -r '
+    if .label == null then empty else
+      "quarterback: this repo is worked \(.glyph) \(.label) — \(.how)."
+      + (if .violation then "\n\n" + .violation else "" end)
+    end' 2>/dev/null
+}
+
+_inject() {   # _inject <text>: hand Claude Code some session-start context, or nothing
+  [ -n "${1:-}" ] || return 0
+  jq -nc --arg c "$1" \
+    '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
+}
+
+# Every "this host has no board" exit routes through here rather than exiting
+# where it stands, so the local note survives the board being absent. Nothing
+# else in this file can run without a board, which is why this is the only thing
+# it does before giving up.
+_boardless_exit() {
+  if [ "$EVENT" = "SessionStart" ]; then
+    _inject "$(_mode_note "$(printf '%s' "$IN" | jq -r '.cwd // empty' 2>/dev/null)")"
+  fi
+  exit 0
+}
+
+[ -n "${QUARTERBACK_BASE_URL:-}" ] || _boardless_exit   # unconfigured → never a guess
+command -v curl >/dev/null 2>&1 || _boardless_exit
 
 # ---- the Bash escape, and it is here for a measured reason --------------------
 # `PreToolUse` used to be scoped to `Task`, which fires a handful of times a
@@ -143,7 +198,10 @@ if [ "$EVENT" = "PreToolUse" ] \
   exit 0
 fi
 
-qb_resolve_token || exit 0                     # no token → no-op
+# Below the escape, and #185 put it there deliberately — see above. Routed
+# through `_boardless_exit` for #178's reason: on a SessionStart that gets this
+# far, a host that cannot produce a token has still told us which mode it is in.
+qb_resolve_token || _boardless_exit             # no token
 
 BASE="$QUARTERBACK_BASE_URL"
 AGENT="$QUARTERBACK_AGENT"
@@ -591,36 +649,6 @@ _sync_note() {   # echo the board's advice for THIS checkout, or nothing
   | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null
 }
 
-_mode_note() {   # #178 — which way this repo is worked, and whether this tree agrees
-  # THE ONE THING THAT WOULD HAVE STOPPED 2026-08-17 AND 2026-08-25. Both times
-  # several agents ended up editing one working tree, and both times a build or a
-  # `git reset --hard` destroyed work that nobody could get back. Neither time did
-  # anyone CHOOSE the shared tree: the session started there, and nothing at any
-  # point said which of the fleet's two ways of working was in force. This is the
-  # sentence that says it, before the first tool call rather than after the loss.
-  #
-  # It resolves NOTHING itself. `qb-mode` reads the repo's declared mode through
-  # the same `harness_rules` layering every other setting goes through, so this
-  # hook cannot become a second place the answer is worked out and quietly differ.
-  #
-  # Fail-open like everything else here, and one extra silence on purpose: an
-  # unconfigured or absent `qb-mode` says nothing at all. A note that appeared on
-  # boxes with the harness and vanished on boxes without it would teach people the
-  # absence means "jungle", and the absence means nothing of the kind.
-  [ -n "$cwd" ] || return 0
-  command -v qb-mode >/dev/null 2>&1 || return 0
-  local js
-  # Exit code deliberately ignored: 3 IS the interesting answer and it carries the
-  # body we want. Emptiness is the only failure this can act on.
-  js=$(qb-mode --json "$cwd" 2>/dev/null)
-  [ -n "$js" ] || return 0
-  printf '%s' "$js" | jq -r '
-    if .label == null then empty else
-      "quarterback: this repo is worked \(.glyph) \(.label) — \(.how)."
-      + (if .violation then "\n\n" + .violation else "" end)
-    end' 2>/dev/null
-}
-
 _publish_push() {   # announce HEAD if a push just put it on the tracking branch
   [ -n "$cwd" ] || return 0
   local top sha up subject
@@ -930,7 +958,7 @@ case "$EVENT" in
     # live in this repo" reads completely differently depending on whether this
     # repo expects them to share a tree, and the answer has to arrive first to
     # frame it (#178).
-    mode_note="$(_mode_note)"
+    mode_note="$(_mode_note "$cwd")"
     [ -n "$mode_note" ] && start_notes="${start_notes:+$start_notes$SEP}$mode_note"
 
     # Presence/collision (v2.7): our lease (with repo) is registered; ask who ELSE
@@ -997,10 +1025,7 @@ case "$EVENT" in
         fi
       fi
     fi
-    if [ -n "$start_notes" ]; then
-      jq -nc --arg c "$start_notes" \
-        '{hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'
-    fi
+    _inject "$start_notes"
     ;;
   UserPromptSubmit)
     _state working

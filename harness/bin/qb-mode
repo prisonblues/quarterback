@@ -25,10 +25,24 @@ question with one answer, and the failure mode of them each deriving it is the o
 `harness_rules` was built to prevent — several places a setting is written down,
 disagreeing quietly.
 
-The rules themselves stay where they are. This resolves nothing: it calls
-`harness_rules.resolve_mode`, which applies the same layering (`.harness-rules.sample`
-on the default branch, this box's overlay, the board's dials) that every other
-harness setting goes through. A second reader of that file would be a second answer.
+The rules themselves stay where they are. This resolves nothing of its own: it calls
+`harness_rules.resolve_mode` over the repo's rules file, so a second reader of that
+file — with its own idea of precedence — never comes into existence.
+
+WHICH REF, and it is the one security-shaped choice here. This reads
+`origin/<default-branch>` and NOT the working tree, which is the opposite of what
+`resolve_repo` does for an interactive caller. That default is right for what it was
+written for: a person who typed a command IS the authorization, and editing the rules
+locally should take effect at once. Nothing typed this. It runs from a session-start
+hook, on whatever happened to be checked out, and "the agent started in this
+directory" is not anybody approving that branch's policy.
+
+Left on the working tree, the effect was worse than theoretical: writing
+`{"mode": {"name": "jungle"}}` into `.harness-rules.sample` — uncommitted, not even
+on a branch — turned the shared-checkout alarm off. A guard whose whole purpose is
+to be hard to ignore had an accidental off switch, in the file it reads.
+
+The board's dial layer is not consulted at all; see the resolver call below.
 
 IT NEVER STOPS ANYTHING, which is the same bargain `worktree-holder` strikes and
 for the same reason. Exit 3 is a caller's cue to say so and offer the remedy, not
@@ -96,17 +110,33 @@ def main() -> int:
     # seconds of waiting is charged to every session on the fleet, and on a status
     # line, where it is charged again on every render.
     #
-    # `setdefault`, so an operator or a test that has already set the variable
-    # keeps whatever they meant by it. Being SET AT ALL is the documented offline
-    # switch; empty means "this run has no dials", which is the truth here.
-    os.environ.setdefault(harness_rules.DIALS_ENV, "")
+    # Set unconditionally, not `setdefault`. The earlier version deferred to a
+    # caller who had already set it, which made the "never different" claim above
+    # conditional on the environment: an inherited `QUARTERBACK_DIALS` holding a
+    # cost dial would be parsed and applied on a path that has no business reading
+    # one, and a malformed one would `SystemExit` out of a status line. This
+    # command answers one question that no dial can move, so it takes the answer
+    # off the table rather than negotiating over it.
+    os.environ[harness_rules.DIALS_ENV] = ""
 
     try:
-        cfg = harness_rules.resolve_repo(a.repo)
-    except (harness_rules.RepoNotFound, SystemExit) as exc:
-        # SystemExit too: `resolve_repo` raises it for a checkout with no `origin`,
-        # which is a perfectly ordinary local repo and must not take a status bar
-        # down with it.
+        # `from_default_branch=True` — see the module docstring for why this does
+        # not follow `resolve_repo`'s interactive default.
+        cfg = harness_rules.resolve_repo(a.repo, from_default_branch=True)
+    except (Exception, SystemExit) as exc:  # noqa: BLE001 — see below
+        # EVERY failure is "cannot tell", and the breadth is the point rather than
+        # laziness. This has one job on two hot paths — a session-start hook and a
+        # status line — and the documented contract is three answers, of which 4 is
+        # "I could not work it out". A resolver reaching the filesystem, git and a
+        # JSON parser has more ways to fail than a caller can enumerate: a missing
+        # `git` is FileNotFoundError, a rules file deleted mid-read is OSError, a
+        # repo with no `origin` is SystemExit. Narrow catches turned each of those
+        # into a traceback where the contract promised a number.
+        #
+        # `SystemExit` is named alongside `Exception` rather than covered by it:
+        # it descends from BaseException, so a bare `except Exception` misses it —
+        # which is how widening this catch briefly REGRESSED the one failure it
+        # already handled, a checkout with no `origin` remote.
         if not a.quiet:
             print(f"qb-mode: {exc}", file=sys.stderr)
         return CANNOT_TELL
@@ -120,9 +150,10 @@ def main() -> int:
         print(json.dumps({
             "mode": mode.name, "isolation": mode.isolation, "landing": mode.landing,
             "mixed": mode.mixed, "label": mode.label, "glyph": mode.glyph,
-            "how": mode.how, "repo": cfg["github"], "root": tree.root,
-            "primary": tree.primary, "shared_checkout": tree.shared,
-            "worktrees": tree.worktrees, "violation": problem,
+            "how": mode.how, "declared": mode.declared, "repo": cfg["github"],
+            "root": tree.root, "primary": tree.primary,
+            "dispenses": tree.dispenses, "worktrees": tree.worktrees,
+            "violation": problem,
         }, indent=2, ensure_ascii=False))
     elif a.bar:
         print(f"{mode.glyph} {mode.label}")

@@ -247,7 +247,16 @@ DEFAULTS: dict = {
     # what it is: it is the safe end of both axes. An unconfigured repo gets its
     # own worktree and a PR gate, and a repo that wants the shared tree asks.
     "mode": {
-        "name": "cleanroom",
+        # `null` is "nobody has said", and it is NOT the same fact as
+        # `"cleanroom"`. Both resolve to cleanroom — see MODES — but the alarm
+        # treats them differently, because the confidence behind them differs: a
+        # repo that DECLARED cleanroom has been told that its primary checkout is
+        # not a place to work, and a repo that merely inherited the default might
+        # be somebody's private clone that nobody else will ever open. Collapsing
+        # the two would either nag every lone clone on the box or say nothing to
+        # a repo that asked to be protected, and there is no third setting of one
+        # flag that does both.
+        "name": None,
         # THE TWO AXES, SEPARABLE ON PURPOSE. #178 is explicit that isolation (own
         # worktree / shared checkout) and landing (PR gate / direct commit) are two
         # dials which happen to move together today, and that wiring them together
@@ -1053,6 +1062,11 @@ class Mode(NamedTuple):
     isolation: str
     landing: str
     mixed: bool
+    #: Somebody chose this, rather than it falling out of the defaults. True when
+    #: the rules file names a mode or pins the isolation axis itself. Read by
+    #: `mode_violation`, which is willing to speak up on thinner evidence about a
+    #: repo that asked for cleanroom than about one that never mentioned it.
+    declared: bool
     problems: tuple[str, ...]
 
     @property
@@ -2735,16 +2749,34 @@ def resolve_mode(cfg: dict) -> Mode:
     if not isinstance(block, dict):
         block = {}
     problems: list[str] = []
-    fallback = DEFAULTS["mode"]["name"]
+    fallback = "cleanroom"
+
+    # DECLARED means somebody chose, by either route: naming a mode, or pinning
+    # the isolation axis without naming one. Read off the file's own values before
+    # any fallback is applied, because after that every repo looks declared.
+    declared = block.get("name") is not None or block.get("isolation") is not None
 
     name = block.get("name") or fallback
-    if name not in MODES:
+    # `not in` on a dict hashes the operand, so a rules file holding
+    # `"name": ["jungle"]` raised TypeError out of a settings resolver — a crash
+    # for a caller whose whole contract is that a bad value warns and falls back.
+    # The type is checked rather than the exception caught: "that is not a mode
+    # name" is a better sentence than "unhashable type: 'list'".
+    if not isinstance(name, str):
+        problems.append(
+            f"mode.name must be a string naming a mode "
+            f"({', '.join(sorted(MODES))}), not {type(name).__name__} — "
+            f"working as {fallback!r}.")
+        name, declared = fallback, False
+    elif name not in MODES:
         problems.append(
             f"mode.name {name!r} is not a mode this harness knows "
             f"({', '.join(sorted(MODES))}) — working as {fallback!r}, which asks "
             f"for an isolated worktree and a PR. If this repo really is worked in "
             f"the shared checkout, that is `jungle` and it needs spelling right.")
-        name = fallback
+        # NOT declared: a word that names no mode is not a choice of mode, and
+        # the alarm should not speak up more confidently because of a typo.
+        name, declared = fallback, False
     preset = MODES[name]
 
     axes: dict[str, str] = {}
@@ -2770,7 +2802,7 @@ def resolve_mode(cfg: dict) -> Mode:
 
     return Mode(name=name, isolation=axes["isolation"], landing=axes["landing"],
                 mixed=any(axes[a] != preset[a] for a in MODE_AXES),
-                problems=tuple(problems))
+                declared=declared, problems=tuple(problems))
 
 
 class Tree(NamedTuple):
@@ -2781,8 +2813,12 @@ class Tree(NamedTuple):
     up in by DEFAULT, because that is where a session starts unless something hands
     it somewhere else, and it is therefore the one several agents end up in at once.
 
-    `dispenses` is what makes the primary tree a SHARED one rather than merely the
-    first one. A lone clone that nobody cuts worktrees from is a private tree that
+    `dispenses` is what makes the primary tree a shared one rather than merely the
+    first one — a condition `mode_violation` weighs, deliberately, rather than a
+    combined `shared` flag on this type. There was one, and it read as the
+    authoritative answer to "is this tree at risk" while being only one of the two
+    ways a tree can be. Removed rather than corrected: a caller reaching for a
+    single boolean wants `mode_violation`, which knows what was declared. A lone clone that nobody cuts worktrees from is a private tree that
     happens to be primary, and telling its owner to go and get a worktree would be
     the false positive that teaches people to ignore the true ones. Two things say
     a checkout hands out worktrees, and either is enough: `.worktree.json`, which
@@ -2796,10 +2832,33 @@ class Tree(NamedTuple):
     dispenses: bool
     worktrees: int
 
-    @property
-    def shared(self) -> bool:
-        """The tree another agent can walk into without being sent there."""
-        return self.primary and self.dispenses
+
+def _worktree_records(root: str | Path) -> list[dict[str, str]]:
+    """`git worktree list --porcelain`, parsed into one dict per checkout.
+
+    Parsed rather than grepped for `^worktree `, because the attributes are the
+    interesting part. `prunable` marks a registration whose directory is GONE —
+    git keeps the entry until someone runs `git worktree prune` — and a count that
+    included those answered "a linked worktree exists" on the strength of one that
+    had been deleted. `bare` marks a repository with no working tree at all.
+
+    Git documents the main worktree first, which is what makes `records[0]` the
+    answer to "where is the primary checkout" for a submodule or a
+    `--separate-git-dir` clone, where deriving it from the common git dir is wrong.
+    """
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in _git(root, "worktree", "list", "--porcelain").stdout.splitlines():
+        if not line.strip():
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        current[key] = value
+    if current:
+        records.append(current)
+    return records
 
 
 def tree_of(root: str | Path) -> Tree:
@@ -2813,18 +2872,50 @@ def tree_of(root: str | Path) -> Tree:
     # Both are printed relative to `root` in the primary checkout (`.git` and
     # `.git`) and absolute from a linked one (`…/.git/worktrees/x` and `…/.git`),
     # so they are resolved against `root` before being compared rather than
-    # compared as the strings git happened to choose.
+    # compared as the strings git happened to choose. Asked from a SUBDIRECTORY
+    # the two disagree in spelling and agree once resolved, which is why they are
+    # resolved rather than compared raw.
     base = Path(root)
     primary = (bool(git_dir)
                and Path(base, git_dir).resolve() == Path(base, common).resolve())
-    main_root = Path(base, common).resolve().parent if common else base
 
-    listed = _git(root, "worktree", "list", "--porcelain").stdout
-    worktrees = sum(1 for line in listed.splitlines() if line.startswith("worktree "))
+    records = _worktree_records(root)
+    # Live checkouts only. A `prunable` record is a directory somebody deleted and
+    # git has not been told to forget, and counting it said "this checkout hands
+    # out worktrees" about one that currently hands out none. `bare` has no working
+    # tree to share, so it is not one either.
+    live = [r for r in records if "prunable" not in r and "bare" not in r]
+
+    # THE PRIMARY CHECKOUT'S OWN ROOT, asked of git rather than inferred by taking
+    # the parent of the common git directory. That inference holds only for the
+    # ordinary `<root>/.git` layout and is wrong wherever the git directory lives
+    # somewhere else — under a superproject's `.git/modules/<name>` for a
+    # submodule, or at an arbitrary path under `git init --separate-git-dir`. Both
+    # looked for `.worktree.json` in a directory that is not the checkout, found
+    # nothing, and reported a shared tree as private.
+    #
+    # Two cases, because no single question answers both. Standing IN the primary
+    # checkout, `--show-toplevel` is the direct answer and survives every layout,
+    # including a subdirectory. Standing in a LINKED worktree it would answer about
+    # this worktree, so the main one is read off the porcelain — which git
+    # documents as listing the main worktree first, and which is only ever reached
+    # from a layout that has linked worktrees, i.e. an ordinary one.
+    #
+    # `worktree list` alone would not do for the first case: under
+    # `--separate-git-dir` it reports the GIT DIRECTORY as the worktree path
+    # (verified: `worktree /tmp/x/elsewhere.git` for a checkout at `/tmp/x/w`),
+    # which is the same class of wrong answer this replaced.
+    top = _git(root, "rev-parse", "--show-toplevel").stdout.strip()
+    if primary and top:
+        main_root = Path(top)
+    elif live:
+        main_root = Path(live[0]["worktree"])
+    else:
+        main_root = base
 
     return Tree(root=str(base), primary=primary,
-                dispenses=(main_root / ".worktree.json").is_file() or worktrees > 1,
-                worktrees=worktrees)
+                dispenses=(main_root / ".worktree.json").is_file() or len(live) > 1,
+                worktrees=len(live))
 
 
 def mode_violation(mode: Mode, tree: Tree) -> str | None:
@@ -2837,11 +2928,26 @@ def mode_violation(mode: Mode, tree: Tree) -> str | None:
     reasonably choose, and a harness that nagged about it would be pushing a
     jungle repo toward the ceremony #178 explicitly says not to push it toward.
 
+    HOW MUCH EVIDENCE IT TAKES DEPENDS ON WHO ASKED. A repo that DECLARED cleanroom
+    has stated that its primary checkout is not a place to work, and being in it is
+    enough — nothing else has to be true. A repo that merely inherited the default
+    gets the benefit of the doubt until the checkout is one that actually hands out
+    worktrees, because there it might be somebody's private clone that no second
+    agent will ever open.
+
+    That split replaces a single `tree.shared` test, which was wrong in the
+    direction that matters. It required `dispenses` of every repo, so a declared
+    cleanroom with two agents in a primary checkout that had never cut a worktree —
+    the dangerous state, not a harmless one — reported no problem at all. The
+    guard was aiming at the lone clone and caught the first collision with it.
+
     It says what to DO rather than what is wrong, and it does NOT restate the mode:
     every caller prints this directly under the mode line, and a warning whose first
     clause the reader has just read is a warning they start skimming.
     """
-    if mode.isolation != "worktree" or not tree.shared:
+    if mode.isolation != "worktree" or not tree.primary:
+        return None
+    if not (mode.declared or tree.dispenses):
         return None
     return (f"You are in the SHARED checkout ({tree.root}), and work here belongs "
             f"in a worktree of its own. Take one before you edit: "

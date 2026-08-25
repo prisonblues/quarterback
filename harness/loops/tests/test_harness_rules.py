@@ -7,6 +7,7 @@ branch could rewrite the policy governing its own review.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -1656,22 +1657,23 @@ def test_a_lone_clone_dispenses_nothing(repo):
     nobody cuts worktrees from is primary and is NOT shared, and nagging its owner
     is how a true alarm gets trained into noise."""
     tree = hr.tree_of(repo)
-    assert (tree.primary, tree.dispenses, tree.shared) == (True, False, False)
+    assert (tree.primary, tree.dispenses) == (True, False)
+    assert hr.mode_violation(hr.resolve_mode({}), tree) is None
 
 
 def test_a_worktree_json_makes_the_primary_checkout_a_shared_one(repo):
     (repo / ".worktree.json").write_text("{}\n")
-    assert hr.tree_of(repo).shared is True
+    assert hr.tree_of(repo).dispenses is True
 
 
 def test_an_existing_worktree_says_the_same_thing_without_being_declared(repo, tmp_path):
     git(repo, "worktree", "add", "-q", "-b", "side", str(tmp_path / "myrepo-side"))
-    assert hr.tree_of(repo).shared is True
+    assert hr.tree_of(repo).dispenses is True
 
 
 def test_somewhere_that_is_not_a_checkout_raises_no_alarm(tmp_path):
     tree = hr.tree_of(tmp_path)
-    assert tree.shared is False
+    assert (tree.primary, tree.dispenses) == (False, False)
     assert hr.mode_violation(hr.resolve_mode({}), tree) is None
 
 
@@ -1707,3 +1709,80 @@ def test_a_mixed_repo_is_judged_on_the_isolation_axis_alone(repo):
     write_rules(repo, {"mode": {"name": "cleanroom", "landing": "direct"}})
     mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
     assert hr.mode_violation(mode, hr.tree_of(repo)) is not None
+
+
+# ------------------------------------------ what a codex review found (#448)
+#
+# Four defects an adversarial read turned up after the first cut, each
+# reproduced before it was believed. Kept together so the next person changing
+# `mode_violation` or `tree_of` can see which cases were bought the hard way.
+
+def test_declaring_cleanroom_is_enough_on_its_own(repo):
+    """The dangerous state the first cut reported as fine: a repo that ASKED for
+    cleanroom, its primary checkout, and no worktree ever cut from it. Requiring
+    `dispenses` of every repo aimed at the lone private clone and caught the first
+    collision instead — nothing has to have gone wrong yet for this to be wrong."""
+    write_rules(repo, {"mode": {"name": "cleanroom"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    tree = hr.tree_of(repo)
+    assert (mode.declared, tree.dispenses) == (True, False)
+    assert hr.mode_violation(mode, tree) is not None
+
+
+def test_pinning_the_axis_counts_as_declaring_it(repo):
+    """`{"isolation": "worktree"}` with no mode name is a choice about trees."""
+    write_rules(repo, {"mode": {"isolation": "worktree"}})
+    assert hr.resolve_mode(hr.resolve_repo(str(repo))).declared is True
+
+
+def test_an_undeclared_repo_still_gets_the_benefit_of_the_doubt(repo):
+    """The other half of the same split, and why it is not just "always warn"."""
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    assert mode.declared is False
+    assert hr.mode_violation(mode, hr.tree_of(repo)) is None
+
+
+def test_a_misspelled_mode_is_not_a_declaration(repo, capsys, fresh_reports):
+    """It falls back to cleanroom, and must not then warn MORE confidently on the
+    strength of a typo than it would have with the key absent."""
+    write_rules(repo, {"mode": {"name": "clanroom"}})
+    mode = hr.resolve_mode(hr.resolve_repo(str(repo)))
+    capsys.readouterr()
+    assert (mode.name, mode.declared) == ("cleanroom", False)
+    assert hr.mode_violation(mode, hr.tree_of(repo)) is None
+
+
+def test_a_mode_name_that_is_not_a_string_warns_rather_than_raising(capsys,
+                                                                   fresh_reports):
+    """`name not in MODES` hashes its operand, so a JSON array raised TypeError out
+    of a resolver whose contract is that a bad value warns and falls back."""
+    mode = hr.resolve_mode({"mode": {"name": ["jungle"]}})
+    assert "must be a string" in capsys.readouterr().err
+    assert (mode.name, mode.declared) == ("cleanroom", False)
+
+
+def test_a_deleted_worktree_does_not_count_as_one(repo, tmp_path):
+    """Git keeps a registration after its directory is gone, marked `prunable`,
+    until somebody prunes. Counting those said "this checkout hands out worktrees"
+    about one that currently hands out none."""
+    wt = tmp_path / "myrepo-side"
+    git(repo, "worktree", "add", "-q", "-b", "side", str(wt))
+    assert hr.tree_of(repo).worktrees == 2
+    shutil.rmtree(wt)
+    assert "prunable" in git(repo, "worktree", "list", "--porcelain").stdout
+    assert hr.tree_of(repo).worktrees == 1
+    assert hr.tree_of(repo).dispenses is False
+
+
+def test_the_marker_is_found_when_the_git_dir_lives_elsewhere(tmp_path):
+    """`.worktree.json` was looked for beside the COMMON GIT DIR, which is the
+    checkout only in the ordinary `<root>/.git` layout. With `--separate-git-dir`
+    the parent of the git directory is not the working tree, so a shared checkout
+    read as private. The work-tree path comes from git now."""
+    work, elsewhere = tmp_path / "w", tmp_path / "elsewhere.git"
+    work.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main",
+                    f"--separate-git-dir={elsewhere}", str(work)], check=True)
+    (work / ".worktree.json").write_text("{}\n")
+    assert (work / ".git").is_file()            # a FILE pointing at elsewhere.git
+    assert hr.tree_of(work).dispenses is True

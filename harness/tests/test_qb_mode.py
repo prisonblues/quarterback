@@ -69,21 +69,38 @@ def run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A checkout with an origin, which `resolve_repo` requires to name a repo."""
+    """A checkout with a real `origin` on disk, on a pushed `main`.
+
+    A bare clone rather than a URL, because `qb-mode` reads the rules from
+    `origin/<default>` — so a fixture whose origin does not exist would exercise
+    the "protected ref unreadable" fallback in every test rather than the path
+    under test. The URL is set first and then rewritten, so `resolve_repo` still
+    names the repo `acme/myrepo`.
+    """
     work = tmp_path / "myrepo"
     work.mkdir()
     git(work, "init", "-q", "-b", "main")
     git(work, "config", "user.email", "t@example.com")
     git(work, "config", "user.name", "T")
-    git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
     (work / "README").write_text("x\n")
     git(work, "add", "-A")
     git(work, "commit", "-qm", "init")
+
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
+    git(work, "remote", "set-url", "origin", str(bare))
+    git(work, "push", "-q", "origin", "main")
+    git(work, "remote", "set-head", "origin", "main")
     return work
 
 
 def declare(repo: Path, mode: dict) -> None:
+    """Declare a mode the way a repo really does: committed and pushed."""
     (repo / ".harness-rules.sample").write_text(json.dumps({"mode": mode}))
+    git(repo, "add", "--", ".harness-rules.sample")
+    git(repo, "commit", "-qm", "mode")
+    git(repo, "push", "-q", "origin", "main")
 
 
 # ------------------------------------------------------------- the exit codes
@@ -99,7 +116,7 @@ def test_a_private_checkout_agrees_and_says_so(repo):
 
 
 def test_the_shared_checkout_of_a_cleanroom_repo_exits_3(repo):
-    (repo / ".worktree.json").write_text("{}\n")
+    declare(repo, {"name": "cleanroom"})
     r = run(cwd=repo)
     assert r.returncode == VIOLATED
     # The remedy, not just the complaint — and on stderr, so a caller taking the
@@ -109,7 +126,7 @@ def test_the_shared_checkout_of_a_cleanroom_repo_exits_3(repo):
 
 
 def test_a_worktree_of_that_same_repo_agrees(repo, tmp_path):
-    (repo / ".worktree.json").write_text("{}\n")
+    declare(repo, {"name": "cleanroom"})
     wt = tmp_path / "myrepo-side"
     git(repo, "worktree", "add", "-q", "-b", "side", str(wt))
     assert run(cwd=wt).returncode == AGREES
@@ -118,6 +135,7 @@ def test_a_worktree_of_that_same_repo_agrees(repo, tmp_path):
 def test_a_jungle_repo_is_content_in_its_shared_checkout(repo):
     (repo / ".worktree.json").write_text("{}\n")
     declare(repo, {"name": "jungle"})
+    
     r = run(cwd=repo)
     assert r.returncode == AGREES
     assert "~ JUNGLE" in r.stdout
@@ -146,7 +164,7 @@ def test_a_checkout_with_no_origin_cannot_tell_rather_than_crashing(tmp_path):
 
 def test_it_answers_about_somewhere_else(repo, tmp_path):
     """The hook asks about the session's cwd from wherever it happens to run."""
-    (repo / ".worktree.json").write_text("{}\n")
+    declare(repo, {"name": "cleanroom"})
     r = run(str(repo), cwd=tmp_path)
     assert r.returncode == VIOLATED
     assert "CLEANROOM" in r.stdout
@@ -155,14 +173,14 @@ def test_it_answers_about_somewhere_else(repo, tmp_path):
 def test_bar_is_the_glyph_and_the_label_and_nothing_else(repo):
     """A status line renders this next to everything else it already shows, so it
     must not be handed a sentence."""
-    (repo / ".worktree.json").write_text("{}\n")
+    declare(repo, {"name": "cleanroom"})
     r = run("--bar", cwd=repo)
     assert r.stdout.strip() == "⌂ CLEANROOM"
     assert r.returncode == VIOLATED       # still the true answer, just not said
 
 
 def test_quiet_says_nothing_at_all(repo):
-    (repo / ".worktree.json").write_text("{}\n")
+    declare(repo, {"name": "cleanroom"})
     r = run("--quiet", cwd=repo)
     assert (r.stdout, r.stderr, r.returncode) == ("", "", VIOLATED)
 
@@ -185,6 +203,7 @@ def test_the_json_carries_the_axes_not_just_the_name(repo):
     declare(repo, {"name": "jungle"})
     said = json.loads(run("--json", cwd=repo).stdout)
     assert said["isolation"] == "shared" and said["landing"] == "direct"
+    assert said["declared"] is True
     assert said["violation"] is None
 
 
@@ -247,3 +266,104 @@ def test_it_does_not_wait_on_a_board_it_cannot_reach(repo):
     import harness_rules  # noqa: PLC0415 — the timeout it would have paid
     assert elapsed < harness_rules.DIALS_TIMEOUT, (
         f"took {elapsed:.1f}s — long enough to have waited on the board")
+
+
+# --------------------------------------- what a codex review found (#448)
+
+def test_the_working_tree_cannot_turn_the_alarm_off(repo):
+    """THE REGRESSION THIS SUITE EXISTS FOR. `resolve_repo` reads the working tree
+    for an interactive caller, on the argument that a human who typed a command IS
+    the authorization. Nothing types this — it runs from a session-start hook, on
+    whatever happened to be checked out. So an uncommitted edit to the rules file
+    silenced the shared-checkout alarm: a guard whose whole purpose is to be hard
+    to ignore, with an off switch sitting in the file it reads.
+
+    Not committed, not pushed, not even on a branch. Just written.
+    """
+    declare(repo, {"name": "cleanroom"})
+    assert run(cwd=repo).returncode == VIOLATED
+
+    (repo / ".harness-rules.sample").write_text(json.dumps({"mode": {"name": "jungle"}}))
+    r = run(cwd=repo)
+    assert r.returncode == VIOLATED, "an uncommitted edit changed the answer"
+    assert "CLEANROOM" in r.stdout
+
+
+def test_a_branch_cannot_flip_the_mode_before_it_lands(repo):
+    """The committed form of the same thing: policy for a shared checkout is not
+    something one unmerged branch gets to decide for everyone in it."""
+    declare(repo, {"name": "cleanroom"})
+    git(repo, "checkout", "-q", "-b", "feat/jungle")
+    (repo / ".harness-rules.sample").write_text(json.dumps({"mode": {"name": "jungle"}}))
+    git(repo, "add", "--", ".harness-rules.sample")
+    git(repo, "commit", "-qm", "go jungle")
+    assert run(cwd=repo).returncode == VIOLATED
+
+
+def test_declaring_cleanroom_is_enough_without_a_worktree_json(repo):
+    """The state the first cut called fine: a repo that asked for cleanroom, in its
+    primary checkout, that has never cut a worktree."""
+    declare(repo, {"name": "cleanroom"})
+    assert not (repo / ".worktree.json").exists()
+    assert run(cwd=repo).returncode == VIOLATED
+
+
+def test_an_undeclared_repo_is_left_alone(repo):
+    """And the other half: nobody said cleanroom, nothing dispenses worktrees, so
+    this is somebody's private clone until there is evidence otherwise."""
+    r = run(cwd=repo)
+    assert r.returncode == AGREES
+    assert json.loads(run("--json", cwd=repo).stdout)["declared"] is False
+
+
+def test_no_git_on_path_is_cannot_tell_not_a_traceback(repo, tmp_path):
+    """`_git` shells out directly, so a missing git raised FileNotFoundError out of
+    a command whose contract is three exit codes. Both hot callers — a hook and a
+    status line — would have shown a stack trace."""
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+    env = dict(os.environ, PATH=str(empty),
+               XDG_CONFIG_HOME=str(HARNESS / ".no-such-config"))
+    env["QUARTERBACK_DIALS"] = ""
+    r = subprocess.run([sys.executable, str(QB_MODE)], cwd=str(repo),
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == CANNOT_TELL
+    assert "Traceback" not in r.stderr
+
+
+# ------------------------------------------------ and the hook that calls it
+
+def test_the_note_survives_a_host_with_no_board(repo):
+    """`qb-hook` exits on no board URL, no token, or no curl — all before the mode
+    note could run. None of the three has anything to do with the question: the
+    mode is read out of the repo. It left the guard silent on exactly the hosts
+    least likely to have anybody watching."""
+    declare(repo, {"name": "cleanroom"})
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN",
+                        "QUARTERBACK_TOKEN_CMD")}
+    env["QUARTERBACK_CONFIG"] = str(tmp_nonexistent := HARNESS / ".no-such-config")
+    env["QUARTERBACK_DIALS"] = ""
+    env["PATH"] = f"{HARNESS / 'bin'}:{env['PATH']}"
+    assert not tmp_nonexistent.exists()
+    r = subprocess.run(["bash", str(QB_HOOK), "SessionStart"],
+                       input=json.dumps({"session_id": "t", "cwd": str(repo)}),
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0
+    said = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert "CLEANROOM" in said and "create-worktree" in said
+
+
+def test_a_boardless_host_says_nothing_on_other_events(repo):
+    """The note is a session-start thing. Every other event on a boardless host
+    still exits silently, exactly as it did before."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN",
+                        "QUARTERBACK_TOKEN_CMD")}
+    env["QUARTERBACK_CONFIG"] = str(HARNESS / ".no-such-config")
+    env["PATH"] = f"{HARNESS / 'bin'}:{env['PATH']}"
+    r = subprocess.run(["bash", str(QB_HOOK), "UserPromptSubmit"],
+                       input=json.dumps({"session_id": "t", "cwd": str(repo),
+                                         "prompt": "x"}),
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert (r.returncode, r.stdout) == (0, "")
