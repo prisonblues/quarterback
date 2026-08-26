@@ -2450,6 +2450,28 @@ def dials_url(cfg, repo: str | None = None) -> str:
     one endpoint over. Printing the URL is the whole of what makes that honest:
     #443 is the record of a person being told the reorder was theirs to do and
     replying "i don't know how to re-order".
+
+    **The credential that would change this exists, and it excludes dials on
+    purpose.** #479/#480 add `X-Agent-Elevated` — a per-machine secret an agent
+    presents beside its bearer, which `app.auth.delegated()` accepts for a NAMED
+    SET of writes while the caller keeps its own identity. `POST /plan/reorder`
+    and `POST /plan/item/update` are in that set. `POST /dials` is deliberately
+    not, "including the fleet `tempo` of #474", and there is a test asserting so.
+
+    That is why this function still exists after that credential lands, and it is
+    the thing to read before adding a write verb here: the gap is not that nobody
+    built the door, it is that the door was built with this room left off the key.
+    Moving `POST /dials` from `human` to `delegated` is one dependency and one
+    deleted test; it is also #479's map, which is a decision and not a patch.
+
+    **The rejected design is the one to be careful of.** An earlier cut had the
+    dashboard hold Rich's signed-in Authelia cookie and call the browser vhost —
+    a `HumanClient` in this very file, on `feat/dash-wide-grid`. It was rejected
+    before it shipped (#479, "What was rejected"): the agent BECOMES `human/rich`,
+    every human-only endpoint opens at once from one credential for any process
+    on the box, and provenance is destroyed — an agent's write is recorded as a
+    person's. A dials write built that way would be #335 reopened by a longer
+    route, so if it reappears it wants `delegated`, never the cookie.
     """
     #: The repo rides along so a reader arriving from a terminal lands on the scope
     #: the terminal was showing rather than on the fleet's. A screen watching

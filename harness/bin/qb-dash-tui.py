@@ -1853,6 +1853,12 @@ class Dash(App):
         person told the reorder was theirs to do, in a terminal, whose reply was
         "i don't know how to re-order". A door nobody can find is the same as no
         door.
+
+        **Not "nobody has built the write path yet".** #479/#480's delegated
+        credential is that path, and it names the writes it opens: the plan's
+        order and a plan item's note. `POST /dials` is excluded on purpose and
+        the exclusion has a test. `qbdata.dials_url` carries the full argument
+        and the seam to change if that decision ever moves.
         """
         self.open_url(qd.dials_url(self.cfg))
         self.say("setting a dial is a browser action: POST /dials wants a person "
