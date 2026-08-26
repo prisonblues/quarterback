@@ -102,8 +102,21 @@ class Settings(BaseSettings):
             # missing rather than that the board is broken.
             try:
                 raw = Path(self.elevated_tokens_file).read_text(encoding="utf-8")
-            except OSError:
-                raw = self.elevated_tokens
+            except (OSError, UnicodeDecodeError):
+                # CLOSED, not "fall back to the inline value" — which is what this
+                # did and it was the wrong door. An operator who set the FILE has
+                # said where the secrets live; silently reverting to a stale
+                # inline `ELEVATED_TOKENS` would authorise a set of machines
+                # nobody meant to authorise, at the moment the intended source
+                # broke. Empty means no delegated write is authorised and the
+                # caller is told which credential is missing.
+                #
+                # `UnicodeDecodeError` is caught with it because it is a
+                # `ValueError`, not an `OSError`: a half-written or binary file
+                # would otherwise escape an auth dependency as a 500, which is
+                # precisely the failure the guard exists to prevent, arriving
+                # through the one exception it did not name.
+                raw = ""
         out: dict[str, str] = {}
         for pair in raw.replace("\n", ",").split(","):
             pair = pair.strip()

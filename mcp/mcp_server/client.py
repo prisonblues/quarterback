@@ -145,8 +145,11 @@ class QuarterbackClient:
 
         ``refresh`` re-runs the command past any cached value, which is what a 403
         means here: a secret that authenticated yesterday is exactly what is stale
-        after a rotation. Same move ``QUARTERBACK_TOKEN_REFRESH_CMD`` makes one
-        credential over.
+        after a rotation. Same *reasoning* as ``QUARTERBACK_TOKEN_REFRESH_CMD`` —
+        "the cached copy is exactly what is stale" — but not the same mechanism and
+        there is no ``_REFRESH_CMD`` of its own: this re-runs the ONE command it
+        has, which is enough because `op read` goes to the store every time. A
+        second variable would only matter for a resolver that caches internally.
         """
         if self._elevated and not refresh:
             return self._elevated
@@ -155,7 +158,10 @@ class QuarterbackClient:
         try:
             done = subprocess.run(self._elevated_cmd, shell=True, check=False,
                                   capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            # UnicodeDecodeError because `text=True` decodes the command's stdout:
+            # a secret store that emits a stray byte would otherwise raise out of
+            # a credential lookup rather than reporting "no credential".
             done = None
         # The EXIT CODE decides, not the presence of output. `op` prints
         # diagnostics to stdout on some failures, so a non-zero run that wrote
@@ -168,12 +174,19 @@ class QuarterbackClient:
             value = done.stdout.split("\n", 1)[0].strip()
         if value:
             self._elevated = value
-        elif refresh:
+        elif refresh and self._elevated_cmd:
             # A refresh that produced nothing means the cached value is all there
             # is AND it has already been refused once. Keeping it would let
             # `_delegated_post`'s truthiness check pass and replay the same
             # rejected secret; dropping it turns the next call into the
             # actionable "no credential" refusal instead of a second 403.
+            #
+            # Guarded on there BEING a command, so an operator-configured literal
+            # (`QUARTERBACK_ELEVATED_TOKEN`) is never discarded: nothing can
+            # re-derive it, so dropping it would turn one bad request into a
+            # client that is permanently credential-less until the process
+            # restarts. `_delegated_post` only refreshes when a command exists
+            # anyway; this makes the invariant local rather than remote.
             self._elevated = None
         return self._elevated
 

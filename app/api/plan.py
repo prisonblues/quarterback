@@ -380,10 +380,14 @@ def _refuse_agent_exemption(ref_kind: str | None, note: str | None,
     transfers unaltered: **the label that authorises work has to come from
     someone who is not the worker.**
 
-    So the marker is a human write, on the same footing as ``POST /plan/reorder``
-    and for the reasoning :func:`app.auth.human` already gives. Only two paths can
-    put it on an open item now, and both take :func:`app.auth.human`:
-    ``POST /plan/item/update`` and :func:`exempt_item`'s grant half.
+    So the marker is a human write, for the reasoning :func:`app.auth.human`
+    already gives. Two paths can put it on an open item and **neither will take it
+    from an agent**: :func:`exempt_item`'s grant half, which downgrades an agent's
+    ``grant`` to a request; and ``POST /plan/item/update``, which since #478 runs
+    on :func:`app.auth.delegated` and calls this function for any caller that is
+    not a person. That second path is why this guard is not merely belt-and-braces
+    — widening that endpoint's gate without it reopened #335 through one of the two
+    doors this argument depends on, and a delegated agent exempted its own PR.
 
     **The refusal is not a dead end**, which is the other half of #335 and the
     reason this is not a bare 403: an agent may still *propose* an exemption at
@@ -2560,7 +2564,8 @@ async def update_item(
     editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Retitle, move, re-reason, or drop an item. A person, or a delegated agent.
+    """Retitle, move, re-reason, or drop an item — a person; retitle and re-reason
+    — a delegated agent.
 
     ``dropped`` is not ``done``: one says the work happened, the other says a
     person decided it should not. Reopening a dropped item is allowed here too,
@@ -2584,10 +2589,12 @@ async def update_item(
       about: before this guard, a delegated agent writing a `review: exempt` note
       here got `exempt: True` on its own PR, which is precisely the authority
       ``exempt_item`` refuses it by downgrading a grant to a request.
-    * **Dropping.** *"a person decided it should not"* is the endpoint's own
-      description of the act, and an agent deciding that about work it may be
-      the one avoiding is the same self-approval shape one field over. It also
-      reaches ``live_claim`` and clears somebody's hold.
+    * **Dropping, and moving between plans.** *"a person decided it should not"*
+      is the endpoint's own description of the first, and an agent deciding that
+      about work it may be the one avoiding is the same self-approval shape one
+      field over; it also reaches ``live_claim`` and clears somebody's hold.
+      ``plan`` is the same kind of act — detaching an item from a plan somebody is
+      holding changes what is grouped with what, and ``""`` detaches entirely.
 
     Both refuse the ACT and not the caller, so nothing an agent legitimately does
     here changes: a delegated note update is still one call.
@@ -2598,11 +2605,23 @@ async def update_item(
         # Ordered before every other check so a refusal is about the authority
         # and not about the item's state — an agent told "that item is done"
         # would reasonably conclude the write was otherwise allowed.
-        if body.state is not None:
+        # `state` and `plan` both DECIDE something; `title` and `note` describe.
+        # `plan` joined this guard after a panel round escalated the gap: the
+        # docstring above claimed title and note were the whole surface while
+        # `plan` was applied for a delegated caller with no check at all, so an
+        # agent could move an item between plans — or detach it from one a person
+        # is holding, which reaches `covered_by` and is nearer to dropping than to
+        # re-reasoning. Narrowed rather than documented, because widening later is
+        # one line and discovering the reverse is not.
+        refused = [f for f, v in (("state", body.state), ("plan", body.plan))
+                   if v is not None]
+        if refused:
             raise HTTPException(403, detail={
-                "error": "dropping or reopening an item is a person's decision",
-                "hint": "a delegated credential may re-reason an item (`note`), "
-                        "not decide whether the work should happen. See #478.",
+                "error": f"{' and '.join(refused)} on a plan item is a person's decision",
+                "hint": "a delegated credential may retitle and re-reason an item "
+                        "(`title`, `note`); it may not decide whether the work "
+                        "should happen or which plan it belongs to. See #478.",
+                "refused": refused,
                 "item_id": str(item.id)})
         _refuse_agent_exemption(item.ref_kind, body.note)
     if body.state is not None and item.state == "done" and body.state != "done":
@@ -2983,7 +3002,7 @@ async def reorder(
     editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Set the order. **Human-only** — this is the endpoint decision 1 is about.
+    """Set the order. A person's decision — which a delegated agent may APPLY.
 
     Items in scope that the caller did not list keep their relative order and
     follow the listed ones, and are named in ``appended``. A stale page must not
@@ -3447,7 +3466,11 @@ def _order_view(repo: str | None, now: datetime, c: Computed) -> dict:
         # board reads `suggested_order` back. #232's non-privileged-writer rule.
         "apply": {
             "endpoint": "POST /plan/reorder",
-            "human_only": True,
+            # False since #478: `POST /plan/reorder` takes a person OR an agent
+            # holding its machine's delegated credential. Clients BRANCH on this
+            # field — it is not prose — so leaving it True told every reader that
+            # applying the suggestion was impossible for them.
+            "human_only": False,
             "body": {"repo": repo, "order": list(c.result.suggested_order)},
         },
     }
@@ -3681,7 +3704,7 @@ def _recorded(row: OrderProposal, c: Computed, repo: str | None, now: datetime, 
         "generated": now.isoformat(),
         "apply": {
             "endpoint": "POST /plan/reorder",
-            "human_only": True,
+            "human_only": False,
             "body": {"repo": repo, "order": list(row.suggested_order or [])},
         },
     }

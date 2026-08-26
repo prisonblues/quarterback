@@ -9,7 +9,7 @@ note, or a setup failure arriving as something a caller would retry.
 Skipped without the `server` extra, for the reason `test_server_claim_tools.py`
 gives.
 
-Run: uv run --extra dev --extra server pytest mcp/tests/test_server_human_write_tools.py
+Run: uv run --extra dev --extra server pytest mcp/tests/test_server_delegated_tools.py
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def test_update_can_still_send_an_empty_string_because_it_means_something(monkey
 
 
 def test_a_setup_failure_becomes_a_tool_error_naming_the_tool(monkeypatch):
-    """No cookie is not a transient fault and not an answer about the request —
+    """No credential is not a transient fault and not an answer about the request —
     it must not read as something to retry."""
     wire(monkeypatch, RuntimeError(CLIENT_NO_CREDENTIAL))
     with pytest.raises(ToolError) as e:

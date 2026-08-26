@@ -203,7 +203,8 @@ mcp = FastMCP(
         "**Is that order still right?** plan_order(repo=...) — the order the "
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
-        "labelled derived or ambiguous. Advisory: only a human can apply it.\n\n"
+        "labelled derived or ambiguous. Advisory: applying it is `plan_reorder`, "
+        "which needs a delegated credential and a person who asked.\n\n"
         "## What is waiting on what (#294)\n"
         "**Before you pick up a PR, and before you spend a review round on one:** "
         "landing_graph() — what still gates each node, what landing it would free, "
@@ -1655,8 +1656,8 @@ def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
     and until this tool existed nobody could correct the note but a person in a
     browser. Correcting your own reasoning overrides no one.
 
-    **`title` and `note` are what a delegated credential may set.** `state` is
-    refused for you (#478): "a person decided it should not" is what dropping
+    **`title` and `note` are what a delegated credential may set.** `state` and
+    `plan` are both refused for you (#478): "a person decided it should not" is what dropping
     means, and an agent deciding that about work it might be the one avoiding is
     the self-approval shape one field over. A `note` carrying the review-exemption
     marker is refused for the same reason and points you at
@@ -1667,6 +1668,8 @@ def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
         title: replace the title. Blank is refused.
         note: replace the reasoning. This is the field worth using.
         plan: move it to a named plan; "" detaches it from the one it is in.
+            Refused unless the caller is a person — detaching an item from a plan
+            somebody is holding is a decision, not a correction.
         state: "open" or "dropped" — refused unless the caller is a person.
     """
     body: dict = {"item_id": item_id}

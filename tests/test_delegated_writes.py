@@ -189,6 +189,10 @@ async def test_order_trust_counts_derived_apart_from_unchosen(client):
     r = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
     body = r.json()
     trust = body["order_trust"]
+    # Tied to the seeded rows, not an aggregate floor: `>= 2` in a shared scope
+    # passes for an implementation that marked two OTHER items derived.
+    src = {i["item_id"]: i["rank_source"] for i in body["items"]}
+    assert src[a] == "derived" and src[b] == "derived"
     assert trust["derived"] >= 2
     assert trust["by_source"].get("derived") >= 2
     # The property that matters: a derived row is NOT counted as one nobody chose.
@@ -199,8 +203,11 @@ async def test_order_trust_counts_derived_apart_from_unchosen(client):
     # The decision this migration argued for, asserted rather than implied: a
     # derived row must not flip `trusted`. Conditioned on there being no appended
     # rows, since those legitimately do.
-    if appended == 0:
-        assert trust["trusted"] is True, "a derived order flipped `trusted`"
+    # Unconditional: `trusted` is defined as "no APPENDED rows", so the pin is
+    # that derived rows do not enter that count. Wrapping it in `if appended == 0`
+    # let the assertion evaporate in exactly the runs where the scope is busy —
+    # which is every full-suite run.
+    assert trust["trusted"] is (appended == 0), "derived rows changed `trusted`"
     assert "instruction" in (trust["derived_hint"] or "")
 
 
@@ -250,6 +257,9 @@ async def test_a_person_may_still_set_the_exemption_marker_here(client):
                           json={"item_id": item, "note": "review: exempt — release chore"},
                           headers=HUMAN)
     assert r.status_code == 200, r.text
+    q = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
+    row = next(i for i in q.json()["items"] if i["item_id"] == item)
+    assert row["review"]["exempt"] is True, "the person's marker was not stored"
 
 
 async def test_a_delegated_agent_cannot_drop_an_item(client):
@@ -262,6 +272,9 @@ async def test_a_delegated_agent_cannot_drop_an_item(client):
                           headers=LAPTOP_ELEVATED)
     assert r.status_code == 403, r.text
     assert "person" in r.text.lower()
+    q = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
+    row = next(i for i in q.json()["items"] if i["item_id"] == a)
+    assert row["state"] == "open", "the refusal did not prevent the drop"
 
 
 async def test_a_delegated_note_update_is_still_one_call(client):
@@ -295,6 +308,8 @@ async def test_caller_supplied_headers_cannot_redirect_the_actor(client):
     a, b = await seed(client)
     r = await order_is(client, [b, a], {**LAPTOP_ELEVATED,
                                         "X-Agent-Name": "rich",
+                                        "X-Agent-Key": "rich",
+                                        "X-Agent-Instance": "rich",
                                         "Remote-User": "rich"})
     assert r.status_code == 200, r.text
     by = r.json()["by"]
@@ -322,7 +337,7 @@ async def test_a_delegated_partial_reorder_leaves_carried_rows_alone(client):
 # ------------------------------------------- how the secret map is read (#478)
 
 
-def test_the_file_is_read_and_beats_the_inline_value(monkeypatch, tmp_path):
+def test_the_file_is_read_and_beats_the_inline_value(tmp_path):
     """The production arrangement — op-resolver renders a file — and conftest pins
     the file to '' everywhere, so nothing else exercises this branch at all."""
     from app.config import Settings
@@ -338,5 +353,19 @@ def test_an_unreadable_file_is_a_closed_door_and_not_a_500(tmp_path):
     `_edge_asserted`'s "closed when no secret is configured" rule exists to avoid,
     arriving through the filesystem instead of through configuration."""
     from app.config import Settings
-    st = Settings(elevated_tokens="", elevated_tokens_file=str(tmp_path / "gone"))
-    assert st.elevated_map == {}
+    # An inline value IS set, which is the whole point: the old guard fell back to
+    # it, so a test with an empty inline value passed either way and pinned nothing.
+    st = Settings(elevated_tokens="boxa:inline-secret",
+                  elevated_tokens_file=str(tmp_path / "gone"))
+    assert st.elevated_map == {}, "an unreadable file fell back to the inline map"
+
+
+async def test_a_delegated_agent_cannot_move_an_item_between_plans(client):
+    """The gap a panel round escalated: the docstring said title and note, and
+    `plan` was applied for a delegated caller with no check. Detaching an item from
+    a plan somebody is holding is a decision, not a correction."""
+    (a,) = await seed(client, 1)
+    r = await client.post("/plan/item/update", json={"item_id": a, "plan": ""},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+    assert "plan" in r.json()["detail"]["refused"]

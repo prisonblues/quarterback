@@ -37,8 +37,10 @@ def _counting(tmp_path) -> str:
     """A command printing a different value each call, so a retry that reused the
     cached secret would send the same header twice and be visible."""
     n = tmp_path / "n"
-    return (f"n=$(cat {n} 2>/dev/null || echo 0); n=$((n+1)); "
-            f"echo $n > {n}; echo v$n")
+    # Quoted: a temp directory with a space or a metacharacter in it would
+    # otherwise turn this fixture into a different command.
+    return (f"n=$(cat '{n}' 2>/dev/null || echo 0); n=$((n+1)); "
+            f"echo $n > '{n}'; echo v$n")
 
 
 def client(rec: Recorder, *, secret=SECRET, cmd=None) -> QuarterbackClient:
@@ -68,12 +70,19 @@ def test_it_carries_both_the_bearer_and_the_delegated_secret():
 
 def test_ordinary_calls_do_not_carry_the_delegated_secret():
     """A credential sent on every request is a credential in every log and every
-    proxy. It rides only the two calls that need it."""
+    proxy. It rides only the two calls that need it.
+
+    The delegated call comes FIRST on purpose: the header is set per-request, and a
+    client that had instead set it on the shared session would pass a test that
+    only ever made the ordinary call."""
     rec = Recorder(httpx.Response(200, json={"ok": True}))
-    client(rec).plan({"repo": "acme/one"})
-    (req,) = rec.requests
-    assert ELEVATED_HEADER not in req.headers
-    assert req.headers["Authorization"] == "Bearer tok-machine"
+    c = client(rec)
+    c.plan_reorder({"order": ["a"]})
+    c.plan({"repo": "acme/one"})
+    delegated_req, ordinary_req = rec.requests
+    assert delegated_req.headers[ELEVATED_HEADER] == SECRET
+    assert ELEVATED_HEADER not in ordinary_req.headers, "the header leaked onto the session"
+    assert ordinary_req.headers["Authorization"] == "Bearer tok-machine"
 
 
 def test_no_credential_refuses_before_the_network_and_names_the_remedy():
@@ -164,7 +173,7 @@ def test_a_literal_secret_is_not_retried_because_there_is_nowhere_fresher():
     assert len(rec.requests) == 1
 
 
-def test_a_command_that_exits_non_zero_is_not_a_credential_however_much_it_prints(tmp_path):
+def test_a_command_that_exits_non_zero_is_not_a_credential_however_much_it_prints():
     """`op` writes diagnostics to stdout on some failures. Adopting that as a
     secret produces a 403 nobody can explain, from a value that never was one — so
     the exit code decides, not the presence of output."""
@@ -216,7 +225,11 @@ def test_a_403_about_the_ACT_is_not_retried_as_a_stale_credential(tmp_path):
                           elevated_cmd=_counting(tmp_path))
     with pytest.raises(httpx.HTTPStatusError):
         c.plan_item_update({"item_id": "x", "state": "dropped"})
-    assert len(seen) == 1, "a refusal of the ACT must not spend a credential refresh"
+    assert len(seen) == 1, "a refusal of the ACT must not be retried"
+    # And the store was asked exactly once — a client that re-read the secret and
+    # then declined to retry would send one request too, and would still be
+    # spending an `op read` (which can prompt) on a refusal it cannot fix.
+    assert (tmp_path / "n").read_text().strip() == "1", "the secret store was re-read"
 
 
 def test_item_update_gets_the_same_retry_and_refusal_behaviour(tmp_path):

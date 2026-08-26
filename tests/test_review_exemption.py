@@ -663,3 +663,8 @@ async def test_a_delegated_credential_does_not_grant_an_exemption(client):
     assert body["exempted"] is False, "the delegated credential granted an exemption"
     assert body["granted"] is None
     assert body["proposed"] is True, "it should have been recorded as a request"
+
+    # Close it. This module has no autouse teardown, and an open PR-backed item
+    # left in a shared scope is pressure on the fleet-wide `GET /plan` page that
+    # #486 is about — the failure lands in another file with nothing pointing here.
+    await client.post("/plan/item/done", json={"item_id": item}, headers=LAPTOP)
