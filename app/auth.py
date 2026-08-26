@@ -37,6 +37,16 @@ NAME_HEADER = "X-Agent-Name"
 #: else can, because nothing else knows it. See :func:`human`.
 EDGE_SECRET_HEADER = "X-Edge-Auth"
 
+#: A PERSON's own key, presented to the AGENT vhost — the second way to be a
+#: human here, and the one that does not go through Authelia.
+#:
+#: Client-supplied like a bearer and unlike ``Remote-User``, so the edge neither
+#: injects nor strips it: ``edge-untrusted.conf`` clears the four ``Remote-*``
+#: headers and ``X-Edge-Auth`` and nothing else, which is exactly why this can be
+#: a new header rather than a vhost change. Presenting it to the browser vhost
+#: would work too and is pointless — the edge has already said who you are there.
+HUMAN_KEY_HEADER = "X-Human-Key"
+
 #: Told to a caller whose ``Remote-User`` the edge did not vouch for. Shared by
 #: :func:`human` and :func:`author` because it is one boundary, not two — the
 #: person answering an ask and the person reordering the plan are proved the same
@@ -263,10 +273,27 @@ def _as_person(who: str) -> str:
     return identity
 
 
+def _keyed_person(human_key: str) -> str | None:
+    """The person a ``X-Human-Key`` names, or None if it names nobody.
+
+    Compared with :func:`hmac.compare_digest` and only against keys that are
+    non-empty, so an unconfigured deployment cannot be entered with an empty
+    header — the same rule `_edge_asserted` keeps for the edge secret, and the
+    reason both fail closed rather than open.
+    """
+    if not human_key:
+        return None
+    for person, expected in settings.human_map.items():
+        if expected and hmac.compare_digest(human_key, expected):
+            return person
+    return None
+
+
 def human(
     authorization: str = Header(default=""),
     remote_user: str = Header(default="", alias="Remote-User"),
     edge_auth: str = Header(default="", alias=EDGE_SECRET_HEADER),
+    human_key: str = Header(default="", alias=HUMAN_KEY_HEADER),
 ) -> str:
     """Authorise a write only a PERSON may make — reordering the plan (v2.39).
 
@@ -299,10 +326,45 @@ def human(
     author on this board now, and an author is ``<machine>/<name>``; a decision
     recorded as bare ``rich`` would be the one identity on the board that could
     not be told from a machine of the same name. See :data:`app.identity.HUMAN`.
+
+    ## The second method: a person's own key (``X-Human-Key``)
+
+    Everything above describes the EDGE method and none of it changes. What is
+    added is a second way to satisfy the same gate, for callers that cannot go
+    through a browser: a static ``name:secret`` from :attr:`Settings.human_map`,
+    presented to the agent vhost, authorising as ``human/<name>``.
+
+    **It is a method, not a loosening.** The argument above is that a header alone
+    is not proof because ``Remote-User`` is client-settable and therefore forgeable
+    by anything that can reach the port. A shared secret is not forgeable by
+    reaching the port; it has to be *held*. So the question it raises is a
+    different one — who holds it — and that question has an honest answer rather
+    than a reassuring one.
+
+    **Who holds it, stated rather than implied (#479).** The key lives on a
+    workstation, readable by the processes that run there, so an agent that goes
+    looking can find it and author as a person. That is accepted deliberately: the
+    alternative on the table was a browser session cookie, which is SSO for an
+    entire estate and expires on a wall clock, so this is both narrower and the
+    one that does not decay. It is per person and revoked by editing one line.
+    Narrowing it further is deferred, not overlooked.
+
+    **The edge still comes first**, so a real browser write is unchanged and is
+    never adjudicated against a key. And an unconfigured deployment has no human
+    keys at all, which fails closed exactly as an unset ``HUMAN_EDGE_SECRET`` does.
     """
-    person = _edge_person(remote_user, edge_auth) or _dev_person(remote_user)
+    person = (_edge_person(remote_user, edge_auth) or _dev_person(remote_user)
+              or _keyed_person(human_key))
     if person is not None:
         return _as_person(person)
+    if human_key:
+        # Presented and wrong: say so rather than falling through to a message
+        # about browsers, which would send somebody to fix the wrong thing.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"the {HUMAN_KEY_HEADER} presented does not match any configured "
+            "person. Check HUMAN_TOKENS on the board and the key this client "
+            "resolved; an unconfigured board has none and refuses every key.")
     if remote_user:
         raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_FROM_THE_EDGE)
     if _match_bearer(authorization) is not None:
@@ -310,7 +372,8 @@ def human(
             status.HTTP_403_FORBIDDEN,
             "this is a human-only endpoint: agents claim and complete plan items, "
             "people decide their order. Use the board in a browser (the edge "
-            "supplies your identity), or set BROWSER_DEV_HUMAN for a local board.",
+            f"supplies your identity), present a person's {HUMAN_KEY_HEADER}, or "
+            "set BROWSER_DEV_HUMAN for a local board.",
         )
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,

@@ -2215,12 +2215,21 @@ decision somebody made.
 **Turning one is a `✎` on the row, and what makes that possible is a credential rather
 than a looser gate.** `GET /dials` takes `app.auth.reader`, which the machine bearer token
 passes, so reading was always free from a terminal. `POST /dials` takes `app.auth.human` and
-still does: every agent on a box holds the same machine token, so nothing inside a request
+still does — every agent on a box holds the same machine token, so nothing inside a request
 from one distinguishes it from a person, and a tempo an agent could raise for itself is the
-self-approval shape #85, #86, #78, #232 and #335 each settled separately. That gate has not
-moved. What the dashboard has now is `qbdata.HumanClient` — a signed-in session presented to
-the **browser vhost**, so the person at the keyboard writes as themselves and the board
-records `human/<user>` exactly as it does for the page.
+self-approval shape #85, #86, #78, #232 and #335 each settled separately.
+
+What `human()` gained is a second **method**: `HUMAN_TOKENS`, `name:secret` pairs in
+`API_TOKENS`' format, presented as **`X-Human-Key`** to the **agent host** beside the ordinary
+bearer. `rich:<secret>` authors as `human/rich` — the same identity the edge produces, by a
+different door, so provenance is preserved rather than laundered.
+
+**Authelia is not in that path, and that is the requirement rather than a detail.** The other
+way to be a person here is an edge session, which expires on a wall clock: a dashboard built
+on one goes dead whenever it lapses and stays dead until somebody re-mints it by hand. A key
+rotates when somebody decides to rotate it and never otherwise. `edge-untrusted.conf` clears
+the four `Remote-*` headers and `X-Edge-Auth` and nothing else, so the new header passes
+through the agent vhost with no nginx change at all.
 
 The `✎` opens an editor on that row: **value**, **reason** and **for** (`30m`, `4h`, `7d`, or
 empty for a dial with no end), with the dial's name fixed — a dial is identified by its name,
@@ -2233,37 +2242,33 @@ otherwise (`P3`, `eager`); an expiry is measured from the **board's** clock, so 
 own clock is slow does not have its "in four hours" refused as being in the past.
 
 **What that credential costs is [#479](https://github.com/prisonblues/quarterback/issues/479),
-and it is stated rather than implied**: the session is readable by everything running as this
-user, so *"the dash can set a dial"* and *"anything on this box can set a dial"* are one fact.
-That is the trade — open it wide now, tighten later — and #479 carries the menu for narrowing
-it. It is also why the delegated agent credential (`X-Agent-Elevated`, #480) is a **different**
-thing and stays narrow: that one is for an agent acting unattended and names the two endpoints
-it may reach; this one is for the person at the keyboard.
+and it is stated rather than implied**: the key sits on this workstation, readable by the
+processes running here, so an agent that goes looking can find it and author as a person. That
+is the trade — open it wide now, tighten later — and #479 carries the menu for narrowing it.
+It is narrower than the design considered before it, a signed-in Authelia session, which is
+SSO for an entire estate. It is also why the delegated **agent** credential
+(`X-Agent-Elevated`, #480) is a *different* thing and stays narrow: that one is for an agent
+acting unattended and names the two endpoints it may reach, `/dials` deliberately not among
+them. Two credentials, two blast radii; an unattended agent still cannot set a dial.
 
-**With no session on the host, the panel is exactly what it was** — and that is every box
-until `QUARTERBACK_EDGE_COOKIE_CMD` is deployed. `HumanClient.why_not()` is asked once per
-paint, the `✎` goes grey, the last row says why in place of the verb, and a click opens
-`<board>/dials/view` instead. `d` opens that page from anywhere either way, because the page
-shows every repo's dials at once where the panel shows this screen's. This is
-[#443](https://github.com/prisonblues/quarterback/issues/443)'s option (3) still holding up
-the option (1) case, and #443 is why the fallback names the URL rather than implying it — the
-record of a person told the reorder was theirs to do whose reply was *"i don't know how to
-re-order"*.
+**With no key on the host, the panel is exactly what it was** — and that is every box until
+one is deployed. `HumanClient.why_not()` is asked once per paint, the `✎` goes grey, the last
+row says why in place of the verb, and a click opens `<board>/dials/view` instead. `d` opens
+that page from anywhere either way, because the page shows every repo's dials at once where
+the panel shows this screen's. This is
+[#443](https://github.com/prisonblues/quarterback/issues/443)'s three shapes settled: the
+dashboard has option (2), a credential distinct from the machine token, and degrades to option
+(3), read-only plus a printed URL. #443 is why the fallback names the URL rather than implying
+it — the record of a person told the reorder was theirs to do whose reply was *"i don't know
+how to re-order"*.
 
 Two variables configure it, in `~/.config/quarterback/config` beside the bearer:
-`QUARTERBACK_HUMAN_URL` (the browser vhost) and `QUARTERBACK_EDGE_COOKIE_CMD` — a **command**,
-for the reason `QUARTERBACK_TOKEN_CMD` is one: a session that lives in 1Password is one `op`
-can re-read when it goes stale and one that never sits in a file. It is resolved lazily, at
-the first write rather than at startup, and re-read once when a write bounces on an expired
-session. `QUARTERBACK_EDGE_COOKIE` takes a literal value for a test or a box with no `op`.
-
-The page at `/dials/view` is the other end of that: what is in force for a repo and for the
-fleet, what each overrides, and a form that sets or clears one. It asks `/whoami` first and
-says plainly when the answer is an agent, so a refusal arrives as a sentence rather than as
-a dead button. A value typed there is sent as **JSON where it parses** (`2`, `true`, `null`,
-a list) and as the string it looks like otherwise (`P3`, `eager`) — a `max_rounds` of `"2"`
-is a dial the harness refuses to apply and reports by name, which is a puzzle to be handed
-at a keyboard.
+`QUARTERBACK_HUMAN_KEY_CMD` — a **command**, for the reason `QUARTERBACK_TOKEN_CMD` is one, so
+the secret is resolved at the first write rather than at startup and lives in that process and
+nowhere else — and `QUARTERBACK_HUMAN_KEY` for a literal value in a test or on a box with no
+`op`. The board half is `HUMAN_TOKENS` (or `HUMAN_TOKENS_FILE`, rendered by the op-resolver),
+and with neither side configured nothing changes: unset fails closed, exactly as an unset
+`HUMAN_EDGE_SECRET` does.
 
 **None of these surfaces knows what a dial MEANS.** The harness owns the vocabulary
 (`harness/loops/harness_rules.py`), the server image carries no `harness/` directory at all,
@@ -3389,8 +3394,7 @@ nobody here can see the settings of. A non-GitHub remote, an absent `gh`, an una
 - The **browser** vhost must accept the person it authenticated. This is the half broken
   since v2.39, and it is not visible from a machine with no forward-auth session: a `302` to
   the auth portal is `?`, not `ok`. Set `QUARTERBACK_HUMAN_URL` so the row has somewhere to
-  ask, and `QUARTERBACK_EDGE_COOKIE_CMD` (or a literal `QUARTERBACK_EDGE_COOKIE`) if you have
-  a signed-in session — the same pair the dash's `✎` writes on; a `403` from that
+  ask, and `QUARTERBACK_EDGE_COOKIE` if you have a signed-in session; a `403` from that
   request is the `FAIL` that says the secret is unset or disagrees between its two stores,
   which is the only end-to-end detector there is, because nothing compares the stores.
 
@@ -4078,7 +4082,7 @@ your board to light up `GET /review/stats` and the board's `/panel` page.
 
 One site config, read by everything: `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` (plus
 the optional `QUARTERBACK_TOKEN_REFRESH_CMD`, `QUARTERBACK_AGENT`, `QUARTERBACK_REPO`, and —
-for the dashboard's own writes — `QUARTERBACK_HUMAN_URL` with `QUARTERBACK_EDGE_COOKIE_CMD`)
+for the dashboard's own writes — `QUARTERBACK_HUMAN_KEY_CMD`)
 from `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, each overridable from the environment.
 `bin/qb-env` is the contract and the loader; `qb`, `qb-hook` and `qb-mcp` source it, while
 `worktree-holder` and `qb-board` read the same two variables directly, so the occupancy check

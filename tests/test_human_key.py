@@ -1,0 +1,157 @@
+"""A person's own key — the second way to satisfy `human()`, and the one that does
+not go through Authelia (#477).
+
+`human()` had exactly one method: the edge injects `HUMAN_EDGE_SECRET` as
+`X-Edge-Auth` beside `Remote-User`, and a request without it is not a person no
+matter what it calls itself. That argument is sound and none of it is weakened
+here — a header alone is still not proof, because `Remote-User` is forgeable by
+anything that can reach the port.
+
+What is added is a **method**, not a loosening: a static `name:secret` the caller
+has to HOLD, presented to the agent vhost. It exists because the alternative for a
+terminal was a browser session, and a session expires on a wall clock — so a
+dashboard depending on one goes dead whenever it lapses and stays dead until
+somebody re-mints it by hand. A key rotates when somebody decides to rotate it.
+
+**The residual is who holds it**, and that has an honest answer rather than a
+reassuring one (#479): the key sits on a workstation, readable by the processes
+running there, so an agent that goes looking can find it and author as a person.
+Accepted deliberately, bounded by being per person and revocable in one line, and
+strictly narrower than the SSO session it replaced.
+"""
+
+from __future__ import annotations
+
+import pytest
+from sqlalchemy import delete
+
+from app.config import settings
+from app.db import async_session
+from app.models.dial import DialSetting
+
+from .conftest import LAPTOP, PINNED_SETTINGS
+
+REPO = "prisonblues/quarterback"
+KEY_HEADER = "X-Human-Key"
+
+
+@pytest.fixture(autouse=True)
+async def _empty_board(client):
+    """No dial survives a test here, in either direction.
+
+    The suite rebuilds the schema once per session, so a dial set by one test is
+    still in force in the next — and, unless this also cleans up on the way OUT,
+    in the next FILE. That is not hypothetical: the last test below sets a FLEET
+    dial, a fleet dial is returned by every repo-scoped read, and
+    `test_repo_identity`'s `test_one_dial_cannot_hold_two_live_values…` asserts on
+    exactly such a read. It failed with one extra row the moment this file was
+    added, and passed alone, which is the signature of a leak rather than a bug.
+    """
+    async with async_session() as s:
+        await s.execute(delete(DialSetting))
+        await s.commit()
+    yield
+    async with async_session() as s:
+        await s.execute(delete(DialSetting))
+        await s.commit()
+
+
+@pytest.fixture
+def human_key(monkeypatch):
+    """One person's key, for the tests that need the door to open.
+
+    Deliberately NOT in `PINNED_SETTINGS`: the default state of this suite is a
+    board with no human keys at all, so "unconfigured refuses everything" is what
+    a test gets for free rather than something it has to arrange.
+    """
+    key = "test-human-key-not-a-real-secret"
+    monkeypatch.setattr(settings, "human_tokens", f"rich:{key}")
+    return key
+
+
+def keyed(key: str) -> dict:
+    """A request that carries a person's key and an ordinary machine bearer.
+
+    Both, because that is what the dashboard sends: the key answers "which
+    person", the bearer answers "from where".
+    """
+    return {**LAPTOP, KEY_HEADER: key}
+
+
+async def test_the_key_authors_as_the_person_it_names(client, human_key):
+    """`rich:<secret>` writes as `human/rich` — the same identity the edge would
+    have produced, because it is the same person by a different door."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "set from the dashboard",
+        "repo": REPO}, headers=keyed(human_key))
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_by"] == "human/rich"
+
+
+async def test_a_bearer_alone_is_still_refused(client):
+    """The gate has not moved. An agent's token is what it always was here, and
+    the refusal names the ways in rather than only saying no."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "an agent trying it on"},
+        headers=LAPTOP)
+    assert r.status_code == 403
+    assert KEY_HEADER in r.json()["detail"]
+
+
+async def test_a_key_that_matches_nobody_says_which_thing_to_check(client, human_key):
+    """A wrong key and a browser problem want different things done about them, so
+    the refusal must not be the one about browsers."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "wrong key"},
+        headers=keyed("not-the-key"))
+    assert r.status_code == 403
+    detail = r.json()["detail"]
+    assert "HUMAN_TOKENS" in detail and "does not match any configured person" in detail
+
+
+async def test_an_empty_key_header_does_not_authenticate_anybody(client, human_key):
+    """The rule `_edge_asserted` keeps, kept here too: an unconfigured or blank
+    credential fails closed. Compared with `compare_digest` against non-empty keys
+    only, so `X-Human-Key: ''` can never match a person whose key is unset."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "blank"},
+        headers=keyed(""))
+    assert r.status_code == 403
+
+
+async def test_a_board_with_no_human_keys_refuses_every_key(client):
+    """Unconfigured is closed, not open — the same failure mode as an unset
+    `HUMAN_EDGE_SECRET`. This deployment has none, so nothing is a person."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "no keys configured"},
+        headers=keyed("anything-at-all"))
+    assert r.status_code == 403
+
+
+async def test_the_key_reaches_every_human_endpoint_and_not_more(client, human_key):
+    """It authorises a PERSON, so it opens what a person opens — that is the whole
+    design, and `/dials/clear` is the second endpoint the dashboard needs.
+
+    What it does NOT do is reach past `human()`: an endpoint gated on something
+    else is unaffected, which is why this is a method on one gate rather than a
+    tier that outranks it.
+    """
+    await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "to be cleared",
+        "repo": REPO}, headers=keyed(human_key))
+    r = await client.post("/dials/clear", json={"dial": "tempo", "repo": REPO},
+                          headers=keyed(human_key))
+    assert r.status_code == 200, r.text
+    assert [d["dial"] for d in r.json()["cleared"]] == ["tempo"]
+
+
+async def test_the_edge_still_comes_first_and_is_unchanged(client, human_key):
+    """A real browser write is never adjudicated against a key. The edge path is
+    tried first and returns the person it vouched for, exactly as before."""
+    edge = {"Remote-User": "rich",
+            "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
+    r = await client.post("/dials", json={
+        "dial": "review_panel.max_rounds", "value": 2, "reason": "from a browser"},
+        headers=edge)
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_by"] == "human/rich"

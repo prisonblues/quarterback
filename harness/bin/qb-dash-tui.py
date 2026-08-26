@@ -2089,16 +2089,16 @@ class Dash(App):
         "i don't know how to re-order". A door nobody can find is the same as no
         door.
 
-        **Not "nobody has built the write path yet".** #479/#480's delegated
-        credential is that path, and it names the writes it opens: the plan's
-        order and a plan item's note. `POST /dials` is excluded on purpose and
-        the exclusion has a test. `qbdata.dials_url` carries the full argument
-        and the seam to change if that decision ever moves.
+        **Still worth a key now that the panel can write.** The page shows every
+        repo's dials at once where this panel shows the screen's own, so a person
+        comparing two projects wants it. The `✎` on a row is the control; this is
+        the map. It is also the fallback when this host has no key.
         """
         self.open_url(qd.dials_url(self.cfg))
-        self.say("setting a dial is a browser action: POST /dials wants a person "
-                 "(Remote-User + the edge secret), and this dashboard holds the "
-                 "machine token every agent on the box holds")
+        self.say("the board's dials page — every repo's dials at once, where this "
+                 "panel shows the screen's own. Setting one from here needs a "
+                 "person's key (QUARTERBACK_HUMAN_KEY_CMD); the page needs a "
+                 "browser the edge has vouched for.")
 
     def open_url(self, url: str) -> None:
         try:
