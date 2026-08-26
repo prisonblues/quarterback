@@ -203,7 +203,7 @@ async def _drive() -> list[str]:
     # the click is already in flight. Off for every test here: none of them is
     # about the caps, and a test that reached the network would be its own bug.
     app.refresh_limits = lambda: None
-    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # THE THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, all off.
     # (`#detail` is a third and is left alone: the drivers move that one
     # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
@@ -215,6 +215,12 @@ async def _drive() -> list[str]:
     # covering it. None of these tests is about the caps, the queue or the seats.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     opened: list[int] = []
     jumped: list[int] = []
@@ -273,6 +279,12 @@ async def _drive_issues() -> list[str]:
     # The caps line and SEATS both move everything under them — see _drive.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     opened: list[int] = []
@@ -358,6 +370,12 @@ async def _drive_plan() -> list[str]:
     # The caps line and SEATS both move everything under them — see _drive.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     app.spawn_refusal = lambda command: None
@@ -430,7 +448,7 @@ async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
-    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # THE THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, all off.
     # (`#detail` is a third and is left alone: the drivers move that one
     # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
@@ -442,6 +460,12 @@ async def _drive_panel() -> list[str]:
     # covering it. None of these tests is about the caps, the queue or the seats.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, str]] = []
     windowed: list[tuple[str, str]] = []
@@ -560,6 +584,12 @@ async def _drive_seats() -> list[str]:
     # on mount AND on a timer, so a fixture that only re-rendered would race it
     # and the panel under the pointer would be the developer's own seats.
     app.refresh_seats = lambda: None
+    # And DIALS, which sits DIRECTLY ABOVE this panel and is `height: auto` (#477).
+    # It grows from nothing to two rows when the board answers, on `refresh_plan`'s
+    # clock, and every row of SEATS moves down with it — mid-click, since this
+    # driver clicks three of them. Not hypothetical: it is what failed
+    # `test_the_seats_panel_jumps_closes_and_adds` on the run that added this line.
+    app.render_dials = lambda *a, **k: None
 
     failures: list[str] = []
     async with app.run_test(size=(90, 50)) as pilot:
@@ -1469,6 +1499,10 @@ async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[s
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
     app.refresh_seats = lambda: None
+    # DIALS too — same reason as `_drive_seats`: it grows above the seat row this
+    # asserts on, and a row that moved between the render and the read is a row
+    # this reads at the wrong index.
+    app.render_dials = lambda *a, **k: None
 
     calls: list[list[str]] = []
     windowed: list[str] = []
@@ -2300,8 +2334,37 @@ DIALS = {
 }
 
 
-async def _drive_dials(offset=None, key=None):
-    """Render the dials, then click at `offset` or press `key`."""
+class FakeHuman:
+    """A human credential that records instead of writing (#479's, stubbed).
+
+    `why_not` is the one method the panel asks on every paint, and returning None
+    is what makes the ✎ a control — so a driver that wants the read-only shape
+    passes `why=<a sentence>` and gets the fallback back.
+    """
+
+    def __init__(self, why: str | None = None, fail: str | None = None):
+        self.why, self.fail = why, fail
+        self.set: list = []
+        self.cleared: list = []
+
+    def why_not(self):
+        return self.why
+
+    def set_dial(self, dial, value, reason, repo=None, expires_at=None):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.set.append((dial, value, reason, repo, expires_at))
+        return {"replaced": [{"value": "P4", "reason": "the old argument"}]}
+
+    def clear_dial(self, dial, repo=None):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.cleared.append((dial, repo))
+        return {"cleared": [{"dial": dial}]}
+
+
+async def _drive_dials(offset=None, key=None, human=None, keys=(), pause=0.3):
+    """Render the dials, then click at `offset` / press `key` / type `keys`."""
     app_module = _load_app()
     qd = app_module.qd
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
@@ -2314,6 +2377,17 @@ async def _drive_dials(offset=None, key=None):
 
     async with app.run_test(size=(100, 50)) as pilot:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        # AFTER the app has mounted, and that is not a detail: `on_mount` builds
+        # the real `HumanClient` from the resolved config, so a stub installed
+        # before `run_test` is replaced by whatever credential the box running
+        # the suite happens to have — which is how a test comes to pass on a
+        # laptop and fail in CI, or worse, write to a real board.
+        #
+        # NO CREDENTIAL by default, which is every box on the fleet today: the
+        # panel reads and the ✎ is the door to the page. A driver that wants the
+        # write path asks for it, so "what happens with nothing configured" stays
+        # the case nobody has to remember to cover.
+        app.human = human if human is not None else FakeHuman(why="no session here")
         app.render_dials(DIALS)
         await pilot.pause()
         table = app.query_one("#dials")
@@ -2326,6 +2400,11 @@ async def _drive_dials(offset=None, key=None):
         if key is not None:
             await pilot.press(key)
             await pilot.pause(0.3)
+        for press in keys:
+            await pilot.press(press)
+            await pilot.pause(0.05)
+        if keys:
+            await pilot.pause(pause)
         return rows, title, opened, app.detail_text, bar
 
 
@@ -2342,22 +2421,68 @@ def test_the_dials_panel_says_which_layer_answered_and_for_how_long():
     assert "2 in force" in title and "1 overridden" in title, title
 
 
-def test_the_dials_panel_always_offers_the_door():
-    """The last row is the page a person turns a dial on, whether or not there is
-    a dial above it — the reader who most needs it is the one who has just found
-    out that nothing is set."""
+def test_the_dials_panel_always_offers_the_verb():
+    """The last row is how a dial gets set, whether or not there is one above it —
+    the reader who most needs it is the one who has just found out that nothing is
+    in force. What that row DOES depends on the credential; that it is there does
+    not."""
     rows, _, _, _, _ = asyncio.run(_drive_dials())
-    assert any("dials/view" in "".join(r) for r in rows), rows
+    assert any("set a dial" in "".join(r) for r in rows), rows
 
 
-def test_the_pencil_opens_the_board_and_says_why_it_had_to():
-    """It does not pretend to turn the dial. `POST /dials` wants a person, and
-    this dashboard holds the token every agent on the box holds."""
+def test_with_no_session_the_pencil_is_the_door_it_always_was():
+    """The read-only shape, which is every box with no cookie — and it must not be
+    a modal whose save could only fail. A form that took four fields and then said
+    so would have spent the person's typing to tell them something it knew before
+    they started."""
     module = _load_app()
     _, _, opened, detail, _ = asyncio.run(
         _drive_dials(offset=(module.Dash.EDIT_COLUMN + 2, 1)))
-    assert opened and opened[0].endswith("/dials/view?repo=" + module.qd.REPO), opened
-    assert "browser" in detail and "machine token" in detail, detail
+    assert opened and "/dials/view" in opened[0], opened
+    assert "no session here" in detail, detail
+
+
+def test_the_row_says_why_the_pencil_is_dead_before_it_is_pressed():
+    """Asked once per paint and drawn into the row, so the refusal arrives before
+    the click rather than after it."""
+    rows, _, _, _, _ = asyncio.run(_drive_dials())
+    assert any("no session here" in "".join(r) for r in rows), rows
+
+
+def test_with_a_session_the_pencil_opens_the_editor_on_that_dial():
+    """The verb this panel did not used to have. Prefilled from the row, and with
+    the dial's NAME fixed: a dial is identified by its name, so an editable one
+    would create a second dial rather than change the one on screen."""
+    module = _load_app()
+
+    async def go():
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = FakeHuman()          # after mount — see `_drive_dials`
+            app.render_dials(DIALS)
+            await pilot.pause()
+            await _click_row(pilot, app.query_one("#dials"),
+                             (module.Dash.EDIT_COLUMN + 2, 1))
+            await pilot.pause(0.3)
+            screen = app.screen
+            return (type(screen).__name__,
+                    screen.row.get("dial") if hasattr(screen, "row") else None,
+                    [w.value for w in screen.query("Input")] if hasattr(screen, "row") else [])
+
+    name, dial, values = asyncio.run(go())
+    assert name == "DialEdit", name
+    assert dial == "tempo", dial
+    # The value comes back spelled the way the box would accept it again, and
+    # there is no name field on an existing dial.
+    assert "held" in values, values
 
 
 def test_a_dial_row_explains_itself_rather_than_opening_anything():
@@ -2381,3 +2506,191 @@ def test_the_tempo_rides_the_caps_line_in_the_clickable_renderer():
     below shows this minute's."""
     _, _, _, _, bar = asyncio.run(_drive_dials())
     assert "TEMPO" in bar and "held" in bar, bar
+
+
+# ---- and the write itself (#479's credential, stubbed) ------------------------
+
+async def _written(asked: dict, human=None, dials=None):
+    """Hand `dial_written` what a modal would have returned, and see what went out.
+
+    Driven at that seam rather than through four Input widgets because that is
+    where the decisions are: parse the value, parse the expiry, refuse a blank
+    reason, and only then spend a request. The keystroke path has its own test.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.human = human or FakeHuman()
+        app.dials = dials if dials is not None else {"asked": True, "now": None}
+        app.dial_written(asked)
+        await pilot.pause(0.3)
+        return app.human, app.detail_text
+
+
+def test_a_saved_dial_goes_out_as_a_value_and_not_as_its_spelling():
+    """`2` is a number, `P3` is a string, and `null` is the documented off switch
+    for three dials — `qbdata.parse_dial_value`, the same table `dials.html`
+    implements in the browser."""
+    human, said = asyncio.run(_written(
+        {"dial": "review_panel.max_rounds", "value": "2", "reason": "window at 94%",
+         "expiry": "", "repo": None}))
+    assert human.set == [("review_panel.max_rounds", 2, "window at 94%", None, None)]
+    # WHAT IT REPLACED, said out loud: moving a dial without being told what it
+    # was is how one gets nudged twice by two people who each believed they were
+    # starting from the default.
+    assert "it was P4" in said and "the old argument" in said, said
+
+
+def test_an_empty_expiry_is_a_dial_with_no_end_rather_than_a_missing_field():
+    human, _ = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "",
+         "repo": "prisonblues/quarterback"}))
+    assert human.set[0][4] is None, human.set
+
+
+def test_an_expiry_is_measured_from_the_boards_clock():
+    """A box whose clock is an hour slow otherwise writes "in one hour" as a time
+    already past, which `POST /dials` refuses at the door — in words about a field
+    the person never filled in."""
+    human, _ = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "4h",
+         "repo": None},
+        dials={"asked": True, "now": "2026-08-26T00:00:00+00:00"}))
+    assert human.set[0][4].startswith("2026-08-26T04:00:00"), human.set
+
+
+def test_a_duration_nobody_can_parse_is_refused_before_anything_is_spent():
+    """Named where the sentence can point at the box that was wrong, rather than
+    at a 422 about a field nobody typed."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "soon",
+         "repo": None}))
+    assert human.set == [], "a request went out on an expiry that would be refused"
+    assert "30m" in said and "4h" in said, said
+
+
+def test_a_dial_with_no_argument_is_refused_here_too():
+    """The board refuses one without a reason — "a dial nobody can read an argument
+    for is a dial nobody can decide to remove" — and so does this, in the same
+    words and without spending the request."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "   ", "expiry": "", "repo": None}))
+    assert human.set == []
+    assert "reason" in said, said
+
+
+def test_clearing_returns_the_repo_to_its_own_default():
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "repo": "prisonblues/quarterback", "clear": True}))
+    assert human.cleared == [("tempo", "prisonblues/quarterback")]
+    assert human.set == []
+    assert "default takes over" in said, said
+
+
+def test_a_refused_write_is_reported_and_does_not_take_the_dashboard_down():
+    """The interesting refusals come from an auth proxy in front of the board, and
+    a dashboard is the one program whose crash costs the reader every other panel
+    on the screen as well."""
+    human = FakeHuman(fail="the edge refused this session before the board saw it")
+    _, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "",
+         "repo": None}, human=human))
+    assert "edge refused" in said, said
+
+
+def test_ctrl_s_in_the_editor_is_what_sends_it():
+    """The keystroke path, end to end: the ✎ opens the modal, the fields are
+    typed, and ctrl+s is the only thing that spends a request."""
+    module = _load_app()
+
+    async def go():
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        human = FakeHuman()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = human
+            app.dials = {"asked": True, "now": None}
+            app.render_dials(DIALS)
+            await pilot.pause()
+            await _click_row(pilot, app.query_one("#dials"),
+                             (module.Dash.EDIT_COLUMN + 2, 1))
+            await pilot.pause(0.3)
+            # The value box holds the focus on an existing dial, so what is typed
+            # replaces it only after it is cleared — `ctrl+a` is not a Textual
+            # binding, so this deletes what is there the way a person would.
+            for _ in range(8):
+                await pilot.press("backspace")
+            for ch in "eager":
+                await pilot.press(ch)
+            await pilot.press("tab")
+            for ch in "draining":
+                await pilot.press(ch)
+            assert not human.set, "a keystroke wrote before ctrl+s did"
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.4)
+            return human.set
+
+    written = asyncio.run(go())
+    assert written, "ctrl+s sent nothing"
+    dial, value, reason, repo, _ = written[0]
+    assert (dial, value, reason) == ("tempo", "eager", "draining"), written
+    # The row's own scope, kept: editing an existing dial is changing the one on
+    # screen, and a write that silently moved it to the fleet would be a different
+    # setting with the same name.
+    assert repo == "prisonblues/quarterback", written
+
+
+def test_a_new_dial_takes_its_scope_from_the_rows_on_screen_not_the_cwd():
+    """The mistake a person cannot see afterwards, and the one a second opinion
+    found: `repo_slug` is where work is LAUNCHED, `Scope` is what is being SHOWN.
+    A pane started in one checkout with `QB_DASH_REPOS=owner/other` draws `other`'s
+    dials — and used to offer to write the dial to the checkout's repo instead.
+    Same dial name, different setting, and nothing on screen says which took it.
+    """
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/other"]))
+    app.repo_slug = "prisonblues/quarterback"          # the checkout it launched in
+    assert app.new_dial_scope() == "prisonblues/other"
+
+
+def test_a_wide_pane_writes_to_the_fleet_because_it_cannot_choose():
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/one", "prisonblues/two"]))
+    app.repo_slug = "prisonblues/one"
+    assert app.new_dial_scope() is None
+
+
+def test_a_repo_known_only_by_a_bare_name_is_not_offered_as_a_scope():
+    """`owner/name` is the board's shape for a repo scope; a bare `quarterback` is
+    refused there. Fleet is the honest answer, and the modal says so in bold."""
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["quarterback"]))
+    app.repo_slug = None
+    assert app.new_dial_scope() is None
+
+
+def test_a_duration_that_would_overflow_is_answered_not_raised():
+    """`timedelta` raises OverflowError rather than ValueError past its range, and
+    an escape here is a crash inside a Textual callback — which takes the whole
+    dashboard, not just this panel."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining",
+         "expiry": "99999999999999999999d", "repo": None}))
+    assert human.set == []
+    assert "not a duration" in said, said

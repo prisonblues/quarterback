@@ -292,11 +292,16 @@ def cfg():
 
 
 def test_the_panel_always_says_where_to_turn_one(dash, watched):
-    """Even — especially — with nothing in force. The reader who most needs the URL
-    is the one who has just found out that the tempo is not what they want."""
+    """Even — especially — with nothing in force. The reader who most needs it is
+    the one who has just found out that the tempo is not what they want.
+
+    BOTH surfaces that can, because this renderer is neither: it has no keyboard,
+    which is the whole of what the printed panels are. The verb is the clickable
+    renderer's `✎` or the board's page, and naming only one of them would send
+    somebody to a browser they did not need."""
     panel = dash.panel_dials({"asked": True, "dials": []}, 80, cfg(), None)
     assert any("dials/view" in line for line in _lines(panel))
-    assert any("browser" in line for line in _lines(panel))
+    assert any("qb-dash-tui" in line for line in _lines(panel))
 
 
 def test_the_panel_draws_the_argument_for_every_value(dash, watched):
@@ -376,3 +381,234 @@ def test_the_caps_line_still_draws_before_the_board_has_answered(dash, watched):
     print an answer it has not got."""
     assert dash.tempo_line({}).plain == ""
     assert "TEMPO" not in _printed(dash.header(cfg(), {}, 80, [], False, None, {}, {}))
+
+
+# ---- the credential the writes go out on (#479) -------------------------------
+#
+# The panel could always read. Writing needs a person, because `POST /dials` takes
+# `app.auth.human` and every agent on a box holds the same machine token. What
+# changed is the credential and not the gate: `HumanClient` presents a person's own
+# `X-Human-Key` to the SAME host as the bearer — the agent vhost, no Authelia — and
+# the board records `human/<user>` as it always has.
+#
+# An earlier cut of this class held a signed-in Authelia session and posted to the
+# browser vhost. It is gone, and the reason it is gone is the reason these tests
+# look the way they do: a session expires on a wall clock, so the ✎ would have died
+# whenever it lapsed and stayed dead until somebody re-minted it by hand. What the
+# key costs instead is #479's to state — it sits on this workstation, readable by
+# what runs here — and that is accepted rather than argued away.
+
+def human(key="", cmd=""):
+    return qd.HumanClient(qd.BoardConfig("https://qb.fo.ls", "tok", "hermes",
+                                         human_key=key, human_key_cmd=cmd))
+
+
+def test_a_host_with_no_key_says_so_before_a_control_is_drawn():
+    """Asked on every paint to decide whether the ✎ is a control or an
+    explanation. A verb that looks available and fails on the click reads as a
+    broken button — and this one would fail against a board that is healthy,
+    because what is missing is on this host."""
+    assert "QUARTERBACK_HUMAN_KEY" in human().why_not()
+    assert human(key="k").why_not() is None
+    assert human(cmd="echo k").why_not() is None
+
+
+def test_a_configured_command_counts_as_a_credential_without_being_run():
+    """`op read` is a network call and a possible unlock prompt. A dashboard that
+    ran one every few seconds to decide whether to draw an icon would be its own
+    bug, so `why_not` answers about configuration only."""
+    marker = Path("/tmp/qb-key-whynot")
+    marker.unlink(missing_ok=True)
+    client = human(cmd=f"printf x >> {marker}; echo the-key")
+    assert client.why_not() is None
+    assert not marker.exists(), "why_not() ran the key command"
+    marker.unlink(missing_ok=True)
+
+
+def test_the_key_is_resolved_lazily_and_cached():
+    """A value in the environment is in every child process of the shell that set
+    it; a command is run when a write is actually made, and the secret then lives
+    in this process and nowhere else."""
+    marker = Path("/tmp/qb-key-calls")
+    marker.unlink(missing_ok=True)
+    client = human(cmd=f"printf x >> {marker}; echo the-key")
+    assert client.key() == "the-key"
+    assert client.key() == "the-key"
+    assert marker.read_text() == "x", "the command ran twice for one key"
+    marker.unlink(missing_ok=True)
+
+
+def test_a_rotated_key_can_be_re_read_and_a_fixed_one_says_it_cannot():
+    """A static key does not go stale on its own — unlike the session this
+    replaced, which is the point of it. `refresh` is for the case that remains: a
+    key rotated while a long-lived dashboard was running."""
+    path = Path("/tmp/qb-key-value")
+    path.write_text("first\n")
+    client = human(cmd=f"cat {path}")
+    assert client.key() == "first"
+    path.write_text("second\n")
+    assert client.key() == "first", "a cached key was re-read without being asked"
+    assert client.key(refresh=True) == "second"
+    path.unlink(missing_ok=True)
+
+    fixed = human(key="static")
+    assert fixed.key() == "static"
+    with pytest.raises(RuntimeError, match="cannot be refreshed"):
+        fixed.key(refresh=True)
+
+
+def test_a_key_command_that_fails_is_not_a_host_that_never_had_one():
+    """Opposite states with opposite remedies. `op` wanting to be unlocked is
+    fixable in ten seconds by somebody who is told; it is unfixable by somebody
+    told there is no key on this host."""
+    client = human(cmd="echo 'not signed in' >&2; exit 1")
+    with pytest.raises(RuntimeError) as caught:
+        client.key()
+    assert qd.HumanClient.KEY_FAILED in str(caught.value)
+    assert "not signed in" in str(caught.value)
+
+
+def test_a_key_that_cannot_be_a_header_is_refused_without_being_quoted():
+    """`http.client.putheader` refuses CR/LF by raising `Invalid header value
+    b'<the entire secret>'`, and this dashboard turns exceptions into sentences on
+    its detail line. A credential in a UI string is one in a screenshot, a
+    scrollback and a tmux buffer."""
+    client = human(cmd=r"printf 'SUPERSECRET\r\nX-Evil: 1'")
+    with pytest.raises(RuntimeError) as caught:
+        client.key()
+    said = str(caught.value)
+    assert "SUPERSECRET" not in said, said
+    assert "not usable as a header" in said and "on purpose" in said
+
+
+def test_a_literal_key_goes_through_the_same_check_and_is_stripped():
+    """A config file and an environment variable carry trailing newlines as
+    readily as `op` does, and a value that skipped the check would reach
+    `putheader` and be quoted back."""
+    assert human(key="the-key\n").key() == "the-key"
+    with pytest.raises(RuntimeError) as caught:
+        human(key="SUPERSECRET\rX: 1").key()
+    assert "SUPERSECRET" not in str(caught.value)
+
+
+def test_the_write_carries_the_key_and_the_bearer_to_the_agent_host():
+    """Both, and to ONE host. The key answers "which person", the bearer answers
+    "from where", and a board that got only the first would authorise the write
+    with nothing to say about its origin. No Authelia in the path at all — which
+    is what makes this maintainable rather than a session to keep re-minting."""
+    sent = {}
+    client = human(key="the-key")
+
+    class FakeResponse:
+        def read(self): return b"{}"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, **kw):
+        sent["url"] = req.full_url
+        sent["headers"] = dict(req.header_items())
+        return FakeResponse()
+
+    import urllib.request
+    real = urllib.request.urlopen
+    urllib.request.urlopen = fake_urlopen
+    try:
+        client.set_dial("tempo", "eager", "because")
+    finally:
+        urllib.request.urlopen = real
+    assert sent["url"] == "https://qb.fo.ls/dials"
+    lower = {k.lower(): v for k, v in sent["headers"].items()}
+    assert lower["x-human-key"] == "the-key"
+    assert lower["authorization"] == "Bearer tok"
+
+
+def test_a_dial_write_carries_the_scope_only_when_there_is_one():
+    """`repo` absent and `repo` blank are the same scope to the board — the fleet —
+    and a fleet dial that could be written under two keys is one that can be set
+    twice and resolved once."""
+    sent = []
+    client = human(key="k")
+    client.post = lambda path, body: sent.append((path, body)) or {}
+    client.set_dial("tempo", "eager", "draining", repo=None)
+    client.set_dial("tempo", "held", "mid-release", repo=REPO,
+                    expires_at="2099-01-01T00:00:00+00:00")
+    assert sent[0] == ("/dials", {"dial": "tempo", "value": "eager", "reason": "draining"})
+    assert sent[1][1]["repo"] == REPO and sent[1][1]["expires_at"].startswith("2099")
+
+
+def test_a_value_of_null_survives_the_write():
+    """The documented off switch for `max_fix_growth`, `distant_merge_lines` and
+    `escalate_on.premise_repeated`. The board goes to some trouble to keep `null`
+    apart from "no row at all"; a client that dropped it would put them back
+    together."""
+    sent = []
+    client = human(key="k")
+    client.post = lambda path, body: sent.append(body) or {}
+    client.set_dial("review_panel.max_fix_growth", None, "off for this round")
+    assert "value" in sent[0] and sent[0]["value"] is None
+
+
+def test_a_dial_with_no_argument_is_refused_by_the_client_too():
+    client = human(key="k")
+    client.post = lambda path, body: pytest.fail("a request went out with no reason")
+    with pytest.raises(RuntimeError, match="reason"):
+        client.set_dial("tempo", "eager", "   ")
+
+
+# ---- the four a second opinion found ------------------------------------------
+#
+# Found by `codex` on the cookie-era diff; three of the four are about code that
+# survived the change of credential, and they are kept because every one is a
+# silent failure — a wrong value written without complaint, a credential on a
+# screen, a crash inside a UI callback.
+
+@pytest.mark.parametrize("text", ["99999999999999999999d", "1234567d"])
+def test_a_duration_too_large_to_be_one_is_refused_rather_than_overflowing(text):
+    """`timedelta` raises OverflowError, not ValueError, past about 2.7 million
+    days — so an unbounded regex hands a UI callback that catches the documented
+    failure a crash instead."""
+    with pytest.raises(ValueError, match="not a duration"):
+        qd.parse_dial_expiry(text)
+
+
+def test_the_durations_a_person_actually_types_still_work():
+    for text in ("30m", "4h", "7d", "999999d"):
+        assert qd.parse_dial_expiry(text) is not None
+
+
+def test_the_detail_says_which_door_the_dial_came_through():
+    """The identity is the same by either method, so the detail line carries the
+    other half: a browser the edge vouched for, or a key on a workstation (#479)."""
+    said = qd.dial_detail(dial(set_by="human/rich") | {"set_via": "key"})
+    assert "with a key" in said, said
+    assert "in a browser" in qd.dial_detail(dial() | {"set_via": "edge"})
+
+
+def test_a_dial_older_than_the_column_does_not_invent_a_method():
+    """Absent is left out rather than guessed at — the same rule the board keeps
+    for the column itself."""
+    said = qd.dial_detail(dial(set_by="human/rich"))
+    assert "with a key" not in said and "in a browser" not in said
+    assert "human/rich" in said
+
+
+def test_a_key_command_that_hangs_names_the_prompt_nobody_answered():
+    """`op read` against a desktop-app integration raises a biometric prompt, and
+    a prompt nobody answers is a command that never returns — measured at 30s to
+    fail and 8.7s to succeed once approved, on the day the real credential was
+    minted. "TimeoutExpired" tells a person nothing they can act on."""
+    client = human(cmd="sleep 60")
+    import subprocess as sp
+    real = sp.run
+
+    def fake(*a, **kw):
+        raise sp.TimeoutExpired(cmd="op", timeout=30)
+
+    sp.run = fake
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.key()
+    finally:
+        sp.run = real
+    said = str(caught.value)
+    assert "desktop" in said and "✎" in said, said

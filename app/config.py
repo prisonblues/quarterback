@@ -54,6 +54,30 @@ class Settings(BaseSettings):
     # Prod: a file (rendered by the op-resolver) holding the same format.
     elevated_tokens_file: str = ""
 
+    # A PERSON's key, and the counterpart of `api_tokens` for `human()` rather
+    # than for `identify()`. `name:secret` pairs in the same format, where the
+    # name is the person the write is recorded as — `rich:<secret>` authors as
+    # `human/rich`, exactly as the edge does.
+    #
+    # It exists so a human write does not have to come through Authelia. The edge
+    # path is a session on a wall clock, so anything depending on it needs
+    # re-minting by hand whenever it lapses; this is a static secret that rotates
+    # when somebody decides to rotate it and never otherwise. The dashboard's
+    # DIALS panel is the caller it was added for.
+    #
+    # NOT `elevated_tokens` widened. That one authorises an AGENT for a named,
+    # narrow set of writes and deliberately excludes `/dials` (#479); this
+    # authorises a PERSON, so it opens what a person opens. Two credentials, two
+    # blast radii, rather than one wider one.
+    #
+    # THE RESIDUAL IS KNOWN AND ACCEPTED (#479): the key sits on a workstation
+    # readable by the processes running there, so an agent that goes looking can
+    # find it and author as a person. Bounded by being per person and revocable in
+    # one line. Narrowing it further is deferred deliberately, not overlooked.
+    human_tokens: str = ""
+    # Prod: a file (rendered by the op-resolver) holding the same format.
+    human_tokens_file: str = ""
+
     # LOCAL DEV ONLY: treat `browser_dev_user` (or any `Remote-User`) as a human
     # for the human-only writes, with no shared secret. Off by default and must
     # stay off anywhere the app is reachable — see DEPLOY.md.
@@ -79,6 +103,41 @@ class Settings(BaseSettings):
             name, token = name.strip(), token.strip()
             if name and token:
                 out[name] = token
+        return out
+
+    @property
+    def human_map(self) -> dict[str, str]:
+        """person -> key, parsed exactly as :meth:`token_map` is.
+
+        A third map rather than a flag on either of the others, and the shape is
+        duplicated rather than shared for `elevated_map`'s reason: the three mean
+        different things — who may write at all, who may make the narrow set
+        `delegated()` names, and who counts as a PERSON — and collapsing any two
+        of them is how a caller quietly gains the wrong one.
+
+        Guarded like `elevated_map` and unlike `token_map`: it is read from inside
+        an auth dependency, so an unreadable file must not surface as a 500 from
+        `human()`. Empty is the closed answer — no human keys, so no key
+        authorises anything — which is the same door an unset `HUMAN_TOKENS`
+        leaves. `UnicodeDecodeError` is caught with `OSError` for `elevated_map`'s
+        reason: it is a `ValueError`, so a half-written or binary file would
+        otherwise escape as the 500 the guard exists to prevent.
+        """
+        raw = self.human_tokens
+        if self.human_tokens_file:
+            try:
+                raw = Path(self.human_tokens_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                raw = ""
+        out: dict[str, str] = {}
+        for pair in raw.replace("\n", ",").split(","):
+            pair = pair.strip()
+            if not pair or ":" not in pair:
+                continue
+            name, _, key = pair.partition(":")
+            name, key = name.strip(), key.strip()
+            if name and key:
+                out[name] = key
         return out
 
     @property

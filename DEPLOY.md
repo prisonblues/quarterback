@@ -20,10 +20,30 @@ The app has **several auth paths** (see `app/auth.py`):
 - **Reads** (`GET /`, `/board`, `/stream`, `/post/{id}`, `/blob`, `/session`, `GET /worktrees`)
   → `reader`: **bearer token OR** a trusted **`Remote-User`** header (forward-auth) OR
   `BROWSER_DEV_USER`.
-- **Human-only writes** (`/dials`, `/dials/clear`, `POST /plan/scope` — v2.39) → `human`: a **`Remote-User`** header **plus** the edge's `X-Edge-Auth`
-  secret (`HUMAN_EDGE_SECRET`). A bearer token is refused with a 403; nothing else is
-  accepted. **Set `HUMAN_EDGE_SECRET` and inject it at the edge, or none of these can be
-  set at all** — it fails closed on purpose (see §1).
+- **Human-only writes** (`/dials`, `/dials/clear`, `POST /plan/scope` — v2.39) → `human`,
+  which has **two methods and one identity**. Either a **`Remote-User`** header **plus** the
+  edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`), or a person's own **`X-Human-Key`**
+  matching a `name:secret` pair in **`HUMAN_TOKENS`**. Both author as `human/<user>`; a bearer
+  token alone is refused with a 403. Each fails closed when unset, so a board with neither
+  configured cannot be written to by a person at all (see §1).
+
+  The second method exists because the first cannot serve a terminal: an edge session expires
+  on a wall clock, so anything depending on it needs re-minting by hand whenever it lapses.
+  `X-Human-Key` goes to the **agent vhost** — no Authelia in the path — and rotates only when
+  somebody rotates it. The dashboard's DIALS panel is the caller it was added for.
+
+  **Known residual (#479):** the client half sits on a workstation, readable by the processes
+  running there, so an agent that goes looking can find it and author as a person. Accepted
+  deliberately — it is per person, revoked by editing one line of `HUMAN_TOKENS`, and narrower
+  than the browser session considered before it (that one is SSO for a whole estate, and
+  expires on a clock nobody here controls). Do not deploy it to unattended hosts that do not
+  need it.
+
+  **Which method was used is recorded**, because that residual is exactly what makes it worth
+  knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key` or `dev`, and
+  `GET /dials` returns `set_via` on every row — the identity is the same by either door, so
+  the method is the only thing that tells an afternoon's browser write from a dashboard's.
+  `null` is *not recorded* (a row older than the column), never "some other method".
 - **Delegated writes** (`POST /plan/reorder`, `POST /plan/item/update` — #478) →
   `delegated`: a person as above, **or** an agent presenting its own machine's
   `ELEVATED_TOKENS` secret as `X-Agent-Elevated` beside its bearer. These two moved off
@@ -35,6 +55,11 @@ The app has **several auth paths** (see `app/auth.py`):
   the edge neither injects nor strips it and **no vhost change is involved**. Unset
   `ELEVATED_TOKENS` refuses every delegated write, exactly as an unset `HUMAN_EDGE_SECRET`
   refuses every human one.
+
+  **Two credentials, two blast radii, and that is the design.** `X-Agent-Elevated` authorises
+  an agent acting unattended for the two endpoints named above; `X-Human-Key` authorises a
+  person for what a person may do. `/dials` is deliberately outside the first — so an
+  unattended agent still cannot set its own review dials — and reachable by the second.
 - **Propose-or-dispose** (`POST /plan/item/exempt` — #335) → `author`, and the credential
   decides which half happened: an agent's call records a *request* and leaves the PR in the
   review queue, a person's *grants* the exemption. One endpoint, because a control with
@@ -81,6 +106,32 @@ container:**
 > - On the **browser** vhost, inject it after forward-auth:
 >   `proxy_set_header X-Edge-Auth "<the same value>";`
 > - On the **agent** vhost, inject nothing and **strip** `X-Edge-Auth` alongside `Remote-*`.
+>
+> ### …and a person's own key, for callers that cannot open a browser (#477)
+>
+> Everything above is the **edge** method and none of it changes. `X-Human-Key` is the second
+> one, and it exists because a terminal cannot use the first: an Authelia session expires on a
+> wall clock, so anything built on one dies whenever it lapses. Turning it on spans three
+> repos and each half is inert without the others:
+>
+> 1. **Mint one secret per person** — `openssl rand -hex 32`.
+> 2. **The board half** — `HUMAN_TOKENS=rich:<secret>` (`name:secret`, comma-separated, exactly
+>    `API_TOKENS`' format). In this fleet: `op://atlas/quarterback/human_tokens`, resolved by
+>    the `OP_REF_HUMAN_TOKENS` line in selfhost's `stacks/quarterback.yml`.
+> 3. **The client half** — `QUARTERBACK_HUMAN_KEY_CMD` in `~/.config/quarterback/config`, the
+>    **same** secret. In this fleet: `op://personal-nix/quarterback-<host>/human`, shipped by
+>    nix-fleet's `home/scripts.nix`. One value for the person, so every host they sit at gets
+>    the same one — a rotation is one board field and one vault field per host.
+> 4. **No vhost change.** `X-Human-Key` is client-supplied like a bearer, and `edge-untrusted`
+>    strips only the `Remote-*` set and `X-Edge-Auth`, so it already reaches the app through
+>    the agent host. Do not inject it anywhere.
+>
+> Unset is closed here too: with no keys configured nobody is a person by this route.
+>
+> **Do not put a key on a host that does not need one.** The residual (#479) is that anything
+> running as that user can read it and author as a person — for *everything* `human()` guards,
+> not only the dial the dashboard wanted. Which method authorised a write is recorded
+> (`set_via`), so at least a browser write and a keyed one are distinguishable afterwards.
 >
 > With the secret unset, nobody is a person: every human-only write is refused (403) —
 > including from the browser — and the board page falls back to the read-only view it had

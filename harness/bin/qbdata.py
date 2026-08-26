@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"
@@ -623,10 +623,32 @@ def pane_scope(seat: dict) -> str | None:
 
 
 class BoardConfig:
-    """Where the board is and how to authenticate to it."""
+    """Where the board is and how to authenticate to it.
 
-    def __init__(self, base_url: str, token: str, agent: str) -> None:
+    TWO URLS AND TWO CREDENTIALS, because the board has two front doors and they
+    are not interchangeable. `base_url` is the AGENT vhost, reached with a bearer
+    token, and it is what every read and every agent write here uses.
+    `human_url` is the BROWSER vhost, reached with a signed-in session cookie,
+    and it is the only door the human-only endpoints can be reached through at
+    all — `app/auth.py` has the agent vhost strip `X-Edge-Auth`, so a call that
+    only a person may make cannot be made on the agent side however it is
+    authenticated. See :class:`HumanClient`.
+    """
+
+    def __init__(self, base_url: str, token: str, agent: str,
+                 human_url: str = "", human_key: str = "",
+                 human_key_cmd: str = "") -> None:
         self.base_url, self.token, self.agent = base_url.rstrip("/"), token, agent
+        self.human_url = (human_url or "").rstrip("/")
+        #: A PERSON's key for the human-only endpoints (`X-Human-Key`), presented
+        #: to the SAME host as the bearer — the agent vhost, no Authelia. See
+        #: :class:`HumanClient`.
+        self.human_key = human_key or ""
+        #: How to GET it, for the same reason `token_cmd` exists beside `token`: a
+        #: secret that lives in 1Password is one `op` can re-read, and one that
+        #: never sits in a file on disk. A value is still accepted — a test, or a
+        #: box with no `op` — but the command is the form the fleet ships.
+        self.human_key_cmd = human_key_cmd or ""
 
 
 def resolve_config() -> BoardConfig:
@@ -646,17 +668,36 @@ def resolve_config() -> BoardConfig:
     url = os.environ.get("QUARTERBACK_BASE_URL", "")
     token = os.environ.get("QUARTERBACK_TOKEN", "")
     token_cmd = os.environ.get("QUARTERBACK_TOKEN_CMD", "")
+    # The browser vhost and a signed-in session for it. Both optional and both
+    # usually only in the file — a shell has no reason to carry them — which is
+    # why the condition below asks about them too. It used to read "no url or no
+    # token", and a host with those two in its environment then never sourced the
+    # config at all: the human URL sitting in that file was invisible, and the
+    # dashboard reported no human credential on a machine that had one.
+    human_url = os.environ.get("QUARTERBACK_HUMAN_URL", "")
+    human_key = os.environ.get("QUARTERBACK_HUMAN_KEY", "")
+    human_key_cmd = os.environ.get("QUARTERBACK_HUMAN_KEY_CMD", "")
 
-    if not url or not (token or token_cmd):
+    if (not url or not (token or token_cmd) or not human_url
+            or not (human_key or human_key_cmd)):
         config = (os.environ.get("QUARTERBACK_CONFIG")
                   or os.path.join(os.environ.get("XDG_CONFIG_HOME")
                                   or os.path.expanduser("~/.config"),
                                   "quarterback", "config"))
         if os.path.isfile(config):
+            # `%s\n` PER VALUE and nothing clever: a cookie is one line of opaque
+            # text that may carry `=` and `;`, so the reader below partitions on
+            # the FIRST `=` only — `name, _, value = line.partition("=")` keeps
+            # everything after it verbatim, which is what a `session=abc; other=d`
+            # needs. A cookie carrying a newline would break the framing, and
+            # cannot: HTTP header values do not have them.
             script = (f'. {shlex.quote(config)} >&2 || exit 1\n'
                       'printf "url=%s\\n" "${QUARTERBACK_BASE_URL:-}"\n'
                       'printf "token=%s\\n" "${QUARTERBACK_TOKEN:-}"\n'
-                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n')
+                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n'
+                      'printf "human_url=%s\\n" "${QUARTERBACK_HUMAN_URL:-}"\n'
+                      'printf "human_key=%s\\n" "${QUARTERBACK_HUMAN_KEY:-}"\n'
+                      'printf "human_key_cmd=%s\\n" "${QUARTERBACK_HUMAN_KEY_CMD:-}"\n')
             got = subprocess.run(["bash", "-c", script], capture_output=True,
                                  text=True, timeout=15)
             if got.returncode == 0:
@@ -668,6 +709,12 @@ def resolve_config() -> BoardConfig:
                         token = value
                     elif name == "token_cmd" and not token_cmd:
                         token_cmd = value
+                    elif name == "human_url" and not human_url:
+                        human_url = value
+                    elif name == "human_key" and not human_key:
+                        human_key = value
+                    elif name == "human_key_cmd" and not human_key_cmd:
+                        human_key_cmd = value
 
     if not token and token_cmd:
         got = subprocess.run(["bash", "-c", token_cmd], capture_output=True,
@@ -677,7 +724,9 @@ def resolve_config() -> BoardConfig:
     if not url:
         raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset "
                            "and the site config did not supply one)")
-    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0])
+    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0],
+                       human_url=human_url, human_key=human_key,
+                       human_key_cmd=human_key_cmd)
 
 
 def _ssl_context():
@@ -699,6 +748,228 @@ def _ssl_context():
     except ImportError:
         return None                                 # the default store, which is fine
     return ssl.create_default_context(cafile=certifi.where())
+
+
+#: The header a person's own key travels in — `app.auth.HUMAN_KEY_HEADER`. Named
+#: rather than spelled inline so the two halves of one contract are greppable as a
+#: pair; the board owns the name and this is the client that honours it.
+HUMAN_KEY_HEADER = "X-Human-Key"
+
+
+class HumanClient:
+    """The writes only a PERSON may make, on a person's own key (#477, #479).
+
+    A separate class from :class:`BoardClient` and not a method on it, because
+    the credential is different and the difference is the whole point: this one
+    authorises as `human/<user>`, and a caller that could reach it by accident
+    from the ordinary client would be authoring decisions as a person.
+
+    **Same host as everything else, and no Authelia.** It presents `X-Human-Key`
+    to the agent vhost, beside the bearer that says which machine this is. That
+    is what makes it maintainable: an earlier cut of this class held a signed-in
+    Authelia session and posted to the browser vhost, and a session expires on a
+    wall clock — so the dashboard's `✎` would have gone dead every time the
+    cookie lapsed, and stayed dead until somebody re-minted it by hand. A static
+    key rotates when somebody decides to rotate it and never otherwise.
+
+    **What it costs is `app/config.py`'s to state and this class's to repeat**,
+    because a reader arrives here first: the key sits on this workstation,
+    readable by the processes running here, so an agent that goes looking can
+    find it and author as a person. Accepted deliberately (#479) and bounded by
+    being per person and revocable in one line.
+    """
+
+    #: What a caller is told when there is no human key here. Phrased as a remedy
+    #: because the usual reason is a machine that never had one — and because a UI
+    #: that greys a control out has room for a sentence and no room for a runbook.
+    NO_KEY = ("no human key on this host — set QUARTERBACK_HUMAN_KEY_CMD "
+              "in ~/.config/quarterback/config")
+
+    #: What the key command's own failure is reported as. Kept apart from NO_KEY
+    #: because they are opposite states with opposite remedies: nothing configured
+    #: is a box that never had one, and a command that failed is usually `op`
+    #: wanting to be unlocked — fixable in ten seconds by somebody who is told.
+    KEY_FAILED = "the human-key command failed"
+
+    #: Everything a key may be made of: printable ASCII, no controls. The bound
+    #: that matters is CR and LF — `http.client.putheader` refuses those, and
+    #: refuses them by raising a ValueError CARRYING THE HEADER VALUE, which this
+    #: dashboard would then print on its detail line. A credential in a UI string
+    #: is a credential in a screenshot, a scrollback and a tmux buffer.
+    _KEY_OK = re.compile(r"^[\x20-\x7e]+$")
+
+    def __init__(self, cfg: BoardConfig) -> None:
+        self.cfg = cfg
+        #: The resolved key, once something has resolved it. `None` is "not asked
+        #: yet" and not "there isn't one" — see :meth:`key`.
+        self._key: str | None = None
+
+    def key(self, refresh: bool = False) -> str:
+        """The key, resolved as late as possible.
+
+        **Lazily, and this is the difference between a credential and a copy of
+        one.** A value in the environment is in every child process of the shell
+        that set it and in the config file it came from; a command is run when a
+        write is actually made, which on this fleet means `op read` against a
+        vault that may need unlocking. The secret then lives in this process for
+        as long as it is useful and nowhere else.
+
+        `refresh` re-runs the command. Unlike the session this replaced, a static
+        key does not go stale on its own — so this exists for the one case that
+        remains, a key rotated while a long-lived dashboard was running.
+        """
+        if self._key is not None and not refresh:
+            return self._key
+        if self.cfg.human_key and not refresh:
+            # THROUGH THE SAME CHECK, and stripped the same way. A literal comes
+            # from a config file or an environment variable, both of which carry
+            # trailing newlines as readily as `op` does.
+            self._key = self._checked(self.cfg.human_key.strip())
+            return self._key
+        if not self.cfg.human_key_cmd:
+            raise RuntimeError(self.NO_KEY if not self.cfg.human_key else
+                               "this key is a fixed value and cannot be "
+                               "refreshed — update QUARTERBACK_HUMAN_KEY, or use "
+                               "the _CMD form")
+        try:
+            got = subprocess.run(["bash", "-c", self.cfg.human_key_cmd],
+                                 capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            # THE LIKELY CAUSE, NAMED. `op read` against a desktop-app
+            # integration raises a biometric prompt, and a prompt nobody answers
+            # is a command that never returns — measured here at 30s to fail and
+            # 8.7s to succeed once approved. "TimeoutExpired" tells a person
+            # nothing they can act on; "look at your desktop" tells them
+            # everything, and it is right far more often than it is wrong.
+            raise RuntimeError(
+                f"{self.KEY_FAILED}: it did not finish in 30s. If it is `op`, "
+                "there is probably an approval prompt waiting on your desktop — "
+                "answer it and press ✎ again") from exc
+        except Exception as exc:                  # noqa: BLE001
+            raise RuntimeError(f"{self.KEY_FAILED}: {type(exc).__name__}") from exc
+        value = got.stdout.strip()
+        if got.returncode != 0 or not value:
+            # stderr, clipped: `op` says "not signed in" there and nowhere else,
+            # and a remedy the caller cannot read is a remedy they do not have.
+            why = " ".join((got.stderr or "").split())[:200]
+            raise RuntimeError(f"{self.KEY_FAILED}" + (f": {why}" if why else ""))
+        self._key = self._checked(value)
+        return self._key
+
+    def _checked(self, value: str) -> str:
+        """One header-safe line, or a refusal that does NOT quote what was wrong.
+
+        Checked HERE rather than left to `putheader`, and the difference is the
+        whole point: the stdlib's own message is `Invalid header value
+        b'<the entire secret>'`, and every caller of this class turns an exception
+        into a sentence for a human to read.
+        """
+        if self._KEY_OK.match(value):
+            return value
+        bad = next((f"{c!r}" for c in value if not (0x20 <= ord(c) <= 0x7e)), "?")
+        raise RuntimeError(
+            f"the human key is not usable as a header — it contains {bad}. "
+            "A newline or control character in the vault field is the usual "
+            "cause; the value itself is not shown here on purpose")
+
+    def why_not(self) -> str | None:
+        """None when a human write could work here; otherwise why it cannot.
+
+        Asked BEFORE the control is drawn rather than after it is used. A verb
+        that looks available and fails on the click is the shape that gets read as
+        a broken button, and this one would fail against a board that is perfectly
+        healthy — the thing that is missing is on this host.
+
+        **A CONFIGURED COMMAND COUNTS**, and running it to find out does not
+        belong here: this is asked on every paint, `op read` is a network call and
+        a possible unlock prompt, and a dashboard that ran one every few seconds
+        would be its own bug. Whether the key WORKS is answered where it is used —
+        at the write, in a sentence the panel shows verbatim.
+        """
+        if not (self.cfg.human_key or self.cfg.human_key_cmd):
+            return self.NO_KEY
+        return None
+
+    def post(self, path: str, body: dict) -> dict:
+        """One human write. Raises with a sentence a panel can show verbatim."""
+        why = self.why_not()
+        if why:
+            raise RuntimeError(why)
+        headers = {"Content-Type": "application/json", HUMAN_KEY_HEADER: self.key()}
+        if self.cfg.token:
+            # The bearer rides along: it is what says which MACHINE this is, and
+            # the board reads both — the key answers "which person", the token
+            # answers "from where". A board that got only the key would authorise
+            # the write and have nothing to say about its origin.
+            headers["Authorization"] = f"Bearer {self.cfg.token}"
+        req = urllib.request.Request(
+            f"{self.cfg.base_url}{path}", data=json.dumps(body).encode(),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30,
+                                        context=_ssl_context()) as resp:
+                text = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._refusal(exc)) from exc
+        except ValueError as exc:
+            # The stdlib refusing to send the header at all. `_checked` should have
+            # caught this; if something got past it, the one thing that must not
+            # happen is the message reaching a screen, because it quotes the value.
+            raise RuntimeError("this key cannot be sent as a header "
+                               f"({type(exc).__name__}); the value is withheld") from None
+        return json.loads(text) if text.strip() else {}
+
+    @staticmethod
+    def _refusal(exc: "urllib.error.HTTPError") -> str:
+        """What the board said, in words a panel can show.
+
+        The board names its own mechanism in the body, so the body is what is
+        worth relaying — a 403 here is "this key matches nobody" or "this endpoint
+        is human-only", and those want different things done about them.
+        """
+        try:
+            body = exc.read().decode()[:400]
+        except Exception:                             # noqa: BLE001
+            body = ""
+        said = ""
+        try:
+            detail = json.loads(body).get("detail")
+            said = detail if isinstance(detail, str) else json.dumps(detail)
+        except Exception:                             # noqa: BLE001
+            said = " ".join(body.split())[:200]
+        if exc.code in (401, 403):
+            return said or f"the board refused this key ({exc.code})"
+        return said or f"the board answered {exc.code}"
+
+    def set_dial(self, dial: str, value, reason: str, repo: str | None = None,
+                 expires_at: str | None = None) -> dict:
+        """Put a dial in force (`POST /dials`), as the person this key names.
+
+        **`value` is any JSON and this does not know what a dial means** — the
+        harness owns that vocabulary and a client that checked it would be the
+        second place a dial is written down (#56, #305). It is passed through as
+        given, `None` included: `null` is the documented off switch for three
+        dials and the board keeps it apart from "no row at all".
+
+        `reason` is required by the board and required here — a dial whose
+        argument was never written down is one nobody can decide to remove — so a
+        blank one is refused where it can be explained rather than at a 422.
+        """
+        if not (reason or "").strip():
+            raise RuntimeError("a dial needs a reason: why is this value in force?")
+        body: dict = {"dial": dial, "value": value, "reason": reason.strip()}
+        if repo:
+            body["repo"] = repo
+        if expires_at:
+            body["expires_at"] = expires_at
+        return self.post("/dials", body)
+
+    def clear_dial(self, dial: str, repo: str | None = None) -> dict:
+        """Take a dial off the board (`POST /dials/clear`); the repo's default returns."""
+        body: dict = {"dial": dial}
+        if repo:
+            body["repo"] = repo
+        return self.post("/dials/clear", body)
 
 
 class BoardClient:
@@ -2183,7 +2454,8 @@ TEMPO_DIAL = "tempo"
 
 #: The shape of an answer, so a caller that got an error still gets one it can
 #: read — `EMPTY_PLAN`'s argument, for the same reason.
-EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False}
+EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False,
+                     "now": None}
 
 
 def fetch_dials(client, repos: list[str] | None = None) -> dict:
@@ -2214,6 +2486,13 @@ def fetch_dials(client, repos: list[str] | None = None) -> dict:
         except Exception as exc:                  # noqa: BLE001 — display it, don't die
             out["error"] = f"{type(exc).__name__}: {exc}"
             break
+        # The BOARD's clock, kept for anything that has to write a time against
+        # it. "In four hours" computed from this machine's clock is four hours
+        # from whatever this machine believes, and a box whose clock is an hour
+        # slow has its expiry refused as being in the past — a validation error
+        # about a field nobody typed. `app/static/dials.html` corrects the same
+        # way from the same field.
+        out["now"] = (got or {}).get("now") or out.get("now")
         for row in (got or {}).get("dials") or []:
             # Two repos' answers both carry the fleet rows. Keyed on (repo, dial)
             # rather than on identity because that pair is what the board's own
@@ -2386,6 +2665,72 @@ def tempo_cell(dials: dict | None, repo: str | None = None
     return "TEMPO", dial_value(row, 12), life, "cyan"
 
 
+def parse_dial_value(text: str):
+    """What a person typed, as the VALUE it looks like — JSON where it parses.
+
+    `2`, `true`, `null` and `["a","b"]` are values several dials document, and a
+    `max_rounds` of `"2"` is a dial the harness refuses to apply and reports by
+    name — a puzzle handed to somebody at a keyboard. Anything that is not JSON is
+    the string it looks like, because `P3` and `eager` are values too and
+    demanding quotes round them would make the common case the fiddly one.
+
+    `app/static/dials.html` implements this same rule in JavaScript, deliberately
+    and unavoidably twice: one is a browser and one is a terminal. They are kept
+    honest by `tests/test_dials_page.py`, which asserts the page's half, and by
+    this function's tests, which assert the same table of inputs.
+    """
+    raw = (text or "").strip()
+    if raw == "":
+        return ""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+#: How long a written expiry may be, and the units a person types. Deliberately
+#: not seconds: a dial is set for an afternoon or for a fortnight, and "14400" is
+#: a number somebody has to work out.
+#: DIGITS ARE BOUNDED, and not for tidiness: `timedelta` raises OverflowError —
+#: not ValueError — past about 2.7 million days, so `99999999999999999999d`
+#: escapes a caller that catches the documented failure and lands in a UI
+#: callback as a crash. Six digits is 2739 years: past every legitimate use and
+#: short of every overflow.
+_EXPIRY_RE = re.compile(r"^\s*(\d{1,6})\s*([mhd])\s*$", re.I)
+_EXPIRY_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_dial_expiry(text: str, now: str | None = None) -> str | None:
+    """`4h` → an ISO timestamp four hours from the BOARD's now. Blank → None.
+
+    None means indefinite, which is a real answer and the one the board stores as
+    "until somebody clears it" — so a blank box is not a missing value here.
+
+    Measured from `now` when the board supplied one (:func:`fetch_dials` keeps
+    it). A clock an hour slow otherwise writes "in one hour" as a time already
+    past, which `POST /dials` refuses at the door — correctly, and in words about
+    a field the person never filled in.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    match = _EXPIRY_RE.match(raw)
+    if not match:
+        raise ValueError(f"{raw!r} is not a duration — try 30m, 4h or 7d, "
+                         "or leave it empty for a dial with no end")
+    seconds = int(match.group(1)) * _EXPIRY_UNITS[match.group(2).lower()]
+    if seconds <= 0:
+        raise ValueError("an expiry of zero is a dial that is absent the moment "
+                         "it is written — leave it empty for no end")
+    base = datetime.now(timezone.utc)
+    if now:
+        try:
+            base = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            pass                                  # a board too old to send one
+    return (base + timedelta(seconds=seconds)).isoformat()
+
+
 def dial_where(row: dict, show_repo: bool = True) -> tuple[str, str]:
     """Which LAYER answered — ("fleet" | the repo, style).
 
@@ -2428,6 +2773,14 @@ def dial_detail(row: dict) -> str:
     else:
         bits.append("set indefinitely — nothing will clear this but a person")
     who = " ".join(x for x in ("set by", row.get("set_by")) if x)
+    # HOW, when the board recorded one. The identity is the same by either door,
+    # so this is the half that says which — a browser the edge vouched for, or a
+    # key on a workstation (#479). Absent is a row older than the column, and it
+    # is left out rather than guessed at.
+    via = {"edge": "in a browser", "key": "with a key",
+           "dev": "via the dev bypass"}.get(row.get("set_via"), row.get("set_via"))
+    if via:
+        who += f" {via}"
     when = ago(row.get("set_at"))
     bits.append(f"{who} {when} ago" if when else who)
     if row.get("reason"):
@@ -2436,42 +2789,30 @@ def dial_detail(row: dict) -> str:
 
 
 def dials_url(cfg, repo: str | None = None) -> str:
-    """Where a person turns one — and it is a browser, deliberately.
+    """The board's dials page — the OTHER surface, not the only one any more.
 
-    `POST /dials` takes `app.auth.human`: `Remote-User` plus the `X-Edge-Auth`
-    secret the edge injects. This dashboard authenticates with the machine bearer
-    token, which is precisely the credential `human()` is built to reject, and
-    rightly — every agent on a box holds that same token and nothing inside a
-    request distinguishes one from a person. A tempo an agent could raise for
-    itself is the self-approval shape #85, #86, #78, #232 and #335 each settled
-    separately, and it is not being reopened by a keybinding.
+    Two things want this URL and neither is a workaround. A person comparing
+    projects wants the page, because it shows every repo's dials at once where
+    the panel shows the screen's own. And a host with no human key wants it,
+    because that is the whole of what the dashboard could do before #477's second
+    half — the panel reads, and names the door.
 
-    So the terminal reads and says where to go, which is #443's option (3) applied
-    one endpoint over. Printing the URL is the whole of what makes that honest:
-    #443 is the record of a person being told the reorder was theirs to do and
-    replying "i don't know how to re-order".
+    **Which is #443's option (3), and it is still carrying weight.** That issue's
+    three shapes were: the client holds an edge session; a credential distinct
+    from the machine token; or read-only plus a printed URL. The dashboard now has
+    (2) — `X-Human-Key`, a person's key presented to the agent host, no Authelia —
+    and (3) is what it degrades to when the key is absent, which is every box that
+    has not been given one. #443 is also why the fallback names the URL rather
+    than implying it: it is the record of a person told the reorder was theirs to
+    do, in a terminal, whose reply was "i don't know how to re-order".
 
-    **The credential that would change this exists, and it excludes dials on
-    purpose.** #479/#480 add `X-Agent-Elevated` — a per-machine secret an agent
-    presents beside its bearer, which `app.auth.delegated()` accepts for a NAMED
-    SET of writes while the caller keeps its own identity. `POST /plan/reorder`
-    and `POST /plan/item/update` are in that set. `POST /dials` is deliberately
-    not, "including the fleet `tempo` of #474", and there is a test asserting so.
-
-    That is why this function still exists after that credential lands, and it is
-    the thing to read before adding a write verb here: the gap is not that nobody
-    built the door, it is that the door was built with this room left off the key.
-    Moving `POST /dials` from `human` to `delegated` is one dependency and one
-    deleted test; it is also #479's map, which is a decision and not a patch.
-
-    **The rejected design is the one to be careful of.** An earlier cut had the
-    dashboard hold Rich's signed-in Authelia cookie and call the browser vhost —
-    a `HumanClient` in this very file, on `feat/dash-wide-grid`. It was rejected
-    before it shipped (#479, "What was rejected"): the agent BECOMES `human/rich`,
-    every human-only endpoint opens at once from one credential for any process
-    on the box, and provenance is destroyed — an agent's write is recorded as a
-    person's. A dials write built that way would be #335 reopened by a longer
-    route, so if it reappears it wants `delegated`, never the cookie.
+    **(1) was built and thrown away, and the reason is worth keeping.** An earlier
+    cut of `HumanClient` held a signed-in Authelia session and posted to the
+    browser vhost. Three things were wrong with it and any of them is fatal: the
+    holder BECOMES the person, so every human-only endpoint opens at once rather
+    than the ones being asked for; the session is SSO for a whole estate; and it
+    expires on a wall clock, so the `✎` would have died whenever it lapsed and
+    stayed dead until somebody re-minted it by hand. #479 records the reversal.
     """
     #: The repo rides along so a reader arriving from a terminal lands on the scope
     #: the terminal was showing rather than on the fleet's. A screen watching

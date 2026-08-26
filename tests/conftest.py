@@ -81,6 +81,13 @@ PINNED_SETTINGS = {
     # rather than falling through to somebody else's secret (#478).
     "ELEVATED_TOKENS": "laptop:not-a-secret-laptop,server:not-a-secret-server",
     "ELEVATED_TOKENS_FILE": "",
+    # EMPTY, and deliberately: the second way to be a person here is a key from
+    # `HUMAN_TOKENS`, and a suite that ran with one configured would be a suite in
+    # which "unconfigured refuses everything" is arranged rather than free. The
+    # tests that need the door open set it for themselves — `test_human_key.py`'s
+    # `human_key` fixture — which is the same reason BROWSER_DEV_HUMAN stays off.
+    "HUMAN_TOKENS": "",
+    "HUMAN_TOKENS_FILE": "",
     "LOG_FILE": "",
 }
 os.environ.update(PINNED_SETTINGS)

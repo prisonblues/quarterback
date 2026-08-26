@@ -176,3 +176,20 @@ def test_every_page_with_a_nav_can_reach_the_dials(name):
     others; this is one more of the same."""
     assert "/dials/view" in (STATIC / name).read_text(encoding="utf-8"), \
         f"{name} has a nav and does not offer the dials page"
+
+
+def test_the_page_says_which_door_a_dial_came_through(page):
+    """`human/rich` is `human/rich` by either method — a person is one author
+    however they arrived — so the identity alone cannot distinguish a browser
+    write from a key on a workstation. The second is the one carrying #479's
+    residual, and this is where a reader sees which they are looking at."""
+    assert "d.set_via" in page
+    assert re.search(r"const VIA = \{[^}]*edge:[^}]*key:", page, re.S), \
+        "the page has to name the methods it renders, or the chip is a bare word"
+
+
+def test_a_row_with_no_recorded_method_says_nothing_rather_than_guessing(page):
+    """`null` is "not recorded" — a row older than the column — and never "some
+    other method". Rendering a default would put the one value a reader must be
+    able to distrust into the field they consult to decide whether to trust it."""
+    assert re.search(r"if\(!d\.set_via\) return \"\"", page)
