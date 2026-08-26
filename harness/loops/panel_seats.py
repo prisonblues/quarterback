@@ -1596,6 +1596,62 @@ def fix_growth_limit(panel: dict, notes: list[str]) -> float | None:
     return n
 
 
+def fix_growth_chars_limit(panel: dict, notes: list[str]) -> int | None:
+    """`max_fix_growth_chars` — a positive whole number of chars, or ``None`` for
+    "do not check this half".
+
+    #492's absolute half of the growth ceiling. :func:`fix_growth_limit` beside it
+    answers "how many TIMES bigger", which hands its rope out in proportion to the
+    starting size: at 3.0x a 113-line PR may grow ~226 lines and a 2,000-line one may
+    grow 4,000, and the second is the case most in need of a ceiling. This answers
+    "how much bigger, full stop", and the caller stops on whichever is crossed first.
+
+    **Absent inherits the default and a written ``null`` switches it off**, exactly as
+    :func:`fix_growth_limit` has it and for the identical reason: the default is a
+    number, so reading the two as one would leave a check whose only job is to stop a
+    cycle with no way to opt out. The two keys are nulled independently — that is most
+    of why this is a second key rather than a two-part value inside the one above.
+
+    ``0`` is refused rather than read as "stop the moment the PR grows at all". A
+    growth ceiling of zero is not a ceiling anything can be under once a fix pass has
+    written a single character, so it would stop every cycle that ran a fix pass —
+    the same "switch turned all the way on" failure `false` produces one function up,
+    and `null` is the spelling already available for what an operator writing `0`
+    here would have meant. A bool is refused before the numeric read for that
+    function's reason (``isinstance(True, int)``); an integral float counts and a
+    fractional one does not, since half a char is not a size any diff has."""
+    raw = panel.get("max_fix_growth_chars", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MAX_FIX_GROWTH_CHARS
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("max_fix_growth_chars", raw,
+                      f"{what} — chars the PR may grow past the size the cycle's "
+                      "first round read it at, or null to switch this half of the "
+                      "check off")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
 def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     """One boolean `review_panel` setting, with `panel_preflight._flag`'s manners —
     the string spellings a hand writes (``"false"``, ``"off"``) and the bare ``0``/``1``
@@ -1697,7 +1753,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The eight #165/#297 settings as this round applied them.
+    """The nine #165/#297/#492 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1710,6 +1766,7 @@ class Dials:
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
+    max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
     max_rounds: int = DEFAULT_MAX_ROUNDS
@@ -1722,6 +1779,7 @@ class Dials:
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
                 "max_fix_growth": self.max_fix_growth,
+                "max_fix_growth_chars": self.max_fix_growth_chars,
                 "reviewer_scope": self.reviewer_scope,
                 "require_failing_test": self.require_failing_test,
                 "max_rounds": self.max_rounds}
@@ -1793,8 +1851,15 @@ class Dials:
         is the fixer being asked to clear" has to be readable from the artifact rather
         than from whoever remembers the repo's config. `max_rounds` is left out — the
         Rounds block already prints the cap it actually used."""
-        growth = ("off" if self.max_fix_growth is None
-                  else f"{self.max_fix_growth:g}x")
+        # Both halves of the ceiling on the one line, joined by "or" because that is
+        # what crossed-first MEANS: a reader who saw only the multiple would take the
+        # absolute stop, when it fires, for a bug in the arithmetic (#492). "off" only
+        # where BOTH are null, since a line that vanishes at some settings is one a
+        # reader cannot tell from a dial that was never applied.
+        halves = [f"{self.max_fix_growth:g}x" if self.max_fix_growth is not None else "",
+                  f"+{self.max_fix_growth_chars:,} chars"
+                  if self.max_fix_growth_chars is not None else ""]
+        growth = " or ".join(h for h in halves if h) or "off"
         # Spelled as what it BOUNDS, not as its key: "below-P2 fix budget" says which
         # findings are on it without the reader holding `round_trigger_floor` in their
         # head, and it is printed even where the band is empty (`fix_severity_floor`
@@ -1813,7 +1878,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all eight at once.
+    """Read, validate and report all nine at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -1835,11 +1900,30 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
         low_severity_fix_lines=low_severity_budget(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
+        max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
                                         DEFAULT_REQUIRE_FAILING_TEST, notes),
         max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes, round_ceiling),
     )
+    # The one migration hazard #492 creates, said out loud rather than special-cased.
+    # A repo that wrote `max_fix_growth: null` meant "no growth check" — that key WAS
+    # the whole check — and after #492 it switches off the multiple only, leaving an
+    # absolute half the file never mentioned still able to stop a cycle. Reading the
+    # one null as switching both off is the obvious alternative and is worse: it makes
+    # a written value mean something other than what it names, which is exactly the
+    # collapse the two-keys decision exists to avoid. So the round SAYS it, and names
+    # the key that finishes the job.
+    #
+    # Fires only where the operator's written intent actually changed meaning — a null
+    # multiple beside a live absolute — and not on the shipped defaults, where nobody
+    # wrote anything to be surprised about.
+    if dials.max_fix_growth is None and dials.max_fix_growth_chars is not None:
+        notes.append(
+            "`max_fix_growth: null` switches off the MULTIPLE half of the growth "
+            "ceiling only — since #492 there is an absolute half beside it, and "
+            f"`max_fix_growth_chars` is in force at {dials.max_fix_growth_chars:,} "
+            "chars. Null that too for the pre-#492 'no growth check at all'")
     if dials.require_failing_test:
         notes.append("`require_failing_test: true` is recorded and NOT enforced — the "
                      "reviewer-emitted failing test it needs is not built (#92, #114), "
@@ -3137,6 +3221,105 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
     return out
 
 
+#: What a changed file counts as when the panel asks how much APPARATUS a change is
+#: carrying (#492). Three kinds, and the third is a residual: `test` and `doc` are
+#: recognised by path, `source` is everything the other two did not claim. Named
+#: `source` after the field report's own wording ("406 lines of test for a 66-line
+#: config change") rather than `other`, which would read as a bucket for oddities.
+GUARD_KINDS = ("test", "doc", "source")
+
+#: Whole path SEGMENTS that make a file part of the test apparatus. Segments and
+#: never substrings, which is the one way this measurement goes quietly wrong: a
+#: `src/protest/` package is not a test directory, `contests/` is not `test`, and a
+#: ratio computed over the wrong files reads exactly like one computed over the right
+#: ones. `fixtures`/`testdata` are here because a 400-line JSON fixture is apparatus
+#: by any reading — the thing this counts is the size of what surrounds a change.
+_TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "testing", "__tests__",
+                        "__mocks__", "e2e", "fixtures", "testdata"})
+#: The same for documentation. `changelog.d` is here because a fragment directory is
+#: documentation however CI treats it.
+_DOC_DIRS = frozenset({"doc", "docs", "adr", "rfc", "changelog.d"})
+#: Documentation wherever it sits: a `.md` under `harness/commands/` is a brief and a
+#: `.md` at the repo root is a README, and neither is the change being guarded.
+_DOC_SUFFIXES = (".md", ".rst", ".adoc", ".txt")
+
+
+def _guard_kind(path: str) -> str:
+    """Which of :data:`GUARD_KINDS` a repo-relative path belongs to.
+
+    Directory before basename, because a directory is the stronger statement: a
+    `tests/README.md` is part of the test apparatus and calling it documentation
+    would be true and useless. Test before doc for the same reason — the two are
+    summed into one `guard` figure by the caller, so the split is for a reader
+    deciding WHICH kind of apparatus grew, and a file inside `tests/` grew the tests.
+
+    Nothing here reads the file. This is a path classifier and it is deliberately
+    coarse: it feeds a number that is REPORTED and gates nothing (#67), so a
+    misfiled path costs a slightly wrong line in a report rather than a stopped
+    cycle. The day it earns a threshold is the day it earns a sharper classifier."""
+    parts = [seg for seg in path.replace("\\", "/").split("/") if seg and seg != "."]
+    if not parts:
+        return "source"
+    dirs = {seg.casefold() for seg in parts[:-1]}
+    low = parts[-1].casefold()
+    stem = low.rsplit(".", 1)[0] if "." in low else low
+    if dirs & _TEST_DIRS:
+        return "test"
+    if (low == "conftest.py" or stem.startswith(("test_", "spec_"))
+            or stem.endswith(("_test", "_spec", ".test", ".spec"))):
+        return "test"
+    if dirs & _DOC_DIRS or low.endswith(_DOC_SUFFIXES):
+        return "doc"
+    return "source"
+
+
+def guard_ratio(diff: str) -> dict | None:
+    """How much APPARATUS this change is carrying: test and doc lines ADDED against
+    source lines added, or None where the diff adds nothing at all.
+
+    #492's second half, and it is **report-only** — #67's instrument-before-gate rule,
+    which the panel's two existing attribution tallies already live under: recorded,
+    counted, printed, and gating nothing. (Their vocabulary is deliberately not
+    repeated here, down to this sentence: a suite guard refuses to let any module
+    outside the ones that measure them so much as name them, and this is not one of
+    those modules.) The signal is real: one cycle produced 406 lines of test
+    for a 66-line config change, and nothing in the panel noticed that the apparatus
+    built to protect a change had outgrown the change. It is also a DIFFERENT failure
+    from raw growth — a fix pass can sit well under `max_fix_growth` overall while the
+    test-to-source ratio inside it goes to 6:1, and 6:1 is a change that wants
+    splitting even when the total is small. What it does not yet have is a threshold
+    anybody has measured, so it ships with none; a number invented today would be a
+    ceiling with an argument written after it.
+
+    **ADDED lines only.** A deletion is not apparatus being built, and counting churn
+    would make a fix pass that rewrites a test file in place read the same as one that
+    writes a second test suite. The field report asked the question in those terms
+    too.
+
+    **The WHOLE PR, and the caller's `review.diff` is what to pass.** Not this round's
+    increment, even where one exists: the question is how much apparatus the CHANGE is
+    carrying, which is the same question at every round and is answerable from round
+    1's diffstat — long before `max_fix_growth` has a second size to compare against.
+    Under a manifest round `review.diff` is the manifest, exactly as the growth
+    ceiling's ends are, and the ratio is then a fact about the manifest; named here
+    rather than left to be discovered.
+
+    One number for the pair and the three components beside it, because `guard` alone
+    cannot say whether a change grew tests or grew prose, and those argue for
+    different things. `ratio` is None where the change added no source at all — a
+    pure test or docs PR, where the quantity is undefined rather than infinite, and
+    reporting a large number for it would be an accusation about the commonest benign
+    shape there is."""
+    counts = {kind: 0 for kind in GUARD_KINDS}
+    for path, lines in _diff_added_lines(diff).items():
+        counts[_guard_kind(path)] += len(lines)
+    if not sum(counts.values()):
+        return None
+    guard = counts["test"] + counts["doc"]
+    return {**counts, "guard": guard,
+            "ratio": round(guard / counts["source"], 2) if counts["source"] else None}
+
+
 def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
     """Which files a reviewer handed only the first `budget` chars of `diff` could
     not read IN FULL — the tail that fell off the end of its prompt.
@@ -3204,7 +3387,8 @@ __all__ = [
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "severity_floor", "reviewer_scope", "low_severity_budget",
-    "distant_merge_lines", "fix_growth_limit",
+    "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
+    "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",

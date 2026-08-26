@@ -720,6 +720,64 @@ DEFAULTS: dict = {
         # whole grown PR, so the same number means "the fix is 3x the change" in one
         # and "the PR tripled" in the other. Both are the thing worth stopping for.
         "max_fix_growth": 3.0,
+        # The ABSOLUTE half of that same ceiling, and the two bind at whichever is
+        # crossed FIRST (#492). Chars the PR may GROW past the size the cycle's first
+        # round read it at.
+        #
+        # **A pure multiple hands its rope out in proportion to the starting size**,
+        # so the absolute growth it permits is largest exactly where a ceiling is most
+        # wanted. At 3.0x a 113-line PR may grow ~226 lines before the check fires and
+        # a 2,000-line one may grow 4,000 — four thousand lines of fix-pass output on
+        # a change that was already large, waved through by the same dial that stops
+        # the small one at 226. "A fix pass that MULTIPLIES the diff has written a
+        # second change" is a claim about ABSOLUTE second-change-ness, and one
+        # multiple cannot express it at both ends of the range.
+        #
+        # **Chars, and the unit is in the name.** The field report asked for lines;
+        # this counts chars because the ceiling beside it already does — `max_fix_growth`
+        # divides `pr_chars` by the first round's `pr_chars` — and two halves of one
+        # ceiling read off two different measurements is #298's defect one level up: a
+        # numerator taken from a different string than the denominator, reading as
+        # configured and stopping nothing. A churned-line count also does not EXIST on
+        # any baseline written before this key did, so a `_lines` dial would decline to
+        # run on every cycle already in flight and on every payload behind it, which is
+        # #169's failure — a mechanism that ships unwired. Chars is the unit
+        # `max_diff_chars`, `judge_max_diff_chars` and `ask_max_context_chars` are
+        # already in, so a reader of this block is not being asked to hold two.
+        #
+        # **30,000, and the conversion is measured rather than assumed.** PR #188's own
+        # diff is 34,717 chars over 521 churned lines — 66 chars a line — and this
+        # repo's last 25 commits run 52-94 with a median near 78, larger diffs running
+        # leaner. So 30,000 is roughly 380-450 churned lines of GROWTH. Against the two
+        # runaways this repo has actually measured: #188 went 185 -> 721 churned lines,
+        # a growth of 536 (~35,000 chars at its own 66), and #236 went 359 -> 2,313, a
+        # growth of 1,954 (~129,000). Both stop, with margin. The 113-line cycle in
+        # #492 grew ~122 lines and does NOT stop here, correctly — that is the "binds a
+        # round late" half of the report, which no absolute floor can reach, and
+        # `guard_ratio` is the earlier signal filed for it.
+        #
+        # **It can only ever TIGHTEN — and that is the narrow claim, not a wider one.**
+        # Crossed-first means both numbers are ceilings, so no value of this key lets
+        # through a cycle 3.0x would have caught. It does NOT follow that the multiple
+        # would eventually have caught what this stops: a 2,000,000-char PR that grows
+        # by 30,001 chars sits at 1.02x and may never approach 3.0x at all, and
+        # catching exactly that is the point — a proportional ceiling can permit that
+        # growth permanently. So this stops cycles the multiple never would, and lets
+        # through none that it would. That is also what makes it cheap to reverse:
+        # `null` switches this half off and restores the pre-#492 behaviour exactly,
+        # and `null` on both is no growth check at all, as it was before either
+        # existed.
+        #
+        # **A second key rather than a two-part `max_fix_growth` value**, which is the
+        # open question #492 left. A pair would avoid a fifth growth-adjacent name in a
+        # block already near 25 keys, and it would cost more than that saves:
+        # `BOARD_DIALS` types this dial as a scalar `number` and the board's column
+        # stores one JSON value per dial, so a pair needs a new shape at both ends; and
+        # `null` is already the documented off switch for `max_fix_growth`, so a pair
+        # would have to answer which half a bare `null` switches off. Two keys, two
+        # nulls, two independent answers, and either one settable from the board on its
+        # own.
+        "max_fix_growth_chars": 30_000,
         # What a reviewer is asked to look FOR. `diff` asks for defects in the
         # change under review, and surfaces anything outside it as an observation
         # rather than as a finding a fix round must clear. `repo` is today's
@@ -2038,10 +2096,11 @@ class Dial(NamedTuple):
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
-    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated`,
-    `escalate_on.fix_injection` and `max_diff_chars`, and means "inherit the default"
-    for everything else — so a dial that took `null` generally would have one written
-    value with two meanings.
+    for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
+    `escalate_on.premise_repeated`, `escalate_on.fix_injection` and
+    `max_diff_chars`, and means "inherit the default" for everything else — so a
+    dial that took `null` generally would have one written value with two
+    meanings.
 
     `rule` is the direction, and it is the one place this layer and #276's throttle
     genuinely differ:
@@ -2100,6 +2159,10 @@ BOARD_DIALS: dict[str, Dial] = {
     # #297's budget for the band between them, and #298's growth ceiling.
     "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
     "review_panel.max_fix_growth": Dial("number", True, "either"),
+    # #492's absolute half of that ceiling. Settable on its own and nullable on its
+    # own, which is the whole reason it is a second key rather than a pair inside the
+    # one above.
+    "review_panel.max_fix_growth_chars": Dial("number", True, "either"),
     # What a cycle costs: how many rounds, how much of the change each seat reads,
     # how much diff it is handed, and whether a second model adjudicates.
     "review_panel.max_rounds": Dial("number", False, "either"),
