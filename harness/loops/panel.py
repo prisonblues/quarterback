@@ -850,6 +850,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # which is the one question the brake exists to answer.
     premise_limit = premise_repeat_limit(panel, notes)
     premise_undecidable = premise_undecidable_brake(panel, notes)
+    # #489's brake, read here rather than at the stop rule so that a malformed value
+    # hard-exits at the same moment `premise_repeated`'s does — before a seat is
+    # dispatched, rather than after a whole panel has been paid for.
+    injection_limit = fix_injection_limit(panel, notes)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -2509,184 +2513,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "the key is still recorded and inherited, and a later round that "
                      "rules the same defect real will hold it there. Withdraw it from "
                      "the next round's --escalated if that is not what you meant")
-    # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
-    # ones itself, so the rule lives in one place instead of depending on every
-    # caller to filter first. It takes keys and nothing else — the count overload
-    # it used to accept could not obey the escalation rule, and a caller passing
-    # one put the #221 jam straight back with nothing said.
-    stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
-                      repeated={c.key for c in outstanding if not is_new(c)},
-                      escalated=held,
-                      # #165. The trigger floor bounds which NEW findings buy a round;
-                      # the fix floor bounds rules 2 and 3, because a finding no fix
-                      # round was asked to clear is outstanding every round by
-                      # construction and would otherwise run the cycle to the cap on
-                      # its own. `round_stop`'s docstring has the whole argument.
-                      trigger_floor=dials.round_trigger_floor,
-                      # The floor the round was REQUIRED to clear, which is the fix
-                      # floor until a budget is in force and the cut afterwards
-                      # (#297) — an unpaid budgeted finding is outstanding for the
-                      # same reason a below-floor one is, and rule 3 would otherwise
-                      # run every budgeted cycle to the cap on it.
-                      # `Dials.cleared_floor` has the argument.
-                      fix_floor=dials.cleared_floor,
-                      # #84's register, read-only here. The BRAKE runs before a fix
-                      # pass (`panel.py --premise`); this is the round's half — it
-                      # ends a cycle whose premise was declared twice and reached a
-                      # round anyway, and it reports the fix passes that declared
-                      # nothing and so could not have been braked at all.
-                      premises=premise_state(premises, round_no, premise_limit,
-                                             premise_undecidable))
-    # Said in `config_notes` as well as in `round_stop`, because these two are read
-    # by different people at different moments: the payload's `round_stop` is what
-    # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
-    # is what a human reads off the PR comment afterwards. An unescalatable cycle has
-    # to be legible in the second place too, or the gap is only ever found by
-    # somebody already looking for it.
+    # ---- MEASURED BEFORE THE STOP RULE, WHICH IS WHAT #489 CHANGED ABOUT IT.
+    # This block used to sit below `round_stop`, and could, because nothing read it:
+    # provenance was recorded, tallied and printed and stopped no run. It now feeds
+    # `escalate_on.fix_injection`, so the tally has to exist before the verdict that
+    # consumes it. Nothing else moved and nothing here reads `stop` — the whole block
+    # is a function of `outstanding`, the baseline and the fix range, all of which
+    # were already resolved above, and nothing between here and where it used to sit
+    # reads or writes any name it binds.
     #
-    # Gated on `--premise-file`, so it fires for a cycle that WIRED the brake and
-    # skipped a declaration and stays quiet for one that never wired it at all. Those
-    # are different facts and only the first is actionable by the caller reading this
-    # report; a note on every round of every unwired cycle is the "loud and wrong" a
-    # reader learns to skip, and it would arrive on the same line as the ones that
-    # mean something. The unwired case is still IN the payload
-    # (`round_stop.premises.undeclared_rounds`), where an auditor asking "could this
-    # cycle have been braked at all?" is looking.
-    undeclared = stop["premises"]["undeclared_rounds"]
-    if undeclared and premise_file and premise_limit is not None:
-        notes.append(
-            f"the fix pass after round(s) {', '.join(str(r) for r in undeclared)} "
-            "declared no premise (`panel.py --premise`), so #84's futility brake could "
-            "not be evaluated on it — those passes are UNESCALATABLE, which is a gap "
-            "in this cycle's record rather than a clean one")
-    for repeated in stop["premises"]["repeated"]:
-        notes.append(
-            f"premise {repeated['key']} was declared in rounds "
-            f"{', '.join(str(r) for r in repeated['rounds'])} — "
-            f"{repeated['text']!r}. A fix pass was written against it more than once, "
-            "so the cycle ends here and a human answers the premise (#67, #84)")
-    # #491's late half, and it is the same shape as the repeat above for the same
-    # reason: `panel.py --premise` refuses the fix when it is PROPOSED, and a caller
-    # that ignored exit 4 wrote it anyway. The register is then the record that says
-    # so, and the round that follows is where it costs something.
-    #
-    # Only when the brake is ARMED. `premise_state` lists an undecidable declaration
-    # either way — the payload reports what the cycle declared — but a repo that
-    # switched the brake off asked for a fixer to be allowed to approximate, and
-    # ending its cycle on the answer anyway would apply a policy it declined.
-    for undecidable in (stop["premises"]["undecidable"] if premise_undecidable else []):
-        notes.append(
-            f"premise {undecidable['key']} was declared in rounds "
-            f"{', '.join(str(r) for r in undecidable['rounds'])} — "
-            f"{undecidable['text']!r} — and answered `decidable: no`. A fix pass was "
-            "written against a property the runtime cannot observe, so every fix for "
-            "it is an approximation: the cycle ends here and a human answers it "
-            "(#491)")
-    # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
-    # a human must answer the premise" does not turn it green. `round_stop` counts
-    # it like any other escalation — correctly, since it is work no fix round may
-    # do — so a cycle whose only remaining item is an escalated `python:S2259`
-    # stops with "nothing left that a fix round can clear", which is true of the
-    # ROUND and reads as a clean finish on a PR that cannot merge.
-    #
-    # Named here rather than fixed by keeping gate issues out of the register:
-    # `outstanding` is `to_fix + sonar` and the stop rule already acted on the key,
-    # so a record that showed the issue as ordinary work would contradict the rule
-    # that stopped the cycle. `preland.py` HOLDs on `sonar_gate == "ERROR"`
-    # independently, so nothing lands on this silently — but that is a different
-    # script, and this panel's own verdict has to say it too: in `reason`, which a
-    # loop reads, and in `veto`, which a human reads. `confident` is already false
-    # (holding an escalation takes a veto line of its own), so this adds no verdict
-    # it has not already earned.
-    held_gate = sorted({c.key for c in sonar} & set(stop["escalated_outstanding"]))
-    if stop["stop"] and held_gate and result.sonar_gate == "ERROR":
-        stop["reason"] += " — and the SonarCloud quality gate is still FAILING"
-        stop["veto"] = [*stop["veto"],
-                        f"{len(held_gate)} escalated finding(s) are SonarCloud gate "
-                        "issues and the gate reads ERROR — a premise answer does not "
-                        "clear an external merge gate, so this PR cannot land until "
-                        "the issue is resolved or excluded in SonarCloud"]
-    # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
-    # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
-    # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
-    # introduced an unbounded FIFO read. So a round whose PR is more than
-    # `max_fix_growth` times the size the cycle's FIRST round found it at stops and
-    # says the change wants splitting, rather than buying another panel over a bigger
-    # change.
-    #
-    # **BOTH ENDS ARE THE WHOLE PR, WHATEVER THIS ROUND REVIEWED (#298).**
-    # `round_scope` decides what the reviewers are asked to LOOK AT; this ceiling
-    # asks how big the change has BECOME. They are different questions, and the
-    # second must not silently change its meaning because the first was configured.
-    # Measured on `review.target` — as it was until #298 — the default `increment`
-    # scope put one round's fix commit over the cycle's whole-PR starting size, which
-    # is a real quantity and not the one that runs away: PR #188 went 185 -> 593 ->
-    # 721 churned lines, 3.90x under this 3.0x ceiling, while its round-2 increment
-    # was 128 lines and never came near it. The backstop against the 63.7% bad-fix
-    # injection this repo measures was pointed at the wrong number and never fired.
-    #
-    # Still no new plumbing on this end: `review.diff` is the PR as `gh pr diff`
-    # returned it under either scope, and `Baseline.first_reviewed` reads the
-    # earliest baseline's whole-PR size off the payloads round 2+ already receive via
-    # `--baseline` (`pr_chars`, recorded below).
-    #
-    # `review.diff` under a manifest round is the MANIFEST, exactly as
-    # `review.target` was: what that round put in front of the panel is a description
-    # of a move, and the target's pre-substitution size lives in `preflight.shape`.
-    # Named rather than left to be discovered, because it is the one case where this
-    # ratio is not two diff sizes.
-    #
-    # The measurement of each end still travels with it and is still printed, because
-    # two readings of a size exist in this payload and whatever reports a ratio has to
-    # be able to say which one it computed. `review_scope` rides alongside so a reader
-    # can see what the round reviewed without mistaking it for what was measured.
-    #
-    # **NOT dressed up as convergence.** It takes a veto line naming itself and
-    # `confident` is forced false, the same discipline the round cap and a held
-    # escalation get: the cycle is ending because something went wrong, and a reader
-    # who cannot tell that from a clean finish has been told the opposite of the truth.
-    # Set AFTER the SonarCloud sentence above so the reason reads outermost-first.
-    growth = None
-    if dials.max_fix_growth is not None and prior.first_reviewed:
-        first_round, first_chars, first_scope = prior.first_reviewed
-        pr_chars = len(review.diff)
-        ratio = pr_chars / first_chars
-        over = ratio > dials.max_fix_growth
-        growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
-                  "over": over, "chars": pr_chars, "scope": "pr",
-                  "review_scope": review.scope,
-                  "first_round": first_round, "first_chars": first_chars,
-                  "first_scope": first_scope}
-        if over:
-            stop["stop"] = True
-            stop["reason"] = (
-                f"this PR is {ratio:.1f}x the size round {first_round} reviewed it at, "
-                f"past the {dials.max_fix_growth:g}x "
-                f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
-                "splitting, not another round")
-            stop["veto"] = [*stop["veto"],
-                            f"the PR's {pr_chars:,} chars (whole PR) "
-                            f"against round {first_round}'s {first_chars:,} "
-                            f"({first_scope}) is {ratio:.1f}x, past the "
-                            f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
-                            "pass that multiplies the change has written a second "
-                            "change, and this stop is that measurement, not convergence"]
-            # Explicit rather than inferred from the veto line: `confident` was already
-            # computed inside `round_stop`, so appending to `veto` here changes nothing
-            # about it — and a verdict this file forces to `stop` must never be able to
-            # carry the flag that means "nothing left to find".
-            stop["confident"] = False
-    stop["fix_growth"] = growth
-
-    # Whether a CYCLE exists at all, and the one predicate that decides it — for
-    # the report's Rounds block and for the payload alike. They used to disagree:
-    # the report suppressed the block for a review-only run while the payload sent
-    # `round_stop` regardless, so `record_review` stored a `/panel` read with
-    # findings as `stopped: false` (the board shows a cycle mid-flight that nothing
-    # will advance) and one without as `stopped: true, stop_confident: true` — a
-    # confident-convergence record for a PR that had no cycle.
-    cycle_run = bool(in_cycle or prior_rounds)
-
+    # The one visible consequence is ORDER: the two notes this block can post — an
+    # unreadable fix range, and the #67 tally that goes dark with it — now appear in
+    # `config_notes` above the stop rule's own notes rather than below them. That is
+    # the right way round for a reader (the measurement, then what was decided on it)
+    # and it is said here rather than left to be noticed, because `config_notes` is an
+    # artifact people diff.
     # ---- provenance: did the last fix pass INTRODUCE this, or did it MISS it? --
     #
     # What this round could not read, banked for the next one. A file is unread
@@ -2829,6 +2670,213 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                              # and what `max_fix_growth` measures.
                              pr_chars=len(review.diff))]
 
+
+    # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
+    # ones itself, so the rule lives in one place instead of depending on every
+    # caller to filter first. It takes keys and nothing else — the count overload
+    # it used to accept could not obey the escalation rule, and a caller passing
+    # one put the #221 jam straight back with nothing said.
+    stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
+                      repeated={c.key for c in outstanding if not is_new(c)},
+                      escalated=held,
+                      # #165. The trigger floor bounds which NEW findings buy a round;
+                      # the fix floor bounds rules 2 and 3, because a finding no fix
+                      # round was asked to clear is outstanding every round by
+                      # construction and would otherwise run the cycle to the cap on
+                      # its own. `round_stop`'s docstring has the whole argument.
+                      trigger_floor=dials.round_trigger_floor,
+                      # The floor the round was REQUIRED to clear, which is the fix
+                      # floor until a budget is in force and the cut afterwards
+                      # (#297) — an unpaid budgeted finding is outstanding for the
+                      # same reason a below-floor one is, and rule 3 would otherwise
+                      # run every budgeted cycle to the cap on it.
+                      # `Dials.cleared_floor` has the argument.
+                      fix_floor=dials.cleared_floor,
+                      # #84's register, read-only here. The BRAKE runs before a fix
+                      # pass (`panel.py --premise`); this is the round's half — it
+                      # ends a cycle whose premise was declared twice and reached a
+                      # round anyway, and it reports the fix passes that declared
+                      # nothing and so could not have been braked at all.
+                      premises=premise_state(premises, round_no, premise_limit,
+                                             premise_undecidable),
+                      # #489's injection gate. The measurement is `provenance_counts`
+                      # above — `introduced` over every new outstanding finding — and
+                      # `injection_state` turns it into the verdict `round_stop`
+                      # applies. Empty on round 1 and on any round whose fix range
+                      # could not be read, which is `over: False` by construction: a
+                      # round that could not be attributed does not end a cycle.
+                      injection=injection_state(provenance_counts, injection_limit))
+    # Said in `config_notes` as well as in `round_stop`, because these two are read
+    # by different people at different moments: the payload's `round_stop` is what
+    # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
+    # is what a human reads off the PR comment afterwards. An unescalatable cycle has
+    # to be legible in the second place too, or the gap is only ever found by
+    # somebody already looking for it.
+    #
+    # Gated on `--premise-file`, so it fires for a cycle that WIRED the brake and
+    # skipped a declaration and stays quiet for one that never wired it at all. Those
+    # are different facts and only the first is actionable by the caller reading this
+    # report; a note on every round of every unwired cycle is the "loud and wrong" a
+    # reader learns to skip, and it would arrive on the same line as the ones that
+    # mean something. The unwired case is still IN the payload
+    # (`round_stop.premises.undeclared_rounds`), where an auditor asking "could this
+    # cycle have been braked at all?" is looking.
+    undeclared = stop["premises"]["undeclared_rounds"]
+    if undeclared and premise_file and premise_limit is not None:
+        notes.append(
+            f"the fix pass after round(s) {', '.join(str(r) for r in undeclared)} "
+            "declared no premise (`panel.py --premise`), so #84's futility brake could "
+            "not be evaluated on it — those passes are UNESCALATABLE, which is a gap "
+            "in this cycle's record rather than a clean one")
+    for repeated in stop["premises"]["repeated"]:
+        notes.append(
+            f"premise {repeated['key']} was declared in rounds "
+            f"{', '.join(str(r) for r in repeated['rounds'])} — "
+            f"{repeated['text']!r}. A fix pass was written against it more than once, "
+            "so the cycle ends here and a human answers the premise (#67, #84)")
+    # #491's late half, and it is the same shape as the repeat above for the same
+    # reason: `panel.py --premise` refuses the fix when it is PROPOSED, and a caller
+    # that ignored exit 4 wrote it anyway. The register is then the record that says
+    # so, and the round that follows is where it costs something.
+    #
+    # Only when the brake is ARMED. `premise_state` lists an undecidable declaration
+    # either way — the payload reports what the cycle declared — but a repo that
+    # switched the brake off asked for a fixer to be allowed to approximate, and
+    # ending its cycle on the answer anyway would apply a policy it declined.
+    for undecidable in (stop["premises"]["undecidable"] if premise_undecidable else []):
+        notes.append(
+            f"premise {undecidable['key']} was declared in rounds "
+            f"{', '.join(str(r) for r in undecidable['rounds'])} — "
+            f"{undecidable['text']!r} — and answered `decidable: no`. A fix pass was "
+            "written against a property the runtime cannot observe, so every fix for "
+            "it is an approximation: the cycle ends here and a human answers it "
+            "(#491)")
+    # #489, said in `config_notes` as well as in `round_stop` and for the reason the
+    # premise notes above are: `jq .round_stop` is what an orchestrator reads to
+    # decide whether to go again, and this is what a human reads off the PR comment
+    # afterwards. The number is already printed a few lines further down ("N
+    # introduced by the last fix pass"); what this adds is that it crossed a
+    # threshold and ended the cycle, which the bare count cannot say.
+    # `fired`, NOT `over`. `over` is a property of the measurement and is true of
+    # rounds this rule deliberately does not touch — a below-floor policy stop, a
+    # round holding an escalation, a round going again under rule 2 for a P1. Gating
+    # on it would print "the cycle ends here" under a confident, converged verdict,
+    # which is a `config_notes` line contradicting the `reason` beside it.
+    if stop["fix_injection"]["fired"]:
+        fi = stop["fix_injection"]
+        notes.append(
+            f"{fi['introduced']} of {fi['new']} new outstanding findings "
+            f"({fi['rate']:.0%}) were introduced by the fix pass before this round, "
+            f"over the {fi['limit']:.0%} `review_panel.escalate_on.fix_injection` "
+            "threshold — the cycle ends here. `introduced` is a floor and not a "
+            "measurement (#48), so the real share is at least that; what this needs "
+            "is a human deciding whether the fix passes are working, not another one "
+            "(#489)")
+    # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
+    # a human must answer the premise" does not turn it green. `round_stop` counts
+    # it like any other escalation — correctly, since it is work no fix round may
+    # do — so a cycle whose only remaining item is an escalated `python:S2259`
+    # stops with "nothing left that a fix round can clear", which is true of the
+    # ROUND and reads as a clean finish on a PR that cannot merge.
+    #
+    # Named here rather than fixed by keeping gate issues out of the register:
+    # `outstanding` is `to_fix + sonar` and the stop rule already acted on the key,
+    # so a record that showed the issue as ordinary work would contradict the rule
+    # that stopped the cycle. `preland.py` HOLDs on `sonar_gate == "ERROR"`
+    # independently, so nothing lands on this silently — but that is a different
+    # script, and this panel's own verdict has to say it too: in `reason`, which a
+    # loop reads, and in `veto`, which a human reads. `confident` is already false
+    # (holding an escalation takes a veto line of its own), so this adds no verdict
+    # it has not already earned.
+    held_gate = sorted({c.key for c in sonar} & set(stop["escalated_outstanding"]))
+    if stop["stop"] and held_gate and result.sonar_gate == "ERROR":
+        stop["reason"] += " — and the SonarCloud quality gate is still FAILING"
+        stop["veto"] = [*stop["veto"],
+                        f"{len(held_gate)} escalated finding(s) are SonarCloud gate "
+                        "issues and the gate reads ERROR — a premise answer does not "
+                        "clear an external merge gate, so this PR cannot land until "
+                        "the issue is resolved or excluded in SonarCloud"]
+    # ---- the growth ceiling (#165). A fix pass that MULTIPLIES the diff has written
+    # a second change, not a fix: on PR #236 the fix passes took a 359-insertion bug
+    # fix to 2,313 while none of the 67 findings was in the fix, and the last of them
+    # introduced an unbounded FIFO read. So a round whose PR is more than
+    # `max_fix_growth` times the size the cycle's FIRST round found it at stops and
+    # says the change wants splitting, rather than buying another panel over a bigger
+    # change.
+    #
+    # **BOTH ENDS ARE THE WHOLE PR, WHATEVER THIS ROUND REVIEWED (#298).**
+    # `round_scope` decides what the reviewers are asked to LOOK AT; this ceiling
+    # asks how big the change has BECOME. They are different questions, and the
+    # second must not silently change its meaning because the first was configured.
+    # Measured on `review.target` — as it was until #298 — the default `increment`
+    # scope put one round's fix commit over the cycle's whole-PR starting size, which
+    # is a real quantity and not the one that runs away: PR #188 went 185 -> 593 ->
+    # 721 churned lines, 3.90x under this 3.0x ceiling, while its round-2 increment
+    # was 128 lines and never came near it. The backstop against the 63.7% bad-fix
+    # injection this repo measures was pointed at the wrong number and never fired.
+    #
+    # Still no new plumbing on this end: `review.diff` is the PR as `gh pr diff`
+    # returned it under either scope, and `Baseline.first_reviewed` reads the
+    # earliest baseline's whole-PR size off the payloads round 2+ already receive via
+    # `--baseline` (`pr_chars`, recorded below).
+    #
+    # `review.diff` under a manifest round is the MANIFEST, exactly as
+    # `review.target` was: what that round put in front of the panel is a description
+    # of a move, and the target's pre-substitution size lives in `preflight.shape`.
+    # Named rather than left to be discovered, because it is the one case where this
+    # ratio is not two diff sizes.
+    #
+    # The measurement of each end still travels with it and is still printed, because
+    # two readings of a size exist in this payload and whatever reports a ratio has to
+    # be able to say which one it computed. `review_scope` rides alongside so a reader
+    # can see what the round reviewed without mistaking it for what was measured.
+    #
+    # **NOT dressed up as convergence.** It takes a veto line naming itself and
+    # `confident` is forced false, the same discipline the round cap and a held
+    # escalation get: the cycle is ending because something went wrong, and a reader
+    # who cannot tell that from a clean finish has been told the opposite of the truth.
+    # Set AFTER the SonarCloud sentence above so the reason reads outermost-first.
+    growth = None
+    if dials.max_fix_growth is not None and prior.first_reviewed:
+        first_round, first_chars, first_scope = prior.first_reviewed
+        pr_chars = len(review.diff)
+        ratio = pr_chars / first_chars
+        over = ratio > dials.max_fix_growth
+        growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
+                  "over": over, "chars": pr_chars, "scope": "pr",
+                  "review_scope": review.scope,
+                  "first_round": first_round, "first_chars": first_chars,
+                  "first_scope": first_scope}
+        if over:
+            stop["stop"] = True
+            stop["reason"] = (
+                f"this PR is {ratio:.1f}x the size round {first_round} reviewed it at, "
+                f"past the {dials.max_fix_growth:g}x "
+                f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
+                "splitting, not another round")
+            stop["veto"] = [*stop["veto"],
+                            f"the PR's {pr_chars:,} chars (whole PR) "
+                            f"against round {first_round}'s {first_chars:,} "
+                            f"({first_scope}) is {ratio:.1f}x, past the "
+                            f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
+                            "pass that multiplies the change has written a second "
+                            "change, and this stop is that measurement, not convergence"]
+            # Explicit rather than inferred from the veto line: `confident` was already
+            # computed inside `round_stop`, so appending to `veto` here changes nothing
+            # about it — and a verdict this file forces to `stop` must never be able to
+            # carry the flag that means "nothing left to find".
+            stop["confident"] = False
+    stop["fix_growth"] = growth
+
+    # Whether a CYCLE exists at all, and the one predicate that decides it — for
+    # the report's Rounds block and for the payload alike. They used to disagree:
+    # the report suppressed the block for a review-only run while the payload sent
+    # `round_stop` regardless, so `record_review` stored a `/panel` read with
+    # findings as `stopped: false` (the board shows a cycle mid-flight that nothing
+    # will advance) and one without as `stopped: true, stop_confident: true` — a
+    # confident-convergence record for a PR that had no cycle.
+    cycle_run = bool(in_cycle or prior_rounds)
+
     # ---- recurrence (#67): is this finding standing where the last fix pass was
     # working, on a complaint that pass was sent to answer?
     #
@@ -2838,13 +2886,37 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # patches a wrong assumption produces the next round's findings, and a fix that
     # removes the assumption does not.
     #
-    # NOTHING READS IT TO STOP A RUN, and that is a decision rather than an
-    # omission. #67 asks for the instrument before the gate in as many words — two
-    # pull requests in one day is an observation, not a calibrated rule — so this
-    # is deliberately absent from `round_stop`, from `stop["veto"]` (which decides
-    # `confident`) and from every ceiling in `panel_caps`. It is recorded, tallied
-    # and printed, and a few dozen cycles of it are what would justify wiring it to
-    # anything.
+    # NOTHING READS IT TO STOP A RUN, and that is still a decision rather than an
+    # omission — but it is now a NARROWER decision than the one this comment used to
+    # record, and #489 is why. What it said was that #67 asks for the instrument
+    # before the gate in as many words — two pull requests in one day is an
+    # observation, not a calibrated rule — so recurrence is absent from `round_stop`,
+    # from `stop["veto"]` (which decides `confident`) and from every ceiling in
+    # `panel_caps`, and that a few dozen cycles of it are what would justify wiring it
+    # to anything. That reasoning had been applied to PROVENANCE too, since neither
+    # tally reached the stop rule; the two are not in the same position and the gap
+    # was never argued, only inherited.
+    #
+    # Provenance's cycles came in and it is wired: `escalate_on.fix_injection` reads
+    # `provenance_counts` above and ends a cycle on it (`round_stop`'s docstring has
+    # the numbers and the whole argument). RECURRENCE STAYS EXACTLY WHERE IT WAS, and
+    # for a reason of its own rather than for want of cycles. The replay behind
+    # `_recurrence` is the disqualifying one: over 36 rounds of this board's own
+    # history the mechanical bucket fires on about four new findings in five, on the
+    # cycles #67 calls circling and on the ones it does not alike — a number that
+    # does not separate the two populations cannot gate on the difference between
+    # them, however many more cycles of it accumulate. `_recurrence`'s own docstring
+    # already made that correction once, when replaying it retired a bucket called
+    # `circling` in favour of `revisited`, and a gate here would be the same claim
+    # coming back through the stop rule. Provenance is the one of the three that can
+    # carry a threshold, because `introduced` is a floor with a known direction; this
+    # is a POSITION, and a position has no direction to err in.
+    #
+    # The judge's per-finding `premise_counts` is the third and is nearer to earning
+    # one than this: it is a witness rather than a coincidence of line numbers, and
+    # 6 of 14 and 4 of 15 on the cycle #489 was filed from is the beginning of a
+    # series. It is not wired here either, and the condition is the one #67 states:
+    # the cycles first.
     if prior.fixed_here and not fix_diff and attributable:
         # Said, because the silence is otherwise unreadable: the previous round DID
         # name work, so an all-`unknown` tally here is the fix range failing rather

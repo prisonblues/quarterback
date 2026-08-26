@@ -338,7 +338,7 @@ def test_the_undecidable_brake_ships_on(repo):
     can only fire on a fixer's own explicit `no`, which cannot happen by accident, and
     its output is "stop and ask a human"."""
     assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
-        "premise_repeated": 2, "premise_undecidable": True}
+        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5}
     assert panel_rounds.premise_undecidable_brake(
         harness_rules.DEFAULTS["review_panel"], []) is True
 
@@ -486,8 +486,15 @@ def test_a_third_occurrence_still_stops_rather_than_passing_the_dial(repo, tmp_p
 def test_the_default_is_the_one_the_rules_file_documents():
     """Two occurrences — "the second time" — and it is ON by default, unlike the rest of
     #78's table. It can only fire after a premise has been DECLARED twice, which cannot
-    happen by accident, and its output is "stop and ask a human"."""
-    assert harness_rules.DEFAULTS["review_panel"]["escalate_on"]["premise_repeated"] == 2
+    happen by accident, and its output is "stop and ask a human".
+
+    `fix_injection` is the block's second implemented matter (#489) and is asserted
+    here rather than only in its own suite, because what this test is really pinning
+    is that the SHIPPED block and the reader agree — and a block that grew a key the
+    exact-equality would otherwise pass over is how a default drifts away from the
+    file that documents it."""
+    assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
+        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5}
     assert panel_rounds.premise_repeat_limit(
         harness_rules.DEFAULTS["review_panel"], []) == 2
 

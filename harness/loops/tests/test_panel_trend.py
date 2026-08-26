@@ -696,9 +696,19 @@ def test_two_payloads_for_ONE_round_render_ONE_row(tmp_path):
 
 #: Every spelling this feature's data can arrive under. Widened past a bare
 #: `trend` because the source scan below is only as good as its vocabulary: a
-#: ceiling reading `cycle_trend`, `RoundTrend` or `introduced` would be exactly the
-#: drift the scan exists to catch, and none of those contains the word.
-TREND_NAMES = re.compile(r"\btrend\b|cycle_trend|RoundTrend|TREND_|_trend_|introduced",
+#: ceiling reading `cycle_trend`, `RoundTrend` or a `_trend_` helper would be exactly
+#: the drift the scan exists to catch, and none of those contains the word.
+#:
+#: **`introduced` was in this list and came out when #489 landed**, which is the
+#: distinction the whole guard turns on. This scan is about the TREND — the
+#: cross-round block #490 built — not about provenance, and `introduced` is
+#: provenance's word (#48), reported per round since v2.24 and now legitimately read
+#: by `round_stop` for #489's injection gate. Left in, the pattern asserted something
+#: #490 never claimed: that no stop condition may consume provenance at all. What
+#: #490 claims is narrower and still pinned by every other name here — its own block
+#: is reporting, and a ceiling that grew a dependency on `RoundTrend` or `cycle_trend`
+#: still goes red.
+TREND_NAMES = re.compile(r"\btrend\b|cycle_trend|RoundTrend|TREND_|_trend_",
                          re.IGNORECASE)
 
 

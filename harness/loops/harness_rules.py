@@ -844,7 +844,69 @@ DEFAULTS: dict = {
         # approximate than stop. Unlike `premise_repeated` there is no number: the
         # answer it reads is a fixer's `yes`/`no`, and an occurrence count over it
         # would be counting how many times somebody said the same `no`.
-        "escalate_on": {"premise_repeated": 2, "premise_undecidable": True},
+        # #489's second brake, and the FIRST gate this codebase has put on a
+        # provenance number. `fix_injection` is the fraction of a round's new
+        # outstanding findings that `panel_scope._provenance` attributed to the
+        # previous fix pass; a round above it ends the cycle, with a veto line and
+        # `confident` false. More than half a round's news being the fix pass's own
+        # damage means `round_stop`'s rule 1 — new findings buy another round — is
+        # being fed by the loop's own output, and a termination test fed by its own
+        # output can only end on the cap.
+        #
+        # **The instrument came before the gate, deliberately, and this is the
+        # calibration arriving.** `panel.py`'s comment beside the #67 tallies states
+        # the withholding in as many words: nothing reads these tallies to stop a
+        # run, #67 asks for the instrument before the gate, "two pull requests in one
+        # day is an observation, not a calibrated rule", and "a few dozen cycles of
+        # it are what would justify wiring it to anything". The cycles are in. 128 of
+        # 201 new findings across the seven PRs in `round_stop`'s docstring were
+        # created by the fix pass immediately before them; 39 of 53 after round 1 on
+        # PR #299, and 17 of 17 in its round 2; 64% then 87% on the cycle #489 was
+        # filed from, over a PR whose actual change was 113 lines. Every one of those
+        # is far above 0.5 and every one of those cycles ran to its cap.
+        #
+        # What is still NOT calibrated is where a HEALTHY cycle sits, which is the
+        # number that decides the false-positive rate. So the rule is built so that
+        # a false positive costs as little as it can — see the three properties under
+        # "on by default" — and `null` switches it off in one line.
+        #
+        # **0.5, read strictly: MORE than half.** Not a percentile off a curve nobody
+        # has; the defence of the number is that it is the point where the fix pass is
+        # generating more of the round's work than the pull request is, which is a
+        # threshold with a meaning. It is also the safe end of a measurement
+        # documented as a FLOOR: `_provenance` under-counts `introduced` in both
+        # directions — a defect a fix introduced by DELETING a guard has no added line
+        # to sit on, and `introduced` needs exact membership in the added lines while
+        # LLM reviewers and Sonar routinely report a line or two off — so a measured
+        # 0.64 is at least 0.64, and a threshold crossed is genuinely crossed.
+        #
+        # **ONE round, not two consecutive.** The field report proposed "two
+        # consecutive rounds over the threshold" and it cannot work: provenance is
+        # only attributable from round 2 (round 1 has no preceding fix), so a
+        # two-round rule cannot fire before round 3, and `max_rounds` above defaults
+        # to 2. Two-consecutive would ship switched off for every repo on the shipped
+        # defaults and fire only for the ones running `--loop`. A brake that is off
+        # wherever it was not configured is the `require_failing_test` failure with
+        # the honesty removed.
+        #
+        # **On by default, like `premise_repeated` and unlike #78's other switches**,
+        # and three properties earn it:
+        #   - it can only ever turn a `go again` into a STOP, never the reverse, so
+        #     no value of it can make a review look cleaner than it is;
+        #   - under the shipped `max_rounds: 2` the only round it can fire on is the
+        #     one the cap would have ended anyway. What a default-on costs a repo on
+        #     the defaults is therefore a better `reason` and one more veto line, not
+        #     an earlier finish — and it bites where the loop actually runs away, in
+        #     a repo that raised the cap or drives `--loop`;
+        #   - a false positive costs one printed question, which is #67's own
+        #     required output and the cheap failure; a false negative is #299's
+        #     five-round cycle, which nothing stopped.
+        #
+        # `panel_rounds.FIX_INJECTION_MIN_NEW` is the other half of the rule and is a
+        # constant rather than a dial: a rate over two findings is not a rate, and a
+        # second number nobody can calibrate is worse than one documented floor.
+        "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
+                         "fix_injection": 0.5},
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -1976,9 +2038,10 @@ class Dial(NamedTuple):
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
-    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated` and
-    `max_diff_chars`, and means "inherit the default" for everything else — so a
-    dial that took `null` generally would have one written value with two meanings.
+    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated`,
+    `escalate_on.fix_injection` and `max_diff_chars`, and means "inherit the default"
+    for everything else — so a dial that took `null` generally would have one written
+    value with two meanings.
 
     `rule` is the direction, and it is the one place this layer and #276's throttle
     genuinely differ:
@@ -2048,6 +2111,10 @@ BOARD_DIALS: dict[str, Dial] = {
     "review_panel.distant_merge_lines": Dial("number", True, "either"),
     "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
     "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either"),
+    # #489's injection gate, `nullable` for its sibling's reason: `null` is how a
+    # repo switches a futility brake off, and a board that could move the number but
+    # not turn it off would be a channel with half a policy in it.
+    "review_panel.escalate_on.fix_injection": Dial("number", True, "either"),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are
