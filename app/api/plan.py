@@ -2575,7 +2575,7 @@ async def update_item(
     so the drop control on a history row was one click from destroying the record
     that the issue ever closed — and the page offered it on every row.
 
-    **A delegated agent may re-reason, and may not decide (#478).** #479's whole
+    **A delegated agent may re-reason, and may not decide (#478).** #478's whole
     argument for a second credential is that it authorises a NAMED, narrow act
     rather than an identity, and the narrow act here is the one the changelog
     names: correcting reasoning an agent itself wrote and that has gone stale.
@@ -2624,6 +2624,19 @@ async def update_item(
                 "refused": refused,
                 "item_id": str(item.id)})
         _refuse_agent_exemption(item.ref_kind, body.note)
+        # And the other direction, which the guard above cannot see: `note` is a
+        # WHOLE-FIELD replacement, so an agent writing an innocuous note over one
+        # that carries the marker REVOKES a person's exemption — the PR silently
+        # rejoins the review queue. Round 1 closed "an agent may not set it" and
+        # left "an agent may not clear it" wide open; same field, same endpoint,
+        # opposite direction. Measured: exempt True -> agent writes a note -> False.
+        if body.note is not None and exempting(item.note):
+            raise HTTPException(403, detail={
+                "error": "that item carries a review exemption a person granted",
+                "hint": "replacing the note would revoke it. Ask a person to change "
+                        "or withdraw the exemption first (POST /plan/item/exempt "
+                        "with grant: false), then re-reason the item.",
+                "item_id": str(item.id)})
     if body.state is not None and item.state == "done" and body.state != "done":
         raise HTTPException(409, detail={
             "error": "that item is done: finished work is a record, not a plan item",

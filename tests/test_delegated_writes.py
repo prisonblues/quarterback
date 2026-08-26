@@ -369,3 +369,79 @@ async def test_a_delegated_agent_cannot_move_an_item_between_plans(client):
                           headers=LAPTOP_ELEVATED)
     assert r.status_code == 403, r.text
     assert "plan" in r.json()["detail"]["refused"]
+
+
+async def test_a_delegated_agent_cannot_revoke_a_persons_exemption(client):
+    """The mirror of the round-1 P1, and the same field. `note` is a whole-field
+    replacement, so an agent writing an innocuous note over one carrying the marker
+    REVOKES the exemption and the PR silently rejoins the review queue.
+
+    Round 1 closed "an agent may not set it"; this closes "an agent may not clear
+    it". Measured before the guard: exempt True -> agent writes a note -> False.
+    """
+    r = await client.post("/plan/item",
+                          json={"title": "an exempted pr", "repo": REPO,
+                                "ref_kind": "pr", "ref_value": "7007"},
+                          headers=LAPTOP)
+    item = r.json()["item_id"]
+    MINE.add(item)
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item, "note": "review: exempt — release chore"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item, "note": "picked this up"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+    assert "/plan/item/exempt" in r.text or "exempt" in r.text.lower()
+
+    q = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
+    row = next(i for i in q.json()["items"] if i["item_id"] == item)
+    assert row["review"]["exempt"] is True, "the agent revoked a person's exemption"
+
+
+async def test_a_person_may_still_replace_the_note_on_an_exempted_item(client):
+    """The guard refuses the ACT for an agent, not the field for everyone."""
+    r = await client.post("/plan/item",
+                          json={"title": "another exempted pr", "repo": REPO,
+                                "ref_kind": "pr", "ref_value": "7008"},
+                          headers=LAPTOP)
+    item = r.json()["item_id"]
+    MINE.add(item)
+    await client.post("/plan/item/update",
+                      json={"item_id": item, "note": "review: exempt — chore"},
+                      headers=HUMAN)
+    r = await client.post("/plan/item/update",
+                          json={"item_id": item, "note": "changed my mind"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+
+async def test_a_machine_with_no_credential_is_told_that_not_that_it_mismatched(client):
+    """Two different situations and the caller can act on only one. "Does not
+    match" when nothing is configured sends somebody to check a secret against a
+    map it is not in."""
+    a, b = await seed(client)
+    r = await order_is(client, [b, a], {**DESKTOP, "X-Agent-Elevated": "anything"})
+    assert r.status_code == 403, r.text
+    assert "no delegated credential configured" in r.text
+    assert "does not match" not in r.text
+
+
+async def test_a_non_ascii_CONFIGURED_secret_refuses_rather_than_500s(client, monkeypatch):
+    """`hmac.compare_digest` raises TypeError on non-ASCII `str`, so the comparison
+    is done on bytes.
+
+    The reachable half is the CONFIGURED side, not the header: HTTP header values
+    are ASCII/latin-1 and httpx refuses to send anything else, so a caller cannot
+    get a non-ASCII value as far as the app. An operator can — `ELEVATED_TOKENS` is
+    just text — and unfixed that turned every delegated request from that machine
+    into a 500 out of an auth dependency rather than a refusal.
+    """
+    from app.config import settings
+    monkeypatch.setattr(type(settings), "elevated_map",
+                        property(lambda self: {"laptop": "sécret-ü"}))
+    a, b = await seed(client)
+    r = await order_is(client, [b, a], LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text

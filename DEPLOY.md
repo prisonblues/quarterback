@@ -30,7 +30,8 @@ The app has **several auth paths** (see `app/auth.py`):
   `human` so an agent can APPLY an order a person asked it to work out; it is not a way to
   BE a person — the caller keeps its own identity, a reorder it applies records
   `rank_source: "derived"` rather than `ordered`, and `update` still refuses it the
-  review-exemption marker (#335) and any `state` change. Client-supplied like a bearer, so
+  review-exemption marker in either direction (#335 — it may neither set one nor
+  replace a note carrying one), and any `state` or `plan` change. Client-supplied like a bearer, so
   the edge neither injects nor strips it and **no vhost change is involved**. Unset
   `ELEVATED_TOKENS` refuses every delegated write, exactly as an unset `HUMAN_EDGE_SECRET`
   refuses every human one.

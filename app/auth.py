@@ -390,8 +390,25 @@ async def delegated(
             # against every secret in the map would let any machine spend any
             # other machine's credential, which is the failure keying it per
             # machine exists to prevent.
-            if expected and hmac.compare_digest(elevated, expected):
+            #
+            # Compared as BYTES. `hmac.compare_digest` raises TypeError on `str`
+            # arguments that are not ASCII-only. The reachable half is the
+            # CONFIGURED side rather than the header — HTTP header values are
+            # ASCII/latin-1 and a client cannot send anything else — but
+            # `ELEVATED_TOKENS` is just text an operator writes, and unfixed a
+            # stray character there turned every delegated request from that
+            # machine into a 500 out of an auth dependency instead of a refusal.
+            if expected and hmac.compare_digest(elevated.encode(), expected.encode()):
                 return await identify(authorization, key, legacy_key, requested, db)
+            # Two different situations, and the caller can act on only one of
+            # them. Saying "does not match" when nothing is configured sends
+            # somebody to check a secret against a map it is not in.
+            if not expected:
+                raise HTTPException(
+                    status.HTTP_403_FORBIDDEN,
+                    f"machine {machine!r} has no delegated credential configured on "
+                    f"the board, so no {ELEVATED_HEADER} value can authorise it. "
+                    "ELEVATED_TOKENS names the machines that may make these writes.")
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,
                 f"the {ELEVATED_HEADER} secret presented does not match the one "
