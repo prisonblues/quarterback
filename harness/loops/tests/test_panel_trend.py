@@ -493,9 +493,12 @@ def test_the_payload_carries_the_block_as_data(monkeypatch, tmp_path):
                    head="bbb222", files=5, baseline=[r1_path])
     assert [t["round"] for t in r2["cycle_trend"]] == [1, 2]
     assert r2["cycle_trend"][0] == {"round": 1, "reviewed": True, "findings": 1,
-                                    "p1p2": 1, "introduced": None,
+                                    "p1p2": 1, "new_findings": 1, "introduced": None,
                                     "pr_chars": r1["pr_chars"], "growth": 1.0}
     assert r2["cycle_trend"][1]["introduced"] == 1
+    # #505's column rides here too — the one cell in this block with a consumer other
+    # than a reader, since `round_stop`'s volume rung is decided over this series.
+    assert r2["cycle_trend"][1]["new_findings"] == 1
 
 
 def test_a_baseline_for_THIS_round_never_reaches_the_block(

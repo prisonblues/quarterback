@@ -69,7 +69,8 @@ def test_the_default_is_on_and_is_the_one_the_rules_file_documents():
     a stop, so no value of it can make a review look cleaner than it is."""
     assert DEFAULT_BLOCK["escalate_on"] == {"premise_repeated": 2,
                                             "premise_undecidable": True,
-                                            "fix_injection": 0.5}
+                                            "fix_injection": 0.5,
+                                            "new_findings_not_falling": 1}
     assert panel_rounds.fix_injection_limit(DEFAULT_BLOCK, []) == 0.5
 
 
