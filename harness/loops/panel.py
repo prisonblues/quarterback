@@ -121,6 +121,14 @@ import panel_scope               # noqa: F401
 from panel_rounds import *       # noqa: F401,F403
 import panel_rounds              # noqa: F401
 
+# The constructive pass (#507) — on an escalation, one question to the seats that
+# still have outstanding findings: what is the smallest change that resolves them?
+# Deliberately NOT star-imported, for `panel_caps`' reason: it is the one thing in
+# this file that spends a fan-out on a round the verdict has already ended, so
+# `panel_propose.` on every call site is what makes "where does the extra spend
+# happen" answerable with one grep.
+import panel_propose              # noqa: F401
+
 # The pre-flight verdict (#138) — whether a round is worth running at all, and
 # whether it should read the diff or a manifest of it. Its own module for the
 # reason the four above are: this file is what #129 split because one of its
@@ -455,6 +463,13 @@ def _payload_defaults() -> dict:
         "new_finding_keys": [],
         "round_stop": None,
         "stop_reason": None,
+        # #507's constructive pass, ALWAYS present and never null — an absent key
+        # and "we did not ask" are different claims, and a consumer forced to tell
+        # them apart would be reading a payload's age rather than a round's state.
+        # The block's own `asked`/`reason` carry which it was, on the skip exits as
+        # on the real one, which is why the defaults come from `panel_propose`
+        # rather than being spelled a second time here.
+        "proposals": panel_propose._propose_defaults(),
         "coverage_note": None,
         "diff_truncated": False,
         "diff_chars": 0,
@@ -872,6 +887,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whole panel has been paid for, and the round's stop is computed under one policy
     # that was resolved in one place.
     not_falling = not_falling_limit(panel, notes)
+    # #507's constructive pass. Read at the same moment as the three brakes above, and
+    # for their reason: a malformed value hard-exits before a seat is dispatched
+    # rather than after a whole panel has been paid for. What it governs is not a
+    # brake — it cannot stop or extend a cycle, and `panel_propose` runs after the
+    # verdict is final — it governs whether an escalation ARRIVES with a proposal on
+    # it or with a list of complaints and nothing else.
+    propose_armed = panel_flag(panel, "propose_on_escalation", True, notes)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -3146,6 +3168,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     p_tally = Counter(c.premise_verdict or "not-said" for c in outstanding)
     premise_counts = ({b: p_tally.get(b, 0) for b in (*PREMISE_VERDICTS, "not-said")}
                       if attributable else {})
+    # ---- the constructive pass (#507). The verdict above is FINAL by this line —
+    # the stop rule, the growth ceiling, the Sonar gate sentence and `confident` are
+    # all settled — and that ordering is the whole of the third property this
+    # feature has to hold: it may only ADD to an escalation, never make one look
+    # cleaner than it is. Nothing below writes to `stop`, and `propose` is handed a
+    # read of it rather than the power to change it.
+    #
+    # It costs a fan-out, so it fires only where the issue says it is worth one: on
+    # an `escalate_on` rung, which is a PR whose cycle was already ending badly.
+    # `panel_propose.escalations_fired` is the whole of that test and it is the only
+    # thing standing between a healthy round and a second panel's worth of tokens —
+    # which is why the round the seats are asked about is the round that STOPPED,
+    # never the round that is going again.
+    #
+    # BEFORE `clock.mark("wrapup")`, deliberately. This is minutes of wall clock and
+    # it has to land inside a measured phase; after the mark it would be time the
+    # round spent that `timing` attributes to nothing, which is the "remainder nobody
+    # can name" that comment exists to rule out.
+    #
+    # Every finding it shows a seat is one the seat itself raised and this round
+    # still has outstanding — `held` marks the escalated ones so the brief can say
+    # whose answer they are. Nothing here reaches `round_stop`, the leaderboard, the
+    # recurrence chain or the severity floors: a proposal is not a finding.
+    proposals = panel_propose.propose(
+        stop if cycle_run else None, outstanding, selected, models, efforts,
+        held=held, armed=propose_armed, cycle_run=cycle_run)
+    # In `config_notes` as well as in the block, on the premise notes' rule: the
+    # payload is what an orchestrator's `jq` reads and `config_notes` is what a human
+    # reads off the PR comment, and a pass that was SKIPPED because the repo switched
+    # it off has to be legible in the second place too. Only for the armed-off case —
+    # a note on every healthy round saying no escalation fired is the "loud and wrong"
+    # a reader learns to skip.
+    if not propose_armed and cycle_run and panel_propose.escalations_fired(stop):
+        notes.append(
+            "this round escalated and `review_panel.propose_on_escalation` is off, so "
+            "the seats were not asked what they would do instead — whoever answers "
+            "this escalation gets the findings and no proposal (#507)")
+
     # A cycle's rounds share one id, inherited from the earliest baseline, so the
     # board can tell "the re-review of THIS declaration" from "whatever ran next
     # on this PR". Only a round 1 of an actual cycle MINTS one.
@@ -3249,6 +3309,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "new_finding_keys": new_keys if cycle_run else [],
         "round_stop": stop if cycle_run else None,
         "stop_reason": stop["reason"] if cycle_run else None,
+        # #507. Beside `round_stop` and emphatically not inside it: what the seats
+        # would DO is not part of the verdict, and a consumer reading the verdict
+        # must not have to step over a proposal to reach it. The board's ingest is
+        # `extra="ignore"`, so this key is dropped there until a column exists for
+        # it — which is the first property enforced by the plumbing rather than by
+        # anyone remembering it: a proposal cannot reach the leaderboard, the
+        # recurrence chain or the finding table, because it is not a finding and
+        # never travels as one.
+        "proposals": proposals,
         "coverage_note": coverage_note or None,
         # The REVIEW TARGET's size — the whole PR under "pr" scope, the increment
         # under "increment". Its meaning is scope-dependent and always has been
@@ -3989,6 +4058,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                              "which is also why this round's quiet does not count_")
             else:
                 lines.append(f"{bullet}{why}")
+
+    # #507, and UNDER the veto lines rather than over them. A reader coming down
+    # this comment meets what ended the cycle first and what the seats would do
+    # about it second; a proposal above the veto reads as a plan, and a plan at the
+    # top of an escalation is exactly the "cleaner than it is" this must not be able
+    # to produce. Empty on every round that did not escalate, which is most of them.
+    lines += panel_propose.propose_lines(proposals)
 
     report = "\n".join(lines)
     print(report)
