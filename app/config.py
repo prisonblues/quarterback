@@ -34,6 +34,26 @@ class Settings(BaseSettings):
     # plan by sending one extra header.
     human_edge_secret: str = ""
 
+    # A DELEGATED agent's own credential, per machine, in the same `name:secret`
+    # shape as `api_tokens` — and read the same two ways, so a deployment that
+    # renders one from op-resolver renders both the same way (#478).
+    #
+    # It is NOT a way to be a person. It authorises a NAMED, narrow set of writes
+    # that would otherwise be human-only, and the writes still author as the
+    # agent: `human()` is untouched, `/dials`, scope declaration and `exempt`'s
+    # grant path stay human-only, and a delegated reorder is recorded as
+    # `derived` rather than `ordered`. Keyed per machine so a leaked secret is
+    # revoked by editing one line, and so a secret minted for hermes is refused
+    # when presented by zeus — see `delegated()` for that check, which is the
+    # whole reason this is a map and not a single value.
+    #
+    # Unset means closed, exactly as `human_edge_secret` is: a deployment that
+    # has not configured this refuses every delegated write rather than
+    # accepting every one.
+    elevated_tokens: str = ""
+    # Prod: a file (rendered by the op-resolver) holding the same format.
+    elevated_tokens_file: str = ""
+
     # LOCAL DEV ONLY: treat `browser_dev_user` (or any `Remote-User`) as a human
     # for the human-only writes, with no shared secret. Off by default and must
     # stay off anywhere the app is reachable — see DEPLOY.md.
@@ -59,6 +79,53 @@ class Settings(BaseSettings):
             name, token = name.strip(), token.strip()
             if name and token:
                 out[name] = token
+        return out
+
+    @property
+    def elevated_map(self) -> dict[str, str]:
+        """machine -> delegated secret, parsed exactly as :meth:`token_map` is.
+
+        One parser, deliberately duplicated in shape rather than in code: the two
+        maps mean different things (who may write at all, versus who may make the
+        narrow set of writes `delegated()` names) and collapsing them into one
+        table is how a machine that should only have the first quietly gains the
+        second.
+        """
+        raw = self.elevated_tokens
+        if self.elevated_tokens_file:
+            # Guarded, unlike `token_map`'s, and the asymmetry is deliberate: this
+            # is read from inside an auth DEPENDENCY, so an unreadable file would
+            # surface as a 500 from `delegated()` — an internal error where the
+            # documented behaviour is a closed, actionable refusal. Falling back to
+            # the inline value keeps that promise: no secrets, so no delegated
+            # write is authorised, and the caller is told which credential is
+            # missing rather than that the board is broken.
+            try:
+                raw = Path(self.elevated_tokens_file).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                # CLOSED, not "fall back to the inline value" — which is what this
+                # did and it was the wrong door. An operator who set the FILE has
+                # said where the secrets live; silently reverting to a stale
+                # inline `ELEVATED_TOKENS` would authorise a set of machines
+                # nobody meant to authorise, at the moment the intended source
+                # broke. Empty means no delegated write is authorised and the
+                # caller is told which credential is missing.
+                #
+                # `UnicodeDecodeError` is caught with it because it is a
+                # `ValueError`, not an `OSError`: a half-written or binary file
+                # would otherwise escape an auth dependency as a 500, which is
+                # precisely the failure the guard exists to prevent, arriving
+                # through the one exception it did not name.
+                raw = ""
+        out: dict[str, str] = {}
+        for pair in raw.replace("\n", ",").split(","):
+            pair = pair.strip()
+            if not pair or ":" not in pair:
+                continue
+            name, _, secret = pair.partition(":")
+            name, secret = name.strip(), secret.strip()
+            if name and secret:
+                out[name] = secret
         return out
 
     @property

@@ -54,6 +54,11 @@ _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 #:   sits at the top because it is IN FLIGHT — a statement of fact about now, not
 #:   a judgement about merit (#427). It costs the human's order nothing, because
 #:   a claimed item is skipped by ``next``: the first free pick is unchanged.
+#: * ``derived`` — a rule and an instruction produced it together: `plan_order`
+#:   supplied the sequence, a person asked for it, and a delegated agent applied
+#:   it (#478). Weaker evidence than ``ordered`` and much stronger than
+#:   ``appended``, which is why `order_trust` counts it separately and does not
+#:   let it flip ``trusted``.
 #:
 #: Only ``ordered`` is the plan's shared intent. The rest are how the row got
 #: there, and ``GET /plan`` says so rather than leaving a reader to infer it from
@@ -63,7 +68,7 @@ _STATE_LIST = ", ".join(f"'{s}'" for s in STATES)
 #: ``picked-up`` row is at a position somebody's action decided even though no
 #: one ranked it, so a plan full of in-flight work is still a plan you can
 #: believe — see :func:`app.api.plan._order_trust`.
-RANK_SOURCES = ("appended", "submitted", "placed", "ordered", "picked-up")
+RANK_SOURCES = ("appended", "submitted", "placed", "ordered", "picked-up", "derived")
 
 _RANK_SOURCE_LIST = ", ".join(f"'{s}'" for s in RANK_SOURCES)
 

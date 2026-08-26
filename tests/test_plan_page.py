@@ -389,6 +389,19 @@ def test_the_page_and_order_trust_agree_on_which_positions_were_chosen(page):
         f"page says {chosen}, the server's vocabulary is {set(RANK_SOURCES)} of "
         "which only `appended` is unchosen")
 
+    # RANK_WHY as well, and this half is why the guard was not enough on its own:
+    # #478 added `derived` to RANK_CHOSEN and not to RANK_WHY, this assertion
+    # passed, and `rankClass` short-circuits on RANK_WHY *before* it ever consults
+    # RANK_CHOSEN — so every derived row rendered "unclear" with the guard green.
+    # A page that has a weight for a source and no sentence for it is the same
+    # drift as having neither, one lookup earlier.
+    why = re.search(r"const RANK_WHY = \{(.*?)\n\};", page, re.S)
+    assert why, "the page must say what each source MEANS"
+    explained = set(re.findall(r'^\s*"?([\w-]+)"?:', why.group(1), re.M))
+    assert explained == set(RANK_SOURCES), (
+        "RANK_WHY does not cover the server's vocabulary: page explains "
+        f"{explained}, the server has {set(RANK_SOURCES)}")
+
 
 # ---- the picker remembers, so (all) is not where every visit starts ---------
 
