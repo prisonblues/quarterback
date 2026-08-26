@@ -361,14 +361,21 @@ def test_a_MIXED_range_stays_readable_and_takes_no_veto(monkeypatch):
     purpose — recorded as a test so the next reader sees a decision rather than a
     gap.
 
-    Four readable files and one binary is PARTIAL attribution, which is a documented
-    bias of this signal and not a blind instrument: `_fix_range_diff`'s docstring
-    already accepts the same loss from the 300-file cap, and a binary file has no
-    lines for a finding to sit on. Vetoing here would fire on any PR touching a
-    lockfile or an image — most of them — and that is the alert fatigue this change
-    exists to avoid, not to create."""
+    Partial attribution is a documented bias of this signal, not a blind instrument.
+    A binary file loses nothing — a finding has a line, and a binary file has none —
+    and a patch the API omitted for SIZE loses real lines, which is accepted because
+    `_fix_range_diff`'s docstring already accepts the identical loss from the same API
+    via the 300-file cap, and `_provenance` documents `introduced` as a floor rather
+    than a measurement.
+
+    Both roads are exercised here, because the second is the one a reason covering
+    only binaries would leave unjustified. Vetoing either would fire on any PR
+    touching a lockfile or an image — most of them — and that is the alert fatigue
+    this change exists to avoid, not to create."""
     monkeypatch.setattr(panel_core, "sh", _sh_returning(
-        _compare(files=(("app/sync.py", COMPARE_PATCH), ("logo.png", None)))))
+        _compare(files=(("app/sync.py", COMPARE_PATCH),
+                        ("logo.png", None),          # binary: nothing to attribute
+                        ("huge.sql", None)))))       # omitted for size: lines lost
     diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert kind == panel.FIX_RANGE_OK and why is None
     assert panel._diff_added_lines(diff) == {"app/sync.py": {11, 12}}

@@ -116,13 +116,28 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
             # review as a possible under-veto and declined deliberately (#500).
             #
             # Partial attribution is a documented BIAS of this signal, not a blind
-            # instrument: the docstring above already accepts the same loss from the
-            # 300-file cap ("a fix pass wider than that is attributed on the first
-            # 300 and the rest read as `missed`"), and a binary file has no lines for
-            # a finding to sit on in the first place. Vetoing here would fire on any
-            # PR that touched a lockfile or an image, which is most of them — and a
-            # veto that fires on most rounds is the one readers learn to skip, which
-            # is the failure this whole change is against.
+            # instrument. The two ways a patch goes missing are worth separating,
+            # because they are not equally harmless and a reason that only covers the
+            # easy one is not a reason:
+            #
+            #   * BINARY — nothing is lost. A finding has a file and a line, and a
+            #     binary file has no lines for one to sit on, so there was never an
+            #     attribution here to miss.
+            #   * TOO LARGE for the compare API to send — lines ARE lost, and a
+            #     finding in that file comes back `missed` when the fix pass may well
+            #     have written it. This is accepted, and it is accepted because the
+            #     docstring above already accepts the identical loss from the same
+            #     API for the same reason: "the compare endpoint returns at most 300
+            #     files, so a fix pass wider than that is attributed on the first 300
+            #     and the rest read as `missed`". Same mechanism, same consequence,
+            #     same bias — and `_provenance` already documents `introduced` as a
+            #     FLOOR rather than a measurement, which is the honest place for it.
+            #
+            # What decides it either way is the alternative: vetoing here fires on any
+            # PR that touched a lockfile or an image, which is most of them, and a
+            # veto that fires on most rounds is the one readers learn to skip — the
+            # failure this whole change is against. #41 (review the increment) is what
+            # removes the guess rather than re-weighing it.
             #
             # The case where it IS blind is every file being unreadable, and that is
             # caught below: then there is no attribution left at all.
