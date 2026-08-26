@@ -567,6 +567,70 @@ Three consequences worth knowing when you read the result:
   always used to. The same list carries the caveats on a round that WAS scoped: a
   rebase between the rounds, or a merge commit inside the range.
 
+### When the cycle ends because the FIX PASS was generating the work (#489, #506)
+
+`escalate_on.fix_injection` ends the cycle when more than half a round's new
+outstanding findings were attributed to the fix pass immediately before them: the
+loop's rule 1 is being fed by the loop's own output, and a termination test fed by
+its own output can only end on the cap. You will see it as a veto line, `confident:
+false`, and a `stop_reason` that names the dial rather than the cap.
+
+**Ending the cycle is half the answer, and the other half is your job.** The fix
+pass that caused it is still on the branch — the PR ships carrying a change the panel
+has just finished saying generated more of the round's work than the pull request
+did, minus the round that would have found the rest of it. Stopping means the loop no
+longer makes it worse; it does not make it better.
+
+So the round now hands you the decision already priced, in `round_stop.revert`:
+
+```
+jq '.round_stop.revert' /tmp/tmp.AbC123/r<r>.json
+```
+
+- `range` / `commits` / `commit_count` — the offending pass's **commit range**,
+  which is the same range provenance attributed against, and the commits inside it.
+- `spans` — how many fix phases that range covers. Normally `1`. More than one means
+  no intervening round recorded a commit to anchor on, so the range is wider than "the
+  last fix pass" — the rate was computed over all of it too, but say so when you
+  relay it.
+- `command` — the `git revert --no-commit` invocation, with FULL SHAs. Nothing has run
+  it. **It can be `null` even when the proposal was made**, and then `no_command` says
+  why: a merge commit inside the range (a `git revert` of a range refuses a merge
+  without `-m`, and a merge is how the base branch got in there — reverting wholesale
+  would undo commits no fix pass wrote); a range GitHub's compare truncated, where a
+  merge past its 250-commit ceiling would be invisible so the merge count is a floor;
+  or commits that could not be listed at all.
+  The range is still named in both cases; it is only the paste-and-run shortcut that is
+  withheld. If you see `no_command`, **do not reconstruct the command** — go and read
+  `git log --oneline <range>` and decide what actually wants undoing.
+- `removes` — what undoing it would take off the board: the findings this round
+  attributed to it, with severities.
+- `costs` — what undoing it would hand back: the complaints that pass was **sent to
+  answer** and this round no longer raises.
+- `still_open` — the complaints it was sent to and did not clear. Those are
+  outstanding either way, so reverting costs nothing there.
+
+**Take it to the user; do not act on it.** Reverting a pass reverts the real fixes in
+it, and a pass that cleared three P2s and introduced eight P3s is a net loss to undo
+wholesale — nothing in the loop knows which is which without asking, which is exactly
+why this is a proposal. Read the two columns knowing they are biased in opposite
+directions on purpose: the cost is an **upper bound** (matched on finding keys alone,
+and under `increment` scope it includes complaints this round did not re-read) and
+the benefit is a **lower bound** (`introduced` is a documented floor). A revert those
+numbers still argue for is one they cannot have talked you into.
+
+**On a rebased branch there is no proposal, and the round says so rather than going
+quiet.** `revert.kind` carries the fix range's own verdict — `ok`, `no-fix`, `blind`,
+`not-asked` — and `blind` is the case the subsection above is about: the range that
+would name the offending pass is the range a rewrite removes, so the cycle can
+measure a change it cannot point at. `offered: false` with `kind: "blind"` means "we
+cannot see this", not "there was nothing wrong".
+
+Two things this deliberately does **not** do, so you are not waiting for them:
+revert-and-re-run as an automatic mode, and re-running the fixer with a narrower
+brief instead of reverting. Both are open on #506 and both are decisions a human
+takes today.
+
 ### When the range between the rounds is an integration (#278)
 
 An integration moves the head, and a moved head used to invalidate the round that
@@ -884,6 +948,12 @@ Then the part that is new, and is the point of running more than one round:
   for or against "the fixer is the slow part" is produced** (#192), and until
   several cycles have produced it the answer is a hunch — the panel's own hunch
   had the judge and the gating wait folded into a phase nobody had measured.
+- **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
+  a decision the user has to take, not as a footnote — the commit range, what
+  reverting it would remove, what it would cost, and that nothing has run it. If the
+  cycle ended on `fix_injection` and `offered` is false, say why: `revert.kind`
+  names it, and `blind` means a rewrite between rounds took away the range that would
+  have identified the pass.
 - **Escalated:** any finding a fixer reported as the approach being wrong rather
   than the code, with its premise, what it explains, what removing it would cost,
   and its `--ask` verdict if one was run. Say it even when the answer is none. This

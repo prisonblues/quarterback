@@ -185,6 +185,106 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
     return "".join(out), None, FIX_RANGE_OK
 
 
+#: How many of a fix pass's commits a proposal will list by name (#506). A revert
+#: proposal is read by a human deciding whether to undo a pass, and a pass of four
+#: commits is the shape that decision is usually about; beyond this the list stops
+#: informing and the COUNT is what matters, which is carried separately. Not a dial:
+#: nothing gates on it, and it bounds a payload field rather than a policy.
+FIX_PASS_COMMIT_CAP = 20
+
+#: What #506's proposal reads out of the same compare endpoint provenance already
+#: uses. `parents` is the load-bearing one — see :func:`fix_pass_commits`.
+_FIX_PASS_COMMITS_JQ = (
+    '{total: (.total_commits // 0), '
+    'commits: [(.commits // [])[] | {sha: .sha, '
+    'title: ((.commit.message // "") | split("\n")[0]), '
+    'parents: ((.parents // []) | length)}]}')
+
+
+def fix_pass_commits(gh_repo: str, base_sha: str | None, head_sha: str | None) -> dict:
+    """The commits a fix pass actually consists of, as
+    `{"commits": [...], "total": n, "merges": n}`, or `{}` when they cannot be read.
+
+    #506 names a fix pass by its commit range and offers a `git revert` for it, and
+    **the range alone is not enough to know that a revert of it is safe.** The bias is
+    already documented on :func:`_fix_range_diff`: merging the base branch INTO the PR
+    between rounds leaves the old head an ancestor, so the compare still reads `ahead`
+    and main's own commits fall inside the range. For attribution that over-counts
+    `introduced` and is recorded as a known lean. For a proposal it is worse than a
+    lean — the offered command would revert other people's commits, and `git revert`
+    refuses a merge commit outright without `-m`, so the invocation cannot even run as
+    written. `merges` is what tells the two apart, and a proposal withholds its command
+    unless it is zero.
+
+    Its own call rather than a fourth element on :func:`_fix_range_diff`, and it is
+    made ONLY on a round whose injection rate crossed the threshold — the terminal
+    round of a diverging cycle, and no other. An ordinary round pays nothing for this,
+    which is the whole reason it is not folded into the range read that every round
+    makes.
+
+    Never raises, on :func:`compare_facts`' contract and for its reason: this is an
+    assurance about a proposal nothing acts on, and a round must not die because the
+    commits behind an attribution it already made could not be listed. `{}` is the
+    honest empty, and a proposal reading it withholds the command rather than
+    assuming the range is clean.
+
+    ``complete`` is the other half of that honesty. The compare endpoint returns at
+    most 250 commits with `total_commits` naming the real figure, so on a longer range
+    ``merges`` is a FLOOR — a merge past the ceiling is invisible — and a proposal has
+    to read a zero there as "not known to be clean" rather than as clean."""
+    if not (gh_repo and base_sha and head_sha) or base_sha == head_sha:
+        return {}
+    try:
+        got = json.loads(panel_core.sh(
+            ["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
+             "--jq", _FIX_PASS_COMMITS_JQ], timeout=FIX_RANGE_TIMEOUT_S))
+    except Exception:                       # every one, per the contract above
+        return {}
+    if not isinstance(got, dict):
+        return {}
+    raw = got.get("commits")
+    if not isinstance(raw, list):
+        return {}
+    commits, merges = [], 0
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        sha = _commit_id(c.get("sha"))
+        if not sha:
+            continue
+        # Counted over EVERY commit the compare returned, and the list is truncated
+        # after — a merge past the display cap is still a merge, and a count that
+        # stopped where the listing stopped would report a range as clean because it
+        # was long. The compare endpoint's own 250-commit ceiling still applies and is
+        # why `total` travels beside this: a range at that ceiling is one whose
+        # merge count is a floor, and a proposal reads `total > len(commits)` as a
+        # reason to say so rather than as a rounding.
+        parents = c.get("parents")
+        if isinstance(parents, int) and not isinstance(parents, bool) and parents > 1:
+            merges += 1
+        commits.append({"sha": sha, "title": str(c.get("title") or "").strip()})
+    total = got.get("total")
+    seen = len(commits)
+    # WAS THE WHOLE RANGE RETURNED? The compare endpoint carries at most 250 commits
+    # while `total_commits` reports the real number, so a long fix pass comes back
+    # short with a 200 and no error — and a merge past that ceiling would be invisible
+    # while `merges == 0` said the range was clean (found by Codex on the second pass).
+    # `merges` is therefore a FLOOR on an incomplete range, exactly as `introduced` is
+    # a floor on the attribution above, and only this flag can say which kind of zero a
+    # zero is.
+    #
+    # `==`, not `<=`: `total_commits` absent comes back through the `--jq` as `0`, and
+    # `0 <= seen` would call a range we know nothing about complete. An answer this
+    # cannot verify has to read as "not verified", because the command it gates is the
+    # one thing here a human runs.
+    complete = (isinstance(total, int) and not isinstance(total, bool)
+                and total == seen)
+    return {"commits": commits[:FIX_PASS_COMMIT_CAP], "merges": merges,
+            "total": total if isinstance(total, int) and not isinstance(total, bool)
+            else seen,
+            "complete": complete}
+
+
 def _commit_id(value: object) -> str | None:
     """A commit id off a JSON response, or None if it is not one.
 
@@ -1922,6 +2022,7 @@ __all__ = [
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "review_ci_settled", "CI_SETTLE_WAIT", "CI_SETTLE_POLL",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
+    "FIX_PASS_COMMIT_CAP", "_FIX_PASS_COMMITS_JQ", "fix_pass_commits",
     "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
     "_changed_lines", "Integration", "MergeReading", "merge_involvement",
     "_is_commitish", "_is_ref", "_same_commit",
