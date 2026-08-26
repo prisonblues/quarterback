@@ -21,6 +21,18 @@ question #328 left open and it answered it itself.
 **The class list is imported, never re-spelled.** :mod:`app.needs_human` owns the
 vocabulary (#279) and ``tests/test_post_type_drift.py`` exists because a second
 copy of a closed list is how the two stop agreeing.
+
+**Six classes, not seven.** #328 proposed adding ``authorisation`` — *may I do
+this* — as distinct from #279's ``auth`` (*does the credential path work*). It is
+not here, on two grounds. :mod:`app.needs_human` states its own rule for growing
+the vocabulary: ``other`` *"is how the vocabulary GROWS — a class that keeps
+turning up under `other` with the same reason is the evidence for adding a
+word"*, and nothing has ever been filed under ``other`` because until this table
+nothing was filed at all. And Rich, 2026-08-26, on whether the evidence is likely
+to arrive: *"in general the agents are highly trusted, and have full and wide
+autonomy to do gh actions. I don't think auth based limits are likely to be
+common."* So the word would be speculative twice over. Widening the CHECK later
+is a fifteen-line migration; narrowing one is not.
 """
 
 from __future__ import annotations
@@ -99,7 +111,11 @@ class Blocker(Base):
     #: Who is being asked — a board identity, or NULL for "any human". NULL is
     #: not "nobody": it is the queue everyone can see, and the difference matters
     #: to the ``⛔ N waiting on you`` chip, which must not claim work is yours.
-    owner: Mapped[str | None] = mapped_column(Text, index=True)
+    #: No plain index: ``ix_blockers_open_owner`` below is partial on
+    #: ``resolved_at IS NULL`` and serves the only query that is hot — *what is
+    #: waiting on me* — while a second, total index would be maintained on every
+    #: answered row for the sake of a history read nobody makes in a loop.
+    owner: Mapped[str | None] = mapped_column(Text)
 
     raised_by: Mapped[str] = mapped_column(Text, nullable=False)
     raised_at: Mapped[datetime] = mapped_column(

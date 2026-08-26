@@ -14,9 +14,15 @@ and the `needs-human/*` labels — were both measured empty, and for one reason:
 event is easy to skip and impossible to chase. This is the queue; #274's post
 stays the doorbell.
 
-**The class list is not restated here.** `app.needs_human.NEEDS_HUMAN_CLASSES`
-(#279) is the definition and the CHECK is generated from it, so widening the
-vocabulary is one migration against one source rather than two lists that drift.
+**The class list IS restated here, and that is the rule rather than a lapse.**
+The first version of this migration imported `app.needs_human.NEEDS_HUMAN_CLASSES`
+on the DRY instinct, and #344's guard caught it: *"a migration is a frozen
+artefact; live app code is not."* Had it shipped, adding a seventh class later
+would have silently changed what THIS revision means on a fresh replay — invisible
+on any database already past it, and detonating on exactly the paths nobody
+watches: a new worktree, a disaster-recovery rebuild, `downgrade base && upgrade
+head`. So the six values are frozen literals, and
+`tests/test_migration_drift.py` is what keeps them honest against the model.
 
 Revision ID: m8f42a01c
 Revises: m5b71c2d9
@@ -29,16 +35,18 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects.postgresql import UUID
 
-from app.models.blocker import SUBJECT_KINDS
-from app.needs_human import NEEDS_HUMAN_CLASSES
-
 revision: str = "m8f42a01c"
 down_revision: str | None = "m5b71c2d9"
 branch_labels = None
 depends_on = None
 
-_CLASSES = ", ".join(f"'{c}'" for c in NEEDS_HUMAN_CLASSES)
-_KINDS = ", ".join(f"'{k}'" for k in SUBJECT_KINDS)
+#: Frozen at this revision. `app.needs_human.NEEDS_HUMAN_CLASSES` is the live
+#: definition and these must match it TODAY — the drift test asserts that — but
+#: they are copied rather than imported so that widening the vocabulary later
+#: cannot reach back and change what this revision did. A seventh class is a new
+#: migration, which is also the honest way to record when it was added.
+_CLASSES = "'decision', 'taste', 'ui', 'environment', 'auth', 'other'"
+_KINDS = "'item', 'issue', 'pr', 'repo'"
 
 
 def upgrade() -> None:

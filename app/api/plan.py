@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal, NamedTuple
 
@@ -74,6 +75,7 @@ from app.auth import author, delegated, human, identify, reader
 from app.claimkey import WORK, BadRef, canonical_repo, derive, work_ref
 from app.db import get_session
 from app.identity import HUMAN, is_human, same_machine
+from app.models.blocker import Blocker
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
@@ -833,7 +835,8 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
                blockers: list[PlanItem], now: datetime,
                plan: Plan | None = None, plan_claim: ResourceLease | None = None,
                mine: str | None = None, session_id: str | None = None,
-               reconciled: PlanReconcile | None = None) -> dict:
+               reconciled: PlanReconcile | None = None,
+               waiting_on_a_human: Sequence[Blocker] = ()) -> dict:
     idle = (now - item.updated_at).total_seconds() / 86400
     return {
         "item_id": str(item.id),
@@ -863,8 +866,20 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
         "depends_on": list(item.depends_on or []),
         # Only OPEN dependencies block: a dropped one will never be done, and
         # waiting on it forever would be the plan quietly lying about "next".
+        # TWO kinds, reported apart because the remedy is different: one waits on
+        # work, the other waits on a person. `blocked_by` keeps its shape and its
+        # meaning for the item-to-item edges — a reader that only knows about
+        # those is not broken by this — and the human kind gets a field of its
+        # own rather than being folded in as a fake item (#328).
         "blocked_by": [{"item_id": str(b.id), "title": b.title,
                         "ref": b.ref_value, "repo": b.repo} for b in blockers],
+        "waiting_on_a_human": [
+            {"blocker_id": str(w.id), "class": w.kind, "question": w.question,
+             "owner": w.owner, "raised_by": w.raised_by,
+             "raised": w.raised_at.isoformat() if w.raised_at else None,
+             "idle_days": round((now - w.raised_at).total_seconds() / 86400, 1)
+             if w.raised_at else None}
+            for w in (waiting_on_a_human or ())],
         "claim": claim_view(claim) if claim is not None else None,
         "added_by": item.added_by,
         "created": item.created_at.isoformat(),
@@ -1145,6 +1160,7 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
     known = {str(i.id): i for i in items}
     wanted = {d for i in items for d in (i.depends_on or [])} - set(known)
     known |= await _load(session, wanted)
+    human_blockers = await _human_blockers_for(session, items)
 
     def plan_of(item: PlanItem) -> Plan | None:
         return plans.get(str(item.plan_id)) if item.plan_id is not None else None
@@ -1162,11 +1178,40 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
             now,
             plan=plan_of(item),
             plan_claim=plan_claim_of(plan_of(item)) if item.state == "open" else None,
+            waiting_on_a_human=human_blockers.get(str(item.id), ()),
             mine=mine, session_id=session_id,
             reconciled=reconciled.get((item.repo, item.ref_kind, item.ref_value)),
         )
         for item in items
     ]
+
+
+async def _human_blockers_for(session: AsyncSession,
+                              items: list[PlanItem]) -> dict[str, list[Blocker]]:
+    """Open blockers keyed by the plan item they are about (#328).
+
+    A SECOND source feeding ``blocked_by``; the item-to-item edges are unchanged
+    and this does not touch them. The two kinds are reported apart because the
+    REMEDY is different — one waits on work, the other waits on a person — which
+    is the argument `_next_caveat` already makes about the kinds it can see.
+
+    Matched on ``subject_value`` against the item's id. A blocker may also name an
+    issue or a PR that no plan item points at, and that is the case
+    ``depends_on`` structurally cannot express — those live in the queue and are
+    simply not attached to a row here.
+    """
+    open_ids = [str(i.id) for i in items if i.state == "open"]
+    if not open_ids:
+        return {}
+    rows = (await session.execute(
+        select(Blocker).where(Blocker.subject_kind == "item",
+                              Blocker.subject_value.in_(open_ids),
+                              Blocker.resolved_at.is_(None))
+        .order_by(Blocker.raised_at))).scalars().all()
+    out: dict[str, list[Blocker]] = {}
+    for b in rows:
+        out.setdefault(b.subject_value, []).append(b)
+    return out
 
 
 async def _scope_items(session: AsyncSession, repo: str | None, exact: bool,
@@ -2089,8 +2134,14 @@ async def read_plan(
             now, mine=caller, session_id=session_q)
     else:
         views = open_views[:limit]
+    # `waiting_on_a_human` joins the reasons `next` passes an item over, and it
+    # has to: the whole failure #328 measured is an item parked on a decision
+    # reading as ordinary open work and being handed to the next agent that asks.
+    # A drain at `eager` (#474) would pick up the item whose own note says "RANK
+    # IS WRONG AND A HUMAN MUST FIX IT" for exactly this reason.
     unclaimed = [v for v in open_views
-                 if not v["claim"] and not v["blocked_by"] and not v["covered_by"]]
+                 if not v["claim"] and not v["blocked_by"] and not v["covered_by"]
+                 and not v["waiting_on_a_human"]]
     trust = _order_trust(open_views)
     nxt = unclaimed[0] if unclaimed else None
     by_state = await _counts_by_state(session, repo, plan_id, exact)
@@ -2138,7 +2189,14 @@ async def read_plan(
         "counts": {
             "open": len(open_views),
             "claimed": sum(1 for v in open_views if v["claim"]),
+            # Two kinds, counted apart, because the remedy is different and
+            # `plan_counts` consumers render them differently: one waits on work
+            # finishing, the other on somebody answering. `blocked` keeps its old
+            # meaning exactly — item-to-item edges — so a reader that predates
+            # #328 is not silently told a new number.
             "blocked": sum(1 for v in open_views if v["blocked_by"]),
+            "waiting_on_a_human": sum(1 for v in open_views
+                                      if v["waiting_on_a_human"]),
             # Held via a plan claim rather than item by item. Counted separately
             # because the remedy is different: a blocked item needs work
             # finishing, a covered one needs a word with its holder.
