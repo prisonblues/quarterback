@@ -1808,7 +1808,20 @@ ESCALATE_ON_UNBUILT = ("quorum_failed", "judge_absent")
 #: Its own code, not 1: the caller has to be able to tell the brake FIRING from the
 #: command failing to run, and both are non-zero. 2 is argparse's usage error and 3
 #: is :data:`panel_core.UNWRITTEN_PAYLOAD_EXIT`.
+#:
+#: **Shared with the undecidability brake (#491)**, deliberately. A caller reads this
+#: code to mean one thing — *do not write this fix, escalate the finding instead* —
+#: and both brakes end in exactly that instruction, with the same `--escalated` keys
+#: to hand the next round. A second code would make every caller learn a second
+#: number to take the identical action, and the reason they differ is in the report,
+#: which is where a reader is looking for it.
 PREMISE_REPEATED_EXIT = 4
+
+#: What a declaration answered about the property its fix asserts (#491): whether the
+#: RUNTIME the assertion runs in can observe it. `unknown` is the honest value for a
+#: declaration that was not asked — every declaration made before this existed, and
+#: every caller that has not passed `--premise-decidable`.
+DECIDABILITY = ("yes", "no", "unknown")
 
 #: The register's shape, so a future one can be told from a hand-written file.
 PREMISE_REGISTER_VERSION = 1
@@ -1867,6 +1880,54 @@ def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
                       "or null to switch the brake off — 1 would escalate the first "
                       "time any premise was declared, which is not a repeat")
     return n
+
+
+def premise_undecidable_brake(panel: dict, notes: list[str]) -> bool:
+    """`review_panel.escalate_on.premise_undecidable` (#491) — does a declaration that
+    answers "the runtime cannot observe this property" refuse the fix?
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep, so a repo writing
+    `escalate_on` at all replaces the default object wholesale, and without the
+    per-key fallback `{"premise_repeated": 2}` would silently switch THIS brake off.
+    That is the exact failure mode #84 hit and it is worth not shipping twice.
+
+    **No number, unlike its sibling, and that asymmetry is the point.**
+    `premise_repeated` counts because one declaration is not evidence — writing a fix
+    against a premise is what a fix pass DOES, and only the repeat says the rounds
+    have stopped being about different things. This one is not counting. It reads a
+    fixer's answer to a question with a fact for an answer, and a `no` is already the
+    whole finding: if the property cannot be observed where the assertion runs, every
+    fix for it is an approximation, the next round finds the gap, and the cap is the
+    only thing that can end the cycle. A second occurrence would confirm nothing the
+    first did not say, at the price of a fix pass and a panel.
+
+    So the value is a FLAG. A count over it would be counting how many times one
+    fixer said one `no`, and `2` would mean "approximate once first", which is the
+    behaviour the brake exists to refuse."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — both readers
+        # run off one config — but this function is public and is called directly by
+        # tests, so it does not rely on a sibling having been called first.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return False                                  # unreachable
+    want = rules.get("premise_undecidable",
+                     ESCALATE_ON_DEFAULTS.get("premise_undecidable"))
+    if want is None or want is False or want == "":
+        return False
+    if want is True:
+        return True
+    _refuse_value("escalate_on.premise_undecidable", want,
+                  "true or false — this brake reads a fixer's yes/no answer about one "
+                  "property, so there is no occurrence to count and a number here "
+                  "would mean 'approximate it once first'")
+    return False                                      # unreachable
 
 
 def premise_key(text: str) -> str:
@@ -1982,8 +2043,15 @@ def load_premises(path: str, repo: str = "", pr: int | None = None
                             "for is invisible to the brake")
             continue
         text = str(entry["text"]).strip()
+        # An unrecognised `decidable` reads as "unknown" HERE, unlike in
+        # `declare_premise` where it raises. The two are different failures: a bad
+        # argument is a caller to correct, and a bad value on disk is a register a
+        # later harness (or a hand edit) wrote, which must not stop the cycle. It
+        # degrades to the value that never brakes, and the entry is otherwise kept.
+        answer = str(entry.get("decidable") or "unknown").strip().lower()
         kept.append({"key": premise_key(text), "text": text,
                      "norm": _norm_title(text), "rounds": sorted(rounds),
+                     "decidable": answer if answer in DECIDABILITY else "unknown",
                      "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
                                          if _is_key(k)})})
     reg["premises"] = kept
@@ -2002,7 +2070,9 @@ def find_premise(reg: dict, text: str) -> dict | None:
 
 
 def declare_premise(reg: dict, text: str, round_no: int,
-                    findings: Iterable[str] = (), limit: int | None = None) -> dict:
+                    findings: Iterable[str] = (), limit: int | None = None,
+                    decidable: str = "unknown",
+                    undecidable_brake: bool = False) -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -2023,23 +2093,89 @@ def declare_premise(reg: dict, text: str, round_no: int,
     caller passes to the next round's ``--escalated`` when the brake fires, which
     is how this composes with `round_stop` instead of growing a second stop: a
     braked premise becomes an ESCALATION, the outcome the loop already knows how to
-    end a cycle on."""
+    end a cycle on.
+
+    ``decidable`` is #491's question, asked of the declaration rather than of the
+    cycle: **can the runtime this fix's assertion runs in observe the property the
+    fix asserts?** ``"no"`` with ``undecidable_brake`` on refuses the fix on its
+    FIRST occurrence, which is the one thing the occurrence counter structurally
+    cannot do.
+
+    The reason it cannot is not a bug in the matching. A fixer circling an
+    unobservable property replaces one PROXY with a better one each round and
+    declares, accurately, a different premise every time — four were declared on one
+    cycle and no two matched, so the counter sat at 1 while three fix passes circled.
+    :func:`same_premise` records the same gap from the other side, and #84 rules out
+    closing it with a similarity heuristic. What closes it is not a better comparison
+    between declarations; it is one more question put to each declaration on its own,
+    whose answer does not depend on the words the fixer chose.
+
+    ``"unknown"`` is the honest default and never brakes: every declaration made
+    before this existed reads that way, and a caller that has not been taught
+    ``--premise-decidable`` must not have an answer inferred for it. #84's rule for
+    the undeclared fix pass is the same rule — report the gap, never guess at it.
+
+    A ``"no"`` already on the entry, though, is not a gap — it is an answer, and it
+    STICKS. Neither a later ``"yes"`` nor a later silence clears it, and the brake
+    reads the entry rather than the declaration in front of it. See the comment on
+    the assignment for why: everything else here would let the one agent whose fix is
+    being refused lift its own refusal by changing its answer."""
     text = " ".join(str(text).split())
+    answer = str(decidable or "unknown").strip().lower()
+    if answer not in DECIDABILITY:
+        # Named rather than coerced to "unknown". A typo silently read as "unknown"
+        # is a brake that does not fire on a declaration that answered "no", which is
+        # this mechanism failing in exactly the direction it exists to prevent.
+        raise ValueError(
+            f"declare_premise(decidable={decidable!r}) takes one of "
+            f"{', '.join(DECIDABILITY)} — the fixer's answer to whether the runtime "
+            "can observe the property the fix asserts")
     keys = sorted({_key_norm(k) for k in findings if _is_key(k)})
     entry = find_premise(reg, text)
     if entry is None:
         entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
-                 "rounds": [], "findings": []}
+                 "rounds": [], "findings": [], "decidable": "unknown"}
         reg.setdefault("premises", []).append(entry)
     if round_no not in entry["rounds"]:
         entry["rounds"] = sorted([*entry["rounds"], round_no])
     entry["findings"] = sorted({*entry["findings"], *keys})
+    entry.setdefault("decidable", "unknown")
+    # **A `no` is STICKY, and the brake reads the ENTRY rather than this declaration.**
+    # Both halves close the same hole, and it is the hole every self-reported signal in
+    # this loop has: the agent whose fix is being refused is the one supplying the
+    # answer. Without stickiness a fixer refused on `no` re-declares the same premise
+    # with `yes` and the refusal is gone, with nothing recording that it ever happened;
+    # without reading the entry, it re-declares with the flag simply OMITTED and
+    # "unknown" brakes nothing. Either way the actor clears its own brake by changing
+    # what it says, which is precisely what `round_stop`'s docstring says cannot be
+    # left to self-report.
+    #
+    # So: `no` is established about the PROPERTY, not about one pass's opinion of it,
+    # and a property the runtime cannot observe does not become observable because a
+    # later declaration says otherwise. `yes` records freely until a `no` lands, which
+    # keeps the ordinary case — a fixer answering honestly, round after round — exactly
+    # as cheap as it was.
+    if answer == "no" or (answer == "yes" and entry["decidable"] != "no"):
+        entry["decidable"] = answer
     occurrence = len(entry["rounds"])
-    escalate = limit is not None and occurrence >= limit
-    if escalate:
-        reason = (f"premise declared {occurrence} time(s) — rounds "
-                  f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
-                  f"at {limit}: a human answers this premise, not another fix pass")
+    repeated = limit is not None and occurrence >= limit
+    undecidable = bool(undecidable_brake) and entry["decidable"] == "no"
+    escalate = repeated or undecidable
+    reasons = []
+    if undecidable:
+        reasons.append(
+            "the property this fix asserts is NOT decidable in the runtime the "
+            "assertion runs in, so every fix for it is an approximation and the next "
+            "round finds the gap between the approximation and the property "
+            "(`escalate_on.premise_undecidable`): a human answers this, not a better "
+            "approximation")
+    if repeated:
+        reasons.append(
+            f"premise declared {occurrence} time(s) — rounds "
+            f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
+            f"at {limit}: a human answers this premise, not another fix pass")
+    if reasons:
+        reason = "; and ".join(reasons)
     elif limit is None:
         reason = (f"recorded (occurrence {occurrence}) — `escalate_on.premise_repeated` "
                   "is off, so nothing brakes on a repeat")
@@ -2050,6 +2186,9 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "occurrence": occurrence, "rounds": list(entry["rounds"]),
             "first_round": entry["rounds"][0], "findings": list(entry["findings"]),
             "limit": limit, "escalate": escalate, "reason": reason,
+            "decidable": entry["decidable"], "answered": answer,
+            "repeated": repeated, "undecidable": undecidable,
+            "undecidable_brake": bool(undecidable_brake),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -2066,16 +2205,30 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
     return [r for r in range(1, max(round_no, 1)) if r not in declared]
 
 
-def premise_state(reg: dict, round_no: int, limit: int | None = None) -> dict:
+def premise_state(reg: dict, round_no: int, limit: int | None = None,
+                  undecidable_brake: bool = False) -> dict:
     """What the cycle's declarations say, for `round_stop` and for the payload."""
     entries = reg.get("premises") or []
-    repeated = [{"key": e["key"], "text": e["text"], "rounds": list(e["rounds"]),
-                 "occurrences": len(e["rounds"]), "findings": list(e.get("findings") or [])}
-                for e in entries
+
+    def view(e: dict) -> dict:
+        return {"key": e["key"], "text": e["text"], "rounds": list(e["rounds"]),
+                "occurrences": len(e["rounds"]),
+                "decidable": e.get("decidable") or "unknown",
+                "findings": list(e.get("findings") or [])}
+
+    repeated = [view(e) for e in entries
                 if limit is not None and len(e.get("rounds") or []) >= limit]
+    # Reported whether or not the brake is armed, on `undeclared_rounds`' rule: the
+    # payload says what the cycle DECLARED, and a repo that switched the brake off
+    # still gets to see that a fix pass was written against a property nothing in its
+    # runtime can observe. `round_stop` is what gates on the flag.
+    undecidable = [view(e) for e in entries
+                   if (e.get("decidable") or "unknown") == "no"]
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
+            "undecidable": undecidable,
+            "undecidable_brake": bool(undecidable_brake),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -2094,6 +2247,20 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
     out.append(f"declared occurrence {verdict['occurrence']}"
                + (f" of {verdict['limit']}" if verdict["limit"] else " (brake off)")
                + f" — after round(s) {rounds}")
+    # Said on every declaration, not only the braking one. A fixer that has never
+    # seen the question does not know it was asked, and "decidable unknown — not
+    # answered" is what teaches it the flag exists at the one moment it is deciding
+    # patch-or-escalate. A line that only appears when it stops you is a line nobody
+    # reads until it is too late to have answered.
+    answer = verdict.get("decidable", "unknown")
+    if answer == "unknown":
+        out.append("decidable  NOT ANSWERED — pass --premise-decidable yes|no: can "
+                   "the runtime this assertion runs in observe the property the fix "
+                   "asserts? An unanswered declaration cannot brake on #491")
+    else:
+        out.append(f"decidable  {answer} — the runtime this assertion runs in "
+                   + ("can" if answer == "yes" else "CANNOT")
+                   + " observe the property the fix asserts")
     if verdict["undeclared_rounds"]:
         # #84: an undeclared fix pass is UNESCALATABLE, and saying so is the point.
         # A cycle nobody could have braked reads exactly like one that did not need
@@ -2107,12 +2274,26 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
     out.append("")
     if verdict["escalate"]:
         keys = " ".join(f"--escalated {k}" for k in verdict["findings"])
+        # Which brake fired changes what the fixer is being told NOT to do, so the
+        # instruction is written from the one that fired rather than assuming the
+        # repeat. #84's sentence tells a fixer not to patch the same premise again;
+        # to a fixer stopped on its FIRST declaration that sentence is simply untrue
+        # about its own cycle, and a stop whose explanation does not match what
+        # happened is one a caller argues with.
+        if verdict.get("undecidable"):
+            why = ("The property is not decidable where the assertion runs (#491), so "
+                   "the fix you are about to write is an approximation of it and the "
+                   "next round's findings are the gap between the two. A better "
+                   "approximation is still an approximation — that is the loop this "
+                   "brake exists to refuse.")
+        else:
+            why = (f"This is fix pass {verdict['occurrence']} against one premise the "
+                   "previous round invalidated (#84).")
         out += [
             "STOP — DO NOT WRITE THIS FIX.",
             verdict["reason"],
             "",
-            f"This is fix pass {verdict['occurrence']} against one premise the previous "
-            "round invalidated (#84). Escalate it instead (review-pr.md step 3a): write no "
+            f"{why} Escalate it instead (review-pr.md step 3a): write no "
             "patch for the findings it explains, fix everything else in the pass, and "
             "report the premise, what it explains and what removing it would cost.",
         ]
@@ -2130,7 +2311,8 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
 
 def declare(repo_name: str | None, premise: str, register_path: str,
             round_no: int, findings: list[str] | None = None,
-            pr_number: int | None = None, json_out: bool = False) -> int:
+            pr_number: int | None = None, json_out: bool = False,
+            decidable: str = "unknown") -> int:
     """`panel.py --premise` — #84's futility brake, evaluated where a fix is PROPOSED.
 
     No seats, no diff, no judge, no vendor call and no board record: it reads the
@@ -2159,8 +2341,19 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     repo_name = cfg.get("name") or repo_name
     notes: list[str] = []
     limit = premise_repeat_limit(cfg["review_panel"], notes)
+    undecidable_brake = premise_undecidable_brake(cfg["review_panel"], notes)
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
-    verdict = declare_premise(reg, premise, round_no, findings or [], limit)
+    verdict = declare_premise(reg, premise, round_no, findings or [], limit,
+                              decidable, undecidable_brake)
+    if verdict["decidable"] == "no" and not undecidable_brake:
+        # The repo switched it off, and the declaration still says the fix cannot be
+        # verified where it runs. Recorded and reported rather than swallowed, on
+        # `ESCALATE_ON_UNBUILT`'s rule: a governance answer that changes nothing must
+        # not be indistinguishable from one that was never given.
+        notes.append("this declaration answered `decidable: no`, and "
+                     "`escalate_on.premise_undecidable` is off — the fix is not "
+                     "refused, and the answer is in the register for the round to "
+                     "report")
     write_failed = write_payload(register_path, reg)
     if json_out:
         print(json.dumps({**verdict, "register": register_path, "notes": notes,
@@ -2331,11 +2524,29 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
       ran anyway — late, and better than the cap. It is deliberately the same
       terminal state a held escalation gets, because it IS one: a repeated premise
       is #67's circling, and the answer to it was never another fix pass.
+    - **A premise whose declaration answered ``decidable: no`` ENDS THE CYCLE** on
+      the same terms (#491), and gated on ``undecidable_brake`` — the register lists
+      such a declaration whether or not the repo armed the brake, because the payload
+      records what the cycle SAID, and a repo that switched it off must not have the
+      policy applied anyway. This is the late half of the same mechanism: the refusal
+      belongs at ``declare_premise``, and what reaches here is the record that a
+      caller wrote the fix regardless.
+
+      It is a SEPARATE rule from the repeat above and not a special case of it,
+      because the repeat is exactly what it cannot rely on. A fixer circling an
+      unobservable property replaces the proxy each round and declares a genuinely
+      different premise every time, so the occurrence counter stays at 1 while the
+      cycle circles — four declarations on one cycle, no two matching. What is shared
+      across those four is not their words but their answer to one question, which is
+      why the question is asked of each declaration alone.
+
     - **A fix pass that declared no premise is reported as unescalatable**
       (``undeclared_rounds``), and costs the round nothing. #84 is explicit that an
       undeclared fix is unescalatable rather than inferred, and the reason it is
       said out loud is that a cycle nobody COULD have braked reads exactly like a
-      cycle that did not need braking — silence would assert the second.
+      cycle that did not need braking — silence would assert the second. An
+      ``unknown`` decidability answer is the same rule one level down: a declaration
+      that was never asked the question is reported as unanswered, never guessed at.
 
     Declarations never buy a round, only end one. A register is a claim by the
     agent that is about to write the fix, and the one thing #67's evidence says
@@ -2503,6 +2714,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # declaration makes the loop run longer — see the docstring's paragraph on why
     # the agent writing the fix does not get that lever.
     circling = list((premises or {}).get("repeated") or [])
+    # #491's half, on exactly the same terms and gated on the same arming flag the
+    # declaration path reads. A repo that switched `escalate_on.premise_undecidable`
+    # off asked for its fixers to be allowed to approximate; ending its cycle on the
+    # answer anyway would enforce a policy it declined, which is the failure
+    # `ESCALATE_ON_UNBUILT` exists to keep on the other side.
+    #
+    # `premise_state` lists these regardless of the flag, deliberately — the payload
+    # records what a cycle DECLARED — so the arming check has to happen here rather
+    # than being assumed from the list being non-empty.
+    unobservable = (list((premises or {}).get("undecidable") or [])
+                    if (premises or {}).get("undecidable_brake") else [])
+    if unobservable:
+        worded = "; ".join(
+            f"{p['text']!r} (rounds {', '.join(str(r) for r in p['rounds'])})"
+            for p in unobservable)
+        stop, reason = True, (
+            f"{len(unobservable)} premise(s) a fix pass was written against assert a "
+            f"property the runtime cannot observe — {worded} — so every fix for them "
+            "is an approximation and the next round finds the gap: a human answers "
+            "this, not a better approximation")
     if circling:
         worded = "; ".join(
             f"{p['text']!r} declared {p['occurrences']}x "
@@ -2536,6 +2767,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "this cycle — the rounds have stopped being about different "
                        "things, and the next fix pass would be the third patch on one "
                        "assumption (#67, #84)"]
+    # Unconditional for the same reason `circling`'s is: it forces the stop above, so
+    # there is no `go again` round this can fire on. Its own line rather than folded
+    # into the one above, because the two say different things to a human deciding
+    # what to do next — one asks whether to keep patching an assumption, the other
+    # asks whether the property can be checked here at all.
+    if unobservable:
+        veto = [*veto, f"{len(unobservable)} premise(s) in this cycle assert a property "
+                       "nothing in the runtime can observe, so no fix for them can be "
+                       "verified where it runs and each round patches the last "
+                       "approximation (#491)"]
     return {
         "stop": stop,
         "reason": reason,
@@ -2571,6 +2812,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         else {"limit": premises.get("limit"),
               "declared": premises.get("declared", 0),
               "repeated": circling,
+              # The DECLARED list, not the armed one: a payload records what the
+              # cycle said, and `undecidable_brake` beside it says whether this run
+              # was going to act on it. Collapsing the two would make a repo that
+              # switched the brake off indistinguishable from one where no fixer ever
+              # answered the question.
+              "undecidable": list(premises.get("undecidable") or []),
+              "undecidable_brake": bool(premises.get("undecidable_brake")),
               "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
     }
 
@@ -2591,6 +2839,7 @@ __all__ = [
     "_positive_int", "_whole_pr_chars",
     "load_baseline", "coverage_veto", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
+    "DECIDABILITY", "premise_undecidable_brake",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

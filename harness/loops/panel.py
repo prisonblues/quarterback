@@ -671,6 +671,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Two writers would be two answers to "how many times was this premise declared",
     # which is the one question the brake exists to answer.
     premise_limit = premise_repeat_limit(panel, notes)
+    premise_undecidable = premise_undecidable_brake(panel, notes)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -2356,7 +2357,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # ends a cycle whose premise was declared twice and reached a
                       # round anyway, and it reports the fix passes that declared
                       # nothing and so could not have been braked at all.
-                      premises=premise_state(premises, round_no, premise_limit))
+                      premises=premise_state(premises, round_no, premise_limit,
+                                             premise_undecidable))
     # Said in `config_notes` as well as in `round_stop`, because these two are read
     # by different people at different moments: the payload's `round_stop` is what
     # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
@@ -2385,6 +2387,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"{', '.join(str(r) for r in repeated['rounds'])} — "
             f"{repeated['text']!r}. A fix pass was written against it more than once, "
             "so the cycle ends here and a human answers the premise (#67, #84)")
+    # #491's late half, and it is the same shape as the repeat above for the same
+    # reason: `panel.py --premise` refuses the fix when it is PROPOSED, and a caller
+    # that ignored exit 4 wrote it anyway. The register is then the record that says
+    # so, and the round that follows is where it costs something.
+    #
+    # Only when the brake is ARMED. `premise_state` lists an undecidable declaration
+    # either way — the payload reports what the cycle declared — but a repo that
+    # switched the brake off asked for a fixer to be allowed to approximate, and
+    # ending its cycle on the answer anyway would apply a policy it declined.
+    for undecidable in (stop["premises"]["undecidable"] if premise_undecidable else []):
+        notes.append(
+            f"premise {undecidable['key']} was declared in rounds "
+            f"{', '.join(str(r) for r in undecidable['rounds'])} — "
+            f"{undecidable['text']!r} — and answered `decidable: no`. A fix pass was "
+            "written against a property the runtime cannot observe, so every fix for "
+            "it is an approximation: the cycle ends here and a human answers it "
+            "(#491)")
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
@@ -3538,6 +3557,17 @@ def main() -> int:
                          "by a round so the payload can say which premises repeated "
                          "and which fix passes declared none. One path per PR, beside "
                          "the --json-file payloads")
+    ap.add_argument("--premise-decidable", choices=("yes", "no"), default=None,
+                    dest="premise_decidable",
+                    help="#491's question, and the one thing the occurrence counter "
+                         "cannot ask: can the runtime this fix's assertion runs in "
+                         "OBSERVE the property the fix asserts? `no` refuses the fix "
+                         "on its FIRST declaration under "
+                         "review_panel.escalate_on.premise_undecidable — every fix for "
+                         "an unobservable property is an approximation, and the next "
+                         "round finds the gap between the approximation and the "
+                         "property. Omitted is 'not answered' and brakes nothing. "
+                         "--premise only")
     ap.add_argument("--premise-for", action="append", default=[], metavar="KEY",
                     dest="premise_for",
                     help="a finding key this fix pass would have cleared. Repeatable. "
@@ -3597,6 +3627,8 @@ def main() -> int:
                                    ("--premise", args.premise is not None),
                                    ("--premise-file", bool(args.premise_file)),
                                    ("--premise-for", bool(args.premise_for)),
+                                   ("--premise-decidable",
+                                    args.premise_decidable is not None),
                                    ("--max-rounds", args.max_rounds is not None)) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
@@ -3654,7 +3686,8 @@ def main() -> int:
                 "no finding at all")
         return declare(args.repo, args.premise.strip(), args.premise_file,
                        1 if args.round_no is None else args.round_no,
-                       args.premise_for, args.pr, args.json_out)
+                       args.premise_for, args.pr, args.json_out,
+                       args.premise_decidable or "unknown")
     # `--premise-file` is NOT refused here: a round READS the register, so the
     # payload can say which premises repeated and which fix passes declared none.
     # `--premise-for` has no reading outside a declaration and is refused, on the
@@ -3664,6 +3697,11 @@ def main() -> int:
         raise SystemExit("--premise-for belongs to --premise — it names the findings a "
                          "refused fix pass would have cleared, and a review round has "
                          "no fix pass to refuse. The round's equivalent is --escalated")
+    if args.premise_decidable:
+        raise SystemExit("--premise-decidable belongs to --premise — it is an answer "
+                         "about the fix a pass is ABOUT to write, and a review round "
+                         "writes none. The round reads the answers already in the "
+                         "register through --premise-file")
     if args.pr is None:
         raise SystemExit("--pr is required — or pass --ask to challenge one premise "
                          "instead of reviewing a PR")

@@ -77,9 +77,10 @@ def repo(monkeypatch):
     return use
 
 
-def declare(register, premise, round_no, *keys, pr=34, json_out=False):
+def declare(register, premise, round_no, *keys, pr=34, json_out=False,
+            decidable="unknown"):
     return panel.declare("board", premise, str(register), round_no, list(keys), pr,
-                         json_out)
+                         json_out, decidable)
 
 
 def register(path):
@@ -160,20 +161,315 @@ def test_a_reworded_restatement_is_matched_and_the_earlier_wording_is_shown(
     assert "restates" in capsys.readouterr().out
 
 
-def test_two_proxies_for_one_premise_are_two_premises_and_that_is_the_known_limit(
+def test_two_proxies_for_one_premise_are_still_two_premises_to_the_COUNTER(
         repo, tmp_path):
-    """The gap, pinned so it cannot be forgotten or quietly closed with a heuristic.
+    """The gap in the COUNT, pinned so it cannot be forgotten or quietly closed with a
+    similarity heuristic.
 
     #62's three proxies were `rc == 0`, an artefact's existence and a head SHA moving:
     textually unrelated, identical in what they assumed. #84 rules out inferring the
     premise from the findings and says to compare DECLARATIONS — so a fixer that
-    declares the proxy instead of the premise defeats the brake, and the answer is the
-    instruction in both briefs ("state the premise, never the proxy"), not a similarity
-    rule this file would then have to calibrate."""
+    declares the proxy instead of the premise defeats the counter, and the answer is
+    NOT a similarity rule this file would then have to calibrate.
+
+    What changed with #491 is the answer, not this fact: the counter still sees two
+    premises here, and the brake that catches this cycle is the decidability question
+    put to each declaration on its own. See
+    `test_the_undecidable_answer_catches_what_the_counter_cannot`, which is this same
+    scenario with the question answered."""
     reg = tmp_path / "premises.json"
     assert declare(reg, PROXY_MERGE, 1, KEY_A) == 0
     assert declare(reg, PROXY_REFS, 2, KEY_B) == 0
     assert len(register(reg)["premises"]) == 2
+
+
+# ------------------------------------------------- #491: the undecidable declaration
+
+def test_the_undecidable_answer_catches_what_the_counter_cannot(repo, tmp_path):
+    """The whole point, in one test: the exact scenario the counter is blind to, with
+    the decidability question answered.
+
+    Two proxies for one unobservable property, honestly declared, sharing almost no
+    words — `test_two_proxies_for_one_premise_are_still_two_premises_to_the_COUNTER`
+    is this without the answer, and it runs to two clean declarations. Answered, the
+    FIRST one is refused, so the second fix pass never happens."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, PROXY_MERGE, 1, KEY_A,
+                   decidable="no") == panel_rounds.PREMISE_REPEATED_EXIT
+
+
+def test_it_fires_on_the_first_declaration_not_the_second(repo, tmp_path):
+    """The asymmetry with `premise_repeated`, pinned because it looks like an
+    inconsistency and is not. An unobservable property does not become observable on
+    the next attempt, so a second occurrence confirms nothing the first did not say —
+    at the price of a fix pass and a whole panel."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A, decidable="no") == \
+        panel_rounds.PREMISE_REPEATED_EXIT
+    assert register(reg)["premises"][0]["rounds"] == [1]
+
+
+def test_a_decidable_yes_is_recorded_and_brakes_nothing(repo, tmp_path):
+    """The flag is not a switch that stops everything it touches. A fixer that looked
+    at the question and found the property observable writes the fix."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A, decidable="yes") == 0
+    assert register(reg)["premises"][0]["decidable"] == "yes"
+
+
+def test_a_declaration_that_was_never_asked_the_question_brakes_nothing(repo, tmp_path):
+    """`unknown` is the honest default: every declaration written before #491 existed
+    reads this way, and #84's rule for an undeclared fix pass is the same rule one
+    level down — report the gap, never guess at it."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A) == 0
+    assert register(reg)["premises"][0]["decidable"] == "unknown"
+
+
+def test_the_refused_declaration_is_still_recorded(repo, tmp_path):
+    """`declare_premise`'s existing rule, which the new brake must not quietly break:
+    the register holds the declaration that was STOPPED as well as the ones allowed,
+    or the round-side half has nothing to read."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="no")
+    entry = register(reg)["premises"][0]
+    assert entry["rounds"] == [1] and entry["decidable"] == "no"
+    assert entry["findings"] == [KEY_A]
+
+
+def test_the_answer_survives_a_reload_or_the_round_cannot_read_it(repo, tmp_path):
+    """`load_premises` rebuilds every entry field by field, so an answer it drops is an
+    answer the round-side half never sees — the brake would then fire before the fix
+    and be silent afterwards."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="no")
+    loaded, problems = panel_rounds.load_premises(str(reg), "acme/board", 34)
+    assert not problems
+    assert loaded["premises"][0]["decidable"] == "no"
+
+
+def test_silence_does_not_retract_an_earlier_answer(repo, tmp_path):
+    """A later pass that simply did not pass the flag has not un-established what an
+    earlier one answered — and the brake still fires, because it reads the ENTRY and
+    not the declaration in front of it. Reading the silence as a retraction would let
+    a caller clear the brake by dropping an argument."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A,
+                   decidable="no") == panel_rounds.PREMISE_REPEATED_EXIT
+    assert declare(reg, LANDED, 2, KEY_B) == panel_rounds.PREMISE_REPEATED_EXIT
+    assert register(reg)["premises"][0]["decidable"] == "no"
+
+
+def test_a_later_yes_does_not_clear_an_earlier_no(repo, tmp_path):
+    """The hole every self-reported signal in this loop has: the agent whose fix is
+    being refused supplies the answer. Without this, a fixer stopped on `no`
+    re-declares the same premise with `yes` and the refusal is gone with nothing
+    recording that it happened — the actor lifting its own brake by changing what it
+    says, which is what `round_stop`'s docstring says cannot be self-reported.
+
+    `no` is established about the PROPERTY. A property the runtime cannot observe does
+    not become observable because a later declaration says otherwise."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="no")
+    assert declare(reg, LANDED, 2, KEY_B,
+                   decidable="yes") == panel_rounds.PREMISE_REPEATED_EXIT
+    assert register(reg)["premises"][0]["decidable"] == "no"
+
+
+def test_a_yes_is_recorded_freely_until_a_no_lands(repo, tmp_path):
+    """Stickiness runs one way only. The ordinary case — a fixer answering honestly,
+    round after round — stays exactly as cheap as it was, or the flag would become
+    something a fixer learns not to answer."""
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A, decidable="yes") == 0
+    assert register(reg)["premises"][0]["decidable"] == "yes"
+    declare(reg, LANDED, 2, KEY_B, decidable="no")
+    assert register(reg)["premises"][0]["decidable"] == "no"
+
+
+def test_an_answer_on_disk_that_nothing_recognises_reads_as_unknown(tmp_path):
+    """A register a later harness (or a hand edit) wrote must not stop the cycle. It
+    degrades to the value that never brakes, and the rest of the entry is kept —
+    unlike a bad ARGUMENT, which is a caller to correct and raises."""
+    reg = tmp_path / "premises.json"
+    reg.write_text(json.dumps({"version": 1, "repo": "board", "pr": 34, "premises": [
+        {"text": LANDED, "rounds": [1], "findings": [KEY_A], "decidable": "maybe"}]}))
+    loaded, problems = panel_rounds.load_premises(str(reg), "board", 34)
+    assert not problems
+    assert loaded["premises"][0]["decidable"] == "unknown"
+    assert loaded["premises"][0]["rounds"] == [1]
+
+
+def test_a_bad_answer_in_an_ARGUMENT_is_refused_rather_than_read_as_unknown():
+    """The other side of the line above. A typo coerced to `unknown` is a brake that
+    does not fire on a declaration that answered `no`, which is this mechanism failing
+    in the exact direction it exists to prevent."""
+    with pytest.raises(ValueError) as e:
+        panel_rounds.declare_premise({}, LANDED, 1, [KEY_A], 2, "No!", True)
+    assert "decidable" in str(e.value)
+
+
+# --------------------------------------------------------------- #491: the dial
+
+def test_the_ask_path_refuses_the_answer_rather_than_ignoring_it(monkeypatch, tmp_path):
+    """The rule `--premise-for` is refused by, and its reason: a flag accepted and
+    ignored is a caller believing it asked for something this run does not do. `--ask`
+    puts a premise to the SEATS; it declares nothing, so there is no register for an
+    answer to be recorded in."""
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--ask", "a premise",
+                                      "--premise-decidable", "no"])
+    with pytest.raises(SystemExit) as e:
+        panel.main()
+    assert "--premise-decidable" in str(e.value)
+
+
+def test_a_review_round_refuses_the_answer_too(monkeypatch):
+    """A round writes no fix, so it has none to answer for. It reads the answers
+    already in the register through `--premise-file`."""
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--pr", "1",
+                                      "--premise-decidable", "no"])
+    with pytest.raises(SystemExit) as e:
+        panel.main()
+    assert "--premise-decidable belongs to --premise" in str(e.value)
+
+
+def test_the_undecidable_brake_ships_on(repo):
+    """On by default, like `premise_repeated` and unlike the rest of #78's table: it
+    can only fire on a fixer's own explicit `no`, which cannot happen by accident, and
+    its output is "stop and ask a human"."""
+    assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
+        "premise_repeated": 2, "premise_undecidable": True}
+    assert panel_rounds.premise_undecidable_brake(
+        harness_rules.DEFAULTS["review_panel"], []) is True
+
+
+def test_a_repo_that_wrote_only_the_other_key_keeps_this_one(repo, tmp_path):
+    """`review_panel` merges one level deep, so a written `escalate_on` REPLACES the
+    default object. Without the per-key fallback, `{"premise_repeated": 2}` would
+    silently switch this brake off — which is the exact failure #84 hit and is not
+    worth shipping twice."""
+    assert panel_rounds.premise_undecidable_brake(
+        {"escalate_on": {"premise_repeated": 2}}, []) is True
+
+
+def test_switching_it_off_lets_the_fix_be_written(repo, tmp_path):
+    """A repo may decide it would rather a fixer approximate than stop."""
+    repo(cfg(escalate_on={"premise_undecidable": False}))
+    reg = tmp_path / "premises.json"
+    assert declare(reg, LANDED, 1, KEY_A, decidable="no") == 0
+
+
+def test_switching_it_off_still_records_the_answer_and_says_so(repo, tmp_path, capsys):
+    """`ESCALATE_ON_UNBUILT`'s rule: a governance answer that changes nothing must not
+    be indistinguishable from one that was never given."""
+    repo(cfg(escalate_on={"premise_undecidable": False}))
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="no")
+    assert register(reg)["premises"][0]["decidable"] == "no"
+    assert "premise_undecidable` is off" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", [2, "yes", 0.5, []])
+def test_a_number_here_is_refused_because_there_is_nothing_to_count(value):
+    """`2` would mean "approximate it once first", which is the behaviour the brake
+    exists to refuse. The value it reads is a fixer's yes/no about one property, so
+    there is no occurrence to count."""
+    with pytest.raises(SystemExit) as e:
+        panel_rounds.premise_undecidable_brake(
+            {"escalate_on": {"premise_undecidable": value}}, [])
+    assert "escalate_on.premise_undecidable" in str(e.value)
+
+
+def test_the_new_key_is_not_reported_as_a_typo():
+    assert "review_panel.escalate_on" not in harness_rules.unknown_keys(
+        {"review_panel": {"escalate_on": {"premise_undecidable": True}}})
+
+
+# ------------------------------------------- #491: the late half, at the round
+
+def test_an_undecidable_premise_that_reaches_a_round_ends_the_cycle():
+    """The same shape as the repeat's late half, and for the same reason: `--premise`
+    refuses the fix when it is PROPOSED, and a caller that ignored exit 4 wrote it
+    anyway. The register is then the record that says so."""
+    reg = {"premises": [{"key": "p1", "text": LANDED, "norm": LANDED, "rounds": [1],
+                         "findings": [KEY_A], "decidable": "no"}]}
+    # A new finding, so absent the brake this round would GO AGAIN — the stop then
+    # means the brake, not rule 4's "otherwise dry".
+    stop = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=panel_rounds.premise_state(reg, 2, 2, True))
+    assert stop["stop"] is True
+    assert "cannot observe" in stop["reason"]
+
+
+def test_the_undecidable_stop_is_never_reported_as_convergence():
+    """A cycle ending on an open question is not a clean finish, and a reader who
+    cannot tell the two apart has been told the opposite of the truth. Named for the
+    brake it covers: #84's repeat has a test of this name already, and two of them
+    would mean only the second ever ran."""
+    reg = {"premises": [{"key": "p1", "text": LANDED, "norm": LANDED, "rounds": [1],
+                         "findings": [KEY_A], "decidable": "no"}]}
+    stop = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=panel_rounds.premise_state(reg, 2, 2, True))
+    assert stop["confident"] is False
+    assert any("#491" in v for v in stop["veto"])
+
+
+def test_a_repo_that_disarmed_the_brake_does_not_get_its_cycle_ended():
+    """`premise_state` lists the declaration either way — the payload records what the
+    cycle SAID — so the arming check has to happen at the stop rather than being
+    inferred from the list being non-empty."""
+    reg = {"premises": [{"key": "p1", "text": LANDED, "norm": LANDED, "rounds": [1],
+                         "findings": [KEY_A], "decidable": "no"}]}
+    state = panel_rounds.premise_state(reg, 2, 2, False)
+    assert state["undecidable"] and state["undecidable_brake"] is False
+    assert panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state)["stop"] is False
+
+
+def test_the_payload_records_the_declaration_and_the_arming_separately():
+    """Collapsing the two would make a repo that switched the brake off
+    indistinguishable from one where no fixer ever answered the question."""
+    reg = {"premises": [{"key": "p1", "text": LANDED, "norm": LANDED, "rounds": [1],
+                         "findings": [KEY_A], "decidable": "no"}]}
+    stop = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=panel_rounds.premise_state(reg, 2, 2, False))
+    assert [p["key"] for p in stop["premises"]["undecidable"]] == ["p1"]
+    assert stop["premises"]["undecidable_brake"] is False
+
+
+# ------------------------------------------------------- #491: what the fixer reads
+
+def test_the_question_is_put_to_every_declaration_not_only_the_braking_one(
+        repo, tmp_path, capsys):
+    """A fixer that has never seen the question does not know it was asked. The line
+    that only appears when it stops you is the line nobody reads until it is too late
+    to have answered."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A)
+    assert "--premise-decidable" in capsys.readouterr().out
+
+
+def test_the_stop_explains_the_brake_that_actually_fired(repo, tmp_path, capsys):
+    """#84's sentence tells a fixer not to patch the same premise again. To a fixer
+    stopped on its FIRST declaration that is simply untrue about its own cycle, and a
+    stop whose explanation does not match what happened is one a caller argues with."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="no")
+    out = capsys.readouterr().out
+    assert "STOP — DO NOT WRITE THIS FIX." in out
+    assert "not decidable where the assertion runs" in out
+    assert "fix pass 1 against one premise the previous round invalidated" not in out
+
+
+def test_a_declaration_that_trips_both_brakes_says_both(repo, tmp_path):
+    """They are different questions and a fixer acting on one has not answered the
+    other."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A, decidable="yes")
+    verdict = panel_rounds.declare_premise(
+        panel_rounds.load_premises(str(reg))[0], LANDED, 2, [KEY_A], 2, "no", True)
+    assert verdict["repeated"] and verdict["undecidable"]
+    assert "NOT decidable" in verdict["reason"]
+    assert "declared 2 time(s)" in verdict["reason"]
 
 
 def test_a_third_occurrence_still_stops_rather_than_passing_the_dial(repo, tmp_path):
@@ -191,8 +487,7 @@ def test_the_default_is_the_one_the_rules_file_documents():
     """Two occurrences — "the second time" — and it is ON by default, unlike the rest of
     #78's table. It can only fire after a premise has been DECLARED twice, which cannot
     happen by accident, and its output is "stop and ask a human"."""
-    assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
-        "premise_repeated": 2}
+    assert harness_rules.DEFAULTS["review_panel"]["escalate_on"]["premise_repeated"] == 2
     assert panel_rounds.premise_repeat_limit(
         harness_rules.DEFAULTS["review_panel"], []) == 2
 
@@ -355,6 +650,7 @@ def test_a_round_with_no_register_still_answers_the_question():
     payload written before the field" — that would be reading a payload's age."""
     got = panel_rounds.round_stop(3, 5, [], [], [])
     assert got["premises"] == {"limit": None, "declared": 0, "repeated": [],
+                              "undecidable": [], "undecidable_brake": False,
                               "undeclared_rounds": [1, 2]}
 
 
@@ -595,6 +891,33 @@ def test_the_orchestrators_brief_runs_the_brake_before_it_re_briefs_a_fix_pass()
     escalated zero times across five rounds and the human named the premise."""
     assert "--premise-file /tmp/tmp.AbC123/premises.json" in PANEL_REVIEW_PR
     assert "Do not launch §4." in PANEL_REVIEW_PR
+
+
+def test_the_fixers_brief_carries_the_fourth_test_and_says_it_stands_alone(
+        ):
+    """The mechanism is a flag, and a flag nobody is told to answer is #169's unwired key
+    with extra steps. The "stands alone" half is load-bearing: as a fourth CONJUNCT it
+    could never fire, because test 3 passes precisely when test 4 is failing."""
+    assert "decidable in the runtime the assertion runs" in REVIEW_PR
+    assert "It is an escalation if tests 1-3 all hold, or if test 4 fails." in REVIEW_PR
+    assert "--premise-decidable" in REVIEW_PR
+
+
+def test_the_orchestrators_brief_asks_for_the_answer_it_is_placed_to_give():
+    """A fixer replacing a proxy is answering the finding in front of it, honestly. Only
+    the reader holding every round can see that the proxies keep changing while the thing
+    being approximated does not — the same argument that makes the declaration itself the
+    orchestrator's to run."""
+    assert "--premise-decidable" in PANEL_REVIEW_PR
+    assert "escalate_on.premise_undecidable" in PANEL_REVIEW_PR
+
+
+def test_both_briefs_say_the_counter_is_blind_rather_than_leaving_it_to_discipline():
+    """"State the premise, never the proxy" is a discipline, and the cycle that produced
+    #491 shows what a discipline is worth here: four honest declarations, none matching.
+    A brief that offered only the instruction would be promising a detector again."""
+    assert "does not depend on your wording" in REVIEW_PR
+    assert "restates" in PANEL_REVIEW_PR and "the answer to this flag is" in PANEL_REVIEW_PR
 
 
 def test_both_briefs_carry_the_limit_rather_than_implying_coverage():
