@@ -424,6 +424,12 @@ def _payload_defaults() -> dict:
         # value of asking twice is that they can disagree.
         "recurrence_counts": {},
         "premise_counts": {},
+        # #492's guard-to-guarded reading, and null where this round never measured
+        # one — a skipped round, or a diff that adds nothing. Not `{}`: the three
+        # counts and the ratio are one reading, and an empty mapping would let a
+        # consumer index it and get zeros for a change nobody measured, which is the
+        # absent-vs-zero collapse the keys above are shaped to prevent.
+        "guard_ratio": None,
         # Where a run sits in the panel -> fix -> panel cycle. Defaulted here too,
         # so the skipped PR answers `payload['round_stop']` with "no cycle ran"
         # rather than with a KeyError.
@@ -2836,29 +2842,65 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # escalation get: the cycle is ending because something went wrong, and a reader
     # who cannot tell that from a clean finish has been told the opposite of the truth.
     # Set AFTER the SonarCloud sentence above so the reason reads outermost-first.
+    #
+    # **TWO NUMBERS, CROSSED-FIRST (#492).** The multiple above is the whole of what
+    # this used to be, and a pure multiple hands its rope out in proportion to the
+    # starting size: at 3.0x a 113-line PR may grow ~226 lines while a 2,000-line one
+    # may grow 4,000 — the loosest allowance handed to the case most in need of a
+    # ceiling. So `max_fix_growth_chars` states the same limit absolutely and the
+    # cycle stops on whichever is crossed first. Both are ceilings, so the pair can
+    # only ever TIGHTEN: nothing this arrangement lets through would have been caught
+    # by the multiple alone. Either half is `null`-able on its own and both null is
+    # the pre-#165 behaviour of no check at all, which is why the block below runs
+    # whenever EITHER is set rather than only when the multiple is.
+    #
+    # `grown` is the difference of the same two sizes the ratio divides — deliberately,
+    # because two halves of one ceiling read off two different measurements is #298's
+    # defect one level up, and there is exactly one pair of numbers in this payload
+    # that both halves may be computed from.
     growth = None
-    if dials.max_fix_growth is not None and prior.first_reviewed:
+    limit, limit_chars = dials.max_fix_growth, dials.max_fix_growth_chars
+    if (limit is not None or limit_chars is not None) and prior.first_reviewed:
         first_round, first_chars, first_scope = prior.first_reviewed
         pr_chars = len(review.diff)
         ratio = pr_chars / first_chars
-        over = ratio > dials.max_fix_growth
-        growth = {"limit": dials.max_fix_growth, "ratio": round(ratio, 3),
-                  "over": over, "chars": pr_chars, "scope": "pr",
+        grown = pr_chars - first_chars
+        over_ratio = limit is not None and ratio > limit
+        over_chars = limit_chars is not None and grown > limit_chars
+        over = over_ratio or over_chars
+        growth = {"limit": limit, "limit_chars": limit_chars,
+                  "ratio": round(ratio, 3), "grown": grown,
+                  "over": over, "over_ratio": over_ratio, "over_chars": over_chars,
+                  "chars": pr_chars, "scope": "pr",
                   "review_scope": review.scope,
                   "first_round": first_round, "first_chars": first_chars,
                   "first_scope": first_scope}
         if over:
+            # Which half fired, in the words each one is about. A stop that named the
+            # multiple when the absolute is what bound would send an operator to raise
+            # a key that was never crossed — and where both fired, both are said,
+            # because "3.4x AND +38,000 chars" is a different argument for splitting
+            # than either alone.
+            crossed, ceilings = [], []
+            if over_ratio:
+                crossed.append(f"{ratio:.1f}x the size round {first_round} reviewed it "
+                               f"at, past the {limit:g}x `max_fix_growth` ceiling")
+                ceilings.append(f"{limit:g}x `max_fix_growth`")
+            if over_chars:
+                crossed.append(f"{grown:,} chars bigger than round {first_round} "
+                               f"reviewed it, past the {limit_chars:,}-char "
+                               "`max_fix_growth_chars` ceiling")
+                ceilings.append(f"{limit_chars:,}-char `max_fix_growth_chars`")
             stop["stop"] = True
             stop["reason"] = (
-                f"this PR is {ratio:.1f}x the size round {first_round} reviewed it at, "
-                f"past the {dials.max_fix_growth:g}x "
-                f"`max_fix_growth` ceiling — {stop['reason']}, and what this needs is "
-                "splitting, not another round")
+                f"this PR is {' and '.join(crossed)} — {stop['reason']}, and what this "
+                "needs is splitting, not another round")
             stop["veto"] = [*stop["veto"],
                             f"the PR's {pr_chars:,} chars (whole PR) "
                             f"against round {first_round}'s {first_chars:,} "
-                            f"({first_scope}) is {ratio:.1f}x, past the "
-                            f"{dials.max_fix_growth:g}x `max_fix_growth` ceiling — a fix "
+                            f"({first_scope}) is {ratio:.1f}x and +{grown:,} chars, "
+                            f"past the {' and '.join(ceilings)} "
+                            f"ceiling{'s' if len(ceilings) > 1 else ''} — a fix "
                             "pass that multiplies the change has written a second "
                             "change, and this stop is that measurement, not convergence"]
             # Explicit rather than inferred from the veto line: `confident` was already
@@ -3232,6 +3274,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                         if cycle_run else []),
         "recurrence_counts": recurrence_counts,
         "premise_counts": premise_counts,
+        # #492, and measured on EVERY round including the first — which is the
+        # point of it. `max_fix_growth` needs two rounds before it has a ratio at
+        # all; how much apparatus a change is carrying is answerable from round 1's
+        # diffstat, and one cycle produced 406 lines of test for a 66-line config
+        # change with nothing in the panel noticing. `review.diff` is the whole PR
+        # under either round scope, the same end the growth ceiling reads.
+        "guard_ratio": guard_ratio(review.diff),
         "skipped": result.skipped,
         "run_key": run_key,
     }
@@ -3435,6 +3484,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         #
         # It cannot stop anything and nothing consults it — see `cycle_trend_lines`.
         lines.extend(cycle_trend_lines(trend_rows, prior.first_reviewed))
+    # ---- guard-to-guarded (#492), and it is printed OUTSIDE the `in_rounds` block
+    # above deliberately. Provenance and recurrence are questions only a later round
+    # can ask; this one is answerable from round 1's diffstat, and round 1 is where an
+    # operator can still act on it cheaply — the whole complaint behind the issue is
+    # that the growth ceilings bind a round late.
+    #
+    # It says what it is and stops (#67, exactly as recurrence above does). Nothing
+    # gates on it, no threshold is crossed, no stop. A ceiling here would be a number
+    # invented today with its argument written afterwards, and this repo's rule is
+    # that an instrument earns a gate over a few dozen cycles or not at all.
+    gr = payload["guard_ratio"]
+    if gr:
+        # The split is printed beside the ratio because `guard` alone cannot say
+        # whether a change grew its tests or grew its prose, and those argue for
+        # different things.
+        against = (f"{gr['source']} source — **{gr['ratio']:g}:1**"
+                   if gr["ratio"] is not None
+                   else "no source lines at all — no ratio to take")
+        lines.append(f"**Guard-to-guarded:** {gr['test']} test + {gr['doc']} doc "
+                     f"line(s) added against {against}. Reported, not a threshold — "
+                     "nothing stops on this (#67).")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "blocked": "🚧 gated — a run exists and will not execute without a human",
               "none": "🚫 no run exists for this commit",

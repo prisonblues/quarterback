@@ -1,4 +1,4 @@
-"""#165's seven `review_panel` dials, and #297's eighth — thoroughness against convergence, per repo.
+"""#165's seven `review_panel` dials, #297's eighth and #492's ninth — thoroughness against convergence, per repo.
 
 The panel had one behaviour and no dials. Every choice it made about what counts as
 worth reporting, what a fix round has to clear, and what buys another round was a
@@ -8,8 +8,10 @@ had and **128 of them — 63.7% — were created by the fix pass immediately bef
 against a ~7% industry baseline for bad-fix injection. Every one of those panels
 terminated on the round cap, each saying in its own output "a stop, not convergence".
 
-So there are now eight settings — seven from #165 and `low_severity_fix_lines` from
-#297, which answers a second measurement taken five days later on the same panel — and
+So there are now nine settings — seven from #165, `low_severity_fix_lines` from #297,
+which answers a second measurement taken five days later on the same panel, and
+`max_fix_growth_chars` from #492, which answers a field report that the growth ceiling
+scales its rope with the starting size — and
 this suite is what says they are settings rather than documentation. Each one gets three tests, because there are exactly three ways a
 setting fails:
 
@@ -61,7 +63,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The eight, and where each one's default is written twice. `skip_title_patterns` and
+#: The nine, and where each one's default is written twice. `skip_title_patterns` and
 #: the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
@@ -69,6 +71,7 @@ DIALS = {
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
     "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
+    "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",
     "max_rounds": "DEFAULT_MAX_ROUNDS",
@@ -236,6 +239,7 @@ BAD_VALUES = [
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
     ("low_severity_fix_lines", "a few", "a whole number"),
     ("max_fix_growth", "lots", "is not a number"),
+    ("max_fix_growth_chars", "a lot", "a whole number"),
     ("reviewer_scope", "everything", "diff, repo"),
     ("require_failing_test", "sometimes", "true or false"),
     ("max_rounds", 2.5, "whole number of rounds >= 1"),
@@ -244,7 +248,7 @@ BAD_VALUES = [
 
 @pytest.mark.parametrize("key,bad,accepted", BAD_VALUES)
 def test_a_malformed_value_of_a_known_key_is_a_hard_exit(key, bad, accepted):
-    """All eight, in one table, because the failure they share is the one that matters:
+    """All nine, in one table, because the failure they share is the one that matters:
     a repo that wrote `fix_severity_floor: p-4` intending the pre-#165 "fix everything"
     silently got the default, stopped fixing P3s and P4s, and the review ran anyway —
     under a policy the file did not ask for, in the round the fixer was briefed from. A
@@ -278,9 +282,12 @@ def test_unset_is_still_the_silent_not_configured_reading(key, unset):
     WRITTEN null — `null` or `""`, as against an absent key — is its off switch, which
     is still not an error. `low_severity_fix_lines` is the second such key and the
     reading is the same: a written null is "no budget at all", which is not the same
-    answer as the default and not a mistake either."""
+    answer as the default and not a mistake either. `max_fix_growth_chars` is the third
+    and inherits the reading from the key it sits beside (#492) — the two halves of one
+    ceiling are nulled independently, which is most of why it is a second key."""
     dials = panel_seats.resolve_dials({key: unset}, None, [])
-    expected = (None if key in ("max_fix_growth", "low_severity_fix_lines")
+    expected = (None if key in ("max_fix_growth", "max_fix_growth_chars",
+                                "low_severity_fix_lines")
                 else harness_rules.DEFAULTS["review_panel"][key])
     assert getattr(dials, key) == expected
 
@@ -669,18 +676,35 @@ def test_a_fix_that_did_not_multiply_the_change_is_not_stopped(monkeypatch, caps
     assert growth["over"] is False and 1 < growth["ratio"] < 3
 
 
-def test_null_switches_the_growth_check_off(monkeypatch, capsys, tmp_path):
+def test_null_switches_the_multiple_off_and_says_the_other_half_is_still_there(
+        monkeypatch, capsys, tmp_path):
     """The non-default value. `null` is the only spelling of "off" — the default IS a
     number, so reading null as "inherit" like every other setting would leave a check
-    whose only job is to stop a cycle with no way to opt out."""
+    whose only job is to stop a cycle with no way to opt out.
+
+    Since #492 it switches off the MULTIPLE and not the ceiling: there is an absolute
+    half beside it now, and a repo that wrote this null meant "no growth check",
+    because at the time that key WAS the whole check. Collapsing the one null onto both
+    halves is the obvious alternative and is worse — it makes a written value mean
+    something other than what it names — so the round says so instead, and names the
+    key that finishes the job. The stop still does not fire here (`HUGE` is 6.5x on a
+    growth of ~5,800 chars), which is what the null bought."""
     _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
                    max_rounds=3, diff=SMALL, config=cfg(max_fix_growth=None))
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
                         baseline=[r1], max_rounds=3, diff=HUGE, scope="pr",
                         config=cfg(max_fix_growth=None))
     assert payload["review_panel"]["max_fix_growth"] is None
-    assert payload["round_stop"]["fix_growth"] is None
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["limit"] is None and growth["over_ratio"] is False
+    assert growth["over"] is False
     assert payload["round_stop"]["stop"] is False
+    note, = notes_about(payload, "max_fix_growth_chars")
+    assert "30,000" in note and "in force" in note
+    # And it does NOT fire on the shipped defaults, where nobody wrote anything to be
+    # surprised about — a note on every run is a note nobody reads.
+    _, plain, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="plain")
+    assert not notes_about(plain, "max_fix_growth_chars")
 
 
 def test_an_absent_max_fix_growth_is_the_default_not_off():
@@ -708,6 +732,309 @@ def test_a_bad_max_fix_growth_is_refused_and_never_read_as_a_threshold(bad, why)
     assert why in str(refusal.value)
     assert "null to switch the check off" in str(refusal.value)
     assert notes == []
+
+
+# ------------------------------------------------------- 4b. max_fix_growth_chars
+
+#: A large first round and a large absolute growth that is nevertheless UNDER 3.0x —
+#: the shape #492 is about. 1,200 churned lines to 3,200: +2,000 lines, which at this
+#: repo's measured ~66 chars a churned line is the size of a whole second feature, and
+#: 2.66x, which the multiple waves straight through. The bigger the PR the wider that
+#: gap gets, and the PR most in need of a ceiling is the one handed the loosest.
+BIG = "diff --git a/a.py b/a.py\n" + LINE * 1200
+BIGGER = "diff --git a/a.py b/a.py\n" + LINE * 3200
+
+
+def test_the_absolute_ceiling_stops_growth_the_multiple_waves_through(monkeypatch,
+                                                                      capsys, tmp_path):
+    """A multiple hands its rope out in proportion to the starting size. At 3.0x a
+    113-line PR may grow ~226 lines and a 2,000-line one may grow 4,000, so the same
+    dial that stops the first at 226 waves four thousand lines of fix-pass output
+    through on the second — and "a fix pass that MULTIPLIES the diff has written a
+    second change" is a claim about ABSOLUTE second-change-ness that one multiple
+    cannot make at both ends of the range (#492)."""
+    # Stated as a property of the fixture, or this test asserts nothing: the multiple is
+    # NOT crossed here, so a run against the pre-#492 code goes on to another round.
+    # The default is spelled out rather than read off `panel_core`: this line is a
+    # property of the FIXTURE, and reading it from the code under test would make it
+    # the first thing to fail when the dial is absent — a red run that proves the
+    # constant is missing rather than that the ceiling does not bind.
+    assert len(BIGGER) / len(BIG) < 3.0
+    assert len(BIGGER) - len(BIG) > 30000
+
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG)
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=2, baseline=[r1], max_rounds=3, diff=BIGGER,
+                             scope="pr")
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over"] is True, growth
+    # WHICH half fired, because a stop that named the multiple would send an operator
+    # to raise a key that was never crossed.
+    assert growth["over_ratio"] is False and growth["over_chars"] is True
+    assert growth["grown"] == len(BIGGER) - len(BIG)
+    assert growth["limit_chars"] == 30000
+    assert stop["stop"] is True and stop["confident"] is False
+    assert "`max_fix_growth_chars` ceiling" in stop["reason"]
+    assert "`max_fix_growth` ceiling" not in stop["reason"], stop["reason"]
+    assert any("`max_fix_growth_chars`" in v for v in stop["veto"])
+    assert "a stop, not convergence" in report
+
+
+def test_the_absolute_half_does_not_swallow_the_multiple_that_already_bound(
+        monkeypatch, capsys, tmp_path):
+    """The pair can only ever TIGHTEN, and a cycle the multiple already stopped must
+    still be told that is what stopped it. `SMALL` -> `HUGE` is 6.5x on a growth of
+    ~5,800 chars — nowhere near the absolute — so this is the case where the two
+    halves disagree in the other direction."""
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=HUGE, scope="pr")
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["over_ratio"] is True and growth["over_chars"] is False
+    assert growth["grown"] < 30000
+    assert "`max_fix_growth` ceiling" in payload["round_stop"]["reason"]
+    assert "`max_fix_growth_chars`" not in payload["round_stop"]["reason"]
+
+
+def test_null_switches_the_absolute_half_off_and_leaves_the_multiple(monkeypatch,
+                                                                     capsys, tmp_path):
+    """The non-default value, and the reason this is a second key rather than a
+    two-part value inside `max_fix_growth`: the two halves are nulled independently, so
+    a repo can keep the multiple and decline the absolute without either of them having
+    to answer what half a bare `null` switched off."""
+    conf = cfg(max_fix_growth_chars=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    assert payload["review_panel"]["max_fix_growth_chars"] is None
+    assert payload["review_panel"]["max_fix_growth"] == 3.0
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["limit_chars"] is None and growth["over"] is False
+    assert payload["round_stop"]["stop"] is False
+
+
+def test_nulling_both_halves_is_no_growth_check_at_all(monkeypatch, capsys, tmp_path):
+    """The pre-#165 behaviour, and it takes two nulls now rather than one. Asserted
+    rather than left to a comment, because the block that applies the ceiling runs
+    whenever EITHER half is set — the shape that most easily leaves an operator who
+    switched "the growth check" off still being stopped by it."""
+    conf = cfg(max_fix_growth=None, max_fix_growth_chars=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    assert payload["round_stop"]["fix_growth"] is None
+    assert payload["round_stop"]["stop"] is False
+
+
+def test_an_absent_max_fix_growth_chars_is_the_default_not_off():
+    """The same distinction `max_fix_growth` draws one function up, and it has to be
+    drawn again here: the default is a number, so reading an absent key as `null` would
+    leave half a check whose only job is to stop a cycle with no way back on."""
+    assert panel_seats.fix_growth_chars_limit({}, []) == 30000
+    assert panel_seats.fix_growth_chars_limit({"max_fix_growth_chars": None}, []) is None
+
+
+@pytest.mark.parametrize("bad,why", [
+    (False, "a whole number"),
+    ("a lot", "a whole number"),
+    (2.5, "a whole number"),
+    (0, "above zero"),
+    (-30000, "above zero"),
+])
+def test_a_bad_max_fix_growth_chars_is_refused_and_never_read_as_a_threshold(bad, why):
+    """`0` is refused rather than read as "stop the moment it grows at all": a growth
+    ceiling of zero is one no cycle that ran a fix pass can be under, so it would stop
+    every one of them — the switch turned all the way on, which is the same failure
+    `max_fix_growth: false` produces beside it, and `null` is the spelling already
+    available for what the operator meant. `false` is refused for that key's reason
+    (`isinstance(True, int)`), and a fractional value because half a char is not a size
+    any diff has."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.fix_growth_chars_limit({"max_fix_growth_chars": bad}, notes)
+    assert why in str(refusal.value)
+    assert "null to switch this half of the check off" in str(refusal.value)
+    assert notes == []
+
+
+def test_the_dials_line_names_both_halves_of_the_growth_ceiling(monkeypatch, capsys,
+                                                                tmp_path):
+    """The report's **Panel dials** line is the only place a round's policy is written
+    down where an operator can see it, and `/panel-review-pr.md` briefs the fixer off
+    it. A line that named only the multiple would make the absolute stop, when it
+    fires, read as an arithmetic bug."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
+    assert "fix growth cap 3x or +30,000 chars" in report
+    # And "off" only where BOTH are null — a line that vanishes at some settings is one
+    # a reader cannot tell from a dial that was never applied.
+    off, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="off",
+                    config=cfg(max_fix_growth=None, max_fix_growth_chars=None))
+    assert "fix growth cap off" in off
+
+
+def test_the_orchestrator_is_told_that_naming_findings_does_not_lift_the_budget():
+    """#492's third part, and it is prose because the mistake is an orchestrator's.
+
+    `low_severity_fix_lines` caps ACCUMULATION and its docstring is emphatic that the
+    question is mechanical rather than discretionary — the spend is counted with `git
+    diff --numstat` after each fix and the fixer is never asked whether this risks
+    ballooning. On the cycle #492 was filed from the orchestrator LIFTED it for round
+    2, because the human had named which findings to fix: it read a narrowed finding
+    list as the budget having been spent by decision. The pass came out at 422 lines
+    and produced 13 new findings, which is the exact shape the budget exists to
+    prevent, and the one brake still capable of firing was the one removed.
+
+    Which findings a pass may touch and how much churn it may add are two controls.
+    Nothing in the brief said so, and collapsing them is a natural mistake for an
+    orchestrator that has just been handed a shorter list."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert ("Selecting findings and capping churn are INDEPENDENT controls, and naming "
+            "findings NEVER lifts the budget (#492)") in flat
+    assert "relay the budget with a narrowed list exactly as you would with the full one" in flat
+    # And the unpaid remainder goes where a below-floor finding goes, rather than
+    # vanishing because a narrower list implied it was already handled.
+    assert ("a pass that runs out of it reports the unpaid findings exactly as it "
+            "reports below-floor ones") in flat
+
+
+def test_the_orchestrator_is_told_the_growth_ceiling_now_has_two_halves():
+    """The **Panel dials** line is what §4 briefs the fixer from, and an orchestrator
+    that believed the ceiling was one number would read the absolute stop as an
+    arithmetic bug when it fired."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "TWO halves, a multiple and an absolute char count" in flat
+    assert "stops the cycle on whichever is crossed first" in flat
+
+
+def test_the_orchestrator_is_told_to_carry_guard_to_guarded_and_not_to_gate_on_it():
+    """Report-only has to be said to the actor that would otherwise invent a threshold.
+    An orchestrator handed a 6:1 ratio and no rule will supply one, and a rule supplied
+    that way is a ceiling with its argument written afterwards (#67)."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "**Guard-to-guarded**" in flat and "`guard_ratio` in the JSON" in flat
+    assert "no threshold here for you to apply and none for you to invent" in flat
+    assert "available from round 1's diffstat" in flat
+
+
+# ----------------------------------------------------- 4c. guard-to-guarded (#492)
+
+def guard_diff(*files):
+    """A unified diff that adds `n` lines to each named path — the shape
+    `_diff_added_lines` reads, headers and hunk marker included, because the
+    classifier's whole input is the `b/` path off those headers."""
+    out = []
+    for path, added in files:
+        out.append(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                   f"@@ -0,0 +1,{added} @@\n")
+        out.extend("+a line\n" for _ in range(added))
+    return "".join(out)
+
+
+#: The reported cycle's own shape: 406 lines of test for a 66-line config change.
+GUARDED = guard_diff(("harness/loops/harness_rules.py", 66),
+                     ("harness/loops/tests/test_dials.py", 406))
+
+
+def test_guard_to_guarded_is_measured_and_reported_from_round_one(monkeypatch, capsys,
+                                                                  tmp_path):
+    """406 lines of test for a 66-line config change, and nothing in the panel noticed
+    that the apparatus built to protect a change had outgrown the change (#492).
+
+    Round ONE, which is the point: `max_fix_growth` needs a second round before it has
+    a ratio at all, and this is answerable from the first round's diffstat — which is
+    the round where an operator can still act on it cheaply. It is also a DIFFERENT
+    failure from raw growth: a fix pass can sit well under 3.0x overall while the
+    test-to-source ratio inside it goes to 6:1."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=GUARDED)
+    assert "Guard-to-guarded" in report
+    assert "406 test + 0 doc line(s) added against 66 source — **6.15:1**" in report
+    assert payload["guard_ratio"] == {"test": 406, "doc": 0, "source": 66,
+                                      "guard": 406, "ratio": 6.15}
+    # REPORT-ONLY (#67's instrument-before-gate, the rule `provenance` and `recurrence`
+    # already live under). A threshold invented today would be a ceiling with its
+    # argument written afterwards; this one earns a gate over a few dozen cycles or
+    # never gets one.
+    assert "nothing stops on this" in report
+    assert payload["round_stop"]["stop"] is False
+    assert not any("uard" in v for v in payload["round_stop"]["veto"])
+
+
+def test_a_change_that_adds_no_source_has_no_ratio_rather_than_an_infinite_one(
+        monkeypatch, capsys, tmp_path):
+    """A pure test or docs PR is the commonest benign shape there is, and a large
+    number reported for it would be an accusation. The quantity is undefined, not
+    enormous, and the line says so instead of dividing."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=guard_diff(("docs/how-it-works.md", 40)))
+    assert "no source lines at all — no ratio to take" in report
+    assert payload["guard_ratio"] == {"test": 0, "doc": 40, "source": 0,
+                                      "guard": 40, "ratio": None}
+
+
+def test_a_diff_that_adds_nothing_is_not_measured_at_all(monkeypatch, capsys, tmp_path):
+    """Null, not a mapping of zeros. "Nobody measured one" and "measured, and it was
+    none" are different facts and the payload's other counters are all shaped to keep
+    them apart — a consumer handed `{}` here would index it and get a zero for a change
+    nothing ever read."""
+    deletion = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+                "@@ -1,2 +0,0 @@\n-gone\n-also gone\n")
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=deletion)
+    assert payload["guard_ratio"] is None
+    assert "Guard-to-guarded" not in report
+
+
+def test_the_ratio_counts_lines_ADDED_and_not_churn(monkeypatch, capsys, tmp_path):
+    """A deletion is not apparatus being built. Counting churn would make a fix pass
+    that rewrites one test file in place read the same as one that writes a second test
+    suite, and only the second is the thing this measures."""
+    rewrite = ("diff --git a/tests/test_a.py b/tests/test_a.py\n"
+               "--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+               "@@ -1,3 +1,2 @@\n-old\n-old\n-old\n+new\n+new\n"
+               "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+               "@@ -1,0 +1,4 @@\n+x\n+x\n+x\n+x\n")
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                        diff=rewrite)
+    assert payload["guard_ratio"] == {"test": 2, "doc": 0, "source": 4,
+                                      "guard": 2, "ratio": 0.5}
+
+
+@pytest.mark.parametrize("path,kind", [
+    ("harness/loops/panel.py", "source"),
+    ("app/api/dials.py", "source"),
+    # A whole SEGMENT, never a substring: this is the one way the measurement goes
+    # quietly wrong, since a ratio over the wrong files reads exactly like one over
+    # the right files.
+    ("src/protest/client.py", "source"),
+    ("src/contests/rules.py", "source"),
+    ("harness/loops/tests/test_panel_dials.py", "test"),
+    ("tests/fixtures/big.json", "test"),
+    ("conftest.py", "test"),
+    ("web/ui/Button.spec.tsx", "test"),
+    ("internal/store/store_test.go", "test"),
+    # Directory beats basename: a README inside the test tree grew the test tree, and
+    # calling it documentation would be true and useless.
+    ("tests/README.md", "test"),
+    ("docs/architecture.rst", "doc"),
+    ("changelog.d/492.feat.md", "doc"),
+    ("README.md", "doc"),
+    ("harness/commands/panel-review-pr.md", "doc"),
+])
+def test_a_path_is_classified_by_segment_not_by_substring(path, kind):
+    """The classifier is deliberately coarse — it feeds a number that is reported and
+    gates nothing, so a misfiled path costs a slightly wrong line rather than a stopped
+    cycle. Coarse is not the same as loose about segments, though: `protest` and
+    `contests` both contain `test`, and a substring match would count a client library
+    as apparatus."""
+    assert panel_seats._guard_kind(path) == kind
 
 
 # --------------------------------------------------------------------- 5. reviewer_scope
@@ -1187,7 +1514,8 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
     assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
             "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
-            "cap 3x · fixer may defer yes · failing test required no") in report
+            "cap 3x or +30,000 chars · fixer may defer yes · failing test "
+            "required no") in report
 
 
 def _release_pr(monkeypatch, config):

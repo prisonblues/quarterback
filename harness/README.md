@@ -172,7 +172,10 @@ at 721 lines, 74% of the PR being review-response code, off a round-2 fix list t
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
 individually reasonable small fixes;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
-fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
+whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
+the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
+stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
 not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
