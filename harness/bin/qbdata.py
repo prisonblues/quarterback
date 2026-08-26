@@ -2153,6 +2153,336 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
     return clip(" · ".join(bits), 400)
 
 
+# ---- the dials in force ------------------------------------------------------
+#
+# A dial is a setting: the repo supplies a default, the BOARD states the value in
+# force, and the layer that answered is part of the answer (#305). Until #477
+# nothing a person or an agent looks at showed one. `GET /dials` was written and
+# read by exactly two things — a browser endpoint and one function in
+# `panel_seats.py` — so the value governing every round on the fleet was invisible
+# on `qb-dash`, `qb-dash-tui`, `qb-board` and the web board alike.
+#
+# That was tolerable while a dial only configured what a review round costs. It
+# stops being tolerable with `tempo` (#474), which is the answer to "is this fleet
+# working right now, and how hard" — and that is a fact which has to be legible
+# from the place the fleet is driven from, which is a terminal.
+#
+# **This file does not learn the vocabulary, and that is not laziness.** The board
+# stores `dial` as opaque text and `value` as opaque JSON because the harness owns
+# the dial table (`harness/loops/harness_rules.py`), and a copy anywhere else is a
+# second place a dial is written down — #56's rule, and the confusion #305 exists
+# to end. So everything below renders what the board said and asserts nothing
+# about what it MEANS: `tempo` gets a cell of its own because the issue asks for
+# one, not because this module knows what an `eager` is.
+
+#: The dial the fleet's throttle lives on (#474). Named here for one reason: it is
+#: the dial that gets a cell of its own on the header line, next to the caps it is
+#: there to protect. Its VALUES are not named here, and must not be — a screen that
+#: knew the rungs would be a second copy of the ladder.
+TEMPO_DIAL = "tempo"
+
+#: The shape of an answer, so a caller that got an error still gets one it can
+#: read — `EMPTY_PLAN`'s argument, for the same reason.
+EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False}
+
+
+def fetch_dials(client, repos: list[str] | None = None) -> dict:
+    """What the board says is in force, for the repos this screen watches.
+
+    One call per repo, because `GET /dials?repo=X` answers with X's own dials AND
+    the fleet-wide ones — which is the join a reader wants and a screen watching
+    two projects has to make twice. A screen that resolved no repo at all asks
+    once with no scope, which returns the fleet rows: the honest answer for a
+    dashboard that cannot say which project it is in.
+
+    Reading is free with the credential this dashboard already holds: `GET /dials`
+    takes `app.auth.reader`, which a machine bearer token passes. Writing is not,
+    and that asymmetry is the whole shape of #477 — see :func:`dials_url`.
+
+    Never raises. A board that will not answer is `error`, and `asked` stays True
+    so that a caller can tell "no dials are set" from "nobody has asked yet": the
+    first is a state worth drawing and the second is a screen that has not
+    finished starting, and #244's rule is that those must not look alike.
+    """
+    out: dict = {**EMPTY_DIALS, "asked": True}
+    scopes = [r for r in (repos if repos is not None else resolve_repos()) if r] or [None]
+    rows: list[dict] = []
+    seen: set[tuple] = set()
+    for scope in scopes:
+        try:
+            got = client.get("/dials", {"repo": scope} if scope else None)
+        except Exception as exc:                  # noqa: BLE001 — display it, don't die
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            break
+        for row in (got or {}).get("dials") or []:
+            # Two repos' answers both carry the fleet rows. Keyed on (repo, dial)
+            # rather than on identity because that pair is what the board's own
+            # `ix_dial_settings_live` holds unique: one live row per scope per
+            # dial, so a duplicate here is the same row arriving twice.
+            key = (row.get("repo"), row.get("dial"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    out["dials"], out["shadowed"] = dials_in_force(rows, scopes)
+    return out
+
+
+def dials_in_force(rows: list[dict], repos: list[str | None] | None = None
+                   ) -> tuple[list[dict], list[dict]]:
+    """Split the board's rows into the ones in force and the ones overridden.
+
+    **A repo dial beats a fleet dial of the same name**, and that precedence is
+    the client's to apply — the board says so in one line and deliberately does
+    not do it, because a repo read returns both scopes so that ONE call answers
+    "what is in force here".
+
+    A fleet row is shadowed only where every repo on this screen overrides it. A
+    screen watching two projects, one of which sets `review_panel.max_rounds` for
+    itself, still has that fleet row in force in the other — and a panel that
+    dropped it would be reporting the first repo's answer as the fleet's.
+
+    Ordered repo-first then by name, which is the order `GET /dials` returns and
+    the order a reader would write the table in.
+    """
+    scopes = [r for r in (repos or []) if r]
+    overridden: dict[str, set[str]] = {}
+    for row in rows:
+        if row.get("repo"):
+            overridden.setdefault(row.get("dial") or "", set()).add(row["repo"])
+    in_force, shadowed = [], []
+    for row in rows:
+        beaten = (not row.get("repo") and scopes
+                  and set(scopes) <= overridden.get(row.get("dial") or "", set()))
+        (shadowed if beaten else in_force).append(row)
+    return sorted(in_force, key=_dial_order), sorted(shadowed, key=_dial_order)
+
+
+def _dial_order(row: dict) -> tuple:
+    """Repo before fleet, then by name — `GET /dials`' own order, and the order a
+    reader would write the table in."""
+    return (row.get("repo") is None, row.get("dial") or "")
+
+
+def dial_of(dials: dict | None, name: str, repo: str | None = None) -> dict | None:
+    """The row in force for one dial, or None. Repo scope first, then fleet.
+
+    The precedence is applied again here rather than trusted to the sort, because
+    a caller asking for one dial by name is asking which value ANSWERS — and with
+    two rows for it in the list, the wrong one is a plausible answer rather than
+    a visible bug.
+    """
+    rows = [d for d in (dials or {}).get("dials") or [] if d.get("dial") == name]
+    if repo:
+        rows.sort(key=lambda d: d.get("repo") != repo)
+    else:
+        rows.sort(key=lambda d: d.get("repo") is not None)
+    return rows[0] if rows else None
+
+
+def dial_value(row: dict | None, width: int = 24) -> str:
+    """A dial's value, rendered without claiming to know what it means.
+
+    JSON spellings throughout — `true`, `false`, `null` — rather than a friendlier
+    `on`/`off`, because the friendly words are a vocabulary and this file does not
+    have one. `null` in particular is a real setting on three dials (the documented
+    off switch for `max_fix_growth`, `distant_merge_lines` and
+    `escalate_on.premise_repeated`), and the board goes to some trouble to keep it
+    apart from "no row at all"; rendering it as blank would put the two back
+    together on the one screen a person reads.
+    """
+    if row is None:
+        return ""
+    value = row.get("value")
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, bool) or value is None:
+        text = {True: "true", False: "false", None: "null"}[value]
+    elif isinstance(value, (int, float)):
+        text = f"{value}"
+    else:
+        text = json.dumps(value, separators=(",", ":"))
+    return clip(text, width)
+
+
+#: What an indefinite dial's remaining-life cell says. **Not** `until()`'s `—`,
+#: which every other panel uses for a value nobody reported: an expiry that was
+#: never set is a decision somebody made, and the opposite of an unknown one.
+DIAL_NO_END = "no end"
+
+
+def dial_life(row: dict | None) -> tuple[str, str]:
+    """How long this dial has left, and how loudly to say it — (text, style).
+
+    **The half that must not be dropped.** A `tempo: eager` with forty minutes on
+    it and a `tempo: eager` set indefinitely are different situations and they must
+    not render identically — #244's rule (being idle and being broken must not look
+    alike) applied to a switch instead of a queue.
+
+    Which is why the INDEFINITE one is the loud cell and the countdown is the quiet
+    one, rather than the other way about. A dial that expires will take itself off
+    the board with nobody remembering it; a dial with no end stays until a person
+    goes and clears it, and the failure mode of the whole layer is a temporary
+    setting that outlived its reason with nothing saying it is still in force.
+    """
+    if row is None:
+        return "", "grey50"
+    if not row.get("expires_at"):
+        return DIAL_NO_END, "yellow"
+    left = until(row.get("expires_at"))
+    mins = minutes_left(row.get("expires_at"))
+    return left, "grey50" if mins is None or mins >= 10 else "grey62"
+
+
+def tempo_cell(dials: dict | None, repo: str | None = None
+               ) -> tuple[str, str, str, str] | None:
+    """The header cell: ("TEMPO", value, life, colour) — or None before the first ask.
+
+    Four states and no two of them alike, because collapsing any pair is the bug
+    this issue is about:
+
+      * **not asked yet** — None, and the caller draws nothing. A screen that
+        printed "unset" while its first fetch was still in flight would be stating
+        something it did not know.
+      * **the board would not answer** — `?`, in the colour of a thing that is
+        wrong. Not "unset": an unreadable dial is not an absent one.
+      * **no dial set** — `unset`, quietly. The harness's own default governs, and
+        this screen does not know what that is (see the section note).
+      * **a dial in force** — its value, and its life beside it.
+      * **more than one answer** — see below. Only reachable on a screen watching
+        several projects, and only where they disagree.
+
+    `repo` is the question "what is the tempo HERE", and with it given there is one
+    answer by construction: that repo's row, or the fleet's behind it. Without it
+    the screen is asking about everything it watches, and everything it watches can
+    disagree — which is the case this cell must not paper over.
+    """
+    if not (dials or {}).get("asked"):
+        return None
+    if (dials or {}).get("error"):
+        return "TEMPO", "?", "", "red"
+    live = [d for d in (dials or {}).get("dials") or [] if d.get("dial") == TEMPO_DIAL]
+    if not live:
+        return "TEMPO", "unset", "", "grey50"
+    row = dial_of(dials, TEMPO_DIAL, repo)
+    life, _ = dial_life(row)
+    if repo or len(live) == 1:
+        return "TEMPO", dial_value(row, 12), life, "cyan"
+    # SEVERAL ANSWERS, and the cell has room for one. Printing either of them would
+    # be this panel's own defect — one layer's value stated as though it were
+    # everybody's — so it says how many there are and leaves the panel below to say
+    # which is which.
+    #
+    # **The expiry counts as a disagreement, not just the value.** Two repos both
+    # `eager`, one for forty minutes and one indefinitely, are the pair this whole
+    # issue says must not render alike; agreeing on the word and then showing one
+    # of the two countdowns beside it is that failure with an extra step. So a
+    # split expiry keeps the value — it IS agreed — and gives up the life cell,
+    # which is the half that has no single answer.
+    if len({json.dumps(d.get("value"), sort_keys=True) for d in live}) > 1:
+        return "TEMPO", "mixed", f"{len(live)} repos", "yellow"
+    if len({d.get("expires_at") for d in live}) > 1:
+        return "TEMPO", dial_value(row, 12), f"{len(live)} repos", "yellow"
+    return "TEMPO", dial_value(row, 12), life, "cyan"
+
+
+def dial_where(row: dict, show_repo: bool = True) -> tuple[str, str]:
+    """Which LAYER answered — ("fleet" | the repo, style).
+
+    The one column on these panels that does not answer to the screen's scope,
+    and deliberately: everywhere else the repo cell names a PROJECT, and a screen
+    showing one project spends eleven columns restating it (#261). Here it names
+    the layer a value came from, which is half of what a dial's answer IS — "in
+    force fleet-wide" and "in force for this repo" are different facts about the
+    same number, and a reader who cannot tell them apart cannot tell whether
+    clearing it changes one project or all of them.
+
+    So the word `repo` stands in for the name on a single-project screen, where
+    the name is already in the header and only the layer is news.
+    """
+    repo = row.get("repo")
+    if not repo:
+        return "fleet", "cyan"
+    return (clip(short_repo(repo), 11) if show_repo else "repo"), "grey62"
+
+
+def dial_detail(row: dict) -> str:
+    """The whole of a dial, for the detail line under the tables.
+
+    Worth a click because the row is six narrow cells and the argument does not
+    fit in one of them. The board REQUIRES a reason on every write for exactly
+    this reason — "a dial nobody can read an argument for is a dial nobody can
+    decide to remove" — so a surface that renders the value and drops the reason
+    keeps the setting and throws away the only thing that lets anybody undo it.
+
+    The expiry is spelled out rather than counted down. `no end` in a six-column
+    cell is the fact; "set indefinitely — nothing will clear this but a person" is
+    what the fact MEANS, and that sentence is the whole of why the two states must
+    not render alike.
+    """
+    bits = [f"{row.get('dial') or '?'} = {dial_value(row, 200)}"]
+    bits.append("fleet-wide" if not row.get("repo") else f"for {row['repo']}")
+    if row.get("expires_at"):
+        left = until(row.get("expires_at"))
+        bits.append(f"expires in {left}" if left != "—" else "expired")
+    else:
+        bits.append("set indefinitely — nothing will clear this but a person")
+    who = " ".join(x for x in ("set by", row.get("set_by")) if x)
+    when = ago(row.get("set_at"))
+    bits.append(f"{who} {when} ago" if when else who)
+    if row.get("reason"):
+        bits.append(row["reason"])
+    return clip(" · ".join(b for b in bits if b), 400)
+
+
+def dials_url(cfg, repo: str | None = None) -> str:
+    """Where a person turns one — and it is a browser, deliberately.
+
+    `POST /dials` takes `app.auth.human`: `Remote-User` plus the `X-Edge-Auth`
+    secret the edge injects. This dashboard authenticates with the machine bearer
+    token, which is precisely the credential `human()` is built to reject, and
+    rightly — every agent on a box holds that same token and nothing inside a
+    request distinguishes one from a person. A tempo an agent could raise for
+    itself is the self-approval shape #85, #86, #78, #232 and #335 each settled
+    separately, and it is not being reopened by a keybinding.
+
+    So the terminal reads and says where to go, which is #443's option (3) applied
+    one endpoint over. Printing the URL is the whole of what makes that honest:
+    #443 is the record of a person being told the reorder was theirs to do and
+    replying "i don't know how to re-order".
+
+    **The credential that would change this exists, and it excludes dials on
+    purpose.** #479/#480 add `X-Agent-Elevated` — a per-machine secret an agent
+    presents beside its bearer, which `app.auth.delegated()` accepts for a NAMED
+    SET of writes while the caller keeps its own identity. `POST /plan/reorder`
+    and `POST /plan/item/update` are in that set. `POST /dials` is deliberately
+    not, "including the fleet `tempo` of #474", and there is a test asserting so.
+
+    That is why this function still exists after that credential lands, and it is
+    the thing to read before adding a write verb here: the gap is not that nobody
+    built the door, it is that the door was built with this room left off the key.
+    Moving `POST /dials` from `human` to `delegated` is one dependency and one
+    deleted test; it is also #479's map, which is a decision and not a patch.
+
+    **The rejected design is the one to be careful of.** An earlier cut had the
+    dashboard hold Rich's signed-in Authelia cookie and call the browser vhost —
+    a `HumanClient` in this very file, on `feat/dash-wide-grid`. It was rejected
+    before it shipped (#479, "What was rejected"): the agent BECOMES `human/rich`,
+    every human-only endpoint opens at once from one credential for any process
+    on the box, and provenance is destroyed — an agent's write is recorded as a
+    person's. A dials write built that way would be #335 reopened by a longer
+    route, so if it reappears it wants `delegated`, never the cookie.
+    """
+    #: The repo rides along so a reader arriving from a terminal lands on the scope
+    #: the terminal was showing rather than on the fleet's. A screen watching
+    #: several sends none: there is one box on that page and it would have to pick
+    #: one of them, which is a worse answer than letting the page ask.
+    base = f"{getattr(cfg, 'base_url', '') or ''}/dials/view"
+    watched = resolve_repos() or []
+    scope = repo if repo is not None else (watched[0] if len(watched) == 1 else None)
+    return f"{base}?repo={urllib.parse.quote(scope)}" if scope else base
+
+
 # ---- the tmux screen ---------------------------------------------------------
 # The dashboard reads the seats off tmux rather than off the board, because they
 # are different questions. The board knows which AGENTS are live anywhere on the

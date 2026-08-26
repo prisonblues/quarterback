@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>quarterback dials</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --line:#262b36; --fg:#e6e9ef;
+    --muted:#8b93a3; --accent:#6ea8fe; --chip:#232936;
+    --sat:env(safe-area-inset-top); --sab:env(safe-area-inset-bottom);
+    --sal:env(safe-area-inset-left); --sar:env(safe-area-inset-right);
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+    font:14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-text-size-adjust:100%; }
+  header { position:sticky; top:0; z-index:5; background:var(--panel);
+    border-bottom:1px solid var(--line);
+    padding:calc(8px + var(--sat)) calc(16px + var(--sar)) 8px calc(16px + var(--sal));
+    display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; letter-spacing:.3px; }
+  header .spacer { flex:1; }
+  header a { font-size:13px; text-decoration:none; }
+  /* 16px: below it Safari zooms the viewport when a control takes focus, and this
+     page is nothing but controls. 44px is the floor below which a control is
+     missed rather than pressed. */
+  select, input, textarea, button { background:var(--chip); color:var(--fg);
+    border:1px solid var(--line); border-radius:6px; padding:6px 8px;
+    font:inherit; font-size:16px; }
+  select, input { min-height:44px; }
+  a { color:var(--accent); }
+  main { max-width:940px; margin:0 auto;
+    padding:12px calc(16px + var(--sar)) calc(60px + var(--sab)) calc(16px + var(--sal)); }
+  /* `width:100%` so each takes a line of its own under the controls rather than
+     being pushed off the right edge of the flex row — plan.html's `.counts` does
+     the same, and a refusal a reader cannot see is the same as no refusal. Both
+     live in the STICKY header: an answer to a tap made halfway down the page has
+     to appear somewhere the thumb can still see it. */
+  .err { color:#e5484d; font-size:13px; width:100%; white-space:pre-wrap;
+    word-break:break-word; }
+  .note { color:#9fb4d0; font-size:13px; width:100%; word-break:break-word; }
+
+  /* Who is looking, and therefore whether the verbs on this page will work at all
+     — plan.html's banner, in its colours, saying the same kind of thing one
+     endpoint over. A refusal a reader can see coming is not a dead button. */
+  .banner { border:1px solid #5c4a1e; background:#1c1810; border-radius:10px;
+    padding:10px 12px; margin:8px 0 12px; color:#f0b429; font-size:13px;
+    white-space:pre-wrap; word-break:break-word; }
+  .hint { border:1px solid #31435c; background:#141821; border-radius:10px;
+    padding:10px 12px; margin:8px 0 12px; color:#9fb4d0; font-size:13px;
+    word-break:break-word; }
+
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.5px;
+    color:var(--muted); margin:18px 0 6px; font-weight:600; }
+  .empty { color:var(--muted); padding:14px 2px; }
+
+  .dial { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    padding:9px 12px; margin:8px 0; display:flex; gap:10px; align-items:flex-start;
+    flex-wrap:wrap; }
+  /* A dial this repo overrides is not in force here. Kept on screen and dimmed
+     rather than dropped: the person who set it fleet-wide has to be able to see
+     what became of it. */
+  .dial.shadowed { opacity:.55; border-style:dashed; }
+  .dial .body { flex:1; min-width:0; }
+  .row1 { display:flex; align-items:baseline; gap:8px; flex-wrap:wrap; }
+  .name { font-weight:600; word-break:break-all; }
+  .value { color:#9fddc7; word-break:break-all; }
+  .why { color:#aeb6c2; font-size:12px; margin-top:3px; white-space:pre-wrap;
+    word-break:break-word; }
+  .meta { color:var(--muted); font-size:11px; margin-top:3px; }
+  .chip { font-size:11px; padding:1px 7px; border-radius:999px; background:var(--chip);
+    border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
+  .chip.fleet { color:#8fb4e8; border-color:#31435c; }
+  .chip.repo { color:#d9a5c8; border-color:#5c3149; }
+  /* THE TWO EXPIRY STATES, AND THEY MUST NOT LOOK ALIKE (#477, #244's rule applied
+     to a switch instead of a queue). A tempo with forty minutes left and a tempo
+     set for good are different situations. The indefinite one is the loud chip and
+     the countdown is the quiet one, deliberately: a dial that expires takes itself
+     off the board with nobody remembering it, and a dial with no end stays until a
+     person comes and clears it. */
+  .chip.forever { color:#f0b429; border-color:#5c4a1e; }
+  .chip.until { color:#9fddc7; border-color:#2e5c48; }
+  .acts button { font-size:12px; min-height:32px; cursor:pointer; color:#e8a0a0;
+    border-color:#5c2626; background:#1c1416; }
+  .acts button:disabled { opacity:.35; cursor:default; }
+
+  form.set { border:1px solid var(--line); border-radius:10px; background:var(--panel);
+    padding:12px; margin:8px 0 4px; display:grid; gap:10px;
+    grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); }
+  form.set label { display:flex; flex-direction:column; gap:4px;
+    font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  form.set .wide { grid-column:1 / -1; }
+  form.set button[type=submit] { color:#9fddc7; border-color:#2e5c48;
+    background:#141d19; min-height:44px; cursor:pointer; }
+  form.set button[type=submit]:disabled { opacity:.4; cursor:not-allowed; }
+</style>
+</head>
+<body>
+<header>
+  <h1>dials</h1>
+  <input id="repo" placeholder="owner/name — blank for the fleet" size="26"
+         title="which repository's dials to show, alongside the fleet-wide ones" />
+  <span class="spacer"></span>
+  <a href="/plan/view">plan</a>
+  <a href="/fleet">fleet</a>
+  <a href="/">board</a>
+  <span id="err" class="err"></span>
+  <span id="note" class="note"></span>
+</header>
+<main>
+  <div id="banner"></div>
+  <div class="hint">
+    A dial is a setting: the repo supplies a default, the board states the value in
+    force, and a <b>repo dial beats a fleet dial</b> of the same name. The board does
+    not know what a dial <i>means</i> — the harness owns that vocabulary
+    (<code>harness/loops/harness_rules.py</code>), so a name no harness recognises is
+    stored, returned, and ignored out loud rather than refused here.
+  </div>
+
+  <h2 id="liveTitle">in force</h2>
+  <div id="list"></div>
+
+  <div id="shadowedWrap" hidden>
+    <h2>overridden — fleet dials this repo sets for itself</h2>
+    <div id="shadowed"></div>
+  </div>
+
+  <h2>set one</h2>
+  <form class="set" id="setForm" autocomplete="off">
+    <label class="wide">dial
+      <input id="fDial" placeholder="review_panel.fix_severity_floor" required />
+    </label>
+    <label>value
+      <input id="fValue" placeholder='P3, 2, true, null, "eager"' />
+    </label>
+    <label>scope
+      <select id="fScope">
+        <option value="fleet">every repo (fleet)</option>
+        <option value="repo">this repo only</option>
+      </select>
+    </label>
+    <label>expires
+      <select id="fExpiry">
+        <option value="3600">in 1 hour</option>
+        <option value="14400">in 4 hours</option>
+        <option value="43200">in 12 hours</option>
+        <option value="86400">in 1 day</option>
+        <option value="604800">in 7 days</option>
+        <option value="">no end — until somebody clears it</option>
+      </select>
+    </label>
+    <label class="wide">reason
+      <input id="fReason" placeholder="why is this value in force?" required />
+    </label>
+    <div class="wide">
+      <button type="submit" id="fSubmit">set it</button>
+      <span class="note" id="valueNote"></span>
+    </div>
+  </form>
+</main>
+<script>
+// The dials page — what is in force, and the one surface a person can turn one from.
+//
+// #477: a dial was set from an endpoint and read back by one function in
+// `panel_seats.py`, so the values governing every round on the fleet were invisible
+// on `qb-dash`, `qb-dash-tui`, `qb-board` and here alike. The two terminal dashboards
+// now render what is in force and print this page's URL, because they CANNOT do the
+// other half: `POST /dials` takes `app.auth.human` — Remote-User plus the edge
+// secret — and a dashboard authenticates with the machine bearer token every agent
+// on the box holds. That asymmetry is the point rather than a gap (#443's option 3):
+// a tempo an agent could raise for itself is the self-approval shape #85, #86, #78,
+// #232 and #335 each settled separately.
+
+const HUMAN = "human";
+const REPO_KEY = "qb.dials.repo";
+
+const listEl = document.getElementById("list");
+const shadowedEl = document.getElementById("shadowed");
+const shadowedWrap = document.getElementById("shadowedWrap");
+const bannerEl = document.getElementById("banner");
+const errEl = document.getElementById("err");
+const noteEl = document.getElementById("note");
+const repoEl = document.getElementById("repo");
+const liveTitle = document.getElementById("liveTitle");
+const form = document.getElementById("setForm");
+const fDial = document.getElementById("fDial"), fValue = document.getElementById("fValue");
+const fScope = document.getElementById("fScope"), fExpiry = document.getElementById("fExpiry");
+const fReason = document.getElementById("fReason"), fSubmit = document.getElementById("fSubmit");
+const valueNote = document.getElementById("valueNote");
+
+function esc(s){ const d=document.createElement("div"); d.textContent=s??"";
+  return d.innerHTML.replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
+// A person gets the weight on their name and a colour of their own — every dial is
+// a person's decision by construction (writes are human-only), and "who decided
+// this" is the first thing a reader wants of a setting they did not expect.
+function who(name){ const i=(name??"").indexOf("/");
+  if(i<0) return esc(name);
+  const machine = name.slice(0,i), rest = name.slice(i+1);
+  if(machine===HUMAN) return `<span style="color:#e8c07d;font-weight:600" title="a person, authenticated at the edge"><span style="color:var(--muted);font-weight:400">${esc(machine)}/</span>${esc(rest)}</span>`;
+  return `${esc(machine)}<span style="color:#a9b4c6">/${esc(rest)}</span>`; }
+function span(s){ if(s<60)return Math.floor(s)+"s"; if(s<3600)return Math.floor(s/60)+"m";
+  if(s<86400)return Math.floor(s/3600)+"h"; return Math.floor(s/86400)+"d"; }
+function ago(iso){ return span(Math.max(0,(Date.now()-Date.parse(iso))/1000)); }
+// A COUNTDOWN CARRIES THE MINUTES, and `ago` does not. `span` floors, so a dial
+// set to expire in four hours renders as "for 3h" the instant it is written — a
+// reader who has just chosen four hours and is shown three has been told the write
+// did something other than what they asked. Looking backwards nobody minds
+// ("2m ago"); looking forwards at a number you picked yourself, everybody does.
+// The shape is `until()`'s in qbdata.py, so a dial reads the same in a terminal.
+function left(s){
+  if(s < 60) return Math.max(0, Math.floor(s)) + "s";
+  if(s < 3600) return Math.floor(s/60) + "m";
+  if(s < 86400) return Math.floor(s/3600) + "h" + String(Math.floor(s%3600/60)).padStart(2,"0") + "m";
+  return Math.floor(s/86400) + "d" + Math.floor(s%86400/3600) + "h";
+}
+function say(msg){ errEl.textContent = msg||""; }
+function note(msg){ noteEl.textContent = msg||""; }
+// A FastAPI detail is a string for an HTTPException, {error,hint} for these
+// endpoints, and a list for a pydantic validation error — nothing may assume one.
+function detailText(payload){
+  const det = payload && payload.detail;
+  if(typeof det === "string") return det;
+  if(det && typeof det === "object" && !Array.isArray(det) && det.error)
+    return det.error + (det.hint ? " — " + det.hint : "");
+  return det ? JSON.stringify(det) : null;
+}
+
+// A VALUE, not a string. `2`, `true`, `null` and `["a","b"]` are values several
+// dials document, and typing them into a text box has to produce them rather than
+// their spellings — a `max_rounds` of `"2"` is a dial the harness will refuse to
+// apply and report by name, which is a puzzle to be handed at a keyboard.
+//
+// Anything that is not JSON is the string it looks like, because that is the other
+// half of the vocabulary — `P3` and `eager` are values too, and demanding quotes
+// around them would make the common case the fiddly one.
+function parseValue(raw){
+  const text = (raw ?? "").trim();
+  if(text === "") return "";
+  try { return JSON.parse(text); } catch(err){ return text; }
+}
+function valueLabel(v){
+  return typeof v === "string" ? v : JSON.stringify(v);
+}
+function describeValue(){
+  const v = parseValue(fValue.value);
+  valueNote.textContent = fValue.value.trim() === ""
+    ? "an empty box sets the empty string — type null for the JSON null"
+    : `sends ${JSON.stringify(v)} (${typeof v === "object" && v !== null ? "json" : v === null ? "null" : typeof v})`;
+}
+
+function repoScope(){ return repoEl.value.trim(); }
+function remembered(){ try { return localStorage.getItem(REPO_KEY); } catch(err){ return null; } }
+function remember(v){ try { localStorage.setItem(REPO_KEY, v); } catch(err){} }
+
+// The expiry chip, and the two states it must keep apart. `expires_in` is the
+// board's own seconds-remaining rather than a subtraction done here: a browser
+// whose clock is minutes out would otherwise report an expiry that has not
+// happened, or miss one that has.
+function lifeChip(d){
+  if(!d.expires_at)
+    return `<span class="chip forever" title="nothing will clear this but a person">no end</span>`;
+  const secs = d.expires_in != null ? d.expires_in
+                                   : (Date.parse(d.expires_at) - boardNow())/1000;
+  return `<span class="chip until" title="${esc(d.expires_at)}">${
+    secs <= 0 ? "expiring" : "for " + left(secs)}</span>`;
+}
+
+function card(d, shadowed){
+  const scope = d.scope === "fleet"
+    ? `<span class="chip fleet" title="in force in every repo that has no dial of its own">fleet</span>`
+    : `<span class="chip repo" title="in force in ${esc(d.repo||"")} only, and it beats the fleet value">${esc(d.repo||"repo")}</span>`;
+  const el = document.createElement("div");
+  el.className = "dial" + (shadowed ? " shadowed" : "");
+  el.innerHTML = `
+    <div class="body">
+      <div class="row1">
+        <span class="name">${esc(d.dial)}</span>
+        <span class="value">${esc(valueLabel(d.value))}</span>
+        ${scope}${lifeChip(d)}
+      </div>
+      <div class="why">${esc(d.reason || "")}</div>
+      <div class="meta">${who(d.set_by)}${d.set_at ? " · " + esc(ago(d.set_at)) + " ago" : ""}${
+        shadowed ? " · overridden by this repo's own value" : ""}</div>
+    </div>
+    <div class="acts"><button type="button">clear</button></div>`;
+  el.querySelector("button").onclick = ()=> clear(d);
+  return el;
+}
+
+let gen = 0, busy = false;
+
+// HOW FAR THIS BROWSER'S CLOCK IS FROM THE BOARD'S, in milliseconds, learned from
+// every read (`GET /dials` returns its own `now`).
+//
+// The expiry on a write is computed here — "in 4 hours" has to become a timestamp
+// somewhere — and computed from `Date.now()` alone it is four hours from THIS
+// machine's idea of now. A laptop whose clock is ten minutes slow writes a dial
+// that expires ten minutes early; one an hour slow has its "in 1 hour" refused
+// outright, because `POST /dials` rejects an expiry in the past and by the board's
+// clock that is what it just sent. Neither failure names a clock, and the second
+// arrives as a validation error about a field the reader never typed.
+//
+// The board's `now` is on the wire already, so the correction is free. Zero until
+// the first read lands, which is also the state a write cannot be made from.
+let skew = 0;
+function boardNow(){ return Date.now() + skew; }
+
+async function load(){
+  const my = ++gen;
+  const scope = repoScope();
+  let r;
+  try { r = await fetch("/dials?repo=" + encodeURIComponent(scope),
+                        {headers:{Accept:"application/json"}}); }
+  catch(err){ if(my===gen) say("the board did not answer"); return; }
+  const body = await r.json().catch(()=>null);
+  if(my !== gen) return;                       // overtaken by a newer read
+  if(!r.ok){ say(detailText(body) || ("dials unavailable (" + r.status + ")")); return; }
+  say("");
+  if(body.now) skew = Date.parse(body.now) - Date.now();
+  render(body.dials || []);
+}
+
+function render(dials){
+  // Precedence is the CLIENT's to apply, and the board says so in one line: a repo
+  // read returns both scopes so that one call answers "what is in force here". The
+  // two dashboards make the same split (qbdata.dials_in_force) and it has to mean
+  // the same thing on all three surfaces.
+  const overridden = new Set(dials.filter(d => d.scope === "repo").map(d => d.dial));
+  const live = dials.filter(d => !(d.scope === "fleet" && overridden.has(d.dial)));
+  const shadowed = dials.filter(d => d.scope === "fleet" && overridden.has(d.dial));
+  liveTitle.textContent = `in force · ${live.length}`;
+  listEl.innerHTML = "";
+  if(!live.length){
+    // Not "no dials": every dial HAS a value, and this is the state where the
+    // repo's own default is the one in force everywhere.
+    listEl.innerHTML = `<div class="empty">every dial is at its repo default${
+      repoScope() ? "" : " — name a repository above to see its own dials too"}</div>`;
+  }
+  live.forEach(d => listEl.appendChild(card(d, false)));
+  shadowedWrap.hidden = !shadowed.length;
+  shadowedEl.innerHTML = "";
+  shadowed.forEach(d => shadowedEl.appendChild(card(d, true)));
+}
+
+async function post(path, body){
+  busy = true;
+  let r;
+  try { r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                              body: JSON.stringify(body)}); }
+  catch(err){ say("the board did not answer"); return false; }
+  finally { busy = false; }
+  const payload = await r.json().catch(()=>null);
+  if(!r.ok){
+    // The server's own sentence, kept on screen. Every refusal here names the field
+    // and why — an expiry in the past, a value that is not JSON, a repo that is not
+    // `owner/name` — and paraphrasing it would lose the half that says what to do.
+    say(detailText(payload) || ("refused (" + r.status + ")"));
+    return false;
+  }
+  return payload;
+}
+
+form.onsubmit = async (ev)=>{
+  ev.preventDefault();
+  say(""); note("");
+  const scope = repoScope();
+  if(fScope.value === "repo" && !scope){
+    note("name a repository at the top of the page first, or set this one fleet-wide");
+    return;
+  }
+  const body = {dial: fDial.value.trim(), value: parseValue(fValue.value),
+                reason: fReason.value.trim()};
+  if(fScope.value === "repo") body.repo = scope;
+  const seconds = parseInt(fExpiry.value, 10);
+  if(!Number.isNaN(seconds))
+    body.expires_at = new Date(boardNow() + seconds*1000).toISOString();
+  fSubmit.disabled = true;
+  const got = await post("/dials", body);
+  fSubmit.disabled = false;
+  if(!got) return;
+  // What it REPLACED, said out loud. Moving a dial without being told what it was
+  // is how one gets nudged twice by two people who each believed they were starting
+  // from the default — the endpoint returns the old row for this sentence.
+  const was = (got.replaced || []).map(d => `${valueLabel(d.value)} (${d.reason})`);
+  note(was.length ? `set — it was ${was.join(", ")}` : "set");
+  fValue.value = ""; fReason.value = ""; describeValue();
+  load();
+};
+
+async function clear(d){
+  say(""); note("");
+  const body = {dial: d.dial};
+  if(d.scope === "repo" && d.repo) body.repo = d.repo;
+  const got = await post("/dials/clear", body);
+  if(!got) return;
+  // `note` writes textContent, so the name goes in RAW — running it through `esc`
+  // here would render the entities themselves, which is the escaping bug wearing
+  // its own disguise.
+  note(got.cleared && got.cleared.length
+       ? `cleared ${d.dial} — the repo's own default takes over on the next resolution`
+       : `${d.dial} was already gone`);
+  load();
+}
+
+// ---- who is looking, and therefore whether any of this will be accepted -----
+//
+// Identity is a QUESTION, never an assumption — the same page is served to an
+// agent's token, to a person the edge vouched for, and to a browser nobody vouched
+// for. Both writes here are behind `app.auth.human`, so the page asks and says what
+// it was told rather than leaving the refusal to arrive as a bare 403 under a thumb.
+async function loadMe(){
+  let r;
+  try { r = await fetch("/whoami", {headers:{Accept:"application/json"}}); }
+  catch(err){ return; }   // offline: the list read reports the connection
+  const body = await r.json().catch(()=>null);
+  if(r.ok && body && body.kind === HUMAN) return;   // a person — nothing to warn about
+  let msg;
+  if(r.ok && body)
+    msg = `the board says you are looking as ${who(body.agent)} — an agent, not a `
+        + `person. Setting and clearing a dial are a person's calls and will be `
+        + `refused here: every agent on a box holds the same machine token, so `
+        + `nothing inside a request from one distinguishes it from a person with `
+        + `that token. Reading is not deciding, and reading works.`;
+  else if(r.ok)
+    msg = `the board answered /whoami with something this page could not read, so `
+        + `whether a write will be accepted is unknown until you try it.`;
+  else
+    msg = `the board will not say who you are (${r.status}), so setting and clearing `
+        + `a dial will be refused. What it said:`
+        + (detailText(body) ? "\n\n" + esc(detailText(body)) : "");
+  bannerEl.innerHTML = `<div class="banner">${msg}</div>`;
+  fSubmit.disabled = true;
+}
+
+// The repo comes from the link that sent you here, then from what you chose last
+// time. `qb-dash` prints this URL with its own screen's repo on it, so a reader
+// arriving from a terminal lands on the scope they were just looking at rather
+// than on the fleet's.
+const fromUrl = new URLSearchParams(location.search).get("repo");
+repoEl.value = fromUrl != null ? fromUrl : (remembered() || "");
+// Remembered on ARRIVAL and not only on a change, or the scope the terminal sent
+// you to survives exactly until the first reload — and a reader who reloads a page
+// they were linked into is not asking to be moved to the fleet's dials.
+if(fromUrl != null) remember(repoScope());
+repoEl.onchange = ()=>{ remember(repoScope()); note(""); load(); };
+fValue.oninput = describeValue;
+describeValue();
+loadMe();
+load();
+setInterval(()=>{ if(!busy) load(); }, 20000);
+</script>
+</body>
+</html>

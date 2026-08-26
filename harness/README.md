@@ -2036,8 +2036,9 @@ along the bottom (the **tape**) is the event stream. Who is alive and on what, w
 which claim and for how long, what the fleet agreed to do next, every open PR with its CI
 verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
 the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub, and a review-queue row says every
-reason it is still waiting. `qb-dash` is the same views rendered without
+where it is, a PR or an issue opens on GitHub, a review-queue row says every
+reason it is still waiting, and a dial row says why it is set (its `✎` opens the one surface
+that can change it). `qb-dash` is the same views rendered without
 interaction, for a box that cannot import `textual` — which is the whole of what
 it is for since #426. It is not a lesser default any more; it is the fallback.
 
@@ -2184,12 +2185,69 @@ of panes nobody is watching; `qbdata.pace()` turns the cached figures into `go` 
 same cache and the same three-minute floor, so a verdict never costs a call and the word and
 the bar cannot come to disagree.
 
+**DIALS says what the fleet is running under, and where to change it.** A dial is a
+setting: the repo supplies a default, the board states the value in force, and the layer
+that answered is part of the answer ([#305](https://github.com/prisonblues/quarterback/issues/305)).
+Until [#477](https://github.com/prisonblues/quarterback/issues/477) **no screen showed one**
+— a dial was set from an endpoint and read back by one function in `panel_seats.py`, so the
+value governing every round on the fleet was invisible on `qb-dash`, `qb-dash-tui`,
+`qb-board` and the web board alike. That was tolerable while a dial only configured what a
+review round costs; it stops being tolerable with `tempo` (#474), which is the answer to
+*"is this fleet working right now, and how hard"*.
+
+The panel sits at the top, above the seats, for the caps line's own reason: it is the
+configuration every panel below it is running under. Each row is the dial, its value, the
+layer it came from (`fleet`, or the repo), and what is left of it; the argument for it — the
+board requires one on every write — is on the line underneath with who set it and when.
+**A repo dial beats a fleet dial** of the same name, so the beaten one is counted in the
+title as `overridden` rather than drawn as if it were in force. And `tempo` gets a cell of
+its own on the caps line, beside the budget it is there to protect: the caps say what the
+seats may spend, this says whether they are supposed to be spending it at all.
+
+**An indefinite dial and an expiring one do not render alike**, which is the half of this
+that is easiest to drop. A `tempo: eager` with forty minutes on it and one set indefinitely
+are different situations; the countdown is the quiet cell and `no end` is the loud one,
+because a dial that expires takes itself off the board with nobody remembering it while one
+with no end stays until a person comes and clears it. That is
+[#244](https://github.com/prisonblues/quarterback/issues/244)'s rule — being idle and being
+broken must not look alike — applied to a switch instead of a queue. `—` is not used here:
+on every other panel it means "nobody reported this", and an expiry that was never set is a
+decision somebody made.
+
+**Turning one is a browser action, and the panel says so with the URL.** `GET /dials` takes
+`app.auth.reader`, which the machine bearer token passes, so reading is free from a
+terminal. `POST /dials` takes `app.auth.human` — `Remote-User` plus the `X-Edge-Auth` secret
+the edge injects — and every agent on a box holds the same machine token, so nothing inside
+a request from one distinguishes it from a person. A tempo an agent could raise for itself
+is the self-approval shape #85, #86, #78, #232 and #335 each settled separately, and it is
+not being reopened by a keybinding. So the terminal reads and names the door: the last row
+of the panel is `set one in a browser: <board>/dials/view?repo=…`, `d` opens that page, and
+the `✎` on any row does the same. This is
+[#443](https://github.com/prisonblues/quarterback/issues/443)'s option (3) applied one
+endpoint over — and #443 is also why the URL is printed rather than implied, being the
+record of a person told the reorder was theirs to do whose reply was *"i don't know how to
+re-order"*.
+
+The page at `/dials/view` is the other end of that: what is in force for a repo and for the
+fleet, what each overrides, and a form that sets or clears one. It asks `/whoami` first and
+says plainly when the answer is an agent, so a refusal arrives as a sentence rather than as
+a dead button. A value typed there is sent as **JSON where it parses** (`2`, `true`, `null`,
+a list) and as the string it looks like otherwise (`P3`, `eager`) — a `max_rounds` of `"2"`
+is a dial the harness refuses to apply and reports by name, which is a puzzle to be handed
+at a keyboard.
+
+**None of these surfaces knows what a dial MEANS.** The harness owns the vocabulary
+(`harness/loops/harness_rules.py`), the server image carries no `harness/` directory at all,
+and a copy in a dashboard would be a second place a dial is written down — the confusion
+#56's rule and #305 exist to end. So a `tempo` with no board dial reads `unset` rather than
+naming a default, and a dial no harness recognises is stored, returned and ignored, loudly.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming starts a
 real session you can attach to, read and interrupt. Clicking anywhere else on the row still
 opens the thing on GitHub. The keys are `o` open, `p` panel-review, `f` fix the selected
-issue or plan item, `s` this project's rows or the whole fleet's, `r` refresh, `?` the list,
-`q` quit.
+issue or plan item, `d` the board's dials page, `s` this project's rows or the whole
+fleet's, `r` refresh, `?` the list, `q` quit.
 
 **The `⚒` goes through `qb-start` (#371), and therefore inherits its gate.** It used to
 compose `claude -- /fix-issue <n>` and hand it to tmux, and what that started was a session
