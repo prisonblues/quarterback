@@ -29,7 +29,17 @@ import panel_core                   # noqa: F401
 #: and `harness_rules` says as much where it refuses to sniff a layer out of its
 #: own provenance string. The caller gates on this; the sentence stays for the
 #: reader.
-FIX_RANGE_OK, FIX_RANGE_NO_FIX, FIX_RANGE_BLIND = "ok", "no-fix", "blind"
+#: `rewritten` is split out of `blind` (#512) because the two forbid different
+#: things. Blind is "this reader could not get the range" — too large to hold, an
+#: API refusal, patches it cannot parse — and says nothing about whether a sound
+#: copy of that range exists elsewhere; the round's own `Review.increment` often IS
+#: one, and refusing to attribute from it is a false blindness on a round that read
+#: the fix pass perfectly well. Rewritten is "the range is NOT the fix pass": after
+#: a rebase the three-dot merge base moves back, so any diff of that span — this
+#: reader's or the round's — widens toward the whole PR and attributing from either
+#: blames the fixer for every line the PR ever added. Nothing may attribute there.
+FIX_RANGE_OK, FIX_RANGE_NO_FIX = "ok", "no-fix"
+FIX_RANGE_BLIND, FIX_RANGE_REWRITTEN = "blind", "rewritten"
 
 
 def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
@@ -62,7 +72,8 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
     and their lines are attributed to the fix pass — `introduced` then
     over-counts. And the compare endpoint returns at most 300 files, so a fix
     pass wider than that is attributed on the first 300 and the rest read as
-    `missed`. #41 (review the increment) is what removes the guess altogether.
+    `missed`. #41 has landed and #512 acted on it — see :func:`_provenance` for what
+    that removed and what it did not.
     """
     if not gh_repo:
         return None, "no GitHub repo is configured for this run", FIX_RANGE_BLIND
@@ -92,7 +103,7 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
                 FIX_RANGE_BLIND)
     if got.get("status") == "diverged":
         return None, (f"{span} have diverged — the branch was rewritten between rounds, so "
-                      "the range would span commits no fix pass wrote"), FIX_RANGE_BLIND
+                      "the range would span commits no fix pass wrote"), FIX_RANGE_REWRITTEN
     # `behind` is the other rewrite, and it reaches here looking like nothing at all
     # (#500, found on review). The head is an ANCESTOR of the commit the last round
     # reviewed — a reset backwards, a force-push that dropped commits — so the
@@ -105,7 +116,7 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
     if got.get("status") == "behind":
         return None, (f"{span} is BEHIND — the branch was reset to an ancestor of the "
                       "commit the last round reviewed, so the fix pass it would "
-                      "attribute is no longer on the branch"), FIX_RANGE_BLIND
+                      "attribute is no longer on the branch"), FIX_RANGE_REWRITTEN
     out: list[str] = []
     size = 0
     for f in got.get("files") or []:
@@ -172,6 +183,106 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
         return (None, f"the range {span} changed no line this can attribute against",
                 FIX_RANGE_NO_FIX)
     return "".join(out), None, FIX_RANGE_OK
+
+
+#: How many of a fix pass's commits a proposal will list by name (#506). A revert
+#: proposal is read by a human deciding whether to undo a pass, and a pass of four
+#: commits is the shape that decision is usually about; beyond this the list stops
+#: informing and the COUNT is what matters, which is carried separately. Not a dial:
+#: nothing gates on it, and it bounds a payload field rather than a policy.
+FIX_PASS_COMMIT_CAP = 20
+
+#: What #506's proposal reads out of the same compare endpoint provenance already
+#: uses. `parents` is the load-bearing one — see :func:`fix_pass_commits`.
+_FIX_PASS_COMMITS_JQ = (
+    '{total: (.total_commits // 0), '
+    'commits: [(.commits // [])[] | {sha: .sha, '
+    'title: ((.commit.message // "") | split("\n")[0]), '
+    'parents: ((.parents // []) | length)}]}')
+
+
+def fix_pass_commits(gh_repo: str, base_sha: str | None, head_sha: str | None) -> dict:
+    """The commits a fix pass actually consists of, as
+    `{"commits": [...], "total": n, "merges": n}`, or `{}` when they cannot be read.
+
+    #506 names a fix pass by its commit range and offers a `git revert` for it, and
+    **the range alone is not enough to know that a revert of it is safe.** The bias is
+    already documented on :func:`_fix_range_diff`: merging the base branch INTO the PR
+    between rounds leaves the old head an ancestor, so the compare still reads `ahead`
+    and main's own commits fall inside the range. For attribution that over-counts
+    `introduced` and is recorded as a known lean. For a proposal it is worse than a
+    lean — the offered command would revert other people's commits, and `git revert`
+    refuses a merge commit outright without `-m`, so the invocation cannot even run as
+    written. `merges` is what tells the two apart, and a proposal withholds its command
+    unless it is zero.
+
+    Its own call rather than a fourth element on :func:`_fix_range_diff`, and it is
+    made ONLY on a round whose injection rate crossed the threshold — the terminal
+    round of a diverging cycle, and no other. An ordinary round pays nothing for this,
+    which is the whole reason it is not folded into the range read that every round
+    makes.
+
+    Never raises, on :func:`compare_facts`' contract and for its reason: this is an
+    assurance about a proposal nothing acts on, and a round must not die because the
+    commits behind an attribution it already made could not be listed. `{}` is the
+    honest empty, and a proposal reading it withholds the command rather than
+    assuming the range is clean.
+
+    ``complete`` is the other half of that honesty. The compare endpoint returns at
+    most 250 commits with `total_commits` naming the real figure, so on a longer range
+    ``merges`` is a FLOOR — a merge past the ceiling is invisible — and a proposal has
+    to read a zero there as "not known to be clean" rather than as clean."""
+    if not (gh_repo and base_sha and head_sha) or base_sha == head_sha:
+        return {}
+    try:
+        got = json.loads(panel_core.sh(
+            ["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
+             "--jq", _FIX_PASS_COMMITS_JQ], timeout=FIX_RANGE_TIMEOUT_S))
+    except Exception:                       # every one, per the contract above
+        return {}
+    if not isinstance(got, dict):
+        return {}
+    raw = got.get("commits")
+    if not isinstance(raw, list):
+        return {}
+    commits, merges = [], 0
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        sha = _commit_id(c.get("sha"))
+        if not sha:
+            continue
+        # Counted over EVERY commit the compare returned, and the list is truncated
+        # after — a merge past the display cap is still a merge, and a count that
+        # stopped where the listing stopped would report a range as clean because it
+        # was long. The compare endpoint's own 250-commit ceiling still applies and is
+        # why `total` travels beside this: a range at that ceiling is one whose
+        # merge count is a floor, and a proposal reads `total > len(commits)` as a
+        # reason to say so rather than as a rounding.
+        parents = c.get("parents")
+        if isinstance(parents, int) and not isinstance(parents, bool) and parents > 1:
+            merges += 1
+        commits.append({"sha": sha, "title": str(c.get("title") or "").strip()})
+    total = got.get("total")
+    seen = len(commits)
+    # WAS THE WHOLE RANGE RETURNED? The compare endpoint carries at most 250 commits
+    # while `total_commits` reports the real number, so a long fix pass comes back
+    # short with a 200 and no error — and a merge past that ceiling would be invisible
+    # while `merges == 0` said the range was clean (found by Codex on the second pass).
+    # `merges` is therefore a FLOOR on an incomplete range, exactly as `introduced` is
+    # a floor on the attribution above, and only this flag can say which kind of zero a
+    # zero is.
+    #
+    # `==`, not `<=`: `total_commits` absent comes back through the `--jq` as `0`, and
+    # `0 <= seen` would call a range we know nothing about complete. An answer this
+    # cannot verify has to read as "not verified", because the command it gates is the
+    # one thing here a human runs.
+    complete = (isinstance(total, int) and not isinstance(total, bool)
+                and total == seen)
+    return {"commits": commits[:FIX_PASS_COMMIT_CAP], "merges": merges,
+            "total": total if isinstance(total, int) and not isinstance(total, bool)
+            else seen,
+            "complete": complete}
 
 
 def _commit_id(value: object) -> str | None:
@@ -368,8 +479,18 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
       `missed`. So the split is biased toward `missed` in BOTH directions, and the
       `introduced` count should be read as a floor rather than as a measurement.
 
-    #41 (review the increment) is what removes both: a finding raised against the
-    increment is introduced by construction, with no line arithmetic in the middle.
+    #41 (review the increment) HAS LANDED — `--scope increment`, v2.28, the default
+    — and #512 is what acted on it: a round that reviewed the increment now
+    attributes against that diff (`payload.fix_range_source == "increment"`) rather
+    than re-fetching the span through :func:`_fix_range_diff`. What that removed is
+    the second compare call, the anchor mismatch behind it, and the base-merge
+    over-count named above; the two biases in this docstring it did NOT remove,
+    because placing a finding in the increment is still a comparison and a deletion
+    still has no added line to sit on.
+
+    So this function is still reached, and still biased, on exactly the rounds #41
+    never covered: `round_scope: pr`, and any round whose increment fell back. Read
+    `fix_range_source` before reading these buckets.
     """
     if not have_range:
         return "unknown"
@@ -1893,7 +2014,7 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "_fix_range_diff", "_commit_id", "_head_sha_now",
-    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND",
+    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND", "FIX_RANGE_REWRITTEN",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now", "PROVENANCE", "_provenance",
@@ -1901,6 +2022,7 @@ __all__ = [
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "review_ci_settled", "CI_SETTLE_WAIT", "CI_SETTLE_POLL",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
+    "FIX_PASS_COMMIT_CAP", "_FIX_PASS_COMMITS_JQ", "fix_pass_commits",
     "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
     "_changed_lines", "Integration", "MergeReading", "merge_involvement",
     "_is_commitish", "_is_ref", "_same_commit",
