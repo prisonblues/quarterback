@@ -2072,6 +2072,22 @@ DECIDABILITY = ("yes", "no", "unknown")
 #: The register's shape, so a future one can be told from a hand-written file.
 PREMISE_REGISTER_VERSION = 1
 
+#: New outstanding findings a round needs before #489's injection rate is a RATE at
+#: all, and the reason it is a constant rather than a second dial.
+#:
+#: A strict majority of three findings is two of them, and two findings is not a
+#: measurement of anything: `panel_scope._provenance` is documented as routinely
+#: wrong by a line or two in both directions, so at n<4 the cycle's verdict is one
+#: reviewer's line number. At 4 the majority the rule fires on is three findings
+#: agreeing, which is the smallest number that is a pattern rather than a coin.
+#:
+#: Not a dial, deliberately. #489's own open question is that nothing calibrates
+#: where a healthy cycle sits, and the honest answer to one uncalibrated number is
+#: not to ship two of them — a repo asked to tune a sample size it has no data for
+#: will either leave it alone or turn the brake off by accident. `fix_injection:
+#: null` is the supported way to switch this off, and it is one line.
+FIX_INJECTION_MIN_NEW = 4
+
 
 def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
     """`review_panel.escalate_on.premise_repeated` — the occurrence a declared
@@ -2174,6 +2190,80 @@ def premise_undecidable_brake(panel: dict, notes: list[str]) -> bool:
                   "property, so there is no occurrence to count and a number here "
                   "would mean 'approximate it once first'")
     return False                                      # unreachable
+
+
+def fix_injection_limit(panel: dict, notes: list[str]) -> float | None:
+    """`review_panel.escalate_on.fix_injection` (#489) — the fraction of a round's
+    new outstanding findings that may have been INTRODUCED by the previous fix pass
+    before the cycle ends, or ``None`` for "do not brake".
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep
+    (`harness_rules._DEEP_BLOCKS`), so a repo that writes `escalate_on` at all
+    replaces the default object wholesale, and without the per-key fallback
+    `{"premise_repeated": 2}` would silently switch THIS brake off. That is the
+    exact failure mode #84 hit and it is worth not shipping a third time.
+
+    **The bounds are `0 < x < 1`, and both ends are refused rather than clamped.**
+    Zero or below is not a fraction of anything and would fire on any attributable
+    round with a single introduced finding in it — every round of every cycle,
+    which is a brake with no discrimination in it. One or above can never be
+    EXCEEDED, because a rate is at most 1.0 and the comparison is strict: it is the
+    brake switched off behind a value that reads as armed, which is precisely the
+    posture `require_failing_test` exists to refuse having silently. `null` is the
+    spelling for off, `0.99` is the spelling for "only when every one of them was
+    introduced", and a repo that meant either gets the one it typed.
+
+    ``false`` is a second spelling of ``null`` and is honoured as one, exactly as
+    `premise_repeat_limit` honours it: it is what an operator reaches for to turn a
+    brake off, and refusing it would be this harness telling somebody their "off" was
+    a typo. ``true`` is refused, because there is no number it could mean — a
+    threshold is not a switch, and guessing one would be inventing the policy. Both
+    are settled before the numeric read for `fix_growth_limit`'s reason:
+    ``isinstance(True, int)`` is True, so a bool that fell through would become 1.0
+    or 0.0, and 0.0 is a brake that fires on every attributable round. Non-finite is
+    rejected with the rest: ``inf`` is the check off behind a value that reads like a
+    number, and ``nan`` compares false against everything, which is the same thing."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — both readers
+        # run off one config, and `run()` calls that one first — but this function is
+        # public and is called directly by tests, so it does not rely on a sibling
+        # having been called before it. The unbuilt-name notes
+        # (`ESCALATE_ON_UNBUILT`) are deliberately NOT repeated here: they are a fact
+        # about the block rather than about either dial, and one report carrying the
+        # same sentence once per reader is the "loud and wrong" a reader learns to
+        # skip.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return None                                   # unreachable
+    want = rules.get("fix_injection", ESCALATE_ON_DEFAULTS.get("fix_injection"))
+    if want is None or want is False or want == "":
+        return None
+
+    def refuse(what: str) -> float | None:
+        _refuse_value("escalate_on.fix_injection", want,
+                      f"{what} — the fraction of a round's new findings that may have "
+                      "been introduced by the previous fix pass, or null to switch the "
+                      "brake off. 1 or more can never be exceeded, which is the brake "
+                      "off behind a value that reads as on")
+        return None                                   # unreachable
+
+    if isinstance(want, bool) or not isinstance(want, (int, float, str)):
+        return refuse("a number above 0 and below 1")
+    try:
+        n = float(want)
+    except (TypeError, ValueError):
+        return refuse("a number above 0 and below 1")
+    if n != n or n in (float("inf"), float("-inf")):
+        return refuse("a finite number above 0 and below 1")
+    if not 0 < n < 1:
+        return refuse("above 0 and below 1")
+    return n
 
 
 def premise_key(text: str) -> str:
@@ -2478,6 +2568,43 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
+def injection_state(counts: dict | None, limit: float | None) -> dict:
+    """#489's measurement as this round read it, for `round_stop` and the payload.
+
+    `counts` is `panel.py`'s `provenance_counts` — `panel_scope.PROVENANCE`'s four
+    buckets over every NEW outstanding finding, empty on a round with nothing to
+    attribute (round 1, or a cycle whose fix range could not be read at all). The
+    rate is `introduced / (every bucket)`, and the three buckets that are not
+    `introduced` sit in the DENOMINATOR on purpose:
+
+    - `missed` belongs there because it is the other half of the same question, and
+      the ratio between them is the whole signal;
+    - `unknown` and `missed-unread` belong there because they DEPRESS the rate, and
+      that is the direction a stop should fail in. A round the harness could not
+      place is a round that does not end the cycle, which is the same posture
+      `_provenance` itself takes when it declines to guess.
+
+    Every field is present on every round, `premise_state`'s rule and for its
+    reason: an absent key and "the brake was off" are different claims, and a
+    consumer that had to tell them apart would be reading a payload's age rather
+    than a cycle's state. `rate` is `None` — not `0.0` — where there is nothing to
+    divide, because zero is a claim about a fix pass and this is the absence of one.
+
+    `over` is the RULE and it is decided here rather than in `round_stop`, on
+    `premise_state`'s precedent: what the stop rule receives is a verdict about a
+    measurement it has no other way to make, and keeping the arithmetic beside the
+    thing it measures is what lets the stop rule stay a rule about findings."""
+    counts = counts or {}
+    introduced = int(counts.get("introduced") or 0)
+    total = sum(int(counts.get(b) or 0) for b in PROVENANCE)
+    rate = (introduced / total) if total else None
+    over = bool(limit is not None and rate is not None
+                and total >= FIX_INJECTION_MIN_NEW and rate > limit)
+    return {"limit": limit, "introduced": introduced, "new": total,
+            "rate": None if rate is None else round(rate, 4),
+            "min_new": FIX_INJECTION_MIN_NEW, "over": over}
+
+
 def premise_report(verdict: dict, register_path: str, notes: list[str],
                    problems: list[str]) -> str:
     """The one screen a fixer sees when it declares a premise. Plain text, because
@@ -2627,7 +2754,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                escalated: Iterable[str] = (), *,
                trigger_floor: str = NO_SEVERITY_FLOOR,
                fix_floor: str = NO_SEVERITY_FLOOR,
-               premises: dict | None = None) -> dict:
+               premises: dict | None = None,
+               injection: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -2799,6 +2927,62 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     cannot be self-reported is whether the loop is making progress; letting it
     extend the loop would hand that agent the other lever too.
 
+    ``injection`` is #489, and it is the third futility bound in this function
+    after ``premises`` and the cap. The cap bounds COST; ``premises`` bounds one
+    assumption being patched twice; this one bounds **rule 1 being fed by its own
+    output**, which is the failure ``trigger_floor``'s paragraph above indicts by
+    name and which nothing until now acted on. From round 2 what a round reviews IS
+    the previous round's fix, so a finding that fix created buys another panel,
+    another fix pass and another round of the same — and 128 of the 201 new findings
+    across the seven PRs counted above were exactly that.
+
+    **This is the gate `panel.py` deliberately withheld, and the withholding was
+    right.** The comment beside #67's tallies in that file says nothing reads them to
+    stop a run, that #67 asks for the instrument before the gate, and that "a few dozen
+    cycles of it are what would justify wiring it to anything". This is not that
+    decision being reversed as an oversight; it is the condition it named being met.
+    128/201 across seven PRs, 39/53 after round 1 on PR #299 with its round 2 at 17
+    of 17, and 64% then 87% on the cycle #489 was filed from — over a pull request
+    whose actual change was 113 lines. #67's other two tallies stay withheld, and the
+    comment beside them in `panel.py` now argues that on its own terms rather than by
+    inheritance from this one. Provenance is the one of the three that can carry a
+    threshold, because ``introduced`` is a floor and a floor has a known direction to
+    err in.
+
+    :func:`injection_state` is the measurement and it arrives already decided, on
+    ``premises``' precedent, so this function applies a rule rather than computing a
+    rate over a diff it has no business seeing.
+
+    **It can only turn a `go again` into a STOP, and it is CHECKED on that
+    condition rather than merely obeying it.** A round that is already stopping has
+    no next round to prevent, and a dry round rewritten as "diverging" would be an
+    accusation about a cycle that converged. So a dry stop, a stop under either
+    floor and a stop holding an escalation all keep their own reason and their own
+    confidence. What that costs is the case where a below-floor stop hides a high
+    injection rate, and it is deliberate: #165's floor stops are POLICY stops that
+    are explicitly not vetoed, and vetoing them through this door would make every
+    configured convergence non-confident and hand the cap back its monopoly on
+    ending the loop.
+
+    **Never dressed up as convergence** — a veto line naming the dial, ``confident``
+    false by the existing rule, and a ``reason`` that says a human is owed an answer:
+    the same discipline ``max_fix_growth``, the round cap and a held escalation get.
+    Applied BEFORE the cap for ``premises``' reason, and before ``circling`` so that
+    a cycle doing both is reported as the premise repeat. That one NAMES the
+    assumption a fixer wrote against; this one only counts, and the more specific
+    truth wins the ``reason``.
+
+    **Why a threshold on this number errs in the safe direction.**
+    :func:`panel_scope._provenance` records that its split is biased toward
+    ``missed`` in BOTH directions — a defect a fix introduced by DELETING a guard has
+    no added line to sit on, and ``introduced`` requires exact membership in the
+    added lines while LLM reviewers and Sonar routinely report a line or two off —
+    and it says the count "should be read as a floor rather than as a measurement".
+    A floor that is over a threshold is genuinely over it. The unattributable
+    buckets sit in the denominator for the same reason (see
+    :func:`injection_state`): they depress the rate, so a round the harness could
+    not place is a round that does not end the cycle.
+
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
     READMEs and ``panel-review-pr.md`` point at it rather than restating it, since
@@ -2959,6 +3143,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # It can only ever turn a `go again` into a STOP. There is no branch where a
     # declaration makes the loop run longer — see the docstring's paragraph on why
     # the agent writing the fix does not get that lever.
+    # #489, and BEFORE both #84's brake and the cap. Before the cap for the reason
+    # given there — a futility bound is the more specific truth than "the counter ran
+    # out" — and before `circling` because a cycle doing both is better reported as
+    # the premise repeat: that one names the assumption, this one only counts it.
+    #
+    # `and not stop` is a CONDITION and not a redundancy. It is the whole of the
+    # guarantee that this dial can never make a review look cleaner than it is: the
+    # only transition it can make is `go again` -> STOP, so a dry round, a
+    # below-floor policy stop and a round holding an escalation each keep the reason
+    # and the confidence they earned. Recorded in a local because the veto below has
+    # to know whether this FIRED, and by then `stop` says only that something did.
+    injecting = injection_state(None, None) if injection is None else injection
+    injected = bool(injecting["over"] and not stop)
+    if injected:
+        stop, reason = True, (
+            f"{injecting['introduced']} of {injecting['new']} new finding(s) "
+            f"({injecting['rate']:.0%}) were introduced by the fix pass before this "
+            f"round, over the {injecting['limit']:.0%} "
+            "`escalate_on.fix_injection` threshold — the fix pass is generating this "
+            "round's work, and a human answers that, not another fix pass")
     circling = list((premises or {}).get("repeated") or [])
     # #491's half, on exactly the same terms and gated on the same arming flag the
     # declaration path reads. A repo that switched `escalate_on.premise_undecidable`
@@ -3005,6 +3209,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #489. Unconditional for `circling`'s reason and one of its own: `injected` is
+    # only ever true on a round this rule itself stopped, so there is no `go again`
+    # round it can fire on. Said in full — both counts, the rate, the dial and the
+    # floor caveat — because this veto is the only place a reader is told WHY a
+    # number that is not a measurement is nevertheless enough to end a cycle.
+    if injected:
+        veto = [*veto, f"{injecting['introduced']} of {injecting['new']} new "
+                       f"outstanding finding(s) — {injecting['rate']:.0%} — were "
+                       "introduced by the fix pass before this round, past the "
+                       f"{injecting['limit']:.0%} `escalate_on.fix_injection` "
+                       "threshold. `introduced` is a documented FLOOR and not a "
+                       "measurement (#48), so the real share is at least that: this "
+                       "stop is that number, not convergence (#489)"]
     # #84. Unconditional rather than "only on a STOP", because `circling` forces the
     # stop a few lines above — there is no `go again` round this can fire on, and
     # writing the guard anyway would say there was.
@@ -3066,6 +3283,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
               "undecidable": list(premises.get("undecidable") or []),
               "undecidable_brake": bool(premises.get("undecidable_brake")),
               "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
+        # #489's measurement as this round read it, and ALWAYS present for the reason
+        # `premises` is: a payload with no key and a round with nothing to attribute
+        # are different claims, and a consumer forced to tell them apart would be
+        # reading the payload's age rather than the cycle's state. `over` is the
+        # verdict, `rate` is null where there was nothing to divide, and `limit` is
+        # null where the repo switched the brake off — the three answers a reader
+        # comparing two rounds needs to keep apart.
+        "fix_injection": injecting,
     }
 
 
@@ -3088,6 +3313,7 @@ __all__ = [
     "load_baseline", "coverage_veto", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
+    "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
