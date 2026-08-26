@@ -20,7 +20,10 @@ coordination primitive rather than a to-do list in a table:
   by everyone remembering: one open item per ref.
 * **"Not yet" is a fact.** A dependency blocks, a dropped one does not block
   forever, and a circular one is refused.
-* **Only a human reorders — and placing a new item is not reordering (#183).**
+* **Only a human DECIDES an order — and placing a new item is not reordering
+  (#183).** Since #478 a delegated agent may APPLY one a person asked for, and the
+  row records `derived` rather than `ordered` so the two never blur; the tests for
+  that live in `test_delegated_writes.py`.
   Permuting existing items is contested, so the sequence stays the human's, which
   is what stops it thrashing. Saying where a NEW item enters alters no existing
   pair's relative order, so an agent may do it — and `next` says out loud how much

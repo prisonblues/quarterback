@@ -22,8 +22,11 @@ issues, a human repeating the sequence to whoever asked, and an untracked
 3. *Only a human reorders it — and PLACING a new item is not reordering (#183).*
    Permuting items already in the plan is contested: two agents disagreeing about
    whether #80 outranks #83 and rewriting each other is how the plan stops being
-   the shared intent it exists to be, so ``POST /plan/reorder`` is human-only and
-   stays that way. Choosing where a NEW item *enters* alters the relative order of
+   the shared intent it exists to be, so ``POST /plan/reorder`` never takes an
+   order an agent *decided*. What it does take, since #478, is one a person asked
+   for: :func:`app.auth.delegated` accepts a person, or an agent presenting its own
+   machine's credential — and the row then records ``derived`` rather than
+   ``ordered``, so the two are never confused. Deciding stays a person's. Choosing where a NEW item *enters* alters the relative order of
    nothing already there — every existing pair keeps its existing relationship —
    so it cannot thrash, and ``after`` / ``before`` on ``POST /plan/item`` let an
    agent do it. What a placement competes with is not another agent's judgement;
@@ -1627,7 +1630,7 @@ class ItemIn(BaseModel):
     #: inserting between ranks 2 and 3 leaves every existing pair's relative order
     #: untouched, so there is no prior decision to overwrite and nothing to thrash
     #: (#183). Permuting what is already there is still :func:`reorder`, and still
-    #: human-only.
+    #: not an agent's own decision to make (#478).
     after: str | None = Field(default=None, max_length=128)
     before: str | None = Field(default=None, max_length=128)
     #: Whose stated priority this placement transcribes — ``"Rich, 23:00"``.
@@ -1873,7 +1876,8 @@ async def report_reconcile(
     decision; it was that the observation and the plan were two facts on one board
     that never met. `plan_read` carries this now, and says it in `next.caveat`.
 
-    Agent-authenticated, unlike the plan's ORDER, which is human-only. Ordering is
+    Agent-authenticated, unlike the plan's ORDER, which needs a person or a
+    delegated credential (#478). Ordering is
     the fleet's shared intent and an agent rewriting it makes the plan thrash;
     reporting what GitHub says about a ref is not intent, and the only agent that
     can report it is one somebody already trusted with a machine token.
@@ -2164,7 +2168,8 @@ async def add_item(
     ranks 2 and 3 and every existing pair keeps its existing relationship, so
     there is no prior decision to overwrite and nothing for two agents to thrash.
     Permuting existing items is the contested operation, and that is
-    :func:`reorder`, which is human-only and unchanged.
+    :func:`reorder`, which is unchanged in what it MEANS: an agent may apply an
+    order a person asked for (#478) and may never decide one.
 
     Absent a position it appends, exactly as before — and says so, in
     ``rank_source``, rather than leaving a reader of 28 ranked rows to work out
@@ -2505,9 +2510,10 @@ async def complete_item(
 def _completion_note(existing: str | None, said: str | None) -> str | None:
     """Add the completion note to the item's note without destroying it.
 
-    `note` is the human's reasoning for the item's position — "the sentence a
-    human would otherwise repeat to each agent that asks", and human-only to
-    edit for exactly that reason. Replacing it with a completing agent's receipt
+    `note` is the reasoning for the item's position — "the sentence a human would
+    otherwise repeat to each agent that asks". Editing it is deliberate and takes
+    its own call: a person, or a delegated agent correcting reasoning that has gone
+    stale (#478). What it is not is a side effect of finishing something. Replacing it with a completing agent's receipt
     ("landed in PR #143") deleted the intent and left the receipt in a field the
     agent was not allowed to write, unrecoverably.
     """
@@ -2554,7 +2560,7 @@ async def update_item(
     editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Retitle, move, re-reason, or drop an item. Human-only, like reordering.
+    """Retitle, move, re-reason, or drop an item. A person, or a delegated agent.
 
     ``dropped`` is not ``done``: one says the work happened, the other says a
     person decided it should not. Reopening a dropped item is allowed here too,
@@ -2563,9 +2569,42 @@ async def update_item(
     A ``done`` item cannot be dropped. Dropping clears ``done_at``/``done_by``,
     so the drop control on a history row was one click from destroying the record
     that the issue ever closed — and the page offered it on every row.
+
+    **A delegated agent may re-reason, and may not decide (#478).** #479's whole
+    argument for a second credential is that it authorises a NAMED, narrow act
+    rather than an identity, and the narrow act here is the one the changelog
+    names: correcting reasoning an agent itself wrote and that has gone stale.
+    Two of this endpoint's other powers are decisions and stay a person's:
+
+    * **The review-exemption marker.** :func:`_refuse_agent_exemption`'s docstring
+      says *"Only two paths can put it on an open item now, and both take
+      app.auth.human: POST /plan/item/update and exempt_item's grant half"* — so
+      widening this endpoint's gate without this guard reopened #335 through one
+      of the two doors that #335's own fix depends on. Measured, not reasoned
+      about: before this guard, a delegated agent writing a `review: exempt` note
+      here got `exempt: True` on its own PR, which is precisely the authority
+      ``exempt_item`` refuses it by downgrading a grant to a request.
+    * **Dropping.** *"a person decided it should not"* is the endpoint's own
+      description of the act, and an agent deciding that about work it may be
+      the one avoiding is the same self-approval shape one field over. It also
+      reaches ``live_claim`` and clears somebody's hold.
+
+    Both refuse the ACT and not the caller, so nothing an agent legitimately does
+    here changes: a delegated note update is still one call.
     """
     _refuse_phase(body.phase)
     item = await _get(session, body.item_id)
+    if not is_human(editor):
+        # Ordered before every other check so a refusal is about the authority
+        # and not about the item's state — an agent told "that item is done"
+        # would reasonably conclude the write was otherwise allowed.
+        if body.state is not None:
+            raise HTTPException(403, detail={
+                "error": "dropping or reopening an item is a person's decision",
+                "hint": "a delegated credential may re-reason an item (`note`), "
+                        "not decide whether the work should happen. See #478.",
+                "item_id": str(item.id)})
+        _refuse_agent_exemption(item.ref_kind, body.note)
     if body.state is not None and item.state == "done" and body.state != "done":
         raise HTTPException(409, detail={
             "error": "that item is done: finished work is a record, not a plan item",

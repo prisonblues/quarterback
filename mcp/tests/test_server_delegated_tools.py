@@ -1,7 +1,8 @@
 """What `plan_reorder` and `plan_item_update` decide before anything is sent.
 
 These two are the only tools in this server that write through
-`app.auth.human` (#479), and the whole of what they can get wrong locally is the
+`app.auth.delegated` (#478) — NOT `human`, which is the distinction the whole
+feature turns on — and the whole of what they can get wrong locally is the
 body: a scope silently widened, an optional field sent as null and clobbering a
 note, or a setup failure arriving as something a caller would retry.
 
@@ -20,6 +21,12 @@ pytest.importorskip("mcp", reason="the MCP SDK is only in the `server` extra")
 
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp_server import server as srv
+from mcp_server.client import QuarterbackClient
+
+#: The client's OWN refusal text, not a string invented here. A fixture that
+#: supplies the message it then asserts on proves only that `str(e)` works; taking
+#: it from the source means this fails if the client stops naming the credential.
+CLIENT_NO_CREDENTIAL = QuarterbackClient.NO_CREDENTIAL
 
 
 class Recorder:
@@ -80,11 +87,11 @@ def test_update_can_still_send_an_empty_string_because_it_means_something(monkey
 def test_a_setup_failure_becomes_a_tool_error_naming_the_tool(monkeypatch):
     """No cookie is not a transient fault and not an answer about the request —
     it must not read as something to retry."""
-    wire(monkeypatch, RuntimeError("QUARTERBACK_EDGE_COOKIE is not set"))
+    wire(monkeypatch, RuntimeError(CLIENT_NO_CREDENTIAL))
     with pytest.raises(ToolError) as e:
         srv.plan_reorder(None, order=["a"])
     assert "plan_reorder" in str(e.value)
-    assert "QUARTERBACK_EDGE_COOKIE" in str(e.value)
+    assert "QUARTERBACK_ELEVATED_TOKEN" in str(e.value)
 
 
 def test_the_board_s_own_refusal_is_surfaced_with_its_detail(monkeypatch):

@@ -1258,10 +1258,13 @@ def plan_order(ctx: Context, repo: str | None = None) -> dict:
     query is #101 and not written yet. Absent evidence is never good news, and it
     is listed rather than left to be inferred.
 
-    **You cannot apply this.** `apply` in the response names the one call that
-    puts an order into force (`POST /plan/reorder`) and it is human-only. If you
-    disagree with a placement, say so on the board addressed to whoever is
-    deciding — the ordering is advisory in both directions.
+    **This is advisory and applying it is a separate, deliberate act.** `apply` in
+    the response names the call that puts an order into force
+    (`POST /plan/reorder`), which is `plan_reorder` — available to you only with a
+    delegated credential and only when a person asked for a sort (#478). Nothing
+    here is permission to run it: the ordering is advisory in both directions, and
+    if you disagree with a placement, say so on the board addressed to whoever is
+    deciding.
 
     Args:
         repo: the scope, EXACTLY — omit for the fleet-wide list. Unlike
@@ -1597,11 +1600,15 @@ def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dic
     """Put an order into force. **A human's decision, which you may be asked to apply.**
 
     `plan_order` computes what the rules imply and cannot apply it; this is the
-    call that does. It goes to the ordinary board host with your bearer, and it
-    needs `QUARTERBACK_HUMAN_URL` and `QUARTERBACK_EDGE_COOKIE` — without either
-    it refuses and says which is missing, rather than failing at the network.
+    call that does. It goes to the ordinary board host with your bearer, carrying
+    your machine's own `QUARTERBACK_ELEVATED_TOKEN` beside it — without one it
+    refuses before spending a request and names the missing credential.
 
-    **Only when you were asked.** #479 is the standing record that this door is
+    **It does not make you a person.** The order lands authored by you and
+    recorded as `rank_source: "derived"`, so nothing can mistake it for a sequence
+    somebody typed, and every other write `human` gates stays shut to you (#478).
+
+    **Only when you were asked.** #479 is the standing record of what this door is
     deliberately open wider than the boundary it crosses, and the thing it is
     open for is a person saying "sort it". Reordering because you formed an
     opinion is the failure `app/api/plan.py` rule 3 describes: *"two agents
@@ -1641,23 +1648,26 @@ def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dic
 def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
                      note: str | None = None, plan: str | None = None,
                      state: str | None = None) -> dict:
-    """Retitle, re-reason, move or drop one item. Same human gate as `plan_reorder`.
+    """Retitle or re-reason one item. Same delegated credential as `plan_reorder`.
 
     The verb for a note that has gone stale — the common case and the honest one:
     an agent writes an item's reasoning when it adds it, the issue then moves on,
     and until this tool existed nobody could correct the note but a person in a
     browser. Correcting your own reasoning overrides no one.
 
-    `state="dropped"` is not `done`: one says the work happened, the other that a
-    person decided it should not. Treat it as a person's call and not yours —
-    a `done` item cannot be dropped at all, and the board refuses it.
+    **`title` and `note` are what a delegated credential may set.** `state` is
+    refused for you (#478): "a person decided it should not" is what dropping
+    means, and an agent deciding that about work it might be the one avoiding is
+    the self-approval shape one field over. A `note` carrying the review-exemption
+    marker is refused for the same reason and points you at
+    `POST /plan/item/exempt`, which records a request instead (#335).
 
     Args:
         item_id: the item.
         title: replace the title. Blank is refused.
         note: replace the reasoning. This is the field worth using.
         plan: move it to a named plan; "" detaches it from the one it is in.
-        state: "open" or "dropped".
+        state: "open" or "dropped" — refused unless the caller is a person.
     """
     body: dict = {"item_id": item_id}
     for key, value in (("title", title), ("note", note),

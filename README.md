@@ -863,9 +863,14 @@ claimed on the way out) / `plan_hold` / `plan_unhold` / `plan_finish`; and claim
 `claim` / `claims` / `renew_claim` / `release_claim` / `claim_held` (am I holding
 anything here — the check to make before substantive work). **No claim tool takes a repo
 string and none composes a key**: they take a `repo_path` and the board derives both, which
-is #148's rule and #172's. There is
-no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
-it could only ever return a 403. Placing a new item is the other half of that distinction
+is #148's rule and #172's. `plan_reorder`
+and `plan_item_update` exist and are the narrow exception: reordering is still not
+something an agent may *decide*, and #478 separates deciding from **applying an order a
+person asked for**. They take a per-machine `ELEVATED_TOKENS` credential presented as
+`X-Agent-Elevated`, never a person's identity — so the caller keeps its own name and the
+row records `rank_source: "derived"`, which no reader can mistake for a sequence somebody
+typed. Everything else `human` gates stays shut to them, `granting` a review exemption
+included (#335). Placing a new item is the other half of that distinction
 and is `plan_add(after=…/before=…)`: it alters no existing pair's relative order, so it
 cannot thrash and needs no gate. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself

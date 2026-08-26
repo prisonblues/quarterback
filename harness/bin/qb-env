@@ -34,6 +34,13 @@
 #   QUARTERBACK_AGENT      this machine's name in the token file. Defaults to hostname.
 #   QUARTERBACK_HUMAN_URL  optional; the BROWSER vhost, where a person is authenticated at
 #                          the edge. Read only by `qb-doctor`, which uses it to ask whether
+#   QUARTERBACK_ELEVATED_TOKEN[_CMD]  optional; this machine's DELEGATED credential
+#                          (quarterback #478), presented as X-Agent-Elevated beside the
+#                          bearer. It authorises exactly two plan writes for an agent
+#                          that keeps its own identity — NOT a way to be a person, and
+#                          everything else app.auth.human gates stays shut to it. Same
+#                          value-or-command shape as QUARTERBACK_TOKEN, and resolved the
+#                          same way; unset means those two tools refuse and say so.
 #                          human writes actually work (#204). Deliberately separate from
 #                          BASE_URL and deliberately without a default, for the same reason
 #                          BASE_URL has none: the two hostnames proxy to the same container

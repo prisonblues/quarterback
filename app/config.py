@@ -93,7 +93,17 @@ class Settings(BaseSettings):
         """
         raw = self.elevated_tokens
         if self.elevated_tokens_file:
-            raw = Path(self.elevated_tokens_file).read_text(encoding="utf-8")
+            # Guarded, unlike `token_map`'s, and the asymmetry is deliberate: this
+            # is read from inside an auth DEPENDENCY, so an unreadable file would
+            # surface as a 500 from `delegated()` — an internal error where the
+            # documented behaviour is a closed, actionable refusal. Falling back to
+            # the inline value keeps that promise: no secrets, so no delegated
+            # write is authorised, and the caller is told which credential is
+            # missing rather than that the board is broken.
+            try:
+                raw = Path(self.elevated_tokens_file).read_text(encoding="utf-8")
+            except OSError:
+                raw = self.elevated_tokens
         out: dict[str, str] = {}
         for pair in raw.replace("\n", ",").split(","):
             pair = pair.strip()

@@ -23,7 +23,6 @@ import httpx
 ELEVATED_HEADER = "X-Agent-Elevated"
 
 
-
 def _decode_frame(data: list[str]) -> dict | None:
     """The frame's payload, or None if it is not something a consumer can read.
 
@@ -89,7 +88,6 @@ class QuarterbackClient:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
-        self._transport = transport
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
         # host that has no credential: every authed call 401s, and ``health()``
@@ -155,15 +153,28 @@ class QuarterbackClient:
         if not self._elevated_cmd:
             return self._elevated
         try:
-            out = subprocess.run(self._elevated_cmd, shell=True, check=False,
-                                 capture_output=True, text=True, timeout=30).stdout
+            done = subprocess.run(self._elevated_cmd, shell=True, check=False,
+                                  capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
-            return self._elevated
-        # First line only, exactly as `qb_resolve_token` trims: a store that
-        # prints a warning after the value must not put it in a header.
-        value = out.split("\n", 1)[0].strip()
+            done = None
+        # The EXIT CODE decides, not the presence of output. `op` prints
+        # diagnostics to stdout on some failures, so a non-zero run that wrote
+        # something would otherwise be adopted as a credential — and the symptom
+        # would be a 403 nobody could explain, from a value that never was one.
+        value = ""
+        if done is not None and done.returncode == 0:
+            # First line only, exactly as `qb_resolve_token` trims: a store that
+            # prints a warning after the value must not put it in a header.
+            value = done.stdout.split("\n", 1)[0].strip()
         if value:
             self._elevated = value
+        elif refresh:
+            # A refresh that produced nothing means the cached value is all there
+            # is AND it has already been refused once. Keeping it would let
+            # `_delegated_post`'s truthiness check pass and replay the same
+            # rejected secret; dropping it turns the next call into the
+            # actionable "no credential" refusal instead of a second 403.
+            self._elevated = None
         return self._elevated
 
     def _delegated_post(self, path: str, body: dict) -> dict:
@@ -176,10 +187,16 @@ class QuarterbackClient:
         if not self._resolve_elevated():
             raise RuntimeError(self.NO_CREDENTIAL)
         resp = self._send_delegated(path, body)
-        # One retry, and only when there is somewhere fresher to look. A rotated
-        # secret's first symptom is a write that worked yesterday.
-        if resp.status_code == 403 and self._elevated_cmd \
-                and self._resolve_elevated(refresh=True):
+        # One retry, and only for the 403 that is actually about the credential.
+        # A 403 here can equally be the board refusing the ACT — dropping an item,
+        # writing an exemption marker — and re-reading 1Password to ask again is
+        # both useless and misleading: it turns a clear "you may not" into two
+        # identical refusals with a secret-store round trip between them. The
+        # board names the header in the credential case (see `delegated()`), so
+        # that is what to match on.
+        if (resp.status_code == 403 and self._elevated_cmd
+                and ELEVATED_HEADER in resp.text
+                and self._resolve_elevated(refresh=True)):
             resp = self._send_delegated(path, body)
         resp.raise_for_status()
         return resp.json()

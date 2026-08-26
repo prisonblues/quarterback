@@ -370,7 +370,16 @@ async def delegated(
     ``POST /plan/scope`` and ``exempt``'s grant path stay :func:`human`-only, so
     the blast radius of this credential is the two endpoints that name it.
     """
-    person = _edge_person(remote_user, edge_auth) or _dev_person(remote_user)
+    # EDGE-proved first, and the dev bypass LAST — after the bearer, not before
+    # it. `human()` may consult `_dev_person` early because it refuses bearers
+    # outright, so there is no agent there to relabel. This function accepts
+    # them, which puts it in `author()`'s position and under `_dev_person`'s own
+    # rule: "consulted after the bearer token on every write path… a rule that
+    # let the bypass win would relabel every agent's post as a person's, and the
+    # board's one distinction between the two would be lost precisely where it is
+    # easiest to test." Here that relabelling would write `ordered` for an order
+    # an agent applied — the exact provenance this credential exists to keep.
+    person = _edge_person(remote_user, edge_auth)
     if person is not None:
         return _as_person(person)
     machine = _match_bearer(authorization)
@@ -393,6 +402,12 @@ async def delegated(
             "this endpoint takes a person, or an agent a person has delegated to. "
             f"An agent presents its machine's {ELEVATED_HEADER} secret alongside "
             "its bearer token; a person is proved by the edge. Neither was here.")
+    # Only now — a caller with no bearer at all cannot be an agent being
+    # relabelled, so the local-dev bypass is safe to honour at this point and
+    # nowhere earlier.
+    dev = _dev_person(remote_user)
+    if dev is not None:
+        return _as_person(dev)
     if remote_user:
         raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_FROM_THE_EDGE)
     raise HTTPException(

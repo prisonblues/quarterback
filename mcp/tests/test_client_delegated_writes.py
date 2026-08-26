@@ -13,8 +13,6 @@ from "the board said no", because only the first is a setup step.
 
 from __future__ import annotations
 
-import os
-
 import httpx
 import pytest
 from mcp_server.client import ELEVATED_HEADER, QuarterbackClient
@@ -33,6 +31,14 @@ class Recorder:
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         return self._response or httpx.Response(200, json={"reordered": 2})
+
+
+def _counting(tmp_path) -> str:
+    """A command printing a different value each call, so a retry that reused the
+    cached secret would send the same header twice and be visible."""
+    n = tmp_path / "n"
+    return (f"n=$(cat {n} 2>/dev/null || echo 0); n=$((n+1)); "
+            f"echo $n > {n}; echo v$n")
 
 
 def client(rec: Recorder, *, secret=SECRET, cmd=None) -> QuarterbackClient:
@@ -96,16 +102,14 @@ def test_item_update_uses_the_same_credential():
 
 # --------------------------------------------------------- the secret's own life
 
-def test_the_command_is_not_run_until_a_delegated_write_is_attempted():
+def test_the_command_is_not_run_until_a_delegated_write_is_attempted(tmp_path):
     """This client is constructed once per MCP session on EVERY session start and
     the command is usually `op read`, which can prompt. Resolving eagerly would
     put a credential prompt in front of every agent that starts, to serve two
     tools it will probably never call."""
-    marker = "/tmp/qb-elev-ran-never"
-    if os.path.exists(marker):
-        os.remove(marker)
+    marker = tmp_path / "ran"
     QuarterbackClient(BASE, "t", elevated_cmd=f"touch {marker}; echo s").close()
-    assert not os.path.exists(marker), "constructing the client must run nothing"
+    assert not marker.exists(), "constructing the client must run nothing"
 
 
 def test_the_command_supplies_the_secret():
@@ -133,27 +137,24 @@ def test_a_command_that_fails_is_not_an_exception_it_is_no_credential():
     assert "QUARTERBACK_ELEVATED_TOKEN" in str(e.value)
 
 
-def test_a_403_re_reads_the_command_and_retries_once():
+def test_a_403_re_reads_the_command_and_retries_once(tmp_path):
     """A rotated secret's first symptom is a write that worked yesterday, and
-    asking the store again is the whole remedy."""
+    asking the store again is the whole remedy.
+
+    The refusal has to NAME the header — see the test below for why."""
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.headers.get(ELEVATED_HEADER, ""))
         if len(seen) == 1:
-            return httpx.Response(403, json={"detail": "does not match"})
+            return httpx.Response(403, json={
+                "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
         return httpx.Response(200, json={"reordered": 1})
 
-    counter = "/tmp/qb-elev-n"
-    if os.path.exists(counter):
-        os.remove(counter)
-    script = (f"n=$(cat {counter} 2>/dev/null || echo 0); n=$((n+1)); "
-              f"echo $n > {counter}; echo v$n")
     c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
-                          elevated_cmd=script)
+                          elevated_cmd=_counting(tmp_path))
     assert c.plan_reorder({"order": ["a"]}) == {"reordered": 1}
     assert seen == ["v1", "v2"], seen
-    os.remove(counter)
 
 
 def test_a_literal_secret_is_not_retried_because_there_is_nowhere_fresher():
@@ -161,3 +162,80 @@ def test_a_literal_secret_is_not_retried_because_there_is_nowhere_fresher():
     with pytest.raises(httpx.HTTPStatusError):
         client(rec).plan_reorder({"order": []})
     assert len(rec.requests) == 1
+
+
+def test_a_command_that_exits_non_zero_is_not_a_credential_however_much_it_prints(tmp_path):
+    """`op` writes diagnostics to stdout on some failures. Adopting that as a
+    secret produces a 403 nobody can explain, from a value that never was one — so
+    the exit code decides, not the presence of output."""
+    rec = Recorder()
+    with pytest.raises(RuntimeError) as e:
+        client(rec, secret=None, cmd="echo '[ERROR] could not read secret'; exit 1"
+               ).plan_reorder({"order": []})
+    assert not rec.requests
+    assert "QUARTERBACK_ELEVATED_TOKEN" in str(e.value)
+
+
+def test_a_failed_refresh_drops_the_stale_secret_rather_than_replaying_it(tmp_path):
+    """The cached value has already been refused once. Keeping it lets the next
+    call sail past the "have I got one" check and replay the same rejected secret;
+    dropping it turns that into the actionable refusal instead of a second 403."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(403, json={
+            "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+
+    # Prints once, then fails — a store that went away after the first read.
+    once = tmp_path / "once"
+    cmd = f"if [ -f {once} ]; then exit 1; fi; touch {once}; echo first"
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=cmd)
+    with pytest.raises(httpx.HTTPStatusError):
+        c.plan_reorder({"order": ["a"]})
+    assert len(calls) == 1, "a refresh that produced nothing must not be retried"
+
+    with pytest.raises(RuntimeError) as e:
+        c.plan_reorder({"order": ["a"]})
+    assert "QUARTERBACK_ELEVATED_TOKEN" in str(e.value), "the stale value was kept"
+
+
+def test_a_403_about_the_ACT_is_not_retried_as_a_stale_credential(tmp_path):
+    """`delegated()` is not the only thing that answers 403 on these paths — the
+    board refuses the act too (dropping an item, writing an exemption marker).
+    Re-reading 1Password to ask the same question again is useless and misleading."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(ELEVATED_HEADER, ""))
+        return httpx.Response(403, json={
+            "detail": "dropping or reopening an item is a person's decision"})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=_counting(tmp_path))
+    with pytest.raises(httpx.HTTPStatusError):
+        c.plan_item_update({"item_id": "x", "state": "dropped"})
+    assert len(seen) == 1, "a refusal of the ACT must not spend a credential refresh"
+
+
+def test_item_update_gets_the_same_retry_and_refusal_behaviour(tmp_path):
+    """Both delegated calls share one path; only one of them was exercised for it."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(ELEVATED_HEADER, ""))
+        if len(seen) == 1:
+            return httpx.Response(403, json={
+                "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+        return httpx.Response(200, json={"ok": True})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=_counting(tmp_path))
+    assert c.plan_item_update({"item_id": "x", "note": "n"}) == {"ok": True}
+    assert seen == ["v1", "v2"]
+
+    rec = Recorder()
+    with pytest.raises(RuntimeError):
+        client(rec, secret=None).plan_item_update({"item_id": "x"})
+    assert not rec.requests
