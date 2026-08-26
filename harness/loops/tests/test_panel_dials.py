@@ -778,7 +778,13 @@ def test_the_absolute_ceiling_stops_growth_the_multiple_waves_through(monkeypatc
     assert stop["stop"] is True and stop["confident"] is False
     assert "`max_fix_growth_chars` ceiling" in stop["reason"]
     assert "`max_fix_growth` ceiling" not in stop["reason"], stop["reason"]
-    assert any("`max_fix_growth_chars`" in v for v in stop["veto"])
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    # The veto's CONCLUSION follows the half that fired. `config_notes` never reaches
+    # the board, so this list is the record's only copy of why a cycle ended — and "a
+    # fix pass that multiplies the change" is simply false at 2.7x, let alone of the
+    # 2,000,000-char baseline that grows by 30,001 and sits at 1.02x.
+    assert "whatever the ratio says" in veto
+    assert "multiplies the change" not in veto
     assert "a stop, not convergence" in report
 
 
@@ -797,6 +803,60 @@ def test_the_absolute_half_does_not_swallow_the_multiple_that_already_bound(
     assert growth["grown"] < 30000
     assert "`max_fix_growth` ceiling" in payload["round_stop"]["reason"]
     assert "`max_fix_growth_chars`" not in payload["round_stop"]["reason"]
+
+
+#: Over BOTH halves at once: 32.6x on a growth of ~33,000 chars.
+BOTH_OVER = "diff --git a/a.py b/a.py\n" + LINE * 2000
+
+
+def test_a_stop_that_crossed_both_halves_names_both_and_keeps_the_multiplied_wording(
+        monkeypatch, capsys, tmp_path):
+    """"3.4x AND +38,000 chars" is a different argument for splitting than either
+    alone, so both are said. And where the multiple DID fire the conclusion goes back
+    to "a fix pass that multiplies the change", because there it is true."""
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BOTH_OVER, scope="pr")
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over_ratio"] is True and growth["over_chars"] is True
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    assert "`max_fix_growth`" in veto and "ceilings" in veto
+    assert "multiplies the change" in veto and "whatever the ratio says" not in veto
+    assert "`max_fix_growth` ceiling" in stop["reason"]
+    assert "`max_fix_growth_chars` ceiling" in stop["reason"]
+
+
+def test_a_repo_that_nulled_the_multiple_is_told_in_the_VETO_which_half_stopped_it(
+        monkeypatch, capsys, tmp_path):
+    """The migration hazard at the one moment it costs something, and it rides on the
+    veto rather than staying a `config_notes` line because **`config_notes` never
+    reaches the board** — the veto list is the record's only copy, which is the same
+    reason a baseline problem is deliberately recorded as both.
+
+    `max_fix_growth` can only be None from a WRITTEN null (an absent key inherits
+    3.0), so this branch is exactly the repo that switched "the growth check" off
+    before #492 and has now been stopped by the half it never wrote. Without this it
+    would read the board record, see a cycle terminated by a ceiling, and have nothing
+    telling it the key it already set was not the one that fired."""
+    conf = cfg(max_fix_growth=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    stop = payload["round_stop"]
+    assert stop["stop"] is True and stop["fix_growth"]["over_chars"] is True
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    assert "switches off the MULTIPLE only" in veto
+    assert "nulling it too is the pre-#492 no-growth-check-at-all" in veto
+    # And NOT on a repo that wrote neither key: there the multiple is live, nobody's
+    # written intent changed meaning, and a pointer about a migration would be noise.
+    _, plain, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                      baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr", name="p")
+    assert not any("switches off the MULTIPLE only" in v
+                   for v in plain["round_stop"]["veto"])
 
 
 def test_null_switches_the_absolute_half_off_and_leaves_the_multiple(monkeypatch,

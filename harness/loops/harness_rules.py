@@ -756,12 +756,17 @@ DEFAULTS: dict = {
         # round late" half of the report, which no absolute floor can reach, and
         # `guard_ratio` is the earlier signal filed for it.
         #
-        # **It can only ever TIGHTEN.** Crossed-first means both numbers are ceilings,
-        # so every cycle this stops is one the multiple would have stopped a round
-        # later at best; there is no value of this key that lets through a cycle 3.0x
-        # would have caught. That is what makes it cheap to reverse — `null` switches
-        # this half off and restores the pre-#492 behaviour exactly, and `null` on both
-        # is no growth check at all, as it was before either existed.
+        # **It can only ever TIGHTEN — and that is the narrow claim, not a wider one.**
+        # Crossed-first means both numbers are ceilings, so no value of this key lets
+        # through a cycle 3.0x would have caught. It does NOT follow that the multiple
+        # would eventually have caught what this stops: a 2,000,000-char PR that grows
+        # by 30,001 chars sits at 1.02x and may never approach 3.0x at all, and
+        # catching exactly that is the point — a proportional ceiling can permit that
+        # growth permanently. So this stops cycles the multiple never would, and lets
+        # through none that it would. That is also what makes it cheap to reverse:
+        # `null` switches this half off and restores the pre-#492 behaviour exactly,
+        # and `null` on both is no growth check at all, as it was before either
+        # existed.
         #
         # **A second key rather than a two-part `max_fix_growth` value**, which is the
         # open question #492 left. A pair would avoid a fifth growth-adjacent name in a

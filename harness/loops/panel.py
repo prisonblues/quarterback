@@ -2895,14 +2895,35 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             stop["reason"] = (
                 f"this PR is {' and '.join(crossed)} — {stop['reason']}, and what this "
                 "needs is splitting, not another round")
+            # The CONCLUSION follows the half that fired, and it is not cosmetic:
+            # `config_notes` never reaches the board (see the veto render below), so
+            # this list is the record's only copy of why a cycle ended. "A fix pass
+            # that multiplies the change" is false of an absolute-only stop — a
+            # 2,000,000-char baseline growing by 30,001 chars has a ratio of 1.02 —
+            # and a board record that says it is a wrong claim about a real PR in the
+            # one field an auditor reads.
+            said = ("a fix pass that multiplies the change has written a second change"
+                    if over_ratio else
+                    "a fix pass that adds this much on top of what the cycle started "
+                    "from has written a second change, whatever the ratio says")
+            # The migration pointer, and it rides on the VETO rather than staying a
+            # config note for the same reason. `max_fix_growth` can only be None from
+            # a WRITTEN null (an absent key inherits 3.0), so this branch is exactly
+            # the repo that switched "the growth check" off before #492 and has now
+            # been stopped by the half it never wrote. `resolve_dials` already says so
+            # in `config_notes`; that copy does not reach the board, and this is the
+            # moment it matters most.
+            migrated = ("" if limit is not None or not over_chars else
+                        " — and note `max_fix_growth: null` switches off the MULTIPLE "
+                        "only: `max_fix_growth_chars` is the half that stopped this, "
+                        "and nulling it too is the pre-#492 no-growth-check-at-all")
             stop["veto"] = [*stop["veto"],
                             f"the PR's {pr_chars:,} chars (whole PR) "
                             f"against round {first_round}'s {first_chars:,} "
                             f"({first_scope}) is {ratio:.1f}x and +{grown:,} chars, "
                             f"past the {' and '.join(ceilings)} "
-                            f"ceiling{'s' if len(ceilings) > 1 else ''} — a fix "
-                            "pass that multiplies the change has written a second "
-                            "change, and this stop is that measurement, not convergence"]
+                            f"ceiling{'s' if len(ceilings) > 1 else ''} — {said}, and "
+                            f"this stop is that measurement, not convergence{migrated}"]
             # Explicit rather than inferred from the veto line: `confident` was already
             # computed inside `round_stop`, so appending to `veto` here changes nothing
             # about it — and a verdict this file forces to `stop` must never be able to
