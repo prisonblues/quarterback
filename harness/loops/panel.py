@@ -1827,9 +1827,34 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # tell no reviewer about it. One `gh pr checks` against a round that takes
     # minutes is a couple of seconds of wall-clock for a fact that refutes a whole
     # class of finding, so the overlap is not worth keeping.
-    ci_status, ci_failing, ci_skip = review_ci(gh_repo, pr_number)
+    #
+    # And a PENDING build gets a bounded chance to finish BEFORE the seats are
+    # dispatched, which is the whole of #501. A round takes 20-40 minutes here and
+    # a build about four and a half, so the old behaviour reliably told reviewers
+    # "CI is still running" about a build that finished during the round — and a
+    # reviewer that is told so declares "could not assess: CI result is unknown",
+    # which `coverage_veto` counts and `round_stop` turns into `confident: false`.
+    # Measured fleet-wide over five days: 19 rounds, 9 of them PENDING, and
+    # `stop_confident` true on NONE of them.
+    #
+    # The cause is removed rather than the symptom filtered, because the symptom
+    # cannot be filtered honestly: the veto is a reviewer's free-form prose, and
+    # `coverage_veto`'s standing rule is that exemptions come off recorded state
+    # and never off the wording of a declaration. See `review_ci_settled`.
+    ci_status, ci_failing, ci_skip, ci_waited = review_ci_settled(
+        gh_repo, pr_number, read=review_ci)
     if ci_skip:
         result.skipped.append(ci_skip)
+    if ci_waited:
+        # Said out loud: a round that sat for four minutes should account for the
+        # time rather than look slow for no reason, and a wait that ran out is the
+        # case where the veto below is still correct.
+        settled = "settled" if ci_status != "PENDING" else "did not settle"
+        notes.append(
+            f"waited {ci_waited:.0f}s for CI before dispatching the seats — it "
+            f"{settled} ({ci_status}). A reviewer told the build is still running "
+            f"declares it as a gap it cannot assess, and that costs the round its "
+            f"confident stop (#501)")
     ci_text = ci_brief(ci_status, ci_failing, ci_skip)
 
     # A manifest round asks a different question, so it sends a different brief —

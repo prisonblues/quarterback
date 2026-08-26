@@ -1740,6 +1740,72 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
     return "PASS", failing, None
 
 
+#: How long a round may wait for a PENDING CI to settle before dispatching the
+#: seats. Measured rather than guessed: on this repo a full run is ~4m30s wall
+#: clock with a 1-9 second queue wait, and a panel round is 20-40 minutes — so the
+#: build reliably finishes DURING a round that was told it had not.
+CI_SETTLE_WAIT = 600
+
+#: How often to ask. `gh pr checks` is a couple of seconds, and the thing being
+#: waited on changes on the order of minutes.
+CI_SETTLE_POLL = 20
+
+
+def review_ci_settled(gh_repo: str, pr_number: int, *,
+                      read=None,
+                      budget: float = CI_SETTLE_WAIT,
+                      poll: float = CI_SETTLE_POLL,
+                      now=time.monotonic, sleep=time.sleep):
+    """:func:`review_ci`, but give a PENDING build a bounded chance to finish.
+
+    **Why waiting beats reading it again afterwards.** The obvious fix for a stale
+    CI reading is to take a second one when the round ends. It does not work here,
+    and the reason is :func:`panel_rounds.coverage_veto`'s standing rule: a veto is
+    exempted *"off RECORDED STATE, never off the wording of a message or a
+    declaration"*. The veto in question is not the panel's own — it is a REVIEWER
+    saying "could not assess: CI result is unknown (still running)", free-form
+    prose produced because its prompt said so. Answering that afterwards would mean
+    matching model text for something CI-shaped, which is the one thing that rule
+    forbids, and forbids for a good reason: a regex over prose exempts a genuine
+    round-specific gap whose wording happens to match, and misses the structural
+    one that does not.
+
+    So the cause is removed instead of the symptom filtered. If the seats are told
+    a real answer, no reviewer has a gap to declare and nothing needs exempting.
+
+    Measured, fleet-wide over five days: 19 rounds, ``ci_status`` PENDING on 9 of
+    them, and ``stop_confident`` true on **none** — the field that separates a
+    converged cycle from one that gave up carried no information at all. That is
+    the failure `coverage_veto`'s docstring already names in the abstract: *"a
+    signal that is never positive carries no information and trains its reader to
+    ignore it."*
+
+    Bounded, and the bound fails in the honest direction: a build that is still
+    pending when the budget runs out is reported exactly as it is today, PENDING,
+    veto and all. Waiting can only ever turn an unknown into a fact.
+
+    Returns ``(status, failing, skip, waited_seconds)`` — the wait is returned
+    rather than logged so the caller can put it in `config_notes`, because a round
+    that sat for four minutes should say so rather than look slow for no reason.
+    """
+    # `read` is injected rather than resolved here, and the caller passes its OWN
+    # `review_ci`. That is not ceremony: a dozen suites stub `panel.review_ci` to
+    # keep a round off the network, and a wrapper that reached for this module's
+    # binding instead would slip past every one of them — shelling out to `gh` in
+    # tests and, on a PENDING answer, sitting on the whole budget.
+    read = read or review_ci
+    started = now()
+    status, failing, skip = read(gh_repo, pr_number)
+    if status != "PENDING":
+        return status, failing, skip, 0.0
+    while now() - started < budget:
+        sleep(min(poll, max(0.0, budget - (now() - started))))
+        status, failing, skip = read(gh_repo, pr_number)
+        if status != "PENDING":
+            break
+    return status, failing, skip, round(now() - started, 1)
+
+
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
 #: them silently. Generated from the module's own top level, so a helper added here
@@ -1751,6 +1817,7 @@ __all__ = [
     "_base_tip_now", "PROVENANCE", "_provenance",
     "RECURRENCE", "SITE_RADIUS", "_recurrence",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
+    "review_ci_settled", "CI_SETTLE_WAIT", "CI_SETTLE_POLL",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
     "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
     "_changed_lines", "Integration", "MergeReading", "merge_involvement",
