@@ -99,10 +99,13 @@ skip quietly: each costs you a write-up in step 6 and nothing else on the list.
 
 **A deferral is not "not now" as a way out of work.** It costs you two lines — why
 the defect is real, and what this change is for such that the defect sits outside
-it — and it has to go somewhere: the ORCHESTRATOR opens the issue and records the
-finding against it once you have relayed, which is what makes a deferral a record
-rather than a shrug. You open nothing and record nothing, exactly as for an
-escalation. #223 and #237 are what a good one looks like. A finding you are simply
+it — and it has to go somewhere: once you have relayed, the ORCHESTRATOR records
+the finding `deferred` on the board, and opens a GitHub issue for it where the
+repo's `review_panel.file_deferral_issues` calls for one (#482 — the row is the
+durable record and the issue is a work item on a human's tracker, and for the P3/P4
+tail those are not the same thing). Either way it lands somewhere with your two
+lines attached, which is what makes a deferral a record rather than a shrug. You
+open nothing and record nothing, exactly as for an escalation. #223 and #237 are what a good one looks like. A finding you are simply
 tired of, or one whose fix you have not worked out, is not a deferral. With
 `fixer_may_defer` off, the first two are the whole list and "not now" is not
 available to you.
@@ -628,7 +631,8 @@ Deferred — real, and not this change's job
   Why it is real: <one line — this is not a refutation>
   Why not here: <one line — what this change is for, and why the defect sits
        outside it>
-  Goes to: the orchestrator files it — you open nothing
+  Goes to: the orchestrator records it — a board row always, an issue where
+       `file_deferral_issues` calls for one. You open nothing
 
 Escalated — the approach, not the code
 - Premise: <one sentence>

@@ -352,12 +352,18 @@ def test_the_bar_for_what_is_in_scope_did_not_move():
 
 
 def test_a_deferral_still_has_to_go_somewhere():
-    """`deferred_to` names an issue ref, so the row wants one — a `deferred` with
-    nowhere to go is the markdown list this replaced. The orchestrator opens it, never
-    the fixer, which is the same division step 3a already draws."""
+    """A `deferred` with nowhere to go is the markdown list this replaced, and #482
+    did not weaken that — it named WHERE. The board row is where every deferral goes;
+    a GitHub issue is a second copy the gate decides on. Either way the orchestrator
+    is the one who writes it, never the fixer, which is the same division step 3a
+    already draws."""
     orchestrator = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
     assert "deferred_to" in orchestrator
-    assert "the orchestrator files it — you open nothing" in orchestrator
+    assert ("the orchestrator records it — a board row always, an issue where "
+            "`file_deferral_issues` calls for one. You open nothing") in orchestrator
+    # And the prose above the template does not promise an issue the gate may refuse.
+    assert "the ORCHESTRATOR opens the issue and records the finding against it" \
+        not in orchestrator
     panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
     assert "Three roads arrive here and all three are the same row" in panel_md
     assert "review_panel.fixer_may_defer" in panel_md
@@ -1704,6 +1710,22 @@ def test_the_board_may_set_the_gate_and_may_not_set_a_word_it_does_not_know():
         assert harness_rules._dial_problem("d", dial, good) == "", good
     for bad in ("P0", "sometimes", "P-2", 2, True, None):
         assert harness_rules._dial_problem("d", dial, bad), bad
+
+
+@pytest.mark.parametrize("dial_name", ["review_panel.file_deferral_issues",
+                                       "review_panel.fix_severity_floor"])
+@pytest.mark.parametrize("written", [" P2 ", "\tp2\n"])
+def test_a_board_set_severity_band_is_stripped_before_it_is_judged(dial_name, written):
+    """The layer must not decide what a written value means. `panel_seats._severity`
+    strips and upper-cases every severity that enters the panel, so `severity_floor`
+    accepts `" p2 "` out of a rules file — and a board dial that refused the same
+    value would make one written value mean two things depending on which layer
+    carried it, which is precisely the layer a person typing into a settings endpoint
+    cannot see. It refused: the regex ran against the raw string while the word
+    endpoints beside it were being trimmed, so `" always "` was accepted and `" P2 "`
+    was not."""
+    dial = harness_rules.BOARD_DIALS[dial_name]
+    assert harness_rules._dial_problem(dial_name, dial, written) == ""
 
 
 @pytest.mark.parametrize("written,applied", [("p3", "P3"), (" Always ", "always")])

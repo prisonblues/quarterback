@@ -2514,6 +2514,19 @@ def _dial_default(path: str) -> tuple[Any, bool]:
     return node, True
 
 
+def _is_band(value: Any) -> bool:
+    """Is this a severity band a floor may name, written any way a hand writes one?
+
+    STRIPPED BEFORE MATCHING, which is the half `_SEVERITY_RE`'s own comment claims
+    and the check did not do: `panel_seats._severity` strips and upper-cases every
+    severity that enters the panel, and `severity_floor` therefore accepts `" p2 "`
+    out of a rules file. A board dial that refused the same value would make one
+    written value mean two things depending on which layer carried it — and the layer
+    is exactly what a person writing into a settings endpoint cannot see.
+    """
+    return isinstance(value, str) and bool(_SEVERITY_RE.match(value.strip()))
+
+
 def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     """Why this value may not be applied, or `""`.
 
@@ -2533,12 +2546,11 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
             f"`{path}` must be true or false, not {value!r} — a quoted 'false' is "
             f"a non-empty string and would read as ON")
     if dial.kind == "severity":
-        return "" if isinstance(value, str) and _SEVERITY_RE.match(value) else (
+        return "" if _is_band(value) else (
             f"`{path}` must be a severity band P1-P4, not {value!r}")
     if dial.kind == "deferral_gate":
-        ok = isinstance(value, str) and (
-            bool(_SEVERITY_RE.match(value))
-            or value.strip().lower() in _DEFERRAL_GATE_ENDS)
+        ok = _is_band(value) or (isinstance(value, str)
+                                 and value.strip().lower() in _DEFERRAL_GATE_ENDS)
         return "" if ok else (
             f"`{path}` must be a severity band P1-P4 or one of "
             f"{', '.join(_DEFERRAL_GATE_ENDS)}, not {value!r}")
@@ -2611,11 +2623,11 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
         # lower-cases a scope on its way in, and a provenance table showing `"p3"`
         # beside a round that ran `P3` is a table a reader would have to second-guess.
         if dial.kind == "severity":
-            value = value.upper()
+            value = value.strip().upper()
         elif dial.kind == "deferral_gate":
             # Each half normalised the way its own vocabulary is: a band upper-cased
             # like every other severity, an end lower-cased like every other word.
-            value = (value.upper() if _SEVERITY_RE.match(value)
+            value = (value.strip().upper() if _is_band(value)
                      else value.strip().lower())
         elif dial.kind == "scope":
             value = value.strip().lower()
