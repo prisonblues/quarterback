@@ -17,7 +17,7 @@ value a reader must be able to distrust, sitting in the column they consult to
 decide whether to trust the row.
 
 Revision ID: m5b71c2d9
-Revises: mfe8671ba
+Revises: m3a9c41e7
 Create Date: 2026-08-26 09:40:00.000000
 
 """
@@ -29,7 +29,13 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = 'm5b71c2d9'
-down_revision: str | None = 'mfe8671ba'
+# RE-POINTED after #480 landed. Both branches forked from mfe8671ba, so both
+# named it as their parent and the chain grew two heads the moment they met —
+# which is exactly what CI's "one migration head after the merge" check exists to
+# catch, and it caught it. The columns are independent (a rank source on
+# plan_items, a method on dial_settings), so the order between them carries no
+# meaning; what matters is that there is an order at all.
+down_revision: str | None = 'm3a9c41e7'
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

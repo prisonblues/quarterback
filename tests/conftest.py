@@ -76,6 +76,11 @@ PINNED_SETTINGS = {
     "BROWSER_DEV_USER": "",
     "BROWSER_DEV_HUMAN": "false",
     "HUMAN_EDGE_SECRET": "tok-edge",
+    # Per machine, and only two of the three have one: `desktop` is deliberately
+    # left without so a test can show an unprovisioned machine being refused
+    # rather than falling through to somebody else's secret (#478).
+    "ELEVATED_TOKENS": "laptop:not-a-secret-laptop,server:not-a-secret-server",
+    "ELEVATED_TOKENS_FILE": "",
     # EMPTY, and deliberately: the second way to be a person here is a key from
     # `HUMAN_TOKENS`, and a suite that ran with one configured would be a suite in
     # which "unconfigured refuses everything" is arranged rather than free. The
@@ -93,6 +98,11 @@ from app.main import app  # noqa: E402
 LAPTOP = {"Authorization": "Bearer tok-laptop"}
 SERVER = {"Authorization": "Bearer tok-server"}
 DESKTOP = {"Authorization": "Bearer tok-desktop"}
+
+#: A machine's DELEGATED credential rides beside its bearer — `delegated()` looks
+#: the secret up BY the authenticated machine, so the pair has to match.
+LAPTOP_ELEVATED = {**LAPTOP, "X-Agent-Elevated": "not-a-secret-laptop"}
+SERVER_ELEVATED = {**SERVER, "X-Agent-Elevated": "not-a-secret-server"}
 
 
 def pytest_configure(config: pytest.Config) -> None:

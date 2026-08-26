@@ -318,8 +318,8 @@ Everything above tells you to fix everything and never note-and-move-on. That is
 right, and it is also exactly why every fixer so far has patched a broken premise
 rather than saying so. This is the one permitted exception, and it is narrow.
 
-**It is an escalation only if all three hold.** Otherwise it is a defect, and you
-fix it:
+**It is an escalation if tests 1-3 all hold, or if test 4 fails.** Otherwise it is
+a defect, and you fix it:
 
 1. **The defect is downstream of a decision, not of the line.** The named code
    does what it was written to do; the finding is what that intent costs.
@@ -331,6 +331,30 @@ fix it:
    whose regression test can only be written against a single example moves the
    boundary rather than removing it. (#114 is this same check, reached from the
    other side.)
+4. **Is the property your fix asserts decidable in the runtime the assertion runs
+   in?** If it is not, escalate — whatever tests 1-3 said.
+
+**Test 4 stands alone, and the other three are why it has to.** Tests 1-3 are a
+conjunction that describes one shape: *the code is right, your patch would be a
+special case, and you cannot write a general test for it.* Test 4 describes a
+different one, and a stronger one. Ask what your fix really needs to know, then ask
+whether anything where the assertion runs can actually observe it. If the answer is
+no, every possible fix is an **approximation** of that property, the next round's
+findings are the gap between your approximation and the property, and the round
+count is unbounded by construction — no fix can close it, because no fix can check
+it.
+
+Requiring test 4 to hold *alongside* the other three would guarantee it never fired.
+A better approximation is generally testable, so test 3 passes precisely when test 4
+is failing — which is how this pattern survived four fix passes on one cycle with all
+three tests applied honestly and answered correctly every time.
+
+**The tell is that you can describe what you are really checking for, and then
+notice the runtime cannot see it.** "The panel actually reviewed the PR" is not
+observable from inside the process that ran it; exit codes, payload files and head
+SHAs are all proxies for it, each one checkable, none of them the property. If your
+next sentence is *"well, a better signal would be…"*, you are choosing the next
+proxy, and that is the loop this test exists to stop.
 
 **Check the premise before writing the patch, and check your own last round
 hardest.** The strongest case on record is a fixer circling its own fix: on
@@ -355,16 +379,35 @@ PREMISE
 )
 python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
     --premise-file <the register path from the brief> \
+    --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
 
-Read the exit code, not the prose. **0** means this premise has not been patched
-before in this cycle: carry on and decide patch-or-escalate on the three tests
-above. **4** means it has, and `review_panel.escalate_on.premise_repeated` says
-stop — **do not write the patch**. It is an escalation now whether or not it
-passes the three tests, because a premise a fix pass has already been written
-against once is #67's circling by definition, and the second patch is what
-produces the third round. Report it under `Escalated` with the command's output,
+`--premise-decidable` is **test 4, answered where it can brake something**. Pass
+`no` when the runtime the assertion runs in cannot observe the property the fix
+asserts, `yes` when it can. Omit it and the declaration is recorded as *not
+answered*: nothing brakes on it, the report says so, and #491's whole mechanism is
+off for that pass. It is one word and it is the only part of step 3a that a later
+round can act on.
+
+Read the exit code, not the prose. **0** means the fix may be written: carry on and
+decide patch-or-escalate on the four tests above. **4** means it may not — **do not
+write the patch** — and the report says which brake fired:
+
+- `escalate_on.premise_repeated`: this premise has been patched before in this
+  cycle. It is an escalation now whether or not it passes tests 1-3, because a
+  premise a fix pass has already been written against once is #67's circling by
+  definition, and the second patch is what produces the third round.
+- `escalate_on.premise_undecidable`: you answered `no` to test 4. This fires on the
+  **first** declaration, not the second, and that is deliberate — an unobservable
+  property does not become observable on the next attempt, so waiting for a repeat
+  buys a fix pass and a panel to confirm what your own answer already said.
+
+A `no` **sticks to the premise**. Re-declaring it later with `yes`, or with the flag
+omitted, does not clear it and does not get you past the brake — the answer is about
+the property, not about one pass's opinion of it, and the one agent whose fix is being
+refused is not the one who gets to lift the refusal. If you believe the `no` was
+wrong, that is the escalation talking to a human, which is where it was going anyway. Report it under `Escalated` with the command's output,
 including the `--escalated` keys it prints, and fix everything else in the pass
 as usual.
 
@@ -375,12 +418,21 @@ double-quoted argument bash *executes* them. `--premise-for` takes finding
 titles — they are what the orchestrator hands the next round as `--escalated`,
 and an ID there names no finding at all.
 
-**State the premise, never the proxy.** The brake compares declarations, not code:
-"the panel exiting 0 means it reviewed" and "the payload existing means it
+**State the premise, never the proxy.** The repeat brake compares declarations, not
+code: "the panel exiting 0 means it reviewed" and "the payload existing means it
 reviewed" are one premise wearing two proxies, they share almost no words, and
 declared that way they count as two. Declare what the fix *assumes about the
 world* — "a local check can prove a review happened" — and the second one is
 caught.
+
+**And when you cannot — answer test 4, which does not depend on your wording.**
+Declaring at the right altitude is a discipline, and a discipline is not a
+mechanism: replacing a proxy produces a genuinely different premise, honestly
+declared, so the counter stays at 1 while the cycle circles. That is measured, not
+theoretical — one cycle declared four premises, no two of them matched, and three
+fix passes went by. `--premise-decidable no` is what brakes that cycle at the
+first pass, because the answer is a fact about the runtime rather than a fact about
+the sentence you chose.
 
 If the brief gave you no register path, say so in your write-up rather than
 inventing one: an undeclared fix pass is **unescalatable** — nothing can brake it

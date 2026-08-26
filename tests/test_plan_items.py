@@ -20,7 +20,10 @@ coordination primitive rather than a to-do list in a table:
   by everyone remembering: one open item per ref.
 * **"Not yet" is a fact.** A dependency blocks, a dropped one does not block
   forever, and a circular one is refused.
-* **Only a human reorders — and placing a new item is not reordering (#183).**
+* **Only a human DECIDES an order — and placing a new item is not reordering
+  (#183).** Since #478 a delegated agent may APPLY one a person asked for, and the
+  row records `derived` rather than `ordered` so the two never blur; the tests for
+  that live in `test_delegated_writes.py`.
   Permuting existing items is contested, so the sequence stays the human's, which
   is what stops it thrashing. Saying where a NEW item enters alters no existing
   pair's relative order, so an agent may do it — and `next` says out loud how much
@@ -509,7 +512,7 @@ async def test_a_claimed_item_cannot_be_claimed_after_it_is_done(client):
 
 # --------------------------------------------------------- only a human orders
 
-async def test_an_agent_may_not_reorder_the_plan(client):
+async def test_a_bearer_alone_may_not_reorder_the_plan(client):
     """Decision 1 of the issue, and the reason there is a `human` dependency at
     all: if any agent may reorder, the plan thrashes and stops being shared
     intent. The refusal says what to do instead."""
@@ -521,7 +524,11 @@ async def test_an_agent_may_not_reorder_the_plan(client):
                           json={"repo": repo, "order": [second["item_id"], first["item_id"]]},
                           headers=LAPTOP)
     assert r.status_code == 403
-    assert "human-only" in r.json()["detail"]
+    # The refusal names both ways through, because after #478 there are two: a
+    # person proved by the edge, or an agent holding its machine's delegated
+    # credential. A bearer on its own is still neither.
+    detail = r.json()["detail"]
+    assert "X-Agent-Elevated" in detail and "person" in detail
 
     ok = await client.post("/plan/reorder",
                            json={"repo": repo, "order": [second["item_id"], first["item_id"]]},
@@ -1271,7 +1278,10 @@ async def test_a_human_ordering_the_list_is_what_makes_next_confident(client):
 
     plan = await read(client, repo, exact="true")
     assert plan["order_trust"] == {"trusted": True, "by_source": {"ordered": 2},
-                                "unchosen": 0, "first_unchosen": None, "hint": None}
+                                "unchosen": 0, "first_unchosen": None, "hint": None,
+                                # #478: counted beside `unchosen`, never inside it,
+                                # and zero here because a PERSON did this reorder.
+                                "derived": 0, "derived_hint": None}
     assert plan["next"]["caveat"] is None
     assert plan["next"]["rank_source"] == "ordered"
 

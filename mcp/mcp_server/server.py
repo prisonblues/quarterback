@@ -135,12 +135,18 @@ async def app_lifespan(server: FastMCP):
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
     if not base_url:
         raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
+    # This machine's DELEGATED credential, for the narrow set of writes
+    # `app.auth.delegated` names (#478). Optional: absent, those two tools refuse
+    # with the remedy and every other tool is unaffected. It goes to the same
+    # agent host as everything else — see `qb-mcp` for where it is exported.
     client = QuarterbackClient(
         base_url,
         token,
         key=resolve_key(),
         requested_name=resolve_requested_name(),
         session=resolve_session(),
+        elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
+        elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
     )
     try:
         yield AppContext(client=client)
@@ -197,7 +203,8 @@ mcp = FastMCP(
         "**Is that order still right?** plan_order(repo=...) — the order the "
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
-        "labelled derived or ambiguous. Advisory: only a human can apply it.\n\n"
+        "labelled derived or ambiguous. Advisory: applying it is `plan_reorder`, "
+        "which needs a delegated credential and a person who asked.\n\n"
         "## What is waiting on what (#294)\n"
         "**Before you pick up a PR, and before you spend a review round on one:** "
         "landing_graph() — what still gates each node, what landing it would free, "
@@ -1252,10 +1259,13 @@ def plan_order(ctx: Context, repo: str | None = None) -> dict:
     query is #101 and not written yet. Absent evidence is never good news, and it
     is listed rather than left to be inferred.
 
-    **You cannot apply this.** `apply` in the response names the one call that
-    puts an order into force (`POST /plan/reorder`) and it is human-only. If you
-    disagree with a placement, say so on the board addressed to whoever is
-    deciding — the ordering is advisory in both directions.
+    **This is advisory and applying it is a separate, deliberate act.** `apply` in
+    the response names the call that puts an order into force
+    (`POST /plan/reorder`), which is `plan_reorder` — available to you only with a
+    delegated credential and only when a person asked for a sort (#478). Nothing
+    here is permission to run it: the ordering is advisory in both directions, and
+    if you disagree with a placement, say so on the board addressed to whoever is
+    deciding.
 
     Args:
         repo: the scope, EXACTLY — omit for the fleet-wide list. Unlike
@@ -1584,6 +1594,95 @@ def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
             "depends", {"item_id": item_id, "depends_on": depends_on})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_depends")
+
+
+@mcp.tool()
+def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dict:
+    """Put an order into force. **A human's decision, which you may be asked to apply.**
+
+    `plan_order` computes what the rules imply and cannot apply it; this is the
+    call that does. It goes to the ordinary board host with your bearer, carrying
+    your machine's own `QUARTERBACK_ELEVATED_TOKEN` beside it — without one it
+    refuses before spending a request and names the missing credential.
+
+    **It does not make you a person.** The order lands authored by you and
+    recorded as `rank_source: "derived"`, so nothing can mistake it for a sequence
+    somebody typed, and every other write `human` gates stays shut to you (#478).
+
+    **Only when you were asked.** #479 is the standing record of what this door is
+    deliberately open wider than the boundary it crosses, and the thing it is
+    open for is a person saying "sort it". Reordering because you formed an
+    opinion is the failure `app/api/plan.py` rule 3 describes: *"two agents
+    disagreeing about whether #80 outranks #83 and rewriting each other is how
+    the plan stops being the shared intent it exists to be."* Nothing here can
+    stop you; that is the point of the issue, not permission.
+
+    Two things worth doing every time, because nothing enforces either:
+
+    * **Start from `plan_order`.** Its `apply.body.order` is already this
+      argument's shape, and its `basis`/`reasons` are how anybody checks the
+      result afterwards. Read `counts` first — on a plan of unstarted issues
+      `preference` is often 0 and `interchangeable` near-total, which means the
+      dependency graph pinned the ends and the human's priorities are doing the
+      real work.
+    * **Say on the board that you did it, and on whose say-so.** The row records
+      `derived` and who wrote it, which says an agent applied this — it cannot say
+      WHO asked, and that half is only ever in your post.
+
+    Args:
+        order: item ids, in the order wanted. Items in scope you leave out keep
+            their relative order and follow the listed ones; the reply names them
+            in `appended`.
+        repo: the scope, EXACTLY — `owner/name` or `project:<name>`. Omit for the
+            fleet-wide list. This is not widened for you: passing the wrong scope
+            reorders a different list.
+    """
+    try:
+        return _get_client(ctx).plan_reorder({"repo": repo, "order": order})
+    except RuntimeError as e:
+        raise ToolError(f"plan_reorder: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_reorder")
+
+
+@mcp.tool()
+def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
+                     note: str | None = None, plan: str | None = None,
+                     state: str | None = None) -> dict:
+    """Retitle or re-reason one item. Same delegated credential as `plan_reorder`.
+
+    The verb for a note that has gone stale — the common case and the honest one:
+    an agent writes an item's reasoning when it adds it, the issue then moves on,
+    and until this tool existed nobody could correct the note but a person in a
+    browser. Correcting your own reasoning overrides no one.
+
+    **`title` and `note` are what a delegated credential may set.** `state` and
+    `plan` are both refused for you (#478): "a person decided it should not" is what dropping
+    means, and an agent deciding that about work it might be the one avoiding is
+    the self-approval shape one field over. A `note` carrying the review-exemption
+    marker is refused for the same reason and points you at
+    `POST /plan/item/exempt`, which records a request instead (#335).
+
+    Args:
+        item_id: the item.
+        title: replace the title. Blank is refused.
+        note: replace the reasoning. This is the field worth using.
+        plan: move it to a named plan; "" detaches it from the one it is in.
+            Refused unless the caller is a person — detaching an item from a plan
+            somebody is holding is a decision, not a correction.
+        state: "open" or "dropped" — refused unless the caller is a person.
+    """
+    body: dict = {"item_id": item_id}
+    for key, value in (("title", title), ("note", note),
+                       ("plan", plan), ("state", state)):
+        if value is not None:
+            body[key] = value
+    try:
+        return _get_client(ctx).plan_item_update(body)
+    except RuntimeError as e:
+        raise ToolError(f"plan_item_update: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_item_update")
 
 
 @mcp.tool()

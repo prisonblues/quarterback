@@ -354,6 +354,11 @@ const RANK_WHY = {
   // rather than a present state: the row outlives the claim that made it, so a
   // lapsed pickup still reads truthfully as "somebody picked this up".
   "picked-up": "an agent claimed the work, so the board put it on top — in flight, not ranked above what is below it",
+  // Two sources in one sentence, and both halves have to be there: a rule
+  // supplied the sequence and a person asked for it. Neither alone is what
+  // happened, and "an agent did this" without the instruction reads as an agent
+  // that decided.
+  derived: "an agent applied this order on somebody's instruction, computed from the plan's own rules — asked for by a person, not typed by one",
 };
 // A source this page has no sentence for is an UNKNOWN, and an unknown may not be
 // rendered as one of the answers. Left to `|| ""` it came out as no explanation at
@@ -390,7 +395,7 @@ function rankWhy(it){
 // chosen. The model settles it: "each submission leaves exactly one position
 // nobody chose", which is the batch's FIRST item, and that one is `appended`.
 // The rest had their order picked by the submitter.
-const RANK_CHOSEN = new Set(["ordered", "placed", "picked-up", "submitted"]);
+const RANK_CHOSEN = new Set(["ordered", "placed", "picked-up", "submitted", "derived"]);
 function rankClass(it){
   if(!(it.rank_source in RANK_WHY)) return " unclear";
   return RANK_CHOSEN.has(it.rank_source) ? " chosen" : "";

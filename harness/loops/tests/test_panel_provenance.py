@@ -904,3 +904,112 @@ def test_a_round_that_could_attribute_NOTHING_says_nothing_rather_than_zeroes(
     assert r2["provenance_counts"] == {"introduced": 0, "missed": 0,
                                        "missed-unread": 0, "unknown": 1}
     assert "of those:" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# What the number now DOES (#489)
+#
+# The tally above was measured, recorded and printed for six releases and read by
+# nothing — deliberately, and `panel.py` says so in as many words: #67 asks for the
+# instrument before the gate, and "a few dozen cycles of it are what would justify
+# wiring it to anything". `escalate_on.fix_injection` is that gate arriving, and
+# these two tests are the seam it arrived on. Everything either side of it is
+# covered in `test_panel_injection.py` — the dial, the arithmetic and the stop rule —
+# and what is only coverable HERE is that `run()` computes the tally BEFORE the
+# verdict that consumes it. The block used to sit below `round_stop`, and could,
+# because nothing read it.
+# --------------------------------------------------------------------------
+
+def test_a_round_whose_findings_are_mostly_its_own_damage_ends_the_cycle(
+        monkeypatch, tmp_path):
+    """Four findings new to round 2, three of them on lines the round-1 fix wrote.
+    Under rule 1 alone that is four reasons to go again; under the gate it is the
+    fix pass generating the work, and the cycle ends saying so.
+
+    The `reason` is the load-bearing assertion. Every one of these findings is a P2,
+    so without the gate this round goes again and hits the cap — and "round cap (2)
+    reached" sends a reader looking for a bigger cap, which is the one remedy that
+    makes this failure worse."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                         head="bbb222", baseline=[r1_path])
+
+    assert r2["provenance_counts"] == {"introduced": 3, "missed": 1,
+                                       "missed-unread": 0, "unknown": 0}
+    # The `stop_reason` first, because it is what the defect looked like: before the
+    # gate this round said "round cap (2) reached — 4 finding(s) no earlier round
+    # raised, unreviewed", three of those four findings having been written by the
+    # round-1 fix pass.
+    assert "round cap" not in r2["stop_reason"]
+    assert "introduced by the fix pass before this round" in r2["stop_reason"]
+    assert r2["round_stop"]["stop"] is True
+    assert r2["round_stop"]["confident"] is False
+    assert any("escalate_on.fix_injection" in v for v in r2["round_stop"]["veto"])
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["introduced"], got["new"]) == (3, 4)
+    assert (got["rate"], got["over"]) == (0.75, True)
+    # The human half. `jq .round_stop` is what an orchestrator reads; this is what a
+    # person reads off the PR comment, and the printed "N introduced" line above it
+    # cannot say that a threshold was crossed.
+    assert any("fix_injection" in n and "the cycle ends here" in n
+               for n in r2["config_notes"])
+
+
+def test_a_round_that_mostly_found_what_the_last_one_MISSED_is_not_diverging(
+        monkeypatch, tmp_path):
+    """The other side of the same seam, and the one that keeps the gate honest. Four
+    new findings, one of them on the fix pass's own lines: the earlier round
+    under-read, which argues for more coverage and not for stopping. The cycle ends
+    on the cap, as it always did, and the rate rides in the payload saying why it did
+    not fire."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw"),
+                          ("app/sync.py", 91, "and another one beside it"),
+                          ("app/sync.py", 92, "and a third")],
+                         head="bbb222", baseline=[r1_path])
+
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["introduced"], got["new"]) == (1, 4)
+    assert (got["rate"], got["over"]) == (0.25, False)
+    assert "round cap (2) reached" in r2["stop_reason"]
+    assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+
+
+def test_a_round_that_stops_UNDER_A_FLOOR_is_not_told_it_stopped_on_divergence(
+        monkeypatch, tmp_path):
+    """The integration half of `over` vs `fired`, and the one a unit test cannot
+    reach: `run()` writes the human-readable note, and gating it on the MEASUREMENT
+    rather than on the VERDICT puts "the cycle ends here" in `config_notes` under a
+    `reason` that names a policy floor and a `confident: true` beside it.
+
+    Both floors are raised to P1 so this round's P2s buy nothing and clear nothing:
+    the cycle stops under #165's trigger floor, which is a policy stop that is
+    deliberately NOT vetoed. Three of its four new findings were still written by the
+    fix pass, so the rate is over the threshold and has to say so in the payload —
+    and say nothing anywhere else."""
+    cfg = {**CFG, "review_panel": {"fix_severity_floor": "P1",
+                                   "round_trigger_floor": "P1"}}
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111",
+                              cfg=cfg)
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                         head="bbb222", baseline=[r1_path], cfg=cfg)
+
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["over"], got["fired"]) == (True, False)
+    assert "round trigger floor" in r2["stop_reason"]
+    assert r2["round_stop"]["confident"] is True
+    assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+    assert not any("fix_injection" in n for n in r2["config_notes"])

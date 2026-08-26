@@ -720,6 +720,64 @@ DEFAULTS: dict = {
         # whole grown PR, so the same number means "the fix is 3x the change" in one
         # and "the PR tripled" in the other. Both are the thing worth stopping for.
         "max_fix_growth": 3.0,
+        # The ABSOLUTE half of that same ceiling, and the two bind at whichever is
+        # crossed FIRST (#492). Chars the PR may GROW past the size the cycle's first
+        # round read it at.
+        #
+        # **A pure multiple hands its rope out in proportion to the starting size**,
+        # so the absolute growth it permits is largest exactly where a ceiling is most
+        # wanted. At 3.0x a 113-line PR may grow ~226 lines before the check fires and
+        # a 2,000-line one may grow 4,000 — four thousand lines of fix-pass output on
+        # a change that was already large, waved through by the same dial that stops
+        # the small one at 226. "A fix pass that MULTIPLIES the diff has written a
+        # second change" is a claim about ABSOLUTE second-change-ness, and one
+        # multiple cannot express it at both ends of the range.
+        #
+        # **Chars, and the unit is in the name.** The field report asked for lines;
+        # this counts chars because the ceiling beside it already does — `max_fix_growth`
+        # divides `pr_chars` by the first round's `pr_chars` — and two halves of one
+        # ceiling read off two different measurements is #298's defect one level up: a
+        # numerator taken from a different string than the denominator, reading as
+        # configured and stopping nothing. A churned-line count also does not EXIST on
+        # any baseline written before this key did, so a `_lines` dial would decline to
+        # run on every cycle already in flight and on every payload behind it, which is
+        # #169's failure — a mechanism that ships unwired. Chars is the unit
+        # `max_diff_chars`, `judge_max_diff_chars` and `ask_max_context_chars` are
+        # already in, so a reader of this block is not being asked to hold two.
+        #
+        # **30,000, and the conversion is measured rather than assumed.** PR #188's own
+        # diff is 34,717 chars over 521 churned lines — 66 chars a line — and this
+        # repo's last 25 commits run 52-94 with a median near 78, larger diffs running
+        # leaner. So 30,000 is roughly 380-450 churned lines of GROWTH. Against the two
+        # runaways this repo has actually measured: #188 went 185 -> 721 churned lines,
+        # a growth of 536 (~35,000 chars at its own 66), and #236 went 359 -> 2,313, a
+        # growth of 1,954 (~129,000). Both stop, with margin. The 113-line cycle in
+        # #492 grew ~122 lines and does NOT stop here, correctly — that is the "binds a
+        # round late" half of the report, which no absolute floor can reach, and
+        # `guard_ratio` is the earlier signal filed for it.
+        #
+        # **It can only ever TIGHTEN — and that is the narrow claim, not a wider one.**
+        # Crossed-first means both numbers are ceilings, so no value of this key lets
+        # through a cycle 3.0x would have caught. It does NOT follow that the multiple
+        # would eventually have caught what this stops: a 2,000,000-char PR that grows
+        # by 30,001 chars sits at 1.02x and may never approach 3.0x at all, and
+        # catching exactly that is the point — a proportional ceiling can permit that
+        # growth permanently. So this stops cycles the multiple never would, and lets
+        # through none that it would. That is also what makes it cheap to reverse:
+        # `null` switches this half off and restores the pre-#492 behaviour exactly,
+        # and `null` on both is no growth check at all, as it was before either
+        # existed.
+        #
+        # **A second key rather than a two-part `max_fix_growth` value**, which is the
+        # open question #492 left. A pair would avoid a fifth growth-adjacent name in a
+        # block already near 25 keys, and it would cost more than that saves:
+        # `BOARD_DIALS` types this dial as a scalar `number` and the board's column
+        # stores one JSON value per dial, so a pair needs a new shape at both ends; and
+        # `null` is already the documented off switch for `max_fix_growth`, so a pair
+        # would have to answer which half a bare `null` switches off. Two keys, two
+        # nulls, two independent answers, and either one settable from the board on its
+        # own.
+        "max_fix_growth_chars": 30_000,
         # What a reviewer is asked to look FOR. `diff` asks for defects in the
         # change under review, and surfaces anything outside it as an observation
         # rather than as a finding a fix round must clear. `repo` is today's
@@ -818,7 +876,95 @@ DEFAULTS: dict = {
         # (`require_failing_test`'s precedent): a governance switch believed to be on
         # and quietly off is the loudest possible way to make a process look
         # governed.
-        "escalate_on": {"premise_repeated": 2},
+        #
+        # `premise_undecidable` (#491) is the second one built, and it brakes on the
+        # FIRST declaration rather than the second — which is not the inconsistency it
+        # looks like. `premise_repeated` counts occurrences because one declaration
+        # says nothing: a fix written against a premise is ordinary, and only the
+        # repeat is evidence. `premise_undecidable` is not counting anything. It fires
+        # on a fixer's own answer to a specific question — *can the runtime this
+        # assertion runs in observe the property you are asserting?* — and a `no`
+        # there is already the whole finding. Every fix for such a property is an
+        # approximation of it, the next round finds the gap between the approximation
+        # and the property, and the round count is unbounded by construction. Waiting
+        # for a second one buys a fix pass and a panel to confirm what the first
+        # answer said.
+        #
+        # **This is what `premise_repeated` cannot see, and #491 is the measurement.**
+        # A fixer that replaces one proxy with a better one declares a genuinely
+        # different premise every round, honestly — four were declared on one cycle
+        # and no two matched, so the occurrence counter never reached 2 while three
+        # fix passes circled one undecidable property. Comparing declaration TEXT
+        # cannot close that (`same_premise` says so, and #84 rules out building a
+        # similarity heuristic); asking one more question of each declaration can.
+        #
+        # `false`/`null` switches it off, for a repo that would rather a fixer
+        # approximate than stop. Unlike `premise_repeated` there is no number: the
+        # answer it reads is a fixer's `yes`/`no`, and an occurrence count over it
+        # would be counting how many times somebody said the same `no`.
+        # #489's second brake, and the FIRST gate this codebase has put on a
+        # provenance number. `fix_injection` is the fraction of a round's new
+        # outstanding findings that `panel_scope._provenance` attributed to the
+        # previous fix pass; a round above it ends the cycle, with a veto line and
+        # `confident` false. More than half a round's news being the fix pass's own
+        # damage means `round_stop`'s rule 1 — new findings buy another round — is
+        # being fed by the loop's own output, and a termination test fed by its own
+        # output can only end on the cap.
+        #
+        # **The instrument came before the gate, deliberately, and this is the
+        # calibration arriving.** `panel.py`'s comment beside the #67 tallies states
+        # the withholding in as many words: nothing reads these tallies to stop a
+        # run, #67 asks for the instrument before the gate, "two pull requests in one
+        # day is an observation, not a calibrated rule", and "a few dozen cycles of
+        # it are what would justify wiring it to anything". The cycles are in. 128 of
+        # 201 new findings across the seven PRs in `round_stop`'s docstring were
+        # created by the fix pass immediately before them; 39 of 53 after round 1 on
+        # PR #299, and 17 of 17 in its round 2; 64% then 87% on the cycle #489 was
+        # filed from, over a PR whose actual change was 113 lines. Every one of those
+        # is far above 0.5 and every one of those cycles ran to its cap.
+        #
+        # What is still NOT calibrated is where a HEALTHY cycle sits, which is the
+        # number that decides the false-positive rate. So the rule is built so that
+        # a false positive costs as little as it can — see the three properties under
+        # "on by default" — and `null` switches it off in one line.
+        #
+        # **0.5, read strictly: MORE than half.** Not a percentile off a curve nobody
+        # has; the defence of the number is that it is the point where the fix pass is
+        # generating more of the round's work than the pull request is, which is a
+        # threshold with a meaning. It is also the safe end of a measurement
+        # documented as a FLOOR: `_provenance` under-counts `introduced` in both
+        # directions — a defect a fix introduced by DELETING a guard has no added line
+        # to sit on, and `introduced` needs exact membership in the added lines while
+        # LLM reviewers and Sonar routinely report a line or two off — so a measured
+        # 0.64 is at least 0.64, and a threshold crossed is genuinely crossed.
+        #
+        # **ONE round, not two consecutive.** The field report proposed "two
+        # consecutive rounds over the threshold" and it cannot work: provenance is
+        # only attributable from round 2 (round 1 has no preceding fix), so a
+        # two-round rule cannot fire before round 3, and `max_rounds` above defaults
+        # to 2. Two-consecutive would ship switched off for every repo on the shipped
+        # defaults and fire only for the ones running `--loop`. A brake that is off
+        # wherever it was not configured is the `require_failing_test` failure with
+        # the honesty removed.
+        #
+        # **On by default, like `premise_repeated` and unlike #78's other switches**,
+        # and three properties earn it:
+        #   - it can only ever turn a `go again` into a STOP, never the reverse, so
+        #     no value of it can make a review look cleaner than it is;
+        #   - under the shipped `max_rounds: 2` the only round it can fire on is the
+        #     one the cap would have ended anyway. What a default-on costs a repo on
+        #     the defaults is therefore a better `reason` and one more veto line, not
+        #     an earlier finish — and it bites where the loop actually runs away, in
+        #     a repo that raised the cap or drives `--loop`;
+        #   - a false positive costs one printed question, which is #67's own
+        #     required output and the cheap failure; a false negative is #299's
+        #     five-round cycle, which nothing stopped.
+        #
+        # `panel_rounds.FIX_INJECTION_MIN_NEW` is the other half of the rule and is a
+        # constant rather than a dial: a rate over two findings is not a rate, and a
+        # second number nobody can calibrate is worse than one documented floor.
+        "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
+                         "fix_injection": 0.5},
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -1950,9 +2096,11 @@ class Dial(NamedTuple):
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
-    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated` and
+    for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
+    `escalate_on.premise_repeated`, `escalate_on.fix_injection` and
     `max_diff_chars`, and means "inherit the default" for everything else — so a
-    dial that took `null` generally would have one written value with two meanings.
+    dial that took `null` generally would have one written value with two
+    meanings.
 
     `rule` is the direction, and it is the one place this layer and #276's throttle
     genuinely differ:
@@ -2011,6 +2159,10 @@ BOARD_DIALS: dict[str, Dial] = {
     # #297's budget for the band between them, and #298's growth ceiling.
     "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
     "review_panel.max_fix_growth": Dial("number", True, "either"),
+    # #492's absolute half of that ceiling. Settable on its own and nullable on its
+    # own, which is the whole reason it is a second key rather than a pair inside the
+    # one above.
+    "review_panel.max_fix_growth_chars": Dial("number", True, "either"),
     # What a cycle costs: how many rounds, how much of the change each seat reads,
     # how much diff it is handed, and whether a second model adjudicates.
     "review_panel.max_rounds": Dial("number", False, "either"),
@@ -2021,6 +2173,11 @@ BOARD_DIALS: dict[str, Dial] = {
     # #278's dial, and #84's futility brake.
     "review_panel.distant_merge_lines": Dial("number", True, "either"),
     "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
+    "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either"),
+    # #489's injection gate, `nullable` for its sibling's reason: `null` is how a
+    # repo switches a futility brake off, and a board that could move the number but
+    # not turn it off would be a channel with half a policy in it.
+    "review_panel.escalate_on.fix_injection": Dial("number", True, "either"),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are

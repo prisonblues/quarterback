@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from collections.abc import Iterable, Iterator
 
 import httpx
+
+#: The header a delegated agent presents (#478). Must match
+#: ``app.auth.ELEVATED_HEADER``; the two live in different repos' worth of
+#: distance, so the name is stated once on each side and the tests pin it.
+ELEVATED_HEADER = "X-Agent-Elevated"
 
 
 def _decode_frame(data: list[str]) -> dict | None:
@@ -77,6 +83,8 @@ class QuarterbackClient:
         requested_name: str | None = None,
         session: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        elevated: str | None = None,
+        elevated_cmd: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
@@ -91,6 +99,17 @@ class QuarterbackClient:
             headers["X-Agent-Key"] = key
         if requested_name:
             headers["X-Agent-Name"] = requested_name
+        # This machine's DELEGATED credential (#478), for the narrow set of writes
+        # `app.auth.delegated` names. It goes to the ordinary agent host beside the
+        # bearer — it is a client-supplied credential like the bearer, not an
+        # edge-injected proof like `Remote-User`, so the edge neither supplies it
+        # nor strips it and no vhost change is involved.
+        #
+        # Resolved LAZILY and never here: the command is usually `op read`, which
+        # can prompt, and this client is constructed once per MCP session on every
+        # session start — to serve two tools a session will probably never call.
+        self._elevated = elevated or None
+        self._elevated_cmd = elevated_cmd or None
         # A TRANSPORT is injected, never a client, and this is round 2's third
         # P2. The parameter used to take an httpx.Client and call
         # `.headers.update()` on it — which mutates an object the caller owns, so
@@ -108,6 +127,106 @@ class QuarterbackClient:
 
     def close(self) -> None:
         self._http.close()
+
+    # -------------------------------------------------------------- delegated
+
+    #: What to tell a caller with no credential. Long because it is the whole
+    #: remedy: this fails on every unprovisioned box, and a bare 403 would send
+    #: somebody to the board's auth code instead of to their own config.
+    NO_CREDENTIAL = (
+        "this call needs a delegated credential and this host has none. Set "
+        "QUARTERBACK_ELEVATED_TOKEN, or QUARTERBACK_ELEVATED_TOKEN_CMD to a "
+        "command that prints it (the fleet resolves it from 1Password, per "
+        "machine). It is not the board bearer and not a person's session."
+    )
+
+    def _resolve_elevated(self, refresh: bool = False) -> str | None:
+        """This machine's delegated secret, from the literal or from the command.
+
+        ``refresh`` re-runs the command past any cached value, which is what a 403
+        means here: a secret that authenticated yesterday is exactly what is stale
+        after a rotation. Same *reasoning* as ``QUARTERBACK_TOKEN_REFRESH_CMD`` —
+        "the cached copy is exactly what is stale" — but not the same mechanism and
+        there is no ``_REFRESH_CMD`` of its own: this re-runs the ONE command it
+        has, which is enough because `op read` goes to the store every time. A
+        second variable would only matter for a resolver that caches internally.
+        """
+        if self._elevated and not refresh:
+            return self._elevated
+        if not self._elevated_cmd:
+            return self._elevated
+        try:
+            done = subprocess.run(self._elevated_cmd, shell=True, check=False,
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            # UnicodeDecodeError because `text=True` decodes the command's stdout:
+            # a secret store that emits a stray byte would otherwise raise out of
+            # a credential lookup rather than reporting "no credential".
+            done = None
+        # The EXIT CODE decides, not the presence of output. `op` prints
+        # diagnostics to stdout on some failures, so a non-zero run that wrote
+        # something would otherwise be adopted as a credential — and the symptom
+        # would be a 403 nobody could explain, from a value that never was one.
+        value = ""
+        if done is not None and done.returncode == 0:
+            # First line only, exactly as `qb_resolve_token` trims: a store that
+            # prints a warning after the value must not put it in a header.
+            value = done.stdout.split("\n", 1)[0].strip()
+        if value:
+            self._elevated = value
+        elif refresh and self._elevated_cmd:
+            # A refresh that produced nothing means the cached value is all there
+            # is AND it has already been refused once. Keeping it would let
+            # `_delegated_post`'s truthiness check pass and replay the same
+            # rejected secret; dropping it turns the next call into the
+            # actionable "no credential" refusal instead of a second 403.
+            #
+            # Guarded on there BEING a command, so an operator-configured literal
+            # (`QUARTERBACK_ELEVATED_TOKEN`) is never discarded: nothing can
+            # re-derive it, so dropping it would turn one bad request into a
+            # client that is permanently credential-less until the process
+            # restarts. `_delegated_post` only refreshes when a command exists
+            # anyway; this makes the invariant local rather than remote.
+            self._elevated = None
+        return self._elevated
+
+    def _delegated_post(self, path: str, body: dict) -> dict:
+        """POST to the agent host, carrying this machine's delegated credential.
+
+        The same host and the same bearer as every other call — only one extra
+        header. A missing credential is refused BEFORE the request, because that
+        is one setup step rather than an answer about what was asked.
+        """
+        if not self._resolve_elevated():
+            raise RuntimeError(self.NO_CREDENTIAL)
+        resp = self._send_delegated(path, body)
+        # One retry, and only for the 403 that is actually about the credential.
+        # A 403 here can equally be the board refusing the ACT — dropping an item,
+        # writing an exemption marker — and re-reading 1Password to ask again is
+        # both useless and misleading: it turns a clear "you may not" into two
+        # identical refusals with a secret-store round trip between them. The
+        # board names the header in the credential case (see `delegated()`), so
+        # that is what to match on.
+        if (resp.status_code == 403 and self._elevated_cmd
+                and ELEVATED_HEADER in resp.text
+                and self._resolve_elevated(refresh=True)):
+            resp = self._send_delegated(path, body)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _send_delegated(self, path: str, body: dict) -> httpx.Response:
+        """One POST with whatever secret is current — split out so the retry above
+        re-reads the header rather than reusing a stale one."""
+        return self._http.post(self._url(path), json=body,
+                               headers={ELEVATED_HEADER: self._elevated or ""})
+
+    def plan_reorder(self, body: dict) -> dict:
+        """``POST /plan/reorder`` — put an order into force. Delegated (#478)."""
+        return self._delegated_post("/plan/reorder", body)
+
+    def plan_item_update(self, body: dict) -> dict:
+        """``POST /plan/item/update`` — retitle, move, re-reason, drop. Delegated."""
+        return self._delegated_post("/plan/item/update", body)
 
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"

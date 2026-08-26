@@ -172,9 +172,11 @@ Four properties, each closing a failure the two file layers have:
 **Which dials, and the one boundary case.** The settable set is
 `harness_rules.BOARD_DIALS`, and it is the dials whose value is a judgement about
 **cost** rather than about capability: both floors, `low_severity_fix_lines`,
-`max_fix_growth`, `max_rounds`, `reviewer_scope`, `max_diff_chars`,
-`judge_max_diff_chars`, `judge_model`, `distant_merge_lines` and
-`escalate_on.premise_repeated`. Everything that decides what may be **merged** —
+`max_fix_growth`, `max_fix_growth_chars`, `max_rounds`, `reviewer_scope`,
+`max_diff_chars`, `judge_max_diff_chars`, `judge_model`,
+`distant_merge_lines`, `escalate_on.premise_repeated`,
+`escalate_on.premise_undecidable` and `escalate_on.fix_injection`.
+Everything that decides what may be **merged** —
 `auto_merge`, the `epic` and `preland` blocks, title patterns, the loop schedule —
 stays in the sample, for the reason the overlay refuses the same set.
 
@@ -307,11 +309,13 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.fix_severity_floor` | Severity a fix round is asked to clear, at or above. **`P3`**. Below it a finding is reported, marked 🔽 under its own heading, recorded (`below_fix_floor` in the payload) and **not fixed**. The measured cut is at P2 (67.3% of findings, zero P1s lost) and this deliberately sits a tier below it: severity is model-authored, and the class a P2 floor misses is correctness expressed as craft — a missing regression test on a parser or an auth boundary, a missing timeout or cleanup, a migration rollback gap. Fixing one in a pass already open is one edit; P4 (31.3%, the tier that ballooned #236) stays out. `P4` fixes everything, the pre-#165 behaviour — for `round_stop`'s rules 1 and 3; rule 2's bar is a hardcoded `("P1", "P2")` and only `P1` moves it. A Sonar hard-gate issue is exempt from both floors at every rule. |
 | `review_panel.round_trigger_floor` | Severity a NEW finding needs to buy another round. **`P2`** — a tier above `fix_severity_floor`, because letting a P3 buy a round costs a whole panel plus another fix pass where fixing it in the open pass costs one edit. Below-floor new findings are still reported and recorded; `round_stop`'s reason names the floor and the count. `P4` is the pre-#165 behaviour. |
 | `review_panel.low_severity_fix_lines` | Churned lines the WHOLE round may spend fixing findings below `round_trigger_floor` — at the shipped floors, the P3 band. **40**. Spent cheapest-first and COUNTED (`git diff --numstat` after each fix), never estimated; what it does not reach is reported and recorded exactly like a below-floor finding. The measurement: PR #188's feature was 185 churned lines and two fix passes made it 721 — **74% of the PR was review-response code** — with round 2's fix list 89% below P2, and on #268 85% of round-2 findings were created by the round-1 fix pass. A budget and not a per-fix cap, because #188's round 1 was 408 lines of individually reasonable small fixes that any per-fix cap waves through; and not a higher floor, because a genuinely cheap correctness-adjacent fix is still worth taking while the pass is open. `0` fixes none of the band (the applied floor becomes the cut, and the report says so); `null` is no budget at all, the pre-#297 unconditional behaviour. While a budget is in force, `round_stop`'s repeat rules are bounded at the cut rather than at the fix floor — an unpaid budgeted finding is outstanding by construction, exactly as a below-floor one is. |
-| `review_panel.max_fix_growth` | Multiple of the cycle's FIRST round's reviewed size that a later round may review before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. |
 | `review_panel.max_fix_growth` | Multiple of its size at the cycle's FIRST round that the PR may grow to before the cycle stops and says the change wants splitting. **3.0**; `null` switches the check off (the one key here where `null` is not "inherit"). Not dressed up as convergence — it takes a veto line and `confident` is false. **Both ends are whole-PR sizes whatever `round_scope` is** (#298): that dial decides what the reviewers are asked to *look at*, this one asks how big the change has *become*. Measured on the review target it compared one round's fix commit against the cycle's whole-PR starting size, and PR #188 reached 3.90x — 185 → 593 → 721 churned lines — without the guard firing. `pr_chars` in the payload is the number both ends are read from. |
+| `review_panel.escalate_on.fix_injection` | Fraction of a round's **new outstanding findings** that may have been INTRODUCED by the previous fix pass before the cycle ends. **0.5**, read strictly — more than half a round's news being the fix pass's own damage means `round_stop`'s rule 1 is being fed by the loop's own output, and a termination test fed by its own output can only end on the cap. `null` switches it off (the second key here where `null` is not "inherit"). Not dressed up as convergence: a veto line naming the dial, `confident` false, and a `reason` saying a human answers it. **It can only turn a `go again` into a stop**, never the reverse — a dry round, a below-floor policy stop and a round holding an escalation all keep the reason they earned. **And only the round RULE 1 was buying**: a round going again under rule 2 (a P1/P2 or a Sonar gate issue outstanding) or rule 3 (a finding an earlier round already raised) is going again for work the fix pass FAILED to do, not work it generated, so a rate over four below-floor findings cannot cancel the repair round for an unrelated P1. That is where it parts from #84's brake, which fires at any of the four rules: a repeated premise is a fixer's own declaration, and this is a threshold on a statistic. The payload therefore carries **`over`** (the measurement crossed) and **`fired`** (this rule is why the cycle stopped) apart — reading the first as the second attaches "ended on divergence" to a confident, converged round. **One round, not two consecutive**: provenance is only attributable from round 2 and `max_rounds` defaults to 2, so a two-round rule could never fire on the shipped defaults. Under those defaults it fires only on the round the cap would have ended anyway, so what it buys a repo that changed nothing is a better `reason` and one more veto line; it bites where the loop runs away, in a repo that raised the cap. The measurement: 128 of 201 new findings across seven PRs, 39 of 53 after round 1 on PR #299 (17 of 17 in its round 2), 64% then 87% on the cycle #489 was filed from — every one of them far above 0.5, and every one ran to its cap. `introduced` is a documented FLOOR and not a measurement (#48), which is what makes a threshold on it err safe: a measured 0.64 is at least 0.64. The unattributable buckets sit in the denominator for the same reason — they depress the rate, so a round the harness could not place does not end a cycle. `panel_rounds.FIX_INJECTION_MIN_NEW` (**4**) is the minimum denominator and is a constant, not a second dial: a rate over two findings is not a rate. One honest mismatch, recorded rather than fixed: the denominator is every new outstanding finding while the rules are applied to the CLEARABLE ones, so a cycle holding an escalation computes its rate partly over a finding no fix round may touch — the two are answers to different questions (what this round PRODUCED, and what the next one could DO about it) and are allowed to differ. Recorded every round as `round_stop.fix_injection` whether it fired or not. |
+| `review_panel.max_fix_growth_chars` | The ABSOLUTE half of that same ceiling (#492): chars the PR may **grow** past the size the cycle's first round read it at, with the cycle stopping on whichever of the two is crossed **first**. **30,000**; `null` switches this half off and leaves the multiple, and `null` on both is no growth check at all. A pure multiple hands its rope out in proportion to the starting size — at 3.0x a 113-line PR may grow ~226 lines and a 2,000-line one may grow 4,000, so the loosest allowance goes to the case most in need of a ceiling. Chars rather than lines because the multiple beside it already divides `pr_chars` by `pr_chars`, and two halves of one ceiling read off two different measurements is #298's defect one level up; 30,000 is ~380-450 churned lines at PR #188's own measured 66 chars a line, which stops #188's +536 and #236's +1,954 with margin. Both are ceilings, so the pair can only ever **tighten** — nothing it lets through would have been caught by the multiple alone. A repo that wrote `max_fix_growth: null` before #492 gets a `config_notes` line saying the other half is still in force and naming the key that finishes the job. |
 | `review_panel.reviewer_scope` | What a reviewer is asked to look for: **`diff`** (defects in the change and its seams; anything outside it is an observation) or `repo` (the pre-#165 wording — "search the codebase, don't just review the diff"). Not how hard anyone looks: every dimension stays in the prompt and a code-reading seat still reads the callers. |
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
 | `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins over it, and neither wins over the BOARD: a value the board states is a ceiling nothing below it may exceed (#55). This wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
+| `review_panel.escalate_on` | #78's reserved matters — the decisions the process may not take on its own. Two are built. `premise_repeated` (**2**) is the OCCURRENCE a declared premise is stopped on: the second time a fix is written against one premise, stop. `premise_undecidable` (**true**) stops on the FIRST declaration that answers `--premise-decidable no` — the property the fix asserts is not observable in the runtime the assertion runs in, so every fix for it is an approximation and no number of rounds converges (#491). The asymmetry is the point: one counts because a single declaration is not evidence, the other reads a fact about the runtime that a repeat cannot make truer. It exists because the counter is structurally blind to proxy-replacement — a fixer swapping one proxy for a better one declares a genuinely different premise each round, and one measured cycle declared four that no two of matched. `quorum_failed` and `judge_absent` are accepted, reported in `config_notes` and enforced by nothing. Merged one level deep, with a per-key fallback so writing one key does not switch the others off. |
 | `review_panel.budget` | #55's spend ceiling: `tokens_per_day`, `runs_per_day`, `tokens_per_pr`, `runs_per_pr`, `fleet_tokens_per_day`. **Every one `null` — no ceiling — which is what landing it did to every repo.** Checked against `GET /review/spend` *before any seat is dispatched*, and a repo at its ceiling is refused through the pre-flight's own machinery: printed, recorded with `reviewed: false` and a per-seat `ran: false`, posted to the PR, and carrying `stop_confident: false` so a budget stop cannot read as convergence. Tokens are input + output (`/review/stats`' `billable`); the run ceilings are what still binds where nothing was instrumented, and `runs_per_pr` is the one that binds a caller which renumbers its rounds. `0` is a real value and means nothing may be spent; `--force` overrides none of them. Board-settable, and the board's value beats this file's — a ceiling a repo can raise from inside itself is decorative. |
 | `review_panel.budget_window_hours` | What "per day" means for the two rolling ceilings. **24**. A dial rather than a constant because the window and the ceiling are one decision: halving the window halves the ceiling. The per-PR ceilings have no window — they are about one pull request's whole cost, and a rolling one would let a PR reviewed daily for a fortnight stay under a ceiling it passed on day two. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
@@ -647,7 +651,7 @@ upgrade at different times does not become a version pin; a value this harness c
 read is not version skew in any direction, it is a typo, and `fix_severity_floor: "p-4"`
 meaning "fix everything" must not quietly become the default and stop the pass fixing
 P3s. Unset — missing, `null`, `""` — is not a mistake and stays silent (and for
-`max_fix_growth` and `low_severity_fix_lines`, both of which distinguish an absent key
+`max_fix_growth`, `max_fix_growth_chars` and `low_severity_fix_lines`, all of which distinguish an absent key
 from a written one, an explicit `null` is the off switch).
 
 **What the round applied is in the artifact.** The report carries a
@@ -997,7 +1001,8 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
 - **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
   earlier round raised; `round_stop` in the payload then says go-again (something new,
   a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding
-  — SonarCloud's hard-gate issues included) or stop (dry / round cap), and whether
+  — SonarCloud's hard-gate issues included) or stop (dry / below a floor / a premise
+  declared twice / the fix pass generating the round's work / round cap), and whether
   stopping was *convergence*. The declarations never extend the loop — a truncated
   reviewer is truncated again next round — and the ones a blind seat makes no longer
   cost the stop its confidence either; what is left only stops a broken round being
@@ -1605,6 +1610,7 @@ Run-level fields worth knowing about because their meaning is conditional:
 | `since_sha` | the anchor the increment was taken from; null under `pr` scope |
 | `diff_chars` | the size of the **review target** — the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it: plotting this across a cycle's rounds without doing so shows a cliff at round 2 and reads as a shrinking PR |
 | `pr_chars` | the size of the **whole PR**, whatever this round reviewed — the same number as `diff_chars` under `pr` scope, and the PR's own size under `increment`. This is the line that does *not* cliff at round 2, and it is what `max_fix_growth` measures at both ends (#298). Under a `manifest` verdict both measure the manifest, which is what was sent |
+| `guard_ratio` | how much **apparatus** this change is carrying (#492): `{test, doc, source, guard, ratio}`, counting lines **added** on each side of the whole PR's diff, with `guard` = test + doc and `ratio` = guard / source. Present on every reviewed round including the **first**, which is the point — `max_fix_growth` needs a second round before it has a ratio at all, and the cycle this was filed from produced 406 lines of test for a 66-line config change. `ratio` is null where the change adds no source (undefined, not infinite); the whole field is null where the round measured nothing. **Reported and gating nothing** (#67) — it earns a threshold over a few dozen cycles or not at all |
 | `preflight` | the verdict the round was weighed against before it ran, on every exit that reached it: `verdict` (`run`/`manifest`/`refuse`), `reason`, `cap`/`cap_seat`/`cap_unit`/`over_cap`, `forced`/`would_have`, the `thresholds` in force, and `shape` (`chars`, `bytes`, `added`, `removed`, `moved`, `move_ratio`, `files`, plus `files_added_only`/`files_removed_only` — the one-sided file lists, capped at 40 paths each with a `_elided` count beside them, because this block rides in every board record and a 700-file refactor wrote 700 paths into each one). `cap_unit` is `chars` or `bytes` and says which reading of `shape` the `cap` and the `over_cap` beside it are in — a ratio a consumer cannot attribute to one of the two readings cannot be checked at all. `over_cap` is null when and only when no ceiling was declared: a measured ratio is emitted even where it rounds to 0.0, so "small against a real ceiling" and "no ceiling" stay different answers. **`null` means the run never reached the verdict** — the title-pattern skip returns before it — which is a different statement from a `run` verdict, and the difference is what answers "was this PR ever weighed?" |
 | `preflight.shape` | measured on the **review target**, so it is scope-dependent exactly as `diff_chars` is: the whole PR under `pr` scope, the increment under `increment`. Read `scope` beside it. Under a `manifest` verdict it is also the only place the target's *pre-substitution* size appears, because `diff_chars` then measures the manifest — which is what was reviewed |
 | `context_chars` | everything prepared *alongside* the target; 0 under `pr` scope. With `diff_chars` this is what an uncapped reviewer was given. Neither is a per-reviewer number — budgets are, so a seat that got less says so in `reviewers.<name>.max_diff_chars` and `.truncated`, and a seat that got the whole target and only part of the context is named in `config_notes` |
@@ -1652,6 +1658,83 @@ Its known biases, since the defence of a heuristic is that they are written down
 - **Sonar's hard-gate issues carry provenance and are counted with the rest.** They are PR-scanned
   — SonarCloud's new-code view — so the same reading holds; a Sonar issue that predates the PR
   would read `missed`, and that is the scanner's file scope rather than the panel's under-reading.
+
+### The cycle so far (#490): every round beside the others
+
+Every round's report used to state that round's own figures and nothing else, so a reader — human
+or orchestrator — had to hold three reports in their head and do the arithmetic to see which way a
+cycle was going. Read one at a time, a diverging cycle looks flat. This is the block that puts the
+rounds side by side, from round 2 onward:
+
+```
+round  findings  P1/P2  introduced  whole PR  vs r1
+   r1         8      2           —   113,402  1.00x
+   r2        14      5     9 (64%)   236,187  2.08x
+   r3        15      4    13 (87%)   340,341  3.00x
+```
+
+8 → 14 → 15 findings reads as converging. Against a PR that tripled on an underlying change of 113
+lines it is the opposite reading, and it was available from data every round already had — the
+cycle this comes from ran to its end before anyone computed it.
+
+| column | what it is |
+|---|---|
+| `findings` | that round's `to_fix` + `sonar_findings`, the population `outstanding` counts. `dismissed` is out: the master ruled those not real and no fixer will ever touch them. `?` where a bucket is present and is not a list of finding records — see below |
+| `P1/P2` | how many of them were at or above P2. An unreadable severity counts as severe, which is `severity_at_least`'s standing asymmetry — a row that under-states severity is a row that argues for another round |
+| `introduced` | that round's `provenance_counts["introduced"]`, and its share of that round's own findings. Three states, told apart by `attributed()`: `—` is round 1, where the question does not arise; `?` is a round that was asked and could not answer, meaning `unknown` was the only bucket with anything in it; and `0` is the round that attributed and had nothing to attribute — a round of repeats, or one with no findings. A failed attribution is never printed as `0`, which would be a claim about the fix pass made from a measurement that did not happen |
+| `whole PR` | `pr_chars`, the size of the **whole PR** whatever that round reviewed (#298). Never `diff_chars`, which under `increment` scope is one fix commit and would show the change shrinking exactly while it grows |
+| `vs rN` | that size over the size the cycle's **first reviewed round** found the PR at — `Baseline.first_reviewed`, which is `max_fix_growth`'s own denominator. One denominator, so the block's ratio and the ceiling's veto line are the same measurement; where it is missing the ceiling does not run either and the column says `?` rather than picking a substitute |
+
+A round that reviewed nothing (a title skip, a pre-flight refusal) prints `not run` and no numbers:
+`0 findings` there would put the strongest convergence signal the block can show against a round
+that never happened. A payload with no `reviewed` field reads the same way, which is how
+`first_reviewed` and the coverage record read that same silence — one answer to one field across
+the module, rather than a row saying something the ratio beside it disagrees with.
+
+**A count never degrades to a smaller number.** The rest of `load_baseline` reads the finding
+buckets tolerantly — a record that is not a mapping is skipped and the round keeps the others —
+because what those reads build is the `keys`/`titles` sets, where a dropped record makes a repeat
+read as new and buys a round nobody needed: the safe direction. A count has no such direction.
+`"to_fix": "corrupt"` iterates into single characters, each fails the mapping test, and a tolerant
+count reports **0 findings** from a payload nothing was read out of. So a bucket that is present
+and is not a list, or a list holding anything that is not a mapping, makes that row's counts `?`.
+An *absent* bucket is still empty, which is what an older schema's silence means. `introduced` is
+bounded by the population it is a share of, for the same reason: provenance is tallied over the
+very findings counted beside it, so a payload claiming more introduced than found is an
+inconsistent pair rather than a large measurement, and it reads `?` instead of `20 (2000%)`.
+
+**One row per round, not per payload.** Two files claiming round 2 are not two rounds, and a column
+carrying two `r2` rows with different figures in it cannot be read down — which is the whole of
+what the block is for. The ambiguity is still reported in `config_notes`, and the row kept is the
+last-written of them: the same `(round, mtime, path)` tie-break that already decides which payload
+supplies the anchor and the coverage record, so the row and the commit that round is attributed
+against come from one file.
+
+**A cycle whose earliest baseline reviewed nothing gets no ratios at all**, and that is #298's
+refusal rather than a gap here: `Baseline.first_reviewed` reads the earliest accepted baseline and
+nothing later, so there is no starting size and `max_fix_growth` does not run either. Scanning
+forward for the first round that *did* review would change when that ceiling fires, which is a stop
+condition and not this block's to move. Where the round-1 payload was simply never passed, the
+earliest baseline there is becomes the denominator and the header names it (`vs r2`).
+
+**There is deliberately no density metric, and adding one takes an argument.** While reading the
+cycle above by hand the reporter computed findings-per-10k-chars and got **9.46 → 7.97 → 4.82** — a
+number that falls every round, reads as steady improvement, and is describing a cycle that was
+diverging. It falls because the denominator is growing, which is the failure rather than evidence
+against it. Any per-size figure added here must sit beside **both** the absolute count and the
+growth ratio, or it will mislead in exactly the case the block exists to expose;
+`tests/test_panel_trend.py` asserts the rendered rows whole and pins the absence.
+
+**It is reporting and nothing else.** No dial, no gate, nothing that can end a cycle: `round_stop`
+does not read it, no ceiling in `panel_caps` reads it, and it does not reach the fixer's brief. It
+is worth having whether or not the injection-rate stop of #489 is ever wired to `round_stop`, and
+chaining a cheap reporting improvement to a policy argument is how the cheap half waits on the
+expensive one.
+
+The rows are rebuilt from each baseline's **raw** per-round fields every round — the finding
+buckets, `provenance_counts`, `pr_chars` — never chained from an earlier round's computed copy. So
+a cycle with a skipped round in the middle, or one spanning the release that added this, still gets
+a complete block instead of a tail.
 
 ### Recurrence (#67): is the loop making progress on this defect?
 
@@ -1704,6 +1787,7 @@ Run-level fields it depends on:
 | `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
+| `cycle_trend` | **#490.** The cross-round block as data — one object per round of the cycle *including this one*: `round`, `reviewed`, `findings`, `p1p2`, `introduced`, `pr_chars`, `growth`. Every count is nullable and none defaults to 0, because "did not measure" and "measured zero" are opposite readings and this block exists to stop that confusion. `growth` is stored rather than left to be recomputed, since its denominator is the cycle's first reviewed round's size and not this row's. `[]` outside a cycle, on the same rule `new_findings` and `round_stop` use |
 | `recurrence_counts`, `premise_counts` | **#67.** The two tallies over the same population, on exactly `provenance_counts`' terms (`{}` = the question does not arise; all-zero = it was asked and there was nothing). Two objects rather than one, because the whole value of asking twice is that they can disagree. `premise_counts` carries a `not-said` bucket — the judge having nothing to say is the commonest answer, and a shortfall against a denominator stored elsewhere would invent it |
 
 A baseline written before v2.24 carries no `head_sha`, so provenance degrades to `unknown` rather

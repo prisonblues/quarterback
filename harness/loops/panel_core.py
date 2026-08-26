@@ -235,6 +235,14 @@ NO_SEVERITY_FLOOR = SEVERITIES[-1]
 #: How many times the first round's reviewed size a later round may review before
 #: the cycle stops and says the change wants splitting. None disables it.
 DEFAULT_MAX_FIX_GROWTH = 3.0
+#: The ABSOLUTE half of that ceiling (#492): chars the PR may GROW past the size the
+#: cycle's first round read it at, before the same stop fires. Whichever of this and
+#: the multiple is crossed FIRST binds, so it can only ever tighten the check. A pure
+#: multiple hands its rope out in proportion to the starting size — 226 lines on a
+#: 113-line PR, 4,000 on a 2,000-line one — and the second is the case most in need of
+#: a ceiling. None disables this half and leaves the multiple; `harness_rules` carries
+#: the calibration.
+DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
 #: What a reviewer is asked to look for: defects in the change (`diff`), or in the
 #: change and everything it touches (`repo` — the pre-#165 posture).
 DEFAULT_REVIEWER_SCOPE = "diff"
@@ -2351,7 +2359,8 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
-    "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
+    "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
     "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",

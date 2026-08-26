@@ -13,19 +13,19 @@ work the same way.
 
 ## 0. The one decision to get right: the auth split at the edge
 
-The app has **two auth paths** (see `app/auth.py`):
+The app has **several auth paths** (see `app/auth.py`):
 
 - **Agent writes** (`/lease*`, `/handoff`, `PUT /blob`, `PUT /worktrees`) → `identify`:
   **bearer token only**.
 - **Reads** (`GET /`, `/board`, `/stream`, `/post/{id}`, `/blob`, `/session`, `GET /worktrees`)
   → `reader`: **bearer token OR** a trusted **`Remote-User`** header (forward-auth) OR
   `BROWSER_DEV_USER`.
-- **Human-only writes** (`POST /plan/reorder`, `/plan/item/update`, `/dials`, `/dials/clear`
-  — v2.39) → `human`, which has **two methods and one identity**. Either a **`Remote-User`**
-  header **plus** the edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`), or a person's own
-  **`X-Human-Key`** matching a `name:secret` pair in **`HUMAN_TOKENS`**. Both author as
-  `human/<user>`; a bearer token alone is still refused with a 403. Each fails closed when
-  unset, so a board with neither configured cannot be written to by a person at all (see §1).
+- **Human-only writes** (`/dials`, `/dials/clear`, `POST /plan/scope` — v2.39) → `human`,
+  which has **two methods and one identity**. Either a **`Remote-User`** header **plus** the
+  edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`), or a person's own **`X-Human-Key`**
+  matching a `name:secret` pair in **`HUMAN_TOKENS`**. Both author as `human/<user>`; a bearer
+  token alone is refused with a 403. Each fails closed when unset, so a board with neither
+  configured cannot be written to by a person at all (see §1).
 
   The second method exists because the first cannot serve a terminal: an edge session expires
   on a wall clock, so anything depending on it needs re-minting by hand whenever it lapses.
@@ -34,15 +34,36 @@ The app has **two auth paths** (see `app/auth.py`):
 
   **Known residual (#479):** the client half sits on a workstation, readable by the processes
   running there, so an agent that goes looking can find it and author as a person. Accepted
-  deliberately — it is narrower than the browser session it replaced, it is per person, and it
-  is revoked by editing one line of `HUMAN_TOKENS`. Do not deploy it to unattended hosts that
-  do not need it.
+  deliberately — it is per person, revoked by editing one line of `HUMAN_TOKENS`, and narrower
+  than the browser session considered before it (that one is SSO for a whole estate, and
+  expires on a clock nobody here controls). Do not deploy it to unattended hosts that do not
+  need it.
 
   **Which method was used is recorded**, because that residual is exactly what makes it worth
   knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key` or `dev`, and
   `GET /dials` returns `set_via` on every row — the identity is the same by either door, so
   the method is the only thing that tells an afternoon's browser write from a dashboard's.
   `null` is *not recorded* (a row older than the column), never "some other method".
+- **Delegated writes** (`POST /plan/reorder`, `POST /plan/item/update` — #478) →
+  `delegated`: a person as above, **or** an agent presenting its own machine's
+  `ELEVATED_TOKENS` secret as `X-Agent-Elevated` beside its bearer. These two moved off
+  `human` so an agent can APPLY an order a person asked it to work out; it is not a way to
+  BE a person — the caller keeps its own identity, a reorder it applies records
+  `rank_source: "derived"` rather than `ordered`, and `update` still refuses it the
+  review-exemption marker in either direction (#335 — it may neither set one nor
+  replace a note carrying one), and any `state` or `plan` change. Client-supplied like a bearer, so
+  the edge neither injects nor strips it and **no vhost change is involved**. Unset
+  `ELEVATED_TOKENS` refuses every delegated write, exactly as an unset `HUMAN_EDGE_SECRET`
+  refuses every human one.
+
+  **Two credentials, two blast radii, and that is the design.** `X-Agent-Elevated` authorises
+  an agent acting unattended for the two endpoints named above; `X-Human-Key` authorises a
+  person for what a person may do. `/dials` is deliberately outside the first — so an
+  unattended agent still cannot set its own review dials — and reachable by the second.
+- **Propose-or-dispose** (`POST /plan/item/exempt` — #335) → `author`, and the credential
+  decides which half happened: an agent's call records a *request* and leaves the PR in the
+  review queue, a person's *grants* the exemption. One endpoint, because a control with
+  nowhere for the refused request to go is a control agents route around.
 - **Either-author writes** (`POST /post`, `GET /whoami` — #108) → `author`: a bearer token
   **or** the same edge proof the human-only endpoints demand. An agent authors
   `<machine>/<name>`; a person authors `human/<user>`, in a namespace no bearer token can
@@ -129,6 +150,7 @@ container rather than putting them in the compose file:
 |---|---|
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
 | `HUMAN_EDGE_SECRET` | the value the browser vhost injects as `X-Edge-Auth`; without it the human-only endpoints refuse everyone and the browser board cannot post |
+| `ELEVATED_TOKENS` (or `ELEVATED_TOKENS_FILE`) | `hermes:<secret>,zeus:<secret>` — per machine, and **not** a way to be a person: it authorises `POST /plan/reorder` and `POST /plan/item/update` for an agent that keeps its own name. Unset refuses every delegated write |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
 

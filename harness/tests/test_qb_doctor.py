@@ -511,7 +511,7 @@ def test_forward_auth_with_no_session_is_unknown_and_names_the_runbook(monkeypat
     check = qd.check_edge(host_for(repo, base_url="https://agent", human_url="https://browser"))
     assert check.verdict == "unknown"
     assert "no session" in check.detail
-    assert qd.EDGE_RUNBOOK in check.manual
+    assert qd.edge_runbook() in check.manual
 
 
 #: What `app/auth.py` actually answers a `Remote-User` the edge did not vouch for.
@@ -533,7 +533,7 @@ def test_a_refused_human_write_fails_and_says_it_needs_a_person(monkeypatch, rep
     assert check.verdict == "fail"
     assert "HUMAN_EDGE_SECRET" in check.detail
     assert check.fix is None, "a secret in 1Password and a redeploy is not qb-doctor's to run"
-    assert qd.EDGE_RUNBOOK in check.manual
+    assert qd.edge_runbook() in check.manual
 
 
 @pytest.mark.parametrize("body", [
@@ -3600,3 +3600,58 @@ def test_the_two_readings_are_independent_of_each_other(tmp_path, no_cache):
     ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
 
     assert qd._cache_key("row", "q?", ev, 1) != qd._cache_key("row", "q?", ev, 2)
+
+
+# ---------------------------------------- the runbook path resolves, not asserts
+
+
+def _runbook(tmp_path, where: str):
+    """A selfhost checkout with the runbook in `where`."""
+    d = tmp_path / where
+    d.mkdir(parents=True)
+    (d / qd.EDGE_RUNBOOK_FILE).write_text("# the runbook\n")
+    return tmp_path
+
+
+@pytest.mark.parametrize("where", ["issues/closed", "issues/open"])
+def test_the_runbook_is_found_in_either_state_of_the_issue(monkeypatch, tmp_path, where):
+    """The bug this replaced: the path hardcoded `issues/open`, the issue closed on
+    2026-08-22, the file moved, and the row whose whole point is that its remedy is
+    a path printed a path to nothing. Both states resolve, because which one the
+    file is in is a fact about somebody else's repo on somebody else's schedule."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, where)))
+    assert qd.edge_runbook().endswith(f"{where}/{qd.EDGE_RUNBOOK_FILE}")
+
+
+def test_a_resolved_runbook_names_a_file_that_exists(monkeypatch, tmp_path):
+    """The property worth pinning, since the failure it replaces was a plausible
+    path to nothing: whatever comes back, if it looks like a path it IS one."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, "issues/closed")))
+    answer = qd.edge_runbook()
+    assert Path(answer.replace("~", str(Path.home()), 1)).is_file()
+
+
+def test_no_checkout_says_so_instead_of_naming_a_path(monkeypatch, tmp_path):
+    """A box without the selfhost repo gets a sentence, never a path — #408's rule
+    is that a row carries the fix, and a path that is not there is not a fix."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(tmp_path / "nothing-here"))
+    answer = qd.edge_runbook()
+    assert "not on this box" in answer
+    assert qd.EDGE_RUNBOOK_FILE in answer, "it must still name what to look for"
+    assert not answer.startswith("~/"), "a sentence, not a path"
+
+
+def test_the_env_override_is_what_lets_a_checkout_live_elsewhere(monkeypatch, tmp_path):
+    """This is a path into ANOTHER repository — the one thing this script cannot
+    derive from its own checkout — so the override is the mechanism, not a bypass.
+
+    Compared after expanding `~`, because the answer is deliberately abbreviated
+    when it sits under `$HOME` — which it does inside the nix sandbox, where
+    `tmp_path` is under a synthetic home. Asserting the raw absolute string passed
+    on a developer box and failed in the build for a reason that had nothing to do
+    with the override.
+    """
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, "issues/closed")))
+    answer = qd.edge_runbook()
+    expanded = answer.replace("~", str(Path.home()), 1) if answer.startswith("~") else answer
+    assert str(tmp_path) in expanded, answer

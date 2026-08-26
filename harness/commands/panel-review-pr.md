@@ -197,7 +197,9 @@ like a full panel.
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.
   It says which severity floor the fixer is being briefed to, what buys another round,
-  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling
+  — which since #492 has TWO halves, a multiple and an absolute char count, and stops
+  the cycle on whichever is crossed first. Read it BEFORE §4: the brief you build
   depends on it, and it is the only place the round's policy is written down where
   you can see it (#165).
 - **To fix** — the master-confirmed findings the fix round is asked to clear (any
@@ -215,6 +217,14 @@ From its output collect:
 - **Coverage declared** — per reviewer, what it said it could not assess, plus
   any reviewer the panel reports as truncated. These are what separate "clean"
   from "I could not tell"; carry them to §6 rather than dropping them.
+- **Guard-to-guarded** — the line printed under that name (`guard_ratio` in the
+  JSON): test and doc lines ADDED against source lines added, over the whole PR. It is
+  REPORTED and gates nothing (#67's instrument-before-gate rule, #492), so there is no
+  threshold here for you to apply and none for you to invent — carry the number into
+  §6 the way you carry the coverage declarations. What makes it worth reading is
+  WHEN it arrives: it is available from round 1's diffstat, where `max_fix_growth`
+  needs a second round before it has a ratio at all, and the cycle it was filed from
+  produced 406 lines of test for a 66-line config change with nothing noticing.
 - **Rounds** — the `**Rounds:**` line (also `round_stop` in the JSON): whether
   the cycle should go again and whether stopping would be convergence.
 
@@ -275,6 +285,23 @@ with these overrides:
   low-severity finding unconditional, which is the 408-line round-1 fix pass this
   budget exists to stop. Copy the note under the heading verbatim — it carries the
   line count and the spend rule.
+- **Selecting findings and capping churn are INDEPENDENT controls, and naming
+  findings NEVER lifts the budget (#492).** A human who says "just fix the
+  concurrency ones" has narrowed *which* findings this pass may touch. They have said
+  nothing whatever about *how much churn* one pass may add, which is the separate
+  question `low_severity_fix_lines` answers — and that dial's own docstring is
+  emphatic that the question is **mechanical, not discretionary**: the spend is
+  COUNTED with `git diff --numstat` after each fix, never estimated, and the fixer is
+  never asked "does this risk ballooning?", because that is a judgement by the actor
+  whose judgement the 85% impugns. Reading a shorter list as the budget having been
+  spent by decision is a natural mistake for an orchestrator that has just been handed
+  one, and it has been made: on the cycle #492 was filed from the budget was lifted
+  for round 2 *because* the human had named the findings, and the pass came out at 422
+  lines and produced 13 new findings — the exact shape the budget exists to prevent,
+  with the one brake still capable of firing being the one that was removed. So relay
+  the budget with a narrowed list exactly as you would with the full one, and a pass
+  that runs out of it reports the unpaid findings exactly as it reports below-floor
+  ones (§4b's road 2).
 - **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
   itself in worktree mode and must not guess: state `fix_severity_floor`,
   `low_severity_fix_lines`, `reviewer_scope` and `fixer_may_defer` from the panel
@@ -512,6 +539,7 @@ round from 2 on, before you go back to §4:
 ```
 python3 ~/.claude/loops/panel.py --premise "<one sentence: what this fix pass assumes>" \
     --pr <pr> --round <r> --premise-file /tmp/tmp.AbC123/premises.json \
+    --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
 
@@ -525,12 +553,32 @@ does and for its reason: a premise about code carries backticks and `$(…)`, an
 inside a double-quoted argument bash executes them while a `$VAR` expands to
 empty and declares a premise you did not write.
 
-**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is the
-brake: `review_panel.escalate_on.premise_repeated` (default `2`) says a fix has
-already been written against this premise once in this cycle, and **the second one
-is not to be written**. Do not launch §4. The findings that premise explains become
-escalations under the `--escalated` rule below — relay them, open the premise
-issue, and stop the cycle. The command prints the `--escalated` keys for the round you are recording
+**`--premise-decidable` is the question the counter cannot ask (#491).** Answer `no`
+when the runtime the fix's assertion runs in cannot observe the property the fix
+asserts, `yes` when it can. Omitted is *not answered*, and nothing brakes on it.
+
+You are the right reader for this one for the same reason you are the right reader
+for the declaration itself: a fixer replacing one proxy with a better one is not
+being careless, it is answering the finding in front of it, and only somebody
+holding all the rounds can see that the proxies keep changing while the thing being
+approximated does not. **When you find yourself writing a premise that restates the
+last round's premise with a different signal in it, the answer to this flag is
+`no`.**
+
+**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is a
+brake, and the report names which:
+
+- `escalate_on.premise_repeated` (default `2`) — a fix has already been written
+  against this premise once in this cycle, and **the second one is not to be
+  written**.
+- `escalate_on.premise_undecidable` (default `true`) — you answered `no`. It fires
+  on the **first** declaration: an unobservable property is not going to become
+  observable next round, so the cycle cannot converge on it whatever the counter
+  says.
+
+Do not launch §4. Either way, the findings that premise explains become escalations
+under the `--escalated` rule below — relay them, open the premise issue, and stop
+the cycle. The command prints the `--escalated` keys for the round you are recording
 against.
 
 **Why it is here and not at the end of a round.** The cap bounds cost; this bounds
@@ -557,7 +605,10 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
 A premise declared twice that reaches a round anyway ends the cycle there: it takes
 a veto line, `confident` is false, and `round_stop.reason` names the premise. That
 is the late half of the same brake — worse than stopping before the fix, better than
-the cap.
+the cap. A premise answered `decidable: no` that reaches a round does the same, on
+the same terms (#491), and the payload carries both lists under
+`round_stop.premises` with `undecidable_brake` saying whether this repo armed the
+second one.
 
 **An undeclared fix pass is unescalatable, and the report says so.** If a round's
 `config_notes` says the fix pass after round N declared no premise, that is a gap in

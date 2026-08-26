@@ -863,6 +863,225 @@ def _same_words(a: str, b: str) -> bool:
     return words(a) == words(b)
 
 
+#: The severity band the cross-round block counts separately (#490). Two, not a
+#: full histogram: the question a reader of that block is asking is "is this cycle
+#: producing WORSE findings or merely more of them", and P1/P2 against the total is
+#: the cheapest split that answers it. It is also the band `round_trigger_floor`
+#: defaults to, so the count is the one that decides whether a round buys another.
+TREND_SEVERE = "P2"
+
+
+@dataclass
+class RoundTrend:
+    """One earlier round as the cross-round trend block reads it (#490).
+
+    A round's own report states that round's figures and nothing else, and read one
+    at a time a diverging cycle looks flat: 8 -> 14 -> 15 findings reads as
+    converging right up until you notice the PR tripled underneath it. This is the
+    row that puts the rounds beside each other.
+
+    **Derived fresh from each baseline payload, never chained.** Every field here is
+    read off fields the payload has recorded since long before this block existed —
+    the finding buckets, ``provenance_counts``, ``pr_chars`` — so a cycle whose
+    round 2 was skipped, or was run by a panel too old to emit a trend at all, still
+    gets a complete block in round 3. Carrying a round's *computed* trend forward in
+    its payload would have made the block only as long as its unbroken tail.
+
+    Every count is nullable and none of them is defaulted to zero, because a round
+    that did not measure something and a round that measured zero of it are opposite
+    readings and this block exists to stop exactly that confusion. A skipped round
+    reviewed nothing, so it has no finding count — printing ``0 findings`` for it
+    would put the strongest possible convergence signal in the block on the strength
+    of a round that never ran.
+    """
+
+    #: Which round this row is. From the payload's own ``round``, so a set of
+    #: baselines with a gap in it renders the gap rather than renumbering.
+    round: int
+    #: Did that round review anything at all? Everything below is None when it did
+    #: not — see the class docstring on why that is not zero.
+    reviewed: bool
+    #: Everything the round left the cycle to clear: ``to_fix`` + ``sonar_findings``,
+    #: which is exactly the population :data:`panel.outstanding` counts on this run.
+    #: ``dismissed`` is deliberately out — the master ruled those not real and no
+    #: fixer will ever touch them, so counting them would inflate every row by the
+    #: judge's own work.
+    findings: int | None = None
+    #: How many of those were P1 or P2 (:data:`TREND_SEVERE`). An unreadable
+    #: severity counts as severe, which is :func:`panel_core.severity_at_least`'s
+    #: standing asymmetry and the right direction here too: a row that under-states
+    #: severity is a row that argues for another round.
+    p1p2: int | None = None
+    #: How many of that round's findings the round before it INTRODUCED — its
+    #: ``provenance_counts["introduced"]``.
+    #:
+    #: None, not 0, wherever the round could not attribute (:func:`attributed`):
+    #: round 1, which has no earlier fix pass; a round whose only populated bucket
+    #: is ``unknown``, meaning the fix range was unreadable; and a round that
+    #: reviewed nothing. ``0 introduced`` in any of those is a claim about a fix
+    #: pass made from a measurement that did not happen, and it is the flattering
+    #: direction.
+    #:
+    #: An ALL-ZERO tally is the opposite case and does read 0: the round attributed
+    #: and had nothing to attribute, which is what a round of repeats looks like.
+    introduced: int | None = None
+    #: The size of the WHOLE PR when that round read it (:func:`_whole_pr_chars`),
+    #: never the round's review target: under ``increment`` scope the target is one
+    #: fix commit, and a size column that cliffs at round 2 would show the change
+    #: shrinking while it grows. The same number ``max_fix_growth`` measures (#298).
+    pr_chars: int | None = None
+
+
+def attributed(counts: object) -> bool:
+    """Was a round's provenance ANSWERABLE — did the attribution run at all?
+
+    Three states live in one ``provenance_counts`` object and only two of them are
+    obvious, which is why this is a named predicate rather than a truth test:
+
+    * ``{}`` — the question does not arise. Round 1, or no cycle. False.
+    * every bucket 0 — the question was asked and there was nothing to attribute:
+      a round whose findings were all repeats, or which had none. **True**, and the
+      trend block prints ``0``, because that is a measurement.
+    * ``unknown`` the only positive bucket — the fix range was unreadable (no commit
+      recorded, a branch rewritten between rounds, an API refusal), so every bucket
+      that says something about the fix pass is 0 *by failure*. False: printed as a
+      number it reads "0 introduced", a claim about the fix pass made from a
+      measurement that did not happen, and it is the flattering direction.
+
+    **Not the same question the report's `of those:` line asks, and they must not be
+    merged.** That line asks "is there anything worth a sentence", so it withholds on
+    an all-zero tally where this returns True — a round with three repeat findings has
+    nothing to say in prose and a perfectly good ``0`` to put in a column. Sharing one
+    predicate would force one of the two to lie; the shared thing is the ``unknown``
+    rule, which both apply.
+
+    Defensive about its argument on `load_baseline`'s standing reason — this is read
+    off a payload that may have been hand-edited or written by another version — and
+    it reads only the buckets :data:`panel_scope.PROVENANCE` names, so a stray key
+    cannot make an unattributable round look attributed.
+    """
+    if not isinstance(counts, dict):
+        return False
+    tally = {b: _nonneg_int(counts.get(b)) for b in PROVENANCE}
+    if all(v is None for v in tally.values()):
+        # `{}`, or a payload carrying nothing this recognises. Either way there is
+        # no tally here, which is the first state above and not the second.
+        return False
+    return (any(tally[b] for b in PROVENANCE if b != "unknown")
+            or not tally["unknown"])
+
+
+def _nonneg_int(value: object) -> int | None:
+    """A count a payload can be believed about, or None.
+
+    :func:`_positive_int`'s sibling, and separate because the two admit different
+    numbers for good reasons: a SIZE of 0 cannot be a denominator, while a COUNT of
+    0 is the most interesting reading in the trend block ("nothing was introduced").
+    Same refusals otherwise — a bool is an `int` in Python, and a float or a string
+    arrives from a hand-edited payload.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _introduced(counts: object, findings: int | None) -> int | None:
+    """How many of a round's findings the fix pass before it wrote, or None.
+
+    Bounded by the population it is a share OF, which is the one consistency check
+    available here: provenance is tallied over the very findings counted beside it,
+    so `introduced` can never exceed `findings` in a payload this panel wrote. A
+    hand-edited or foreign one saying otherwise is not a large measurement, it is an
+    inconsistent pair — and the renderer would turn it into `20 (2000%)`, a
+    percentage of a denominator the number does not belong to. Unknown is the honest
+    reading, and it is the direction that cannot flatter the cycle.
+
+    Unchecked where `findings` is itself unknown: there is no population to bound it
+    against, and refusing on that would throw away the one number that did survive.
+    """
+    if not attributed(counts):
+        return None
+    n = _nonneg_int(counts.get("introduced"))
+    if n is not None and findings is not None and n > findings:
+        return None
+    return n
+
+
+def _countable(payload: dict) -> list[dict] | None:
+    """Every finding an earlier round left the cycle to clear, or None where the
+    payload cannot be COUNTED.
+
+    The rest of :func:`load_baseline` reads these buckets tolerantly — a record that
+    is not a mapping is skipped and the round keeps its other findings — and that is
+    right for what those reads produce, which is the `keys` and `titles` sets. A
+    dropped record there means one repeat is not recognised, the finding reads as new,
+    and the cycle buys a round nobody needed: the safe direction.
+
+    A COUNT cannot be tolerant in that direction. `"to_fix": "corrupt"` iterates into
+    single characters, every one of them fails `isinstance(f, dict)`, and the row
+    reports **0 findings** — the strongest convergence signal this block can emit,
+    from a payload nothing was read out of. One malformed record among ten produces
+    the same failure quietly at 9. So a bucket that is present and is not a list, or a
+    list holding anything that is not a mapping, makes the counts UNKNOWN rather than
+    smaller, and the row prints `?`.
+
+    An ABSENT bucket is empty rather than unknown, which is the one tolerance kept:
+    that is how every other reader in this file takes it, and it is what an older
+    schema's silence means.
+    """
+    raised: list[dict] = []
+    for bucket in ("to_fix", "sonar_findings"):
+        got = payload.get(bucket)
+        if got is None:
+            continue
+        if not isinstance(got, list) or any(not isinstance(f, dict) for f in got):
+            return None
+        raised.extend(got)
+    return raised
+
+
+def _trend_row(was: int, payload: dict) -> RoundTrend:
+    """Read one accepted baseline as a :class:`RoundTrend` row.
+
+    Every read here degrades to None rather than raising or guessing, on
+    :func:`load_baseline`'s standing rule that a bad payload costs a row's cell and
+    never the review: this block is a reporting nicety and must never be the reason
+    a round does not run. What it must never do is degrade to a NUMBER — a cell that
+    is quietly small reads as a measurement, and every wrong number this block can
+    print reads as convergence.
+
+    ``reviewed`` is taken exactly as :attr:`Baseline.read_nothing` and
+    :attr:`Baseline.first_reviewed` take it — truthiness of the payload's own field,
+    so a payload too old to carry it reads as "not run" here, in the growth
+    denominator and in the coverage record alike. One reading of one field across the
+    module: a third answer here would put a row in the block that the ratio beside it
+    disagrees with.
+    """
+    reviewed = bool(payload.get("reviewed"))
+    findings = p1p2 = None
+    if reviewed:
+        # `dismissed` is not here — see `RoundTrend.findings`.
+        raised = _countable(payload)
+        if raised is not None:
+            findings = len(raised)
+            p1p2 = sum(1 for f in raised
+                       if severity_at_least(f.get("severity"), TREND_SEVERE))
+    counts = payload.get("provenance_counts")
+    return RoundTrend(
+        round=was, reviewed=reviewed, findings=findings, p1p2=p1p2,
+        # Gated on `reviewed` for the reason the two counts above are: a skipped
+        # in-cycle round records an all-zero tally by construction, and `0
+        # introduced` read off it is the same fabrication as `0 findings` — it
+        # attributed nothing because it reviewed nothing.
+        introduced=_introduced(counts, findings) if reviewed else None,
+        # Gated on `reviewed` as well as on the field: a skipped round records
+        # `pr_chars: 0` by default and `_positive_int` already refuses that, but a
+        # refused round records the size of a PR it then did not review — and a
+        # growth ratio computed from a round nobody read is a measurement of
+        # nothing. `first_reviewed` beside it takes the same view (#298).
+        pr_chars=_whole_pr_chars(payload) if reviewed else None)
+
+
 @dataclass
 class Baseline:
     """What earlier rounds of THIS PR already raised."""
@@ -1039,6 +1258,17 @@ class Baseline:
     #: `diff_chars` is a fix commit and cannot stand in for the PR. The check then
     #: does not run, and says so rather than inventing a denominator.
     first_reviewed: tuple[int, int, str] | None = None
+    #: One :class:`RoundTrend` per ACCEPTED baseline, in round order — the earlier
+    #: half of #490's cross-round block. This round appends its own row and renders
+    #: the lot; nothing here decides anything.
+    #:
+    #: One row per ROUND, not per accepted payload. Two files claiming round 2 are
+    #: not two rounds — the block promises per-round figures, and a column carrying
+    #: two `r2` rows with different numbers cannot be read down, which is the whole
+    #: of what it is for. The ambiguity is still reported (`problems`), and the row
+    #: kept is the last-written of them: the same tie-break that already decides
+    #: which payload supplies the anchor and the coverage record.
+    trend: list[RoundTrend] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -1623,6 +1853,22 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             # report prints the measurement so a reader can check that rather than
             # take it on trust.
             b.first_reviewed = (first_round, chars, "pr")
+        # #490's rows, off the SAME accepted, cycle-checked, round-ordered set
+        # everything above is read from — a baseline this run refused as belonging
+        # to another cycle must not appear in the block either, or the reader is
+        # shown a trend across two PRs' worth of rounds.
+        #
+        # ONE ROW PER ROUND. Two payloads for one round is a state this function
+        # tolerates and warns about (see `problems` above), but two files claiming
+        # round 2 are not two rounds, and a block whose whole value is being read
+        # down a column must not carry two `r2` rows with different figures in it.
+        # The winner is the LAST in `ordered`, which is the same last-written
+        # tie-break (round, then mtime, then path) that already decides which of two
+        # payloads supplies the anchor and the coverage record — so the row and the
+        # commit the round is attributed against come from the same file rather than
+        # from whichever rule was applied last.
+        rows = {was: _trend_row(was, payload) for was, _path, payload in ordered}
+        b.trend = [rows[was] for was in sorted(rows)]
     return b
 
 
@@ -1808,10 +2054,39 @@ ESCALATE_ON_UNBUILT = ("quorum_failed", "judge_absent")
 #: Its own code, not 1: the caller has to be able to tell the brake FIRING from the
 #: command failing to run, and both are non-zero. 2 is argparse's usage error and 3
 #: is :data:`panel_core.UNWRITTEN_PAYLOAD_EXIT`.
+#:
+#: **Shared with the undecidability brake (#491)**, deliberately. A caller reads this
+#: code to mean one thing — *do not write this fix, escalate the finding instead* —
+#: and both brakes end in exactly that instruction, with the same `--escalated` keys
+#: to hand the next round. A second code would make every caller learn a second
+#: number to take the identical action, and the reason they differ is in the report,
+#: which is where a reader is looking for it.
 PREMISE_REPEATED_EXIT = 4
+
+#: What a declaration answered about the property its fix asserts (#491): whether the
+#: RUNTIME the assertion runs in can observe it. `unknown` is the honest value for a
+#: declaration that was not asked — every declaration made before this existed, and
+#: every caller that has not passed `--premise-decidable`.
+DECIDABILITY = ("yes", "no", "unknown")
 
 #: The register's shape, so a future one can be told from a hand-written file.
 PREMISE_REGISTER_VERSION = 1
+
+#: New outstanding findings a round needs before #489's injection rate is a RATE at
+#: all, and the reason it is a constant rather than a second dial.
+#:
+#: A strict majority of three findings is two of them, and two findings is not a
+#: measurement of anything: `panel_scope._provenance` is documented as routinely
+#: wrong by a line or two in both directions, so at n<4 the cycle's verdict is one
+#: reviewer's line number. At 4 the majority the rule fires on is three findings
+#: agreeing, which is the smallest number that is a pattern rather than a coin.
+#:
+#: Not a dial, deliberately. #489's own open question is that nothing calibrates
+#: where a healthy cycle sits, and the honest answer to one uncalibrated number is
+#: not to ship two of them — a repo asked to tune a sample size it has no data for
+#: will either leave it alone or turn the brake off by accident. `fix_injection:
+#: null` is the supported way to switch this off, and it is one line.
+FIX_INJECTION_MIN_NEW = 4
 
 
 def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
@@ -1866,6 +2141,128 @@ def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
                       "a whole number of OCCURRENCES >= 2 (2 means 'the second time'), "
                       "or null to switch the brake off — 1 would escalate the first "
                       "time any premise was declared, which is not a repeat")
+    return n
+
+
+def premise_undecidable_brake(panel: dict, notes: list[str]) -> bool:
+    """`review_panel.escalate_on.premise_undecidable` (#491) — does a declaration that
+    answers "the runtime cannot observe this property" refuse the fix?
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep, so a repo writing
+    `escalate_on` at all replaces the default object wholesale, and without the
+    per-key fallback `{"premise_repeated": 2}` would silently switch THIS brake off.
+    That is the exact failure mode #84 hit and it is worth not shipping twice.
+
+    **No number, unlike its sibling, and that asymmetry is the point.**
+    `premise_repeated` counts because one declaration is not evidence — writing a fix
+    against a premise is what a fix pass DOES, and only the repeat says the rounds
+    have stopped being about different things. This one is not counting. It reads a
+    fixer's answer to a question with a fact for an answer, and a `no` is already the
+    whole finding: if the property cannot be observed where the assertion runs, every
+    fix for it is an approximation, the next round finds the gap, and the cap is the
+    only thing that can end the cycle. A second occurrence would confirm nothing the
+    first did not say, at the price of a fix pass and a panel.
+
+    So the value is a FLAG. A count over it would be counting how many times one
+    fixer said one `no`, and `2` would mean "approximate once first", which is the
+    behaviour the brake exists to refuse."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — both readers
+        # run off one config — but this function is public and is called directly by
+        # tests, so it does not rely on a sibling having been called first.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return False                                  # unreachable
+    want = rules.get("premise_undecidable",
+                     ESCALATE_ON_DEFAULTS.get("premise_undecidable"))
+    if want is None or want is False or want == "":
+        return False
+    if want is True:
+        return True
+    _refuse_value("escalate_on.premise_undecidable", want,
+                  "true or false — this brake reads a fixer's yes/no answer about one "
+                  "property, so there is no occurrence to count and a number here "
+                  "would mean 'approximate it once first'")
+    return False                                      # unreachable
+
+
+def fix_injection_limit(panel: dict, notes: list[str]) -> float | None:
+    """`review_panel.escalate_on.fix_injection` (#489) — the fraction of a round's
+    new outstanding findings that may have been INTRODUCED by the previous fix pass
+    before the cycle ends, or ``None`` for "do not brake".
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep
+    (`harness_rules._DEEP_BLOCKS`), so a repo that writes `escalate_on` at all
+    replaces the default object wholesale, and without the per-key fallback
+    `{"premise_repeated": 2}` would silently switch THIS brake off. That is the
+    exact failure mode #84 hit and it is worth not shipping a third time.
+
+    **The bounds are `0 < x < 1`, and both ends are refused rather than clamped.**
+    Zero or below is not a fraction of anything and would fire on any attributable
+    round with a single introduced finding in it — every round of every cycle,
+    which is a brake with no discrimination in it. One or above can never be
+    EXCEEDED, because a rate is at most 1.0 and the comparison is strict: it is the
+    brake switched off behind a value that reads as armed, which is precisely the
+    posture `require_failing_test` exists to refuse having silently. `null` is the
+    spelling for off, `0.99` is the spelling for "only when every one of them was
+    introduced", and a repo that meant either gets the one it typed.
+
+    ``false`` is a second spelling of ``null`` and is honoured as one, exactly as
+    `premise_repeat_limit` honours it: it is what an operator reaches for to turn a
+    brake off, and refusing it would be this harness telling somebody their "off" was
+    a typo. ``true`` is refused, because there is no number it could mean — a
+    threshold is not a switch, and guessing one would be inventing the policy. Both
+    are settled before the numeric read for `fix_growth_limit`'s reason:
+    ``isinstance(True, int)`` is True, so a bool that fell through would become 1.0
+    or 0.0, and 0.0 is a brake that fires on every attributable round. Non-finite is
+    rejected with the rest: ``inf`` is the check off behind a value that reads like a
+    number, and ``nan`` compares false against everything, which is the same thing."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — both readers
+        # run off one config, and `run()` calls that one first — but this function is
+        # public and is called directly by tests, so it does not rely on a sibling
+        # having been called before it. The unbuilt-name notes
+        # (`ESCALATE_ON_UNBUILT`) are deliberately NOT repeated here: they are a fact
+        # about the block rather than about either dial, and one report carrying the
+        # same sentence once per reader is the "loud and wrong" a reader learns to
+        # skip.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return None                                   # unreachable
+    want = rules.get("fix_injection", ESCALATE_ON_DEFAULTS.get("fix_injection"))
+    if want is None or want is False or want == "":
+        return None
+
+    def refuse(what: str) -> float | None:
+        _refuse_value("escalate_on.fix_injection", want,
+                      f"{what} — the fraction of a round's new findings that may have "
+                      "been introduced by the previous fix pass, or null to switch the "
+                      "brake off. 1 or more can never be exceeded, which is the brake "
+                      "off behind a value that reads as on")
+        return None                                   # unreachable
+
+    if isinstance(want, bool) or not isinstance(want, (int, float, str)):
+        return refuse("a number above 0 and below 1")
+    try:
+        n = float(want)
+    except (TypeError, ValueError):
+        return refuse("a number above 0 and below 1")
+    if n != n or n in (float("inf"), float("-inf")):
+        return refuse("a finite number above 0 and below 1")
+    if not 0 < n < 1:
+        return refuse("above 0 and below 1")
     return n
 
 
@@ -1982,8 +2379,15 @@ def load_premises(path: str, repo: str = "", pr: int | None = None
                             "for is invisible to the brake")
             continue
         text = str(entry["text"]).strip()
+        # An unrecognised `decidable` reads as "unknown" HERE, unlike in
+        # `declare_premise` where it raises. The two are different failures: a bad
+        # argument is a caller to correct, and a bad value on disk is a register a
+        # later harness (or a hand edit) wrote, which must not stop the cycle. It
+        # degrades to the value that never brakes, and the entry is otherwise kept.
+        answer = str(entry.get("decidable") or "unknown").strip().lower()
         kept.append({"key": premise_key(text), "text": text,
                      "norm": _norm_title(text), "rounds": sorted(rounds),
+                     "decidable": answer if answer in DECIDABILITY else "unknown",
                      "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
                                          if _is_key(k)})})
     reg["premises"] = kept
@@ -2002,7 +2406,9 @@ def find_premise(reg: dict, text: str) -> dict | None:
 
 
 def declare_premise(reg: dict, text: str, round_no: int,
-                    findings: Iterable[str] = (), limit: int | None = None) -> dict:
+                    findings: Iterable[str] = (), limit: int | None = None,
+                    decidable: str = "unknown",
+                    undecidable_brake: bool = False) -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -2023,23 +2429,89 @@ def declare_premise(reg: dict, text: str, round_no: int,
     caller passes to the next round's ``--escalated`` when the brake fires, which
     is how this composes with `round_stop` instead of growing a second stop: a
     braked premise becomes an ESCALATION, the outcome the loop already knows how to
-    end a cycle on."""
+    end a cycle on.
+
+    ``decidable`` is #491's question, asked of the declaration rather than of the
+    cycle: **can the runtime this fix's assertion runs in observe the property the
+    fix asserts?** ``"no"`` with ``undecidable_brake`` on refuses the fix on its
+    FIRST occurrence, which is the one thing the occurrence counter structurally
+    cannot do.
+
+    The reason it cannot is not a bug in the matching. A fixer circling an
+    unobservable property replaces one PROXY with a better one each round and
+    declares, accurately, a different premise every time — four were declared on one
+    cycle and no two matched, so the counter sat at 1 while three fix passes circled.
+    :func:`same_premise` records the same gap from the other side, and #84 rules out
+    closing it with a similarity heuristic. What closes it is not a better comparison
+    between declarations; it is one more question put to each declaration on its own,
+    whose answer does not depend on the words the fixer chose.
+
+    ``"unknown"`` is the honest default and never brakes: every declaration made
+    before this existed reads that way, and a caller that has not been taught
+    ``--premise-decidable`` must not have an answer inferred for it. #84's rule for
+    the undeclared fix pass is the same rule — report the gap, never guess at it.
+
+    A ``"no"`` already on the entry, though, is not a gap — it is an answer, and it
+    STICKS. Neither a later ``"yes"`` nor a later silence clears it, and the brake
+    reads the entry rather than the declaration in front of it. See the comment on
+    the assignment for why: everything else here would let the one agent whose fix is
+    being refused lift its own refusal by changing its answer."""
     text = " ".join(str(text).split())
+    answer = str(decidable or "unknown").strip().lower()
+    if answer not in DECIDABILITY:
+        # Named rather than coerced to "unknown". A typo silently read as "unknown"
+        # is a brake that does not fire on a declaration that answered "no", which is
+        # this mechanism failing in exactly the direction it exists to prevent.
+        raise ValueError(
+            f"declare_premise(decidable={decidable!r}) takes one of "
+            f"{', '.join(DECIDABILITY)} — the fixer's answer to whether the runtime "
+            "can observe the property the fix asserts")
     keys = sorted({_key_norm(k) for k in findings if _is_key(k)})
     entry = find_premise(reg, text)
     if entry is None:
         entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
-                 "rounds": [], "findings": []}
+                 "rounds": [], "findings": [], "decidable": "unknown"}
         reg.setdefault("premises", []).append(entry)
     if round_no not in entry["rounds"]:
         entry["rounds"] = sorted([*entry["rounds"], round_no])
     entry["findings"] = sorted({*entry["findings"], *keys})
+    entry.setdefault("decidable", "unknown")
+    # **A `no` is STICKY, and the brake reads the ENTRY rather than this declaration.**
+    # Both halves close the same hole, and it is the hole every self-reported signal in
+    # this loop has: the agent whose fix is being refused is the one supplying the
+    # answer. Without stickiness a fixer refused on `no` re-declares the same premise
+    # with `yes` and the refusal is gone, with nothing recording that it ever happened;
+    # without reading the entry, it re-declares with the flag simply OMITTED and
+    # "unknown" brakes nothing. Either way the actor clears its own brake by changing
+    # what it says, which is precisely what `round_stop`'s docstring says cannot be
+    # left to self-report.
+    #
+    # So: `no` is established about the PROPERTY, not about one pass's opinion of it,
+    # and a property the runtime cannot observe does not become observable because a
+    # later declaration says otherwise. `yes` records freely until a `no` lands, which
+    # keeps the ordinary case — a fixer answering honestly, round after round — exactly
+    # as cheap as it was.
+    if answer == "no" or (answer == "yes" and entry["decidable"] != "no"):
+        entry["decidable"] = answer
     occurrence = len(entry["rounds"])
-    escalate = limit is not None and occurrence >= limit
-    if escalate:
-        reason = (f"premise declared {occurrence} time(s) — rounds "
-                  f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
-                  f"at {limit}: a human answers this premise, not another fix pass")
+    repeated = limit is not None and occurrence >= limit
+    undecidable = bool(undecidable_brake) and entry["decidable"] == "no"
+    escalate = repeated or undecidable
+    reasons = []
+    if undecidable:
+        reasons.append(
+            "the property this fix asserts is NOT decidable in the runtime the "
+            "assertion runs in, so every fix for it is an approximation and the next "
+            "round finds the gap between the approximation and the property "
+            "(`escalate_on.premise_undecidable`): a human answers this, not a better "
+            "approximation")
+    if repeated:
+        reasons.append(
+            f"premise declared {occurrence} time(s) — rounds "
+            f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
+            f"at {limit}: a human answers this premise, not another fix pass")
+    if reasons:
+        reason = "; and ".join(reasons)
     elif limit is None:
         reason = (f"recorded (occurrence {occurrence}) — `escalate_on.premise_repeated` "
                   "is off, so nothing brakes on a repeat")
@@ -2050,6 +2522,9 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "occurrence": occurrence, "rounds": list(entry["rounds"]),
             "first_round": entry["rounds"][0], "findings": list(entry["findings"]),
             "limit": limit, "escalate": escalate, "reason": reason,
+            "decidable": entry["decidable"], "answered": answer,
+            "repeated": repeated, "undecidable": undecidable,
+            "undecidable_brake": bool(undecidable_brake),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -2066,17 +2541,81 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
     return [r for r in range(1, max(round_no, 1)) if r not in declared]
 
 
-def premise_state(reg: dict, round_no: int, limit: int | None = None) -> dict:
+def premise_state(reg: dict, round_no: int, limit: int | None = None,
+                  undecidable_brake: bool = False) -> dict:
     """What the cycle's declarations say, for `round_stop` and for the payload."""
     entries = reg.get("premises") or []
-    repeated = [{"key": e["key"], "text": e["text"], "rounds": list(e["rounds"]),
-                 "occurrences": len(e["rounds"]), "findings": list(e.get("findings") or [])}
-                for e in entries
+
+    def view(e: dict) -> dict:
+        return {"key": e["key"], "text": e["text"], "rounds": list(e["rounds"]),
+                "occurrences": len(e["rounds"]),
+                "decidable": e.get("decidable") or "unknown",
+                "findings": list(e.get("findings") or [])}
+
+    repeated = [view(e) for e in entries
                 if limit is not None and len(e.get("rounds") or []) >= limit]
+    # Reported whether or not the brake is armed, on `undeclared_rounds`' rule: the
+    # payload says what the cycle DECLARED, and a repo that switched the brake off
+    # still gets to see that a fix pass was written against a property nothing in its
+    # runtime can observe. `round_stop` is what gates on the flag.
+    undecidable = [view(e) for e in entries
+                   if (e.get("decidable") or "unknown") == "no"]
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
+            "undecidable": undecidable,
+            "undecidable_brake": bool(undecidable_brake),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
+
+
+def injection_state(counts: dict | None, limit: float | None) -> dict:
+    """#489's measurement as this round read it, for `round_stop` and the payload.
+
+    `counts` is `panel.py`'s `provenance_counts` and nothing else: it is
+    `panel_scope.PROVENANCE`'s four buckets, non-negative integers, over every NEW
+    outstanding finding — empty (`{}` or ``None``) on a round with nothing to
+    attribute, which is round 1 or a cycle whose fix range could not be read at all.
+    That is a CONTRACT and not a defended boundary. Unlike `round_stop`'s two
+    door checks, which exist because a `str` where a list belongs fails SILENTLY and
+    goes on running the loop, every wrong shape here is either loud at once (a
+    non-mapping raises) or arrives from a caller this module ships beside — and
+    validation that can only fire on a bug in the file next door buys a second place
+    for the schema to be written down and disagree with the first. The
+    rate is `introduced / (every bucket)`, and the three buckets that are not
+    `introduced` sit in the DENOMINATOR on purpose:
+
+    - `missed` belongs there because it is the other half of the same question, and
+      the ratio between them is the whole signal;
+    - `unknown` and `missed-unread` belong there because they DEPRESS the rate, and
+      that is the direction a stop should fail in. A round the harness could not
+      place is a round that does not end the cycle, which is the same posture
+      `_provenance` itself takes when it declines to guess.
+
+    Every field is present on every round, `premise_state`'s rule and for its
+    reason: an absent key and "the brake was off" are different claims, and a
+    consumer that had to tell them apart would be reading a payload's age rather
+    than a cycle's state. `rate` is `None` — not `0.0` — where there is nothing to
+    divide, because zero is a claim about a fix pass and this is the absence of one.
+
+    `over` is the RULE and it is decided here rather than in `round_stop`, on
+    `premise_state`'s precedent: what the stop rule receives is a verdict about a
+    measurement it has no other way to make, and keeping the arithmetic beside the
+    thing it measures is what lets the stop rule stay a rule about findings."""
+    counts = counts or {}
+    introduced = int(counts.get("introduced") or 0)
+    total = sum(int(counts.get(b) or 0) for b in PROVENANCE)
+    # ROUNDED FIRST, AND THE VERDICT IS TAKEN ON THE ROUNDED NUMBER. The payload
+    # carries `rate`, `limit` and `over` side by side, and a reader has to be able to
+    # check one against the other: deciding on the full float and publishing four
+    # decimal places would let a round record `rate: 0.5, limit: 0.5, over: true`,
+    # which reads as the strict comparison being broken. Four places is far finer
+    # than any denominator a round of findings can produce, so this changes no real
+    # verdict — it only stops the artifact contradicting itself.
+    rate = None if not total else round(introduced / total, 4)
+    over = bool(limit is not None and rate is not None
+                and total >= FIX_INJECTION_MIN_NEW and rate > limit)
+    return {"limit": limit, "introduced": introduced, "new": total, "rate": rate,
+            "min_new": FIX_INJECTION_MIN_NEW, "over": over}
 
 
 def premise_report(verdict: dict, register_path: str, notes: list[str],
@@ -2094,6 +2633,20 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
     out.append(f"declared occurrence {verdict['occurrence']}"
                + (f" of {verdict['limit']}" if verdict["limit"] else " (brake off)")
                + f" — after round(s) {rounds}")
+    # Said on every declaration, not only the braking one. A fixer that has never
+    # seen the question does not know it was asked, and "decidable unknown — not
+    # answered" is what teaches it the flag exists at the one moment it is deciding
+    # patch-or-escalate. A line that only appears when it stops you is a line nobody
+    # reads until it is too late to have answered.
+    answer = verdict.get("decidable", "unknown")
+    if answer == "unknown":
+        out.append("decidable  NOT ANSWERED — pass --premise-decidable yes|no: can "
+                   "the runtime this assertion runs in observe the property the fix "
+                   "asserts? An unanswered declaration cannot brake on #491")
+    else:
+        out.append(f"decidable  {answer} — the runtime this assertion runs in "
+                   + ("can" if answer == "yes" else "CANNOT")
+                   + " observe the property the fix asserts")
     if verdict["undeclared_rounds"]:
         # #84: an undeclared fix pass is UNESCALATABLE, and saying so is the point.
         # A cycle nobody could have braked reads exactly like one that did not need
@@ -2107,12 +2660,26 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
     out.append("")
     if verdict["escalate"]:
         keys = " ".join(f"--escalated {k}" for k in verdict["findings"])
+        # Which brake fired changes what the fixer is being told NOT to do, so the
+        # instruction is written from the one that fired rather than assuming the
+        # repeat. #84's sentence tells a fixer not to patch the same premise again;
+        # to a fixer stopped on its FIRST declaration that sentence is simply untrue
+        # about its own cycle, and a stop whose explanation does not match what
+        # happened is one a caller argues with.
+        if verdict.get("undecidable"):
+            why = ("The property is not decidable where the assertion runs (#491), so "
+                   "the fix you are about to write is an approximation of it and the "
+                   "next round's findings are the gap between the two. A better "
+                   "approximation is still an approximation — that is the loop this "
+                   "brake exists to refuse.")
+        else:
+            why = (f"This is fix pass {verdict['occurrence']} against one premise the "
+                   "previous round invalidated (#84).")
         out += [
             "STOP — DO NOT WRITE THIS FIX.",
             verdict["reason"],
             "",
-            f"This is fix pass {verdict['occurrence']} against one premise the previous "
-            "round invalidated (#84). Escalate it instead (review-pr.md step 3a): write no "
+            f"{why} Escalate it instead (review-pr.md step 3a): write no "
             "patch for the findings it explains, fix everything else in the pass, and "
             "report the premise, what it explains and what removing it would cost.",
         ]
@@ -2130,7 +2697,8 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
 
 def declare(repo_name: str | None, premise: str, register_path: str,
             round_no: int, findings: list[str] | None = None,
-            pr_number: int | None = None, json_out: bool = False) -> int:
+            pr_number: int | None = None, json_out: bool = False,
+            decidable: str = "unknown") -> int:
     """`panel.py --premise` — #84's futility brake, evaluated where a fix is PROPOSED.
 
     No seats, no diff, no judge, no vendor call and no board record: it reads the
@@ -2159,8 +2727,19 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     repo_name = cfg.get("name") or repo_name
     notes: list[str] = []
     limit = premise_repeat_limit(cfg["review_panel"], notes)
+    undecidable_brake = premise_undecidable_brake(cfg["review_panel"], notes)
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
-    verdict = declare_premise(reg, premise, round_no, findings or [], limit)
+    verdict = declare_premise(reg, premise, round_no, findings or [], limit,
+                              decidable, undecidable_brake)
+    if verdict["decidable"] == "no" and not undecidable_brake:
+        # The repo switched it off, and the declaration still says the fix cannot be
+        # verified where it runs. Recorded and reported rather than swallowed, on
+        # `ESCALATE_ON_UNBUILT`'s rule: a governance answer that changes nothing must
+        # not be indistinguishable from one that was never given.
+        notes.append("this declaration answered `decidable: no`, and "
+                     "`escalate_on.premise_undecidable` is off — the fix is not "
+                     "refused, and the answer is in the register for the round to "
+                     "report")
     write_failed = write_payload(register_path, reg)
     if json_out:
         print(json.dumps({**verdict, "register": register_path, "notes": notes,
@@ -2188,7 +2767,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                escalated: Iterable[str] = (), *,
                trigger_floor: str = NO_SEVERITY_FLOOR,
                fix_floor: str = NO_SEVERITY_FLOOR,
-               premises: dict | None = None) -> dict:
+               premises: dict | None = None,
+               injection: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -2331,16 +2911,115 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
       ran anyway — late, and better than the cap. It is deliberately the same
       terminal state a held escalation gets, because it IS one: a repeated premise
       is #67's circling, and the answer to it was never another fix pass.
+    - **A premise whose declaration answered ``decidable: no`` ENDS THE CYCLE** on
+      the same terms (#491), and gated on ``undecidable_brake`` — the register lists
+      such a declaration whether or not the repo armed the brake, because the payload
+      records what the cycle SAID, and a repo that switched it off must not have the
+      policy applied anyway. This is the late half of the same mechanism: the refusal
+      belongs at ``declare_premise``, and what reaches here is the record that a
+      caller wrote the fix regardless.
+
+      It is a SEPARATE rule from the repeat above and not a special case of it,
+      because the repeat is exactly what it cannot rely on. A fixer circling an
+      unobservable property replaces the proxy each round and declares a genuinely
+      different premise every time, so the occurrence counter stays at 1 while the
+      cycle circles — four declarations on one cycle, no two matching. What is shared
+      across those four is not their words but their answer to one question, which is
+      why the question is asked of each declaration alone.
+
     - **A fix pass that declared no premise is reported as unescalatable**
       (``undeclared_rounds``), and costs the round nothing. #84 is explicit that an
       undeclared fix is unescalatable rather than inferred, and the reason it is
       said out loud is that a cycle nobody COULD have braked reads exactly like a
-      cycle that did not need braking — silence would assert the second.
+      cycle that did not need braking — silence would assert the second. An
+      ``unknown`` decidability answer is the same rule one level down: a declaration
+      that was never asked the question is reported as unanswered, never guessed at.
 
     Declarations never buy a round, only end one. A register is a claim by the
     agent that is about to write the fix, and the one thing #67's evidence says
     cannot be self-reported is whether the loop is making progress; letting it
     extend the loop would hand that agent the other lever too.
+
+    ``injection`` is #489, and it is the third futility bound in this function
+    after ``premises`` and the cap. The cap bounds COST; ``premises`` bounds one
+    assumption being patched twice; this one bounds **rule 1 being fed by its own
+    output**, which is the failure ``trigger_floor``'s paragraph above indicts by
+    name and which nothing until now acted on. From round 2 what a round reviews IS
+    the previous round's fix, so a finding that fix created buys another panel,
+    another fix pass and another round of the same — and 128 of the 201 new findings
+    across the seven PRs counted above were exactly that.
+
+    **This is the gate `panel.py` deliberately withheld, and the withholding was
+    right.** The comment beside #67's tallies in that file says nothing reads them to
+    stop a run, that #67 asks for the instrument before the gate, and that "a few dozen
+    cycles of it are what would justify wiring it to anything". This is not that
+    decision being reversed as an oversight; it is the condition it named being met.
+    128/201 across seven PRs, 39/53 after round 1 on PR #299 with its round 2 at 17
+    of 17, and 64% then 87% on the cycle #489 was filed from — over a pull request
+    whose actual change was 113 lines. #67's other two tallies stay withheld, and the
+    comment beside them in `panel.py` now argues that on its own terms rather than by
+    inheritance from this one. Provenance is the one of the three that can carry a
+    threshold, because ``introduced`` is a floor and a floor has a known direction to
+    err in.
+
+    :func:`injection_state` is the measurement and it arrives already decided, on
+    ``premises``' precedent, so this function applies a rule rather than computing a
+    rate over a diff it has no business seeing.
+
+    **It may only take away the round RULE 1 was buying.** The justification is
+    about rule 1 and nothing else, so the rule is bounded to it: a round going again
+    under rule 2 (a P1/P2 or a Sonar gate issue still outstanding) or rule 3 (a
+    finding an earlier round already raised) is going again for work the fix pass
+    FAILED to do, which is not the same claim as the fix pass generating work — and
+    four below-floor findings, mostly introduced, must not be able to cancel the
+    repair round for an unrelated P1. This is where it parts company with #84's
+    brake, which fires at any of the four rules: a repeated premise is the fixer's
+    own DECLARATION about the patch it is about to write, and this is a threshold on
+    a statistic. A statistic may end the loop it is a statistic about; it may not
+    overrule a named blocker.
+
+    **It can only turn a `go again` into a STOP, and it is CHECKED on that
+    condition rather than merely obeying it.** A round that is already stopping has
+    no next round to prevent, and a dry round rewritten as "diverging" would be an
+    accusation about a cycle that converged. So a dry stop, a stop under either
+    floor and a stop holding an escalation all keep their own reason and their own
+    confidence. What that costs is the case where a below-floor stop hides a high
+    injection rate, and it is deliberate: #165's floor stops are POLICY stops that
+    are explicitly not vetoed, and vetoing them through this door would make every
+    configured convergence non-confident and hand the cap back its monopoly on
+    ending the loop.
+
+    **Never dressed up as convergence** — a veto line naming the dial, ``confident``
+    false by the existing rule, and a ``reason`` that says a human is owed an answer:
+    the same discipline ``max_fix_growth``, the round cap and a held escalation get.
+    Applied BEFORE the cap for ``premises``' reason, and before ``circling`` so that
+    a cycle doing both is reported as the premise repeat. That one NAMES the
+    assumption a fixer wrote against; this one only counts, and the more specific
+    truth wins the ``reason``.
+
+    **One honest mismatch, written down rather than fixed**, on the same terms
+    :func:`panel_scope._provenance` records its own two: the rate's denominator is
+    every new outstanding finding, while the rules above are applied to the
+    CLEARABLE ones — escalated keys are subtracted from the work and are not
+    subtracted from the tally. So a cycle holding an escalation can compute its rate
+    partly over a finding no fix round may touch. Closing it needs the tally keyed by
+    finding rather than by bucket, which is a second measurement beside
+    ``provenance_counts`` and a second thing that can disagree with it; and the two
+    numbers are answers to different questions, which is why they are allowed to
+    differ. The rate is a property of what this ROUND produced — an escalated finding
+    the last fix pass introduced is still a finding the last fix pass introduced —
+    and the work bound is a property of what the NEXT round could do about it.
+
+    **Why a threshold on this number errs in the safe direction.**
+    :func:`panel_scope._provenance` records that its split is biased toward
+    ``missed`` in BOTH directions — a defect a fix introduced by DELETING a guard has
+    no added line to sit on, and ``introduced`` requires exact membership in the
+    added lines while LLM reviewers and Sonar routinely report a line or two off —
+    and it says the count "should be read as a floor rather than as a measurement".
+    A floor that is over a threshold is genuinely over it. The unattributable
+    buckets sit in the denominator for the same reason (see
+    :func:`injection_state`): they depress the rate, so a round the harness could
+    not place is a round that does not end the cycle.
 
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
@@ -2502,7 +3181,63 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # It can only ever turn a `go again` into a STOP. There is no branch where a
     # declaration makes the loop run longer — see the docstring's paragraph on why
     # the agent writing the fix does not get that lever.
+    # #489, and BEFORE both #84's brake and the cap. Before the cap for the reason
+    # given there — a futility bound is the more specific truth than "the counter ran
+    # out" — and before `circling` because a cycle doing both is better reported as
+    # the premise repeat: that one names the assumption, this one only counts it.
+    #
+    # `not stop` is a CONDITION and not a redundancy. It is the whole of the guarantee
+    # that this dial can never make a review look cleaner than it is: the only
+    # transition it can make is `go again` -> STOP, so a dry round, a below-floor
+    # policy stop and a round holding an escalation each keep the reason and the
+    # confidence they earned.
+    #
+    # `triggering` IS THE SECOND CONDITION, and it is what keeps the rule inside its
+    # own justification. The argument for this brake is about RULE 1 specifically —
+    # new findings buy another round, and from round 2 those findings are the loop's
+    # own output — so it may only take away the round rule 1 was buying. A round going
+    # again under rule 2 or rule 3 is going again for a P1 the fix did not clear or a
+    # finding an earlier round already raised, and neither of those is the fix pass
+    # generating work: they are work it FAILED to do, and a rate computed over
+    # below-floor news must not cancel the repair round for an unrelated blocker. That
+    # is the one place this differs from #84's brake, which fires at any of the four
+    # rules — and the difference is that a repeated premise is a fixer's own
+    # DECLARATION about the patch it is about to write, while this is a threshold on a
+    # statistic. A statistic may end the loop it is a statistic about; it may not
+    # overrule a named P1.
+    #
+    # Recorded in a local because the veto and the payload both have to know whether
+    # this FIRED, and by then `stop` says only that something did.
+    injecting = injection_state(None, None) if injection is None else injection
+    injected = bool(injecting["over"] and not stop and triggering)
+    if injected:
+        stop, reason = True, (
+            f"{injecting['introduced']} of {injecting['new']} new finding(s) "
+            f"({injecting['rate']:.0%}) were introduced by the fix pass before this "
+            f"round, past the `escalate_on.fix_injection` threshold of "
+            f"{injecting['limit']:g} — the fix pass is generating this round's work, "
+            "and a human answers that, not another fix pass")
     circling = list((premises or {}).get("repeated") or [])
+    # #491's half, on exactly the same terms and gated on the same arming flag the
+    # declaration path reads. A repo that switched `escalate_on.premise_undecidable`
+    # off asked for its fixers to be allowed to approximate; ending its cycle on the
+    # answer anyway would enforce a policy it declined, which is the failure
+    # `ESCALATE_ON_UNBUILT` exists to keep on the other side.
+    #
+    # `premise_state` lists these regardless of the flag, deliberately — the payload
+    # records what a cycle DECLARED — so the arming check has to happen here rather
+    # than being assumed from the list being non-empty.
+    unobservable = (list((premises or {}).get("undecidable") or [])
+                    if (premises or {}).get("undecidable_brake") else [])
+    if unobservable:
+        worded = "; ".join(
+            f"{p['text']!r} (rounds {', '.join(str(r) for r in p['rounds'])})"
+            for p in unobservable)
+        stop, reason = True, (
+            f"{len(unobservable)} premise(s) a fix pass was written against assert a "
+            f"property the runtime cannot observe — {worded} — so every fix for them "
+            "is an approximation and the next round finds the gap: a human answers "
+            "this, not a better approximation")
     if circling:
         worded = "; ".join(
             f"{p['text']!r} declared {p['occurrences']}x "
@@ -2528,6 +3263,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #489. Unconditional for `circling`'s reason and one of its own: `injected` is
+    # only ever true on a round this rule itself stopped, so there is no `go again`
+    # round it can fire on. Said in full — both counts, the rate, the dial and the
+    # floor caveat — because this veto is the only place a reader is told WHY a
+    # number that is not a measurement is nevertheless enough to end a cycle.
+    if injected:
+        veto = [*veto, f"{injecting['introduced']} of {injecting['new']} new "
+                       f"outstanding finding(s) — {injecting['rate']:.0%} — were "
+                       "introduced by the fix pass before this round, past the "
+                       f"`escalate_on.fix_injection` threshold of "
+                       f"{injecting['limit']:g}. `introduced` is a documented FLOOR "
+                       "and not a measurement (#48), so the real share is at least "
+                       "that: this stop is that number, not convergence (#489)"]
     # #84. Unconditional rather than "only on a STOP", because `circling` forces the
     # stop a few lines above — there is no `go again` round this can fire on, and
     # writing the guard anyway would say there was.
@@ -2536,6 +3284,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "this cycle — the rounds have stopped being about different "
                        "things, and the next fix pass would be the third patch on one "
                        "assumption (#67, #84)"]
+    # Unconditional for the same reason `circling`'s is: it forces the stop above, so
+    # there is no `go again` round this can fire on. Its own line rather than folded
+    # into the one above, because the two say different things to a human deciding
+    # what to do next — one asks whether to keep patching an assumption, the other
+    # asks whether the property can be checked here at all.
+    if unobservable:
+        veto = [*veto, f"{len(unobservable)} premise(s) in this cycle assert a property "
+                       "nothing in the runtime can observe, so no fix for them can be "
+                       "verified where it runs and each round patches the last "
+                       "approximation (#491)"]
     return {
         "stop": stop,
         "reason": reason,
@@ -2571,7 +3329,31 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         else {"limit": premises.get("limit"),
               "declared": premises.get("declared", 0),
               "repeated": circling,
+              # The DECLARED list, not the armed one: a payload records what the
+              # cycle said, and `undecidable_brake` beside it says whether this run
+              # was going to act on it. Collapsing the two would make a repo that
+              # switched the brake off indistinguishable from one where no fixer ever
+              # answered the question.
+              "undecidable": list(premises.get("undecidable") or []),
+              "undecidable_brake": bool(premises.get("undecidable_brake")),
               "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
+        # #489's measurement as this round read it, and ALWAYS present for the reason
+        # `premises` is: a payload with no key and a round with nothing to attribute
+        # are different claims, and a consumer forced to tell them apart would be
+        # reading the payload's age rather than the cycle's state. `rate` is null where
+        # there was nothing to divide, and `limit` is null where the repo switched the
+        # brake off.
+        #
+        # `over` AND `fired`, because they are different questions and reading the
+        # first as the second is a lie about a clean round. `over` is a property of the
+        # MEASUREMENT — this round's rate crossed the threshold — and it is true of
+        # plenty of rounds this rule deliberately does not touch: a below-floor policy
+        # stop, a round holding an escalation, a round going again for a P1 under rule
+        # 2. `fired` is the property of the VERDICT: this rule is why the cycle
+        # stopped. A consumer that gated a "the cycle ended on divergence" sentence on
+        # `over` would attach it to a confident, converged round, which is exactly the
+        # misreporting the rest of this function is organised against.
+        "fix_injection": {**injecting, "fired": injected},
     }
 
 
@@ -2588,9 +3370,13 @@ __all__ = [
     "MAX_RECURRENCE_FINDINGS", "RECURRENCE_TITLE_CHARS", "recurrence_brief",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
-    "_positive_int", "_whole_pr_chars",
+    "_positive_int", "_nonneg_int", "_whole_pr_chars",
+    "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
+    "_introduced", "_trend_row",
     "load_baseline", "coverage_veto", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
+    "DECIDABILITY", "premise_undecidable_brake",
+    "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

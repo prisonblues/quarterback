@@ -172,7 +172,10 @@ at 721 lines, 74% of the PR being review-response code, off a round-2 fix list t
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
 individually reasonable small fixes;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
-fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
+whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
+the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
+stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
 not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
@@ -197,8 +200,10 @@ fixes on one unexamined premise, and PR #88 had a fixer circle its own previous 
 single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
 **approach** is wrong rather than the code, and write no patch for it: stated, with the premise
 in one sentence and what removing it would cost, rather than answered with a special case. It is
-narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
-because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+narrow on purpose — three conditions that must all hold, **or** a fourth that fails on its own
+(#491: the property the fix asserts is not decidable in the runtime the assertion runs in, so
+every fix for it is an approximation and the rounds cannot converge) — and it never authorises a
+redesign, because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
 premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
 question that path exists for. An escalated finding is recorded as `deferred` by the
 orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
