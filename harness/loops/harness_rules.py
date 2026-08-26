@@ -1107,6 +1107,59 @@ DEFAULTS: dict = {
         # second number nobody can calibrate is worse than one documented floor.
         "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
                          "fix_injection": 0.5, "new_findings_not_falling": 1},
+        # #507, and it is NOT a fifth rung — which is why it is here and not inside
+        # the block above. Every key in `escalate_on` answers one question: does this
+        # end the cycle? This one ends nothing, extends nothing and cannot move a
+        # verdict. It decides what an escalation ARRIVES WITH.
+        #
+        # **The hole it fills.** Every seat returns findings — a defect, a severity,
+        # a location — and on an ordinary round that is the right contract. On a
+        # cycle that will not converge the fixer is doing something else: inferring
+        # the reviewer's INTENT from a criticism and guessing at a change that
+        # satisfies it, and that guess is what the next round reads. #489's numbers
+        # are what the guessing costs — 128 of 201 new findings across seven PRs were
+        # created by the fix immediately before them — and nothing anywhere asked a
+        # seat the obvious question. So when a rung above fires, each seat that still
+        # has outstanding findings on the PR is asked one thing: *given these
+        # findings of yours, what is the smallest change that resolves them?* The
+        # answers go in the escalation output, in front of whoever the escalation
+        # goes to.
+        #
+        # **On escalation and not every round**, which is the whole of the cost
+        # argument. It buys a fan-out on a PR whose cycle was already ending badly,
+        # and nothing at all on a healthy round — where the fixer has the findings
+        # and the findings are working. #507 is explicit that this is where it is
+        # cheap and worth it.
+        #
+        # **`--ask` (#129) is the machinery and the wrong question.** That path fans
+        # a PREMISE out to the same seats and tallies holds/fails/unresolved; it
+        # adjudicates a claim somebody already wrote. Here nobody has written one,
+        # because the whole problem is that the fixer does not know what the claim
+        # should be. `panel_propose` reuses the fan-out and reuses neither the
+        # question nor — deliberately — the TALLY: four seats proposing four
+        # incompatible changes is the most useful answer a stuck cycle can get, and a
+        # verdict struck over them would average away the one thing worth collecting.
+        #
+        # **On by default, and the properties that earn it are not the brakes'.**
+        # Those two had to argue that they could not end a cycle early; this one
+        # cannot end a cycle at all:
+        #   - a proposal is NOT a finding. It enters no leaderboard, no cross-round
+        #     defect chain and no severity floor, it reaches `round_stop` through
+        #     nothing,
+        #     and the board's `extra="ignore"` ingest drops the key outright. A
+        #     reviewer that proposes is not thereby right (#79's precedent);
+        #   - it runs AFTER `stop`, `reason`, `veto` and `confident` are final and
+        #     writes to none of them, so it cannot make a review look cleaner than it
+        #     is — the property `fix_injection` and #505's rung each claim, and the
+        #     easiest of the three to hold here;
+        #   - a false positive costs one extra fan-out on a cycle that already spent
+        #     several rounds of them, and the failure it prevents is a human at a veto
+        #     line with a list of complaints and no proposal.
+        #
+        # `false` switches it off in one line, and the round then SAYS so in
+        # `config_notes` when it escalates — a repo that declined this must not be
+        # indistinguishable from one where the pass silently did not run.
+        "propose_on_escalation": True,
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -2332,6 +2385,14 @@ BOARD_DIALS: dict[str, Dial] = {
     # a board that could move the number but not turn the brake off would be a
     # channel carrying half a policy.
     "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either"),
+    # #507's constructive pass. `either`, because it is the one dial here whose two
+    # directions cost different things and neither is a merge policy: switching it ON
+    # spends a fan-out on cycles that escalate, switching it OFF sends a human to a
+    # veto line with a list of complaints and no proposal. A fleet mid-drain may well
+    # want the first answer and a fleet reviewing one careful pull request the second,
+    # which is exactly the decision a settings channel exists for — and it can move no
+    # verdict either way, so there is nothing here a board could loosen.
+    "review_panel.propose_on_escalation": Dial("flag", False, "either"),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are

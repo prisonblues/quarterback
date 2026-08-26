@@ -175,8 +175,8 @@ Four properties, each closing a failure the two file layers have:
 `max_fix_growth`, `max_fix_growth_chars`, `max_rounds`, `reviewer_scope`,
 `max_diff_chars`, `judge_max_diff_chars`, `judge_model`,
 `distant_merge_lines`, `escalate_on.premise_repeated`,
-`escalate_on.premise_undecidable`, `escalate_on.fix_injection` and
-`escalate_on.new_findings_not_falling`.
+`escalate_on.premise_undecidable`, `escalate_on.fix_injection`,
+`escalate_on.new_findings_not_falling` and `propose_on_escalation`.
 Everything that decides what may be **merged** —
 `auto_merge`, the `epic` and `preland` blocks, title patterns, the loop schedule —
 stays in the sample, for the reason the overlay refuses the same set.
@@ -319,6 +319,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.require_failing_test` | A finding must carry a reproducible failing test to block. **false, and read-only**: the reviewer-emitted test artefact it needs is not built (#92 — a reviewer emits a test and never runs one; #114 — it must be shown RED pre-fix). Setting it `true` is recorded, reported, and enforces nothing, and the round says so in `config_notes`. |
 | `review_panel.max_rounds` | The round cap, as a repo setting. **2**. `panel.py --max-rounds` still wins over it, and neither wins over the BOARD: a value the board states is a ceiling nothing below it may exceed (#55). This wins over the built-in constant. #165 proposes 1 and this keeps 2 deliberately — round 2 is what caught a defect *created* by round 1's fix on #236 — because the three keys above attack the fix pass's growth instead. |
 | `review_panel.escalate_on` | #78's reserved matters — the decisions the process may not take on its own. Four are built, and the two above are the volume/attribution pair. `premise_repeated` (**2**) is the OCCURRENCE a declared premise is stopped on: the second time a fix is written against one premise, stop. `premise_undecidable` (**true**) stops on the FIRST declaration that answers `--premise-decidable no` — the property the fix asserts is not observable in the runtime the assertion runs in, so every fix for it is an approximation and no number of rounds converges (#491). The asymmetry is the point: one counts because a single declaration is not evidence, the other reads a fact about the runtime that a repeat cannot make truer. It exists because the counter is structurally blind to proxy-replacement — a fixer swapping one proxy for a better one declares a genuinely different premise each round, and one measured cycle declared four that no two of matched. `quorum_failed` and `judge_absent` are accepted, reported in `config_notes` and enforced by nothing. Merged one level deep, with a per-key fallback so writing one key does not switch the others off. |
+| `review_panel.propose_on_escalation` | On an escalation, ask each seat that still has outstanding findings on this PR one question: **given these findings of yours, what is the smallest change that resolves them?** **true**, and on. It is NOT a fifth `escalate_on` rung and is deliberately not filed inside that block: every key there answers *does this end the cycle?*, and this one ends nothing, extends nothing and moves no verdict — it decides what an escalation ARRIVES WITH. The hole it fills is #507's: every seat returns findings, which is the right contract for an ordinary round, but on a cycle that will not converge the fixer is inferring the reviewer's INTENT from a criticism and guessing at a change that satisfies it — and that guess is what the next round reads. 128 of 201 new findings across seven PRs were created by the fix immediately before them. **On escalation, not every round**: it fires where an `escalate_on` rung FIRED (`fix_injection`, `new_findings_not_falling`, `premise_repeated`, `premise_undecidable` — `fired`, never merely `over`), so it costs one fan-out on a PR whose cycle was already ending badly and nothing at all on a healthy round. The round CAP is not an escalation and does not trigger it: a cap is a cost bound that ends healthy cycles and diverging ones in the same place. `--ask` (#129) is the machinery and the wrong question — it adjudicates a premise somebody already wrote, and here nobody has, because the whole problem is that the fixer does not know what the claim should be — so `panel_propose` reuses the fan-out and reuses neither the question nor, deliberately, the **tally**: four seats proposing four incompatible changes is the most useful answer a stuck cycle can get, and a verdict struck over them would average away the one thing worth collecting. Nothing is reconciled and no agreement is computed. **A proposal is not a finding**: it enters no leaderboard, no cross-round defect chain and no severity floor, it reaches `round_stop` through nothing, and the board's `extra="ignore"` ingest drops the key — a reviewer that proposes is not thereby right (#79). **It cannot make a review look cleaner than it is**: it runs after `stop`, `reason`, `veto` and `confident` are final and writes to none of them, and its section is printed UNDER the veto lines rather than over them. An escalated finding is shown and MARKED as the human's to answer, never as work for a fixer. Recorded every round as `proposals`, with each seat's verdict (`change` / `no small change` / `cannot tell`), its one-line proposal, where, which of its findings it claims to resolve, and the exact listing it was shown. `false` switches it off — and a round that then escalates says so in `config_notes`, because a repo that declined this must not be indistinguishable from one where nothing fired. |
 | `review_panel.budget` | #55's spend ceiling: `tokens_per_day`, `runs_per_day`, `tokens_per_pr`, `runs_per_pr`, `fleet_tokens_per_day`. **Every one `null` — no ceiling — which is what landing it did to every repo.** Checked against `GET /review/spend` *before any seat is dispatched*, and a repo at its ceiling is refused through the pre-flight's own machinery: printed, recorded with `reviewed: false` and a per-seat `ran: false`, posted to the PR, and carrying `stop_confident: false` so a budget stop cannot read as convergence. Tokens are input + output (`/review/stats`' `billable`); the run ceilings are what still binds where nothing was instrumented, and `runs_per_pr` is the one that binds a caller which renumbers its rounds. `0` is a real value and means nothing may be spent; `--force` overrides none of them. Board-settable, and the board's value beats this file's — a ceiling a repo can raise from inside itself is decorative. |
 | `review_panel.budget_window_hours` | What "per day" means for the two rolling ceilings. **24**. A dial rather than a constant because the window and the ceiling are one decision: halving the window halves the ceiling. The per-PR ceilings have no window — they are about one pull request's whole cost, and a rolling one would let a PR reviewed daily for a fortnight stay under a ceiling it passed on day two. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
@@ -1533,6 +1534,68 @@ $ panel.py --ask "panel.py exits non-zero when it skips a PR on a title pattern"
   other recording failure is reported too, and a run whose `--json-file` could not be
   written is not recorded at all — it is about to exit non-zero, and a board row for it
   would be two records disagreeing about whether the ask happened.
+
+### What the seats would do instead (#507)
+
+Every seat returns **findings** — a defect, a severity, a location — and for an ordinary round
+that is the right contract. A reviewer that proposed a patch for every nit would be a second
+author, and the leaderboard measures whether a reviewer is *right*, not whether it is helpful.
+
+On a cycle that will not converge the fixer is doing something else entirely: **inferring the
+reviewer's intent from a criticism**, and then guessing at a change that satisfies it. That guess
+is what the next round reads, and 128 of 201 new findings across seven PRs were created by the
+fix pass immediately before them. Nothing anywhere asked a seat the obvious question.
+
+So when an `escalate_on` rung **fires**, the round asks each seat that still has outstanding
+findings on this PR one thing:
+
+> given these findings of yours, what is the smallest change that resolves them?
+
+```
+### What the seats would do instead (3 asked)
+_This cycle escalated on `new_findings_not_falling`. …_
+- **claude** (4 finding(s)) — _change_ — `panel_rounds.py:3402`: hold the escalated keys out of
+  `blockers` instead of filtering them at each rule
+    - resolves 3 of them: `a1b2c3d4e5f6`, `1122334455aa`, `9f8e7d6c5b4a`
+- **codex** (2 finding(s)) — _no small change_: the two rules disagree about what `outstanding`
+  means; one of them has to move before either finding can be closed
+- **pi** (1 finding(s)) — _cannot tell_: I would need the previous round's payload
+```
+
+- **On escalation, not every round.** `fix_injection`, `new_findings_not_falling`,
+  `premise_repeated` and `premise_undecidable`, and on each one's `fired` rather than its `over`
+  — the measurement crossing a threshold is true of plenty of rounds those rules deliberately do
+  not touch. The round **cap** does not trigger it: a cap is a cost bound and ends healthy cycles
+  in the same place as diverging ones, so firing on it would be the "every round" this avoids.
+- **`--ask` is the machinery and the wrong question.** That path fans a *premise* out and tallies
+  it; here nobody has written a premise, because the whole problem is that the fixer does not
+  know what the claim should be. The fan-out, the sandbox, the retry and the attribution are
+  shared; the question, the reply shape and the **tally** are not.
+- **There is no tally, and that is the feature.** Four seats proposing four incompatible changes
+  is the most useful possible answer on a stuck cycle — it says the finding set has no small
+  resolution, which is the thing nobody currently learns until round five. Nothing here
+  reconciles them and nothing computes agreement: deciding whether two proposals are the same
+  change is the similarity heuristic #84 rules out for premises, one level down.
+- **A seat is shown what IT wrote**, not the judge's merge of it. `Canonical.synthesis` is one
+  sentence over every reporter of a defect, so a finding three seats raised carries a wording none
+  of them wrote — and the premise is *given these findings of yours*. The merged wording is shown
+  beside it where the two differ, because that is what the PR comment calls the defect.
+- **A proposal is not a finding.** No leaderboard, no cross-round defect chain, no severity
+  floor, and no path into `round_stop`. The prompt says so to the seat as well: a reviewer that
+  believed this was scored would propose in order to score. A `change` verdict carrying no change
+  is unreadable rather than recorded — the whole content of that verdict is the proposal.
+- **Its spend is measured locally and is invisible to #55's ceilings**, exactly as `--ask`'s is:
+  the board's review ingest is `extra="ignore"`, and folding proposal tokens into the round's own
+  reviewer rows would charge them to the review and inflate the leaderboard's cost-per-finding for
+  a seat that answered a question about findings it had already made.
+- **It cannot make a review look cleaner than it is.** It runs after `stop`, `reason`, `veto` and
+  `confident` are final and writes to none of them, and its section is printed **under** the veto
+  lines — a plan at the top of an escalation is exactly the "cleaner" this must not produce.
+- **An escalated finding is shown and marked** as the human's to answer. It is outstanding, and
+  the human at the veto line is precisely who needs a proposal on it; what it must not become is
+  a licence for a fix pass to patch one, so the brief says whose answer it is.
+- **`propose_on_escalation: false`** switches it off, and a round that then escalates says so in
+  `config_notes` rather than looking like a round where nothing fired.
 
 ### The `--json` payload
 
