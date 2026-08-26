@@ -584,6 +584,12 @@ async def _drive_seats() -> list[str]:
     # on mount AND on a timer, so a fixture that only re-rendered would race it
     # and the panel under the pointer would be the developer's own seats.
     app.refresh_seats = lambda: None
+    # And DIALS, which sits DIRECTLY ABOVE this panel and is `height: auto` (#477).
+    # It grows from nothing to two rows when the board answers, on `refresh_plan`'s
+    # clock, and every row of SEATS moves down with it — mid-click, since this
+    # driver clicks three of them. Not hypothetical: it is what failed
+    # `test_the_seats_panel_jumps_closes_and_adds` on the run that added this line.
+    app.render_dials = lambda *a, **k: None
 
     failures: list[str] = []
     async with app.run_test(size=(90, 50)) as pilot:
@@ -1493,6 +1499,10 @@ async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[s
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
     app.refresh_seats = lambda: None
+    # DIALS too — same reason as `_drive_seats`: it grows above the seat row this
+    # asserts on, and a row that moved between the render and the read is a row
+    # this reads at the wrong index.
+    app.render_dials = lambda *a, **k: None
 
     calls: list[list[str]] = []
     windowed: list[str] = []
