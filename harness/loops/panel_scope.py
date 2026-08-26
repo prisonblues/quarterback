@@ -14,11 +14,30 @@ from __future__ import annotations
 from panel_core import *            # noqa: F401,F403
 import panel_core                   # noqa: F401
 
-def _fix_range_diff(gh_repo: str, base_sha: str | None,
-                    head_sha: str | None) -> tuple[str | None, str | None]:
+#: What a missing fix range MEANS, as a value rather than as a sentence (#500).
+#:
+#: `no-fix` and `blind` both come back with no diff and both disable provenance,
+#: recurrence and increment scoping — and they are not the same news. Nothing
+#: landed between the rounds, so there is nothing to attribute and the instruments
+#: are VACUOUS; against that, the branch was rewritten (or the API refused, or the
+#: range would not fit) and the instruments are BLIND on a fix pass that really
+#: happened. The second is a coverage gap and takes a veto; the first is a fact
+#: about the cycle and takes none.
+#:
+#: A value and not a substring match on ``why``, on this repo's own rule: deriving
+#: a fact back out of a sentence written for a human is how the two drift apart,
+#: and `harness_rules` says as much where it refuses to sniff a layer out of its
+#: own provenance string. The caller gates on this; the sentence stays for the
+#: reader.
+FIX_RANGE_OK, FIX_RANGE_NO_FIX, FIX_RANGE_BLIND = "ok", "no-fix", "blind"
+
+
+def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
+                    ) -> tuple[str | None, str | None, str]:
     """The diff of everything that landed BETWEEN two rounds — i.e. the fix pass
     whose damage (or thoroughness) provenance is trying to attribute — as
-    `(diff, None)`; or `(None, why)` when there is no range to read.
+    `(diff, None, "ok")`; or `(None, why, kind)` when there is no range to read,
+    where `kind` is :data:`FIX_RANGE_NO_FIX` or :data:`FIX_RANGE_BLIND`.
 
     It never raises. A force-push that orphaned the earlier head, a baseline
     written before `head_sha` was recorded, no `gh` on PATH, an API refusal, a
@@ -46,18 +65,19 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
     `missed`. #41 (review the increment) is what removes the guess altogether.
     """
     if not gh_repo:
-        return None, "no GitHub repo is configured for this run"
+        return None, "no GitHub repo is configured for this run", FIX_RANGE_BLIND
     if not base_sha:
         return None, ("the baseline does not record which commit it reviewed "
-                      "(written before `head_sha` existed)")
+                      "(written before `head_sha` existed)"), FIX_RANGE_BLIND
     if not head_sha:
-        return None, "this round did not record the commit it reviewed"
+        return None, "this round did not record the commit it reviewed", FIX_RANGE_BLIND
     span = f"{base_sha[:8]}..{head_sha[:8]}"
     if base_sha == head_sha:
         # Not a failure and not worth an API call to be told nothing changed —
         # but told apart from one, or the operator goes looking for a GitHub
         # fault that never happened.
-        return None, f"no commit landed between rounds (head unchanged at {head_sha[:8]})"
+        return (None, f"no commit landed between rounds (head unchanged at {head_sha[:8]})",
+                FIX_RANGE_NO_FIX)
     try:
         got = json.loads(panel_core.sh(["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
                              "--jq", _FIX_RANGE_JQ], timeout=FIX_RANGE_TIMEOUT_S))
@@ -66,31 +86,77 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
         # OSError, a hung call is a TimeoutExpired, a truncated body is a
         # ValueError, and each of them would otherwise take down a whole review
         # round over an attribution nothing gates on.
-        return None, f"could not read the range {span} ({type(e).__name__})"
+        return None, f"could not read the range {span} ({type(e).__name__})", FIX_RANGE_BLIND
     if not isinstance(got, dict):
-        return None, f"the compare API answered {span} with something that is not an object"
+        return (None, f"the compare API answered {span} with something that is not an object",
+                FIX_RANGE_BLIND)
     if got.get("status") == "diverged":
         return None, (f"{span} have diverged — the branch was rewritten between rounds, so "
-                      "the range would span commits no fix pass wrote")
+                      "the range would span commits no fix pass wrote"), FIX_RANGE_BLIND
+    # `behind` is the other rewrite, and it reaches here looking like nothing at all
+    # (#500, found on review). The head is an ANCESTOR of the commit the last round
+    # reviewed — a reset backwards, a force-push that dropped commits — so the
+    # three-dot merge base IS the head and the compare comes back with no files. Left
+    # to the empty-compare road below that reads as "no commit landed between
+    # rounds", which is the opposite of what happened: commits were REMOVED, the fix
+    # pass this round is meant to attribute is gone from the branch, and the round is
+    # as blind as a diverged one. Named here rather than inferred from an empty file
+    # list, because the file list cannot tell the two apart.
+    if got.get("status") == "behind":
+        return None, (f"{span} is BEHIND — the branch was reset to an ancestor of the "
+                      "commit the last round reviewed, so the fix pass it would "
+                      "attribute is no longer on the branch"), FIX_RANGE_BLIND
     out: list[str] = []
     size = 0
     for f in got.get("files") or []:
         name, patch = f.get("filename"), f.get("patch")
         if not (name and patch):
-            continue  # binary, or too large for the API to send a patch for
+            # Binary, or too large for the API to send a patch for. SKIPPED, and the
+            # range still comes back `ok` when other files were readable — raised on
+            # review as a possible under-veto and declined deliberately (#500).
+            #
+            # Partial attribution is a documented BIAS of this signal, not a blind
+            # instrument: the docstring above already accepts the same loss from the
+            # 300-file cap ("a fix pass wider than that is attributed on the first
+            # 300 and the rest read as `missed`"), and a binary file has no lines for
+            # a finding to sit on in the first place. Vetoing here would fire on any
+            # PR that touched a lockfile or an image, which is most of them — and a
+            # veto that fires on most rounds is the one readers learn to skip, which
+            # is the failure this whole change is against.
+            #
+            # The case where it IS blind is every file being unreadable, and that is
+            # caught below: then there is no attribution left at all.
+            continue
         body = patch.rstrip("\n")
         chunk = f"diff --git a/{name} b/{name}\n{body}\n"
         size += len(chunk)
         if size > FIX_RANGE_MAX_CHARS:
             return None, (f"the range {span} is larger than {FIX_RANGE_MAX_CHARS:,} chars — "
-                          "not attributed, rather than held whole in memory")
+                          "not attributed, rather than held whole in memory"), FIX_RANGE_BLIND
         out.append(chunk)
     if not out:
         # An empty compare — a revert that nets to nothing, an empty commit — is
         # "no range", not "a range with no added lines". The second reading calls
         # every new finding `missed`, confidently and with nothing to say so.
-        return None, f"the range {span} changed no line this can attribute against"
-    return "".join(out), None
+        #
+        # **Which KIND it is turns on whether any file changed at all**, and the two
+        # roads out of this loop are not the same news (#500, found on review). No
+        # files means nothing landed: the instruments are vacuous, there is no fix
+        # pass they failed to see, and a veto would fire on an honest empty round.
+        # Files that changed but carried no readable patch — every one binary, or
+        # each too large for the API to send — means a fix pass DID happen and this
+        # cannot see it, which is blind in exactly the sense a rewritten branch is.
+        # Collapsing them would suppress the veto on a round that genuinely lost its
+        # attribution, which is the failure this whole change exists to stop.
+        changed = len(got.get("files") or [])
+        if changed:
+            return (None, f"the range {span} changed {changed} file(s) and none of them "
+                    "carried a readable patch (binary, or too large for the compare "
+                    "API to send) — a fix pass landed that this cannot attribute",
+                    FIX_RANGE_BLIND)
+        return (None, f"the range {span} changed no line this can attribute against",
+                FIX_RANGE_NO_FIX)
+    return "".join(out), None, FIX_RANGE_OK
 
 
 def _commit_id(value: object) -> str | None:
@@ -1812,6 +1878,7 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "_fix_range_diff", "_commit_id", "_head_sha_now",
+    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now", "PROVENANCE", "_provenance",
