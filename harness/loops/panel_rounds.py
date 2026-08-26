@@ -2571,9 +2571,16 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
 def injection_state(counts: dict | None, limit: float | None) -> dict:
     """#489's measurement as this round read it, for `round_stop` and the payload.
 
-    `counts` is `panel.py`'s `provenance_counts` — `panel_scope.PROVENANCE`'s four
-    buckets over every NEW outstanding finding, empty on a round with nothing to
-    attribute (round 1, or a cycle whose fix range could not be read at all). The
+    `counts` is `panel.py`'s `provenance_counts` and nothing else: it is
+    `panel_scope.PROVENANCE`'s four buckets, non-negative integers, over every NEW
+    outstanding finding — empty (`{}` or ``None``) on a round with nothing to
+    attribute, which is round 1 or a cycle whose fix range could not be read at all.
+    That is a CONTRACT and not a defended boundary. Unlike `round_stop`'s two
+    door checks, which exist because a `str` where a list belongs fails SILENTLY and
+    goes on running the loop, every wrong shape here is either loud at once (a
+    non-mapping raises) or arrives from a caller this module ships beside — and
+    validation that can only fire on a bug in the file next door buys a second place
+    for the schema to be written down and disagree with the first. The
     rate is `introduced / (every bucket)`, and the three buckets that are not
     `introduced` sit in the DENOMINATOR on purpose:
 
@@ -2597,11 +2604,17 @@ def injection_state(counts: dict | None, limit: float | None) -> dict:
     counts = counts or {}
     introduced = int(counts.get("introduced") or 0)
     total = sum(int(counts.get(b) or 0) for b in PROVENANCE)
-    rate = (introduced / total) if total else None
+    # ROUNDED FIRST, AND THE VERDICT IS TAKEN ON THE ROUNDED NUMBER. The payload
+    # carries `rate`, `limit` and `over` side by side, and a reader has to be able to
+    # check one against the other: deciding on the full float and publishing four
+    # decimal places would let a round record `rate: 0.5, limit: 0.5, over: true`,
+    # which reads as the strict comparison being broken. Four places is far finer
+    # than any denominator a round of findings can produce, so this changes no real
+    # verdict — it only stops the artifact contradicting itself.
+    rate = None if not total else round(introduced / total, 4)
     over = bool(limit is not None and rate is not None
                 and total >= FIX_INJECTION_MIN_NEW and rate > limit)
-    return {"limit": limit, "introduced": introduced, "new": total,
-            "rate": None if rate is None else round(rate, 4),
+    return {"limit": limit, "introduced": introduced, "new": total, "rate": rate,
             "min_new": FIX_INJECTION_MIN_NEW, "over": over}
 
 
@@ -2953,6 +2966,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     ``premises``' precedent, so this function applies a rule rather than computing a
     rate over a diff it has no business seeing.
 
+    **It may only take away the round RULE 1 was buying.** The justification is
+    about rule 1 and nothing else, so the rule is bounded to it: a round going again
+    under rule 2 (a P1/P2 or a Sonar gate issue still outstanding) or rule 3 (a
+    finding an earlier round already raised) is going again for work the fix pass
+    FAILED to do, which is not the same claim as the fix pass generating work — and
+    four below-floor findings, mostly introduced, must not be able to cancel the
+    repair round for an unrelated P1. This is where it parts company with #84's
+    brake, which fires at any of the four rules: a repeated premise is the fixer's
+    own DECLARATION about the patch it is about to write, and this is a threshold on
+    a statistic. A statistic may end the loop it is a statistic about; it may not
+    overrule a named blocker.
+
     **It can only turn a `go again` into a STOP, and it is CHECKED on that
     condition rather than merely obeying it.** A round that is already stopping has
     no next round to prevent, and a dry round rewritten as "diverging" would be an
@@ -2971,6 +2996,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     a cycle doing both is reported as the premise repeat. That one NAMES the
     assumption a fixer wrote against; this one only counts, and the more specific
     truth wins the ``reason``.
+
+    **One honest mismatch, written down rather than fixed**, on the same terms
+    :func:`panel_scope._provenance` records its own two: the rate's denominator is
+    every new outstanding finding, while the rules above are applied to the
+    CLEARABLE ones — escalated keys are subtracted from the work and are not
+    subtracted from the tally. So a cycle holding an escalation can compute its rate
+    partly over a finding no fix round may touch. Closing it needs the tally keyed by
+    finding rather than by bucket, which is a second measurement beside
+    ``provenance_counts`` and a second thing that can disagree with it; and the two
+    numbers are answers to different questions, which is why they are allowed to
+    differ. The rate is a property of what this ROUND produced — an escalated finding
+    the last fix pass introduced is still a finding the last fix pass introduced —
+    and the work bound is a property of what the NEXT round could do about it.
 
     **Why a threshold on this number errs in the safe direction.**
     :func:`panel_scope._provenance` records that its split is biased toward
@@ -3148,21 +3186,37 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # out" — and before `circling` because a cycle doing both is better reported as
     # the premise repeat: that one names the assumption, this one only counts it.
     #
-    # `and not stop` is a CONDITION and not a redundancy. It is the whole of the
-    # guarantee that this dial can never make a review look cleaner than it is: the
-    # only transition it can make is `go again` -> STOP, so a dry round, a
-    # below-floor policy stop and a round holding an escalation each keep the reason
-    # and the confidence they earned. Recorded in a local because the veto below has
-    # to know whether this FIRED, and by then `stop` says only that something did.
+    # `not stop` is a CONDITION and not a redundancy. It is the whole of the guarantee
+    # that this dial can never make a review look cleaner than it is: the only
+    # transition it can make is `go again` -> STOP, so a dry round, a below-floor
+    # policy stop and a round holding an escalation each keep the reason and the
+    # confidence they earned.
+    #
+    # `triggering` IS THE SECOND CONDITION, and it is what keeps the rule inside its
+    # own justification. The argument for this brake is about RULE 1 specifically —
+    # new findings buy another round, and from round 2 those findings are the loop's
+    # own output — so it may only take away the round rule 1 was buying. A round going
+    # again under rule 2 or rule 3 is going again for a P1 the fix did not clear or a
+    # finding an earlier round already raised, and neither of those is the fix pass
+    # generating work: they are work it FAILED to do, and a rate computed over
+    # below-floor news must not cancel the repair round for an unrelated blocker. That
+    # is the one place this differs from #84's brake, which fires at any of the four
+    # rules — and the difference is that a repeated premise is a fixer's own
+    # DECLARATION about the patch it is about to write, while this is a threshold on a
+    # statistic. A statistic may end the loop it is a statistic about; it may not
+    # overrule a named P1.
+    #
+    # Recorded in a local because the veto and the payload both have to know whether
+    # this FIRED, and by then `stop` says only that something did.
     injecting = injection_state(None, None) if injection is None else injection
-    injected = bool(injecting["over"] and not stop)
+    injected = bool(injecting["over"] and not stop and triggering)
     if injected:
         stop, reason = True, (
             f"{injecting['introduced']} of {injecting['new']} new finding(s) "
             f"({injecting['rate']:.0%}) were introduced by the fix pass before this "
-            f"round, over the {injecting['limit']:.0%} "
-            "`escalate_on.fix_injection` threshold — the fix pass is generating this "
-            "round's work, and a human answers that, not another fix pass")
+            f"round, past the `escalate_on.fix_injection` threshold of "
+            f"{injecting['limit']:g} — the fix pass is generating this round's work, "
+            "and a human answers that, not another fix pass")
     circling = list((premises or {}).get("repeated") or [])
     # #491's half, on exactly the same terms and gated on the same arming flag the
     # declaration path reads. A repo that switched `escalate_on.premise_undecidable`
@@ -3218,10 +3272,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{injecting['introduced']} of {injecting['new']} new "
                        f"outstanding finding(s) — {injecting['rate']:.0%} — were "
                        "introduced by the fix pass before this round, past the "
-                       f"{injecting['limit']:.0%} `escalate_on.fix_injection` "
-                       "threshold. `introduced` is a documented FLOOR and not a "
-                       "measurement (#48), so the real share is at least that: this "
-                       "stop is that number, not convergence (#489)"]
+                       f"`escalate_on.fix_injection` threshold of "
+                       f"{injecting['limit']:g}. `introduced` is a documented FLOOR "
+                       "and not a measurement (#48), so the real share is at least "
+                       "that: this stop is that number, not convergence (#489)"]
     # #84. Unconditional rather than "only on a STOP", because `circling` forces the
     # stop a few lines above — there is no `go again` round this can fire on, and
     # writing the guard anyway would say there was.
@@ -3286,11 +3340,20 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # #489's measurement as this round read it, and ALWAYS present for the reason
         # `premises` is: a payload with no key and a round with nothing to attribute
         # are different claims, and a consumer forced to tell them apart would be
-        # reading the payload's age rather than the cycle's state. `over` is the
-        # verdict, `rate` is null where there was nothing to divide, and `limit` is
-        # null where the repo switched the brake off — the three answers a reader
-        # comparing two rounds needs to keep apart.
-        "fix_injection": injecting,
+        # reading the payload's age rather than the cycle's state. `rate` is null where
+        # there was nothing to divide, and `limit` is null where the repo switched the
+        # brake off.
+        #
+        # `over` AND `fired`, because they are different questions and reading the
+        # first as the second is a lie about a clean round. `over` is a property of the
+        # MEASUREMENT — this round's rate crossed the threshold — and it is true of
+        # plenty of rounds this rule deliberately does not touch: a below-floor policy
+        # stop, a round holding an escalation, a round going again for a P1 under rule
+        # 2. `fired` is the property of the VERDICT: this rule is why the cycle
+        # stopped. A consumer that gated a "the cycle ended on divergence" sentence on
+        # `over` would attach it to a confident, converged round, which is exactly the
+        # misreporting the rest of this function is organised against.
+        "fix_injection": {**injecting, "fired": injected},
     }
 
 

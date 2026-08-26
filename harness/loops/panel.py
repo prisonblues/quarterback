@@ -2519,7 +2519,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `escalate_on.fix_injection`, so the tally has to exist before the verdict that
     # consumes it. Nothing else moved and nothing here reads `stop` — the whole block
     # is a function of `outstanding`, the baseline and the fix range, all of which
-    # were already resolved above.
+    # were already resolved above, and nothing between here and where it used to sit
+    # reads or writes any name it binds.
+    #
+    # The one visible consequence is ORDER: the two notes this block can post — an
+    # unreadable fix range, and the #67 tally that goes dark with it — now appear in
+    # `config_notes` above the stop rule's own notes rather than below them. That is
+    # the right way round for a reader (the measurement, then what was decided on it)
+    # and it is said here rather than left to be noticed, because `config_notes` is an
+    # artifact people diff.
     # ---- provenance: did the last fix pass INTRODUCE this, or did it MISS it? --
     #
     # What this round could not read, banked for the next one. A file is unread
@@ -2749,7 +2757,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # afterwards. The number is already printed a few lines further down ("N
     # introduced by the last fix pass"); what this adds is that it crossed a
     # threshold and ended the cycle, which the bare count cannot say.
-    if stop["fix_injection"]["over"]:
+    # `fired`, NOT `over`. `over` is a property of the measurement and is true of
+    # rounds this rule deliberately does not touch — a below-floor policy stop, a
+    # round holding an escalation, a round going again under rule 2 for a P1. Gating
+    # on it would print "the cycle ends here" under a confident, converged verdict,
+    # which is a `config_notes` line contradicting the `reason` beside it.
+    if stop["fix_injection"]["fired"]:
         fi = stop["fix_injection"]
         notes.append(
             f"{fi['introduced']} of {fi['new']} new outstanding findings "

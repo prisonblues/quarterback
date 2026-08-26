@@ -283,7 +283,79 @@ def test_the_measurement_rides_in_the_payload_whether_it_fired_or_not():
     state."""
     off = panel_rounds.round_stop(2, 5, [], [], [])
     assert off["fix_injection"] == {"limit": None, "introduced": 0, "new": 0,
-                                    "rate": None, "min_new": 4, "over": False}
+                                    "rate": None, "min_new": 4, "over": False,
+                                    "fired": False}
     on = panel_rounds.round_stop(2, 5, ["k1"], [], [], injection=_state(1, 3))
     assert on["fix_injection"] == {"limit": 0.5, "introduced": 1, "new": 4,
-                                   "rate": 0.25, "min_new": 4, "over": False}
+                                   "rate": 0.25, "min_new": 4, "over": False,
+                                   "fired": False}
+
+
+def test_over_and_fired_are_different_questions_and_the_payload_keeps_them_apart():
+    """A round can be over the threshold and be one this rule must not touch — a
+    below-floor policy stop is the commonest. `over` says the MEASUREMENT crossed;
+    `fired` says the VERDICT is this rule's. A consumer that read the first as the
+    second would attach "the cycle ended on divergence" to a confident, converged
+    round, which is the misreporting `round_stop` is organised against."""
+    quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
+    got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
+                                  trigger_floor="P2", fix_floor="P2",
+                                  injection=_state(9, 1))
+    assert got["fix_injection"]["over"] is True
+    assert got["fix_injection"]["fired"] is False
+    assert got["confident"] is True
+
+
+def test_a_round_going_again_for_an_unrelated_P1_is_not_cancelled_by_the_rate():
+    """The rule's own scope, enforced. Its justification is about RULE 1 — new
+    findings buying another round, fed by the loop's own output — so it may only take
+    away the round rule 1 was buying.
+
+    Here four new findings sit below the trigger floor, so rule 1 buys nothing, and
+    the round goes again under rule 2 for a P1 the fix did not clear. That P1 is work
+    the fix pass FAILED to do rather than work it generated, and a statistic computed
+    over four below-floor findings must not cancel its repair round. This is where the
+    rule parts company with #84's brake, which fires at any of the four rules: a
+    repeated premise is a fixer's own declaration, and this is a threshold."""
+    quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
+    blocker = _finding("P1", key_from="the mirror never closes")
+    got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], [*quiet, blocker], [],
+                                  trigger_floor="P2", fix_floor="P3",
+                                  injection=_state(3, 1))
+    assert got["fix_injection"]["over"] is True
+    assert got["fix_injection"]["fired"] is False
+    assert got["stop"] is False and "P1/P2" in got["reason"]
+
+
+def test_a_numeric_string_is_read_as_the_number_it_spells():
+    """`premise_repeat_limit` and `fix_growth_limit` both accept the string spellings
+    a hand or a generator writes, and this reads the same block as the first of them —
+    a repo whose `escalate_on` came out of a templating pass would otherwise get a
+    hard exit from one dial and a number from the other, off one file."""
+    assert panel_rounds.fix_injection_limit(
+        {"escalate_on": {"fix_injection": "0.75"}}, []) == 0.75
+    assert panel_rounds.fix_injection_limit(
+        {"escalate_on": {"fix_injection": " 0.5 "}}, []) == 0.5
+
+
+def test_a_board_dial_over_a_replaced_escalate_on_is_REPORTED_not_silent():
+    """The known edge of the per-key fallback, pinned rather than left to be
+    discovered. `escalate_on` merges wholesale, so a repo writing only
+    `premise_repeated` has no `fix_injection` leaf for a board dial to overwrite —
+    and `apply_dials` refuses to create one, deliberately: setting it back would
+    resurrect a key from a layer the repo cannot see.
+
+    The reader's fallback still supplies the DEFAULT, so the brake is on at 0.5 while
+    the board believes its own value is in force. That is the same shape
+    `premise_repeated` has had since #84 and the reason it is survivable is the one
+    asserted here: the refusal is in `problems`, named, rather than silent."""
+    cfg = {"review_panel": {"escalate_on": {"premise_repeated": 2}}}
+    applied, problems = harness_rules.apply_dials(
+        cfg, {"review_panel.escalate_on.fix_injection":
+              {"value": None, "scope": "repo"}})
+    assert not applied
+    assert any("review_panel.escalate_on.fix_injection" in p
+               and "nothing to override" in p for p in problems)
+    # And the reader is unmoved by the board's opinion, which is the half that makes
+    # the report load-bearing rather than decorative.
+    assert panel_rounds.fix_injection_limit(cfg["review_panel"], []) == 0.5

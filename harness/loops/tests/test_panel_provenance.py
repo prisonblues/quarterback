@@ -981,3 +981,35 @@ def test_a_round_that_mostly_found_what_the_last_one_MISSED_is_not_diverging(
     assert (got["rate"], got["over"]) == (0.25, False)
     assert "round cap (2) reached" in r2["stop_reason"]
     assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+
+
+def test_a_round_that_stops_UNDER_A_FLOOR_is_not_told_it_stopped_on_divergence(
+        monkeypatch, tmp_path):
+    """The integration half of `over` vs `fired`, and the one a unit test cannot
+    reach: `run()` writes the human-readable note, and gating it on the MEASUREMENT
+    rather than on the VERDICT puts "the cycle ends here" in `config_notes` under a
+    `reason` that names a policy floor and a `confident: true` beside it.
+
+    Both floors are raised to P1 so this round's P2s buy nothing and clear nothing:
+    the cycle stops under #165's trigger floor, which is a policy stop that is
+    deliberately NOT vetoed. Three of its four new findings were still written by the
+    fix pass, so the rate is over the threshold and has to say so in the payload —
+    and say nothing anywhere else."""
+    cfg = {**CFG, "review_panel": {"fix_severity_floor": "P1",
+                                   "round_trigger_floor": "P1"}}
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111",
+                              cfg=cfg)
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                         head="bbb222", baseline=[r1_path], cfg=cfg)
+
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["over"], got["fired"]) == (True, False)
+    assert "round trigger floor" in r2["stop_reason"]
+    assert r2["round_stop"]["confident"] is True
+    assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+    assert not any("fix_injection" in n for n in r2["config_notes"])
