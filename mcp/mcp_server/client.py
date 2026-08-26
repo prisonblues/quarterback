@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from collections.abc import Iterable, Iterator
 
 import httpx
@@ -110,6 +111,10 @@ class QuarterbackClient:
         # session start — to serve two tools a session will probably never call.
         self._elevated = elevated or None
         self._elevated_cmd = elevated_cmd or None
+        # Serialises credential RESOLUTION only — never a request. Two delegated
+        # calls that both need a fetch would otherwise run the command twice, and
+        # the command is `op read`, which can prompt. See `_resolve_elevated`.
+        self._elevated_lock = threading.Lock()
         # A TRANSPORT is injected, never a client, and this is round 2's third
         # P2. The parameter used to take an httpx.Client and call
         # `.headers.update()` on it — which mutates an object the caller owns, so
@@ -140,55 +145,68 @@ class QuarterbackClient:
         "machine). It is not the board bearer and not a person's session."
     )
 
-    def _resolve_elevated(self, refresh: bool = False) -> str | None:
-        """This machine's delegated secret, from the literal or from the command.
+    def _resolve_elevated(self, *, stale: str | None = None) -> str | None:
+        """This machine's delegated secret — the cached one, or a freshly fetched one.
 
-        ``refresh`` re-runs the command past any cached value, which is what a 403
-        means here: a secret that authenticated yesterday is exactly what is stale
-        after a rotation. Same *reasoning* as ``QUARTERBACK_TOKEN_REFRESH_CMD`` —
-        "the cached copy is exactly what is stale" — but not the same mechanism and
-        there is no ``_REFRESH_CMD`` of its own: this re-runs the ONE command it
-        has, which is enough because `op read` goes to the store every time. A
-        second variable would only matter for a resolver that caches internally.
+        ``stale`` is the value the caller just had refused, and passing it asks for
+        a secret **different from that one**. That is a compare-and-swap on the
+        cache rather than an unconditional re-fetch, and it is what makes a
+        concurrent retry cheap: if another call has already rotated the cache, this
+        one gets the new value without running the command a second time.
+
+        Same *reasoning* as ``QUARTERBACK_TOKEN_REFRESH_CMD`` — "the cached copy is
+        exactly what is stale" — but not the same mechanism, and there is no
+        ``_REFRESH_CMD`` of its own: this re-runs the ONE command it has, which is
+        enough because `op read` goes to the store every time.
+
+        **Everything that touches ``self._elevated`` happens under the lock, and
+        nothing else does.** The lock is held across the subprocess, deliberately:
+        the cost of serialising is one caller waiting, and the cost of not doing so
+        is two concurrent `op read` invocations — which on a box using the 1Password
+        desktop integration is two authorisation prompts for one logical fetch.
         """
-        if self._elevated and not refresh:
+        with self._elevated_lock:
+            current = self._elevated
+            # Warm, or somebody else already replaced the value this caller was
+            # refused. Either way there is nothing to fetch.
+            if current and current != stale:
+                return current
+            if not self._elevated_cmd:
+                # Nothing to re-derive from, so an operator-configured literal is
+                # never discarded: dropping it would leave this client permanently
+                # credential-less until the process restarts, turning one bad
+                # request into every later one.
+                return current
+            try:
+                done = subprocess.run(self._elevated_cmd, shell=True, check=False,
+                                      capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+                # UnicodeDecodeError because `text=True` decodes the command's
+                # stdout: a secret store that emits a stray byte would otherwise
+                # raise out of a credential lookup rather than reporting "no
+                # credential".
+                done = None
+            # The EXIT CODE decides, not the presence of output. `op` prints
+            # diagnostics to stdout on some failures, so a non-zero run that wrote
+            # something would otherwise be adopted as a credential — and the
+            # symptom would be a 403 nobody could explain, from a value that never
+            # was one.
+            value = ""
+            if done is not None and done.returncode == 0:
+                # First line only, exactly as `qb_resolve_token` trims: a store
+                # that prints a warning after the value must not put it in a
+                # header.
+                value = done.stdout.split("\n", 1)[0].strip()
+            if value:
+                self._elevated = value
+            elif stale is not None:
+                # The fetch produced nothing AND the cached value has already been
+                # refused once. Keeping it would let the next call sail past the
+                # "have I got one" check and replay a rejected secret; dropping it
+                # turns that into the actionable "no credential" refusal instead of
+                # a second 403.
+                self._elevated = None
             return self._elevated
-        if not self._elevated_cmd:
-            return self._elevated
-        try:
-            done = subprocess.run(self._elevated_cmd, shell=True, check=False,
-                                  capture_output=True, text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
-            # UnicodeDecodeError because `text=True` decodes the command's stdout:
-            # a secret store that emits a stray byte would otherwise raise out of
-            # a credential lookup rather than reporting "no credential".
-            done = None
-        # The EXIT CODE decides, not the presence of output. `op` prints
-        # diagnostics to stdout on some failures, so a non-zero run that wrote
-        # something would otherwise be adopted as a credential — and the symptom
-        # would be a 403 nobody could explain, from a value that never was one.
-        value = ""
-        if done is not None and done.returncode == 0:
-            # First line only, exactly as `qb_resolve_token` trims: a store that
-            # prints a warning after the value must not put it in a header.
-            value = done.stdout.split("\n", 1)[0].strip()
-        if value:
-            self._elevated = value
-        elif refresh and self._elevated_cmd:
-            # A refresh that produced nothing means the cached value is all there
-            # is AND it has already been refused once. Keeping it would let
-            # `_delegated_post`'s truthiness check pass and replay the same
-            # rejected secret; dropping it turns the next call into the
-            # actionable "no credential" refusal instead of a second 403.
-            #
-            # Guarded on there BEING a command, so an operator-configured literal
-            # (`QUARTERBACK_ELEVATED_TOKEN`) is never discarded: nothing can
-            # re-derive it, so dropping it would turn one bad request into a
-            # client that is permanently credential-less until the process
-            # restarts. `_delegated_post` only refreshes when a command exists
-            # anyway; this makes the invariant local rather than remote.
-            self._elevated = None
-        return self._elevated
 
     def _delegated_post(self, path: str, body: dict) -> dict:
         """POST to the agent host, carrying this machine's delegated credential.
@@ -197,9 +215,15 @@ class QuarterbackClient:
         header. A missing credential is refused BEFORE the request, because that
         is one setup step rather than an answer about what was asked.
         """
-        if not self._resolve_elevated():
+        secret = self._resolve_elevated()
+        if not secret:
             raise RuntimeError(self.NO_CREDENTIAL)
-        resp = self._send_delegated(path, body)
+        # Held in a LOCAL for the rest of this call. Reading `self._elevated` again
+        # at send time is the race this method used to have: a concurrent call
+        # clearing the cache between resolve and send left this request going out
+        # with an empty header — a 403 that looks like a wrong secret and is
+        # actually a missing one.
+        resp = self._send_delegated(path, body, secret)
         # One retry, and only for the 403 that is actually about the credential.
         # A 403 here can equally be the board refusing the ACT — dropping an item,
         # writing an exemption marker — and re-reading 1Password to ask again is
@@ -208,17 +232,26 @@ class QuarterbackClient:
         # board names the header in the credential case (see `delegated()`), so
         # that is what to match on.
         if (resp.status_code == 403 and self._elevated_cmd
-                and ELEVATED_HEADER in resp.text
-                and self._resolve_elevated(refresh=True)):
-            resp = self._send_delegated(path, body)
+                and ELEVATED_HEADER in resp.text):
+            fresh = self._resolve_elevated(stale=secret)
+            # Only when it is actually different. `_resolve_elevated` returns the
+            # same value when there was nothing fresher, and replaying it would
+            # spend a second request to be refused identically.
+            if fresh and fresh != secret:
+                resp = self._send_delegated(path, body, fresh)
         resp.raise_for_status()
         return resp.json()
 
-    def _send_delegated(self, path: str, body: dict) -> httpx.Response:
-        """One POST with whatever secret is current — split out so the retry above
-        re-reads the header rather than reusing a stale one."""
+    def _send_delegated(self, path: str, body: dict,
+                        secret: str) -> httpx.Response:
+        """One POST with the secret it is GIVEN — never one it reads off `self`.
+
+        The parameter is the fix for #498's first item rather than a tidy-up: a
+        request must carry the credential its caller resolved, not whatever the
+        shared cache happens to hold by the time the header is built.
+        """
         return self._http.post(self._url(path), json=body,
-                               headers={ELEVATED_HEADER: self._elevated or ""})
+                               headers={ELEVATED_HEADER: secret})
 
     def plan_reorder(self, body: dict) -> dict:
         """``POST /plan/reorder`` — put an order into force. Delegated (#478)."""
