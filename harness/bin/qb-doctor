@@ -163,11 +163,50 @@ CMD_TIMEOUT = 30
 #: which is this file's subject happening to this file.
 MAX_BODY = 8 * 1024 * 1024
 
-#: Where the runbook for the edge secret lives. Named in full because the whole
-#: point of the edge row is that its remedy belongs to a person, and "ask Rich"
-#: is not a remedy — a path is.
-EDGE_RUNBOOK = ("~/source/selfhost/issues/open/"
-                "160-bug-quarterback-human-writes-refused-at-the-edge.md")
+#: The runbook's file name. Only the name is a constant, because only the name is
+#: stable: the file moves between `issues/open` and `issues/closed` as the issue's
+#: state changes, and this used to hardcode `issues/open`.
+#:
+#: It moved to `closed` on 2026-08-22, when the secret was actually deployed — so
+#: from that day the one row whose entire purpose is *"the remedy belongs to a
+#: person, and a path is the remedy"* printed a path to nothing. A stale pointer is
+#: worse here than no pointer: it sends somebody looking in a directory the file is
+#: not in, for a document that does exist.
+EDGE_RUNBOOK_FILE = "160-bug-quarterback-human-writes-refused-at-the-edge.md"
+
+#: Both states the issue can be in, newest-first by likelihood: a runbook worth
+#: naming is usually one whose problem has been solved at least once.
+EDGE_RUNBOOK_DIRS = ("issues/closed", "issues/open")
+
+#: The checkout it lives in. An env override because this is a path into ANOTHER
+#: repository, which is the one thing this script cannot derive from its own.
+SELFHOST_REPO_ENV = "SELFHOST_REPO"
+
+
+def edge_runbook() -> str:
+    """Where the runbook is on THIS box, or how to find it when it is not here.
+
+    Resolved rather than asserted. The alternative — a constant naming one of the
+    two directories — is what shipped, and it was wrong within a fortnight for a
+    reason no reader could have predicted from the constant: the issue was closed,
+    so the file moved, so the remedy pointed at nothing.
+
+    Never returns a path that does not exist. A box without the selfhost checkout
+    gets a sentence saying which repository to look in, which is a worse remedy
+    than a path and a much better one than a path that is a lie.
+    """
+    root = Path(os.environ.get(SELFHOST_REPO_ENV) or Path.home() / "source" / "selfhost")
+    for where in EDGE_RUNBOOK_DIRS:
+        found = root / where / EDGE_RUNBOOK_FILE
+        if found.is_file():
+            # `~` rather than the absolute path, to match every other path this
+            # tool prints and because the reader is the person whose home it is.
+            try:
+                return f"~/{found.relative_to(Path.home())}"
+            except ValueError:
+                return str(found)
+    return (f"{EDGE_RUNBOOK_FILE} in the selfhost repo — not on this box "
+            f"(set {SELFHOST_REPO_ENV} if it is checked out elsewhere)")
 
 
 @dataclass
@@ -1156,12 +1195,19 @@ def check_edge(host: Host) -> Check:
       ever stopped stripping, any agent on any box could post as Rich. That half
       is checkable from here and it is checked first, because a false pass on it
       is worse than a fail on the other.
-    * the browser vhost must ACCEPT the person it authenticated. That is the half
-      that has been broken since v2.39 — `HUMAN_EDGE_SECRET` was never generated,
-      never given to the app and never injected by nginx — and it is the half a
-      machine with no forward-auth session cannot see. Hence `unknown` there and
-      not `ok`: the honest answer is "nothing on this host can tell", and the
-      remedy is a runbook rather than a command.
+    * the browser vhost must ACCEPT the person it authenticated. This was broken
+      from v2.39 until 2026-08-22 — `HUMAN_EDGE_SECRET` had never been generated,
+      given to the app or injected by nginx — and selfhost #160 fixed it, verified
+      live. **Stated in the past tense deliberately.** This paragraph asserted the
+      present one for four days after it stopped being true, next to a runbook path
+      that had gone stale for the same reason: the issue closing is what moved the
+      file, and the same event is what made the sentence wrong.
+
+      It is still `unknown` rather than `ok`, and that is not a leftover. This half
+      needs a forward-auth session and an agent host has none, so "nothing on this
+      host can tell" remains the honest answer whatever the deployment does — see
+      `_edge_human_writes`, and `QUARTERBACK_EDGE_COOKIE` for the one way a box can
+      answer it.
 
     Deliberately NOT done by asking the app whether the secret is configured.
     That would need a new endpoint, and a new endpoint would be absent from the
@@ -1179,7 +1225,7 @@ def check_edge(host: Host) -> Check:
                      "agent vhost refuses a self-supplied Remote-User; the browser vhost is "
                      "not known to this host, so human writes could not be tested", "unknown",
                      manual="set QUARTERBACK_HUMAN_URL in ~/.config/quarterback/config, then "
-                            f"re-run. If human writes are refused, the runbook is {EDGE_RUNBOOK}")
+                            f"re-run. If human writes are refused, the runbook is {edge_runbook()}")
     return _edge_human_writes(host)
 
 
@@ -1250,13 +1296,13 @@ def _edge_human_writes(host: Host) -> Check:
     status, body, err = http_get(f"{host.human_url}/whoami", headers)
     if err:
         return Check("edge", host.human_url, f"could not reach the browser vhost: {err}",
-                     "unknown", manual=f"runbook: {EDGE_RUNBOOK}")
+                     "unknown", manual=f"runbook: {edge_runbook()}")
     if status in (301, 302, 303, 307, 308):
         return Check(
             "edge", host.human_url,
             f"the browser vhost answered {status} — forward-auth, and this host has no "
             "session, so nothing here can see whether HUMAN_EDGE_SECRET is set", "unknown",
-            manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to a "
+            manual=f"runbook: {edge_runbook()} (or set QUARTERBACK_EDGE_COOKIE to a "
                    "signed-in session and re-run)")
     if status in (401, 403):
         # WHICH hop refused matters, and the status code cannot say. The auth proxy
@@ -1273,17 +1319,17 @@ def _edge_human_writes(host: Host) -> Check:
                          "board's — the auth proxy refused this host before the app saw the "
                          "request, so nothing here can see whether HUMAN_EDGE_SECRET is set",
                          "unknown",
-                         manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to "
+                         manual=f"runbook: {edge_runbook()} (or set QUARTERBACK_EDGE_COOKIE to "
                                 "a signed-in session and re-run)")
         return Check("edge", host.human_url,
                      f"human writes are REFUSED ({status}) — the edge authenticated a person "
                      "and the app would not take them, which is HUMAN_EDGE_SECRET unset or "
                      "disagreeing between 1Password and sops", "fail",
-                     manual=f"runbook: {EDGE_RUNBOOK} — needs a generated secret in TWO "
+                     manual=f"runbook: {edge_runbook()} — needs a generated secret in TWO "
                             "stores and two deploys; that is a person's job, not this tool's")
     if status != 200:
         return Check("edge", host.human_url, f"/whoami answered {status}", "unknown",
-                     manual=f"runbook: {EDGE_RUNBOOK}")
+                     manual=f"runbook: {edge_runbook()}")
     try:
         kind = json.loads(body).get("kind")
     except ValueError:
@@ -1292,7 +1338,7 @@ def _edge_human_writes(host: Host) -> Check:
         return Check("edge", host.human_url,
                      f"the browser vhost answered as {kind!r}, not a person — Remote-User is "
                      "not reaching the app", "fail",
-                     manual=f"runbook: {EDGE_RUNBOOK}")
+                     manual=f"runbook: {edge_runbook()}")
     return Check("edge", host.human_url, "human writes accepted", "ok")
 
 
