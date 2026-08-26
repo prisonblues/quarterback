@@ -1406,6 +1406,38 @@ def severity_floor(panel: dict, key: str, fallback: str, notes: list[str]) -> st
     return got
 
 
+def deferral_issue_floor(panel: dict, notes: list[str]) -> str:
+    """`file_deferral_issues` — one of ``SEVERITIES``, ``"always"`` or ``"never"``.
+
+    Which deferrals get a GitHub issue as well as the board row every deferral gets
+    anyway (#482). Not :func:`severity_floor` with a wider vocabulary, because the
+    two ends are words rather than bands: `"below P4"` names no band this panel has,
+    and `P0` is deliberately absent from ``SEVERITIES`` — so `"never"` would be
+    unwritable and `"always"` would have to be spelled `P4`, which reads as a
+    severity judgement about a decision that is not one.
+
+    Case-insensitive on both halves, and normalised to the spelling each half uses
+    everywhere else: a band comes back upper-cased like every other severity in the
+    panel, an end lower-cased like every other word in a rules file. Unset — missing,
+    null or ``""`` — takes the default silently, the reading every setting here gives
+    it. Anything else is refused (:func:`_refuse_value`), because a repo that wrote
+    `file_deferral_issues: "P-2"` meaning "the tail stays off the tracker" and
+    silently got the default would go on filing exactly the issues it asked to stop.
+    """
+    want = panel.get("file_deferral_issues")
+    if want is None or want == "":
+        return DEFAULT_FILE_DEFERRAL_ISSUES
+    if isinstance(want, str):
+        if want.strip().lower() in DEFERRAL_ISSUE_ENDS:
+            return want.strip().lower()
+        got = _severity(want, "")
+        if got:
+            return got
+    _refuse_value("file_deferral_issues", want,
+                  f"one of {', '.join(SEVERITIES)}, "
+                  f"{' or '.join(DEFERRAL_ISSUE_ENDS)} (case-insensitive)")
+
+
 def reviewer_scope(panel: dict, notes: list[str]) -> str:
     """``diff`` or ``repo`` — what a reviewer is asked to look for.
 
@@ -1753,7 +1785,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The nine #165/#297/#492 settings as this round applied them.
+    """The ten #165/#297/#492/#482 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1762,6 +1794,7 @@ class Dials:
     means the payload records what was applied rather than what was written."""
 
     fixer_may_defer: bool = DEFAULT_FIXER_MAY_DEFER
+    file_deferral_issues: str = DEFAULT_FILE_DEFERRAL_ISSUES
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
@@ -1775,6 +1808,7 @@ class Dials:
         """For the payload. Every key present on every round, so a consumer never has
         to tell "the default applied" from "a payload written before the field"."""
         return {"fixer_may_defer": self.fixer_may_defer,
+                "file_deferral_issues": self.file_deferral_issues,
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
@@ -1845,6 +1879,51 @@ class Dials:
                     and severity_at_least(severity, self.fix_severity_floor)
                     and not severity_at_least(severity, self.round_trigger_floor))
 
+    def files_issue(self, severity: str, escalated: bool = False) -> bool:
+        """Does a deferral at this severity get a GitHub issue as well as its row?
+
+        The board row is not in question and never is: every deferral gets one, at
+        every setting of this dial. What this answers is whether a SECOND copy is
+        opened on a human's tracker (#482).
+
+        **An ESCALATION is exempt at every setting**, which is why this takes a second
+        argument rather than reading severity alone. Two of §4b's three roads to
+        `deferred` are work items — a fixer deferral and a below-floor or unpaid
+        finding — and those are what a tracker is for and what the tail measurement
+        counted. The third is not a work item at all: an escalation's issue *asks* a
+        question about the change's premise, it is the artefact that carries that
+        question past the end of the session, and the cycle is not finished until a
+        human answers it. Withholding it would not save a ticket, it would drop the
+        question — the same exemption a Sonar hard-gate issue gets from both severity
+        floors, and for the same reason: it is not a severity judgement.
+
+        An unreadable or absent severity files the issue. That is the safe direction
+        and the only one: the cost of an issue nobody needed is one line on a tracker,
+        and the cost of silently withholding one is the finding living solely in a row
+        whose severity nothing could read — which is the dumping ground this dial
+        exists to avoid, arriving through the back door."""
+        if escalated:
+            return True
+        gate = self.file_deferral_issues
+        if gate == DEFERRAL_ISSUES_ALWAYS:
+            return True
+        if gate == DEFERRAL_ISSUES_NEVER:
+            return False
+        band = _severity(severity, "")
+        return not band or severity_at_least(band, gate)
+
+    def deferral_gist(self) -> str:
+        """The one line the report says about where deferrals go, in the orchestrator's
+        own terms rather than as a key name — it is the orchestrator, not the fixer,
+        that acts on this, and it acts on it after the round has finished."""
+        if self.file_deferral_issues == DEFERRAL_ISSUES_ALWAYS:
+            return "every deferral gets a GitHub issue"
+        if self.file_deferral_issues == DEFERRAL_ISSUES_NEVER:
+            return ("no deferral gets a GitHub issue — board rows only "
+                    "(an escalation still does)")
+        return (f"deferrals at/above {self.file_deferral_issues} get a GitHub issue, "
+                f"below it a board row only (an escalation always gets one)")
+
     def gist(self) -> str:
         """The one report line. Printed on EVERY round, at the default or not: the
         orchestrator builds the fixer's brief out of this report, so "which findings
@@ -1873,12 +1952,18 @@ class Dials:
                 f"reviewer scope {self.reviewer_scope} · "
                 f"fix growth cap {growth} · fixer may defer "
                 f"{'yes' if self.fixer_may_defer else 'no'} · failing test required "
-                f"{'yes' if self.require_failing_test else 'no'}")
+                f"{'yes' if self.require_failing_test else 'no'} · "
+                # Printed on every round at the default or not, for the same reason
+                # the rest of this line is: the orchestrator builds §4b's bookkeeping
+                # out of this report, so "does this deferral get an issue" has to be
+                # readable from the artifact rather than from whoever remembers the
+                # repo's config (#482).
+                f"{self.deferral_gist()}")
 
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all nine at once.
+    """Read, validate and report all ten at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -1894,6 +1979,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     dials = Dials(
         fixer_may_defer=panel_flag(panel, "fixer_may_defer",
                                    DEFAULT_FIXER_MAY_DEFER, notes),
+        file_deferral_issues=deferral_issue_floor(panel, notes),
         fix_severity_floor=severity_floor(panel, "fix_severity_floor",
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
@@ -3386,7 +3472,8 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "reviewer_scope", "low_severity_budget",
+    "severity_floor", "deferral_issue_floor", "reviewer_scope",
+    "low_severity_budget",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "panel_flag",
