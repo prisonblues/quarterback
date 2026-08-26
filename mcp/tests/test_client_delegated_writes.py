@@ -252,3 +252,87 @@ def test_item_update_gets_the_same_retry_and_refusal_behaviour(tmp_path):
     with pytest.raises(RuntimeError):
         client(rec, secret=None).plan_item_update({"item_id": "x"})
     assert not rec.requests
+
+
+# ------------------------------------------- concurrency on the shared client (#498)
+
+
+def _run_log(tmp_path):
+    """A secret command that APPENDS one line per invocation, and a reader for it.
+
+    Counting with `n=$(cat f); echo $((n+1)) > f` does not work here and the first
+    version of this test used it: four concurrent shells all read 0 and all write 1,
+    so the instrument reports "ran once" for a race it is supposed to be detecting.
+    The command is also deliberately SLOW, because `op read` is — network, and
+    sometimes an authorisation prompt — and a fetch faster than thread startup
+    serialises by accident and proves nothing.
+    """
+    log = tmp_path / "runs"
+    return (f"sleep 0.4; echo run >> '{log}'; echo v$(wc -l < '{log}' | tr -d ' ')",
+            lambda: sum(1 for _ in log.open()) if log.exists() else 0)
+
+
+def test_concurrent_callers_refused_the_same_secret_fetch_it_once(tmp_path):
+    """`op read` can prompt, so N concurrent retries must not become N prompts for
+    one logical fetch.
+
+    Measured against the unfixed client: four callers, command ran **4 times**.
+    With the lock and the compare-and-swap: **1**. The later callers pass the value
+    they were refused, find the cache has already moved past it, and take the new
+    one without running anything.
+    """
+    import threading
+    cmd, runs = _run_log(tmp_path)
+    c = QuarterbackClient(BASE, "t", elevated="stale", elevated_cmd=cmd)
+    barrier = threading.Barrier(4)
+    out: list[str | None] = []
+
+    def go():
+        barrier.wait()
+        out.append(c._resolve_elevated(stale="stale"))
+
+    threads = [threading.Thread(target=go) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(15)
+
+    assert runs() == 1, f"one logical fetch ran the command {runs()} times"
+    assert out == ["v1"] * 4, out
+
+
+def test_a_request_carries_the_secret_ITS_caller_resolved(tmp_path):
+    """`_send_delegated` takes the secret as an argument and never reads it off
+    `self`, so a concurrent rotation cannot change a request already being built.
+
+    Honest about what this is: a guard against reintroduction, not a reproduction.
+    The window in the old code was two statements wide and the header dict is built
+    before `post` is entered, so a threaded test could not reliably enter it — the
+    first version of this test claimed to and passed against the unfixed client,
+    which made it worse than no test. This asserts the property that removes the
+    window instead of trying to time it.
+    """
+    import inspect
+    sig = inspect.signature(QuarterbackClient._send_delegated)
+    assert "secret" in sig.parameters, "the secret must be passed, not read off self"
+    src = inspect.getsource(QuarterbackClient._send_delegated)
+    assert "self._elevated" not in src, (
+        "_send_delegated reads the shared cache; a concurrent clear can empty the "
+        "header of a request another caller already authorised")
+
+
+def test_a_refresh_that_finds_nothing_new_is_not_retried(tmp_path):
+    """`_resolve_elevated` returns the same value when there was nothing fresher,
+    and replaying it would spend a second request to be refused identically."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(ELEVATED_HEADER, ""))
+        return httpx.Response(403, json={
+            "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated="same", elevated_cmd="echo same")
+    with pytest.raises(httpx.HTTPStatusError):
+        c.plan_reorder({"order": ["a"]})
+    assert len(seen) == 1, "an unchanged secret was replayed"
