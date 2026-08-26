@@ -3788,11 +3788,31 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                    f"than the `{dials.fix_severity_floor}` fix floor")
         lines.append(f"\n### Reported, not this round's work ({len(under_floor)}) — "
                      f"below the `{dials.fix_floor}` fix floor")
+        # Where the record of these goes, said on the report rather than left to
+        # whoever remembers the repo's config (#482). This list IS §4b's road 2, so
+        # the orchestrator reading it is about to decide issue-or-row for exactly
+        # these findings, and the answer is one line away rather than one file away.
+        # Named for the whole tier and not per finding: they are all below the fix
+        # floor, and at any gate above it that is one answer for the list.
+        # Computed over the severities actually in the list rather than off the
+        # floor: at a budget of 0 the applied floor rises to the trigger cut and this
+        # tier can then hold two bands, so a gate between them files for some of it
+        # and not the rest. Answering from the floor would state one of those as the
+        # answer for all of them.
+        filed = [c for c in under_floor if dials.files_issue(c.severity)]
+        goes = ("each also gets a GitHub issue" if len(filed) == len(under_floor)
+                else "the board row is the whole record — no GitHub issue, so the "
+                     "`deferred` row carries a one-line `note` instead"
+                if not filed else
+                f"{len(filed)} of them also get a GitHub issue and the rest are a "
+                f"board row with a one-line `note` and no issue")
         lines.append("_Master-confirmed, recorded, and deliberately NOT for the fixer: "
                      f"{because}. Do not build a fix brief from "
                      "this list — a fix pass that takes them on is the growth this "
                      "floor exists to stop (#165). They stay in the payload "
-                     "(`below_fix_floor`) and on the board._")
+                     "(`below_fix_floor`) and on the board; recorded `deferred` in "
+                     f"§4b, where `review_panel.file_deferral_issues` is "
+                     f"`{dials.file_deferral_issues}`, so {goes}._")
         for c in under_floor:
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "

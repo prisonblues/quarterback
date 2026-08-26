@@ -906,3 +906,60 @@ async def test_recording_requires_a_writer_token(client):
                           json={"repo": repo_of("auth"), "pr": 1,
                                 "outcomes": [{"key": "k1", "outcome": "fixed"}]})
     assert r.status_code == 401
+
+
+# ------------------------------------- a deferral with no issue behind it (#482)
+
+async def test_a_deferral_can_be_recorded_with_no_issue_to_point_at(client):
+    """#482's open question, settled here rather than assumed.
+
+    `review_panel.file_deferral_issues` lets a repo keep the P3/P4 tail off its
+    tracker — the row is the durable record, the GitHub issue is a work item, and
+    for that tail they are not the same thing. That only works if a `deferred` row
+    can exist with nothing in `deferred_to`, and the issue could not settle it from
+    outside: `qb record-outcome` with an explicit null came back `recorded 0,
+    changed 0, unchanged 0`, which does not distinguish "null rejected" from "no-op,
+    nothing to clear".
+
+    It can. The column is nullable, no validator asks a `deferred` for a target, and
+    the row reads back with its outcome intact — so the dial needs no second half,
+    and the harness may leave the field empty rather than inventing a ref for it.
+    """
+    await record(client, "no-target", to_fix=[finding("t1")])
+    res = await outcomes(client, "no-target", [
+        {"key": "t1", "outcome": "deferred",
+         "note": "P4: the retry loop has no jitter; real, not this change's job"}])
+    assert res["recorded"] == ["t1"]
+    assert res["rejected"] == []
+    c = await chains(client, "no-target")
+    assert c["t1"]["outcome"]["outcome"] == "deferred"
+    assert c["t1"]["outcome"]["deferred_to"] is None
+    # And the note is what makes such a row worth having: with no issue behind it,
+    # the note is the whole of what a reader finds when they come back to it. A row
+    # with neither is the markdown list this replaced, wearing a database.
+    assert c["t1"]["outcome"]["note"].startswith("P4: the retry loop has no jitter")
+
+
+async def test_a_targetless_deferral_still_retires_the_finding_from_needs_human(client):
+    """The other half of the same claim: a board-only deferral has to COUNT as somebody
+    having acted, or the dial would trade tracker spam for a queue that never drains.
+
+    #279's rule is "a flagged defect with no outcome recorded against it, any value",
+    and `deferred` retires it because that is somebody having acted — the docstring on
+    `review_queue._needs_human` says where the deferral went is on the outcome's own
+    `deferred_to`. Now that the field is legitimately empty for the tail, the retiring
+    must not have been reading it."""
+    await record(client, "no-target-nh",
+                 to_fix=[finding("t2", needs_human=True, needs_human_class="decision",
+                              needs_human_reason="which of the two shapes do we want")])
+    open_before = await client.get(
+        f"/review/needs-human?repo={quote(repo_of('no-target-nh'))}&pr=1", headers=AGENT)
+    assert open_before.status_code == 200, open_before.text
+    assert [i["key"] for i in open_before.json()["items"]] == ["t2"]
+
+    await outcomes(client, "no-target-nh",
+                   [{"key": "t2", "outcome": "deferred", "note": "below the fix floor"}])
+    after = await client.get(
+        f"/review/needs-human?repo={quote(repo_of('no-target-nh'))}&pr=1", headers=AGENT)
+    assert after.status_code == 200, after.text
+    assert after.json()["items"] == []

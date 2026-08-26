@@ -63,10 +63,11 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The nine, and where each one's default is written twice. `skip_title_patterns` and
+#: The ten, and where each one's default is written twice. `skip_title_patterns` and
 #: the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
+    "file_deferral_issues": "DEFAULT_FILE_DEFERRAL_ISSUES",
     "fix_severity_floor": "DEFAULT_FIX_SEVERITY_FLOOR",
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
     "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
@@ -235,6 +236,7 @@ def test_the_payload_records_every_dial_as_applied(monkeypatch, capsys, tmp_path
 #: severity either.
 BAD_VALUES = [
     ("fixer_may_defer", "maybe", "true or false"),
+    ("file_deferral_issues", "P-2", "P1, P2, P3, P4, always or never"),
     ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
     ("low_severity_fix_lines", "a few", "a whole number"),
@@ -248,7 +250,7 @@ BAD_VALUES = [
 
 @pytest.mark.parametrize("key,bad,accepted", BAD_VALUES)
 def test_a_malformed_value_of_a_known_key_is_a_hard_exit(key, bad, accepted):
-    """All nine, in one table, because the failure they share is the one that matters:
+    """All ten, in one table, because the failure they share is the one that matters:
     a repo that wrote `fix_severity_floor: p-4` intending the pre-#165 "fix everything"
     silently got the default, stopped fixing P3s and P4s, and the review ran anyway —
     under a policy the file did not ask for, in the round the fixer was briefed from. A
@@ -1564,6 +1566,200 @@ def test_the_orchestrator_relays_the_marks_with_the_list():
         in panel_md
 
 
+# ------------------------------------------- 9. file_deferral_issues (#482)
+#
+# The tail arriving one step downstream of the fix floor. The floor keeps a P4 out of
+# the fix pass and §4b's bookkeeping then filed it as a GitHub issue anyway — twenty
+# open issues on this repo that are panel exhaust and nothing else (#66 #69 #72 #74
+# #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237 #285 #286 #288 #300), one of
+# which (#283 rescued three live defects from it) had become a place findings went to
+# not be found. The board row is the durable record; the GitHub issue is a work item
+# on a human's tracker; for the P3/P4 tail they are not the same thing.
+
+
+def gate(value=None):
+    """A `Dials` with just this dial set, since nothing else here interacts with it."""
+    return panel_seats.resolve_dials(
+        {} if value is None else {"file_deferral_issues": value}, None, [])
+
+
+def test_the_default_keeps_the_p3_p4_tail_off_the_tracker():
+    """P2: at or above it a deferral is a work item somebody will pick up, and the row
+    and the issue coincide. Below it they do not, and below it is where the volume is —
+    P3 and P4 are 67.4% of findings by #165's own severity split."""
+    d = gate()
+    assert d.file_deferral_issues == "P2"
+    assert d.files_issue("P1") and d.files_issue("P2")
+    assert not d.files_issue("P3") and not d.files_issue("P4")
+
+
+def test_the_row_is_never_in_question_only_the_issue():
+    """The whole claim of this dial, asserted where it can be: nothing here turns a
+    finding into no record at all. `files_issue` answers ONE question — is a second
+    copy opened on a tracker — and the `deferred` row is written at every setting, which
+    is what the briefs say and what `deferral_gist` tells a reader on every round."""
+    assert "board row" in gate("never").deferral_gist()
+    for value in ("always", "never", "P1", "P4"):
+        line = gate(value).deferral_gist()
+        assert "row" in line or "issue" in line
+
+
+def test_always_is_the_pre_482_behaviour():
+    """The non-default value that restores what §4b did before this key existed: an
+    issue for every deferral, whatever its severity. A repo that has not adopted the
+    argument must be able to keep its old bookkeeping in one word."""
+    d = gate("always")
+    assert all(d.files_issue(s) for s in ("P1", "P2", "P3", "P4"))
+    assert d.deferral_gist() == "every deferral gets a GitHub issue"
+
+
+def test_never_files_nothing_and_says_the_escalation_still_does():
+    """The other end, for a repo whose work is not queued on its tracker (`mode:
+    jungle`). It is not "discard": the rows are still written and still relayed. And
+    even here the line has to name the exemption, or a reader takes `never` literally
+    and drops the one issue that is a question rather than a task."""
+    d = gate("never")
+    assert not any(d.files_issue(s) for s in ("P1", "P2", "P3", "P4"))
+    assert "an escalation still does" in d.deferral_gist()
+
+
+@pytest.mark.parametrize("value", ["never", "always", "P1", "P2", "P3", "P4"])
+def test_an_escalation_is_exempt_at_every_setting(value):
+    """§4b has three roads to `deferred` and only two of them are work items. An
+    escalation's issue *asks* a question about the change's premise — it is what carries
+    that question past the end of the session, and the cycle is not finished until a
+    human answers it — so suppressing it would drop the question rather than save a
+    ticket. Same exemption a Sonar hard-gate issue gets from both severity floors."""
+    assert gate(value).files_issue("P4", escalated=True)
+
+
+@pytest.mark.parametrize("severity", ["", None, "blocker", "critical"])
+def test_an_unreadable_severity_files_the_issue(severity):
+    """The safe direction, and there is only one. An issue nobody needed costs a line on
+    a tracker; withholding one because the severity could not be read leaves the finding
+    in a row whose severity nothing can sort by — which is the dumping ground this dial
+    exists to prevent, arriving through the back door."""
+    assert gate().files_issue(severity)
+    # `never` is a decision somebody made about every deferral, so it still holds: the
+    # fallback is for an unreadable BAND, not an override of the dial.
+    assert not gate("never").files_issue(severity)
+
+
+@pytest.mark.parametrize("written,applied", [
+    (" p2 ", "P2"), ("P4", "P4"), (" ALWAYS ", "always"), ("Never", "never")])
+def test_the_gate_is_read_case_insensitively(written, applied):
+    """Both halves, each normalised to the spelling its own vocabulary uses everywhere
+    else — a band upper-cased like every severity that enters the panel, a word
+    lower-cased like every other word in a rules file. One written value must not mean
+    two things depending on which layer carried it."""
+    assert gate(written).file_deferral_issues == applied
+
+
+def test_the_report_says_a_below_floor_finding_is_a_board_row_at_the_default(
+        monkeypatch, capsys, tmp_path):
+    """This list IS §4b's road 2, so the orchestrator reading it is about to decide
+    issue-or-row for exactly these findings. The answer belongs on the artifact, not in
+    whoever remembers the repo's config — the same argument the dial line already makes
+    for the fix floor."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")])
+    assert "`review_panel.file_deferral_issues` is `P2`" in report
+    assert ("the board row is the whole record — no GitHub issue, so the `deferred` "
+            "row carries a one-line `note` instead") in report
+
+
+def test_the_report_says_each_gets_an_issue_when_the_gate_is_always(
+        monkeypatch, capsys, tmp_path):
+    """The non-default half of the same line, so the test above is not passing on a
+    sentence that is printed whatever the dial says."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")],
+                       config=cfg(file_deferral_issues="always"))
+    assert "`review_panel.file_deferral_issues` is `always`" in report
+    assert "each also gets a GitHub issue" in report
+
+
+def test_a_split_below_floor_tier_is_counted_rather_than_summarised(
+        monkeypatch, capsys, tmp_path):
+    """The case answering from the floor would get wrong. With the fix floor at P2 the
+    below-floor tier holds two bands, and a gate BETWEEN them files for some of it and
+    not the rest — so the line counts the findings it is actually true of instead of
+    stating one tier's answer for both."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path,
+                       [finding("P3"), finding("P4")],
+                       config=cfg(fix_severity_floor="P2",
+                                  file_deferral_issues="P3"))
+    assert "### Reported, not this round's work (2)" in report
+    assert ("1 of them also get a GitHub issue and the rest are a board row with a "
+            "one-line `note` and no issue") in report
+
+
+def test_the_board_may_set_the_gate_and_may_not_set_a_word_it_does_not_know():
+    """A policy knob a repo can only change by a commit reviewed by the panel that knob
+    configures is the shape #305 exists to fix, so this one is board-settable like the
+    floors beside it — and settable BOTH ways, since neither direction is the safe one.
+    Its two ends are words, which is why it is a `deferral_gate` and not a `severity`:
+    `never` is unwritable as a band and `always` would have to be spelled `P4`."""
+    dial = harness_rules.BOARD_DIALS["review_panel.file_deferral_issues"]
+    assert (dial.kind, dial.nullable, dial.rule) == ("deferral_gate", False, "either")
+    for good in ("P1", "p3", "always", " never "):
+        assert harness_rules._dial_problem("d", dial, good) == "", good
+    for bad in ("P0", "sometimes", "P-2", 2, True, None):
+        assert harness_rules._dial_problem("d", dial, bad), bad
+
+
+@pytest.mark.parametrize("written,applied", [("p3", "P3"), (" Always ", "always")])
+def test_a_board_set_gate_is_normalised_before_it_is_applied(written, applied,
+                                                             monkeypatch):
+    """Normalised where the dial is read rather than by each consumer, so the provenance
+    table shows the value the round actually applied. A table reading `p3` beside a
+    round that ran `P3` is one a reader has to second-guess."""
+    monkeypatch.setattr(harness_rules, "_dial_body", lambda github: (
+        {"dials": [{"dial": "review_panel.file_deferral_issues", "value": written}]},
+        "board", ""))
+    dials, _, problems, _ = harness_rules.board_dials("acme/board")
+    assert problems == []
+    assert dials["review_panel.file_deferral_issues"]["value"] == applied
+
+
+# ---------------------------------------------------- and the briefs say the same thing
+
+def test_the_orchestrator_brief_splits_the_row_from_the_issue():
+    """The enforcement point for this dial is prose — §4b is what opens (or does not
+    open) the issue — so a suite that reads no markdown is testing half a feature, the
+    same reason `fixer_may_defer`'s guards are here."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "review_panel.file_deferral_issues" in flat
+    assert "**Every deferral gets a board row. Only some of them get a GitHub issue**" \
+        in flat
+    # Below the gate: no target, and a note that makes the row worth reading later.
+    assert "Record the row with **no `deferred_to`**" in flat
+    assert "The note is not optional here and it is the whole difference between a " \
+           "record and a dumping ground." in flat
+    # The read the write exists for — named now, so the row is a memory rather than a
+    # dumping ground even before anything queries it across PRs.
+    assert "GET /review/findings?repo=<owner/name>&pr=<n>" in flat
+    # The exemption, and the fallback that stops the two records being lost together.
+    assert "An escalation is exempt at every setting, `never` included." in flat
+    assert "If `qb record-outcome` fails, file the issue whatever the gate says" in flat
+
+
+def test_the_review_brief_no_longer_says_every_deferral_gets_an_issue():
+    """Asserted partly as an ABSENCE, which is how a contradiction elsewhere in the same
+    brief survives a green suite. `review-pr.md` used to instruct the orchestrator to
+    open an issue on all three roads unconditionally, in the sentence a fixer's deferral
+    lands on."""
+    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Your job is the same on all three and it is the half the fixer is " \
+           "forbidden to do: open the issue," not in flat
+    assert "open an issue for it only if `review_panel.file_deferral_issues` says so" \
+        in flat
+    assert ("The row is the record; the issue is a work item, and they are not the "
+            "same thing (#482).") in flat
+    # And the deferral still has somewhere to go — the point was never that the record
+    # is optional.
+    assert "a one-line `note`" in flat
+    assert "An escalation is exempt at every setting" in flat
+
+
 # --------------------------------------------------------------- the report says which
 
 def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_path):
@@ -1575,7 +1771,8 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
             "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
             "cap 3x or +30,000 chars · fixer may defer yes · failing test "
-            "required no") in report
+            "required no · deferrals at/above P2 get a GitHub issue, below it a "
+            "board row only (an escalation always gets one)") in report
 
 
 def _release_pr(monkeypatch, config):

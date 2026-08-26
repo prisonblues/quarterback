@@ -690,16 +690,37 @@ a deferral you infer (the fixer wrote no patch because the approach is in disput
 for, and its two justifying lines are in the summary's `Deferred` block; and a finding
 the panel reported below the fix floor is the third, described in the next paragraph.
 Your job is the same on all three and it is the half the fixer is forbidden to do:
-open the issue, then record the finding `deferred` with that issue in `deferred_to`. #223 and #237
+**record the finding `deferred`, and open an issue for it only if
+`review_panel.file_deferral_issues` says so.** #223 and #237
 are what that record looks like — a human applying exactly this judgement by hand,
 at the round cap, which is the thing the setting exists to let a fixer reach on
 round 1 instead.
 
+**The row is the record; the issue is a work item, and they are not the same thing
+(#482).** `review_panel.file_deferral_issues` is a severity gate — at or above it a
+deferral gets a GitHub issue named in `deferred_to` as it always did; below it the
+deferral is a board row with **no `deferred_to`** and **a one-line `note`** saying
+what the defect is and why it was not fixed. `deferred_to` is nullable, the API takes
+a `deferred` outcome without one, and `/panel` renders such a row with no target
+rather than as broken. The note is what makes that row worth having: it is the thing
+somebody reads later, and `GET /review/findings?repo=<owner/name>&pr=<n>` is where
+they read it. A row with neither an issue nor a note is the markdown list this
+replaced, wearing a database.
+
+Measured on this repo on 2026-08-26, roughly twenty open issues were panel
+deferred-finding exhaust and nothing else. The default is `P2`; `always` restores the
+pre-#482 "an issue for every deferral" and `never` files none. **An escalation is
+exempt at every setting** — its issue asks a question rather than filing a task, and
+it is what carries that question past the end of the session. And if the board write
+fails, file the issue whatever the gate says and say so in the relay: below the gate
+the row is the only record, so losing both loses the finding.
+
 A finding the panel reported **below the round's `fix_severity_floor`** is the one
 that needs no judgement from anybody: the floor already decided. Those arrive marked 🔽 under *Reported, not this round's work*, they were
-never in the fixer's brief, and they are recorded `deferred` against whatever issue
-you open for the batch — one issue for the batch is fine and is usually right, since
-filing nine issues for nine P3s is the overflow this floor exists to stop (#165).
+never in the fixer's brief, and they are recorded `deferred` — as board rows alone at
+the default gate, which is precisely the tier it exists for. Where the gate does call
+for an issue, one issue for the batch is fine and is usually right, since filing nine
+issues for nine P3s is the overflow this floor exists to stop (#165).
 
 The one that matters is `refuted`. A judge-confirmed finding that turns out to be
 wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
@@ -724,9 +745,11 @@ when a human answers. And a `deferred` row that later moves is designed for:
 an expected lifecycle (`app/models/review.py`), which is exactly what the human's
 answer will make of this row.
 
-**You open the premise issue, not the fixer, and only after you have relayed.**
-`deferred_to` names an issue ref, so the row wants one — a `deferred` with nowhere
-to go is the markdown list this replaced — but the fixer is a sub-agent told to
+**You open the premise issue, not the fixer, and only after you have relayed.** This
+one is filed at every setting of `file_deferral_issues`, `never` included: an
+escalation's issue is not a work item on somebody's backlog, it is the question being
+put to a human, and a `deferred` row with nowhere to go and nothing carrying the
+question is the markdown list this replaced. The fixer is a sub-agent told to
 decide nothing and write no patch, so the filing is yours (§3 below). Relay the
 escalation first, then open an issue that **asks**: the premise, the findings it
 explains, what removing it would cost, the patch that was not written, and the
@@ -749,8 +772,11 @@ and why — don't paper over it.
 its `Deferred` block, or the panel reported anything below the fix floor, say so
 plainly with the count and the one-line reason for each: those are defects this pass
 knowingly did not fix, and a relay that omits them tells the user a PR is finished
-when the record says otherwise. Then follow §2b in order — open the issue, record
-the row.
+when the record says otherwise. Then follow §2b in order — record the row, and open
+an issue only where `file_deferral_issues` calls for one. Below the gate the relay is
+where a human hears about it at all, so the count and the reasons are not optional
+there; that is the half of the deal that keeps a board row from being a place things
+go to be forgotten.
 
 **An escalation is the headline, not a footnote.** If the sub-agent escalated
 anything (the brief's step 3a), lead with it: the premise, what it explains,

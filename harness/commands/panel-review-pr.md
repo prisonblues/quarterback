@@ -364,8 +364,11 @@ cat <<'JSON' | qb record-outcome
   {"key": "<key of a finding the fixer resolved>", "outcome": "fixed"},
   {"key": "<key of one that was not a defect>", "outcome": "refuted",
    "note": "installPhase does `install -m 0755 bin/*` — it globs, the script IS installed"},
-  {"key": "<key of one left for later>", "outcome": "deferred",
-   "deferred_to": "prisonblues/quarterback#132"}
+  {"key": "<key of one left for later, at or above the issue gate>",
+   "outcome": "deferred", "deferred_to": "prisonblues/quarterback#132"},
+  {"key": "<key of one BELOW the gate — board row only, see below>",
+   "outcome": "deferred",
+   "note": "P4: the retry loop has no jitter; real, not this change's job"}
 ]}
 JSON
 ```
@@ -386,15 +389,13 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`. **Three roads
+- **`deferred`** — real, not now. **Three roads
   arrive here and all three are the same row.** (1) The fixer said so itself, under
   `review_panel.fixer_may_defer` — the defect is real and outside what this change is
   for, with the two justifying lines in its summary's `Deferred` block. (2) The
   panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
   fixer's brief at all — or it was marked 💸 and the round's `low_severity_fix_lines`
-  budget ran out before it, which is the same row for the same reason (#297); one
-  issue for the batch is fine and usually right, since
-  filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
+  budget ran out before it, which is the same row for the same reason (#297). (3) An
   **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
   finding and `fixed` a lie about the code, and there is no fifth outcome to
@@ -413,6 +414,50 @@ One of four per finding:
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
+
+### Which deferrals get a GitHub issue — `review_panel.file_deferral_issues` (#482)
+
+**Every deferral gets a board row. Only some of them get a GitHub issue**, and this
+setting is which. The report's dial line says the answer for the round you are
+recording, in words, so read it there rather than opening the rules file: *"deferrals
+at/above P2 get a GitHub issue, below it a board row only"*. `always` is the pre-#482
+behaviour (an issue for every one) and `never` files none.
+
+The two records were being conflated. The **board row** is the durable one — it
+chains by finding key across rounds, it feeds `/panel`, and it is what stops the
+leaderboard scoring a confident wrong finding like a real one. The **GitHub issue** is
+a work item on somebody's tracker. For a P1 or P2 deferral those coincide; for the
+P3/P4 tail they do not, and the tail is where the volume is. Measured on this repo on
+2026-08-26, roughly twenty open issues were panel deferred-finding exhaust and nothing
+else (#66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237 #285 #286
+#288 #300), and #283 is a rescue *from* one of them — three live defects that had been
+sitting inside a deferred-findings dump nobody read.
+
+So, per finding:
+
+- **At or above the gate** — open the issue and name it in `deferred_to`, exactly as
+  before. One issue for a batch is still fine and usually right.
+- **Below the gate** — open nothing. Record the row with **no `deferred_to`** (the
+  field is nullable, the API accepts a `deferred` outcome without one, and `/panel`
+  renders such a row with no target rather than as broken) and **a one-line `note`
+  saying what the defect is and why it was not fixed this round.**
+
+  **The note is not optional here and it is the whole difference between a record and
+  a dumping ground.** With an issue, the issue's title and body are what somebody
+  reads later; with no issue, the note is. A row with neither is the markdown list this
+  all replaced, wearing a database. It is also what makes the row *findable*: `GET
+  /review/findings?repo=<owner/name>&pr=<n>` returns every chain on the PR with its
+  outcome attached, which is how a fiddly finding gets found again — the read this
+  write exists to serve.
+- **An escalation is exempt at every setting, `never` included.** Its issue is not a
+  work item, it is the question being put to a human, and it is what carries that
+  question past the end of this session. Road 3 above is unchanged.
+
+**If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
+the relay that you did and why. Below the gate the row is the *only* record, so a
+board that refused the write and a gate that suppressed the issue between them lose
+the finding outright — which is the one outcome this setting must never produce. The
+tracker is the fallback, not the default.
 
 **Do not mark your own findings `refuted` unattended.** That is a self-grading
 loop and #40's constraint applies for the same reason. The board cannot tell a

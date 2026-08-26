@@ -156,7 +156,7 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
 PR and the 67.3% tail beside it is not.
 
-So `.harness-rules.sample` now carries eight `review_panel` dials (#165, #297), and what they
+So `.harness-rules.sample` now carries ten `review_panel` dials (#165, #297, #492, #482), and what they
 bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
 is asked to clear, and below it a finding is reported, marked and recorded rather than
 fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
@@ -177,7 +177,11 @@ whichever is crossed first binds, because a pure multiple hands its rope out in 
 the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
 stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
-not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
+not have; `max_rounds` (**2**) surfaces the existing cap; `file_deferral_issues` (**P2**) decides which
+deferrals get a GitHub issue as well as the board row every deferral gets anyway, which is the
+tail arriving one step downstream of the floor — the floor keeps a P4 out of the fix pass and
+the bookkeeping then filed it as a ticket, twenty times over on this repo alone (#482); and
+`require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
 because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
 
@@ -211,6 +215,22 @@ orchestrator, which relays it, opens an issue that **asks** the premise, and nam
 itself — "the defect is real, and it is not what this change is for" — which is a different
 judgement from an escalation ("the defect is real and the FIX is in dispute") arriving at the
 same row; the fixer owes two justifying lines and the orchestrator still owns the filing.
+
+**A deferral always gets a board row; `review_panel.file_deferral_issues` decides which ones
+also get a GitHub issue** (#482). The two were being treated as one record and they are not: the
+row chains by finding key across rounds, feeds `/panel` and keeps the leaderboard honest, while
+the issue is a work item on somebody's tracker. Those coincide for a P1 or P2 deferral and do not
+for the P3/P4 tail, which is where the volume is — measured on this repo on 2026-08-26, roughly
+twenty open issues were panel deferred-finding exhaust and nothing else, and #283 is a rescue
+*from* one of them. At or above the gate the orchestrator opens the issue and names it in
+`deferred_to` as before; below it the row carries no `deferred_to` (the column is nullable, the
+API accepts it, and `/panel` renders a targetless row rather than breaking) and a one-line `note`
+instead, which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read
+that write exists for. The default is `P2`; `always` is the pre-#482 behaviour and `never` files
+none. **An escalation is exempt at every setting**, because its issue asks a question rather than
+filing a task, and if the board write fails the orchestrator files the issue anyway — below the
+gate the row is the only record, so losing both would lose the finding.
+
 `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to
 step 3a resolve, and that `deferred` is a value the database accepts.

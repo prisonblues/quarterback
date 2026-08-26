@@ -603,6 +603,80 @@ DEFAULTS: dict = {
         # ORCHESTRATOR opens the issue — #223 and #237 are what a good deferral
         # record looks like. False restores today's two exits.
         "fixer_may_defer": True,
+        # WHERE THE DEFERRAL GOES — a board row always, a GitHub issue only at or
+        # above this severity (#482).
+        #
+        # `panel-review-pr.md` §4b used to open an issue for every finding that
+        # lands on `deferred`, and its reason was sound as far as it went:
+        # `deferred_to` names an issue ref, and "a `deferred` with nowhere to go is
+        # the markdown list this replaced". But it conflates two records that are
+        # only sometimes the same one. The **board row** is the durable one — it
+        # chains by finding key across rounds, it feeds `/panel`, and it is what
+        # stops the leaderboard rewarding a reviewer for being confident rather than
+        # right. The **GitHub issue** is a work item on a human's tracker. For a P1
+        # or P2 deferral those coincide. For the P3/P4 tail they do not, and the tail
+        # is where the volume is.
+        #
+        # THE MEASUREMENT, taken on this repo on 2026-08-26. Roughly twenty open
+        # issues are the panel's own deferred-finding exhaust and nothing else —
+        # #66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237
+        # #285 #286 #288 #300 — every one of them a capped or below-floor round with
+        # nowhere to put what was left. #283 is a rescue FROM one of them: three live
+        # defects that had been sitting inside a deferred-findings dump nobody read.
+        # That is the failure mode: at that volume the tracker stops being a queue
+        # and starts being a place findings go to not be found, and every one of
+        # those issues dilutes the ranking #435's queue and the drainer are for. The
+        # same complaint arrived independently from another repo in the fleet — "i
+        # don't want this issue creation spam like i had in quarterback" — which is
+        # the floor working (a P4 kept out of the fix pass) and the bookkeeping one
+        # step downstream filing it as a ticket anyway.
+        #
+        # P2, NOT `"always"`, and the issue that proposed this suggested `"always"`
+        # on the usual preserve-today's-behaviour grounds. Taken at P2 instead
+        # because "anyone not opting in" is the wrong side of this particular
+        # default: the behaviour being preserved is a bookkeeping step that produces
+        # tracker spam at a measured rate of about one issue per capped round, on
+        # every repo the harness reaches, and a repo only discovers it needs the dial
+        # after twenty issues have accumulated. A P1/P2 deferral still gets its issue
+        # — those are the ones where the row and the work item genuinely coincide.
+        #
+        # NOTHING IS DROPPED, and that is the whole difference between this and a
+        # backlog. Below this floor the finding still gets its `deferred` row, still
+        # carries a one-line `note` saying what it is and why it was not fixed —
+        # required by the brief precisely so the row is READABLE later rather than
+        # merely present — and is still relayed to the human in the summary. What it
+        # does not get is a second copy on the tracker. `deferred_to` is nullable
+        # (`app/models/review.py`), the API accepts a `deferred` outcome without one,
+        # and `/panel` renders such a row with no target rather than as broken — the
+        # open question this issue could not settle from outside, settled here and
+        # guarded by a test.
+        #
+        # DESIGNED TO BE READ, not just written. A row nothing queries is the
+        # markdown list again under a new name, so the read side is named at the same
+        # time as the write: `GET /review/findings?repo=&pr=` returns each chain with
+        # its outcome, which is how a fiddly finding on a PR is found again, and it is
+        # what #500's repeat-finding chain and the cross-PR signal both want to read
+        # from. No cross-PR query is built here (that is its own issue) — what this key
+        # must not do is foreclose one, which is why the record is a row with a note
+        # and not a bullet in a closed issue's body.
+        #
+        # AN ESCALATION IS EXEMPT at every setting, including `"never"`. §4b has
+        # three roads to `deferred` and only two of them are work items: a fixer
+        # deferral and a below-floor or unpaid finding, which is what the twenty
+        # issues above were. The third — the fixer escalating the change's premise —
+        # produces an issue that ASKS a question rather than filing a task, it is what
+        # carries that question past the end of the session, and the cycle is not
+        # finished until a human answers it. Suppressing it would drop the question,
+        # not save a ticket. Same exemption a Sonar hard-gate issue gets from both
+        # severity floors, for the same reason: it is not a severity judgement.
+        #
+        # `"always"` restores the pre-#482 behaviour exactly — an issue for every
+        # deferral, whatever its severity. `"never"` files none at all, which is the
+        # right answer for a repo whose tracker is not where its work is queued
+        # (`mode: jungle`), and is NOT the same as discarding them: the rows are
+        # still there and still relayed. Severities are case-insensitive, like every
+        # other floor here.
+        "file_deferral_issues": "P2",
         # What a fix round is asked to CLEAR. At or above this severity a finding
         # gets fixed; below it, it is reported and recorded and not fixed. The
         # panel already computes a calibrated severity and the prompts then throw
@@ -2156,6 +2230,11 @@ BOARD_DIALS: dict[str, Dial] = {
     # which ones buy another round.
     "review_panel.fix_severity_floor": Dial("severity", False, "either"),
     "review_panel.round_trigger_floor": Dial("severity", False, "either"),
+    # #482's third floor: which deferrals get a GitHub issue as well as their board
+    # row. A `deferral_gate` and not a `severity` because its two ends are words —
+    # `always` and `never` — which no severity band can spell: "below P4" has no band
+    # and `P0` is deliberately not a severity this panel has.
+    "review_panel.file_deferral_issues": Dial("deferral_gate", False, "either"),
     # #297's budget for the band between them, and #298's growth ceiling.
     "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
     "review_panel.max_fix_growth": Dial("number", True, "either"),
@@ -2215,6 +2294,11 @@ BOARD_DIALS: dict[str, Dial] = {
 #: that refused `"p2"` while the sample beside it accepted it would make one written
 #: value mean two things depending on which layer carried it.
 _SEVERITY_RE = re.compile(r"^[Pp][1-4]$")
+
+#: The two ends of `file_deferral_issues`, beside the P1..P4 bands (#482). Lower-cased
+#: on the way in for `_SEVERITY_RE`'s reason: one written value must not mean two
+#: things depending on which layer carried it.
+_DEFERRAL_GATE_ENDS = ("always", "never")
 
 #: What `reviewer_scope` accepts. Two words, and a third would silently review the
 #: whole PR every round.
@@ -2451,6 +2535,13 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     if dial.kind == "severity":
         return "" if isinstance(value, str) and _SEVERITY_RE.match(value) else (
             f"`{path}` must be a severity band P1-P4, not {value!r}")
+    if dial.kind == "deferral_gate":
+        ok = isinstance(value, str) and (
+            bool(_SEVERITY_RE.match(value))
+            or value.strip().lower() in _DEFERRAL_GATE_ENDS)
+        return "" if ok else (
+            f"`{path}` must be a severity band P1-P4 or one of "
+            f"{', '.join(_DEFERRAL_GATE_ENDS)}, not {value!r}")
     if dial.kind == "scope":
         return "" if isinstance(value, str) and value.strip().lower() in _SCOPES else (
             f"`{path}` must be one of {', '.join(_SCOPES)}, not {value!r}")
@@ -2521,6 +2612,11 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
         # beside a round that ran `P3` is a table a reader would have to second-guess.
         if dial.kind == "severity":
             value = value.upper()
+        elif dial.kind == "deferral_gate":
+            # Each half normalised the way its own vocabulary is: a band upper-cased
+            # like every other severity, an end lower-cased like every other word.
+            value = (value.upper() if _SEVERITY_RE.match(value)
+                     else value.strip().lower())
         elif dial.kind == "scope":
             value = value.strip().lower()
         scope = "repo" if row.get("scope") == "repo" else "fleet"
