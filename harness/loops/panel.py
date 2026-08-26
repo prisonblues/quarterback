@@ -413,6 +413,7 @@ def _payload_defaults() -> dict:
         # round to attribute against. All-zero is a different statement: a round
         # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
+        "fix_range_source": None,
         # #490's cross-round rows. Empty on every path that reviewed nothing, and
         # that costs a later round nothing: the block is rebuilt from the raw
         # per-round fields of every baseline, so a skipped round leaves a row that
@@ -1152,6 +1153,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # and a skipped round 3 of a cycle is not that — it attributed
                 # nothing because it reviewed nothing, which a consumer must be
                 # able to tell from "not a cycle run".
+                "fix_range_source": None,
                 "provenance_counts": ({b: 0 for b in PROVENANCE}
                                       if skip_prior.rounds else {}),
                 # #67's two tallies follow the same rule, for the same reason.
@@ -1714,6 +1716,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "cycle": prior.cycle,
             "prior_rounds": len(prior.rounds),
             "prior_findings": len(prior.keys),
+            "fix_range_source": None,
             "provenance_counts": ({b: 0 for b in PROVENANCE} if prior.rounds else {}),
             "recurrence_counts": ({b: 0 for b in RECURRENCE} if prior.rounds else {}),
             "premise_counts": ({b: 0 for b in (*PREMISE_VERDICTS, "not-said")}
@@ -2611,9 +2614,61 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # only ever meant `prior_rounds`: round 1 has no earlier round to attribute
     # against whether it is in a cycle or not.
     attributable = bool(prior_rounds)
-    fix_diff, no_range_why, range_kind = (
-        _fix_range_diff(gh_repo, prior.head_sha, head_sha) if attributable
-        else (None, None, FIX_RANGE_OK))
+    # ---- ONE anchor, and the round's own lines where they are safe to use (#512).
+    #
+    # Two defects, one of them nearly introduced by the first cut of this change.
+    #
+    # **The anchor.** Scope anchors on `since or prior.head_sha`; this used to anchor
+    # on `prior.head_sha` outright. `--since` is documented and legitimate — "pass it
+    # to review a specific range, or when the baseline predates that field" — and
+    # passing it pointed the two at different spans with nothing reporting the
+    # mismatch, so the provenance numbers described a range nobody looked at. Both
+    # now read `anchor`, so they cannot drift.
+    #
+    # **The status guard, which is why the compare call STAYS.** It is tempting to
+    # drop it and attribute straight off `review.increment` — the round reviewed
+    # that diff, so it is the fix pass by construction. It is not, after a rewrite.
+    # `fetch_increment` uses the three-dot form and says what that costs: "when the
+    # branch was force-pushed or rebased between rounds the merge base moves back
+    # and the increment WIDENS toward the whole PR. That is the safe failure: the
+    # round re-reads more than it needed to." Safe for a review; catastrophic for an
+    # attribution, because every line the PR ever added is then inside the "fix
+    # range" and every finding on one reads `introduced`. `panel_scope` only falls
+    # back at `len(increment) >= len(diff)`, so a rebase that widens the increment to
+    # most of the PR passes every guard and becomes the target.
+    #
+    # `_fix_range_diff` is the only thing that sees `status`, refuses `diverged` and
+    # `behind`, and drives #509's veto. So it keeps running, and what changes is
+    # WHICH LINES are attributed once it has said the range is sound.
+    #
+    # **And then the increment's lines, because they are the better ones.** It is
+    # `_diff_subset`'d to files also in the PR diff, which drops a base-branch
+    # merge's own files — the over-count `_fix_range_diff`'s docstring names and
+    # cannot fix, since main's commits legitimately sit inside its range.
+    # `anchor`, not `review.since`: the two agree while the increment holds, and
+    # `review.since` is EMPTY on every round whose scope fell back to `pr` — so
+    # reading it there would silently revert to `prior.head_sha` and drop an explicit
+    # `--since`, which is the mismatch this is here to close. `anchor` is bound
+    # before scope is decided, carries `--since`'s own validation, and is what the
+    # round would have reviewed from.
+    if attributable:
+        _range_diff, no_range_why, range_kind = _fix_range_diff(
+            gh_repo, anchor, head_sha)
+    else:
+        _range_diff, no_range_why, range_kind = None, None, FIX_RANGE_OK
+    # The increment is usable whenever the range is not REWRITTEN — including when
+    # this reader came back blind. `blind` means "I could not get the range" (too
+    # large to hold, an API refusal), which says nothing about the copy the round
+    # already reviewed; discarding a sound increment there is a false blindness, and
+    # it would fire on exactly the big base-branch merge this feature is for.
+    # `rewritten` is the one that forbids it, because then no diff of that span is
+    # the fix pass — the round's included.
+    have_increment = review.scope == "increment" and bool(review.increment)
+    if attributable and range_kind != FIX_RANGE_REWRITTEN and have_increment:
+        fix_diff, fix_range_source = review.increment, "increment"
+    else:
+        fix_diff = _range_diff
+        fix_range_source = ("compare" if _range_diff else None) if attributable else None
     # ONE predicate for "is there a range", used by the added lines, by the note
     # and by the attribution itself. Two of them disagreed over an EMPTY compare:
     # truthiness called it no range, `fix_diff is not None` called it a readable
@@ -2654,7 +2709,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # on nearly every round teaches the reader to skip the veto list, which is where
     # the real coverage gaps are reported. That is #501's argument about the CI veto
     # and it applies here before the fact rather than after it.
-    if attributable and range_kind == FIX_RANGE_BLIND:
+    # #512 narrows this: a `blind` range whose increment answered is not a blind
+    # round — the attribution happened, from the diff the seats actually read — so
+    # vetoing there would be the alert fatigue this veto was written to avoid. A
+    # REWRITTEN range always vetoes: nothing attributed, whatever was in hand.
+    if attributable and (range_kind == FIX_RANGE_REWRITTEN
+                         or (range_kind == FIX_RANGE_BLIND
+                             and fix_range_source is None)):
         veto = [*veto, (
             f"provenance, recurrence and increment scoping all read the fix range and "
             f"this round had none — {no_range_why}. Every new finding is recorded "
@@ -3347,6 +3408,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # three files and a resolution order.
         "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
+        # WHICH range answered (#512): `increment` — the diff this round actually
+        # reviewed — or `compare`, the separate API fetch used under `pr` scope and
+        # wherever the increment fell back. `null` where the question does not arise
+        # (round 1). Published because the two are not the same measurement: the
+        # increment drops a base-branch merge's files and the compare range does
+        # not, so a reader comparing `introduced` across rounds has to be able to
+        # see that the denominator's provenance changed under them.
+        "fix_range_source": fix_range_source,
         # #490's block as data, so a board or an orchestrator reading the payload
         # gets the trend without re-deriving it from every earlier round's file.
         # One row per round INCLUDING this one, and rebuilt from the raw per-round
