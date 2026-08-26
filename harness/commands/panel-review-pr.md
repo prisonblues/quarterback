@@ -457,6 +457,48 @@ all is reported the same way, and costs the round its confidence.)
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
 
+### Do not rewrite the branch between rounds, and know the cost if you must (#500)
+
+**A rebase or force-push between rounds disarms three of this cycle's convergence
+instruments at once**, because provenance (#48), recurrence (#67) and `--scope
+increment` all read the same thing: the range between the last round's `head_sha`
+and this one's. `compare/a...b` is the three-dot form, so after a rewrite the old
+head is no longer an ancestor and GitHub answers `diverged` — the range would span
+commits no fix pass wrote, so the panel refuses it rather than blaming the fixer for
+every line the PR ever added.
+
+What that costs is concrete. Every new finding is recorded `unknown` instead of
+`introduced` or `missed`, and **`escalate_on.fix_injection` (#497) cannot fire**:
+the rate is `introduced` over every new outstanding finding, and the unattributable
+ones sit in the denominator, so it is depressed toward zero however badly the fix
+pass behaved. On the cycle #500 was filed from, that happened on round 3 of a
+three-round cycle that ended on the cap — the exact shape the gate exists to stop.
+
+The round now says so where the verdict is read: a **veto line, and `confident`
+false**, the same treatment a reviewer that could not read the whole diff gets.
+That is honesty, not repair — the instruments are still off.
+
+So:
+
+- **Prefer merging the base branch into the PR** over rebasing it. That leaves the
+  old head an ancestor (`status: ahead`), so the range still reads. It is not free —
+  the base branch's own commits then fall inside the range and their lines are
+  attributed to the fix pass, so `introduced` over-counts — but an over-counting
+  instrument is worth more than a dark one, and it fails toward stopping the cycle
+  rather than toward letting it run.
+- **If you must rewrite, do it between CYCLES rather than between rounds** — after a
+  stop, before the next `--round 1`.
+- **If you already have, do not read that round's quiet as convergence.** The veto
+  says as much. Re-running the round with `--scope pr` gets the review back but not
+  the attribution; only a round whose baseline anchor is reachable can attribute.
+
+One instrument this does *not* disarm, worth knowing so you do not over-correct:
+#84's premise register is keyed on declared text rather than on commits, so it
+survives a rewrite intact. `max_fix_growth`/`max_fix_growth_chars` also keep working,
+but note they measure against `Baseline.first_reviewed` — a base-branch merge inflates
+the PR against a denominator from before it, so a ceiling may fire on growth the fix
+passes did not write.
+
 **Round 2+ reviews the fix commit, not the whole PR again** (v2.28), and it gets
 there off the baseline you just passed — `head_sha` in that payload is the anchor,
 so this needs no new flag from you. Behind the fix commit the reviewers get the PR

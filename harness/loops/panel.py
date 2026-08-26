@@ -2611,8 +2611,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # only ever meant `prior_rounds`: round 1 has no earlier round to attribute
     # against whether it is in a cycle or not.
     attributable = bool(prior_rounds)
-    fix_diff, no_range_why = (_fix_range_diff(gh_repo, prior.head_sha, head_sha)
-                              if attributable else (None, None))
+    fix_diff, no_range_why, range_kind = (
+        _fix_range_diff(gh_repo, prior.head_sha, head_sha) if attributable
+        else (None, None, FIX_RANGE_OK))
     # ONE predicate for "is there a range", used by the added lines, by the note
     # and by the attribution itself. Two of them disagreed over an EMPTY compare:
     # truthiness called it no range, `fix_diff is not None` called it a readable
@@ -2622,6 +2623,45 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if attributable and not fix_diff:
         notes.append(f"provenance unavailable: {no_range_why} — new findings are recorded "
                      "as `unknown`, not attributed")
+    # ---- #500: an instrument that could not run is a COVERAGE GAP, and takes a veto.
+    #
+    # Three of this cycle's convergence instruments read the same fix range —
+    # provenance (#48), recurrence (#67), and `--scope increment` — so losing it
+    # loses all three at once, on the round that most wants them. The panel already
+    # DETECTS that and says so; what it said it in was a `config_notes` line in a
+    # payload, read afterwards by whoever thought to look, while the round went on to
+    # report a `stop` whose `reason` never mentioned that its main convergence test
+    # was off.
+    #
+    # **#497 is what makes this cost something.** `fix_injection` is computed from
+    # provenance: with the range gone every new finding lands in `unknown`, `unknown`
+    # sits in the denominator, and the rate is depressed toward zero — so the gate
+    # cannot fire on precisely the cycle it exists for. The measured case is #500's:
+    # a base branch 21 commits ahead, an ordinary and correct rebase between rounds 2
+    # and 3, and a round 3 that could not have produced either of the numbers #497
+    # was calibrated on.
+    #
+    # This is the same rule the panel already applies to a reviewer that could not
+    # read the whole diff — that takes a veto line and costs `confident` — and an
+    # unavailable provenance is a coverage failure of exactly that kind. It does not
+    # stop the cycle and must not: the answer to a blind round is another round with
+    # the instruments back, not a stop.
+    #
+    # **`no-fix` is excluded, and that is the whole reason `range_kind` is a value.**
+    # A head that never moved, or a fix pass that netted to nothing, leaves the
+    # instruments VACUOUS rather than blind — there is no fix pass they failed to
+    # see. Vetoing there would fire on an honest empty round, and a veto that fires
+    # on nearly every round teaches the reader to skip the veto list, which is where
+    # the real coverage gaps are reported. That is #501's argument about the CI veto
+    # and it applies here before the fact rather than after it.
+    if attributable and range_kind == FIX_RANGE_BLIND:
+        veto = [*veto, (
+            f"provenance, recurrence and increment scoping all read the fix range and "
+            f"this round had none — {no_range_why}. Every new finding is recorded "
+            "`unknown`, so `escalate_on.fix_injection` (#497) cannot fire on this "
+            "round whatever the fix pass did: the rate is computed over a denominator "
+            "the unattributable findings sit in. This round's quiet is not evidence "
+            "of a converging cycle (#500)")]
 
     def provenance_of(c: Canonical) -> str | None:
         """None where the question does not arise — outside a cycle, in round 1,
