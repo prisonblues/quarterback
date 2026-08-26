@@ -3792,9 +3792,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # whoever remembers the repo's config (#482). This list IS §4b's road 2, so
         # the orchestrator reading it is about to decide issue-or-row for exactly
         # these findings, and the answer is one line away rather than one file away.
-        # Named for the whole tier and not per finding: they are all below the fix
-        # floor, and at any gate above it that is one answer for the list.
-        # Computed over the severities actually in the list rather than off the
+        #
+        # Computed over the severities actually IN the list rather than off the
         # floor: at a budget of 0 the applied floor rises to the trigger cut and this
         # tier can then hold two bands, so a gate between them files for some of it
         # and not the rest. Answering from the floor would state one of those as the
