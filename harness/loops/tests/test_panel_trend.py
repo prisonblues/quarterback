@@ -134,6 +134,13 @@ def test_an_increment_payload_too_old_for_pr_chars_has_NO_size():
 @pytest.mark.parametrize("counts,expect", [
     ({}, False),
     ({"introduced": 0, "missed": 0, "missed-unread": 0, "unknown": 3}, False),
+    # ALL-ZERO is a measurement, not a failure: the round attributed and had
+    # nothing to attribute, which is what a round of repeats looks like. `?` there
+    # would say the fix range was unreadable when it was read fine.
+    ({"introduced": 0, "missed": 0, "missed-unread": 0, "unknown": 0}, True),
+    # Partly placed. `unknown` is not the ONLY positive bucket, so attribution ran;
+    # the two it could not place are the reason `introduced` is read as a floor.
+    ({"introduced": 0, "missed": 1, "missed-unread": 0, "unknown": 2}, True),
     ({"introduced": 0, "missed": 2, "missed-unread": 0, "unknown": 0}, True),
     ({"introduced": 1, "missed": 0, "missed-unread": 0, "unknown": 0}, True),
     ({"introduced": 0, "missed": 0, "missed-unread": 1, "unknown": 0}, True),
@@ -160,6 +167,31 @@ def test_a_count_a_payload_can_be_believed_about(value, expect):
     numbers on purpose: a SIZE of 0 cannot be a denominator, while a COUNT of 0 is
     the most interesting reading in this block — nothing was introduced."""
     assert panel_rounds._nonneg_int(value) is expect
+
+
+def test_a_round_of_REPEATS_introduced_zero_rather_than_unknown():
+    """The all-zero tally arriving in a row. Every finding this round was raised
+    before, so provenance never had one to place — the fix range was read fine and
+    the honest answer is `0`. Read as unattributable it would print `?`, which says
+    the measurement failed, on the quietest and most reassuring round of a cycle."""
+    row = panel_rounds._trend_row(2, _payload(
+        to_fix=[{"severity": "P2"}, {"severity": "P3"}],
+        provenance_counts={"introduced": 0, "missed": 0,
+                           "missed-unread": 0, "unknown": 0}))
+    assert row.introduced == 0
+    rows = [panel.RoundTrend(1, True, 2, 1, None, 1000), row]
+    assert "0 (0%)" in _table(panel.cycle_trend_lines(rows, (1, 1000, "pr")))[2]
+
+
+def test_a_round_that_reviewed_NOTHING_introduced_nothing_either():
+    """A skipped in-cycle round records an all-zero tally by construction — it is
+    the shape that says "could have attributed, had nothing to". It reviewed no
+    code, so `0 introduced` off it is the same fabrication as `0 findings`, and the
+    row is blank rather than reassuring."""
+    row = panel_rounds._trend_row(2, _payload(
+        reviewed=False, provenance_counts={"introduced": 0, "missed": 0,
+                                           "missed-unread": 0, "unknown": 0}))
+    assert row.introduced is None
 
 
 def test_an_unbelievable_introduced_count_reads_as_UNANSWERED():
@@ -413,6 +445,33 @@ def test_the_blocks_ratio_is_the_SAME_ONE_the_growth_ceiling_measures(
                    [("app/f0.py", 10, "P1", "a dangling handle")],
                    head="bbb222", files=5, baseline=[r1_path])
     assert r2["cycle_trend"][-1]["growth"] == r2["round_stop"]["fix_growth"]["ratio"]
+
+
+def test_round_ONE_is_its_own_denominator(monkeypatch, tmp_path):
+    """Round 1 is the cycle's first reviewed round by construction, so its stored
+    `growth` is 1.0 — the same number round 2 will compute for that row off the
+    baseline. Left null, a board plotting `growth` across a cycle's payloads sees
+    the series start at nothing on the one round whose answer is not in doubt."""
+    _, r1 = _round(monkeypatch, tmp_path, 1,
+                   [("app/f0.py", 3, "P2", "a stale mirror")],
+                   head="aaa111", files=2)
+    assert r1["cycle_trend"][0]["growth"] == 1.0
+
+
+def test_a_round_TWO_with_no_usable_baseline_invents_no_denominator(
+        monkeypatch, tmp_path):
+    """The case round 1's rule must not be widened to cover. Nothing here knows how
+    big the PR was when the cycle started — `max_fix_growth` does not run either —
+    and reading this round's own size as the denominator would record 1.0 against a
+    PR that may have been growing for three rounds."""
+    old = tmp_path / "old.json"
+    old.write_text(json.dumps({"round": 1, "cycle": "cyc", "reviewed": True,
+                               "repo": "e2e", "github": "acme/e2e", "pr": 77,
+                               "to_fix": [], "dismissed": [], "sonar_findings": []}))
+    _, r2 = _round(monkeypatch, tmp_path, 2,
+                   [("app/f0.py", 10, "P1", "a dangling handle")],
+                   head="bbb222", files=5, baseline=[str(old)])
+    assert [t["growth"] for t in r2["cycle_trend"]] == [None, None]
 
 
 def test_the_payload_carries_the_block_as_data(monkeypatch, tmp_path):

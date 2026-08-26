@@ -915,12 +915,15 @@ class RoundTrend:
     #: How many of that round's findings the round before it INTRODUCED — its
     #: ``provenance_counts["introduced"]``.
     #:
-    #: None, not 0, wherever the round could not attribute: round 1 (there is no
-    #: earlier fix pass), and any round whose only populated bucket is ``unknown``
-    #: (no readable fix range). ``0 introduced`` there is a claim about a fix pass
-    #: made from a measurement that failed, and it is the flattering direction —
-    #: the same trap :func:`attributed` is factored out to keep this block and the
-    #: report's `of those:` line on one answer about.
+    #: None, not 0, wherever the round could not attribute (:func:`attributed`):
+    #: round 1, which has no earlier fix pass; a round whose only populated bucket
+    #: is ``unknown``, meaning the fix range was unreadable; and a round that
+    #: reviewed nothing. ``0 introduced`` in any of those is a claim about a fix
+    #: pass made from a measurement that did not happen, and it is the flattering
+    #: direction.
+    #:
+    #: An ALL-ZERO tally is the opposite case and does read 0: the round attributed
+    #: and had nothing to attribute, which is what a round of repeats looks like.
     introduced: int | None = None
     #: The size of the WHOLE PR when that round read it (:func:`_whole_pr_chars`),
     #: never the round's review target: under ``increment`` scope the target is one
@@ -930,28 +933,42 @@ class RoundTrend:
 
 
 def attributed(counts: object) -> bool:
-    """Did a round's ``provenance_counts`` actually PLACE anything?
+    """Was a round's provenance ANSWERABLE — did the attribution run at all?
 
-    One predicate for the report's `of those:` line and for #490's trend block,
-    because the two would otherwise answer it differently in the one case that
-    matters. An all-``unknown`` tally means the fix range was unreadable — no
-    commit recorded, a rewritten branch, an API refusal — and every bucket that
-    says something about the fix pass is therefore 0 by failure rather than by
-    measurement. Rendered as a number it reads "**0 introduced**", which is a
-    bolded claim about the fix pass and a false one.
+    Three states live in one ``provenance_counts`` object and only two of them are
+    obvious, which is why this is a named predicate rather than a truth test:
 
-    ``{}`` is the other false state and is covered by the same test: it is the
-    shape for a round where the question does not arise at all (round 1, or no
-    cycle), and there is nothing there to report either.
+    * ``{}`` — the question does not arise. Round 1, or no cycle. False.
+    * every bucket 0 — the question was asked and there was nothing to attribute:
+      a round whose findings were all repeats, or which had none. **True**, and the
+      trend block prints ``0``, because that is a measurement.
+    * ``unknown`` the only positive bucket — the fix range was unreadable (no commit
+      recorded, a branch rewritten between rounds, an API refusal), so every bucket
+      that says something about the fix pass is 0 *by failure*. False: printed as a
+      number it reads "0 introduced", a claim about the fix pass made from a
+      measurement that did not happen, and it is the flattering direction.
 
-    Defensive about its argument for `load_baseline`'s standing reason — this is
-    read off a payload that may have been hand-edited or written by another
-    version — and it reads only the buckets :data:`panel_scope.PROVENANCE` names,
-    so a stray key cannot make an unattributable round look attributed.
+    **Not the same question the report's `of those:` line asks, and they must not be
+    merged.** That line asks "is there anything worth a sentence", so it withholds on
+    an all-zero tally where this returns True — a round with three repeat findings has
+    nothing to say in prose and a perfectly good ``0`` to put in a column. Sharing one
+    predicate would force one of the two to lie; the shared thing is the ``unknown``
+    rule, which both apply.
+
+    Defensive about its argument on `load_baseline`'s standing reason — this is read
+    off a payload that may have been hand-edited or written by another version — and
+    it reads only the buckets :data:`panel_scope.PROVENANCE` names, so a stray key
+    cannot make an unattributable round look attributed.
     """
     if not isinstance(counts, dict):
         return False
-    return any(_nonneg_int(counts.get(b)) for b in PROVENANCE if b != "unknown")
+    tally = {b: _nonneg_int(counts.get(b)) for b in PROVENANCE}
+    if all(v is None for v in tally.values()):
+        # `{}`, or a payload carrying nothing this recognises. Either way there is
+        # no tally here, which is the first state above and not the second.
+        return False
+    return (any(tally[b] for b in PROVENANCE if b != "unknown")
+            or not tally["unknown"])
 
 
 def _nonneg_int(value: object) -> int | None:
@@ -988,8 +1005,12 @@ def _trend_row(was: int, payload: dict) -> RoundTrend:
     counts = payload.get("provenance_counts")
     return RoundTrend(
         round=was, reviewed=reviewed, findings=findings, p1p2=p1p2,
+        # Gated on `reviewed` for the reason the two counts above are: a skipped
+        # in-cycle round records an all-zero tally by construction, and `0
+        # introduced` read off it is the same fabrication as `0 findings` — it
+        # attributed nothing because it reviewed nothing.
         introduced=(_nonneg_int(counts.get("introduced"))
-                    if attributed(counts) else None),
+                    if reviewed and attributed(counts) else None),
         # Gated on `reviewed` as well as on the field: a skipped round records
         # `pr_chars: 0` by default and `_positive_int` already refuses that, but a
         # refused round records the size of a PR it then did not review — and a

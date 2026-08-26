@@ -2783,7 +2783,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # that happens to carry a size". A report that printed two growth ratios from two
     # denominators would be worse than one that printed none: a reader has no way to
     # tell which of them the ceiling is about to fire on.
-    trend_first_chars = prior.first_reviewed[1] if prior.first_reviewed else None
+    # ROUND 1 is the cycle's first reviewed round by construction — `load_baseline`
+    # refuses every payload at round 1, so `first_reviewed` is None there whatever the
+    # caller passed — and it is therefore its own denominator, at 1.0. Left at None it
+    # recorded `growth: null` for round 1 and a real ratio for every round after, so a
+    # board plotting the field across a cycle's payloads saw the series start at
+    # nothing on the one round whose answer is not in doubt. Round 2 re-derives that
+    # same row from the baseline and gets the same 1.0, so this is the two paths
+    # agreeing rather than a second rule.
+    #
+    # NOT a fallback for "there are earlier rounds but no usable size" — round 2 with
+    # an unreadable baseline, or one written before `pr_chars`. There the denominator
+    # genuinely is unknown, `max_fix_growth` does not run either, and substituting
+    # this round's own size would record 1.0 against a PR that has been growing for
+    # three rounds.
+    trend_first_chars = (prior.first_reviewed[1] if prior.first_reviewed
+                         else len(review.diff) if round_no == 1 else None)
     trend_rows = [*prior.trend,
                   RoundTrend(round=round_no, reviewed=True,
                              findings=len(outstanding),
