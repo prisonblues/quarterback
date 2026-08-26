@@ -29,7 +29,17 @@ import panel_core                   # noqa: F401
 #: and `harness_rules` says as much where it refuses to sniff a layer out of its
 #: own provenance string. The caller gates on this; the sentence stays for the
 #: reader.
-FIX_RANGE_OK, FIX_RANGE_NO_FIX, FIX_RANGE_BLIND = "ok", "no-fix", "blind"
+#: `rewritten` is split out of `blind` (#512) because the two forbid different
+#: things. Blind is "this reader could not get the range" — too large to hold, an
+#: API refusal, patches it cannot parse — and says nothing about whether a sound
+#: copy of that range exists elsewhere; the round's own `Review.increment` often IS
+#: one, and refusing to attribute from it is a false blindness on a round that read
+#: the fix pass perfectly well. Rewritten is "the range is NOT the fix pass": after
+#: a rebase the three-dot merge base moves back, so any diff of that span — this
+#: reader's or the round's — widens toward the whole PR and attributing from either
+#: blames the fixer for every line the PR ever added. Nothing may attribute there.
+FIX_RANGE_OK, FIX_RANGE_NO_FIX = "ok", "no-fix"
+FIX_RANGE_BLIND, FIX_RANGE_REWRITTEN = "blind", "rewritten"
 
 
 def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
@@ -62,7 +72,8 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
     and their lines are attributed to the fix pass — `introduced` then
     over-counts. And the compare endpoint returns at most 300 files, so a fix
     pass wider than that is attributed on the first 300 and the rest read as
-    `missed`. #41 (review the increment) is what removes the guess altogether.
+    `missed`. #41 has landed and #512 acted on it — see :func:`_provenance` for what
+    that removed and what it did not.
     """
     if not gh_repo:
         return None, "no GitHub repo is configured for this run", FIX_RANGE_BLIND
@@ -92,7 +103,7 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
                 FIX_RANGE_BLIND)
     if got.get("status") == "diverged":
         return None, (f"{span} have diverged — the branch was rewritten between rounds, so "
-                      "the range would span commits no fix pass wrote"), FIX_RANGE_BLIND
+                      "the range would span commits no fix pass wrote"), FIX_RANGE_REWRITTEN
     # `behind` is the other rewrite, and it reaches here looking like nothing at all
     # (#500, found on review). The head is an ANCESTOR of the commit the last round
     # reviewed — a reset backwards, a force-push that dropped commits — so the
@@ -105,7 +116,7 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
     if got.get("status") == "behind":
         return None, (f"{span} is BEHIND — the branch was reset to an ancestor of the "
                       "commit the last round reviewed, so the fix pass it would "
-                      "attribute is no longer on the branch"), FIX_RANGE_BLIND
+                      "attribute is no longer on the branch"), FIX_RANGE_REWRITTEN
     out: list[str] = []
     size = 0
     for f in got.get("files") or []:
@@ -368,8 +379,18 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
       `missed`. So the split is biased toward `missed` in BOTH directions, and the
       `introduced` count should be read as a floor rather than as a measurement.
 
-    #41 (review the increment) is what removes both: a finding raised against the
-    increment is introduced by construction, with no line arithmetic in the middle.
+    #41 (review the increment) HAS LANDED — `--scope increment`, v2.28, the default
+    — and #512 is what acted on it: a round that reviewed the increment now
+    attributes against that diff (`payload.fix_range_source == "increment"`) rather
+    than re-fetching the span through :func:`_fix_range_diff`. What that removed is
+    the second compare call, the anchor mismatch behind it, and the base-merge
+    over-count named above; the two biases in this docstring it did NOT remove,
+    because placing a finding in the increment is still a comparison and a deletion
+    still has no added line to sit on.
+
+    So this function is still reached, and still biased, on exactly the rounds #41
+    never covered: `round_scope: pr`, and any round whose increment fell back. Read
+    `fix_range_source` before reading these buckets.
     """
     if not have_range:
         return "unknown"
@@ -1893,7 +1914,7 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "_fix_range_diff", "_commit_id", "_head_sha_now",
-    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND",
+    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND", "FIX_RANGE_REWRITTEN",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now", "PROVENANCE", "_provenance",
