@@ -590,3 +590,25 @@ def test_a_dial_older_than_the_column_does_not_invent_a_method():
     said = qd.dial_detail(dial(set_by="human/rich"))
     assert "with a key" not in said and "in a browser" not in said
     assert "human/rich" in said
+
+
+def test_a_key_command_that_hangs_names_the_prompt_nobody_answered():
+    """`op read` against a desktop-app integration raises a biometric prompt, and
+    a prompt nobody answers is a command that never returns — measured at 30s to
+    fail and 8.7s to succeed once approved, on the day the real credential was
+    minted. "TimeoutExpired" tells a person nothing they can act on."""
+    client = human(cmd="sleep 60")
+    import subprocess as sp
+    real = sp.run
+
+    def fake(*a, **kw):
+        raise sp.TimeoutExpired(cmd="op", timeout=30)
+
+    sp.run = fake
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            client.key()
+    finally:
+        sp.run = real
+    said = str(caught.value)
+    assert "desktop" in said and "✎" in said, said

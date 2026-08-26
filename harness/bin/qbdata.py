@@ -834,6 +834,17 @@ class HumanClient:
         try:
             got = subprocess.run(["bash", "-c", self.cfg.human_key_cmd],
                                  capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            # THE LIKELY CAUSE, NAMED. `op read` against a desktop-app
+            # integration raises a biometric prompt, and a prompt nobody answers
+            # is a command that never returns — measured here at 30s to fail and
+            # 8.7s to succeed once approved. "TimeoutExpired" tells a person
+            # nothing they can act on; "look at your desktop" tells them
+            # everything, and it is right far more often than it is wrong.
+            raise RuntimeError(
+                f"{self.KEY_FAILED}: it did not finish in 30s. If it is `op`, "
+                "there is probably an approval prompt waiting on your desktop — "
+                "answer it and press ✎ again") from exc
         except Exception as exc:                  # noqa: BLE001
             raise RuntimeError(f"{self.KEY_FAILED}: {type(exc).__name__}") from exc
         value = got.stdout.strip()
