@@ -35,12 +35,19 @@ code nobody runs.
 Run: pytest harness/tests
 """
 
-import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# A sibling module, imported by bare name — see `_path_sandbox`'s own docstring
+# for why a suite that asserts a tool is absent cannot build its PATH from the
+# host's.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "remove-worktree"
 
@@ -83,6 +90,13 @@ def run_stanza(branch="feat/issue-337", *, keep="false", stub: str | None = None
     `${0%/*}/qb-release` when the tool is not on PATH, and under `-c` that `$0`
     is the interpreter's own path — so on a machine with the harness installed
     beside bash, `stub=None` would find the real one.
+
+    PATH is built by `_path_sandbox` for the same reason by the other route. The
+    old spelling was `bindir` plus `dirname(bash)`, and where home-manager put
+    the harness that second directory holds `qb-release` next to `bash` — so
+    `command -v` answered before the `$0` guard above ever mattered, and
+    `test_a_missing_qb_release_is_said_and_not_fatal` ran the production tool
+    against a throwaway repo and asserted on its output (#385, #472).
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -94,7 +108,7 @@ def run_stanza(branch="feat/issue-337", *, keep="false", stub: str | None = None
     if dir_left:
         left = str(tmp_path / "still-here")
         Path(left).mkdir(exist_ok=True)
-    script = tmp_path / "stanza.sh"
+    script = _path_sandbox.sibling_dir(tmp_path) / "stanza.sh"
     script.write_text(("set -euo pipefail\n" if strict else "")
                       + PRELUDE
                       + f'KEEP_CLAIM={keep}\nMAIN_REPO={tmp_path}\n'
@@ -103,7 +117,8 @@ def run_stanza(branch="feat/issue-337", *, keep="false", stub: str | None = None
                       + 'echo "WARNINGS=${#CLEANUP_WARNINGS[@]}"\n')
     return subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
-        env={"PATH": f"{bindir}:{os.path.dirname(BASH)}", "HOME": str(tmp_path)})
+        env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir),
+             "HOME": str(tmp_path)})
 
 
 def warnings(got) -> int:
