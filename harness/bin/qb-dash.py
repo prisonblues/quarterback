@@ -538,12 +538,14 @@ def panel_dials(dials: dict, width: int, cfg=None, scope: Scope | None = None) -
         # true of a harness that ships defaults for everything.
         t.add_row(Text("every dial at its repo default" if dials.get("asked")
                        else "asking the board…", style="grey50"))
-    # WHERE TO TURN ONE, and it says browser rather than merely printing a link.
-    # `POST /dials` takes `app.auth.human`; this dashboard holds a machine bearer
-    # token, which is the credential that gate exists to refuse. #443 is the record
-    # of what happens when a surface reads a thing, says the change is yours to
-    # make, and does not say where: "i don't know how to re-order".
-    t.add_row(Text(clip(f"set in a browser: {dials_url(cfg)}", body), style="grey50"))
+    # WHERE TO TURN ONE, and it names both surfaces that can. THIS renderer cannot:
+    # it has no keyboard at all — that is the whole of what `--once` and the printed
+    # panels are — so the verb is the clickable renderer's `✎` or the board's page,
+    # and saying only "a browser" would now be half true. #443 is the record of what
+    # happens when a surface reads a thing, says the change is yours to make, and
+    # does not say where: "i don't know how to re-order".
+    t.add_row(Text(clip(f"set it: ✎ in qb-dash-tui, or {dials_url(cfg)}", body),
+                   style="grey50"))
 
     # A COUNT IS A CLAIM. "0 in force" over an unreachable board says the fleet is
     # running on its defaults, which is the one thing an unanswered read cannot

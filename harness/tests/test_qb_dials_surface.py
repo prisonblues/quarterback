@@ -292,11 +292,16 @@ def cfg():
 
 
 def test_the_panel_always_says_where_to_turn_one(dash, watched):
-    """Even — especially — with nothing in force. The reader who most needs the URL
-    is the one who has just found out that the tempo is not what they want."""
+    """Even — especially — with nothing in force. The reader who most needs it is
+    the one who has just found out that the tempo is not what they want.
+
+    BOTH surfaces that can, because this renderer is neither: it has no keyboard,
+    which is the whole of what the printed panels are. The verb is the clickable
+    renderer's `✎` or the board's page, and naming only one of them would send
+    somebody to a browser they did not need."""
     panel = dash.panel_dials({"asked": True, "dials": []}, 80, cfg(), None)
     assert any("dials/view" in line for line in _lines(panel))
-    assert any("browser" in line for line in _lines(panel))
+    assert any("qb-dash-tui" in line for line in _lines(panel))
 
 
 def test_the_panel_draws_the_argument_for_every_value(dash, watched):
@@ -376,3 +381,115 @@ def test_the_caps_line_still_draws_before_the_board_has_answered(dash, watched):
     print an answer it has not got."""
     assert dash.tempo_line({}).plain == ""
     assert "TEMPO" not in _printed(dash.header(cfg(), {}, 80, [], False, None, {}, {}))
+
+
+# ---- the credential the writes go out on (#479) -------------------------------
+#
+# The panel could always read. Writing needs a person, because `POST /dials` takes
+# `app.auth.human` and every agent on a box holds the same machine token — so what
+# changed is the credential and not the gate: `HumanClient` presents a signed-in
+# session to the browser vhost, and the board records `human/<user>` as it always
+# has. What that costs is #479's to state and this file's to pin: the session is
+# readable by everything running as this user, so "the dash can set a dial" and
+# "anything on this box can set a dial" are one fact.
+
+def human(cookie="", cmd="", url="https://quarterback.fo.ls"):
+    return qd.HumanClient(qd.BoardConfig("https://qb.fo.ls", "tok", "hermes",
+                                         human_url=url, edge_cookie=cookie,
+                                         edge_cookie_cmd=cmd))
+
+
+def test_a_host_with_no_session_says_so_before_a_control_is_drawn():
+    """Asked on every paint to decide whether the ✎ is a control or an
+    explanation. A verb that looks available and fails on the click reads as a
+    broken button — and this one would fail against a board that is healthy,
+    because what is missing is on this host."""
+    assert "QUARTERBACK_EDGE_COOKIE" in human().why_not()
+    assert "QUARTERBACK_HUMAN_URL" in human(cookie="c", url="").why_not()
+
+
+def test_a_configured_command_counts_as_a_credential_without_being_run():
+    """`op read` is a network call and a possible unlock prompt. A dashboard that
+    ran one every few seconds to decide whether to draw an icon would be its own
+    bug, so the question `why_not` answers is about configuration only."""
+    marker = Path("/tmp/qb-cookie-whynot")
+    marker.unlink(missing_ok=True)
+    client = human(cmd=f"printf x >> {marker}; echo session=abc")
+    assert client.why_not() is None
+    # A marker rather than a bare list, or this asserts nothing: the command runs
+    # in a subshell, so the only evidence it did NOT run is that it left nothing.
+    assert not marker.exists(), "why_not() ran the session command"
+    marker.unlink(missing_ok=True)
+
+
+def test_the_session_is_resolved_lazily_and_cached():
+    """A value in the environment is in every child process of the shell that set
+    it; a command is run when a write is actually made and the secret then lives
+    in this process and nowhere else."""
+    marker = "/tmp/qb-cookie-calls"
+    Path(marker).unlink(missing_ok=True)
+    client = human(cmd=f"printf x >> {marker}; echo session=abc")
+    assert client.cookie() == "session=abc"
+    assert client.cookie() == "session=abc"
+    assert Path(marker).read_text() == "x", "the command ran twice for one session"
+    Path(marker).unlink(missing_ok=True)
+
+
+def test_a_refresh_re_reads_it_and_a_fixed_value_says_it_cannot():
+    """An Authelia session expires on a wall clock, so the first thing a bounced
+    write needs is the credential fetched again rather than reported."""
+    client = human(cmd="cat /tmp/qb-cookie-value")
+    Path("/tmp/qb-cookie-value").write_text("first\n")
+    assert client.cookie() == "first"
+    Path("/tmp/qb-cookie-value").write_text("second\n")
+    assert client.cookie() == "first", "a cached session was re-read without being asked"
+    assert client.cookie(refresh=True) == "second"
+    Path("/tmp/qb-cookie-value").unlink(missing_ok=True)
+
+    fixed = human(cookie="static")
+    assert fixed.cookie() == "static"
+    with pytest.raises(RuntimeError, match="cannot be refreshed"):
+        fixed.cookie(refresh=True)
+
+
+def test_a_session_command_that_fails_is_not_a_host_that_never_had_one():
+    """Opposite states with opposite remedies. `op` wanting to be unlocked is
+    fixable in ten seconds by somebody who is told; it is unfixable by somebody
+    told there is no session on this host."""
+    client = human(cmd="echo 'not signed in' >&2; exit 1")
+    with pytest.raises(RuntimeError) as caught:
+        client.cookie()
+    assert qd.HumanClient.COOKIE_FAILED in str(caught.value)
+    assert "not signed in" in str(caught.value)
+
+
+def test_a_dial_write_carries_the_scope_only_when_there_is_one():
+    """`repo` absent and `repo` blank are the same scope to the board — the fleet —
+    and a fleet dial that could be written under two keys is one that can be set
+    twice and resolved once."""
+    sent = []
+    client = human(cookie="c")
+    client.post = lambda path, body: sent.append((path, body)) or {}
+    client.set_dial("tempo", "eager", "draining", repo=None)
+    client.set_dial("tempo", "held", "mid-release", repo=REPO, expires_at="2099-01-01T00:00:00+00:00")
+    assert sent[0] == ("/dials", {"dial": "tempo", "value": "eager", "reason": "draining"})
+    assert sent[1][1]["repo"] == REPO and sent[1][1]["expires_at"].startswith("2099")
+
+
+def test_a_value_of_null_survives_the_write():
+    """The documented off switch for `max_fix_growth`, `distant_merge_lines` and
+    `escalate_on.premise_repeated`. The board goes to some trouble to keep `null`
+    apart from "no row at all"; a client that dropped it would put the two back
+    together."""
+    sent = []
+    client = human(cookie="c")
+    client.post = lambda path, body: sent.append(body) or {}
+    client.set_dial("review_panel.max_fix_growth", None, "off for this round")
+    assert "value" in sent[0] and sent[0]["value"] is None
+
+
+def test_a_dial_with_no_argument_is_refused_by_the_client_too():
+    client = human(cookie="c")
+    client.post = lambda path, body: pytest.fail("a request went out with no reason")
+    with pytest.raises(RuntimeError, match="reason"):
+        client.set_dial("tempo", "eager", "   ")

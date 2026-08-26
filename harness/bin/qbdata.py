@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"
@@ -623,10 +623,30 @@ def pane_scope(seat: dict) -> str | None:
 
 
 class BoardConfig:
-    """Where the board is and how to authenticate to it."""
+    """Where the board is and how to authenticate to it.
 
-    def __init__(self, base_url: str, token: str, agent: str) -> None:
+    TWO URLS AND TWO CREDENTIALS, because the board has two front doors and they
+    are not interchangeable. `base_url` is the AGENT vhost, reached with a bearer
+    token, and it is what every read and every agent write here uses.
+    `human_url` is the BROWSER vhost, reached with a signed-in session cookie,
+    and it is the only door the human-only endpoints can be reached through at
+    all — `app/auth.py` has the agent vhost strip `X-Edge-Auth`, so a call that
+    only a person may make cannot be made on the agent side however it is
+    authenticated. See :class:`HumanClient`.
+    """
+
+    def __init__(self, base_url: str, token: str, agent: str,
+                 human_url: str = "", edge_cookie: str = "",
+                 edge_cookie_cmd: str = "") -> None:
         self.base_url, self.token, self.agent = base_url.rstrip("/"), token, agent
+        self.human_url = (human_url or "").rstrip("/")
+        self.edge_cookie = edge_cookie or ""
+        #: How to GET the cookie, for the same reason `token_cmd` exists beside
+        #: `token`: a session that lives in 1Password is one `op` can re-read when
+        #: it goes stale, and one that never sits in a file on disk in the first
+        #: place. A value is still accepted — a test, or a box with no `op` — but
+        #: the command is the form the fleet ships.
+        self.edge_cookie_cmd = edge_cookie_cmd or ""
 
 
 def resolve_config() -> BoardConfig:
@@ -646,17 +666,36 @@ def resolve_config() -> BoardConfig:
     url = os.environ.get("QUARTERBACK_BASE_URL", "")
     token = os.environ.get("QUARTERBACK_TOKEN", "")
     token_cmd = os.environ.get("QUARTERBACK_TOKEN_CMD", "")
+    # The browser vhost and a signed-in session for it. Both optional and both
+    # usually only in the file — a shell has no reason to carry them — which is
+    # why the condition below asks about them too. It used to read "no url or no
+    # token", and a host with those two in its environment then never sourced the
+    # config at all: the human URL sitting in that file was invisible, and the
+    # dashboard reported no human credential on a machine that had one.
+    human_url = os.environ.get("QUARTERBACK_HUMAN_URL", "")
+    edge_cookie = os.environ.get("QUARTERBACK_EDGE_COOKIE", "")
+    edge_cookie_cmd = os.environ.get("QUARTERBACK_EDGE_COOKIE_CMD", "")
 
-    if not url or not (token or token_cmd):
+    if (not url or not (token or token_cmd) or not human_url
+            or not (edge_cookie or edge_cookie_cmd)):
         config = (os.environ.get("QUARTERBACK_CONFIG")
                   or os.path.join(os.environ.get("XDG_CONFIG_HOME")
                                   or os.path.expanduser("~/.config"),
                                   "quarterback", "config"))
         if os.path.isfile(config):
+            # `%s\n` PER VALUE and nothing clever: a cookie is one line of opaque
+            # text that may carry `=` and `;`, so the reader below partitions on
+            # the FIRST `=` only — `name, _, value = line.partition("=")` keeps
+            # everything after it verbatim, which is what a `session=abc; other=d`
+            # needs. A cookie carrying a newline would break the framing, and
+            # cannot: HTTP header values do not have them.
             script = (f'. {shlex.quote(config)} >&2 || exit 1\n'
                       'printf "url=%s\\n" "${QUARTERBACK_BASE_URL:-}"\n'
                       'printf "token=%s\\n" "${QUARTERBACK_TOKEN:-}"\n'
-                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n')
+                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n'
+                      'printf "human_url=%s\\n" "${QUARTERBACK_HUMAN_URL:-}"\n'
+                      'printf "edge_cookie=%s\\n" "${QUARTERBACK_EDGE_COOKIE:-}"\n'
+                      'printf "edge_cookie_cmd=%s\\n" "${QUARTERBACK_EDGE_COOKIE_CMD:-}"\n')
             got = subprocess.run(["bash", "-c", script], capture_output=True,
                                  text=True, timeout=15)
             if got.returncode == 0:
@@ -668,6 +707,12 @@ def resolve_config() -> BoardConfig:
                         token = value
                     elif name == "token_cmd" and not token_cmd:
                         token_cmd = value
+                    elif name == "human_url" and not human_url:
+                        human_url = value
+                    elif name == "edge_cookie" and not edge_cookie:
+                        edge_cookie = value
+                    elif name == "edge_cookie_cmd" and not edge_cookie_cmd:
+                        edge_cookie_cmd = value
 
     if not token and token_cmd:
         got = subprocess.run(["bash", "-c", token_cmd], capture_output=True,
@@ -677,7 +722,9 @@ def resolve_config() -> BoardConfig:
     if not url:
         raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset "
                            "and the site config did not supply one)")
-    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0])
+    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0],
+                       human_url=human_url, edge_cookie=edge_cookie,
+                       edge_cookie_cmd=edge_cookie_cmd)
 
 
 def _ssl_context():
@@ -699,6 +746,266 @@ def _ssl_context():
     except ImportError:
         return None                                 # the default store, which is fine
     return ssl.create_default_context(cafile=certifi.where())
+
+
+class HumanClient:
+    """The writes only a PERSON may make, on the credential a person has (#443).
+
+    A separate class from :class:`BoardClient` and not a method on it, because
+    almost nothing about the request is the same. Different host (the browser
+    vhost, not the agent one), different credential (a signed-in session cookie,
+    not a bearer token), and a different failure vocabulary — the interesting
+    refusals here come from an auth proxy in front of the app rather than from
+    the app.
+
+    **The bearer token is deliberately NOT sent.** `app/auth.py` documents the
+    reference deployment as one where the two never arrive together — the browser
+    vhost has no token and the agent vhost strips `X-Edge-Auth` — and sending
+    both would be asking the board to adjudicate a case that exists only when
+    something is misconfigured. One credential per door.
+
+    **WHAT THIS WIDENS, and it is not only what it is used for.** The cookie is
+    read from a file readable by every process running as this user, so anything
+    on the box can make any human-only write: the plan's order, the dials, an
+    exemption grant. That is `app.auth.human`'s own argument turned around, and
+    it is a deliberate, recorded choice rather than a consequence of this file —
+    prisonblues/quarterback#479 is what it costs and the menu for narrowing it.
+    """
+
+    #: What a caller is told when there is no human credential here. Phrased as a
+    #: remedy because the usual reason is a machine that never had one rather than
+    #: one whose session went stale — and because a UI that greys a control out
+    #: has room for a sentence and no room for a runbook.
+    NO_COOKIE = ("no signed-in session on this host — set QUARTERBACK_EDGE_COOKIE_CMD "
+                 "(or QUARTERBACK_EDGE_COOKIE) in ~/.config/quarterback/config")
+
+    #: What the cookie command's own failure is reported as. Kept apart from
+    #: NO_COOKIE because they are opposite states with opposite remedies: nothing
+    #: configured is a box that never had a session, and a command that failed is
+    #: usually `op` wanting to be unlocked — which the caller can fix in ten
+    #: seconds if told, and cannot fix at all if told "no session on this host".
+    COOKIE_FAILED = "the session command failed"
+    NO_URL = ("no browser vhost configured — set QUARTERBACK_HUMAN_URL in "
+              "~/.config/quarterback/config")
+
+    def __init__(self, cfg: BoardConfig) -> None:
+        self.cfg = cfg
+        #: The resolved cookie, once something has resolved it. `None` is "not
+        #: asked yet" and not "there isn't one" — see :meth:`cookie`.
+        self._cookie: str | None = None
+
+    def cookie(self, refresh: bool = False) -> str:
+        """The session, resolved as late as possible and re-read when it goes stale.
+
+        **Lazily, and this is the difference between a credential and a copy of
+        one.** A value in the environment is in every child process of the shell
+        that set it and in the config file it came from; a command is run when a
+        write is actually made, which on this fleet means `op read` against a
+        vault that may need unlocking. The secret then lives in this process for
+        as long as it is useful and nowhere else.
+
+        `refresh` re-runs the command, which is what a bounced write wants: an
+        Authelia session expires on a wall clock, so the first thing a stale one
+        needs is to be fetched again rather than reported. A static value cannot
+        be refreshed and says so rather than silently returning the same string.
+        """
+        if self._cookie is not None and not refresh:
+            return self._cookie
+        if self.cfg.edge_cookie and not refresh:
+            self._cookie = self.cfg.edge_cookie
+            return self._cookie
+        if not self.cfg.edge_cookie_cmd:
+            # A refresh with only a static value configured: the caller has been
+            # told the write bounced, and there is nothing here to try again with.
+            raise RuntimeError(self.NO_COOKIE if not self.cfg.edge_cookie else
+                               "this session is a fixed value and cannot be "
+                               "refreshed — sign in again and update "
+                               "QUARTERBACK_EDGE_COOKIE, or use the _CMD form")
+        try:
+            got = subprocess.run(["bash", "-c", self.cfg.edge_cookie_cmd],
+                                 capture_output=True, text=True, timeout=30)
+        except Exception as exc:                  # noqa: BLE001
+            raise RuntimeError(f"{self.COOKIE_FAILED}: {type(exc).__name__}") from exc
+        value = got.stdout.strip()
+        if got.returncode != 0 or not value:
+            # stderr, clipped: `op` says "not signed in" there and nowhere else,
+            # and a remedy the caller cannot read is a remedy they do not have.
+            why = " ".join((got.stderr or "").split())[:200]
+            raise RuntimeError(f"{self.COOKIE_FAILED}" + (f": {why}" if why else ""))
+        self._cookie = value
+        return value
+
+    def why_not(self) -> str | None:
+        """None when a human write could work here; otherwise why it cannot.
+
+        Asked BEFORE the control is drawn rather than after it is used. A verb
+        that looks available and fails on the click is the shape that gets read as
+        a broken button, and this one would fail against a board that is perfectly
+        healthy — the thing that is missing is on this host.
+
+        It answers about the CONFIGURATION only. Whether the edge will actually
+        vouch for the session is a question only the edge can answer, and asking
+        costs a round trip on every paint; a stale cookie therefore still fails at
+        the write, where the refusal names the mechanism.
+        """
+        if not self.cfg.human_url:
+            return self.NO_URL
+        if not (self.cfg.edge_cookie or self.cfg.edge_cookie_cmd):
+            return self.NO_COOKIE
+        # A CONFIGURED COMMAND COUNTS AS A CREDENTIAL, and running it to find out
+        # does not belong here. This is asked on every paint to decide whether a
+        # control is live; `op read` is a network call and a possible unlock
+        # prompt, and a dashboard that ran one every few seconds would be its own
+        # bug. Whether the command works is answered where it is run — at the
+        # write, in a sentence the panel shows verbatim.
+        return None
+
+    def post(self, path: str, body: dict) -> dict:
+        """One human write. Raises with a sentence a panel can show verbatim.
+
+        REDIRECTS ARE NOT FOLLOWED, and that is the whole reason this does not use
+        the module's plain `urlopen`. Forward-auth answers an unauthenticated
+        caller with a 302 to the sign-in portal; urllib would follow it, turn this
+        POST into a GET of a login page, and hand back a 200 carrying HTML. The
+        write would not have happened and nothing in the response would say so.
+        """
+        why = self.why_not()
+        if why:
+            raise RuntimeError(why)
+        try:
+            return self._attempt(path, body, self.cookie())
+        except _Bounced as exc:
+            # ONE retry, and only for the refusals that a fresh session fixes.
+            # An Authelia session expires on a wall clock, so the common failure
+            # here is not "you may not" but "you were signed in an hour ago" —
+            # and a dashboard that reported that instead of re-reading a cookie it
+            # can re-read would be sending a person to 1Password to do what this
+            # already knows how to do. Anything else, and a second bounce, is the
+            # caller's to see.
+            if not self.cfg.edge_cookie_cmd:
+                raise RuntimeError(exc.said) from exc
+            try:
+                fresh = self.cookie(refresh=True)
+            except RuntimeError as err:
+                raise RuntimeError(f"{exc.said} — and re-reading it failed: {err}") from err
+            try:
+                return self._attempt(path, body, fresh)
+            except _Bounced as again:
+                raise RuntimeError(f"{again.said} (with a freshly read session)") from again
+
+    def _attempt(self, path: str, body: dict, cookie: str) -> dict:
+        """One request on one cookie. Raises :class:`_Bounced` for a stale session."""
+        req = urllib.request.Request(
+            f"{self.cfg.human_url}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Cookie": cookie},
+            method="POST")
+        # The same CA-bundle problem `_ssl_context` exists for: an opener built
+        # here would otherwise use the default store, which is empty on a
+        # uv-standalone interpreter, and report an unreachable board against one
+        # that is up.
+        opener = urllib.request.build_opener(
+            _NoRedirect, urllib.request.HTTPSHandler(context=_ssl_context()))
+        try:
+            with opener.open(req, timeout=30) as resp:
+                text = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            said = self._refusal(exc)
+            if exc.code in (301, 302, 303, 307, 308) or (
+                    exc.code in (401, 403) and "X-Edge-Auth" not in said):
+                raise _Bounced(said) from exc
+            raise RuntimeError(said) from exc
+        return json.loads(text) if text.strip() else {}
+
+    @staticmethod
+    def _refusal(exc: "urllib.error.HTTPError") -> str:
+        """Which hop refused, said in the caller's words.
+
+        The proxy and the app answer a stranger with the same codes and opposite
+        diagnoses — `qb-doctor._edge_human_writes` is the long form of this
+        distinction and it decides it the same way: the board names its own
+        mechanism in the body, so a refusal that does not is the proxy's. Getting
+        this backwards tells somebody their secret is broken when they are only
+        signed out.
+        """
+        try:
+            body = exc.read().decode()[:400]
+        except Exception:                             # noqa: BLE001
+            body = ""
+        if exc.code in (301, 302, 303, 307, 308):
+            return ("the browser vhost redirected to sign-in — this session cookie "
+                    "is missing or expired, so nothing was written")
+        if exc.code in (401, 403):
+            if "X-Edge-Auth" in body or "HUMAN_EDGE_SECRET" in body:
+                return ("the board refused the person the edge vouched for — "
+                        "HUMAN_EDGE_SECRET is unset or disagrees between its stores")
+            return ("the edge refused this session before the board saw it — "
+                    "the cookie is not a signed-in session")
+        return f"the browser vhost answered {exc.code}"
+
+    def reorder(self, repo: str | None, order: list[str]) -> dict:
+        """Put an order into force for ONE scope, exactly (`POST /plan/reorder`).
+
+        `repo` is the scope and it is not a filter: `app/static/plan.html` has it
+        that "a reorder of `prisonblues/quarterback` can never renumber [fleet
+        items] by accident", which is a property of sending one scope's whole list
+        and no other item. So the caller assembles `order` from the items of that
+        scope alone, and a fleet-wide list is `repo=None` rather than every repo's
+        items in one array.
+        """
+        return self.post("/plan/reorder", {"repo": repo, "order": list(order)})
+
+    def set_dial(self, dial: str, value, reason: str, repo: str | None = None,
+                 expires_at: str | None = None) -> dict:
+        """Put a dial in force (`POST /dials`), as the person at the keyboard.
+
+        **`value` is any JSON and this does not know what a dial means** — the
+        harness owns that vocabulary and a client that checked it would be the
+        second place a dial is written down (#56, #305). It is passed through as
+        given, `None` included: `null` is the documented off switch for three
+        dials and the board keeps it apart from "no row at all".
+
+        `reason` is required by the board and required here — a dial whose
+        argument was never written down is one nobody can decide to remove — so a
+        blank one is refused where it can be explained rather than at a 422.
+        """
+        if not (reason or "").strip():
+            raise RuntimeError("a dial needs a reason: why is this value in force?")
+        body: dict = {"dial": dial, "value": value, "reason": reason.strip()}
+        if repo:
+            body["repo"] = repo
+        if expires_at:
+            body["expires_at"] = expires_at
+        return self.post("/dials", body)
+
+    def clear_dial(self, dial: str, repo: str | None = None) -> dict:
+        """Take a dial off the board (`POST /dials/clear`); the repo's default returns."""
+        body: dict = {"dial": dial}
+        if repo:
+            body["repo"] = repo
+        return self.post("/dials/clear", body)
+
+
+class _Bounced(RuntimeError):
+    """A refusal a fresh session might fix, as opposed to one it certainly won't.
+
+    The distinction is the whole of why the retry is safe: an expired cookie and
+    a board that refuses the person it was shown are both 401s from out here, and
+    re-reading the credential helps with exactly one of them. Retrying the other
+    would turn one refusal into two and take an `op` unlock prompt with it.
+    """
+
+    def __init__(self, said: str) -> None:
+        super().__init__(said)
+        self.said = said
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an answer here, not a step on the way to one. See HumanClient.post."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 class BoardClient:
@@ -2183,7 +2490,8 @@ TEMPO_DIAL = "tempo"
 
 #: The shape of an answer, so a caller that got an error still gets one it can
 #: read — `EMPTY_PLAN`'s argument, for the same reason.
-EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False}
+EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False,
+                     "now": None}
 
 
 def fetch_dials(client, repos: list[str] | None = None) -> dict:
@@ -2214,6 +2522,13 @@ def fetch_dials(client, repos: list[str] | None = None) -> dict:
         except Exception as exc:                  # noqa: BLE001 — display it, don't die
             out["error"] = f"{type(exc).__name__}: {exc}"
             break
+        # The BOARD's clock, kept for anything that has to write a time against
+        # it. "In four hours" computed from this machine's clock is four hours
+        # from whatever this machine believes, and a box whose clock is an hour
+        # slow has its expiry refused as being in the past — a validation error
+        # about a field nobody typed. `app/static/dials.html` corrects the same
+        # way from the same field.
+        out["now"] = (got or {}).get("now") or out.get("now")
         for row in (got or {}).get("dials") or []:
             # Two repos' answers both carry the fleet rows. Keyed on (repo, dial)
             # rather than on identity because that pair is what the board's own
@@ -2384,6 +2699,67 @@ def tempo_cell(dials: dict | None, repo: str | None = None
     if len({d.get("expires_at") for d in live}) > 1:
         return "TEMPO", dial_value(row, 12), f"{len(live)} repos", "yellow"
     return "TEMPO", dial_value(row, 12), life, "cyan"
+
+
+def parse_dial_value(text: str):
+    """What a person typed, as the VALUE it looks like — JSON where it parses.
+
+    `2`, `true`, `null` and `["a","b"]` are values several dials document, and a
+    `max_rounds` of `"2"` is a dial the harness refuses to apply and reports by
+    name — a puzzle handed to somebody at a keyboard. Anything that is not JSON is
+    the string it looks like, because `P3` and `eager` are values too and
+    demanding quotes round them would make the common case the fiddly one.
+
+    `app/static/dials.html` implements this same rule in JavaScript, deliberately
+    and unavoidably twice: one is a browser and one is a terminal. They are kept
+    honest by `tests/test_dials_page.py`, which asserts the page's half, and by
+    this function's tests, which assert the same table of inputs.
+    """
+    raw = (text or "").strip()
+    if raw == "":
+        return ""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+#: How long a written expiry may be, and the units a person types. Deliberately
+#: not seconds: a dial is set for an afternoon or for a fortnight, and "14400" is
+#: a number somebody has to work out.
+_EXPIRY_RE = re.compile(r"^\s*(\d+)\s*([mhd])\s*$", re.I)
+_EXPIRY_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_dial_expiry(text: str, now: str | None = None) -> str | None:
+    """`4h` → an ISO timestamp four hours from the BOARD's now. Blank → None.
+
+    None means indefinite, which is a real answer and the one the board stores as
+    "until somebody clears it" — so a blank box is not a missing value here.
+
+    Measured from `now` when the board supplied one (:func:`fetch_dials` keeps
+    it). A clock an hour slow otherwise writes "in one hour" as a time already
+    past, which `POST /dials` refuses at the door — correctly, and in words about
+    a field the person never filled in.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    match = _EXPIRY_RE.match(raw)
+    if not match:
+        raise ValueError(f"{raw!r} is not a duration — try 30m, 4h or 7d, "
+                         "or leave it empty for a dial with no end")
+    seconds = int(match.group(1)) * _EXPIRY_UNITS[match.group(2).lower()]
+    if seconds <= 0:
+        raise ValueError("an expiry of zero is a dial that is absent the moment "
+                         "it is written — leave it empty for no end")
+    base = datetime.now(timezone.utc)
+    if now:
+        try:
+            base = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            pass                                  # a board too old to send one
+    return (base + timedelta(seconds=seconds)).isoformat()
 
 
 def dial_where(row: dict, show_repo: bool = True) -> tuple[str, str]:

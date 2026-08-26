@@ -63,7 +63,7 @@ from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.events import Click
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Static
+from textual.widgets import DataTable, Footer, Input, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
@@ -151,6 +151,114 @@ class Confirm(ModalScreen[bool]):
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+
+class DialEdit(ModalScreen[dict | None]):
+    """Set or clear one dial, from the pane — the write half of #477.
+
+    The dashboard could always READ what was in force; turning one was a browser
+    action, because `POST /dials` takes `app.auth.human` and this program
+    authenticates with the machine bearer token every agent on the box holds.
+    What changed is the credential, not the gate: :class:`qbdata.HumanClient`
+    presents a signed-in session to the browser vhost, so the person at this
+    keyboard writes as themselves and the board records `human/<user>` as it
+    always has.
+
+    **What that costs is written down rather than implied** — prisonblues/quarterback#479
+    is the record. The session is readable by everything running as this user, so
+    "the dash can set a dial" and "anything on this box can set a dial" are one
+    fact, and the second is the one to design against.
+
+    Four fields and no dropdowns, because a modal in a 78-column pane has room
+    for labels or for widgets and not both:
+
+      * **dial** — the dotted path. Fixed when editing a row that exists; a dial
+        is identified by its name, so letting this be edited would silently
+        create a second dial rather than change the one on screen.
+      * **value** — JSON where it parses, the string it looks like otherwise
+        (`qbdata.parse_dial_value`, and `dials.html` does the same).
+      * **reason** — required, by the board and here. A dial whose argument was
+        never written down is one nobody can decide to remove.
+      * **for** — `30m`, `4h`, `7d`, or empty for a dial with no end. Empty is a
+        real answer and not a missing one.
+    """
+
+    BINDINGS = [("escape", "cancel", "cancel"), ("ctrl+s", "save", "save"),
+                ("ctrl+x", "clear", "clear")]
+
+    CSS = """
+    DialEdit { align: center middle; }
+    #box { width: 90%; max-width: 76; height: auto; padding: 1 2;
+           background: $panel; border: thick $accent; }
+    #box Input { margin-bottom: 1; }
+    #hint { color: $text-muted; }
+    #warn { color: $warning; }
+    """
+
+    def __init__(self, row: dict | None = None, repo: str | None = None,
+                 scope_label: str = "") -> None:
+        super().__init__()
+        self.row = row or {}
+        self.repo = repo
+        self.scope_label = scope_label
+
+    def compose(self) -> ComposeResult:
+        existing = bool(self.row.get("dial"))
+        with Vertical(id="box"):
+            yield Static(Text("set a dial" if not existing else
+                              f"dial · {self.row.get('dial')}", style="bold"))
+            if not existing:
+                yield Input(placeholder="review_panel.fix_severity_floor", id="f_dial")
+            yield Input(value=self._value_text(), placeholder="P3, 2, true, null",
+                        id="f_value")
+            yield Input(placeholder="why is this value in force?", id="f_reason")
+            yield Input(placeholder="30m · 4h · 7d — empty for no end", id="f_expiry")
+            # WHICH LAYER this will be written to, said before it is written and
+            # not after. `fleet` and `this repo` are different settings with the
+            # same name, and the one thing a person cannot recover from here is
+            # setting the fleet's value while believing they set one repo's.
+            yield Static(Text(f"scope: {self.scope_label or 'fleet (every repo)'}",
+                              style="bold"), id="warn")
+            yield Static(Text("ctrl+s save · ctrl+x clear this dial · esc cancel",
+                              style="bold $accent"), id="hint")
+
+    def _value_text(self) -> str:
+        """The current value, spelled the way this box would accept it back."""
+        if "value" not in self.row:
+            return ""
+        value = self.row.get("value")
+        return value if isinstance(value, str) else json.dumps(value)
+
+    def on_mount(self) -> None:
+        # The field a person came here to change. Editing an existing dial that is
+        # its value; creating one, it is the name.
+        self.query_one("#f_dial" if not self.row.get("dial") else "#f_value",
+                       Input).focus()
+
+    def _field(self, name: str) -> str:
+        found = self.query(f"#{name}")
+        return found.first(Input).value if found else ""
+
+    def action_save(self) -> None:
+        self.dismiss({
+            "dial": (self.row.get("dial") or self._field("f_dial")).strip(),
+            "value": self._field("f_value"),
+            "reason": self._field("f_reason"),
+            "expiry": self._field("f_expiry"),
+            "repo": self.repo,
+        })
+
+    def action_clear(self) -> None:
+        """Take it off the board. Only for a dial that IS on the board — clearing
+        one that was never set is a no-op the board accepts, and offering it while
+        creating one would be a button that cannot mean anything."""
+        if not self.row.get("dial"):
+            self.app.bell()
+            return
+        self.dismiss({"dial": self.row["dial"], "repo": self.repo, "clear": True})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ClickTable(DataTable):
@@ -294,11 +402,10 @@ class Dash(App):
         ("p", "panel_pr", "panel"),
         ("f", "fix_issue", "fix"),
         ("s", "toggle_scope", "scope"),
-        # Opens the board's dials page, from wherever you are. `d` and not
-        # something on the DIALS table, because the whole point is that this
-        # dashboard CANNOT turn a dial: `POST /dials` takes `app.auth.human` and
-        # this program holds a machine bearer token (#477, and #443 one endpoint
-        # over). The key is a door, not a control.
+        # The board's dials PAGE, which is still worth a key now that the panel
+        # can write: the page shows every repo's dials at once and this panel
+        # shows the screen's own, and a person who wants to compare two projects
+        # wants the page. The ✎ on a row is the control; this is the map.
         ("d", "open_dials", "dials"),
         ("question_mark", "help", "keys"),
     ]
@@ -375,6 +482,10 @@ class Dash(App):
         # at all until then, because "no dial is set" and "nobody has asked" are
         # different facts and the first is the one a person acts on (#244).
         self.dials: dict = {}
+        #: The credential the writes go out on, or None until `on_mount` has a
+        #: config to build it from. See `qd.HumanClient` — and #479 for what it
+        #: costs, which is not this file's to re-argue but is this file's to say.
+        self.human: "qd.HumanClient | None" = None
         self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None
@@ -445,7 +556,7 @@ class Dash(App):
             yield ClickTable(id="issues", cursor_type="row")
         yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
                      "plan row→why, queue row→what it waits on, dial row→why it is "
-                     "set, ⚖→panel review, ⚒→fix issue, ✎→turn a dial (in a browser)"
+                     "set, ⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
                      "   ? for keys",
                      id="detail")
         yield Footer()
@@ -462,6 +573,11 @@ class Dash(App):
         self.build_columns()
         try:
             self.client, self.cfg = qd.board_client()
+            # Built unconditionally and asked later whether it can do anything.
+            # `why_not()` is configuration rather than a live check, so a box with
+            # no session still gets an object that explains itself — which is what
+            # lets the ✎ say why instead of going missing.
+            self.human = qd.HumanClient(self.cfg)
         except Exception as exc:                  # noqa: BLE001
             self.query_one("#head", Static).update(
                 Text(f"no board configured: {type(exc).__name__}", style="bold red"))
@@ -963,6 +1079,13 @@ class Dash(App):
         table.clear()
         self.rows = {k: v for k, v in self.rows.items() if not k.startswith("dial:")}
         rows = dials.get("dials") or []
+        # ASKED ONCE PER PAINT, not per row: it is the same answer for every one
+        # of them, and it decides whether the ✎ is a control or an explanation.
+        # A verb that looks available and fails on the click is the shape that
+        # reads as a broken button — and this one would fail against a board that
+        # is perfectly healthy, because what is missing is on this host.
+        cannot = self.human.why_not() if self.human else "no board configured"
+        pencil = "grey30" if cannot else "bold cyan"
         for row in rows:
             where, where_style = qd.dial_where(row)
             life, life_style = qd.dial_life(row)
@@ -970,7 +1093,7 @@ class Dash(App):
             key = f"dial:{row.get('repo') or 'fleet'}:{row.get('dial')}"
             key = table.add_row(
                 Text("●", style="cyan"),
-                Text("✎", style="bold cyan"),
+                Text("✎", style=pencil),
                 Text(qd.clip(row.get("dial"), 34), style="bold white"),
                 Text(qd.dial_value(row, 14), style="cyan"),
                 Text(where, style=where_style),
@@ -1000,10 +1123,15 @@ class Dash(App):
         # The door, always. Registered in `self.rows` so a click reaches
         # `dispatch_row` — an unregistered key is dropped, which is right for a
         # row with no verb and wrong for the only row here that has one.
+        # THE LAST ROW IS THE VERB THIS PANEL DID NOT USED TO HAVE, and it says
+        # which one it is: a live ✎ sets a dial from here, a dead one still opens
+        # the page that can. Drawn whether or not there is a dial above it,
+        # because the reader who most needs it is the one who has just found out
+        # that nothing is set.
         page = table.add_row(
-            Text(""), Text("✎", style="bold cyan"),
-            Text(qd.clip(f"set one in a browser: {qd.dials_url(self.cfg)}", 92),
-                 style="grey50"),
+            Text(""), Text("✎", style=pencil),
+            Text(qd.clip(f"set a dial — {cannot}" if cannot else "set a dial",
+                         92), style="grey50" if cannot else "cyan"),
             Text(""), Text(""), Text(""), Text(""), key="dial:page").value
         self.rows[str(page)] = {"page": True}
 
@@ -1303,11 +1431,12 @@ class Dash(App):
             else:
                 self.say(qd.queue_detail(record))
         elif kind == "dial":
-            # The ✎ opens the page; anything else on the row says what the board
-            # said, in full. Both are reads — this dashboard cannot turn a dial and
-            # the ✎ does not pretend otherwise, it goes to the surface that can.
+            # The ✎ edits; anything else on the row says what the board said, in
+            # full. With no credential on this host the ✎ is the door it always
+            # was — the browser — and says so rather than opening a modal whose
+            # save could only fail.
             if column == self.EDIT_COLUMN or record.get("page"):
-                self.open_dials()
+                self.edit_dial(None if record.get("page") else record)
             else:
                 self.say(qd.dial_detail(record))
         elif kind == "issue":
@@ -1845,6 +1974,88 @@ class Dash(App):
         self.open_url(f"https://github.com/{issue.get('repo') or qd.REPO}"
                       f"/issues/{issue.get('number')}")
 
+    def edit_dial(self, row: dict | None) -> None:
+        """Open the editor on one dial — or on a new one, when `row` is None.
+
+        **Falls back to the browser rather than to a dead modal.** With no session
+        on this host the write cannot succeed, and a form that took four fields
+        and then said so would have spent the person's typing to tell them
+        something it knew before they started. The page is still there and still
+        works, which is the whole reason the read-only version shipped first.
+        """
+        cannot = self.human.why_not() if self.human else "no board configured"
+        if cannot:
+            self.say(f"{cannot} — opening the board's dials page instead")
+            self.open_url(qd.dials_url(self.cfg))
+            return
+        # WHICH SCOPE a new dial lands in, decided here rather than in the modal:
+        # this screen already knows which project it is about, and a scope picker
+        # in a 78-column modal is a control that would be got wrong in a hurry.
+        # Editing an existing row keeps that row's own scope, which is the only
+        # answer that can mean "change what I am looking at".
+        # A screen narrowed to ONE project (`Scope.column` false) is a screen
+        # about that project, so a new dial lands there; a wide one is about the
+        # fleet and cannot pick a repo on the reader's behalf. Either way the
+        # modal states the answer in bold before anything is written.
+        repo = (row or {}).get("repo") if row else (
+            None if self.scope.column else self.repo_slug)
+        label = repo or "fleet (every repo)"
+        self.push_screen(DialEdit(row, repo, label), self.dial_written)
+
+    def dial_written(self, asked: dict | None) -> None:
+        """What the modal came back with, turned into one board write.
+
+        Runs on the UI thread and hands the HTTP off to a worker: `op read` can
+        prompt and the board can be slow, and a dashboard that froze mid-write
+        would look like the thing it is trying to avoid being.
+        """
+        if not asked or not asked.get("dial"):
+            return
+        if asked.get("clear"):
+            self.run_dial_write(asked, None, None)
+            return
+        try:
+            value = qd.parse_dial_value(asked.get("value", ""))
+            expires = qd.parse_dial_expiry(asked.get("expiry", ""),
+                                           (self.dials or {}).get("now"))
+        except ValueError as exc:
+            # Refused HERE, where the sentence can name the box that was wrong,
+            # rather than at a 422 that names a field nobody typed.
+            self.say(str(exc))
+            return
+        if not (asked.get("reason") or "").strip():
+            self.say("a dial needs a reason — why is this value in force? "
+                     "The board refuses one without, and so does this")
+            return
+        self.run_dial_write(asked, value, expires)
+
+    @work(thread=True, exclusive=True, group="dialwrite")
+    def run_dial_write(self, asked: dict, value, expires: str | None) -> None:
+        """The write itself, off the UI thread. Never raises into Textual."""
+        dial, repo = asked["dial"], asked.get("repo")
+        try:
+            if asked.get("clear"):
+                got = self.human.clear_dial(dial, repo)
+                cleared = got.get("cleared") or []
+                said = (f"cleared {dial} — the repo's own default takes over"
+                        if cleared else f"{dial} was already gone")
+            else:
+                got = self.human.set_dial(dial, value, asked["reason"], repo, expires)
+                # WHAT IT REPLACED, said out loud: moving a dial without being told
+                # what it was is how one gets nudged twice by two people who each
+                # believed they were starting from the default. The endpoint
+                # returns the old row for exactly this sentence.
+                was = [f"{qd.dial_value(d, 40)} ({d.get('reason')})"
+                       for d in (got.get("replaced") or [])]
+                said = f"set {dial}" + (f" — it was {', '.join(was)}" if was else "")
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            said = f"{dial}: {exc}"
+        self.call_from_thread(self.say, qd.clip(said, 400))
+        # Straight back to the board rather than waiting out the plan clock: the
+        # person is looking at the row they just changed, and a panel that showed
+        # the old value for fifteen seconds would be read as a write that failed.
+        self.call_from_thread(self.refresh_plan)
+
     def open_dials(self) -> None:
         """The board's dials page — the only surface that can actually turn one.
 
@@ -1928,8 +2139,8 @@ class Dash(App):
         self.say("o open on GitHub · p panel-review · f fix the selected issue or "
                  "plan item · d the board's dials page · s this project's rows or the "
                  "whole fleet's · r refresh · q quit · click ⚖ to review, ⚒ to fix, "
-                 "✎ to open the dials page, a plan row for why it is there, a seat "
-                 "to jump to its pane")
+                 "✎ to set or clear a dial (ctrl+s saves, ctrl+x clears), a plan row "
+                 "for why it is there, a seat to jump to its pane")
 
     def selected_row(self, table_id: str) -> dict | None:
         table = self.query_one(table_id, DataTable)
