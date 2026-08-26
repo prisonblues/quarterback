@@ -38,21 +38,48 @@ HEAD = "a" * 40
 def door(monkeypatch, tmp_path):
     """The door, open, with the HTTP replaced and nothing else.
 
-    Only :func:`needs_human._post` is doubled, so every test below runs the real
-    `announce` — the refusals, the class normalisation, the dedupe and the body
-    it builds are the code under test, not a stub of it. Returns the list of
-    posted bodies, which is the assertion every producer test makes.
-    """
-    posted: list[dict] = []
+    :func:`needs_human._board_json` is doubled — **the one function that touches
+    the network** — so every test below runs the real `announce`: the refusals,
+    the class normalisation, the dedupe, the body it builds and the blocker write
+    are the code under test, not a stub of them.
 
-    def fake_post(body):
+    It used to double :func:`_post` instead, and that was a hole rather than a
+    style: when #523 added a second write, it went straight past the double and
+    the suite made real HTTP requests to whatever board this host resolves. Every
+    test still passed, because the blocker write swallows failures by design — so
+    the apparatus reported success for a call it was supposed to be preventing.
+    Doubling the single network function is what makes that unrepresentable.
+
+    Returns the list of posted `/post` bodies, which is the assertion every
+    producer test makes; `.blockers` on it carries the `/blockers` bodies.
+    """
+    class Posted(list):
+        """A list that also carries the blocker writes, so the fixture keeps its
+        shape for the twenty-odd tests that already index it."""
+        blockers: list[dict]
+
+    posted = Posted()
+    blockers: list[dict] = []
+
+    def fake_board_json(path, body):
+        if path == "/blockers":
+            blockers.append(body)
+            return {"blocker": {"id": f"b{len(blockers)}"}, "raised": True}, ""
         posted.append(body)
-        return 100 + len(posted), ""
+        return {"id": 100 + len(posted)}, ""
 
     monkeypatch.setenv("QUARTERBACK_NEEDS_HUMAN", "on")
     monkeypatch.delenv("QUARTERBACK_NEEDS_HUMAN_TO", raising=False)
     monkeypatch.setattr(nh, "SEEN_PATH", tmp_path / "seen.json")
-    monkeypatch.setattr(nh, "_post", fake_post)
+    monkeypatch.setattr(nh, "_board_json", fake_board_json)
+    # Refuse the network outright for the duration. The double above is the
+    # mechanism; this is the proof it is complete — a write added later that
+    # reaches for urlopen directly fails loudly here instead of quietly posting
+    # to a live board.
+    def no_network(*a, **k):  # pragma: no cover - only runs if the double leaks
+        raise AssertionError("a needs_human test reached the network")
+    monkeypatch.setattr(nh.urllib.request, "urlopen", no_network)
+    posted.blockers = blockers
     return posted
 
 
@@ -767,3 +794,97 @@ class _Report:
     def __init__(self, state, blocking):
         self.state, self.blocking = state, blocking
         self.summary, self.reason, self.last_executed = state, "", None
+
+
+# ------------------------- the row behind the door (#328, #523) --------------
+
+
+def test_announcing_also_records_a_blocker(door):
+    """#274 built the door every producer calls; #328 built the queue behind it.
+    The join is here rather than in the six callers, because `announce`'s own
+    docstring promised it: it is "the only place that knows the post type, the
+    addressee and the wire format, so #328's `blockers` row can become the store
+    by changing this function and nothing else"."""
+    note = nh.announce(cls="decision", reason="no diff settles this",
+                       summary="A or B?", repo="acme/one",
+                       refs=[{"kind": "pr", "value": "7", "repo": "acme/one"}])
+    assert len(door) == 1, "the post must still be made"
+    (row,) = door.blockers
+    assert row["subject_kind"] == "pr" and row["subject_value"] == "7"
+    assert row["kind"] == "decision" and row["question"] == "A or B?"
+    assert "recorded as a blocker" in note
+
+
+def test_the_post_is_made_even_when_the_row_cannot_be(door, monkeypatch):
+    """The doorbell rings first and independently. A board that accepts the post
+    and refuses the row has still told somebody — and the note says which half
+    failed, on the line an operator is already reading."""
+    def half_broken(path, body):
+        if path == "/blockers":
+            return None, "the board answered HTTP 500"
+        door.append(body)
+        return {"id": 1}, ""
+    monkeypatch.setattr(nh, "_board_json", half_broken)
+    note = nh.announce(cls="taste", reason="r", summary="s", repo="acme/one",
+                       refs=[{"kind": "issue", "value": "3", "repo": "acme/one"}])
+    assert len(door) == 1
+    assert "announced on the board" in note
+    assert "not recorded as a blocker" in note and "HTTP 500" in note
+
+
+def test_a_pr_ref_beats_an_issue_ref_as_the_subject(door):
+    """A `stuck` carrying both is about the PR: it is the more specific object,
+    and a blocker filed against the issue would sit on the wrong phase once #521
+    splits fix from land."""
+    nh.announce(cls="decision", reason="r", summary="s", repo="acme/one",
+                refs=[{"kind": "issue", "value": "3", "repo": "acme/one"},
+                      {"kind": "pr", "value": "9", "repo": "acme/one"}])
+    (row,) = door.blockers
+    assert (row["subject_kind"], row["subject_value"]) == ("pr", "9")
+
+
+def test_an_escalation_naming_nothing_is_announced_and_not_stored(door):
+    """Honest rather than lossy. A blocker's whole value is answering "what is
+    waiting on me" with rows; one whose subject is "something, somewhere" answers
+    it with noise. The post still carries it."""
+    note = nh.announce(cls="environment", reason="r", summary="the box is wrong",
+                       repo="acme/one")
+    assert len(door) == 1, "it must still be announced"
+    assert door.blockers == []
+    assert "recorded as a blocker" not in note
+
+
+def test_an_unrecognised_class_is_stored_as_other_not_dropped(door):
+    """#279's rule at ingest, applied to the row: the class is normalised and the
+    escalation survives — a blocker refused for a spelling would be a judgement
+    lost to a typo."""
+    nh.announce(cls="URGENT", reason="r", summary="s", repo="acme/one",
+                refs=[{"kind": "pr", "value": "1", "repo": "acme/one"}])
+    (row,) = door.blockers
+    assert row["kind"] == "other"
+
+
+def test_a_repeat_inside_the_window_makes_neither_a_post_nor_a_row(door):
+    """The post's dedupe governs both, because a second row would be refused by
+    the board anyway (the partial unique index) and calling it to find that out
+    is a request spent to learn nothing."""
+    for _ in range(2):
+        nh.announce(cls="decision", reason="r", summary="s", repo="acme/one",
+                    key="same-key",
+                    refs=[{"kind": "pr", "value": "4", "repo": "acme/one"}])
+    assert len(door) == 1 and len(door.blockers) == 1
+
+
+def test_the_note_distinguishes_a_new_row_from_an_existing_one(door, monkeypatch):
+    """Re-raising an identical open question is a no-op at the board, so calling
+    this every run is safe — and the operator should be able to tell "I just
+    raised this" from "this has been waiting"."""
+    def already_open(path, body):
+        if path == "/blockers":
+            return {"blocker": {"id": "b1"}, "raised": False}, ""
+        door.append(body)
+        return {"id": 1}, ""
+    monkeypatch.setattr(nh, "_board_json", already_open)
+    note = nh.announce(cls="ui", reason="r", summary="s", repo="acme/one",
+                       refs=[{"kind": "pr", "value": "2", "repo": "acme/one"}])
+    assert "already an open blocker" in note
