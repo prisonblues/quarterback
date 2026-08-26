@@ -25,22 +25,35 @@ Run: pytest harness/tests
 """
 
 import json
-import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# A sibling module, imported by bare name — see `_path_sandbox`'s own docstring
+# for why a suite that asserts a tool is absent cannot build its PATH from the
+# host's.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "prune-worktrees"
 
 BASH = shutil.which("bash")
 JQ = shutil.which("jq")
-#: `is_live_suffix` shells out to `tr`. The stanza's PATH below is deliberately
-#: narrow — the stub tools have to be the only ones found — so coreutils has to be
-#: put back explicitly, or the normalisation silently produces an empty string and
-#: every branch reads as live. Which is how this suite first ran: green about a
-#: sweep that had swept nothing.
+#: `is_live_suffix` shells out to `tr` and the sweep pipes through `jq`. The
+#: stanza's PATH below is deliberately narrow — the stub tools have to be the only
+#: ones found — so coreutils has to be put back explicitly, or the normalisation
+#: silently produces an empty string and every branch reads as live. Which is how
+#: this suite first ran: green about a sweep that had swept nothing.
+#:
+#: Put back one BINARY at a time, not one directory at a time. The first fix for
+#: that added `dirname(jq)` and `dirname(tr)` to PATH, and on a home-manager
+#: install `dirname(jq)` is the profile directory that also holds the real
+#: `qb-release` — so `test_without_qb_release_nothing_is_even_listed`, whose whole
+#: subject is that tool being missing, ran with it present (#385, #472).
 TR = shutil.which("tr")
 
 pytestmark = pytest.mark.skipif(BASH is None or JQ is None or TR is None,
@@ -89,7 +102,7 @@ def run_sweep(claims: list, *, live: list[str] = (), tmp_path: Path,
         rel = bindir / "qb-release"
         rel.write_text(f"#!{BASH}\nexit 0\n")
         rel.chmod(0o755)
-    script = tmp_path / "sweep.sh"
+    script = _path_sandbox.sibling_dir(tmp_path) / "sweep.sh"
     script.write_text(
         (PRELUDE % " ".join(f"'{s}'" for s in live))
         + f'MAIN_REPO={tmp_path}\n'
@@ -98,8 +111,8 @@ def run_sweep(claims: list, *, live: list[str] = (), tmp_path: Path,
         + 'printf "BRANCH|%s\\n" "${ORPHAN_CLAIM_BRANCHES[@]:-}"\n')
     got = subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
-        env={"PATH": ":".join([str(bindir), os.path.dirname(BASH),
-                               os.path.dirname(JQ), os.path.dirname(TR)]),
+        env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir,
+                                                tools=("jq", "tr")),
              "HOME": str(tmp_path)})
     assert got.returncode == 0, got.stderr
     got.branches = [ln.split("|", 1)[1] for ln in got.stdout.splitlines()

@@ -137,6 +137,31 @@ class Guarded:
         self._git("init", "-q", "-b", "main")
         self.run_dir = tmp_path / "run"
         self.run_dir.mkdir()
+        # #178's mode note is stubbed for EVERY fixture here, silent by default,
+        # rather than only by the two tests that were about it. `env()` below puts
+        # the real PATH behind the stub directory, so without this the composed
+        # note depends on whether the box running the suite has `qb-mode`
+        # installed — and since #464 that decides whether the shared-tree note
+        # carries its own remedy. `test_the_shared_tree_note_says_the_opposite_of_
+        # the_repo_note` asserted on the remedy, so it was green in CI and red on
+        # every host with the harness on PATH (#473). A test that reads the
+        # composed note must say which mode it means.
+        self.without_mode_note()
+
+    def with_mode_note(self, violation: str = "You are in the SHARED checkout") -> None:
+        """`qb-mode` reporting a violation — #178's note fires, and #464 gives it
+        the remedy this one then drops."""
+        (self.stub / "qb-mode").write_text(
+            "#!/bin/sh\n"
+            'printf \'{"label":"CLEANROOM","glyph":"C","how":"one tree per agent",'
+            f'"violation":"{violation}"}}\'\n'
+        )
+        (self.stub / "qb-mode").chmod(0o755)
+
+    def without_mode_note(self) -> None:
+        """A repo that declares nothing, or a checkout that is where it belongs."""
+        (self.stub / "qb-mode").write_text('#!/bin/sh\nprintf \'{"label":null}\'\n')
+        (self.stub / "qb-mode").chmod(0o755)
 
     def _git(self, *args: str) -> None:
         subprocess.run(
@@ -477,15 +502,50 @@ def test_a_peer_in_your_tree_is_not_reported_as_a_peer_in_your_repo(session):
     assert "hermes/seat-quarterback-4" in note
 
 
+def test_the_fixture_decides_the_mode_note_not_the_host(session):
+    """#473, as a property rather than as a comment.
+
+    Every test here that reads the composed note is reading something #178's mode
+    note can change — since #464 it decides whether the shared-tree note carries
+    its own remedy — and `env()` puts the real PATH behind the stub directory. So
+    `qb-mode` is stubbed silent by `Guarded` itself. Without that this assertion
+    reads the host's answer, and in THIS checkout the real `qb-mode` has plenty to
+    say: quarterback declares CLEANROOM, the shared checkout is a violation, the
+    remedy is deferred, and the test that asserted on it was green in CI and red
+    on every box the harness is installed on.
+    """
+    assert (session.stub / "qb-mode").exists(), "the host's qb-mode would answer"
+    session.peers(PEER, in_tree=session.cwd)
+    assert "Give yourself your own tree" in session.start()
+
+
 def test_the_shared_tree_note_says_the_opposite_of_the_repo_note(session):
     """Two overlaps, two instructions. Sharing a repo is company and the note
     says so; sharing a tree is not free and the note must not inherit that
-    sentence, which is precisely what it did on the night."""
+    sentence, which is precisely what it did on the night.
+
+    Driven in BOTH mode states, and the remedy is asserted as a function of which
+    one. The remedy is not this test's invariant — #464 (90ca5a2, "one remedy, one
+    spelling") made it conditional on #178's note having already given it, and the
+    two `test_the_remedy_is_*` tests below own that half. This one owned it by
+    accident: it asserted `"your own tree" in shared` through a fixture that did
+    not stub `qb-mode`, so what it really asserted was that the host had no
+    `qb-mode` installed. Green in CI, red on every box the harness is wired up on
+    (#473). The sentence that has to be there whichever note gives the remedy is
+    the one that contradicts the repo note.
+    """
     session.peers(PEER, in_tree=session.cwd)
-    note = session.start()
-    shared = note.split("SHARING a working tree", 1)[1]
-    assert "no need to hold off" not in shared
-    assert "your own tree" in shared
+    for arrange, remedy in ((session.without_mode_note, True),
+                            (session.with_mode_note, False)):
+        arrange()
+        shared = session.start().split("SHARING a working tree", 1)[1]
+        assert "no need to hold off" not in shared
+        assert "is not free" in shared, (
+            "the tree note stopped saying the opposite of the repo note")
+        assert ("your own tree" in shared) is remedy, (
+            "#464: the remedy belongs to whichever note is the only one giving it "
+            f"— mode note {'silent' if remedy else 'firing'}, remedy "
+            f"{'expected' if remedy else 'expected to defer'}")
 
 
 def test_the_repo_note_keeps_its_own_voice_for_a_peer_elsewhere(session):
@@ -758,25 +818,16 @@ def test_staging_everything_is_refused_and_naming_your_files_is_not(shared):
 # that had just said it wants all of it.
 
 
-class Moded(Started):
-    """A session whose `qb-mode` reports a violation — #178's note firing."""
-
-    def with_mode_note(self, violation: str = "You are in the SHARED checkout") -> None:
-        (self.stub / "qb-mode").write_text(
-            "#!/bin/sh\n"
-            'printf \'{"label":"CLEANROOM","glyph":"C","how":"one tree per agent",'
-            f'"violation":"{violation}"}}\'\n'
-        )
-        (self.stub / "qb-mode").chmod(0o755)
-
-    def without_mode_note(self) -> None:
-        (self.stub / "qb-mode").write_text('#!/bin/sh\nprintf \'{"label":null}\'\n')
-        (self.stub / "qb-mode").chmod(0o755)
+#
+# `with_mode_note` / `without_mode_note` are on `Guarded` rather than on a
+# subclass of their own: every fixture in this file needs the mode stubbed, not
+# just the two tests that argue about it. `moded` is what is left — a `Started`
+# with the peer already in the tree, which is the situation both notes describe.
 
 
 @pytest.fixture
 def moded(tmp_path):
-    g = Moded(tmp_path)
+    g = Started(tmp_path)
     g._git("remote", "add", "origin", "git@github.com:prisonblues/quarterback.git")
     g.commit("app.py", "seed\n")
     g.peers(PEER, in_tree=g.cwd)
