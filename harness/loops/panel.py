@@ -2660,8 +2660,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"this round had none — {no_range_why}. Every new finding is recorded "
             "`unknown`, so `escalate_on.fix_injection` (#497) cannot fire on this "
             "round whatever the fix pass did: the rate is computed over a denominator "
-            "the unattributable findings sit in. This round's quiet is not evidence "
-            "of a converging cycle (#500)")]
+            "the unattributable findings sit in. Nor can #506 NAME the offending pass "
+            "— it reads this same range — so a fix pass that did generate this round's "
+            "work would ship unproposed as well as unmeasured. This round's quiet is "
+            "not evidence of a converging cycle (#500)")]
 
     def provenance_of(c: Canonical) -> str | None:
         """None where the question does not arise — outside a cycle, in round 1,
@@ -2679,7 +2681,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # so the tally matches `new_findings` rather than roping in the dismissed
     # ones, which no fixer will ever touch. ONE pass rather than one per bucket:
     # `provenance_of` walks `fix_added` through `_same_file` on every call.
-    tally = Counter(provenance_of(c) for c in outstanding)
+    #
+    # Kept as a LIST of (finding, bucket) rather than tallied straight into a
+    # Counter, because #506 needs the findings themselves and not only how many
+    # there were: its proposal has to say WHICH findings a revert would remove, and
+    # re-deriving them would mean a second walk that could disagree with this one
+    # about a finding's bucket.
+    placed = [(c, provenance_of(c)) for c in outstanding]
+    tally = Counter(b for _, b in placed)
     provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
 
     # ---- #490: this round's own row of the cross-round trend block, and the earlier
@@ -2742,6 +2751,67 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                              pr_chars=len(review.diff))]
 
 
+    # ---- #506: the remedy for the rule above, priced but not taken.
+    #
+    # `escalate_on.fix_injection` ends the cycle and leaves the pass that caused it on
+    # the branch. This assembles the two columns of the decision that follows — what
+    # reverting that pass would REMOVE (the findings this round attributed to it) and
+    # what it would COST (the complaints it was sent to answer that this round no
+    # longer raises) — and names the commit range, which is `prior.head_sha ..
+    # head_sha`: the same range provenance attributed against, so the proposal cannot
+    # point at a different pass from the one the rate accused.
+    #
+    # `range_kind` rather than `bool(fix_diff)`, and that is #500's constraint arriving
+    # here rather than a style choice: a rebased branch is `blind` and an empty fix
+    # pass is `no-fix`, both come back with no diff, and only the first is a pass this
+    # cannot see. `revert_state` carries the distinction through in
+    # `_fix_range_diff`'s own words so nothing downstream has to re-derive it from a
+    # sentence.
+    #
+    # Built on every attributable round, not only on the one that fires: the payload
+    # records what the round KNEW, and a consumer that had to infer "there was nothing
+    # to propose" from a missing key would be reading the payload's age.
+    # ONE injection state, built here and passed to `round_stop` below rather than
+    # computed twice: `over` is also the precondition for the extra API call under it,
+    # and two `injection_state` calls could disagree about whether to make it.
+    injecting = injection_state(provenance_counts, injection_limit)
+    revert_cleared, revert_open = fix_pass_outcome(prior.fixed_findings, outstanding)
+    # The commits inside the range, and the ONE extra `gh api` call this whole feature
+    # makes — paid only on a round whose rate crossed the threshold, which is the
+    # terminal round of a diverging cycle and no other. `over` rather than `fired`
+    # because `fired` is `round_stop`'s answer and is not known yet; it is a strict
+    # superset, so the call is made on a few rounds that go on not to propose anything
+    # and never on a round that could not.
+    #
+    # It is not folded into `_fix_range_diff`'s read, which every round makes, for
+    # exactly that reason — and it is not derived from the range either, because the
+    # range cannot say it (found by Codex): a base-branch merge leaves the compare
+    # `ahead` with main's own commits inside it, so a wholesale revert of the range
+    # would undo commits no fix pass wrote and `git revert` would refuse the merge
+    # anyway. `revert_state` withholds the command on that, and on a shape it could
+    # not read at all.
+    revert_shape = (fix_pass_commits(gh_repo, prior.head_sha, head_sha)
+                    if attributable and range_kind == FIX_RANGE_OK and injecting["over"]
+                    else {})
+    revert = revert_state(
+        range_kind if attributable else REVERT_NOT_ASKED,
+        why=no_range_why, base_sha=prior.head_sha if attributable else None,
+        head_sha=head_sha if attributable else None, head_round=prior.head_round,
+        # This round, against the anchor's own round, so the proposal can say how many
+        # fix phases the range covers. `Baseline.head_sha` is the latest earlier round
+        # that SUPPLIED a commit, not the latest that ran, so a round whose payload
+        # recorded none leaves the range spanning two passes (found by Codex).
+        round_no=round_no,
+        # What this round REVIEWED, which is what decides how the cost column reads
+        # (`fix_pass_outcome`): under the default `increment` scope most of what the
+        # pass was sent to fix was not looked at again, so "no longer raised" is a
+        # ceiling on the cost rather than a measurement of it.
+        scope=review.scope,
+        removes=[{"key": c.key, "severity": c.severity, "file": c.file,
+                  "line": c.line, "title": c.synthesis}
+                 for c, bucket in placed if bucket == "introduced"],
+        costs=revert_cleared, still_open=revert_open, shape=revert_shape)
+
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
     # caller to filter first. It takes keys and nothing else — the count overload
@@ -2776,7 +2846,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # applies. Empty on round 1 and on any round whose fix range
                       # could not be read, which is `over: False` by construction: a
                       # round that could not be attributed does not end a cycle.
-                      injection=injection_state(provenance_counts, injection_limit))
+                      injection=injecting,
+                      # #506's remedy for that gate, assembled above. It decides
+                      # nothing — it cannot stop the cycle and cannot keep it going —
+                      # and its only effect is one more veto line on the round the
+                      # gate ended, naming the commit range that is still on the
+                      # branch and pricing what undoing it would cost.
+                      revert=revert)
     # Said in `config_notes` as well as in `round_stop`, because these two are read
     # by different people at different moments: the payload's `round_stop` is what
     # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
@@ -2843,6 +2919,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "measurement (#48), so the real share is at least that; what this needs "
             "is a human deciding whether the fix passes are working, not another one "
             "(#489)")
+    # #506, and only on the round that actually put a proposal. `offered`, not
+    # `fired`: the two come apart on a branch whose fix range could not be read, where
+    # the cycle can end on the rate and the pass still cannot be named — and a note
+    # saying "here is the range" with no range in it is worse than silence. The veto
+    # list carries the full sentence, since that is where a reader is told why the
+    # quiet does not count; this is the shorter one, in the place a human reads what
+    # the round DECIDED.
+    if stop["revert"]["offered"]:
+        rv = stop["revert"]
+        notes.append(
+            f"the fix pass the rate accuses is `{rv['range']}` — everything that "
+            f"landed after round {rv['round']} — and ending the cycle does not remove "
+            f"it from the branch. Reverting it would drop {len(rv['removes'])} finding"
+            f"(s) attributed to it and give back up to {len(rv['costs'])} it cleared: "
+            "a proposal for a human to weigh, not something this loop does (#506)")
     # An escalated SonarCloud issue is still a RED GATE, and "the approach is wrong,
     # a human must answer the premise" does not turn it green. `round_stop` counts
     # it like any other escalation — correctly, since it is work no fix round may
