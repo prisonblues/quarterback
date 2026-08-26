@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""qb-line — what the landing line would look like, and what is blinding its order.
+
+  qb-line                     this checkout's repo, open PRs against the default base
+  qb-line --base test         a different base branch
+  qb-line --json              the same answer as data
+
+**IT FORMS NO QUEUE, ENQUEUES NOTHING, AND MERGES NOTHING**, and that line is not
+being moved. #435 asked for a driver that enumerates a repo's open PRs and enqueues
+them; #476 answers it, and its argument is that a central drainer is the shape this
+codebase has refused four separate times in its own docstrings — `qb-seat` ("no
+orchestrator to lose"), `qb-start` ("a spawner that read the plan and handed seat 1
+the first item would be hub-and-spoke with a hub that runs once"),
+`app/review_queue.py` ("a drainer that also ordered would be the hub-and-spoke shape
+`qb-seats` was written to refuse") and `app/api/landing.py` ("not an orchestrator…
+not a ranker… not a trigger"). Self-selection is the design here, not an accident of
+it, and the engine #476 wants is a dial on the agent that already claimed the work.
+
+What #476 does NOT supersede is the half of #435 that was never about driving:
+
+  > Blind spots are the interesting output. On a backlog assembled over weeks, most
+  > PRs will have no attested file list, and the report naming them is what turns
+  > "the order is null" into a work list.
+
+That is a sensor, and this is it. `GET /merge-queue` already computes an order and
+already names its own blind spots — but only over the PRs whose agent happened to
+run `/fix-and-land` step 4a, which on a real backlog is four of thirty-six. So the
+ranking has never described a drain, and the blind-spot list has never described the
+repo. This walks the OPEN PRs instead of the queued ones and asks the same question
+of each, which is the number nobody has seen: how much of a real backlog could the
+ranker order today, and what would it take to fix the rest.
+
+**There is deliberately no `--preland`.** An earlier cut had one, and it could not
+keep this tool's one promise: `preland.py` fetches the base branch's remote-tracking
+ref (its own docstring — "the one write is ``git fetch``") and `announce_hold` POSTS
+a note to the board for a HOLD, so a `--preland` sweep of a backlog would write once
+per holding PR. Its `--repo` also means a checkout PATH rather than `owner/name`, so
+it could not follow this tool's `--repo` anyway. Run `preland.py --pr N` yourself on
+the one PR you are about to land, which is where it belongs and where its writes are
+somebody's deliberate act.
+
+**Read-only, and it takes no claim.** Every call it makes is a GET with `reader`
+auth (`/reviews`, `/review/collisions`) plus `gh pr list`. Nothing here writes to
+the board, so it is safe to run while other agents are working the same repo, and
+safe to run thirty-six times.
+
+Exit codes: 0 the report was produced (whatever it says), 1 the repo or board could
+not be resolved. A backlog that is entirely blind is a finding, not a failure.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from qbdata import board_client, repo_slug  # noqa: E402
+
+#: What a PR's file evidence is worth to the ranker, worst first. The order is the
+#: report's sort order and the tiers are deliberately NOT collapsed into
+#: "orderable / not": a caller told only that N PRs are unorderable cannot act on
+#: any of them, and the four faults want four different things done. This is
+#: `app/api/merge_queue._blind_spots`' rule applied one population wider — it
+#: answers for queued rows, and the whole point here is the PRs that never queued.
+TIERS = ("never-panelled", "no-file-list", "inconsistent-counts", "stale-evidence",
+         "head-unknown", "prefix-list", "orderable")
+
+#: The tiers that leave the ranker unable to place a PR at all. `prefix-list` is
+#: deliberately absent: a prefix makes a shared-path count a FLOOR, which is a
+#: weaker claim rather than an absent one, and `_blind_spots` says of it "nothing to
+#: do here — GitHub caps a PR's file list at 3,000".
+BLIND = ("never-panelled", "no-file-list", "inconsistent-counts", "stale-evidence",
+         "head-unknown")
+
+FIXES = {
+    "never-panelled": "run a panel round on it — the board has no run for this PR "
+                      "at all, so it is in no class of anybody else's collisions",
+    "no-file-list": "run a panel round on it — a run exists but recorded no "
+                    "changed-file list (#94 was the title-skip path; a pre-v2.23 "
+                    "run is the other way this happens)",
+    "inconsistent-counts": "re-record the run — it stored more paths than its own "
+                           "changed-file count admits to, and the ranker weighs it "
+                           "at the larger of the two meanwhile",
+    "stale-evidence": "re-review at the current head — the file list on file "
+                      "describes a diff that is not the one that would land",
+    "head-unknown": "re-review at the current head — a file list exists, but which "
+                    "commit it belongs to could not be established, so it cannot be "
+                    "shown to describe what would land",
+    "prefix-list": "nothing to do — GitHub caps a PR's file list at 3,000 and this "
+                   "PR is over it, so its collision count is a floor",
+    "orderable": "",
+}
+
+
+def die(msg: str) -> int:
+    print(f"qb-line: {msg}", file=sys.stderr)
+    return 1
+
+
+#: How many open PRs one run will enumerate. High enough for any backlog this fleet
+#: has had, and the cap ANNOUNCES ITSELF when it binds (see `open_prs`) — a report
+#: about how much of a backlog can be ordered is exactly the report that must not
+#: quietly describe the first 200 of 340 as if they were all of it.
+PR_LIMIT = 200
+
+
+def open_prs(repo: str, base: str | None) -> tuple[list[dict], bool]:
+    """The open PRs, from `gh`, and whether the enumeration hit its cap.
+
+    Drafts are included and flagged, never filtered. A draft is not out of the
+    drain — it is a PR whose evidence is as stale or as missing as anyone's, and a
+    report that hid them would under-count the work list it exists to produce.
+    `preland` is what refuses to land one.
+
+    **The cap is reported rather than assumed away.** `gh` does not say whether more
+    rows existed, so this asks for one more than it means to use: getting it back is
+    the only evidence available that the answer is a prefix. This fleet's rule is
+    that a cap which trims an answer announces itself, and it is sharper here than
+    anywhere — the headline of this report is a FRACTION, and a silently truncated
+    denominator makes it read better than the truth.
+    """
+    cmd = ["gh", "pr", "list", "--repo", repo, "--state", "open",
+           "--limit", str(PR_LIMIT + 1),
+           "--json", "number,title,isDraft,headRefOid,baseRefName"]
+    if base:
+        cmd += ["--base", base]
+    got = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if got.returncode != 0:
+        raise RuntimeError(got.stderr.strip() or "gh pr list failed")
+    rows = json.loads(got.stdout or "[]")
+    return rows[:PR_LIMIT], len(rows) > PR_LIMIT
+
+
+#: How many of a PR's runs to fetch when resolving which commit its evidence
+#: belongs to. A page rather than one row, because `/review/collisions` answers
+#: from the newest run BEARING A FILE LIST, which is not always the newest run.
+RUN_PAGE = 50
+
+
+def pr_runs(client, repo: str, pr: int) -> list[dict]:
+    """This PR's recent runs, newest first — a page, not one row.
+
+    ``include_unreviewed`` is on, and it has to be: a title-skipped merge records a
+    run whose entire purpose is the changed-file list it carries, and the default
+    view hides exactly those. Asking without it would report a PR that HAS evidence
+    as never-panelled — the report's worst tier, and a work list with a made-up item
+    on it is worse than a short one.
+    """
+    rows = client.get("/reviews", {"repo": repo, "pr": pr, "limit": RUN_PAGE,
+                                   "include_unreviewed": "true"})
+    if isinstance(rows, dict):                    # a board that wrapped the list
+        rows = rows.get("runs") or rows.get("items") or []
+    return rows or []
+
+
+def evidence(client, repo: str, pr: int, head: str | None,
+             base: str | None) -> dict:
+    """One PR's answer: which tier its file evidence is in, and what would fix it.
+
+    **Judged on the NEWEST run, because that is the run the ranker uses.** This is
+    the correction that shapes the whole function, and it was found on review after a
+    first cut followed `/review/collisions` instead. The two endpoints select
+    differently and deliberately:
+
+    * `app/api/merge_queue.py` takes one unconditional ``DISTINCT ON (pr) ORDER BY ts
+      DESC`` per queued PR with **no file-list predicate** — "a run that recorded no
+      paths must come back as 0 and stay in the population, because it is precisely
+      the row whose absence would read as 'answered, and disjoint'".
+    * `/review/collisions` reaches back past its own window for the newest run
+      **bearing a file list**, because its job is to answer about overlap at all.
+
+    So on a PR whose newest run recorded nothing, collisions answers from an older
+    run and the ranker sees a blank. Following collisions would report such a PR
+    `orderable` while the queue counts it a blind spot — a false all-clear on the one
+    tier here that is a safety claim, and about the exact number this report exists
+    to produce.
+
+    The reach-back is detectable without a second endpoint: collisions only ever
+    answers from an older run when the newest bears no list, so ``run_id`` coming
+    back as anything other than the newest run's IS that case.
+
+    The 404 is a FINDING rather than an error, and on a backlog assembled over weeks
+    it is the commonest answer there is: "no run of this PR recorded a changed-file
+    list — nothing to compare" is precisely the `no-file-list` blind spot arriving as
+    a status code.
+    """
+    runs = pr_runs(client, repo, pr)
+    if not runs:
+        return {"tier": "never-panelled", "run_id": None, "run_head": None,
+                "reviewed": None, "skip_reason": None, "collisions": None}
+    newest = runs[0]
+    common = {"run_id": newest.get("id"), "run_head": newest.get("head_sha"),
+              "run_base": newest.get("base"),
+              "reviewed": newest.get("reviewed"),
+              "skip_reason": newest.get("skip_reason")}
+    try:
+        coll = client.get("/review/collisions", {"repo": repo, "pr": pr})
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"tier": "no-file-list", "collisions": None, **common}
+        raise
+    if coll.get("run_id") != newest.get("id"):
+        # Collisions reached back, so the newest run — the one the queue would weigh
+        # this PR by — recorded nothing. Reported as the blind spot the queue would
+        # report, not as the answer the older run happens to give.
+        return {"tier": "no-file-list", "collisions": None, **common}
+
+    counts = coll.get("counts") or {}
+    recorded, total = coll.get("files_recorded"), coll.get("changed_files_total")
+    out = {"collisions": {k: counts.get(k) for k in
+                          ("considered", "collides", "partial", "disjoint",
+                           "unanswerable", "excluded")},
+           "files_recorded": recorded, "changed_files_total": total,
+           **common}
+
+    # `_blind_spots`' `inconsistent-counts`, in its own words: "the answering run
+    # stored more paths than its own changed-file count admits to". The queue does
+    # not trust such a row, so neither may this.
+    if isinstance(recorded, int) and isinstance(total, int) and recorded > total:
+        return {"tier": "inconsistent-counts", **out}
+    # Unverifiable is not clear. A PR `gh` gave no `headRefOid` for, or a run from
+    # before v2.26 added `head_sha`, cannot be shown to describe what would land —
+    # and falling through to `orderable` is how "we could not check" becomes
+    # "checked", which is the failure this whole report is against.
+    if not head or not newest.get("head_sha"):
+        return {"tier": "head-unknown", **out}
+    # Staleness before completeness, on `_blind_spots`' own ladder: a complete list
+    # of the wrong commit is not evidence about what is landing, so there is nothing
+    # for the prefix question to be asked about yet.
+    #
+    # BASE as well as head, because `app.ranking.Candidate.pinned` compares both and
+    # a retargeted PR is a different diff at the same commit — the run's `base_branch`
+    # is selected into the ranker's query beside `head_sha` for exactly this.
+    if newest["head_sha"] != head:
+        return {"tier": "stale-evidence", **out}
+    if base and newest.get("base") and newest["base"] != base:
+        return {"tier": "stale-evidence", **out}
+    if coll.get("files_complete") is False:
+        return {"tier": "prefix-list", **out}
+    return {"tier": "orderable", **out}
+
+
+def rows_for(client, repo: str, base: str | None) -> list[dict]:
+    out = []
+    prs, capped = open_prs(repo, base)
+    for pr in prs:
+        row = {"pr": pr["number"], "title": pr["title"], "draft": pr["isDraft"],
+               "head": pr.get("headRefOid"), "base": pr.get("baseRefName")}
+        row.update(evidence(client, repo, row["pr"], row["head"], row["base"]))
+        row["fix"] = FIXES[row["tier"]]
+        out.append(row)
+    return out, capped
+
+
+def render(repo: str, base: str | None, rows: list[dict], capped: bool = False) -> str:
+    n = len(rows)
+    if not n:
+        return f"qb-line: {repo} has no open pull requests" + (
+            f" against {base}" if base else "")
+    tiers = {t: [r for r in rows if r["tier"] == t] for t in TIERS}
+    blind = [r for r in rows if r["tier"] in BLIND]
+    orderable = n - len(blind)
+    lines = [
+        f"{repo}: {n} open pull request(s)" + (f" against {base}" if base else ""),
+        "",
+        # The headline, and the number #435 says nobody has ever seen: not how good
+        # the order is, but how much of the backlog it could be computed over.
+        f"  {orderable} of {n} could be ORDERED today "
+        f"({len(blind)} blind: the ranker cannot place them)",
+        "",
+    ]
+    for tier in TIERS:
+        group = tiers[tier]
+        if not group:
+            continue
+        lines.append(f"  {tier}  ({len(group)})")
+        if FIXES[tier]:
+            lines.append(f"    fix: {FIXES[tier]}")
+        for r in group:
+            title = r["title"][:58] + ("…" if len(r["title"]) > 58 else "")
+            draft = " [draft]" if r["draft"] else ""
+            extra = ""
+            if tier == "stale-evidence" and r.get("run_head") and r.get("head"):
+                extra = f"  (evidence at {r['run_head'][:8]}, head is {r['head'][:8]})"
+            if tier == "orderable" and r.get("collisions"):
+                c = r["collisions"]
+                extra = (f"  (collides {c.get('collides')}, "
+                         f"disjoint {c.get('disjoint')}, partial {c.get('partial')})")
+            lines.append(f"    #{r['pr']:<5} {title}{draft}{extra}")
+        lines.append("")
+    if capped:
+        lines.append(
+            f"  ⚠ this repo has MORE than {PR_LIMIT} open PRs — every count above is "
+            f"over the first {PR_LIMIT} only, so the fraction is not the repo's")
+        lines.append("")
+    lines += [
+        "This report forms no queue, enqueues nothing and merges nothing (#476).",
+        "It says what the order could be computed over; the landing stays with each",
+        "PR's own agent, behind its own merge claim.",
+        "",
+        "One limit worth reading with it: `/review/collisions` answers over the PRs",
+        "this board has panelled, so a rival it has never seen is in no class at all.",
+        "That is why `never-panelled` is a tier here rather than a missing row.",
+    ]
+    return "\n".join(lines)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="qb-line",
+        description="What the landing line would look like, and what is blinding "
+                    "its order. Read-only: it forms no queue and merges nothing.")
+    ap.add_argument("--repo", default=None, metavar="OWNER/NAME",
+                    help="default: this checkout's origin remote")
+    ap.add_argument("--base", default=None, metavar="BRANCH",
+                    help="only PRs targeting this base. Default: whatever `gh` "
+                         "lists, which is every open PR against any base")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="the same answer as data, for a caller rather than a reader")
+    args = ap.parse_args()
+
+    repo = args.repo or repo_slug()
+    if not repo:
+        return die("no repo: pass --repo owner/name, or run this in a checkout "
+                   "whose origin remote names one")
+    try:
+        client, _cfg = board_client()
+    except Exception as e:                        # noqa: BLE001
+        return die(f"no board: {e}")
+    try:
+        rows, capped = rows_for(client, repo, args.base)
+    except RuntimeError as e:
+        return die(str(e))
+    except urllib.error.URLError as e:
+        return die(f"board unreachable: {e}")
+
+    if args.as_json:
+        blind = [r for r in rows if r["tier"] in BLIND]
+        print(json.dumps({
+            "repo": repo, "base": args.base, "open": len(rows),
+            "orderable": len(rows) - len(blind), "blind": len(blind),
+            "counts": {t: sum(1 for r in rows if r["tier"] == t) for t in TIERS},
+            # Never silent: `open` is a count of what was ENUMERATED, and a caller
+            # dividing by it needs to know when that is a prefix of the repo.
+            "truncated": capped, "limit": PR_LIMIT,
+            "prs": rows,
+            # Said in the payload and not only in the prose, on this fleet's rule
+            # that a caveat a caller cannot discover from the numbers has to ride
+            # with them: every one of these tools reports what it did NOT do.
+            "acted": False,
+            "scope": "open PRs from `gh`; evidence from PRs this board has panelled",
+        }, indent=2))
+    else:
+        print(render(repo, args.base, rows, capped))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -2709,6 +2709,68 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
 
+### `qb-line` — how much of the backlog could be ordered at all (#435)
+
+`GET /merge-queue` computes an order and names its own blind spots. It has never
+described a drain, because **nothing enumerates a repo's open PRs** — the queue holds
+only the PRs whose agent happened to run `/fix-and-land` step 4a, so the ranking is over
+four rows when the backlog is thirty-six, and one unenrolled straggler nulls
+`suggested_order` for everyone.
+
+```
+qb-line                  this checkout's repo, every open PR
+qb-line --base test      only PRs targeting one base
+qb-line --json           the same answer as data
+```
+
+There is deliberately **no `--preland`**. An earlier cut had one and it could not keep the
+tool's one promise: `preland.py` fetches the base branch's remote-tracking ref — its own
+docstring says "the one write is `git fetch`" — and `announce_hold` POSTs to the board for
+a HOLD, so a sweep would write once per holding PR. Run `preland.py --pr N` on the one PR
+you are about to land, where its writes are somebody's deliberate act.
+
+It walks the OPEN PRs and asks the same question of each, sorting them into five tiers
+with the repair for each:
+
+| tier | what it means | the fix |
+|---|---|---|
+| `never-panelled` | the board has no run for this PR at all, so it is in no class of anybody's collisions | run a panel round |
+| `no-file-list` | the PR's **newest** run recorded no changed-file list — a 404 from `/review/collisions`, or a reach-back past it | run a panel round (#94 was the title-skip path) |
+| `inconsistent-counts` | the run stored more paths than its own changed-file count admits to | re-record the run |
+| `stale-evidence` | the list belongs to a commit the branch has left, or to a base the PR no longer targets | re-review at the head |
+| `head-unknown` | a file list exists and which commit it describes could not be established | re-review at the head |
+| `prefix-list` | GitHub caps a file list at 3,000 and this PR is over it | nothing — the collision count is a floor, not a gap |
+| `orderable` | a complete list at the current head | — |
+
+The headline is the number #435 says nobody has ever seen: **how much of a real backlog
+the ranker could be computed over**, not how good the order is.
+
+**IT FORMS NO QUEUE, ENQUEUES NOTHING AND MERGES NOTHING.** #435 asked for a driver that
+enqueues; [#476](https://github.com/prisonblues/quarterback/issues/476) supersedes that
+half, on the grounds that a central drainer is the shape this codebase has refused four
+separate times in its own docstrings — `qb-seat`'s "no orchestrator to lose", `qb-start`'s
+"a spawner that read the plan and handed seat 1 the first item would be hub-and-spoke with
+a hub that runs once", `app/review_queue.py`'s "a drainer that also ordered would be the
+hub-and-spoke shape `qb-seats` was written to refuse", and `app/api/landing.py`'s "not an
+orchestrator… not a ranker… not a trigger". Self-selection is the design, and the engine
+#476 wants is a dial on the agent that already claimed the work. What survives is the
+sensor, and this is it. `test_qb_line.py` asserts the refusal from the board's side —
+every request it makes is a `GET`.
+
+Three limits it states rather than hides. It enumerates at most 200 open PRs and **says
+so when that binds** — the headline is a fraction, and a silently truncated denominator
+makes it read better than the truth. `/review/collisions` answers over the PRs this
+board has panelled, so a rival it has never seen is in no class at all — which is why
+`never-panelled` is a tier here rather than a missing row. And every tier is judged on the PR's
+**newest** run, because that is the run the ranker uses: `merge_queue` takes one
+unconditional `DISTINCT ON (pr) ORDER BY ts DESC` with no file-list predicate, while
+`/review/collisions` reaches back past its window for the newest run *bearing a list*. On a
+PR whose newest run recorded nothing the two disagree, and following collisions would call
+it `orderable` while the queue counts it blind. The collisions response carries no
+`head_sha` either, so the run's commit comes from `/reviews` — and where it cannot be
+established the PR is `head-unknown`, never `orderable`, because `orderable` is the one
+tier here that is a safety claim.
+
 ### `qb-backfill` — the collision datum, recovered from the forge (#449)
 
 `suggested_order` (#80) is published only when **every** queued PR's evidence is attested:
