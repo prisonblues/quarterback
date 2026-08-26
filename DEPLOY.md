@@ -86,6 +86,32 @@ container:**
 >   `proxy_set_header X-Edge-Auth "<the same value>";`
 > - On the **agent** vhost, inject nothing and **strip** `X-Edge-Auth` alongside `Remote-*`.
 >
+> ### …and a person's own key, for callers that cannot open a browser (#477)
+>
+> Everything above is the **edge** method and none of it changes. `X-Human-Key` is the second
+> one, and it exists because a terminal cannot use the first: an Authelia session expires on a
+> wall clock, so anything built on one dies whenever it lapses. Turning it on spans three
+> repos and each half is inert without the others:
+>
+> 1. **Mint one secret per person** — `openssl rand -hex 32`.
+> 2. **The board half** — `HUMAN_TOKENS=rich:<secret>` (`name:secret`, comma-separated, exactly
+>    `API_TOKENS`' format). In this fleet: `op://atlas/quarterback/human_tokens`, resolved by
+>    the `OP_REF_HUMAN_TOKENS` line in selfhost's `stacks/quarterback.yml`.
+> 3. **The client half** — `QUARTERBACK_HUMAN_KEY_CMD` in `~/.config/quarterback/config`, the
+>    **same** secret. In this fleet: `op://personal-nix/quarterback-<host>/human`, shipped by
+>    nix-fleet's `home/scripts.nix`. One value for the person, so every host they sit at gets
+>    the same one — a rotation is one board field and one vault field per host.
+> 4. **No vhost change.** `X-Human-Key` is client-supplied like a bearer, and `edge-untrusted`
+>    strips only the `Remote-*` set and `X-Edge-Auth`, so it already reaches the app through
+>    the agent host. Do not inject it anywhere.
+>
+> Unset is closed here too: with no keys configured nobody is a person by this route.
+>
+> **Do not put a key on a host that does not need one.** The residual (#479) is that anything
+> running as that user can read it and author as a person — for *everything* `human()` guards,
+> not only the dial the dashboard wanted. Which method authorised a write is recorded
+> (`set_via`), so at least a browser write and a keyed one are distinguishable afterwards.
+>
 > With the secret unset, nobody is a person: every human-only write is refused (403) —
 > including from the browser — and the board page falls back to the read-only view it had
 > before #108. That is the intended default: the failure mode of a misconfigured board is a
