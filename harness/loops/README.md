@@ -1674,7 +1674,7 @@ cycle this comes from ran to its end before anyone computed it.
 
 | column | what it is |
 |---|---|
-| `findings` | that round's `to_fix` + `sonar_findings`, the population `outstanding` counts. `dismissed` is out: the master ruled those not real and no fixer will ever touch them |
+| `findings` | that round's `to_fix` + `sonar_findings`, the population `outstanding` counts. `dismissed` is out: the master ruled those not real and no fixer will ever touch them. `?` where a bucket is present and is not a list of finding records — see below |
 | `P1/P2` | how many of them were at or above P2. An unreadable severity counts as severe, which is `severity_at_least`'s standing asymmetry — a row that under-states severity is a row that argues for another round |
 | `introduced` | that round's `provenance_counts["introduced"]`, and its share of that round's own findings. Three states, told apart by `attributed()`: `—` is round 1, where the question does not arise; `?` is a round that was asked and could not answer, meaning `unknown` was the only bucket with anything in it; and `0` is the round that attributed and had nothing to attribute — a round of repeats, or one with no findings. A failed attribution is never printed as `0`, which would be a claim about the fix pass made from a measurement that did not happen |
 | `whole PR` | `pr_chars`, the size of the **whole PR** whatever that round reviewed (#298). Never `diff_chars`, which under `increment` scope is one fix commit and would show the change shrinking exactly while it grows |
@@ -1682,7 +1682,35 @@ cycle this comes from ran to its end before anyone computed it.
 
 A round that reviewed nothing (a title skip, a pre-flight refusal) prints `not run` and no numbers:
 `0 findings` there would put the strongest convergence signal the block can show against a round
-that never happened.
+that never happened. A payload with no `reviewed` field reads the same way, which is how
+`first_reviewed` and the coverage record read that same silence — one answer to one field across
+the module, rather than a row saying something the ratio beside it disagrees with.
+
+**A count never degrades to a smaller number.** The rest of `load_baseline` reads the finding
+buckets tolerantly — a record that is not a mapping is skipped and the round keeps the others —
+because what those reads build is the `keys`/`titles` sets, where a dropped record makes a repeat
+read as new and buys a round nobody needed: the safe direction. A count has no such direction.
+`"to_fix": "corrupt"` iterates into single characters, each fails the mapping test, and a tolerant
+count reports **0 findings** from a payload nothing was read out of. So a bucket that is present
+and is not a list, or a list holding anything that is not a mapping, makes that row's counts `?`.
+An *absent* bucket is still empty, which is what an older schema's silence means. `introduced` is
+bounded by the population it is a share of, for the same reason: provenance is tallied over the
+very findings counted beside it, so a payload claiming more introduced than found is an
+inconsistent pair rather than a large measurement, and it reads `?` instead of `20 (2000%)`.
+
+**One row per round, not per payload.** Two files claiming round 2 are not two rounds, and a column
+carrying two `r2` rows with different figures in it cannot be read down — which is the whole of
+what the block is for. The ambiguity is still reported in `config_notes`, and the row kept is the
+last-written of them: the same `(round, mtime, path)` tie-break that already decides which payload
+supplies the anchor and the coverage record, so the row and the commit that round is attributed
+against come from one file.
+
+**A cycle whose earliest baseline reviewed nothing gets no ratios at all**, and that is #298's
+refusal rather than a gap here: `Baseline.first_reviewed` reads the earliest accepted baseline and
+nothing later, so there is no starting size and `max_fix_growth` does not run either. Scanning
+forward for the first round that *did* review would change when that ceiling fires, which is a stop
+condition and not this block's to move. Where the round-1 payload was simply never passed, the
+earliest baseline there is becomes the denominator and the header names it (`vs r2`).
 
 **There is deliberately no density metric, and adding one takes an argument.** While reading the
 cycle above by hand the reporter computed findings-per-10k-chars and got **9.46 → 7.97 → 4.82** — a

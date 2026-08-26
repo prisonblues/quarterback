@@ -560,11 +560,17 @@ def _trend_cells(row: RoundTrend) -> list[str]:
         # is mostly self-inflicted says so however few findings it has.
         got = f"{row.introduced} ({round(row.introduced * 100 / n)}%)"
     else:
-        # No findings at all, so there is no share to take — and `0 (0%)` would be
-        # a division this block never performs rather than a measurement.
+        # `n` is 0 (no findings, so no share to take — `0 (0%)` would be a division
+        # this block never performs) or None (the buckets could not be counted, so
+        # there is no denominator to take a share against). The count still prints:
+        # it is the number that survived.
         got = f"{row.introduced}"
     size = f"{row.pr_chars:,}" if row.pr_chars is not None else "?"
-    return [f"r{row.round}", f"{n}", f"{severe}", got, size]
+    # `?`, never `None`. A reviewed round whose finding buckets did not parse has no
+    # count, and an f-string over the missing value would print the word `None` into
+    # a numeric column — which reads as a value rather than as a gap.
+    return [f"r{row.round}", "?" if n is None else f"{n}",
+            "?" if severe is None else f"{severe}", got, size]
 
 
 def _trend_growth(row: RoundTrend, first_chars: int | None) -> str:
@@ -636,8 +642,16 @@ def cycle_trend_lines(rows: list[RoundTrend],
     first_round, first_chars = (first_reviewed[0], first_reviewed[1]) if first_reviewed \
         else (rows[0].round, None)
     # The growth column names its own denominator, so a reader can see WHICH round
-    # the multiples are against without counting rows — a cycle whose round 1 was
-    # skipped measures from round 2 and would otherwise silently mean something else.
+    # the multiples are against without counting rows — a cycle whose round-1 payload
+    # was never passed measures from the earliest baseline there is, and a header
+    # reading `vs r1` would silently name a round that is not in the comparison.
+    #
+    # It does NOT read `vs r2` for a cycle whose round 1 was skipped:
+    # `Baseline.first_reviewed` takes `ordered[0]` and nothing later, so an earliest
+    # round that reviewed nothing leaves no denominator at all. That is #298's
+    # deliberate refusal to invent one — `max_fix_growth` does not run there either —
+    # and this column reports it rather than working around it.
+    #
     # Where there is no denominator every cell is `?`, and a header still claiming
     # `vs r1` would name a comparison that is not being made.
     header = [*TREND_COLUMNS, f"vs r{first_round}" if first_chars else "growth"]

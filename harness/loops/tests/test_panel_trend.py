@@ -357,20 +357,24 @@ def every_seat_is_on_this_box(monkeypatch):
 
 
 def _round(monkeypatch, tmp_path, round_no, findings, head, files, baseline=(),
-           max_rounds=4):
+           max_rounds=4, prompts=None, reviewed=True):
     """One panel run with every subprocess replaced. `findings` is a list of
-    `(file, line, severity, title)`."""
+    `(file, line, severity, title)`. `prompts` collects everything the round put in
+    front of a model, for the test that insists the trend reaches none of them."""
+    prompts = [] if prompts is None else prompts
     fake_sh = gh_stub(meta={"title": "feat: mirror", "additions": 20,
                             "deletions": 2, "headRefOid": head},
                       compare=COMPARE, diff=_diff(files))
 
     def fake_review(name, model, prompt, effort="", **_kw):
+        prompts.append(prompt)
         return panel.ReviewerRun(
             [panel.Finding("claude", sev, f, ln, t, "detail")
              for f, ln, sev, t in findings], None, 800, None)
 
     def fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None,
                         ci="", **_kw):
+        prompts.append(str(coverage or "") + str(ci or ""))
         return ([panel.Canonical(id=panel._finding_id(pr, i + 1),
                                  severity=f.severity, file=f.file, line=f.line,
                                  synthesis=f.title, verdict="confirmed",
@@ -522,9 +526,181 @@ def test_a_baseline_for_THIS_round_never_reaches_the_block(
                for n in again["config_notes"])
 
 
+def test_a_cycle_whose_earliest_baseline_is_round_TWO_measures_from_round_two(
+        monkeypatch, tmp_path, capsys):
+    """The `vs r2` header, through the real derivation rather than a hand-injected
+    tuple. Round 1's payload was never passed, so `load_baseline` reads round 2 as
+    the earliest accepted baseline and that is what the growth column is against —
+    naming it is the only way a reader can tell this from a cycle measured from
+    round 1."""
+    _, _r1 = _round(monkeypatch, tmp_path, 1,
+                    [("app/f0.py", 3, "P2", "a stale mirror")],
+                    head="aaa111", files=2)
+    r2_path, r2 = _round(monkeypatch, tmp_path, 2,
+                         [("app/f0.py", 10, "P1", "a dangling handle")],
+                         head="bbb222", files=4)
+    capsys.readouterr()
+    _, r3 = _round(monkeypatch, tmp_path, 3,
+                   [("app/f0.py", 10, "P1", "a dangling handle"),
+                    ("app/f1.py", 2, "P2", "and another")],
+                   head="ccc333", files=8, baseline=[r2_path])
+    table = _table(capsys.readouterr().out.splitlines())
+    assert table[0].endswith("vs r2")
+    assert table[1].split()[0] == "r2" and table[1].endswith("1.00x")
+    assert r3["cycle_trend"][0]["growth"] == 1.0
+    # And it is the ceiling's denominator too, not a second one computed here.
+    assert r3["cycle_trend"][-1]["growth"] == r3["round_stop"]["fix_growth"]["ratio"]
+    assert r2["pr_chars"] < r3["pr_chars"]
+
+
+def test_an_earliest_round_that_reviewed_NOTHING_leaves_no_denominator(
+        monkeypatch, tmp_path):
+    """#298's deliberate refusal, reported rather than worked around.
+    `Baseline.first_reviewed` reads `ordered[0]` and nothing later, so a cycle whose
+    earliest baseline reviewed nothing has no starting size — `max_fix_growth` does
+    not run either. Scanning forward for the first round that DID review would
+    change when that ceiling fires, which is a stop condition and not this block's
+    to move."""
+    skipped = tmp_path / "skipped.json"
+    skipped.write_text(json.dumps({"round": 1, "cycle": "cyc", "reviewed": False,
+                                   "repo": "e2e", "github": "acme/e2e", "pr": 77,
+                                   "pr_chars": 500, "to_fix": [], "dismissed": [],
+                                   "sonar_findings": []}))
+    _, r2 = _round(monkeypatch, tmp_path, 2,
+                   [("app/f0.py", 10, "P1", "a dangling handle")],
+                   head="bbb222", files=5, baseline=[str(skipped)])
+    assert [t["growth"] for t in r2["cycle_trend"]] == [None, None]
+    assert r2["round_stop"]["fix_growth"] is None
+
+
+# --------------------------------------------------------------------------
+# A payload nothing can be counted out of
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("buckets", [
+    {"to_fix": "corrupt"},
+    {"to_fix": {"severity": "P1"}},
+    {"sonar_findings": "corrupt"},
+    {"to_fix": [{"severity": "P1"}, "corrupt"]},
+    {"to_fix": [{"severity": "P1"}], "sonar_findings": {"severity": "P1"}},
+])
+def test_a_bucket_nothing_can_be_counted_out_of_is_UNKNOWN_not_ZERO(buckets):
+    """The direction this block cannot afford to degrade in. `"to_fix": "corrupt"`
+    iterates into single characters, every one fails the mapping test, and the
+    tolerant read reports **0 findings** — the strongest convergence signal the
+    block can emit, from a payload nothing was read out of. One bad record among
+    ten is the same failure, quietly, at 9."""
+    row = panel_rounds._trend_row(2, _payload(**buckets))
+    assert (row.findings, row.p1p2) == (None, None)
+
+
+def test_an_ABSENT_bucket_is_empty_rather_than_unknown():
+    """The one tolerance kept, because it is what an older schema's silence means —
+    and it is how every other reader in `load_baseline` takes it."""
+    p = _payload(to_fix=[{"severity": "P1"}])
+    del p["sonar_findings"]
+    assert panel_rounds._trend_row(2, p).findings == 1
+
+
+def test_an_uncountable_round_prints_a_question_mark_not_the_word_None():
+    """The renderer's half of it. An f-string over the missing count puts `None` in
+    a numeric column, which reads as a value rather than as a gap."""
+    rows = [panel.RoundTrend(1, True, 2, 1, None, 1000),
+            panel.RoundTrend(2, True, None, None, None, 1200)]
+    cells = _table(panel.cycle_trend_lines(rows, (1, 1000, "pr")))[2].split()
+    assert cells == ["r2", "?", "?", "?", "1,200", "1.20x"]
+
+
+def test_an_introduced_count_bigger_than_the_findings_is_refused():
+    """Provenance is tallied over the very findings counted beside it, so
+    `introduced` can never exceed them in a payload this panel wrote. One that says
+    otherwise is an inconsistent pair, not a large measurement — and rendered it
+    becomes `20 (2000%)`, a percentage of a denominator the number does not belong
+    to. Unknown is the reading that cannot flatter the cycle."""
+    row = panel_rounds._trend_row(2, _payload(
+        to_fix=[{"severity": "P1"}],
+        provenance_counts={"introduced": 20, "missed": 0,
+                           "missed-unread": 0, "unknown": 0}))
+    assert row.introduced is None
+
+
+def test_an_introduced_count_is_kept_when_there_is_nothing_to_bound_it_against():
+    """No population, no bound — and refusing on that would throw away the one
+    number that did survive the payload."""
+    row = panel_rounds._trend_row(2, _payload(
+        to_fix="corrupt",
+        provenance_counts={"introduced": 3, "missed": 0,
+                           "missed-unread": 0, "unknown": 0}))
+    assert (row.findings, row.introduced) == (None, 3)
+
+
+@pytest.mark.parametrize("drop", ["reviewed", "provenance_counts", "to_fix"])
+def test_a_payload_older_than_a_field_loses_that_cell_and_no_other(drop):
+    """The compatibility the changelog claims, exercised field by field rather than
+    asserted in prose. A payload from before `provenance_counts` still contributes
+    its counts; one from before `reviewed` reads as a round that did not run, which
+    is how `first_reviewed` and the coverage record read the same silence — one
+    answer to one field across the module."""
+    p = _payload(to_fix=[{"severity": "P1"}, {"severity": "P3"}],
+                 provenance_counts={"introduced": 1, "missed": 0,
+                                    "missed-unread": 0, "unknown": 0})
+    del p[drop]
+    row = panel_rounds._trend_row(2, p)
+    if drop == "reviewed":
+        assert (row.reviewed, row.findings, row.pr_chars) == (False, None, None)
+    elif drop == "provenance_counts":
+        assert (row.findings, row.p1p2, row.introduced) == (2, 1, None)
+    else:
+        assert (row.findings, row.p1p2, row.introduced) == (0, 0, None)
+
+
+def test_two_payloads_for_ONE_round_render_ONE_row(tmp_path):
+    """Two files claiming round 2 are not two rounds. The block promises per-round
+    figures and its whole value is being read down a column, which two `r2` rows
+    with different numbers in them destroys. The ambiguity is still reported, and
+    the row kept is the last-written — the same tie-break that already decides which
+    payload supplies the anchor and the coverage record, so the row and the commit
+    the round is attributed against come from one file."""
+    paths = []
+    for n, chars in ((1, 100), (2, 700)):
+        f = tmp_path / f"r{n}.json"
+        f.write_text(json.dumps({"round": n, "cycle": "cyc", "reviewed": True,
+                                 "repo": "e2e", "github": "acme/e2e", "pr": 77,
+                                 "pr_chars": chars, "head_sha": "aaa111",
+                                 "to_fix": [{"severity": "P1", "key": f"k{n}",
+                                             "file": "app/f0.py"}],
+                                 "dismissed": [], "sonar_findings": []}))
+        paths.append(str(f))
+    # Named so it sorts last on the (round, mtime, path) tie-break the module
+    # already applies — two files written in the same instant fall through to the
+    # path, and this test is about WHICH rule decides, not about clock resolution.
+    other = tmp_path / "r2z.json"
+    other.write_text(json.dumps({"round": 2, "cycle": "cyc", "reviewed": True,
+                                 "repo": "e2e", "github": "acme/e2e", "pr": 77,
+                                 "pr_chars": 900, "head_sha": "bbb222",
+                                 "to_fix": [], "dismissed": [],
+                                 "sonar_findings": []}))
+    b = panel_rounds.load_baseline([*paths, str(other)],
+                                   {"repo": "e2e", "github": "acme/e2e",
+                                    "pr": 77, "round": 3})
+    assert [t.round for t in b.trend] == [1, 2]
+    # The last-written of the two round-2 payloads, which is the one the anchor
+    # came from as well.
+    assert b.trend[1].pr_chars == 900 and b.head_sha == "bbb222"
+    assert any("two payloads for one round" in p for p in b.problems)
+
+
 # --------------------------------------------------------------------------
 # It is reporting, and it has to stay reporting
 # --------------------------------------------------------------------------
+
+#: Every spelling this feature's data can arrive under. Widened past a bare
+#: `trend` because the source scan below is only as good as its vocabulary: a
+#: ceiling reading `cycle_trend`, `RoundTrend` or `introduced` would be exactly the
+#: drift the scan exists to catch, and none of those contains the word.
+TREND_NAMES = re.compile(r"\btrend\b|cycle_trend|RoundTrend|TREND_|_trend_|introduced",
+                         re.IGNORECASE)
+
 
 @pytest.mark.parametrize("fn", [panel_rounds.round_stop, panel_caps.check])
 def test_nothing_that_can_STOP_a_cycle_reads_the_trend(fn):
@@ -536,19 +712,31 @@ def test_nothing_that_can_STOP_a_cycle_reads_the_trend(fn):
     Asserted against the source of the two functions that CAN end a cycle, because
     a feature drifting into a stop condition is precisely the change that looks
     harmless in a diff — nothing else in the tree would go red for it."""
-    assert not re.search(r"\btrend\b", inspect.getsource(fn))
+    assert not TREND_NAMES.search(inspect.getsource(fn))
 
 
-def test_the_trend_does_not_reach_the_fixers_brief(monkeypatch, tmp_path):
-    """The other place a reporting number turns into an instruction. The block is
-    for the operator (and the orchestrator) deciding whether to go again; a fixer
-    handed a trend would be being asked to answer for the cycle rather than for the
-    findings, which nothing here has the evidence to ask."""
+def test_the_trend_reaches_no_MODEL_this_round_puts_it_in_front_of(
+        monkeypatch, tmp_path):
+    """The behavioural half, and the one that would catch what a source scan cannot:
+    a trend spliced into prose. Every prompt this round hands a model — each seat's
+    and the judge's coverage and CI briefs — is captured and must carry none of it.
+
+    A reviewer told the cycle is diverging is a reviewer told what to conclude before
+    it has read anything, and a judge told it is being asked to answer for the cycle
+    rather than for the finding in front of it. The block is for the operator (and
+    the orchestrator) deciding whether to go again; nothing here has the evidence to
+    ask a model anything about it."""
+    prompts: list[str] = []
     r1_path, _ = _round(monkeypatch, tmp_path, 1,
                         [("app/f0.py", 3, "P2", "a stale mirror")],
                         head="aaa111", files=2)
     _, r2 = _round(monkeypatch, tmp_path, 2,
                    [("app/f0.py", 10, "P1", "a dangling handle")],
-                   head="bbb222", files=5, baseline=[r1_path])
+                   head="bbb222", files=5, baseline=[r1_path], prompts=prompts)
+    assert prompts, "nothing was captured — the double stopped being called"
+    for text in prompts:
+        assert "Cycle so far" not in text
+        assert "P1/P2  introduced" not in text
+    # And the serialised findings a brief is built from carry no trend either.
     for finding in r2["to_fix"]:
-        assert "cycle_trend" not in finding and "trend" not in finding
+        assert not any(TREND_NAMES.search(k) for k in finding)

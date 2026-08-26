@@ -985,23 +985,87 @@ def _nonneg_int(value: object) -> int | None:
     return value
 
 
+def _introduced(counts: object, findings: int | None) -> int | None:
+    """How many of a round's findings the fix pass before it wrote, or None.
+
+    Bounded by the population it is a share OF, which is the one consistency check
+    available here: provenance is tallied over the very findings counted beside it,
+    so `introduced` can never exceed `findings` in a payload this panel wrote. A
+    hand-edited or foreign one saying otherwise is not a large measurement, it is an
+    inconsistent pair — and the renderer would turn it into `20 (2000%)`, a
+    percentage of a denominator the number does not belong to. Unknown is the honest
+    reading, and it is the direction that cannot flatter the cycle.
+
+    Unchecked where `findings` is itself unknown: there is no population to bound it
+    against, and refusing on that would throw away the one number that did survive.
+    """
+    if not attributed(counts):
+        return None
+    n = _nonneg_int(counts.get("introduced"))
+    if n is not None and findings is not None and n > findings:
+        return None
+    return n
+
+
+def _countable(payload: dict) -> list[dict] | None:
+    """Every finding an earlier round left the cycle to clear, or None where the
+    payload cannot be COUNTED.
+
+    The rest of :func:`load_baseline` reads these buckets tolerantly — a record that
+    is not a mapping is skipped and the round keeps its other findings — and that is
+    right for what those reads produce, which is the `keys` and `titles` sets. A
+    dropped record there means one repeat is not recognised, the finding reads as new,
+    and the cycle buys a round nobody needed: the safe direction.
+
+    A COUNT cannot be tolerant in that direction. `"to_fix": "corrupt"` iterates into
+    single characters, every one of them fails `isinstance(f, dict)`, and the row
+    reports **0 findings** — the strongest convergence signal this block can emit,
+    from a payload nothing was read out of. One malformed record among ten produces
+    the same failure quietly at 9. So a bucket that is present and is not a list, or a
+    list holding anything that is not a mapping, makes the counts UNKNOWN rather than
+    smaller, and the row prints `?`.
+
+    An ABSENT bucket is empty rather than unknown, which is the one tolerance kept:
+    that is how every other reader in this file takes it, and it is what an older
+    schema's silence means.
+    """
+    raised: list[dict] = []
+    for bucket in ("to_fix", "sonar_findings"):
+        got = payload.get(bucket)
+        if got is None:
+            continue
+        if not isinstance(got, list) or any(not isinstance(f, dict) for f in got):
+            return None
+        raised.extend(got)
+    return raised
+
+
 def _trend_row(was: int, payload: dict) -> RoundTrend:
     """Read one accepted baseline as a :class:`RoundTrend` row.
 
     Every read here degrades to None rather than raising or guessing, on
     :func:`load_baseline`'s standing rule that a bad payload costs a row's cell and
     never the review: this block is a reporting nicety and must never be the reason
-    a round does not run.
+    a round does not run. What it must never do is degrade to a NUMBER — a cell that
+    is quietly small reads as a measurement, and every wrong number this block can
+    print reads as convergence.
+
+    ``reviewed`` is taken exactly as :attr:`Baseline.read_nothing` and
+    :attr:`Baseline.first_reviewed` take it — truthiness of the payload's own field,
+    so a payload too old to carry it reads as "not run" here, in the growth
+    denominator and in the coverage record alike. One reading of one field across the
+    module: a third answer here would put a row in the block that the ratio beside it
+    disagrees with.
     """
     reviewed = bool(payload.get("reviewed"))
     findings = p1p2 = None
     if reviewed:
         # `dismissed` is not here — see `RoundTrend.findings`.
-        raised = [f for bucket in ("to_fix", "sonar_findings")
-                  for f in (payload.get(bucket) or []) if isinstance(f, dict)]
-        findings = len(raised)
-        p1p2 = sum(1 for f in raised
-                   if severity_at_least(f.get("severity"), TREND_SEVERE))
+        raised = _countable(payload)
+        if raised is not None:
+            findings = len(raised)
+            p1p2 = sum(1 for f in raised
+                       if severity_at_least(f.get("severity"), TREND_SEVERE))
     counts = payload.get("provenance_counts")
     return RoundTrend(
         round=was, reviewed=reviewed, findings=findings, p1p2=p1p2,
@@ -1009,8 +1073,7 @@ def _trend_row(was: int, payload: dict) -> RoundTrend:
         # in-cycle round records an all-zero tally by construction, and `0
         # introduced` read off it is the same fabrication as `0 findings` — it
         # attributed nothing because it reviewed nothing.
-        introduced=(_nonneg_int(counts.get("introduced"))
-                    if reviewed and attributed(counts) else None),
+        introduced=_introduced(counts, findings) if reviewed else None,
         # Gated on `reviewed` as well as on the field: a skipped round records
         # `pr_chars: 0` by default and `_positive_int` already refuses that, but a
         # refused round records the size of a PR it then did not review — and a
@@ -1199,10 +1262,12 @@ class Baseline:
     #: half of #490's cross-round block. This round appends its own row and renders
     #: the lot; nothing here decides anything.
     #:
-    #: It is a list and not a dict keyed by round because a set of baselines can
-    #: legitimately hold two payloads for one round (`problems` says so where it is
-    #: detected), and collapsing them here would silently pick one — in the one
-    #: block whose whole job is to show the reader every round there was.
+    #: One row per ROUND, not per accepted payload. Two files claiming round 2 are
+    #: not two rounds — the block promises per-round figures, and a column carrying
+    #: two `r2` rows with different numbers cannot be read down, which is the whole
+    #: of what it is for. The ambiguity is still reported (`problems`), and the row
+    #: kept is the last-written of them: the same tie-break that already decides
+    #: which payload supplies the anchor and the coverage record.
     trend: list[RoundTrend] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
@@ -1792,7 +1857,18 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # everything above is read from — a baseline this run refused as belonging
         # to another cycle must not appear in the block either, or the reader is
         # shown a trend across two PRs' worth of rounds.
-        b.trend = [_trend_row(was, payload) for was, _path, payload in ordered]
+        #
+        # ONE ROW PER ROUND. Two payloads for one round is a state this function
+        # tolerates and warns about (see `problems` above), but two files claiming
+        # round 2 are not two rounds, and a block whose whole value is being read
+        # down a column must not carry two `r2` rows with different figures in it.
+        # The winner is the LAST in `ordered`, which is the same last-written
+        # tie-break (round, then mtime, then path) that already decides which of two
+        # payloads supplies the anchor and the coverage record — so the row and the
+        # commit the round is attributed against come from the same file rather than
+        # from whichever rule was applied last.
+        rows = {was: _trend_row(was, payload) for was, _path, payload in ordered}
+        b.trend = [rows[was] for was in sorted(rows)]
     return b
 
 
@@ -3007,7 +3083,8 @@ __all__ = [
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
-    "TREND_SEVERE", "RoundTrend", "attributed", "_trend_row",
+    "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
+    "_introduced", "_trend_row",
     "load_baseline", "coverage_veto", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
