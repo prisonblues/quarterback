@@ -963,8 +963,76 @@ DEFAULTS: dict = {
         # `panel_rounds.FIX_INJECTION_MIN_NEW` is the other half of the rule and is a
         # constant rather than a dial: a rate over two findings is not a rate, and a
         # second number nobody can calibrate is worse than one documented floor.
+        #
+        # #505's rung, BESIDE the one above and emphatically not a second stopping
+        # system. `fix_injection` asks *did the fix cause this?*; this one asks *is
+        # the new-finding count still falling?*, which is a different question with a
+        # different answer, and the value is the number of CONSECUTIVE rounds whose
+        # new-finding count did not decrease before the cycle ends.
+        #
+        # **The rule is Rich's, stated on #480 over a cycle this codebase ran**: three
+        # rounds produced 44 findings, then 15 new, then 18 new — stop the cycle and
+        # triage the remainder rather than running a fourth. Read as attribution that
+        # cycle says nothing: the 18 need not have been created by the fix at all. A
+        # reviewer reading deeper, a seat that woke up, a scope that widened and a
+        # vendor added mid-cycle all produce news no fix pass wrote, and `_provenance`
+        # UNDER-counts by design on top of that (a defect introduced by DELETING a
+        # guard has no added line to sit on). So a genuinely diverging cycle can sit
+        # under `fix_injection`'s 0.5 for its whole life and be stopped only by the
+        # cap — which is a cap, and a cap fires in the same place whether the round
+        # found two findings or twenty.
+        #
+        # **1, for `fix_injection`'s own "ONE round, not two consecutive" reason, and
+        # the structure of the argument is identical.** A new-finding count can only
+        # be compared against a predecessor, so round 1 can never be a not-falling
+        # round and a value of 2 could not fire before round 3 — while `max_rounds`
+        # above defaults to 2. Shipped at 2 this rung would be OFF for every repo that
+        # did not configure it and armed only for the ones driving `--loop`, which is
+        # the `require_failing_test` failure with the honesty removed. At 1 the
+        # earliest round it can fire on is round 2, and on the shipped cap that is the
+        # round the cycle was ending on anyway.
+        #
+        # 1 is also exactly the rule as it was stated: 44 -> 15 falls and buys round
+        # 3; 15 -> 18 does not fall and ends the cycle there, which is where the human
+        # ended it.
+        #
+        # **The same three properties earn it the same default-on**, and they are the
+        # test a rung has to pass rather than a form of words:
+        #   - it can only ever turn a `go again` into a STOP, never the reverse, and
+        #     `round_stop` checks that condition rather than merely obeying it — so no
+        #     value of it can make a review look cleaner than it is;
+        #   - under the shipped `max_rounds: 2` the only round it can fire on is round
+        #     2, which is the round the cap would have ended anyway. What a default-on
+        #     costs a repo on the defaults is a better `reason` and one more veto line,
+        #     not an earlier finish;
+        #   - a false positive costs one printed question — the stop is vetoed and
+        #     `confident` is false, so the answer a human gives is "go again", not a
+        #     merge nobody looked at.
+        #
+        # **And one property `fix_injection` cannot claim.** This is computed from the
+        # ROUNDS' OWN COUNTS and never from provenance, so #500 — rebasing between
+        # rounds silently disarms provenance, and therefore silently disarms
+        # `fix_injection` — cannot disarm it. On a busy queue most PRs are rebased
+        # mid-cycle, which is precisely where the one shipped convergence brake stops
+        # being computable, and that is the argument for a second rung existing rather
+        # than for tightening the threshold on the first.
+        #
+        # **What it does NOT do, said out loud because the issue asks for both
+        # clauses.** #505's second gap is that a stopping rule has nowhere to put the
+        # findings it leaves outstanding — Rich's instruction was "stop the cycle AND
+        # triage the remainder into an issue", and the second half is #42, which is
+        # open. This rung ends the round; the remainder is handed to nobody, exactly
+        # as `fix_injection`'s and the cap's are. It trades a round for a stop that a
+        # human has to act on, and until #42 lands that is what it is.
+        #
+        # `null` (or `false`) switches it off in one line, like its sibling. `0` is
+        # REFUSED: zero consecutive not-falling rounds is every round, which is a
+        # brake with no discrimination in it. `panel_rounds.NOT_FALLING_MIN_NEW` is
+        # the noise floor and is a constant rather than a dial, for the reason
+        # `FIX_INJECTION_MIN_NEW` is: 1 -> 2 is arithmetic, not divergence, and a
+        # second number nobody can calibrate is worse than one documented floor.
         "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
-                         "fix_injection": 0.5},
+                         "fix_injection": 0.5, "new_findings_not_falling": 1},
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -2097,7 +2165,8 @@ class Dial(NamedTuple):
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
     for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
-    `escalate_on.premise_repeated`, `escalate_on.fix_injection` and
+    `escalate_on.premise_repeated`, `escalate_on.fix_injection`,
+    `escalate_on.new_findings_not_falling` and
     `max_diff_chars`, and means "inherit the default" for everything else — so a
     dial that took `null` generally would have one written value with two
     meanings.
@@ -2178,6 +2247,12 @@ BOARD_DIALS: dict[str, Dial] = {
     # repo switches a futility brake off, and a board that could move the number but
     # not turn it off would be a channel with half a policy in it.
     "review_panel.escalate_on.fix_injection": Dial("number", True, "either"),
+    # #505's volume rung, on the same terms. A fleet mid-drain wants a shorter
+    # window than a fleet reviewing one careful pull request, which is exactly the
+    # decision the dial layer exists for — and `nullable` for its sibling's reason:
+    # a board that could move the number but not turn the brake off would be a
+    # channel carrying half a policy.
+    "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either"),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are

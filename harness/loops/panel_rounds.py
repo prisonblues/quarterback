@@ -930,6 +930,28 @@ class RoundTrend:
     #: fix commit, and a size column that cliffs at round 2 would show the change
     #: shrinking while it grows. The same number ``max_fix_growth`` measures (#298).
     pr_chars: int | None = None
+    #
+    # LAST, although it reads with `findings` above: dataclass field order is a
+    # constructor signature, and every positional `RoundTrend(round, reviewed,
+    # findings, p1p2, introduced, pr_chars)` in this repo's suites would silently
+    # re-bind two columns if a field were inserted among them. Appended, an old
+    # positional call keeps meaning what it meant.
+    #: How many findings that round raised that NO EARLIER ROUND HAD — its payload's
+    #: own ``new_findings``, which is the count :func:`round_stop`'s rule 1 turns on.
+    #:
+    #: The series of these down the block is #505's rung, and it is the one column
+    #: here that is not reporting-only: `not_falling_state` reads it to decide whether
+    #: the cycle's new-finding count has stopped falling. Read off the payload rather
+    #: than re-derived, so this round's row and the same round's row one round later
+    #: are the same number by construction.
+    #:
+    #: None, not 0, wherever the round did not review — a skipped round records
+    #: ``new_findings: 0`` by default, and read as a real zero that is the strongest
+    #: possible "the count fell" in the block, from a round that raised nothing
+    #: because it read nothing. None for a review-only run too, where the payload
+    #: itself sends null: "raised by no earlier round" is vacuous when there was no
+    #: earlier round.
+    new_findings: int | None = None
 
 
 def attributed(counts: object) -> bool:
@@ -1069,6 +1091,27 @@ def _trend_row(was: int, payload: dict) -> RoundTrend:
     counts = payload.get("provenance_counts")
     return RoundTrend(
         round=was, reviewed=reviewed, findings=findings, p1p2=p1p2,
+        # Gated on `reviewed` for the reason the two counts above are, and this one
+        # matters more than they do because #505's rung reads it: a skipped round
+        # writes `new_findings: 0`, and a 0 read off it would say the count fell to
+        # nothing on a round that raised nothing because it read nothing. `None`
+        # instead, which breaks the streak and does not stop a cycle — the direction
+        # every unknown in this module fails in.
+        #
+        # AND GATED ON THE PAYLOAD KNOWING ITS OWN ROUND, which the other two cells do
+        # not need and this one does (found by a codex second opinion on #505). A count
+        # here is a point in a SERIES, and a point needs a position: `load_baseline`
+        # falls back to round 1 for a payload that does not say which round it is —
+        # silently where the field is absent — so such a row would sit at `r1`, read as
+        # consecutive with this run's round 2, and let the rung end a cycle off a round
+        # number nobody read. `was` is still what the row RENDERS as, because the block
+        # has to show the reader something; what is withheld is the number a rule acts
+        # on. The `round` cell is deliberately not made to lie about it either — the
+        # withheld count prints `?`, which is what "asked and not answered" already
+        # means in this block.
+        new_findings=(_nonneg_int(payload.get("new_findings"))
+                      if reviewed and _positive_int(payload.get("round")) is not None
+                      else None),
         # Gated on `reviewed` for the reason the two counts above are: a skipped
         # in-cycle round records an all-zero tally by construction, and `0
         # introduced` read off it is the same fabrication as `0 findings` — it
@@ -2088,6 +2131,36 @@ PREMISE_REGISTER_VERSION = 1
 #: null` is the supported way to switch this off, and it is one line.
 FIX_INJECTION_MIN_NEW = 4
 
+#: New outstanding findings a round needs before "the count did not fall" is
+#: evidence of anything (#505), and the reason it is a constant rather than a second
+#: dial.
+#:
+#: The rung compares two counts, and at the bottom of the range the comparison is
+#: arithmetic rather than divergence: one new finding then two is a rise of 100% and
+#: is a cycle that is very nearly done. What #505 is about is the shape Rich read off
+#: a real cycle — 44, then 15 new, then 18 new — where both ends of the comparison
+#: are volumes. Below four the round is not producing volume, whatever the round
+#: before it did, and another fix pass is cheap.
+#:
+#: Applied to BOTH ends of every comparison, so it fails in the direction that does
+#: not stop a cycle: a round that produced three new findings cannot end one however
+#: flat the series is, and neither can a round whose PREDECESSOR produced three. The
+#: second half is the one that is easy to leave out and it is not a symmetry for its
+#: own sake — 1 then 4 satisfies "did not decrease" and is a cycle whose first round
+#: under-read, which argues for more coverage rather than for stopping.
+#: `not_falling_state` records which existing test found that.
+#:
+#: Four rather than three for `FIX_INJECTION_MIN_NEW`'s reason and
+#: deliberately the same number — two uncalibrated floors that differ by one would be
+#: two things to defend and one of them would be defended by "it is not the other
+#: one".
+#:
+#: Not a dial, for its sibling's reason: #505 says in as many words that what a
+#: HEALTHY cycle looks like is uncalibrated, and the honest answer to one uncalibrated
+#: number is not to ship two of them. `new_findings_not_falling: null` is the
+#: supported way to switch this off and it is one line.
+NOT_FALLING_MIN_NEW = 4
+
 
 def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
     """`review_panel.escalate_on.premise_repeated` — the occurrence a declared
@@ -2119,8 +2192,9 @@ def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
         if rules.get(key):
             notes.append(
                 f"`escalate_on.{key}` is recorded and NOT enforced — #78 reserves the "
-                "name, and nothing implements it yet; only `premise_repeated` brakes "
-                "anything today")
+                "name, and nothing implements it yet; the brakes that do anything are "
+                "`premise_repeated`, `premise_undecidable`, `fix_injection` and "
+                "`new_findings_not_falling`")
     want = rules.get("premise_repeated", ESCALATE_ON_DEFAULTS.get("premise_repeated"))
     if want is None or want is False or want == "":
         return None
@@ -2264,6 +2338,173 @@ def fix_injection_limit(panel: dict, notes: list[str]) -> float | None:
     if not 0 < n < 1:
         return refuse("above 0 and below 1")
     return n
+
+
+def not_falling_limit(panel: dict, notes: list[str]) -> int | None:
+    """`review_panel.escalate_on.new_findings_not_falling` (#505) — how many
+    CONSECUTIVE rounds whose new-finding count did not decrease end the cycle, or
+    ``None`` for "do not brake".
+
+    The volume rung beside :func:`fix_injection_limit`'s attribution one. That dial
+    asks *did the fix cause this?*; this one asks *is the count still falling?*, and
+    the two have different answers on the same cycle — findings a reviewer reading
+    deeper produced, or a widened scope, are not attributable to any fix pass, and
+    `panel_scope._provenance` under-counts what is. A diverging cycle can therefore
+    sit under `fix_injection`'s threshold for its whole life and be stopped only by
+    the cap.
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep
+    (`harness_rules._DEEP_BLOCKS`), so a repo that writes `escalate_on` at all
+    replaces the default object wholesale, and without the per-key fallback
+    `{"premise_repeated": 2}` would silently switch THIS brake off. That is the exact
+    failure mode #84 hit, and it is worth not shipping a fourth time.
+
+    **A whole number of ROUNDS, at least 1.** ``0`` is refused rather than clamped:
+    zero consecutive not-falling rounds is satisfied by every round, including one
+    whose count fell, which is a brake with no discrimination in it and is the
+    posture `require_failing_test` exists to refuse having silently. A negative is
+    the same value written differently. ``1`` is the default and is NOT refused here
+    — the asymmetry with `premise_repeated`, which refuses 1, is that a premise
+    declared once is an ordinary event while a round whose count did not fall is
+    already the whole observation.
+
+    ``false``/``null``/``""`` are the spellings of off, exactly as they are for
+    `fix_injection`, and ``true`` is refused because a window is not a switch and
+    there is no number it could mean. Bools are settled before the numeric read for
+    `fix_growth_limit`'s reason: ``isinstance(True, int)`` is True, so a bool that
+    fell through would become 1 — the brake at its default behind a value that means
+    something else. A float that is not whole is refused rather than truncated: 1.5
+    rounds is not a number of rounds, and a harness that quietly read it as 1 would
+    be applying a policy the file did not write."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Refused here as well as by its siblings, for the reason `fix_injection_limit`
+        # gives: `run()` calls `premise_repeat_limit` first on every real path, but
+        # this function is public and is called directly by tests, and one that relied
+        # on a sibling having run would be one test double away from applying a policy
+        # nobody wrote. The unbuilt-name notes are left to that first reader — they are
+        # a fact about the block, not about this dial.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return None                                   # unreachable
+    want = rules.get("new_findings_not_falling",
+                     ESCALATE_ON_DEFAULTS.get("new_findings_not_falling"))
+    if want is None or want is False or want == "":
+        return None
+    n = None
+    if isinstance(want, bool):
+        n = None
+    elif isinstance(want, int):
+        n = want
+    elif isinstance(want, float) and want.is_integer():
+        n = int(want)
+    elif isinstance(want, str):
+        try:
+            n = int(want.strip())
+        except ValueError:
+            n = None
+    if n is None or n < 1:
+        _refuse_value("escalate_on.new_findings_not_falling", want,
+                      "a whole number of consecutive ROUNDS >= 1 (1 means 'the first "
+                      "round whose new-finding count did not fall'), or null to switch "
+                      "the brake off — 0 is satisfied by every round, including one "
+                      "whose count fell, which is the brake off behind a value that "
+                      "reads as armed")
+    return n
+
+
+def not_falling_state(series: list[tuple[int, int | None]],
+                      limit: int | None) -> dict:
+    """#505's measurement as this round read it, for :func:`round_stop` and the
+    payload — `injection_state`'s sibling and deliberately its shape.
+
+    ``series`` is one ``(round, count)`` pair per round of the cycle IN ROUND ORDER,
+    ending with this round: each round's own ``new_findings``, the count
+    `round_stop`'s rule 1 turns on. The count is ``None`` where a round did not
+    measure it — a round that reviewed nothing, a baseline whose payload could not be
+    read, a payload older than the field. The ROUND NUMBER rides along because a
+    missing round has to be told from a falling one; see the streak rules. Nothing
+    here is derived from `panel_scope._provenance`, and that is the rung's point: #500
+    (a rebase between rounds silently disarms provenance) disarms `fix_injection` and
+    cannot disarm this, because a round's own count of its own new findings survives
+    the range under it being unreadable.
+
+    **The streak is counted backwards from this round.** A round is part of it when
+    four things hold, and any one of them failing ends it:
+
+    - its predecessor in the list is the round immediately BEFORE it. A cycle with a
+      gap — round 3 with only round 1's baseline readable, because round 2's payload
+      was lost or was never passed to it — has a missing round between the two counts,
+      and a missing round is missing data, which must never end a cycle. Comparing
+      across the gap would also make this rung's own `reason` untrue: it says "the
+      round before", and across a gap that is not the round before. (Found by a codex
+      second opinion on #505; the first cut compared adjacent list entries and put the
+      decision in a comment, which is a decision documented rather than defended.);
+    - both its count and its predecessor's are known. An unknown is not a fall and is
+      not a rise; it is the absence of the comparison, and it resets rather than
+      being guessed at either way. That is the direction that does not stop a cycle.
+      `run()` withholds a round's count for three reasons, and the third is the one
+      worth naming here: a round that reviewed nothing, a payload that cannot say
+      which round it is, and a round whose BASELINE HISTORY was incomplete — where
+      "no earlier round raised it" was decided against baselines this run could not
+      read, so the count is inflated by findings an earlier round did raise;
+    - its count did not DECREASE — ``>=``, so a flat series counts. A cycle producing
+      fifteen new findings a round forever is not converging, and a rule that only
+      caught the rise would let it run to the cap;
+    - BOTH its count and its predecessor's are at least
+      :data:`NOT_FALLING_MIN_NEW`. Both ends, because "not falling" is a claim about a
+      SERIES and a series needs two volumes to be one: a round that went from one
+      finding to four has not stopped falling, it was never falling — there was no
+      volume for it to fall from. See :data:`NOT_FALLING_MIN_NEW` for the floor's own
+      argument, and note which half of this the existing suite found: with the floor
+      on the current round alone, `test_panel_provenance`'s "a round that mostly found
+      what the last one MISSED is not diverging" — 1 finding, then 4 of which one was
+      the fix pass's — was ended by this rung rather than by the cap. That round is
+      the case the rule's own docstring names as its false positive (an earlier round
+      that under-read), and the fix is to require the comparison to be between two
+      measurements rather than to make an exception for one fixture.
+
+    Round 1 is never part of a streak, because it has no predecessor — which is the
+    whole of why the shipped default is 1 rather than 2. This holds however the caller
+    numbers its rounds: what round 1 lacks is a row before it, not the number 1. See
+    the `escalate_on` comment in `harness_rules.DEFAULTS`.
+
+    ``over`` is the RULE and is decided here rather than in `round_stop`, on
+    `injection_state`'s precedent: what the stop rule receives is a verdict about a
+    measurement it has no other way to make, and keeping the arithmetic beside the
+    thing it measures is what lets the stop rule stay a rule about findings.
+
+    Every field is present on every round, `premise_state`'s rule and for its reason:
+    an absent key and "the brake was off" are different claims. ``count`` and ``was``
+    are this round's and its predecessor's, null where there is no such round or the
+    round did not measure — never 0, because zero new findings is a claim about a
+    round and this is the absence of one. ``rounds`` rides beside ``counts`` so a
+    reader can see the gap a streak stopped at rather than having to infer it."""
+    rows = list(series)
+    rounds = [r for r, _ in rows]
+    counts = [n for _, n in rows]
+    streak = 0
+    for i in range(len(rows) - 1, 0, -1):
+        cur, was = counts[i], counts[i - 1]
+        if (rounds[i] != rounds[i - 1] + 1
+                or cur is None or was is None
+                or cur < was
+                or cur < NOT_FALLING_MIN_NEW or was < NOT_FALLING_MIN_NEW):
+            break
+        streak += 1
+    return {"limit": limit,
+            "rounds": rounds,
+            "counts": counts,
+            "count": counts[-1] if counts else None,
+            "was": counts[-2] if len(counts) > 1 else None,
+            "streak": streak,
+            "min_new": NOT_FALLING_MIN_NEW,
+            "over": bool(limit is not None and streak >= limit)}
 
 
 def premise_key(text: str) -> str:
@@ -2768,7 +3009,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                trigger_floor: str = NO_SEVERITY_FLOOR,
                fix_floor: str = NO_SEVERITY_FLOOR,
                premises: dict | None = None,
-               injection: dict | None = None) -> dict:
+               injection: dict | None = None,
+               not_falling: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -2997,6 +3239,67 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     assumption a fixer wrote against; this one only counts, and the more specific
     truth wins the ``reason``.
 
+    ``not_falling`` is #505, and it is the FOURTH futility bound here — beside
+    ``injection`` rather than instead of it, and asking a different question. That one
+    asks *did the fix cause this?*; this one asks *is the new-finding count still
+    falling?*, which is the rule a human stated on #480 over a cycle of this
+    codebase's own: 44 findings, then 15 new, then 18 new — stop, and triage the
+    remainder. The 18 need not be attributable to the fix at all, and
+    :func:`panel_scope._provenance` under-counts the ones that are, so a genuinely
+    diverging cycle can sit under ``injection``'s threshold for its whole life and be
+    stopped only by the cap.
+
+    :func:`not_falling_state` is the measurement and it arrives already decided, on
+    ``premises``' and ``injection``'s precedent.
+
+    **It is computed from the ROUNDS' OWN COUNTS and never from provenance**, which is
+    the property that makes it worth having rather than a tighter threshold on the
+    dial above. #500 — a rebase between rounds silently disarms provenance — disarms
+    ``injection`` outright and cannot touch this: a round's count of its own new
+    findings survives the range under it being unreadable, so on a busy queue where
+    most PRs are rebased mid-cycle this is the rung that still works.
+
+    **It takes the same two bounds as ``injection``, and for the same reasons.** It
+    may only turn a ``go again`` into a STOP, checked on that condition rather than
+    merely obeying it; and it may only take away the round RULE 1 was buying, because
+    its whole justification is about rule 1's input. A round going again under rule 2
+    or rule 3 is going again for work the fix pass FAILED to do, and a count of news
+    must not cancel the repair round for a named blocker. Both flags are therefore
+    computed from the SAME pre-brake state as ``injection``'s, so a round that is over
+    both thresholds records both rather than whichever was applied first.
+
+    That second bound is now enforced as what it says rather than as "rule 1 won the
+    ``reason``" — the two are different, because rules 1-3 are an if/elif chain and a
+    round can be going again under all three at once. What disarms both rungs is a
+    P1/P2 or Sonar gate issue **an earlier round raised** and this one still has, or a
+    ``repeated`` key: work the fix pass failed to do. This round's OWN new P1s do not,
+    and must not — they are the news being counted, and a rung that stood down for them
+    could not fire on the cycle #489 was measured from, where every new finding was a
+    P2. See the comment at ``held_over``.
+
+    **It inherits ``injection``'s honest mismatch, and inherits it knowingly.** The
+    series is each round's own ``new_findings`` — every finding no earlier round
+    raised — while the rules above are applied to the CLEARABLE ones, so a cycle
+    holding an escalation counts a finding no fix round may touch. It is allowed to
+    differ for that rule's reason: the series is a property of what the ROUNDS
+    PRODUCED, and the work bound is a property of what the next round could do about
+    it. Closing it would mean a second per-round count beside the one every payload
+    since the field existed already carries, and a second count is a second thing that
+    can disagree with the first. What keeps it from mattering is ``triggering``: a
+    round whose only news is escalated buys nothing under rule 1 and this rung cannot
+    fire on it.
+
+    **``injection`` owns the ``reason`` when both fire**, on the ordering
+    ``circling`` already establishes: the more specific truth wins. A rate that names
+    the fix pass as the author of this round's work says more than a count that only
+    says the work is not shrinking, and both veto lines are on the record either way.
+
+    **What it does not do.** #505 asks for two clauses — stop the cycle, and triage
+    the remainder into an issue — and only the first is implementable here. The
+    second is #42, which is open: this rung ends the round and the outstanding
+    findings are handed to nobody, exactly as ``injection``'s stop and the cap's hand
+    theirs to nobody. It trades a round for a stop a human has to act on.
+
     **One honest mismatch, written down rather than fixed**, on the same terms
     :func:`panel_scope._provenance` records its own two: the rate's denominator is
     every new outstanding finding, while the rules above are applied to the
@@ -3208,8 +3511,68 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #
     # Recorded in a local because the veto and the payload both have to know whether
     # this FIRED, and by then `stop` says only that something did.
+    #
+    # ONE pre-brake state, read by BOTH volume rungs before either can move `stop`.
+    # `injected` used to read `not stop` directly and meant exactly this; #505's rung
+    # applies first (it owns the less specific `reason`, so `injection` overwrites it
+    # below), and had the second flag gone on reading `stop` it would have been false
+    # on every round the first one stopped — recording `fired: false` for a rule that
+    # was over its threshold and would have ended the round on its own. Two rules over
+    # one pre-brake state answer independently, which is what lets the payload carry
+    # both.
+    #
+    # `held_over` IS PART OF THE BOUND, and leaving it out was a real under-enforcement
+    # of #489's own stated rule rather than a nicety (found by a codex second opinion on
+    # #505). "It may only take away the round rule 1 was buying" is not the same test as
+    # "rule 1 won the `reason`": rules 1, 2 and 3 are an if/elif chain, so a round with
+    # four triggering news AND an outstanding P1 from an earlier round reports rule 1
+    # while going again for BOTH — and with `triggering` as the only condition, either
+    # rung ended it with that P1 unfixed. The docstring's own sentence, "a statistic may
+    # end the loop it is a statistic about; it may not overrule a named P1", is
+    # precisely what that did.
+    #
+    # WHAT IT IS NOT is `not blockers`. `blockers` is every outstanding P1/P2, and on
+    # the ordinary round those ARE this round's news — four new P2s and nothing else
+    # makes `blockers` four items long. Bounded on that, neither rung could fire on the
+    # very cycle #489 was measured from, which is how this was caught: the end-to-end
+    # test for "a round whose findings are mostly its own damage" went back to ending
+    # on the cap. The question rule 2 and rule 3 ask that rule 1 does not is whether
+    # there is work here the fix pass FAILED to do, and that is work an EARLIER round
+    # raised — so the subtraction is this round's own news. `repeats` is already only
+    # that, by construction: `repeated` is the keys an earlier round raised.
+    #
+    # Both rungs take the corrected bound rather than #505's alone: they state the same
+    # rule in the same words, and two brakes whose shared sentence means two different
+    # things is worse than either being wrong on its own. It is a strict NARROWING —
+    # each fires on a subset of the rounds it fired on before — so nothing it changes
+    # can make a review look cleaner: a round it now declines to stop goes again and is
+    # read again, and the cap still binds with `confident` false.
+    fresh = {*clearable_new}
+    held_over = [c for c in blockers if c.key not in fresh]
+    going_again = bool(not stop and triggering and not held_over and not repeats)
     injecting = injection_state(None, None) if injection is None else injection
-    injected = bool(injecting["over"] and not stop and triggering)
+    injected = bool(injecting["over"] and going_again)
+    # #505, applied BEFORE `injected` so that `injected` owns the `reason` when both
+    # fire — `circling`'s ordering rule, one level down. A rate that names the fix pass
+    # as the author of this round's work is the more specific truth than a count saying
+    # only that the work is not shrinking, and both veto lines are on the record.
+    #
+    # `going_again` carries both of this rule's bounds, the same two `injected` takes:
+    # `not stop` is the guarantee that it can only make a `go again` into a STOP, and
+    # the rest of it — `triggering`, and no held-over blocker or repeat — is what keeps
+    # the rule inside its own justification. The argument is about rule 1's input, so it
+    # may only take away the round rule 1 was buying, and may not cancel the repair
+    # round for a P1 an earlier round raised that this fix pass did not clear.
+    flattening = (not_falling_state([], None) if not_falling is None else not_falling)
+    flat = bool(flattening["over"] and going_again)
+    if flat:
+        stop, reason = True, (
+            f"{flattening['count']} new finding(s) this round against "
+            f"{flattening['was']} the round before — {flattening['streak']} "
+            f"consecutive round(s) whose new-finding count did not fall, at the "
+            f"`escalate_on.new_findings_not_falling` limit of {flattening['limit']} — "
+            "the count is not coming down, and a human triages what is left rather "
+            "than another fix pass")
     if injected:
         stop, reason = True, (
             f"{injecting['introduced']} of {injecting['new']} new finding(s) "
@@ -3263,6 +3626,28 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #505, and BEFORE #489's line for the reason the stop below it is applied first:
+    # a reader coming down the veto list meets the count, then the attribution that
+    # explains part of it. Unconditional for `injected`'s reason — `flat` is only ever
+    # true on a round this rule itself stopped, so there is no `go again` round it can
+    # fire on.
+    #
+    # The #500 sentence is not decoration. `fix_injection`'s veto and this one look
+    # alike to a reader, and the one thing that distinguishes them is which of the two
+    # is still armed on a PR that was rebased mid-cycle: provenance is computed against
+    # a range a rebase destroys, and a round's own count of its own new findings is
+    # not. A reader deciding what to do about this stop needs to know it was not
+    # computed from the thing that quietly stopped working.
+    if flat:
+        series = " -> ".join("?" if n is None else str(n)
+                             for n in flattening["counts"])
+        veto = [*veto, "the new-finding count has not fallen for "
+                       f"{flattening['streak']} consecutive round(s) — {series}"
+                       " — at the `escalate_on.new_findings_not_falling` limit of "
+                       f"{flattening['limit']}. Counted from the ROUNDS' own totals "
+                       "and not from provenance, so unlike `fix_injection` a rebase "
+                       "between rounds cannot have disarmed it (#500): this stop is "
+                       "that count, not convergence (#505)"]
     # #489. Unconditional for `circling`'s reason and one of its own: `injected` is
     # only ever true on a round this rule itself stopped, so there is no `go again`
     # round it can fire on. Said in full — both counts, the rate, the dial and the
@@ -3354,6 +3739,20 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # `over` would attach it to a confident, converged round, which is exactly the
         # misreporting the rest of this function is organised against.
         "fix_injection": {**injecting, "fired": injected},
+        # #505's measurement, ALWAYS present for the reason `fix_injection` beside it
+        # is: a payload with no key and a cycle with nothing to compare are different
+        # claims. `counts` is the whole series the verdict was taken over rather than
+        # just the streak, so a reader can check `streak` against it instead of taking
+        # it on trust — the same reason `injection_state` publishes `rate`, `limit` and
+        # `over` side by side.
+        #
+        # `over` AND `fired` kept apart on exactly `fix_injection`'s terms. `over` is a
+        # property of the MEASUREMENT and is true of plenty of rounds this rule
+        # deliberately does not touch — a below-floor policy stop, a round holding an
+        # escalation, a round going again for a P1 under rule 2. `fired` is the
+        # property of the VERDICT. A consumer that read the first as the second would
+        # attach "the cycle ended without converging" to a confident, converged round.
+        "new_findings_not_falling": {**flattening, "fired": flat},
     }
 
 
@@ -3377,6 +3776,7 @@ __all__ = [
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
+    "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

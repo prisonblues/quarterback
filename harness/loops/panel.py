@@ -616,6 +616,13 @@ def _trend_record(row: RoundTrend, first_chars: int | None) -> dict:
     """
     return {"round": row.round, "reviewed": row.reviewed,
             "findings": row.findings, "p1p2": row.p1p2,
+            # #505's series. Carried in the payload but NOT given a printed column:
+            # a column needs the argument the comment on `TREND_COLUMNS` demands and
+            # this change does not make it, while a consumer plotting the cycle should
+            # not have to re-read every round's file to get the number the stop rule
+            # used. `round_stop.new_findings_not_falling.counts` carries the same
+            # series for the round it decided.
+            "new_findings": row.new_findings,
             "introduced": row.introduced, "pr_chars": row.pr_chars,
             "growth": (round(row.pr_chars / first_chars, 3)
                        if first_chars and row.reviewed and row.pr_chars is not None
@@ -860,6 +867,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # hard-exits at the same moment `premise_repeated`'s does — before a seat is
     # dispatched, rather than after a whole panel has been paid for.
     injection_limit = fix_injection_limit(panel, notes)
+    # #505's volume rung, read here for the same reason and at the same moment: a
+    # malformed value has to hard-exit before a seat is dispatched rather than after a
+    # whole panel has been paid for, and the round's stop is computed under one policy
+    # that was resolved in one place.
+    not_falling = not_falling_limit(panel, notes)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -2682,14 +2694,38 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     tally = Counter(provenance_of(c) for c in outstanding)
     provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
 
+    # Whether a CYCLE exists at all, and the one predicate that decides it — for
+    # the report's Rounds block, for the payload and for the trend row below alike.
+    # They used to disagree: the report suppressed the block for a review-only run
+    # while the payload sent `round_stop` regardless, so `record_review` stored a
+    # `/panel` read with findings as `stopped: false` (the board shows a cycle
+    # mid-flight that nothing will advance) and one without as `stopped: true,
+    # stop_confident: true` — a confident-convergence record for a PR that had no
+    # cycle.
+    #
+    # Resolved HERE rather than after the stop rule because the trend row below now
+    # carries `new_findings` and has to gate it on exactly this predicate: for a
+    # review-only run `len(new_keys)` is every finding — the vacuous count "raised by
+    # no earlier round" when there was no earlier round — and #505's rung reads that
+    # column. A second spelling of the same test beside it is how the report and the
+    # payload came to disagree the first time.
+    cycle_run = bool(in_cycle or prior_rounds)
+
     # ---- #490: this round's own row of the cross-round trend block, and the earlier
     # rounds' rows beside it.
     #
-    # REPORTING ONLY. Nothing below this line is read by `round_stop`, by any ceiling
-    # in `panel_caps`, or by the fixer's brief — it cannot stop a cycle and cannot buy
-    # one another round. #489 proposes the gate; this is deliberately separable from
-    # it, because a cheap reporting improvement chained to a policy argument waits on
-    # the policy argument.
+    # REPORTING, and — since #505 — one column that is not. `round_stop` reads
+    # `new_findings` off these rows and nothing else off them: no ceiling in
+    # `panel_caps` consults the block, the fixer's brief does not, and no other cell
+    # here can stop a cycle or buy one another round. The block shipped strictly
+    # reporting-only on purpose (a cheap reporting improvement chained to a policy
+    # argument waits on the policy argument), and the column that grew a consumer is
+    # the one #505 argued for; the rest stay where they were.
+    #
+    # This is also why the rows are built BEFORE the stop rule rather than in the
+    # report: the same per-round series a reader checks the verdict against is the
+    # series the verdict was taken over, so the block and the stop cannot disagree
+    # about how the count moved.
     #
     # This round's row is built HERE rather than in the report, from the same
     # variables the report's own counts come from (`outstanding`, `provenance_counts`,
@@ -2734,6 +2770,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                              # has to see the same object a LATER round will read back
                              # out of this payload, or this round's row and its own row
                              # one round later would answer differently.
+                             # #505's column, gated on `cycle_run` exactly as the
+                             # payload's own `new_findings` is and for its reason.
+                             #
+                             # AND ON `prior.problems`, which the other cells do not
+                             # need (found by a codex second opinion). "New" here means
+                             # "no EARLIER round raised it", and that is a claim about
+                             # the baselines — so a baseline this run could not read,
+                             # or refused as another review's, or could not tell from a
+                             # duplicate of the same round, makes findings an earlier
+                             # round DID raise count as new and inflates this number.
+                             # Fed to #505's rung that is an inflated count compared
+                             # against a sound predecessor, which is the direction that
+                             # ends a cycle. `None` withholds it, the streak treats it
+                             # as the absence of the comparison, and `counts` carries
+                             # the null so a reader can see which round went dark.
+                             #
+                             # Only THIS round's cell needs it. The mirror case — a
+                             # later round comparing against an earlier round's inflated
+                             # count — makes `was` larger and `cur >= was` less likely,
+                             # so it already fails toward going again.
+                             new_findings=(len(new_keys)
+                                           if cycle_run and not prior.problems
+                                           else None),
                              introduced=(provenance_counts.get("introduced")
                                          if attributed(provenance_counts) else None),
                              # The whole PR, whatever this round reviewed (#298) —
@@ -2776,7 +2835,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # applies. Empty on round 1 and on any round whose fix range
                       # could not be read, which is `over: False` by construction: a
                       # round that could not be attributed does not end a cycle.
-                      injection=injection_state(provenance_counts, injection_limit))
+                      injection=injection_state(provenance_counts, injection_limit),
+                      # #505's volume rung beside it. The series is the trend block's
+                      # own `new_findings` column — every round's count of findings no
+                      # earlier round raised, this one included — so the block a reader
+                      # checks the verdict against IS the series the verdict was taken
+                      # over. Nothing here comes from provenance, which is why a rebase
+                      # between rounds (#500) cannot disarm this the way it disarms the
+                      # gate above.
+                      not_falling=not_falling_state(
+                          [(t.round, t.new_findings) for t in trend_rows],
+                          not_falling))
     # Said in `config_notes` as well as in `round_stop`, because these two are read
     # by different people at different moments: the payload's `round_stop` is what
     # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
@@ -2995,15 +3064,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # carry the flag that means "nothing left to find".
             stop["confident"] = False
     stop["fix_growth"] = growth
-
-    # Whether a CYCLE exists at all, and the one predicate that decides it — for
-    # the report's Rounds block and for the payload alike. They used to disagree:
-    # the report suppressed the block for a review-only run while the payload sent
-    # `round_stop` regardless, so `record_review` stored a `/panel` read with
-    # findings as `stopped: false` (the board shows a cycle mid-flight that nothing
-    # will advance) and one without as `stopped: true, stop_confident: true` — a
-    # confident-convergence record for a PR that had no cycle.
-    cycle_run = bool(in_cycle or prior_rounds)
 
     # ---- recurrence (#67): is this finding standing where the last fix pass was
     # working, on a complaint that pass was sent to answer?
