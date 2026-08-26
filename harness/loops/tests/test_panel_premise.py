@@ -338,7 +338,8 @@ def test_the_undecidable_brake_ships_on(repo):
     can only fire on a fixer's own explicit `no`, which cannot happen by accident, and
     its output is "stop and ask a human"."""
     assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
-        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5}
+        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5,
+        "new_findings_not_falling": 1}
     assert panel_rounds.premise_undecidable_brake(
         harness_rules.DEFAULTS["review_panel"], []) is True
 
@@ -494,7 +495,8 @@ def test_the_default_is_the_one_the_rules_file_documents():
     exact-equality would otherwise pass over is how a default drifts away from the
     file that documents it."""
     assert harness_rules.DEFAULTS["review_panel"]["escalate_on"] == {
-        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5}
+        "premise_repeated": 2, "premise_undecidable": True, "fix_injection": 0.5,
+        "new_findings_not_falling": 1}
     assert panel_rounds.premise_repeat_limit(
         harness_rules.DEFAULTS["review_panel"], []) == 2
 

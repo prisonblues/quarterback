@@ -778,7 +778,13 @@ def test_a_REBASE_leaves_the_offending_pass_unnameable_and_the_round_says_both(
     assert any("#506" in v and "NAME the offending pass" in v
                for v in r2["round_stop"]["veto"])
     rv = r2["round_stop"]["revert"]
-    assert rv["kind"] == panel_scope.FIX_RANGE_BLIND
+    # `rewritten`, not `blind`, and the difference arrived in the merge rather than
+    # here: this test was written against a three-value vocabulary and `main` has
+    # since split the rebase out of `blind` into a verdict of its own (#512). The
+    # assertion moved to the narrower value instead of being loosened to accept
+    # either, because `rewritten` is the whole of what this test is about — a
+    # `blind` range that still attributed would not leave the pass unnameable.
+    assert rv["kind"] == panel_scope.FIX_RANGE_REWRITTEN
     assert rv["range"] is None and rv["command"] is None
     assert rv["offered"] is False and r2["round_stop"]["fix_injection"]["over"] is False
     # The cost column survives the blindness, because it does not come from the range.
