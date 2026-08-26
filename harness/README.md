@@ -2251,6 +2251,14 @@ SSO for an entire estate. It is also why the delegated **agent** credential
 acting unattended and names the two endpoints it may reach, `/dials` deliberately not among
 them. Two credentials, two blast radii; an unattended agent still cannot set a dial.
 
+**Which door a dial came through is recorded**, and shown. `human/rich` is `human/rich`
+either way — a person is one author however they arrived — so the identity alone cannot tell
+a browser write from a key on a workstation, and the second is the one carrying the residual
+above. `GET /dials` returns `set_via` (`edge`, `key` or `dev`); the page draws it as a chip
+beside the author and a dial row's detail line says *"set by human/rich with a key"*. A row
+older than the column says nothing rather than guessing, because a default there would be the
+one value a reader must be able to distrust sitting in the field they consult to decide.
+
 **With no key on the host, the panel is exactly what it was** — and that is every box until
 one is deployed. `HumanClient.why_not()` is asked once per paint, the `✎` goes grey, the last
 row says why in place of the verb, and a click opens `<board>/dials/view` instead. `d` opens

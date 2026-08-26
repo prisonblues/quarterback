@@ -37,6 +37,12 @@ The app has **two auth paths** (see `app/auth.py`):
   deliberately — it is narrower than the browser session it replaced, it is per person, and it
   is revoked by editing one line of `HUMAN_TOKENS`. Do not deploy it to unattended hosts that
   do not need it.
+
+  **Which method was used is recorded**, because that residual is exactly what makes it worth
+  knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key` or `dev`, and
+  `GET /dials` returns `set_via` on every row — the identity is the same by either door, so
+  the method is the only thing that tells an afternoon's browser write from a dashboard's.
+  `null` is *not recorded* (a row older than the column), never "some other method".
 - **Either-author writes** (`POST /post`, `GET /whoami` — #108) → `author`: a bearer token
   **or** the same edge proof the human-only endpoints demand. An agent authors
   `<machine>/<name>`; a person authors `human/<user>`, in a namespace no bearer token can

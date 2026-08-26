@@ -23,7 +23,7 @@ strictly narrower than the SSO session it replaced.
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import delete, select
 
 from app.config import settings
 from app.db import async_session
@@ -155,3 +155,74 @@ async def test_the_edge_still_comes_first_and_is_unchanged(client, human_key):
         headers=edge)
     assert r.status_code == 200, r.text
     assert r.json()["dial"]["set_by"] == "human/rich"
+
+
+# ---- and HOW they proved it, recorded beside who they were ---------------------
+
+
+async def test_a_keyed_write_records_the_method_beside_the_identity(client, human_key):
+    """Same author, different event. `human/rich` either way — a person is one
+    author however they arrived — but the key sits on a workstation where anything
+    running as that user can read it (#479), and a row that recorded only `set_by`
+    could not tell that write from a browser's afterwards."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "from the dashboard",
+        "repo": REPO}, headers=keyed(human_key))
+    assert r.json()["dial"]["set_by"] == "human/rich"
+    assert r.json()["dial"]["set_via"] == "key"
+
+
+async def test_an_edge_write_records_the_edge(client, human_key):
+    """The method the key did NOT use, so the column distinguishes rather than
+    merely being populated."""
+    edge = {"Remote-User": "rich",
+            "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "held", "reason": "from a browser", "repo": REPO},
+        headers=edge)
+    assert r.json()["dial"]["set_via"] == "edge"
+
+
+async def test_the_method_survives_to_the_read(client, human_key):
+    """It is on `GET /dials`, not only in the write's own answer — the reader
+    deciding how much weight to put on a dial is looking at the list, not at the
+    response somebody else got."""
+    await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "keyed", "repo": REPO},
+        headers=keyed(human_key))
+    live = (await client.get("/dials", params={"repo": REPO},
+                             headers=LAPTOP)).json()["dials"]
+    assert [(d["dial"], d["set_via"]) for d in live] == [("tempo", "key")]
+
+
+async def test_replacing_a_dial_records_how_the_replacement_was_made(client, human_key):
+    """The row that is cleared keeps a `cleared_via` as well, because `cleared_by`
+    exists so the history of a dial's moves survives — and half a record of a move
+    is an odd place to stop."""
+    await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "first", "repo": REPO},
+        headers=keyed(human_key))
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "held", "reason": "second", "repo": REPO},
+        headers=keyed(human_key))
+    assert r.status_code == 200, r.text
+    assert [d["value"] for d in r.json()["replaced"]] == ["eager"]
+
+    async with async_session() as s:
+        rows = (await s.execute(
+            select(DialSetting).where(DialSetting.cleared_at.is_not(None)))).scalars().all()
+    assert [row.cleared_via for row in rows] == ["key"]
+
+
+async def test_a_row_older_than_the_column_says_nothing_rather_than_guessing(client):
+    """`null` is "not recorded", never "some other method". A back-filled guess
+    would put the one value a reader must be able to distrust into the column they
+    consult to decide whether to trust the row."""
+    async with async_session() as s:
+        s.add(DialSetting(repo=REPO, dial="tempo", value={"value": "eager"},
+                          reason="written before the column existed",
+                          set_by="human/rich"))
+        await s.commit()
+    live = (await client.get("/dials", params={"repo": REPO},
+                             headers=LAPTOP)).json()["dials"]
+    assert [(d["dial"], d["set_via"]) for d in live] == [("tempo", None)]

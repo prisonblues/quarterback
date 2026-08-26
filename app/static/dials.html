@@ -79,6 +79,10 @@
      the countdown is the quiet one, deliberately: a dial that expires takes itself
      off the board with nobody remembering it, and a dial with no end stays until a
      person comes and clears it. */
+  /* HOW a person proved it, which is not who they were. Quiet by construction —
+     it is provenance, not state — and only drawn when the board recorded one, so
+     a row older than the column says nothing rather than guessing. */
+  .chip.via { color:#9aa4b5; border-color:#333b49; }
   .chip.forever { color:#f0b429; border-color:#5c4a1e; }
   .chip.until { color:#9fddc7; border-color:#2e5c48; }
   .acts button { font-size:12px; min-height:32px; cursor:pointer; color:#e8a0a0;
@@ -266,6 +270,20 @@ function lifeChip(d){
     secs <= 0 ? "expiring" : "for " + left(secs)}</span>`;
 }
 
+// The identity is the same by either door — `human/rich` is `human/rich` — so
+// this says which door. A browser the edge vouched for and a key sitting on a
+// workstation are different events, and the second is the one whose residual is
+// written down (#479). Absent when the board recorded nothing, which is a row
+// older than the column and not a third kind of write.
+const VIA = {edge: "via the browser, edge-authenticated",
+             key: "via a person's key, no Authelia in the path",
+             dev: "via the local dev bypass — BROWSER_DEV_HUMAN"};
+function viaChip(d){
+  if(!d.set_via) return "";
+  return ` <span class="chip via" title="${esc(VIA[d.set_via] || d.set_via)}">${
+    esc(d.set_via)}</span>`;
+}
+
 function card(d, shadowed){
   const scope = d.scope === "fleet"
     ? `<span class="chip fleet" title="in force in every repo that has no dial of its own">fleet</span>`
@@ -280,7 +298,7 @@ function card(d, shadowed){
         ${scope}${lifeChip(d)}
       </div>
       <div class="why">${esc(d.reason || "")}</div>
-      <div class="meta">${who(d.set_by)}${d.set_at ? " · " + esc(ago(d.set_at)) + " ago" : ""}${
+      <div class="meta">${who(d.set_by)}${viaChip(d)}${d.set_at ? " · " + esc(ago(d.set_at)) + " ago" : ""}${
         shadowed ? " · overridden by this repo's own value" : ""}</div>
     </div>
     <div class="acts"><button type="button">clear</button></div>`;

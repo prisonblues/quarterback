@@ -47,6 +47,18 @@ names the two endpoints it may reach, and `/dials` is deliberately not among the
 Two credentials, two blast radii, and #479's exclusion survives intact — an
 unattended agent still cannot set a dial.
 
+### And the board records which door was used
+
+`human/rich` is `human/rich` by either method — a person is one author however they arrived —
+so the identity alone cannot tell an afternoon's browser write from a dashboard's, and the
+dashboard's is the one carrying the residual above. `dial_settings` gains `set_via` and
+`cleared_via` (`edge`, `key`, `dev`); `GET /dials` returns `set_via`; the page draws it as a
+chip beside the author, and a dial row's detail line reads *"set by human/rich with a key"*.
+
+`null` is **not recorded** — a row older than the column — and never "some other method".
+Nothing is back-filled: a guess there would be the one value a reader must be able to distrust,
+sitting in the field they consult to decide whether to trust the row.
+
 ### With no key, nothing changed
 
 Which is every box until one is deployed. `why_not()` is asked once per paint, the

@@ -89,14 +89,14 @@ import json
 import re
 from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import is_unique_violation
-from app.auth import human, reader
+from app.auth import human, human_method, reader
 from app.claimkey import BadRef, canonical_repo
 from app.db import get_session
 from app.models.dial import MAX_DIAL, MAX_REASON, DialSetting
@@ -190,6 +190,11 @@ def _view(row: DialSetting, now: datetime) -> dict:
         "repo": row.repo,
         "reason": row.reason,
         "set_by": row.set_by,
+        # HOW they proved it, beside who they were. `null` is "not recorded" — a
+        # row older than the column — and never "some other method": see the
+        # model. A reader deciding how much weight to put on a dial's provenance
+        # needs the two kept apart, which is the whole reason it is stored.
+        "set_via": row.set_via,
         "set_at": _aware(row.set_at).isoformat() if row.set_at else None,
         "expires_at": expires.isoformat() if expires else None,
         "expires_in": int((expires - now).total_seconds()) if expires else None,
@@ -263,6 +268,7 @@ async def list_dials(
 
 @router.post("/dials")
 async def set_dial(
+    request: Request,
     body: DialIn,
     editor: str = Depends(human),
     session: AsyncSession = Depends(get_session),
@@ -321,9 +327,11 @@ async def set_dial(
         await session.execute(
             update(DialSetting)
             .where(DialSetting.id.in_([p.id for p in prior]))
-            .values(cleared_at=now, cleared_by=editor))
+            .values(cleared_at=now, cleared_by=editor,
+                    cleared_via=human_method(request)))
     row = DialSetting(repo=scope, dial=dial, value={"value": body.value},
-                      reason=reason, set_by=editor, set_at=now, expires_at=expires)
+                      reason=reason, set_by=editor, set_at=now, expires_at=expires,
+                      set_via=human_method(request))
     session.add(row)
     try:
         await session.commit()
@@ -343,6 +351,7 @@ async def set_dial(
 
 @router.post("/dials/clear")
 async def clear_dial(
+    request: Request,
     body: ClearIn,
     editor: str = Depends(human),
     session: AsyncSession = Depends(get_session),
@@ -366,6 +375,7 @@ async def clear_dial(
         await session.execute(
             update(DialSetting)
             .where(DialSetting.id.in_([r.id for r in rows]))
-            .values(cleared_at=now, cleared_by=editor))
+            .values(cleared_at=now, cleared_by=editor,
+                    cleared_via=human_method(request)))
         await session.commit()
     return {"dial": dial, "repo": scope, "cleared": cleared, "by": editor}

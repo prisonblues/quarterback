@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hmac
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -46,6 +46,36 @@ EDGE_SECRET_HEADER = "X-Edge-Auth"
 #: a new header rather than a vhost change. Presenting it to the browser vhost
 #: would work too and is pointless — the edge has already said who you are there.
 HUMAN_KEY_HEADER = "X-Human-Key"
+
+#: How a person proved it, for the endpoints that record their writes.
+#:
+#: The IDENTITY is the same by either door — `human/rich` is `human/rich` — and
+#: that is deliberate: a person is one author whichever way they arrived, and
+#: splitting them would put one human in two namespaces. But "a browser the edge
+#: vouched for" and "a key on a workstation" are not the same EVENT, and the
+#: second is the one whose residual is written down in #479. A row that recorded
+#: only the identity could not tell them apart afterwards, which is precisely
+#: when somebody wants to know.
+AUTH_EDGE = "edge"      #: Remote-User + X-Edge-Auth, i.e. Authelia vouched.
+AUTH_KEY = "key"        #: a person's own X-Human-Key, no Authelia in the path.
+AUTH_DEV = "dev"        #: BROWSER_DEV_HUMAN, which is local-only and off by default.
+
+#: Where :func:`human` leaves it. On the request rather than in the return value
+#: because `human()` returns a string that four endpoints already store as an
+#: author, and widening that to a tuple would touch every one of them to serve
+#: the two that care. An endpoint that wants the method asks :func:`human_method`;
+#: one that does not is unchanged and cannot be broken by this.
+_METHOD_ATTR = "qb_auth_method"
+
+
+def human_method(request: Request) -> str | None:
+    """How the caller of a `human()`-gated endpoint proved it, or None.
+
+    None means the question was never asked — an endpoint that does not depend on
+    :func:`human`, or a caller that never reached it. It does NOT mean "some other
+    method": every path through `human()` sets one before returning.
+    """
+    return getattr(request.state, _METHOD_ATTR, None)
 
 #: Told to a caller whose ``Remote-User`` the edge did not vouch for. Shared by
 #: :func:`human` and :func:`author` because it is one boundary, not two — the
@@ -290,6 +320,7 @@ def _keyed_person(human_key: str) -> str | None:
 
 
 def human(
+    request: Request,
     authorization: str = Header(default=""),
     remote_user: str = Header(default="", alias="Remote-User"),
     edge_auth: str = Header(default="", alias=EDGE_SECRET_HEADER),
@@ -353,9 +384,17 @@ def human(
     never adjudicated against a key. And an unconfigured deployment has no human
     keys at all, which fails closed exactly as an unset ``HUMAN_EDGE_SECRET`` does.
     """
-    person = (_edge_person(remote_user, edge_auth) or _dev_person(remote_user)
-              or _keyed_person(human_key))
+    # Tried in this order and RECORDED in the same breath, so the two cannot
+    # drift: a second function working out afterwards which branch had been taken
+    # would be a second implementation of the precedence above it.
+    person = _edge_person(remote_user, edge_auth)
+    method = AUTH_EDGE
+    if person is None:
+        person, method = _dev_person(remote_user), AUTH_DEV
+    if person is None:
+        person, method = _keyed_person(human_key), AUTH_KEY
     if person is not None:
+        setattr(request.state, _METHOD_ATTR, method)
         return _as_person(person)
     if human_key:
         # Presented and wrong: say so rather than falling through to a message

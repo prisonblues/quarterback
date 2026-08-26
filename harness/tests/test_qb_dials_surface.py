@@ -574,3 +574,19 @@ def test_a_duration_too_large_to_be_one_is_refused_rather_than_overflowing(text)
 def test_the_durations_a_person_actually_types_still_work():
     for text in ("30m", "4h", "7d", "999999d"):
         assert qd.parse_dial_expiry(text) is not None
+
+
+def test_the_detail_says_which_door_the_dial_came_through():
+    """The identity is the same by either method, so the detail line carries the
+    other half: a browser the edge vouched for, or a key on a workstation (#479)."""
+    said = qd.dial_detail(dial(set_by="human/rich") | {"set_via": "key"})
+    assert "with a key" in said, said
+    assert "in a browser" in qd.dial_detail(dial() | {"set_via": "edge"})
+
+
+def test_a_dial_older_than_the_column_does_not_invent_a_method():
+    """Absent is left out rather than guessed at — the same rule the board keeps
+    for the column itself."""
+    said = qd.dial_detail(dial(set_by="human/rich"))
+    assert "with a key" not in said and "in a browser" not in said
+    assert "human/rich" in said
