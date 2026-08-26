@@ -28,6 +28,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -1919,6 +1920,156 @@ def test_a_queue_entry_that_arrived_in_the_future_is_not_evidence_of_health(
     assert "no usable arrival time" in check.detail
 
 
+# ------------------------------------------------------------ escalations
+
+
+def _ago(minutes: float) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+def _board_paths(monkeypatch, answers: dict[str, tuple[int, str]]) -> None:
+    """Answer several DIFFERENT board GETs, chosen by a marker in the path.
+
+    `check_escalations` makes two — `/board?type=stuck` and `/blockers` — and a stub
+    that answered both with one body would have the row counting posts as rows and
+    still passing, which is a test asserting its own fixture. Same reasoning as
+    `_gh_answers`, and the same failure it was written to prevent.
+    """
+    def fake(url, headers=None):
+        # The PATH, not the url: `https://board.example/blockers` contains "/board"
+        # — because "https://" ends in a slash — so a substring match answered the
+        # blockers call with the posts body and the row read posts as rows.
+        path = urlsplit(url).path
+        for marker, (status, body) in answers.items():
+            if path.startswith(marker):
+                return status, body if isinstance(body, str) else json.dumps(body), None
+        raise AssertionError(f"no stub for board GET: {url}")
+
+    monkeypatch.setattr(qd, "http_get", fake)
+
+
+def _stuck(n: int) -> tuple[int, dict]:
+    return 200, {"posts": [{"id": i, "type": "stuck"} for i in range(n)]}
+
+
+def _stored(*ages: float) -> tuple[int, dict]:
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a)}
+                              for i, a in enumerate(ages)]}
+
+
+def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
+    """The whole point of the row. #328 landed a table and no producer, twice-over the
+    same shape as the `stuck` type that measured zero across thirty days — and neither
+    was visible, because an empty table and a working table with nothing in it are the
+    same table. Only the second source makes it a finding."""
+    _board_paths(monkeypatch, {"/board": _stuck(4), "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert "4 stuck post(s)" in check.detail
+    assert check.extra["posts"] == 4 and check.extra["rows"] == 0
+
+
+def test_a_quiet_day_is_not_a_severed_producer(monkeypatch, landing_host):
+    """"Do not fail on irrelevance." No escalations and no rows is the correct state of
+    a day nobody got stuck, and a row that called that a fault would be ignored on every
+    good day until it was ignored on the bad one."""
+    _board_paths(monkeypatch, {"/board": _stuck(0), "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "quiet day" in check.detail
+
+
+def test_fewer_rows_than_posts_is_the_designed_behaviour_and_not_a_finding(
+        monkeypatch, landing_host):
+    """An escalation whose refs name no subject is announced and deliberately NOT
+    stored (#523), so posts > rows is by design. A proportional test here would fail on
+    correct data, which is why the predicate is any-versus-none."""
+    _board_paths(monkeypatch, {"/board": _stuck(5), "/blockers": _stored(10)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra == {"posts": 5, "rows": 1, "window_minutes": 1440}
+
+
+def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
+    """A person can raise one by hand, and an unanswered blocker outlives the window
+    the posts are counted over."""
+    _board_paths(monkeypatch, {"/board": _stuck(0), "/blockers": _stored(30, 200)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+
+
+def test_rows_older_than_the_window_do_not_answer_for_todays_stuck(
+        monkeypatch, landing_host):
+    """The two counts have to describe the same span. A table full of last month's
+    blockers would otherwise vouch for a producer that has been severed since."""
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": _stored(4000, 9000)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["rows"] == 0
+
+
+def test_a_row_raised_in_the_future_is_not_evidence_of_health(monkeypatch, landing_host):
+    """Clock skew or bad data. `_age_minutes` returns it negative rather than clamping,
+    and this row discards it — the same rule the queue row applies to arrivals."""
+    _board_paths(monkeypatch, {"/board": _stuck(2), "/blockers": _stored(-90)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+
+
+def test_a_board_without_blockers_deployed_has_not_severed_anything(
+        monkeypatch, landing_host):
+    """An image predating #328 is a deploy that has not happened, not a producer that
+    has broken, and the two want different sentences. Never `fail`."""
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": (404, "")})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "before #328" in check.detail
+    assert "redeploy" in check.manual
+
+
+@pytest.mark.parametrize("answers, phrase", [
+    ({"/board": (500, "")}, "answered 500"),
+    ({"/board": (200, "not json")}, "did not answer JSON"),
+    ({"/board": (200, {"posts": "several"})}, "no list of stuck posts"),
+    ({"/board": _stuck(1), "/blockers": (200, {"blockers": 7})}, "no list of blockers"),
+])
+def test_a_board_that_will_not_state_it_is_unknown_and_never_ok(
+        monkeypatch, landing_host, answers, phrase):
+    """Every way the board can answer uselessly reaches `unknown`. A row that could
+    reach `ok` without having been answered is worse than no row."""
+    _board_paths(monkeypatch, answers)
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+def test_the_finding_names_no_command_that_backfills_the_table(landing_host):
+    """The row measures whether the producer works. Writing rows by hand clears the
+    verdict, leaves every future escalation just as unrecorded, and destroys the only
+    evidence — the same argument the `landed` row makes against merging to go green."""
+    spec = next(s for s in qd.CHECKS if s.name == "escalations")
+    brief = spec.briefs["fail"]
+
+    assert "Do not write rows by hand" in brief.constraints[0]
+    assert brief.audience == "agent"
+
+
 # ----------------------------------------------------------------- landed
 
 _COMMIT = "repos/acme/thing/commits/main"
@@ -2507,7 +2658,8 @@ def test_the_real_tagger_answers_the_argv_this_row_sends_it(landing_repo):
 def test_the_landing_group_holds_every_row_that_answers_can_work_land():
     names = {spec.name for spec in qd.CHECKS if spec.group == "landing"}
 
-    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper", "briefs"}
+    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper",
+                     "briefs", "escalations"}
 
 
 def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, tmp_path,
