@@ -413,6 +413,11 @@ def _payload_defaults() -> dict:
         # round to attribute against. All-zero is a different statement: a round
         # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
+        # #490's cross-round rows. Empty on every path that reviewed nothing, and
+        # that costs a later round nothing: the block is rebuilt from the raw
+        # per-round fields of every baseline, so a skipped round leaves a row that
+        # says "not reviewed" rather than a hole.
+        "cycle_trend": [],
         # #67's tally, on the same terms and empty where the same question does
         # not arise. Two objects rather than one: `recurrence_counts` is what the
         # panel MEASURED and `premise_counts` is what the judge SAID, and the whole
@@ -504,6 +509,165 @@ def _rounds_phrase(rounds: list[int]) -> str:
     a quiet round is not convergence — so it is one of the more closely-read lines
     the tool emits, and ``round 1, 2`` reads as a typo in it."""
     return f"round{'s' if len(rounds) > 1 else ''} {', '.join(str(r) for r in rounds)}"
+
+
+#: The trend block's columns, in order, with the header each one prints under.
+#: A header row rather than a unit repeated in every cell ("14 findings", "9
+#: introduced"): this block is competing for space in a report that is already
+#: dense, and the round cap means most cycles show two data rows — under which a
+#: word repeated per row costs more width than the whole header does.
+#:
+#: **There is deliberately no density column here, and adding one needs an
+#: argument this comment does not have** (#490). While reading the cycle this block
+#: exists for, a reporter computed findings-per-10k-chars by hand and got 9.46 ->
+#: 7.97 -> 4.82: a number that falls every round, reads as steady improvement, and
+#: was describing a cycle that was diverging. It falls because the denominator is
+#: growing, which is the failure, not evidence against it. Any per-size figure
+#: added here must therefore sit beside BOTH the absolute count and the growth
+#: ratio, so that a reader cannot take it on its own — and the safest version, the
+#: one this is, adds none at all. `test_panel_trend.py` pins the absence.
+TREND_COLUMNS = ("round", "findings", "P1/P2", "introduced", "whole PR")
+
+
+def _trend_cells(row: RoundTrend) -> list[str]:
+    """One trend row as its printable cells, before they are padded to a width.
+
+    Every unknown prints as a mark rather than as a number, and the two marks are
+    different on purpose. ``—`` is "the question does not arise" — round 1 has no
+    earlier fix pass to have introduced anything — and ``?`` is "it was asked and
+    could not be answered", which is a round whose fix range was unreadable, or a
+    payload too old to record the size. Collapsed into one mark, a cycle whose
+    attribution was silently broken for two rounds reads exactly like a cycle whose
+    rounds had nothing to attribute.
+    """
+    if not row.reviewed:
+        # A skipped or refused round measured nothing, and every cell after the
+        # round number would be a fabrication. Said in words rather than as four
+        # `?`s, because "this round did not happen" is a different fact from "this
+        # round's numbers did not survive" and the reader needs it at a glance.
+        # Two words that fit under the `findings` header, so one skipped round in a
+        # cycle cannot widen the column every other row is read down.
+        return [f"r{row.round}", "not run", "", "", ""]
+    n, severe = row.findings, row.p1p2
+    if row.introduced is None:
+        # `—` only where the question genuinely does not arise. Round 1 is the whole
+        # of that case: provenance is computed against the round BEFORE, so every
+        # later round was asked, and a None there is a measurement that failed.
+        got = "—" if row.round == 1 else "?"
+    elif n:
+        # The percentage is of THIS round's findings, which is the denominator that
+        # cannot run away: the count and the share move together, so a round that
+        # is mostly self-inflicted says so however few findings it has.
+        got = f"{row.introduced} ({round(row.introduced * 100 / n)}%)"
+    else:
+        # No findings at all, so there is no share to take — and `0 (0%)` would be
+        # a division this block never performs rather than a measurement.
+        got = f"{row.introduced}"
+    size = f"{row.pr_chars:,}" if row.pr_chars is not None else "?"
+    return [f"r{row.round}", f"{n}", f"{severe}", got, size]
+
+
+def _trend_growth(row: RoundTrend, first_chars: int | None) -> str:
+    """The growth column: this round's whole-PR size over the size the cycle's
+    FIRST reviewed round found it at.
+
+    The denominator is `Baseline.first_reviewed`'s and nothing else, so this ratio
+    and `max_fix_growth`'s veto line are the same measurement (#165, #298) — a
+    report carrying two ratios computed from two denominators is worse than one
+    carrying none, because a reader has no way to tell which one the ceiling is
+    about to fire on. Where that denominator is missing the ceiling does not run
+    either, and this column says `?` rather than picking a substitute.
+    """
+    if not row.reviewed:
+        # Blank, not `?`: a round that reviewed nothing has no size to be a multiple
+        # of anything, and `?` would say the measurement was attempted and lost. Its
+        # own `findings` cell already says `not run` in words.
+        return ""
+    if first_chars is None or row.pr_chars is None:
+        return "?"
+    return f"{row.pr_chars / first_chars:.2f}x"
+
+
+def _trend_record(row: RoundTrend, first_chars: int | None) -> dict:
+    """One trend row as the PAYLOAD carries it (#490).
+
+    The ratio is stored as well as the two sizes it came from, because the
+    denominator is not this row's — it is the cycle's first reviewed round's — and a
+    consumer that recomputed it from the rows would have to re-derive
+    `Baseline.first_reviewed`'s rule to get the same number. The report and the
+    payload therefore quote one arithmetic, which is the property the block is worth
+    having at all.
+
+    Rounded to 3 places to match `round_stop`'s `fix_growth.ratio`, which is the
+    same quantity for this round's row and would otherwise differ from it in the
+    tail digits of a float.
+    """
+    return {"round": row.round, "reviewed": row.reviewed,
+            "findings": row.findings, "p1p2": row.p1p2,
+            "introduced": row.introduced, "pr_chars": row.pr_chars,
+            "growth": (round(row.pr_chars / first_chars, 3)
+                       if first_chars and row.reviewed and row.pr_chars is not None
+                       else None)}
+
+
+def cycle_trend_lines(rows: list[RoundTrend],
+                      first_reviewed: tuple[int, int, str] | None) -> list[str]:
+    """#490's block: every round of this cycle, side by side.
+
+    Every round's report states that round's own figures and nothing else, so the
+    reader has to hold three reports in their head to see which way the cycle is
+    going — and read one at a time, a diverging cycle looks flat. 8 -> 14 -> 15
+    findings reads as converging; against a PR that tripled on an underlying change
+    of 113 lines it is the opposite reading, and it was available from data every
+    round already had. On the cycle that produced this, three rounds ran before
+    anyone did the arithmetic.
+
+    **Reporting only.** Nothing here is consulted by `round_stop`, by any ceiling in
+    `panel_caps`, or by the fixer's brief; it cannot end a cycle and it cannot buy
+    one another round. That is deliberate and separable from #489, which proposes
+    the gate: chaining a cheap, uncontroversial reporting improvement to a policy
+    argument is how the cheap half waits on the expensive one.
+
+    Empty for anything under two rows, which is where the block has nothing to say —
+    a single round beside itself is the report the reader already has.
+    """
+    if len(rows) < 2:
+        return []
+    first_round, first_chars = (first_reviewed[0], first_reviewed[1]) if first_reviewed \
+        else (rows[0].round, None)
+    # The growth column names its own denominator, so a reader can see WHICH round
+    # the multiples are against without counting rows — a cycle whose round 1 was
+    # skipped measures from round 2 and would otherwise silently mean something else.
+    # Where there is no denominator every cell is `?`, and a header still claiming
+    # `vs r1` would name a comparison that is not being made.
+    header = [*TREND_COLUMNS, f"vs r{first_round}" if first_chars else "growth"]
+    body = [[*_trend_cells(r), _trend_growth(r, first_chars)] for r in rows]
+    # Right-aligned, header included in the width, so the numbers line up under
+    # their own labels — the whole value of the block is that a column can be read
+    # down, and a ragged column cannot.
+    width = [max(len(r[i]) for r in (header, *body)) for i in range(len(header))]
+    # The leading blank line is load-bearing markdown, not spacing. Everything
+    # directly above this block is a `  - ` bullet, and a paragraph starting at
+    # column 0 straight after one is a LAZY CONTINUATION of that list item in GFM —
+    # which would indent the fence under the bullet and render the table inside it.
+    out = ["",
+           "**Cycle so far** — every round of this cycle beside the others, because "
+           "a round's own figures cannot show which way the cycle is going:", "",
+           "```"]
+    out += ["  ".join(c.rjust(w) for c, w in zip(r, width)).rstrip()
+            for r in (header, *body)]
+    out += ["```", ""]
+    # The one sentence of guidance, and it is about the pair rather than about any
+    # single column: findings that hold steady while the PR grows are the reading
+    # this block exists to make visible, and a reader who takes the finding count
+    # alone gets the same wrong answer the block was built to prevent.
+    out.append("Read the counts and the size TOGETHER — a finding count that holds "
+               "while the PR grows is not convergence, and `introduced` is the share "
+               "of each round's findings that the fix pass before it wrote. "
+               "`—` is a question that does not arise; `?` is one that could not be "
+               "answered.")
+    out.append("")
+    return out
 
 
 def _veto_gist(text: str, limit: int = 80) -> str:
@@ -2592,6 +2756,50 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     tally = Counter(provenance_of(c) for c in outstanding)
     provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
 
+    # ---- #490: this round's own row of the cross-round trend block, and the earlier
+    # rounds' rows beside it.
+    #
+    # REPORTING ONLY. Nothing below this line is read by `round_stop`, by any ceiling
+    # in `panel_caps`, or by the fixer's brief — it cannot stop a cycle and cannot buy
+    # one another round. #489 proposes the gate; this is deliberately separable from
+    # it, because a cheap reporting improvement chained to a policy argument waits on
+    # the policy argument.
+    #
+    # This round's row is built HERE rather than in the report, from the same
+    # variables the report's own counts come from (`outstanding`, `provenance_counts`,
+    # `review.diff`), so the block's last line cannot disagree with the summary two
+    # lines above it about how many findings this round has.
+    #
+    # No filter here for a baseline claiming THIS round or a later one, and that is a
+    # deliberate non-guard rather than an oversight: `load_baseline` already refuses
+    # such a payload outright — "is round N, which is not earlier than this run's
+    # round N" — and both call sites hand it this run's `round_no`, so no such row can
+    # reach `prior.trend` and its findings are not counted as an earlier round either.
+    # A second filter would be unreachable code carrying a config note that can never
+    # fire, which reads to the next person as a case somebody has actually seen.
+    #
+    # The denominator, once, for the block and for the payload alike — and it is
+    # `max_fix_growth`'s own (`Baseline.first_reviewed`, #298), never "the first row
+    # that happens to carry a size". A report that printed two growth ratios from two
+    # denominators would be worse than one that printed none: a reader has no way to
+    # tell which of them the ceiling is about to fire on.
+    trend_first_chars = prior.first_reviewed[1] if prior.first_reviewed else None
+    trend_rows = [*prior.trend,
+                  RoundTrend(round=round_no, reviewed=True,
+                             findings=len(outstanding),
+                             p1p2=sum(1 for c in outstanding
+                                      if severity_at_least(c.severity, TREND_SEVERE)),
+                             # `provenance_counts`, not the raw tally: `attributed`
+                             # has to see the same object a LATER round will read back
+                             # out of this payload, or this round's row and its own row
+                             # one round later would answer differently.
+                             introduced=(provenance_counts.get("introduced")
+                                         if attributed(provenance_counts) else None),
+                             # The whole PR, whatever this round reviewed (#298) —
+                             # `review.diff`, which is what `pr_chars` records below
+                             # and what `max_fix_growth` measures.
+                             pr_chars=len(review.diff))]
+
     # ---- recurrence (#67): is this finding standing where the last fix pass was
     # working, on a complaint that pass was sent to answer?
     #
@@ -2910,6 +3118,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # three files and a resolution order.
         "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
+        # #490's block as data, so a board or an orchestrator reading the payload
+        # gets the trend without re-deriving it from every earlier round's file.
+        # One row per round INCLUDING this one, and rebuilt from the raw per-round
+        # fields every round rather than chained from the last round's copy — a
+        # cycle with a skipped round, or one that spans the release that added this,
+        # still gets a complete block instead of a tail.
+        # Gated on there being a CYCLE, exactly as the report's Rounds block and
+        # `new_findings` are: a review-only run has no cycle, so a "cycle trend"
+        # carrying its single row is a claim about a loop nobody is running.
+        "cycle_trend": ([_trend_record(t, trend_first_chars) for t in trend_rows]
+                        if cycle_run else []),
         "recurrence_counts": recurrence_counts,
         "premise_counts": premise_counts,
         "skipped": result.skipped,
@@ -3108,6 +3327,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          + f", {mc.get('separate', 0)} separate defects. A fix that "
                            "patches a wrong assumption produces the next round's "
                            "findings; one that removes it does not.")
+        # #490, and the last thing in this block on purpose: everything above is
+        # THIS round, and this is the cycle. A reader who stops at the round summary
+        # has the report they always had; a reader who does not gets the arithmetic
+        # that took ninety seconds by hand on the cycle this came from.
+        #
+        # It cannot stop anything and nothing consults it — see `cycle_trend_lines`.
+        lines.extend(cycle_trend_lines(trend_rows, prior.first_reviewed))
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "blocked": "🚧 gated — a run exists and will not execute without a human",
               "none": "🚫 no run exists for this commit",

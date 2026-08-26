@@ -1654,6 +1654,55 @@ Its known biases, since the defence of a heuristic is that they are written down
   — SonarCloud's new-code view — so the same reading holds; a Sonar issue that predates the PR
   would read `missed`, and that is the scanner's file scope rather than the panel's under-reading.
 
+### The cycle so far (#490): every round beside the others
+
+Every round's report used to state that round's own figures and nothing else, so a reader — human
+or orchestrator — had to hold three reports in their head and do the arithmetic to see which way a
+cycle was going. Read one at a time, a diverging cycle looks flat. This is the block that puts the
+rounds side by side, from round 2 onward:
+
+```
+round  findings  P1/P2  introduced  whole PR  vs r1
+   r1         8      2           —   113,402  1.00x
+   r2        14      5     9 (64%)   236,187  2.08x
+   r3        15      4    13 (87%)   340,341  3.00x
+```
+
+8 → 14 → 15 findings reads as converging. Against a PR that tripled on an underlying change of 113
+lines it is the opposite reading, and it was available from data every round already had — the
+cycle this comes from ran to its end before anyone computed it.
+
+| column | what it is |
+|---|---|
+| `findings` | that round's `to_fix` + `sonar_findings`, the population `outstanding` counts. `dismissed` is out: the master ruled those not real and no fixer will ever touch them |
+| `P1/P2` | how many of them were at or above P2. An unreadable severity counts as severe, which is `severity_at_least`'s standing asymmetry — a row that under-states severity is a row that argues for another round |
+| `introduced` | that round's `provenance_counts["introduced"]`, and its share of that round's own findings. `—` is round 1, where the question does not arise; `?` is a round that was asked and could not answer (no readable fix range) — never `0`, which would be a bolded claim about a fix pass made from a measurement that failed |
+| `whole PR` | `pr_chars`, the size of the **whole PR** whatever that round reviewed (#298). Never `diff_chars`, which under `increment` scope is one fix commit and would show the change shrinking exactly while it grows |
+| `vs rN` | that size over the size the cycle's **first reviewed round** found the PR at — `Baseline.first_reviewed`, which is `max_fix_growth`'s own denominator. One denominator, so the block's ratio and the ceiling's veto line are the same measurement; where it is missing the ceiling does not run either and the column says `?` rather than picking a substitute |
+
+A round that reviewed nothing (a title skip, a pre-flight refusal) prints `not run` and no numbers:
+`0 findings` there would put the strongest convergence signal the block can show against a round
+that never happened.
+
+**There is deliberately no density metric, and adding one takes an argument.** While reading the
+cycle above by hand the reporter computed findings-per-10k-chars and got **9.46 → 7.97 → 4.82** — a
+number that falls every round, reads as steady improvement, and is describing a cycle that was
+diverging. It falls because the denominator is growing, which is the failure rather than evidence
+against it. Any per-size figure added here must sit beside **both** the absolute count and the
+growth ratio, or it will mislead in exactly the case the block exists to expose;
+`tests/test_panel_trend.py` asserts the rendered rows whole and pins the absence.
+
+**It is reporting and nothing else.** No dial, no gate, nothing that can end a cycle: `round_stop`
+does not read it, no ceiling in `panel_caps` reads it, and it does not reach the fixer's brief. It
+is worth having whether or not the injection-rate stop of #489 is ever wired to `round_stop`, and
+chaining a cheap reporting improvement to a policy argument is how the cheap half waits on the
+expensive one.
+
+The rows are rebuilt from each baseline's **raw** per-round fields every round — the finding
+buckets, `provenance_counts`, `pr_chars` — never chained from an earlier round's computed copy. So
+a cycle with a skipped round in the middle, or one spanning the release that added this, still gets
+a complete block instead of a tail.
+
 ### Recurrence (#67): is the loop making progress on this defect?
 
 `provenance` asks whether the last fix pass *wrote the line* a finding sits on. `recurrence` asks
@@ -1705,6 +1754,7 @@ Run-level fields it depends on:
 | `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
+| `cycle_trend` | **#490.** The cross-round block as data — one object per round of the cycle *including this one*: `round`, `reviewed`, `findings`, `p1p2`, `introduced`, `pr_chars`, `growth`. Every count is nullable and none defaults to 0, because "did not measure" and "measured zero" are opposite readings and this block exists to stop that confusion. `growth` is stored rather than left to be recomputed, since its denominator is the cycle's first reviewed round's size and not this row's. `[]` outside a cycle, on the same rule `new_findings` and `round_stop` use |
 | `recurrence_counts`, `premise_counts` | **#67.** The two tallies over the same population, on exactly `provenance_counts`' terms (`{}` = the question does not arise; all-zero = it was asked and there was nothing). Two objects rather than one, because the whole value of asking twice is that they can disagree. `premise_counts` carries a `not-said` bucket — the judge having nothing to say is the commonest answer, and a shortfall against a denominator stored elsewhere would invent it |
 
 A baseline written before v2.24 carries no `head_sha`, so provenance degrades to `unknown` rather

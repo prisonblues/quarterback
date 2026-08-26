@@ -863,6 +863,141 @@ def _same_words(a: str, b: str) -> bool:
     return words(a) == words(b)
 
 
+#: The severity band the cross-round block counts separately (#490). Two, not a
+#: full histogram: the question a reader of that block is asking is "is this cycle
+#: producing WORSE findings or merely more of them", and P1/P2 against the total is
+#: the cheapest split that answers it. It is also the band `round_trigger_floor`
+#: defaults to, so the count is the one that decides whether a round buys another.
+TREND_SEVERE = "P2"
+
+
+@dataclass
+class RoundTrend:
+    """One earlier round as the cross-round trend block reads it (#490).
+
+    A round's own report states that round's figures and nothing else, and read one
+    at a time a diverging cycle looks flat: 8 -> 14 -> 15 findings reads as
+    converging right up until you notice the PR tripled underneath it. This is the
+    row that puts the rounds beside each other.
+
+    **Derived fresh from each baseline payload, never chained.** Every field here is
+    read off fields the payload has recorded since long before this block existed —
+    the finding buckets, ``provenance_counts``, ``pr_chars`` — so a cycle whose
+    round 2 was skipped, or was run by a panel too old to emit a trend at all, still
+    gets a complete block in round 3. Carrying a round's *computed* trend forward in
+    its payload would have made the block only as long as its unbroken tail.
+
+    Every count is nullable and none of them is defaulted to zero, because a round
+    that did not measure something and a round that measured zero of it are opposite
+    readings and this block exists to stop exactly that confusion. A skipped round
+    reviewed nothing, so it has no finding count — printing ``0 findings`` for it
+    would put the strongest possible convergence signal in the block on the strength
+    of a round that never ran.
+    """
+
+    #: Which round this row is. From the payload's own ``round``, so a set of
+    #: baselines with a gap in it renders the gap rather than renumbering.
+    round: int
+    #: Did that round review anything at all? Everything below is None when it did
+    #: not — see the class docstring on why that is not zero.
+    reviewed: bool
+    #: Everything the round left the cycle to clear: ``to_fix`` + ``sonar_findings``,
+    #: which is exactly the population :data:`panel.outstanding` counts on this run.
+    #: ``dismissed`` is deliberately out — the master ruled those not real and no
+    #: fixer will ever touch them, so counting them would inflate every row by the
+    #: judge's own work.
+    findings: int | None = None
+    #: How many of those were P1 or P2 (:data:`TREND_SEVERE`). An unreadable
+    #: severity counts as severe, which is :func:`panel_core.severity_at_least`'s
+    #: standing asymmetry and the right direction here too: a row that under-states
+    #: severity is a row that argues for another round.
+    p1p2: int | None = None
+    #: How many of that round's findings the round before it INTRODUCED — its
+    #: ``provenance_counts["introduced"]``.
+    #:
+    #: None, not 0, wherever the round could not attribute: round 1 (there is no
+    #: earlier fix pass), and any round whose only populated bucket is ``unknown``
+    #: (no readable fix range). ``0 introduced`` there is a claim about a fix pass
+    #: made from a measurement that failed, and it is the flattering direction —
+    #: the same trap :func:`attributed` is factored out to keep this block and the
+    #: report's `of those:` line on one answer about.
+    introduced: int | None = None
+    #: The size of the WHOLE PR when that round read it (:func:`_whole_pr_chars`),
+    #: never the round's review target: under ``increment`` scope the target is one
+    #: fix commit, and a size column that cliffs at round 2 would show the change
+    #: shrinking while it grows. The same number ``max_fix_growth`` measures (#298).
+    pr_chars: int | None = None
+
+
+def attributed(counts: object) -> bool:
+    """Did a round's ``provenance_counts`` actually PLACE anything?
+
+    One predicate for the report's `of those:` line and for #490's trend block,
+    because the two would otherwise answer it differently in the one case that
+    matters. An all-``unknown`` tally means the fix range was unreadable — no
+    commit recorded, a rewritten branch, an API refusal — and every bucket that
+    says something about the fix pass is therefore 0 by failure rather than by
+    measurement. Rendered as a number it reads "**0 introduced**", which is a
+    bolded claim about the fix pass and a false one.
+
+    ``{}`` is the other false state and is covered by the same test: it is the
+    shape for a round where the question does not arise at all (round 1, or no
+    cycle), and there is nothing there to report either.
+
+    Defensive about its argument for `load_baseline`'s standing reason — this is
+    read off a payload that may have been hand-edited or written by another
+    version — and it reads only the buckets :data:`panel_scope.PROVENANCE` names,
+    so a stray key cannot make an unattributable round look attributed.
+    """
+    if not isinstance(counts, dict):
+        return False
+    return any(_nonneg_int(counts.get(b)) for b in PROVENANCE if b != "unknown")
+
+
+def _nonneg_int(value: object) -> int | None:
+    """A count a payload can be believed about, or None.
+
+    :func:`_positive_int`'s sibling, and separate because the two admit different
+    numbers for good reasons: a SIZE of 0 cannot be a denominator, while a COUNT of
+    0 is the most interesting reading in the trend block ("nothing was introduced").
+    Same refusals otherwise — a bool is an `int` in Python, and a float or a string
+    arrives from a hand-edited payload.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _trend_row(was: int, payload: dict) -> RoundTrend:
+    """Read one accepted baseline as a :class:`RoundTrend` row.
+
+    Every read here degrades to None rather than raising or guessing, on
+    :func:`load_baseline`'s standing rule that a bad payload costs a row's cell and
+    never the review: this block is a reporting nicety and must never be the reason
+    a round does not run.
+    """
+    reviewed = bool(payload.get("reviewed"))
+    findings = p1p2 = None
+    if reviewed:
+        # `dismissed` is not here — see `RoundTrend.findings`.
+        raised = [f for bucket in ("to_fix", "sonar_findings")
+                  for f in (payload.get(bucket) or []) if isinstance(f, dict)]
+        findings = len(raised)
+        p1p2 = sum(1 for f in raised
+                   if severity_at_least(f.get("severity"), TREND_SEVERE))
+    counts = payload.get("provenance_counts")
+    return RoundTrend(
+        round=was, reviewed=reviewed, findings=findings, p1p2=p1p2,
+        introduced=(_nonneg_int(counts.get("introduced"))
+                    if attributed(counts) else None),
+        # Gated on `reviewed` as well as on the field: a skipped round records
+        # `pr_chars: 0` by default and `_positive_int` already refuses that, but a
+        # refused round records the size of a PR it then did not review — and a
+        # growth ratio computed from a round nobody read is a measurement of
+        # nothing. `first_reviewed` beside it takes the same view (#298).
+        pr_chars=_whole_pr_chars(payload) if reviewed else None)
+
+
 @dataclass
 class Baseline:
     """What earlier rounds of THIS PR already raised."""
@@ -1039,6 +1174,15 @@ class Baseline:
     #: `diff_chars` is a fix commit and cannot stand in for the PR. The check then
     #: does not run, and says so rather than inventing a denominator.
     first_reviewed: tuple[int, int, str] | None = None
+    #: One :class:`RoundTrend` per ACCEPTED baseline, in round order — the earlier
+    #: half of #490's cross-round block. This round appends its own row and renders
+    #: the lot; nothing here decides anything.
+    #:
+    #: It is a list and not a dict keyed by round because a set of baselines can
+    #: legitimately hold two payloads for one round (`problems` says so where it is
+    #: detected), and collapsing them here would silently pick one — in the one
+    #: block whose whole job is to show the reader every round there was.
+    trend: list[RoundTrend] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
     def raised_before(self, finding: Canonical) -> bool:
@@ -1623,6 +1767,11 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             # report prints the measurement so a reader can check that rather than
             # take it on trust.
             b.first_reviewed = (first_round, chars, "pr")
+        # #490's rows, off the SAME accepted, cycle-checked, round-ordered set
+        # everything above is read from — a baseline this run refused as belonging
+        # to another cycle must not appear in the block either, or the reader is
+        # shown a trend across two PRs' worth of rounds.
+        b.trend = [_trend_row(was, payload) for was, _path, payload in ordered]
     return b
 
 
@@ -2836,7 +2985,8 @@ __all__ = [
     "MAX_RECURRENCE_FINDINGS", "RECURRENCE_TITLE_CHARS", "recurrence_brief",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
     "Baseline", "_baseline_title", "_SHA_RE", "_mtime",
-    "_positive_int", "_whole_pr_chars",
+    "_positive_int", "_nonneg_int", "_whole_pr_chars",
+    "TREND_SEVERE", "RoundTrend", "attributed", "_trend_row",
     "load_baseline", "coverage_veto", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
