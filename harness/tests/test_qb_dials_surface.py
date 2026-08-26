@@ -493,3 +493,78 @@ def test_a_dial_with_no_argument_is_refused_by_the_client_too():
     client.post = lambda path, body: pytest.fail("a request went out with no reason")
     with pytest.raises(RuntimeError, match="reason"):
         client.set_dial("tempo", "eager", "   ")
+
+
+# ---- the four a second opinion found ------------------------------------------
+#
+# Each of these was live on the first cut of the write path and each was found by
+# `codex` reading the diff. They are kept as tests rather than as a changelog line
+# because every one of them is a silent failure: two are wrong values written
+# without complaint, one is a credential on a screen, and one is a crash inside a
+# UI callback.
+
+def test_a_board_refusal_is_not_retried_with_a_fresh_session():
+    """The retry is safe only because it is narrow. Deciding from the rendered
+    SENTENCE got it exactly backwards: the sentence for a board refusal names
+    `HUMAN_EDGE_SECRET` and never contains the string `X-Edge-Auth`, so the one
+    case that must never be retried was the one case that always was — with an
+    `op` unlock prompt in front of it, to be refused identically a second time."""
+    board = "HUMAN_EDGE_SECRET is unset"
+    assert qd.HumanClient._stale_session(403, board) is False
+    assert "HUMAN_EDGE_SECRET" in qd.HumanClient._refusal(403, board)
+
+
+@pytest.mark.parametrize("code,body,stale", [
+    (302, "", True),                       # forward-auth bouncing to sign-in
+    (401, "", True),                       # the proxy, which names nothing
+    (403, "", True),
+    (403, "X-Edge-Auth missing", False),   # the board, naming its own mechanism
+    (403, "HUMAN_EDGE_SECRET unset", False),
+    (500, "", False),                      # not an auth answer at all
+])
+def test_only_a_signed_out_session_is_worth_reading_again(code, body, stale):
+    assert qd.HumanClient._stale_session(code, body) is stale
+
+
+def test_a_session_that_cannot_be_a_header_is_refused_without_being_quoted():
+    """`http.client.putheader` refuses CR/LF by raising `Invalid header value
+    b'<the entire secret>'`, and this dashboard turns exceptions into sentences on
+    its detail line. A credential in a UI string is a credential in a screenshot,
+    a scrollback and a tmux buffer."""
+    client = human(cmd=r"printf 'session=SUPERSECRET\r\nX-Evil: 1'")
+    with pytest.raises(RuntimeError) as caught:
+        client.cookie()
+    said = str(caught.value)
+    assert "SUPERSECRET" not in said, said
+    assert "not usable as a header" in said and "on purpose" in said
+
+
+def test_a_trailing_newline_in_the_vault_field_is_survivable_not_fatal():
+    """The ordinary way to arrive at the check above: `op read` strips one newline
+    and a pasted field may hold two. Stripped rather than refused, or the first
+    person to use this feature is debugging their vault instead."""
+    assert human(cmd="printf 'session=abc\\n\\n'").cookie() == "session=abc"
+
+
+@pytest.mark.parametrize("text", ["99999999999999999999d", "1234567d"])
+def test_a_duration_too_large_to_be_one_is_refused_rather_than_overflowing(text):
+    """`timedelta` raises OverflowError, not ValueError, past about 2.7 million
+    days — so an unbounded regex hands a UI callback that catches the documented
+    failure a crash instead."""
+    with pytest.raises(ValueError, match="not a duration"):
+        qd.parse_dial_expiry(text)
+
+
+def test_the_durations_a_person_actually_types_still_work():
+    for text in ("30m", "4h", "7d", "999999d"):
+        assert qd.parse_dial_expiry(text) is not None
+
+
+def test_a_literal_session_goes_through_the_same_check_as_a_read_one():
+    """A config file and an environment variable carry trailing newlines as
+    readily as `op` does, and a value that skipped the check would reach
+    `putheader` and be quoted back — the disclosure the check exists to stop."""
+    assert human(cookie="session=abc\n").cookie() == "session=abc"
+    with pytest.raises(RuntimeError) as caught:
+        human(cookie="session=SUPERSECRET\rX: 1").cookie()
+    assert "SUPERSECRET" not in str(caught.value)

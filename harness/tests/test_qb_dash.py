@@ -2641,3 +2641,46 @@ def test_ctrl_s_in_the_editor_is_what_sends_it():
     # screen, and a write that silently moved it to the fleet would be a different
     # setting with the same name.
     assert repo == "prisonblues/quarterback", written
+
+
+def test_a_new_dial_takes_its_scope_from_the_rows_on_screen_not_the_cwd():
+    """The mistake a person cannot see afterwards, and the one a second opinion
+    found: `repo_slug` is where work is LAUNCHED, `Scope` is what is being SHOWN.
+    A pane started in one checkout with `QB_DASH_REPOS=owner/other` draws `other`'s
+    dials — and used to offer to write the dial to the checkout's repo instead.
+    Same dial name, different setting, and nothing on screen says which took it.
+    """
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/other"]))
+    app.repo_slug = "prisonblues/quarterback"          # the checkout it launched in
+    assert app.new_dial_scope() == "prisonblues/other"
+
+
+def test_a_wide_pane_writes_to_the_fleet_because_it_cannot_choose():
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/one", "prisonblues/two"]))
+    app.repo_slug = "prisonblues/one"
+    assert app.new_dial_scope() is None
+
+
+def test_a_repo_known_only_by_a_bare_name_is_not_offered_as_a_scope():
+    """`owner/name` is the board's shape for a repo scope; a bare `quarterback` is
+    refused there. Fleet is the honest answer, and the modal says so in bold."""
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["quarterback"]))
+    app.repo_slug = None
+    assert app.new_dial_scope() is None
+
+
+def test_a_duration_that_would_overflow_is_answered_not_raised():
+    """`timedelta` raises OverflowError rather than ValueError past its range, and
+    an escape here is a crash inside a Textual callback — which takes the whole
+    dashboard, not just this panel."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining",
+         "expiry": "99999999999999999999d", "repo": None}))
+    assert human.set == []
+    assert "not a duration" in said, said

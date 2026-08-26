@@ -1993,14 +1993,32 @@ class Dash(App):
         # in a 78-column modal is a control that would be got wrong in a hurry.
         # Editing an existing row keeps that row's own scope, which is the only
         # answer that can mean "change what I am looking at".
-        # A screen narrowed to ONE project (`Scope.column` false) is a screen
-        # about that project, so a new dial lands there; a wide one is about the
-        # fleet and cannot pick a repo on the reader's behalf. Either way the
-        # modal states the answer in bold before anything is written.
-        repo = (row or {}).get("repo") if row else (
-            None if self.scope.column else self.repo_slug)
+        repo = (row or {}).get("repo") if row else self.new_dial_scope()
         label = repo or "fleet (every repo)"
         self.push_screen(DialEdit(row, repo, label), self.dial_written)
+
+    def new_dial_scope(self) -> str | None:
+        """Which repo a NEW dial belongs to — off the SCOPE, never off the cwd.
+
+        The rows on this pane are `Scope`'s (`QB_DASH_REPOS`, or `--repo`, or the
+        launch directory's origin, in that order). `self.repo_slug` is only the
+        last of those, and it is where work is LAUNCHED rather than what is being
+        shown: a pane started in one checkout with `QB_DASH_REPOS=owner/other`
+        displays `other`'s dials and would have written the dial to the checkout's
+        repo instead. Same name, different setting, and nothing on screen
+        afterwards says which one took it — the one mistake this panel must not
+        let a person make.
+
+        None means the fleet, and it is the honest answer twice over: a wide pane
+        is about several projects and cannot choose between them, and a sole repo
+        this process knows only by a bare name is not one the board would accept
+        (`owner/name` is its shape). The modal states whichever answer this gives
+        in bold before anything is written.
+        """
+        if self.scope.column:
+            return None                      # several projects, or the wide view
+        named = [r for r in self.scope.repos if "/" in r]
+        return named[0] if len(named) == 1 else None
 
     def dial_written(self, asked: dict | None) -> None:
         """What the modal came back with, turned into one board write.
@@ -2018,9 +2036,15 @@ class Dash(App):
             value = qd.parse_dial_value(asked.get("value", ""))
             expires = qd.parse_dial_expiry(asked.get("expiry", ""),
                                            (self.dials or {}).get("now"))
-        except ValueError as exc:
+        except (ValueError, OverflowError) as exc:
             # Refused HERE, where the sentence can name the box that was wrong,
             # rather than at a 422 that names a field nobody typed.
+            #
+            # OverflowError as well as ValueError, and it is not defensive
+            # padding: `timedelta` raises it rather than ValueError for a duration
+            # past its range, so the bounded regex and this clause are two halves
+            # of one fix. Escaping here is a crash inside a Textual callback,
+            # which takes the dashboard down and every other panel with it.
             self.say(str(exc))
             return
         if not (asked.get("reason") or "").strip():

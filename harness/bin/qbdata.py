@@ -812,7 +812,12 @@ class HumanClient:
         if self._cookie is not None and not refresh:
             return self._cookie
         if self.cfg.edge_cookie and not refresh:
-            self._cookie = self.cfg.edge_cookie
+            # THROUGH THE SAME CHECK, and stripped the same way. A literal comes
+            # from a config file or an environment variable, both of which carry
+            # trailing newlines as readily as `op` does — and a value that skipped
+            # the check here would reach `putheader` and be quoted back, which is
+            # the disclosure the check exists to prevent.
+            self._cookie = self._checked(self.cfg.edge_cookie.strip())
             return self._cookie
         if not self.cfg.edge_cookie_cmd:
             # A refresh with only a static value configured: the caller has been
@@ -832,8 +837,35 @@ class HumanClient:
             # and a remedy the caller cannot read is a remedy they do not have.
             why = " ".join((got.stderr or "").split())[:200]
             raise RuntimeError(f"{self.COOKIE_FAILED}" + (f": {why}" if why else ""))
-        self._cookie = value
-        return value
+        self._cookie = self._checked(value)
+        return self._cookie
+
+    #: Everything a session may be made of: printable ASCII, no controls. The
+    #: bound that matters is CR and LF — `http.client.putheader` refuses those,
+    #: and refuses them by raising a ValueError CARRYING THE HEADER VALUE, which
+    #: this dashboard would then print on its detail line. A credential in a UI
+    #: string is a credential in a screenshot, a scrollback and a tmux buffer.
+    _COOKIE_OK = re.compile(r"^[\x20-\x7e]+$")
+
+    def _checked(self, value: str) -> str:
+        """One header-safe line, or a refusal that does NOT quote what was wrong.
+
+        Checked HERE rather than left to `putheader`, and the difference is the
+        whole point: the stdlib's own message is `Invalid header value
+        b'session=<the entire secret>'`, and every caller of this class turns an
+        exception into a sentence for a human to read.
+
+        A vault field with a trailing newline is the ordinary way to arrive here —
+        `op read` strips one and the value may hold more — so this says which
+        character was wrong and nothing else about it.
+        """
+        if self._COOKIE_OK.match(value):
+            return value
+        bad = next((f"{c!r}" for c in value if not (0x20 <= ord(c) <= 0x7e)), "?")
+        raise RuntimeError(
+            f"the session is not usable as a header — it contains {bad}. "
+            "A newline or control character in the vault field is the usual "
+            "cause; the value itself is not shown here on purpose")
 
     def why_not(self) -> str | None:
         """None when a human write could work here; otherwise why it cannot.
@@ -911,15 +943,51 @@ class HumanClient:
             with opener.open(req, timeout=30) as resp:
                 text = resp.read().decode()
         except urllib.error.HTTPError as exc:
-            said = self._refusal(exc)
-            if exc.code in (301, 302, 303, 307, 308) or (
-                    exc.code in (401, 403) and "X-Edge-Auth" not in said):
+            # READ THE BODY ONCE. `HTTPError` is a file object: a second `read()`
+            # returns empty, so a classifier and a message that each read for
+            # themselves disagree — and the second one always sees nothing.
+            try:
+                body = exc.read().decode()[:400]
+            except Exception:                     # noqa: BLE001
+                body = ""
+            said = self._refusal(exc.code, body)
+            if self._stale_session(exc.code, body):
                 raise _Bounced(said) from exc
             raise RuntimeError(said) from exc
+        except ValueError as exc:
+            # The stdlib refusing to send the header at all. `_checked` should
+            # have caught this at resolution; if something got past it, the one
+            # thing that must not happen is the message reaching a screen, because
+            # it quotes the header value verbatim.
+            raise RuntimeError("this session cannot be sent as a header "
+                               f"({type(exc).__name__}); the value is withheld") from None
         return json.loads(text) if text.strip() else {}
 
     @staticmethod
-    def _refusal(exc: "urllib.error.HTTPError") -> str:
+    def _stale_session(code: int, body: str) -> bool:
+        """Would a freshly-read session fix this? Decided from the BODY.
+
+        The distinction is what makes the retry safe, and reading it off the
+        rendered sentence — which is what this did first — got it exactly
+        backwards: the sentence for a BOARD refusal names `HUMAN_EDGE_SECRET` and
+        does not contain the string `X-Edge-Auth`, so "X-Edge-Auth not in said"
+        was true for the one case that must never be retried. Every board refusal
+        was re-attempted, with an `op` unlock prompt in front of it, to be refused
+        identically a second time.
+        """
+        if code in (301, 302, 303, 307, 308):
+            # Forward-auth bouncing an unauthenticated caller to the sign-in
+            # portal: the definitive "you are signed out".
+            return True
+        if code in (401, 403):
+            # The board names its own mechanism when IT is the one refusing; an
+            # answer that does not is the proxy's, and the proxy's is the one a
+            # new session answers.
+            return not ("X-Edge-Auth" in body or "HUMAN_EDGE_SECRET" in body)
+        return False
+
+    @staticmethod
+    def _refusal(code: int, body: str) -> str:
         """Which hop refused, said in the caller's words.
 
         The proxy and the app answer a stranger with the same codes and opposite
@@ -929,20 +997,16 @@ class HumanClient:
         this backwards tells somebody their secret is broken when they are only
         signed out.
         """
-        try:
-            body = exc.read().decode()[:400]
-        except Exception:                             # noqa: BLE001
-            body = ""
-        if exc.code in (301, 302, 303, 307, 308):
+        if code in (301, 302, 303, 307, 308):
             return ("the browser vhost redirected to sign-in — this session cookie "
                     "is missing or expired, so nothing was written")
-        if exc.code in (401, 403):
+        if code in (401, 403):
             if "X-Edge-Auth" in body or "HUMAN_EDGE_SECRET" in body:
                 return ("the board refused the person the edge vouched for — "
                         "HUMAN_EDGE_SECRET is unset or disagrees between its stores")
             return ("the edge refused this session before the board saw it — "
                     "the cookie is not a signed-in session")
-        return f"the browser vhost answered {exc.code}"
+        return f"the browser vhost answered {code}"
 
     def reorder(self, repo: str | None, order: list[str]) -> dict:
         """Put an order into force for ONE scope, exactly (`POST /plan/reorder`).
@@ -2727,7 +2791,12 @@ def parse_dial_value(text: str):
 #: How long a written expiry may be, and the units a person types. Deliberately
 #: not seconds: a dial is set for an afternoon or for a fortnight, and "14400" is
 #: a number somebody has to work out.
-_EXPIRY_RE = re.compile(r"^\s*(\d+)\s*([mhd])\s*$", re.I)
+#: DIGITS ARE BOUNDED, and not for tidiness: `timedelta` raises OverflowError —
+#: not ValueError — past about 2.7 million days, so `99999999999999999999d`
+#: escapes a caller that catches the documented failure and lands in a UI
+#: callback as a crash. Six digits is 2739 years: past every legitimate use and
+#: short of every overflow.
+_EXPIRY_RE = re.compile(r"^\s*(\d{1,6})\s*([mhd])\s*$", re.I)
 _EXPIRY_UNITS = {"m": 60, "h": 3600, "d": 86400}
 
 
