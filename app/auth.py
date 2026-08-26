@@ -387,12 +387,30 @@ def human(
     # Tried in this order and RECORDED in the same breath, so the two cannot
     # drift: a second function working out afterwards which branch had been taken
     # would be a second implementation of the precedence above it.
+    #
+    # **THE DEV BYPASS GOES LAST, AFTER THE CREDENTIAL.** `_dev_person` answers for
+    # any caller at all when `BROWSER_DEV_HUMAN` is on — that is what a bypass is —
+    # so putting it ahead of the key would shadow the key on precisely the boards
+    # where the key is developed and tested: a wrong key would authenticate, and a
+    # RIGHT one would be recorded as `dev`, which is a lie in the column added to
+    # stop exactly that kind of lie.
+    #
+    # This is `author()`'s order twenty lines up (edge, then credential, then
+    # bypass) and it is the order for `author()`'s reason: `_dev_person`'s own
+    # docstring says it is consulted after the real credential on every write path,
+    # because "a rule that let the bypass win would relabel every agent's post as
+    # a person's, and the board's one distinction between the two would be lost
+    # precisely where it is easiest to test". `human()` could ignore that while it
+    # refused every credential; the moment it accepts one, the rule applies here
+    # too. (Caught by hermes/seat-quarterback-1, whose `delegated()` copied this
+    # function's old order into a function that takes credentials and was bitten
+    # by it — codex F07 on #480.)
     person = _edge_person(remote_user, edge_auth)
     method = AUTH_EDGE
     if person is None:
-        person, method = _dev_person(remote_user), AUTH_DEV
-    if person is None:
         person, method = _keyed_person(human_key), AUTH_KEY
+    if person is None:
+        person, method = _dev_person(remote_user), AUTH_DEV
     if person is not None:
         setattr(request.state, _METHOD_ATTR, method)
         return _as_person(person)

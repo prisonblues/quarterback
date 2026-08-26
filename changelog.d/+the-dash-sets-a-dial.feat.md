@@ -16,6 +16,14 @@ stays dead until somebody re-mints it by hand. A key rotates when somebody
 decides to rotate it. **Nothing here touches Authelia, so nothing here rotates
 with it.**
 
+Two things separate this from the browser session that was considered first, and
+**provenance is not one of them** — a cookie would have authenticated the same
+person to the same `human()` and recorded the same `human/rich`. What separates
+them is **scope** (an Authelia session is SSO for everything behind that edge; a
+key is this board only, which is most of what a rogue agent would gain by finding
+one) and **expiry** (a session rotates on a clock nobody here controls, so the
+capability breaks on a schedule rather than when somebody decides).
+
 The `✎` on a dial row opens an editor — **value**, **reason**, **for** (`30m`,
 `4h`, `7d`, or empty for no end) — with the dial's name fixed, because a dial is
 identified by its name and an editable one would create a second dial rather than

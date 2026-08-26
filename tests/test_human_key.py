@@ -226,3 +226,37 @@ async def test_a_row_older_than_the_column_says_nothing_rather_than_guessing(cli
     live = (await client.get("/dials", params={"repo": REPO},
                              headers=LAPTOP)).json()["dials"]
     assert [(d["dial"], d["set_via"]) for d in live] == [("tempo", None)]
+
+
+async def test_a_real_key_is_not_recorded_as_the_dev_bypass(client, human_key, monkeypatch):
+    """The trap `delegated()` was bitten by, on #480, and this function's old order
+    walked straight into it.
+
+    `_dev_person` answers for ANY caller when `BROWSER_DEV_HUMAN` is on — that is
+    what a bypass is. Consulted before the key it shadows it on exactly the boards
+    where the key is developed: a wrong key authenticates, and a RIGHT one is
+    recorded as `dev`, which is a falsehood in the column added to prevent
+    falsehoods. So the credential is tried first and the bypass is the last resort,
+    which is `author()`'s order and `_dev_person`'s own stated rule.
+    """
+    monkeypatch.setattr(settings, "browser_dev_human", True)
+    monkeypatch.setattr(settings, "browser_dev_user", "devuser")
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "keyed on a dev board",
+        "repo": REPO}, headers=keyed(human_key))
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "key", "the bypass shadowed a real key"
+    assert r.json()["dial"]["set_by"] == "human/rich"
+
+
+async def test_the_bypass_still_works_when_there_is_no_credential(client, monkeypatch):
+    """Last resort, not removed. A local board with `BROWSER_DEV_HUMAN` on is still
+    writable with no key at all — that is what the flag is for — and it records
+    `dev`, so the row says which of the three doors was used."""
+    monkeypatch.setattr(settings, "browser_dev_human", True)
+    monkeypatch.setattr(settings, "browser_dev_user", "devuser")
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "local dev", "repo": REPO},
+        headers=LAPTOP)
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "dev"
