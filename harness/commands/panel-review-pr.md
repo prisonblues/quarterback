@@ -512,6 +512,7 @@ round from 2 on, before you go back to §4:
 ```
 python3 ~/.claude/loops/panel.py --premise "<one sentence: what this fix pass assumes>" \
     --pr <pr> --round <r> --premise-file /tmp/tmp.AbC123/premises.json \
+    --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
 
@@ -525,12 +526,32 @@ does and for its reason: a premise about code carries backticks and `$(…)`, an
 inside a double-quoted argument bash executes them while a `$VAR` expands to
 empty and declares a premise you did not write.
 
-**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is the
-brake: `review_panel.escalate_on.premise_repeated` (default `2`) says a fix has
-already been written against this premise once in this cycle, and **the second one
-is not to be written**. Do not launch §4. The findings that premise explains become
-escalations under the `--escalated` rule below — relay them, open the premise
-issue, and stop the cycle. The command prints the `--escalated` keys for the round you are recording
+**`--premise-decidable` is the question the counter cannot ask (#491).** Answer `no`
+when the runtime the fix's assertion runs in cannot observe the property the fix
+asserts, `yes` when it can. Omitted is *not answered*, and nothing brakes on it.
+
+You are the right reader for this one for the same reason you are the right reader
+for the declaration itself: a fixer replacing one proxy with a better one is not
+being careless, it is answering the finding in front of it, and only somebody
+holding all the rounds can see that the proxies keep changing while the thing being
+approximated does not. **When you find yourself writing a premise that restates the
+last round's premise with a different signal in it, the answer to this flag is
+`no`.**
+
+**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is a
+brake, and the report names which:
+
+- `escalate_on.premise_repeated` (default `2`) — a fix has already been written
+  against this premise once in this cycle, and **the second one is not to be
+  written**.
+- `escalate_on.premise_undecidable` (default `true`) — you answered `no`. It fires
+  on the **first** declaration: an unobservable property is not going to become
+  observable next round, so the cycle cannot converge on it whatever the counter
+  says.
+
+Do not launch §4. Either way, the findings that premise explains become escalations
+under the `--escalated` rule below — relay them, open the premise issue, and stop
+the cycle. The command prints the `--escalated` keys for the round you are recording
 against.
 
 **Why it is here and not at the end of a round.** The cap bounds cost; this bounds
@@ -557,7 +578,10 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
 A premise declared twice that reaches a round anyway ends the cycle there: it takes
 a veto line, `confident` is false, and `round_stop.reason` names the premise. That
 is the late half of the same brake — worse than stopping before the fix, better than
-the cap.
+the cap. A premise answered `decidable: no` that reaches a round does the same, on
+the same terms (#491), and the payload carries both lists under
+`round_stop.premises` with `undecidable_brake` saying whether this repo armed the
+second one.
 
 **An undeclared fix pass is unescalatable, and the report says so.** If a round's
 `config_notes` says the fix pass after round N declared no premise, that is a gap in

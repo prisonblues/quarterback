@@ -197,8 +197,10 @@ fixes on one unexamined premise, and PR #88 had a fixer circle its own previous 
 single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
 **approach** is wrong rather than the code, and write no patch for it: stated, with the premise
 in one sentence and what removing it would cost, rather than answered with a special case. It is
-narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
-because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+narrow on purpose — three conditions that must all hold, **or** a fourth that fails on its own
+(#491: the property the fix asserts is not decidable in the runtime the assertion runs in, so
+every fix for it is an approximation and the rounds cannot converge) — and it never authorises a
+redesign, because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
 premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
 question that path exists for. An escalated finding is recorded as `deferred` by the
 orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in

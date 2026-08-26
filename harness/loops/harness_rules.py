@@ -818,7 +818,33 @@ DEFAULTS: dict = {
         # (`require_failing_test`'s precedent): a governance switch believed to be on
         # and quietly off is the loudest possible way to make a process look
         # governed.
-        "escalate_on": {"premise_repeated": 2},
+        #
+        # `premise_undecidable` (#491) is the second one built, and it brakes on the
+        # FIRST declaration rather than the second — which is not the inconsistency it
+        # looks like. `premise_repeated` counts occurrences because one declaration
+        # says nothing: a fix written against a premise is ordinary, and only the
+        # repeat is evidence. `premise_undecidable` is not counting anything. It fires
+        # on a fixer's own answer to a specific question — *can the runtime this
+        # assertion runs in observe the property you are asserting?* — and a `no`
+        # there is already the whole finding. Every fix for such a property is an
+        # approximation of it, the next round finds the gap between the approximation
+        # and the property, and the round count is unbounded by construction. Waiting
+        # for a second one buys a fix pass and a panel to confirm what the first
+        # answer said.
+        #
+        # **This is what `premise_repeated` cannot see, and #491 is the measurement.**
+        # A fixer that replaces one proxy with a better one declares a genuinely
+        # different premise every round, honestly — four were declared on one cycle
+        # and no two matched, so the occurrence counter never reached 2 while three
+        # fix passes circled one undecidable property. Comparing declaration TEXT
+        # cannot close that (`same_premise` says so, and #84 rules out building a
+        # similarity heuristic); asking one more question of each declaration can.
+        #
+        # `false`/`null` switches it off, for a repo that would rather a fixer
+        # approximate than stop. Unlike `premise_repeated` there is no number: the
+        # answer it reads is a fixer's `yes`/`no`, and an occurrence count over it
+        # would be counting how many times somebody said the same `no`.
+        "escalate_on": {"premise_repeated": 2, "premise_undecidable": True},
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -2021,6 +2047,7 @@ BOARD_DIALS: dict[str, Dial] = {
     # #278's dial, and #84's futility brake.
     "review_panel.distant_merge_lines": Dial("number", True, "either"),
     "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
+    "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either"),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are
