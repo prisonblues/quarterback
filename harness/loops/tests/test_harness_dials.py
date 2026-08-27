@@ -428,11 +428,14 @@ def test_a_floor_is_read_case_insensitively_from_the_board_too(repo, monkeypatch
     that refused `"p2"` while the sample beside it accepted it would make one written
     value mean two things depending on which layer carried it. Normalised on the way
     in, so the provenance table shows the value the round applied."""
+    # ` Repo `, not ` Increment `: this test was written against the same wrong
+    # tuple the code had, so the one place a scope was exercised end to end was
+    # exercising a word `panel_seats.reviewer_scope` refuses with `SystemExit`.
     board(monkeypatch, dial(FLOOR, "p3"), dial("review_panel.reviewer_scope",
-                                               " Increment "))
+                                               " Repo "))
     cfg = hr.resolve_repo(str(repo))
     assert cfg["review_panel"]["fix_severity_floor"] == "P3"
-    assert cfg["review_panel"]["reviewer_scope"] == "increment"
+    assert cfg["review_panel"]["reviewer_scope"] == "repo"
     assert cfg["_dials"][FLOOR]["value"] == "P3"
 
 
@@ -448,3 +451,194 @@ def test_an_expired_dial_is_absent_even_when_it_is_also_wrong(repo, monkeypatch,
     cfg = hr.resolve_repo(str(repo))
     assert cfg["review_panel"]["fix_severity_floor"] == "P2"
     assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------------------------------- #539
+# The dial table, read back OUT of this module by whatever draws a form.
+#
+# Setting a dial was four empty boxes and one placeholder covering all 29 at
+# once, so the question a person actually has — what does THIS one take, what is
+# it now, which way may it move — had no answer on the screen where it is asked.
+# What is pinned here is not that the answer is pretty; it is that there is only
+# ever ONE of it. A client that hard-coded these bands, defaults or words would be
+# the second place a dial is written down, which is the failure #56's rule and
+# #305 both exist to end — so every one of these asserts against `BOARD_DIALS` and
+# `DEFAULTS` rather than against a list written out again here.
+
+
+def test_every_settable_dial_has_a_spec_and_no_others_do():
+    """`BOARD_DIALS` settles the list, and `dial_specs` is a view of it — not a
+    second table that could gain a name the harness will not apply, or lose one it
+    will."""
+    assert set(hr.dial_specs()) == set(hr.BOARD_DIALS)
+
+
+def test_a_specs_default_is_the_one_DEFAULTS_holds():
+    """Read back rather than restated, which is `_dial_default`'s own argument: a
+    default written twice is a default two layers can disagree about, and the form
+    showing the stale one is how somebody sets a dial believing they are changing
+    something."""
+    specs = hr.dial_specs()
+    for path, spec in specs.items():
+        value, known = hr._dial_default(path)
+        assert spec["default"] == value and spec["default_known"] == known
+
+
+def test_a_dial_with_no_default_says_so_rather_than_offering_null(monkeypatch):
+    """A dial in `BOARD_DIALS` and absent from `DEFAULTS` is a bug in this module,
+    and `null` is a value several dials really take — so drawing one for the other
+    would hide the bug behind a plausible answer."""
+    monkeypatch.setitem(hr.BOARD_DIALS, "review_panel.invented",
+                        hr.Dial("number", False, "either"))
+    spec = hr.dial_specs()["review_panel.invented"]
+    assert spec["default_known"] is False and spec["default"] is None
+
+
+def test_every_closed_kind_offers_its_set_and_the_open_ones_offer_nothing():
+    """A form can only offer what is enumerable. The other half of this — that
+    every offered word is one the judge accepts once the client has parsed it — is
+    asserted in `harness/tests/test_qb_dials_surface.py`, which is the only suite
+    holding both the table and `parse_dial_value`; a copy of that parser here would
+    be the drift this whole design is trying not to have."""
+    specs = hr.dial_specs()
+    closed = {p: s for p, s in specs.items()
+              if hr.BOARD_DIALS[p].kind in ("severity", "deferral_gate", "scope",
+                                            "flag")}
+    assert closed and all(s["choices"] for s in closed.values())
+    assert not any(specs[p]["choices"] for p, d in hr.BOARD_DIALS.items()
+                   if d.kind in ("number", "text"))
+
+
+def test_a_kind_with_no_closed_set_offers_nothing_rather_than_a_guess():
+    """`number` and `text` are not lists, and a form that enumerated them would be
+    making the vocabulary up."""
+    assert hr.dial_choices("review_panel.max_rounds") == ()
+    assert hr.dial_choices("review_panel.judge_model") == ()
+    assert hr.dial_choices("review_panel.reviewer_scope") == hr._SCOPES
+
+
+def test_the_bands_a_floor_offers_are_the_bands_the_pattern_matches():
+    """`_SEVERITY_BANDS` is the one statement and `_SEVERITY_RE` is built from it,
+    so a band added to the panel cannot be offered by a form and refused by the
+    same module one function along."""
+    assert all(hr._is_band(b) for b in hr._SEVERITY_BANDS)
+    assert hr.dial_choices("review_panel.fix_severity_floor") == hr._SEVERITY_BANDS
+    assert not hr._is_band("P0") and not hr._is_band("P5")
+
+
+def test_null_is_named_as_an_off_switch_only_where_it_is_one():
+    """`null` is the documented off switch wherever `Dial.nullable` is true and
+    means "inherit the default" everywhere else — two meanings for one written
+    value, which a person cannot tell apart from the value box."""
+    assert "null" in hr.dial_hint("review_panel.max_fix_growth")
+    assert "null" not in hr.dial_hint("review_panel.fix_severity_floor")
+
+
+def test_a_narrow_dial_says_which_way_it_may_move():
+    """The direction rule is invisible in the value and discoverable only by having
+    a write ignored — so the seats and the repo's own off switch carry the note and
+    the floors, which move both ways, do not."""
+    specs = hr.dial_specs()
+    assert specs["reviewers.pi.enabled"]["note"]
+    assert specs["enabled"]["note"]
+    assert not specs["review_panel.fix_severity_floor"]["note"]
+
+
+def test_a_name_the_harness_does_not_know_is_refused_before_the_write():
+    """The board cannot make this judgement — it stores `dial` as opaque text on
+    purpose — so a misspelt name is accepted, stored, returned as in force, and
+    then ignored by every harness that reads it. This is the only side that can
+    catch it, and the sentence says who settles the list."""
+    said = hr.dial_problem("review_panel.fix_sevrity_floor", "P2")
+    assert "not a board-settable dial" in said and "This harness settles" in said
+
+
+def test_the_write_side_judge_is_the_read_side_judge():
+    """`dial_problem` is `board_dials`' own check asked one step earlier. If they
+    could disagree, a value refused here would be one the board took and a round
+    applied — or worse, the other way round."""
+    dial = hr.BOARD_DIALS["review_panel.max_rounds"]
+    for value in (2, "2", None, True, -1, 0.5):
+        assert hr.dial_problem("review_panel.max_rounds", value) == \
+            hr._dial_problem("review_panel.max_rounds", dial, value)
+
+
+def test_a_merge_gate_is_still_not_a_dial_and_the_form_cannot_offer_one():
+    """`auto_merge` and the loop schedule decide what may be MERGED, and a merge
+    gate is policy that belongs where a human reviewing a branch can see it. A form
+    drawn off this table cannot offer what the table does not hold."""
+    specs = hr.dial_specs()
+    assert "auto_merge" not in specs
+    assert not [k for k in specs if k.startswith("loops.")]
+    assert "review_panel.skip_title_patterns" not in specs
+
+
+def test_every_settable_dial_says_what_it_decides():
+    """One line each, or the picker offering it is 29 dotted paths again. Asserted
+    on the table rather than on a list here: a dial added to `BOARD_DIALS` without
+    one is the exact regression, and a copy of the sentences in this file would be
+    the second place they are written down."""
+    missing = [p for p, d in hr.BOARD_DIALS.items() if not d.what.strip()]
+    assert not missing, missing
+
+
+def test_the_one_liner_is_a_line_and_not_an_argument():
+    """The argument stays beside the key in `DEFAULTS`, at whatever length it needs.
+    This has to fit under a value box in a 78-column pane, and the box is 66 columns
+    wide inside its border — so the ceiling is two wrapped lines and a paragraph is
+    a description that pushes the form off the bottom of the pane. The person who
+    wants the reasoning is one `grep` from the comment carrying it."""
+    for path, dial in hr.BOARD_DIALS.items():
+        assert len(dial.what) <= 2 * 66, (path, len(dial.what))
+        assert "\n" not in dial.what, path
+
+
+def test_the_table_is_written_in_the_order_a_person_asks_in():
+    """`dial_specs` hands its entries over in `BOARD_DIALS`' order and the picker
+    keeps it, so this file is where that order is actually decided. Alphabetically
+    the first dial is `enabled` — the one that turns this repo's reviews off — and
+    it is nobody's answer to "what did I come here to change"."""
+    names = list(hr.dial_specs())
+    assert names[:2] == ["review_panel.fix_severity_floor",
+                         "review_panel.round_trigger_floor"]
+    assert names.index("enabled") > names.index("review_panel.max_rounds")
+
+
+def test_the_board_layer_accepts_exactly_what_the_panel_accepts():
+    """The dial layer validates `reviewer_scope` and `panel_seats` applies it, and
+    they were two different tuples: `("diff", "increment")` here against
+    `("diff", "repo")` there. Both directions were broken and neither was visible —
+    `repo`, the documented value, was refused by the board layer and never applied;
+    `increment`, which is `round_scope`'s word, passed this check, reached the
+    resolved config and then hit `panel_seats.reviewer_scope`, which refuses an
+    unknown scope with `SystemExit`. A dial that validates and then kills the run.
+
+    Asserted rather than imported because `panel_core` imports THIS module: the
+    constant cannot live in one place, so it has to be held against the other."""
+    import panel_core as pc
+
+    assert hr._SCOPES == pc.REVIEWER_SCOPES
+    assert hr.dial_problem("review_panel.reviewer_scope", "repo") == ""
+    assert "increment" not in hr.dial_choices("review_panel.reviewer_scope")
+
+
+def test_the_default_reviewer_scope_is_one_of_the_words_offered():
+    """The cheapest way to notice the tuple has gone wrong again: whatever
+    `DEFAULTS` ships has to be a value the picker would offer and the judge would
+    take."""
+    default, known = hr._dial_default("review_panel.reviewer_scope")
+    assert known and default in hr.dial_choices("review_panel.reviewer_scope")
+
+
+def test_a_number_dial_refuses_the_values_that_are_not_numbers_after_all():
+    """`json.loads` accepts `NaN`, `Infinity` and `-Infinity` as bare literals, and
+    `NaN` compares false against every bound — so `value < 0` let it through and a
+    floor, a round cap or a budget took a value nothing can compare against.
+    `app/api/dials.py` refuses all three at the board (`allow_nan=False`, because
+    Postgres will not store them), and a validator that disagreed with the endpoint
+    it guards would send the refusal back a round later instead of at the keyboard."""
+    for value in (float("nan"), float("inf"), float("-inf")):
+        said = hr.dial_problem("review_panel.max_rounds", value)
+        assert "finite" in said, (value, said)
+    assert hr.dial_problem("review_panel.max_rounds", 2) == ""
+    assert hr.dial_problem("review_panel.max_fix_growth", 3.5) == ""

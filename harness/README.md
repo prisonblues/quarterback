@@ -2377,6 +2377,96 @@ is **JSON where it parses** (`2`, `true`, `null`, a list) and the string it look
 otherwise (`P3`, `eager`); an expiry is measured from the **board's** clock, so a box whose
 own clock is slow does not have its "in four hours" refused as being in the past.
 
+**The vocabulary is on the screen where it is asked for**
+([#539](https://github.com/prisonblues/quarterback/issues/539)). Setting a NEW dial was four
+empty boxes and one placeholder covering all 29 of them at once — `P3, 2, true, null`, four
+value kinds in one line, which is what a form says when it cannot tell which dial it is on.
+The name field now filters the settable dials as you type (`↓` walks them, enter or a click
+takes one), matching on the half of a name a person actually remembers: `budget` finds the
+five `review_panel.budget.*`, `enabled` finds the seats. The list is in `BOARD_DIALS`' own
+order — the two floors, then what a cycle costs, then the futility brakes, the budgets and
+the switches — because sorted alphabetically it opened on `enabled`, which switches this
+repo's reviews off entirely and is nobody's answer to *what did I come here to change*.
+
+**Scrolling the list says what each one does, and what it will take.** The line under the
+value box describes the name under the cursor, not the name in the box — *the lowest severity
+a fix pass may act on; under it is deferred, not fixed* — and the value box's own placeholder
+becomes that dial's accepted values, `a severity band — P1, P2, P3, P4`. Both halves of "is
+this the one I meant" move together as you read down the list, and the second half costs no
+rows, which is the only reason they both fit a pane this size. The name box is untouched while
+you browse: what is highlighted is being read, what is typed is what will be written.
+
+That description had no home a program could read. Every dial's argument is a Python comment
+beside its key in `DEFAULTS`, at whatever length it needed, so a screen could show a dial's
+shape and never its point. `Dial.what` is a one-line summary of it — capped at two wrapped
+lines at 66 columns, asserted by a test — and the argument stays where it was.
+
+Once a name IS one of the 29 the list retires and the description grows into the rest of the
+block: what the dial takes (`a severity band — P1, P2, P3, P4`), its default, what is in force
+now and at which scope, and — for `enabled` and the per-seat switches — that it is **narrow
+only**, which is invisible in the value and otherwise discoverable just by having a write
+ignored. The two states are the two questions: *which one did I mean*, then *what do I type,
+what is it now, what happens if I clear it*. They cannot both be on a 78×24 pane, and typing
+again brings the list back.
+
+The description, the names and the refusal line sit at the column the fields' own text starts
+at, rather than at the panel's padding. An `Input` draws a border and pads inside it, so its
+text begins three columns in while a bare `Static` begins at the edge — which put every line
+describing a field three columns to the left of the field, down the middle of a form that is
+otherwise one column. The title and the key line keep the edge: they frame the form rather
+than belonging to a field.
+
+Writing those descriptions turned up a dial that validated and then killed the run.
+`reviewer_scope` takes `diff` or `repo` (`panel_core.REVIEWER_SCOPES`), and the board layer's
+validator had `("diff", "increment")` — `increment` is `round_scope`'s word. So `repo`, the
+documented value, was refused here and never applied, while `increment` passed, reached the
+resolved config, and met `panel_seats.reviewer_scope`, which refuses an unknown scope with
+`SystemExit`. `_SCOPES` is `("diff", "repo")` now and a test pins it against
+`REVIEWER_SCOPES`; the constant cannot simply be imported, because `panel_core` imports
+`harness_rules`.
+
+`ctrl+s` refuses in the box rather than after it. `POST /dials` cannot do this: the board
+stores `dial` as opaque text and `value` as opaque JSON deliberately, so a misspelt name or a
+quoted `"2"` is accepted, stored, reported as in force, and then ignored by every harness
+that reads it — the refusal used to arrive from a round hours later, on the old value. The
+sentence is the harness's own (`harness_rules.dial_problem`) and the other three fields keep
+what was typed into them.
+
+**A bad VALUE is a refusal; an unknown NAME is a warning and then a write**, and the
+asymmetry is the point. The table being consulted is the harness beside *this dashboard*, and
+the two are installed separately — so a hard refusal would make a box one release behind a
+box that cannot set a dial the rest of the fleet already applies. `tempo` (#474) is the
+standing case: both dashboards draw it and `BOARD_DIALS` does not hold it. So an unrecognised
+name says *nothing this box knows applies `tempo`* and the next `ctrl+s` sets it anyway;
+confirming one name does not wave the next one through. A value for a name this box *does*
+know gets no such benefit of the doubt — the kind came from the same table as the name, so
+there is no version of the harness in which `max_rounds: "2"` is a value somebody applies.
+Where the filter has narrowed to exactly one name, both messages say which: *— ↓ takes
+`review_panel.max_rounds`*.
+
+The scope moved onto the title line in the same pass, and not for tidiness: the picker cost
+four rows a 78×24 pane did not have, and what a Textual modal does when it outgrows its
+screen is clip whatever was composed last — which was the scope. `fleet` and `this repo` are
+two settings with one name and it is the mistake you cannot see afterwards, so it is now the
+line that cannot be the one to go. A test drives the modal at 78×24 and asserts every control
+is drawn.
+
+None of this is a second copy of the dial table. `qbdata.dial_vocabulary()` reads
+`harness_rules.dial_specs()` at call time — names, kinds, defaults, directions, all still
+settled by `BOARD_DIALS` and `DEFAULTS` — and a box that cannot read it gets `{}`, which is
+*cannot tell* and never *nothing is settable*: the picker is hidden, the line under the value
+says so, and the write goes through exactly as it did before, with the board as the only
+judge. A form that refused there would leave the person at that keyboard with no door at all.
+
+**And it says WHICH cannot-tell.** Three states end in an empty vocabulary — no
+`harness/loops` beside the dashboard, a `harness_rules.py` that will not import, and a
+harness older than the dial table — and `qbdata.dial_trouble()` tells them apart, because a
+partial upgrade reported as an install that never happened sends somebody to look for a
+directory that is sitting right there. It is the distinction the board layer already draws one
+level up: `_dials_unreadable` is *we could not find out*, never *there is no dial*. The
+failure is not cached either, so a harness installed while the dashboard is open is picked up
+the next time the modal opens rather than at the next restart.
+
 **What that credential costs is [#479](https://github.com/prisonblues/quarterback/issues/479),
 and it is stated rather than implied**: the key sits on this workstation, readable by the
 processes running here, so an agent that goes looking can find it and author as a person. That

@@ -13,6 +13,7 @@ import shlex
 import socket
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -2822,6 +2823,194 @@ def dials_url(cfg, repo: str | None = None) -> str:
     watched = resolve_repos() or []
     scope = repo if repo is not None else (watched[0] if len(watched) == 1 else None)
     return f"{base}?repo={urllib.parse.quote(scope)}" if scope else base
+
+
+# ---- the dials a person may SET ----------------------------------------------
+#
+# Everything above renders what the board said and asserts nothing about what it
+# MEANS, and that is right for a reader: the board stores `dial` as opaque text and
+# `value` as opaque JSON, and a dashboard that had learnt the vocabulary would be a
+# second place a dial is written down (#56, #305).
+#
+# **A WRITER CANNOT WORK THAT WAY, and the difference is not a loophole.** Reading
+# an unknown dial is harmless — it is drawn, and the harness that owns the list
+# says what it made of it. Writing one is not: `POST /dials` accepts any dotted
+# path and any JSON, so a misspelt name or a quoted `"2"` is stored, returned as in
+# force, and then ignored by every harness that reads it. That gap is what #539 was
+# filed about — four empty boxes, one placeholder covering 29 dials and six value
+# kinds at once, and a typo that saves clean and is discovered by a round which ran
+# under the old value.
+#
+# So the write half READS THE HARNESS'S OWN TABLE at call time rather than carrying
+# a copy of it: `harness_rules.dial_specs()` for the names, kinds, defaults and
+# directions, and `harness_rules.dial_problem()` for the refusal sentence. That is
+# a client reading the one copy, which is what #56's rule asks for. Nothing below
+# names a dial, a band or a default.
+#
+# **It degrades to what shipped before.** A box with no `harness/loops` beside the
+# script — the dashboard installed on its own, or run out of a stripped checkout —
+# gets an empty vocabulary and no refusal, which is exactly today's behaviour: a
+# free-text name, a free-text value, and the board taking both. A form that refused
+# to open because it could not find the table would have made the dashboard less
+# useful than it was.
+
+
+def loops_dir(script: str | None = None) -> str | None:
+    """`harness/loops`, in the two layouts there are — a checkout and the package.
+
+    The third copy of this lookup (`qb-mode`, `qb-bump`), and it is repeated for
+    the reason `package.nix` gives rather than out of neglect: `bin/` and
+    `share/quarterback-harness/loops` are siblings in the store output, `bin/` and
+    `loops/` are siblings in a checkout, and home-manager links each file in bin/
+    as its own flat store path — so "beside the script" is the only relationship
+    that survives every layout, and a shared helper would have to live somewhere
+    that is not beside it.
+
+    `script` defaults to THIS file rather than to `sys.argv[0]`, which is the
+    difference that matters for a library: `qbdata.py` is installed beside the
+    dashboards, and a caller invoked through a wrapper or a `python -c` would
+    otherwise resolve the lookup against wherever the interpreter was started.
+    """
+    here = os.path.dirname(os.path.realpath(script or __file__))
+    parent = os.path.dirname(here)
+    for cand in (os.environ.get("QB_LOOPS_DIR"),
+                 os.path.join(parent, "loops"),
+                 os.path.join(parent, "share", "quarterback-harness", "loops")):
+        if cand and os.path.isfile(os.path.join(cand, "harness_rules.py")):
+            return cand
+    return None
+
+
+#: The module once it has been found, so that opening the modal a second time does
+#: not re-import a large one. SUCCESS ONLY — a failure is deliberately NOT
+#: remembered, and an earlier cut of this cached both on the grounds that "the
+#: modal asks on every keystroke", which is simply not true: `dial_vocabulary` is
+#: asked once when the modal opens and the keystrokes filter the dict it returned.
+#: So the saving was imaginary and the cost was real — a dashboard left open across
+#: a harness install would have gone on saying the table could not be read until
+#: somebody restarted it, which is the failure `expires_at` exists to prevent one
+#: layer up.
+_DIAL_RULES: list = []
+
+#: Why the table could not be read, in a sentence, or `""`. Written by
+#: `_dial_rules` and asked for by `dial_trouble` — see that function for why the
+#: two failures must not be told the same way.
+_DIAL_TROUBLE = ""
+
+
+def _dial_rules(script: str | None = None):
+    """The `harness_rules` module, or None where it cannot be read.
+
+    Never raises. An import that fails — a partial install, a syntax error in a
+    checkout mid-edit — leaves the form exactly as useful as it was before this
+    landed, which is a worse form and not a broken one.
+    """
+    global _DIAL_TROUBLE
+    if _DIAL_RULES:
+        return _DIAL_RULES[0]
+    where = loops_dir(script)
+    if not where:
+        _DIAL_TROUBLE = "no harness/loops beside this dashboard"
+        return None
+    if where not in sys.path:
+        sys.path.insert(0, where)
+    try:
+        import harness_rules  # noqa: PLC0415 — resolved at call time, by design
+    except Exception as exc:                   # noqa: BLE001 — degrade, don't die
+        _DIAL_TROUBLE = (f"{where}/harness_rules.py would not import: "
+                         f"{type(exc).__name__}: {exc}")
+        return None
+    if not hasattr(harness_rules, "dial_specs"):
+        # The harness beside this script can be OLDER than this file — a checkout on
+        # a branch that predates #539, or a half-updated install. Not the same fact
+        # as an absent directory, and not the same fact as a broken one.
+        _DIAL_TROUBLE = (f"the harness at {where} predates the dial table "
+                         f"(no dial_specs)")
+        return None
+    _DIAL_TROUBLE = ""
+    _DIAL_RULES.append(harness_rules)
+    return harness_rules
+
+
+def dial_trouble(script: str | None = None) -> str:
+    """Why the vocabulary is empty, in a sentence a screen can print, or `""`.
+
+    **THREE FAILURES, NOT ONE.** No `harness/loops` beside the dashboard is a box
+    that never had the table; a `harness_rules.py` that will not import is a box
+    that has it and is broken; a harness older than `dial_specs` is a box mid-
+    upgrade. All three end in an empty vocabulary and unvalidated writes, and until
+    this existed the screen told all three as the first one — so a partial upgrade
+    reported itself as an install that had never happened, which is a sentence that
+    sends somebody to look in the wrong place.
+
+    The board layer makes the same distinction one level up and for the same
+    reason: `_dials_unreadable` is "we could not find out", never "there is no
+    dial". A screen that cannot tell those apart is a screen that reports a
+    misconfigured box as a healthy one.
+    """
+    _dial_rules(script)
+    return _DIAL_TROUBLE
+
+
+def dial_vocabulary(script: str | None = None) -> dict[str, dict]:
+    """Every dial the harness will actually apply, as plain data. `{}` when unknown.
+
+    An empty answer is "this box cannot tell", NOT "no dial is settable" — the same
+    distinction `fetch_dials` draws with `asked`, and it is load-bearing for the
+    same reason: a form that drew "0 dials" would be stating as a fact the one
+    thing it failed to find out.
+    """
+    rules = _dial_rules(script)
+    if rules is None:
+        return {}
+    try:
+        return rules.dial_specs()
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return {}
+
+
+def dial_refusal(dial: str, value, script: str | None = None) -> str:
+    """Why this write will not be applied, or `""` — asked before it is made.
+
+    `""` also covers "cannot judge", and that is deliberate rather than sloppy: a
+    box that cannot read the harness's table must not refuse a write the board
+    would have taken, because the person at that keyboard has no other door. The
+    cost of the false negative is today's behaviour; the cost of a false refusal is
+    a dial nobody can set at all.
+    """
+    rules = _dial_rules(script)
+    if rules is None or not hasattr(rules, "dial_problem"):
+        return ""  # `hasattr` for `dial_specs`' reason, one function up
+    try:
+        return rules.dial_problem(dial, value) or ""
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return ""
+
+
+def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> list[str]:
+    """The dial names worth offering for what has been typed so far.
+
+    Substring rather than prefix, because the useful half of a name is in the
+    middle of it: `budget` finds the five `review_panel.budget.*` and `enabled`
+    finds the seats, and a prefix filter would answer both with nothing until the
+    person had typed `review_panel.` — which is the part they know.
+
+    Prefix matches first, so typing a name in full still puts the exact one at the
+    top; case-folded, because a dial is lower-case and somebody reaching for
+    `Budget` has not made a mistake worth an empty list. Within those two groups the
+    order is the VOCABULARY'S OWN — `BOARD_DIALS` is written grouped by what a dial
+    decides, and sorting the names alphabetically would open the list on `enabled`,
+    the one dial that switches this repo's reviews off and nobody's answer to "what
+    did I come here to change".
+    """
+    want = (typed or "").strip().lower()
+    names = list(vocabulary)
+    if not want:
+        return names[:limit]
+    rank = {name: i for i, name in enumerate(names)}
+    hit = [n for n in names if want in n.lower()]
+    hit.sort(key=lambda n: (not n.lower().startswith(want), rank[n]))
+    return hit[:limit]
 
 
 # ---- the tmux screen ---------------------------------------------------------
