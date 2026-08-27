@@ -188,7 +188,7 @@ in
         default = true;
         description = ''
           Pass --dangerously-skip-permissions to a spawned agent. On by default,
-          for `qb-seat`'s reason: a spawned window is a pane nobody is watching,
+          for a seat screen's reason: a spawned window is a pane nobody is watching,
           so the first tool call wanting a permission it does not hold stops it
           in the one way this cannot recover from — the pane looks busy, the
           board shows a live agent holding a claim, and nothing is moving.

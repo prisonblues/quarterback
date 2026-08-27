@@ -151,8 +151,8 @@ def board_client():
         (tools / "tmux").chmod(0o755)
 
     # $XDG_CONFIG_HOME, because there is no override to point at a file: the
-    # resolution under test is the real one, and it is the same one `qb-env`,
-    # `qb-seat` and `qbdata` use. A `$QUARTERBACK_SPAWN` existed here until the
+    # resolution under test is the real one, and it is the same one `qb-env` and
+    # `qbdata` use. A `$QUARTERBACK_SPAWN` existed here until the
     # codex review pointed out that a bypass a repository could set falsifies the
     # only claim this gate makes.
     config = tmp_path / "config"

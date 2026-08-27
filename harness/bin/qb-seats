@@ -39,9 +39,21 @@
 # SEAT, interrupt it and redirect it, without touching the others. Most of what
 # follows exists to protect that.
 #
-# WHAT IT IS. A layout. It arranges panes and starts one process in each. Every
-# seat runs `qb-seat <n>` (its sibling in this directory), which is where a
-# seat's identity and brief live. The screen knows nothing about either.
+# WHAT IT IS. A layout. It arranges panes, puts a shell in each, and types one
+# line into it. That line is QB_SEAT_INITIAL_CMD and it is the whole of what a
+# seat is told; `claude-yolo` by default, and empty for a pane that comes up as a
+# bare shell. The screen knows nothing else about the agent.
+#
+# A SEAT IS A PANE, NOT A ROLE (#540). It used to be the other way round: each
+# pane ran `qb-seat <n>`, which gave the agent a board name (`seat-<repo>-<n>`)
+# and a brief telling it to claim a plan item. Both are gone. A seat is now a
+# pane with a shell in it and a number on it, and whether an agent lives in one is
+# a fact the PANE reports — `@qb_session`, stamped by the lifecycle hook — rather
+# than something spelled into the agent's name for a dashboard to parse back out.
+#
+# `@qb_seat` survives all of that. It is a pane option, it never leaves this box,
+# and it is what the bar's cells, the ✕, the qb key's 1-9 and `--add` address a
+# seat by. What it stopped being is an identity.
 #
 # WHAT IT DELIBERATELY DOES NOT DO:
 #
@@ -50,9 +62,16 @@
 #     the loop that takes it, with the database isolation that implies. A screen
 #     that made worktrees up front would be guessing.
 #   * No dispatch. It does not read the plan, does not pick items, does not hand
-#     seat 3 a different brief from seat 1. A spawner that assigns is hub-and-
+#     seat 3 a different line from seat 1. A spawner that assigns is hub-and-
 #     spoke with a hub that runs once at t=0, and removing the dispatcher is the
-#     entire point. Every seat gets the same brief and self-selects.
+#     entire point. Every seat gets the same initial command.
+#
+#     Which is not the same as every seat coming up idle. QB_SEAT_INITIAL_CMD
+#     carries a prompt if you want one — `claude-yolo -- /get-involved` is a
+#     screen that comes up claiming — and that is still self-selection rather
+#     than dispatch: the same line to every pane, and the board's atomic
+#     `plan_claim` deciding who gets what. Whether the fleet should be taking
+#     work at all is `tempo`'s question (#474), not this script's.
 #   * No driving. It starts the agents. After that the panes are just panes.
 #   * No second board client. The board pane runs `qb-board`; if that grows a
 #     filter, the filter goes there. The moment this script parses board JSON to
@@ -66,7 +85,16 @@
 # claims are atomic — holding each other's claims perfectly legitimately, because
 # they are the same holder. So this script unsets the variable before starting
 # the server, and marks it for removal from the session environment, which covers
-# every pane split off later. qb-seat sets its own, per seat.
+# every pane split off later.
+#
+# NOTHING SETS ONE IN ITS PLACE, and that is the #540 half of this. `qb-seat` used
+# to export `seat-<repo>-<n>` here, which is why the stripping existed at all —
+# one value inherited from the launching shell would have overridden every seat's
+# own. With no seat label there is nothing to override and nothing to collide:
+# `qb-hook` falls back to the session id, which is one value per CONVERSATION and
+# so is unique across panes by construction. The strip stays because an inherited
+# value would still make every pane on the screen one agent, and that failure is
+# as invisible now as it was then.
 #
 # WHY TMUX AND NOT ZELLIJ. zellij's case is real — declarative KDL layouts,
 # `start_suspended`, and `override-layout --retain-existing-terminal-panes`. It
@@ -109,7 +137,31 @@ MAX_SEATS=10            # five across, two down — see the layout note below
 REPO=""                 # default: the git repo you ran this from
 SESSION=""              # default: seats-<repo basename>
 STAGED=0                # 1 = pane waits on Enter before starting its agent
-YOLO=""                 # "" = as it comes (on), 1 = force on, 0 = prompts back
+
+# THE INITIAL COMMAND — the one line a seat is given, and the whole of what makes
+# a pane an agent rather than a shell (#540).
+#
+# `claude-yolo` AND NOT `claude --dangerously-skip-permissions`, which is the same
+# thing spelled out and would be wrong here. The value is TYPED INTO AN INTERACTIVE
+# SHELL, not exec'd, so it resolves whatever that shell resolves: on the box this
+# was written for `claude-yolo` is an alias in ~/.bashrc and is not on PATH at all.
+# Naming the alias is therefore both the shorter default and the one that lets a
+# consumer put their own wrapper, function or nix-shell in front of it without this
+# script needing to know. A default that had to be an executable would have taken
+# that away for nothing.
+#
+# It also means the permission flag is not this script's business any more. There
+# is no QB_SEAT_YOLO: the difference between an agent that stops to ask and one
+# that does not is which command you type, which is one knob instead of two that
+# could disagree.
+SEAT_CMD_DEFAULT="claude-yolo"
+
+# What --no-yolo asks for. Spelled once, here, because the usage text prints it
+# and the flag sets it, and a second copy is how the two come to differ.
+SEAT_CMD_PROMPTS="claude"
+
+INITIAL_CMD=""          # resolved by resolve_initial_cmd; "" means type nothing
+INITIAL_CMD_SET=""      # non-empty once resolved, since "" is a real answer
 BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
 KEY_DEFAULT="C-q"       # the qb key, when QB_SEATS_KEY does not say otherwise
 BAR_BG=colour235        # the seat bar's OWN ground — see seat_bar for why it
@@ -127,7 +179,7 @@ TARGET=""               # which screen `resume` was asked for: a number, a name,
 
 usage() {
   cat <<EOF
-usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
+usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--cmd LINE] [--add] [--kill]
        $PROG list
        $PROG resume [ID|NAME]
 
@@ -135,13 +187,15 @@ usage: $PROG [N] [-C DIR] [-s NAME] [--staged] [--no-yolo] [--add] [--kill]
   -C DIR      repo the seats run in (default: the git root of \$PWD)
   -s NAME     tmux session name (default: seats-<repo basename>)
   --staged    build the screen with each seat waiting on Enter, so the layout
-              can be eyeballed before N agents start claiming
-  --no-yolo   give the seats their permission prompts back. They start without
-              them, because a pane nobody is watching cannot answer one and a
-              seat waiting to be asked a question is a seat that has stopped.
-              QB_SEAT_YOLO=0 in your environment is the same thing said once
+              can be eyeballed before N agents start
+  --cmd LINE  what to type into each seat, instead of \`$SEAT_CMD_DEFAULT\`.
+              --cmd '' is a screen of bare shells. Beats QB_SEAT_INITIAL_CMD
+  --no-yolo   sugar for --cmd $SEAT_CMD_PROMPTS: an agent that stops to ask.
+              The default does not, because a pane nobody is watching cannot
+              answer a permission prompt and a seat waiting to be asked a
+              question is a seat that has stopped
   --yolo      the default, said out loud — useful only to override a
-              QB_SEAT_YOLO=0 you have exported
+              QB_SEAT_INITIAL_CMD you have exported
   --add       add one seat to an already-running screen and reflow
   --kill      kill the screen
   list        the screens that are up — number, name, seats, repo — newest
@@ -170,13 +224,17 @@ Environment:
                       it once and leaves nothing running
   QB_SEATS_TOP_ANIMATE 0 to write the top line straight out rather than
                       decrypting it into place
-  QB_SEAT_YOLO        0 to give the seats their permission prompts back
-  QB_SEAT_AGENT       the agent binary a seat runs, instead of \`claude\`
-  QB_SEAT_SCOPE       what the seats are called after — \`seat-<scope>-<n>\`.
-                      Defaults to the repository's directory name, which is what
-                      makes two screens on two projects able to both number from
-                      1; set it when two screens share ONE repository, or set it
-                      empty for the machine-wide numbering this had before
+  QB_SEAT_INITIAL_CMD the line typed into each seat, default \`$SEAT_CMD_DEFAULT\`.
+                      Set it EMPTY for panes that come up as bare shells and
+                      nothing else. It is typed into an interactive shell, so an
+                      alias or a function of your own works — and it may carry a
+                      prompt: QB_SEAT_INITIAL_CMD='$SEAT_CMD_DEFAULT -- /get-involved'
+                      is a screen that comes up claiming work. --cmd is the same
+                      answer for one invocation, and wins
+  QB_SEATS_PACE       off, warn (default) or obey — what a screen does when the
+                      shared subscription's window is spent. warn says so and
+                      starts anyway; obey brings the seats up as bare shells and
+                      starts nothing; off does not consult qb-pace at all
 
 The seat bar is a second status line above the seats, one clickable cell per
 seat: the name jumps to that pane, the ✕ closes it after a y/n, and ＋ adds one.
@@ -260,8 +318,8 @@ board_cmd() {
 # this is a second pane and not a swap of QB_SEATS_BOARD.
 #
 # Set QB_SEATS_DASH to the empty string for a screen with no dash at all. Same
-# spelling as qb-seat's QB_SEAT_BRIEF, and for the same reason: `${VAR+set}` so
-# that empty means "none" and unset means "pick for me".
+# spelling as QB_SEAT_INITIAL_CMD, and for the same reason: `${VAR+set}` so that
+# empty means "none" and unset means "pick for me".
 #
 # The INSTALLED dash is preferred over anything in a checkout, and that is not a
 # style preference. The packaged one carries its own interpreter — the whole point
@@ -837,10 +895,10 @@ install_top() {
   # One knob for "do not ask about the subscription", not two: QB_SEATS_PACE=off
   # already silences the estimate this script prints, and it means the same thing
   # here.
-  # An `if` and not `[ … ] && …`, which is seat_env_fill's warning one function
-  # along: a trailing AND-list whose test is false is a failing command, and this
-  # script runs under `set -e`.
-  if [ "${QB_SEATS_PACE:-on}" = off ]; then
+  # An `if` and not `[ … ] && …`: a trailing AND-list whose test is false is a
+  # failing command, and this script runs under `set -e`.
+  pace_resolve
+  if [ "$PACE_MODE" = off ]; then
     tmux set-option -t "$SESSION_ID:" @qb_top_pace 0
   fi
 
@@ -913,7 +971,7 @@ install_top() {
 # serves both without a second spelling.
 
 # `${VAR+set}` and not `${VAR:-}`, the same spelling as QB_SEATS_DASH and
-# qb-seat's QB_SEAT_BRIEF, and for the same reason: EMPTY MEANS NONE and unset
+# QB_SEAT_INITIAL_CMD, and for the same reason: EMPTY MEANS NONE and unset
 # means pick for me. Those are different answers here — a user whose terminal or
 # whose emacs wants C-q asks for no key at all with `QB_SEATS_KEY=`, and a `-n`
 # test would read that as "not answered" and bind the default over the top of the
@@ -1320,43 +1378,88 @@ type_into() {
 #
 # --staged is the equivalent of zellij's `start_suspended`, and better: the
 # command is typed but not entered, so it can be read, edited, or abandoned.
+# EMPTY MEANS TYPE NOTHING, and that is an answer rather than a gap: a seat whose
+# initial command is empty comes up as the shell the pane already holds, which is
+# what QB_SEAT_INITIAL_CMD= asks for and what QB_SEATS_PACE=obey falls back to.
+# The pane is built either way — the line is the only difference between a seat
+# with an agent in it and a seat without one.
 start_seat() {
-  local pane=$1 n=$2 enter=1
+  local pane=$1 enter=1
+  [ -n "$INITIAL_CMD" ] || return 0
   [ "$STAGED" -eq 1 ] && enter=0
-  # The bare name when the pane's shell will find it, which is the ordinary case
-  # and keeps the command line in the pane readable. Otherwise the absolute path
-  # resolved by require_qb_seat — see there for who is short of a PATH.
-  type_into "$pane" "$SEAT_CMD $n" "$enter"
+  type_into "$pane" "$INITIAL_CMD" "$enter"
 }
 
-SEAT_CMD="qb-seat"      # what start_seat types; require_qb_seat may absolutise it
-
-# PATH is the wrong and only question this used to ask, and --add is where that
-# broke. The ＋ on the seat bar reaches this through `run-shell`, whose PATH is
-# the TMUX SERVER's — and the server is usually one that was already running for
-# something else, long before anything put the harness on a PATH. So the ＋ died
-# here with "qb-seat is not on PATH", and `run-shell -b` throws stderr away, so
-# the button simply did nothing. Measured, not guessed.
+# WHAT A SEAT IS TOLD, in precedence order, and every layer is an explicit answer
+# rather than a fallback: --cmd (or the two flags that are sugar for it) beats an
+# exported QB_SEAT_INITIAL_CMD, which beats the built-in default.
 #
-# qb-seat, qb-seats and qb-seat-click install into one directory together, so a
-# sibling of $0 is a better answer than PATH and is always available. PATH still
-# wins when it has one, so an installed copy beats a checkout.
-require_qb_seat() {
-  SEAT_CMD=$(beside_me qb-seat)
-  [ -x "$SEAT_CMD" ] || die \
-    "qb-seat is neither on PATH nor beside this script (looked at $SEAT_CMD)"
-  # Typed into a pane, the bare name is nicer to read and equivalent whenever
-  # the pane's own shell can resolve it.
-  command -v qb-seat >/dev/null 2>&1 && SEAT_CMD="qb-seat"
+# `${VAR+set}` and not `${VAR:-}`, which is the distinction the whole knob turns
+# on: an EMPTY QB_SEAT_INITIAL_CMD asks for a bare shell and is the one value a
+# `:-` test cannot express, because it reads as "unset" and hands the pane the
+# default instead. That exact bug had a name in the version of this file that
+# forwarded QB_SEAT_BRIEF, and it is worth keeping the spelling that avoided it.
+resolve_initial_cmd() {
+  [ -n "$INITIAL_CMD_SET" ] && return 0
+  if [ -n "${QB_SEAT_INITIAL_CMD+set}" ]; then
+    INITIAL_CMD=$QB_SEAT_INITIAL_CMD
+    INITIAL_CMD_SET=env
+  else
+    INITIAL_CMD=$SEAT_CMD_DEFAULT
+    INITIAL_CMD_SET=default
+  fi
   return 0
+}
+
+# THE SAME QUESTION FOR --add, with one more place to look and a different order.
+#
+# A seat added to a running screen should be the seat that screen is made of, and
+# --add cannot read the environment the screen was BUILT in — the ＋ on the bar
+# reaches this through `run-shell`, whose environment is the tmux SERVER's, which
+# usually predates the screen. So the build records its answer on the session as
+# `@qb_initial_cmd` and this reads it back. That is also why the recording is not
+# an `-e` on the session environment, which is how the seat knobs travelled before
+# #540: an environment variable is inherited by the pane's shell, where the user's
+# own rc can see it and a `claude` started by hand would pick it up, while a tmux
+# option is read by the screen's own tooling and by nothing else.
+#
+# THE SCREEN BEATS THE ENVIRONMENT HERE, WHICH THE BUILD PATH REVERSES, and the
+# asymmetry is the point rather than an inconsistency. At build time an exported
+# QB_SEAT_INITIAL_CMD is the only thing that has spoken. By --add time the screen
+# has, deliberately and in front of somebody — `qb-seats --cmd …` — and an export
+# is as likely to be ambient as chosen: put it in an rc file, as this fleet does
+# with several of these, and every ＋ afterwards would quietly add a seat unlike
+# the ones beside it. The two failures are not the same size. Ignoring an export
+# is visible in the pane a second later and `--cmd` is the unambiguous way to say
+# it; an ambient one silently making one seat different is the kind of thing
+# nobody finds.
+#
+# So: --cmd, then the screen, then an export, then the default.
+#
+# UNSET AND EMPTY ARE DIFFERENT HERE, and tmux can tell them apart: `show-options
+# -v` on an option that was never set exits 1 ("invalid option"), while one set to
+# the empty string exits 0 and prints nothing. Measured on 3.6a. So a screen built
+# by this version always answers — including "bare shells", which is a real answer
+# — and only a screen built by a qb-seats older than this option falls through to
+# the environment and the default. Without that distinction `--add` onto a screen
+# of bare shells would start an agent nobody asked for.
+inherit_initial_cmd() {
+  local recorded
+  [ -n "$INITIAL_CMD_SET" ] && return 0
+  if recorded=$(tmux show-options -t "$SESSION_ID:" -v @qb_initial_cmd 2>/dev/null); then
+    INITIAL_CMD=$recorded
+    INITIAL_CMD_SET=screen
+    return 0
+  fi
+  resolve_initial_cmd
 }
 
 # Absolute paths for the two scripts the bar shells out to, resolved HERE rather
 # than left to PATH. A tmux server usually predates the screen running in it, so
-# a `run-shell` inherits whatever PATH started the server — the same trap the
-# seat_env forwarding below exists for, one layer along. PATH first so an
-# installed copy wins over a checkout; this script's own directory as the
-# fallback, because the three install together.
+# a `run-shell` inherits whatever PATH started the server — the same trap
+# `@qb_initial_cmd` is recorded on the session to avoid, one layer along. PATH
+# first so an installed copy wins over a checkout; this script's own directory as
+# the fallback, because the three install together.
 beside_me() {
   local name=$1 found
   found=$(command -v "$name" 2>/dev/null) && { printf '%s' "$found"; return; }
@@ -1371,21 +1474,20 @@ beside_me() {
 # fleet's only hard ceiling was somebody noticing a bar go red — and this command
 # is the moment that matters most and the moment nobody is looking at the dash.
 #
-# IT WARNS AND PROCEEDS, ALWAYS. A human bringing up a screen has already decided
-# to spend; what helps is a prediction rather than a refusal — what these N seats
-# cost, against what is left and when it comes back. The refusal lives one layer
-# down in qb-seat, off by default, for the panes with nobody in front of them
-# (QB_SEAT_PACE=obey).
+# IT WARNS AND PROCEEDS BY DEFAULT. A human bringing up a screen has already
+# decided to spend; what helps is a prediction rather than a refusal — what these
+# N seats cost, against what is left and when it comes back. QB_SEATS_PACE=obey is
+# the opt-in that acts on it; see pace_gate below.
 #
-# Printed here rather than left to the seats, because a pane execs its agent
-# moments later and the agent's own screen paints over anything printed before
-# it. This is the terminal that stays.
+# Printed here rather than left to the seats, because a pane's agent paints over
+# anything printed before it. This is the terminal that stays.
 #
 # QB_SEATS_PACE=off silences it — and is how a test avoids reading the developer's
 # real subscription.
 pace_note() {
   local bin line
-  [ "${QB_SEATS_PACE:-on}" = off ] && return 0
+  pace_resolve
+  [ "$PACE_MODE" = off ] && return 0
   bin=$(beside_me qb-pace)
   # An older or partial install has no qb-pace. That is not a reason to refuse to
   # build a screen; it is a screen built without the estimate, as before.
@@ -1408,77 +1510,109 @@ pace_note() {
   return 0
 }
 
-# ---- the knobs qb-seat reads ------------------------------------------------
-# qb-seat's own knobs have to be forwarded explicitly. A pane's environment comes
-# from the tmux SERVER, and the server is usually one that was already running
-# for something else — so `QB_SEAT_AGENT=... qb-seats` would otherwise set a
-# variable in this process that no seat ever sees, and start the real agent while
-# reporting nothing wrong. Found exactly that way: a smoke test meant to run a
-# harmless stand-in launched two live agent sessions instead.
+# ONE KNOB FOR BOTH HALVES, and the old spelling keeps its meaning. This used to
+# be two: QB_SEATS_PACE=on|off silenced the estimate here, and QB_SEAT_PACE=
+# warn|obey|off decided whether qb-seat refused to start a pane. Two knobs a
+# character apart, governing one question, in two files — so this takes the plural
+# one and grows the vocabulary onto it. `off` is exactly what it was, which is what
+# every caller and every test that sets it means; `on` is accepted as the old
+# spelling of the default and reads as `warn`.
 #
-# This list is exactly the set qb-seat READS, and test_forwarded_knobs_are_all_read
-# pins it that way. Forwarding a name qb-seat does not read is the same silent
-# failure one layer along: the variable arrives in the pane, nothing consults it,
-# and the seat starts the real agent while reporting nothing wrong. That is how
-# QB_SEAT_AGENT_ARGS got here — qb-seat takes agent arguments positionally, so no
-# such variable was ever read — and how this list said QB_SEAT_AGENT while qb-seat
-# said QB_SEAT_CLAUDE, which is board finding 3632.
+# ANSWERED ONCE AND REMEMBERED, because a bad value is reported and there are
+# three callers: the estimate, the gate, and the top line's "do not ask about the
+# subscription" flag. Recomputing would print the complaint three times for one
+# typo, which is how a message worth reading becomes noise to skip.
 #
-# --yolo/--no-yolo are not a fourth mechanism, they are this one with the value
-# supplied here: the flags set the variable qb-seat already reads, so a flag and
-# an exported QB_SEAT_YOLO cannot diverge in behaviour and there is one thing to
-# test. Neither flag given leaves the variable alone entirely — an unset variable
-# is how qb-seat is told "not answered", and answering it here with a default of
-# our own would be a second place for the default to live and drift.
-#
-# THE PREDICATE MIRRORS HOW qb-seat READS EACH NAME, which is not the same test for
-# all of them. qb-seat takes QB_SEAT_BRIEF with `${QB_SEAT_BRIEF+set}` so that
-# set-and-empty means "no brief at all" and unset means "use the built-in one" —
-# those are different answers, and only the first can ask for a waiting seat. A
-# `-n` test here cannot express it: it drops the empty value, nothing arrives in
-# the pane, qb-seat sees unset, and the seat starts on the full brief while
-# reporting nothing wrong. That is the same silent failure the build path already
-# warns about twice, arriving through the forwarder instead of past it.
-#
-# The other three are read with `${VAR:-}`, where empty and unset are the same
-# answer, so `-n` is the honest test for them and forwarding an empty value would
-# only add a variable that says nothing.
-#
-# QB_SEAT_SCOPE goes with QB_SEAT_BRIEF and not with those three, for exactly the
-# same reason: qb-seat reads it with `${QB_SEAT_SCOPE+set}` because empty is the
-# one value that asks for the machine-wide seat numbering it had before #208, and
-# a `-n` test here would drop that request on the floor and give the screen the
-# per-project default it was told not to use.
-#
-# NOTHING IS FORWARDED WHEN IT IS UNSET, which is the whole default: the panes are
-# created with `-c "$REPO"`, so each seat derives the same scope from its own cwd
-# that this screen would have computed for it. A default written out here as well
-# would be a second place for it to live and drift.
-#
-# THIS IS A FUNCTION BECAUSE BOTH PATHS NEED IT, and for a while only one had it.
-# `up` puts the list on the SESSION, so every pane split off later inherits it;
-# --add puts the same list on the one pane it creates, with -e, so it does not
-# rewrite the session under the seats already working in it. But
-# `QB_SEAT_BRIEF= qb-seats --add` onto a screen built without one is the same
-# request as `QB_SEAT_BRIEF= qb-seats`, and a predicate written out in only one of
-# the two places is the same silent failure in half the cases. One list, one set of
-# tests, both callers.
-seat_env=()
-seat_env_fill() {
-  local v
-  seat_env=()
-  [ -n "$YOLO" ] && QB_SEAT_YOLO="$YOLO"
-  for v in QB_SEAT_AGENT QB_SEAT_FORCE QB_SEAT_PACE QB_SEAT_YOLO; do
-    [ -n "${!v:-}" ] && seat_env+=(-e "$v=${!v}")
-  done
-  [ -n "${QB_SEAT_BRIEF+set}" ] && seat_env+=(-e "QB_SEAT_BRIEF=$QB_SEAT_BRIEF")
-  [ -n "${QB_SEAT_SCOPE+set}" ] && seat_env+=(-e "QB_SEAT_SCOPE=$QB_SEAT_SCOPE")
-  # Said out loud, because the last test is allowed to be false and this script
-  # runs under `set -e`: a function whose final command is a failed `[` returns 1,
-  # and a bare call to it would then take the whole screen down.
+# IT SETS A GLOBAL RATHER THAN PRINTING ONE, and that is the whole reason it is
+# shaped like this. A bad value is reported, and there are three callers — the
+# estimate, the gate, and the top line's "do not ask about the subscription" flag
+# — so the complaint has to be made once for one typo or it is noise to skip. A
+# function that printed the mode would be called as `$(pace_mode)`, which is a
+# SUBSHELL: the memo would be set in a process that exits on the next line and
+# every caller would warn again. So the answer lands in PACE_MODE and callers read
+# it there.
+PACE_MODE=""
+pace_resolve() {
+  if [ -z "$PACE_MODE" ]; then
+    case "${QB_SEATS_PACE:-warn}" in
+      off)       PACE_MODE=off ;;
+      obey)      PACE_MODE=obey ;;
+      # `on` is the spelling this knob had while it governed the estimate alone,
+      # and it meant "not off" — which is what warn is.
+      warn|on)   PACE_MODE=warn ;;
+      *)  # Named, not guessed at silently: a mode this does not know is a typo in
+          # the one variable that decides whether a screen spends the last of a
+          # shared window, and reading it as the strict answer would be a screen
+          # that mysteriously starts nothing.
+          warn "QB_SEATS_PACE=${QB_SEATS_PACE} is not off, warn or obey — read as warn"
+          PACE_MODE=warn ;;
+    esac
+  fi
   return 0
 }
 
+# WHAT A SPENT WINDOW COSTS A SCREEN: the agents, not the panes.
+#
+# The refusal this replaces lived in qb-seat and refused to create the PANE
+# (exit 4). That was the right instinct aimed at the wrong object — a pane costs
+# nothing, and refusing somebody a terminal because a subscription window is spent
+# is a refusal they can only work around by not using this script. What actually
+# spends the window is the agent, so that is what is withheld: the seats come up as
+# bare shells, the top line says why, and typing the command yourself is one line
+# away if you disagree.
+#
+# So `obey` is no longer "you may not have a screen"; it is "this screen does not
+# start agents right now", which is what it was always trying to say.
+#
+# A SCREEN OF BARE SHELLS IS NOT GATED AT ALL. With an empty initial command there
+# is no agent to withhold, so the gate has nothing to act on and does not consult
+# qb-pace — which also means the test suite's screens never read the developer's
+# real subscription just because they left the mode at its default.
+#
+# 3 IS `hold`, AND ONLY 3. A timeout (124), a broken install, an `unknown` — every
+# one of those means the gate did not run rather than that it passed, and none of
+# them withholds anything. That is the deliberate direction here and the opposite
+# of qb-start's: a screen a human is standing in front of, told the window is
+# spent, is a human who can decide; #244's rule is about the unattended path.
+pace_gate() {
+  local bin line status
+  [ -n "$INITIAL_CMD" ] || return 0
+  pace_resolve
+  [ "$PACE_MODE" = obey ] || return 0
+  bin=$(beside_me qb-pace)
+  [ -x "$bin" ] || return 0
+  if command -v timeout >/dev/null 2>&1; then
+    line=$(timeout 20 "$bin" --gate 2>/dev/null) || status=$?
+  else
+    line=$("$bin" --gate 2>/dev/null) || status=$?
+  fi
+  status=${status:-0}
+  [ -n "$line" ] && warn "$line"
+  [ "$status" = 3 ] || return 0
+  warn "QB_SEATS_PACE=obey and the shared window is spent, so these seats come up as
+       bare shells. The line above says when it comes back; type ${INITIAL_CMD} in a
+       pane to start one anyway, or QB_SEATS_PACE=warn to build the screen as usual."
+  INITIAL_CMD=""
+  INITIAL_CMD_SET=paced
+  return 0
+}
+
+# ---- nothing to forward any more (#540) -------------------------------------
+# A block of forwarding lived here, and its removal is most of what this change
+# is. `qb-seat` read five variables of its own — QB_SEAT_AGENT, QB_SEAT_BRIEF,
+# QB_SEAT_SCOPE, QB_SEAT_YOLO, QB_SEAT_FORCE — and none of them could reach a pane
+# by itself: a pane's environment comes from the tmux SERVER, usually one that was
+# already running for something else, so each had to be put on the session with
+# `-e` and each had to be read with the right one of `${VAR+set}` and `${VAR:-}`
+# depending on whether empty was an answer for it. Getting that wrong was silent
+# in both directions, and it went wrong twice.
+#
+# One value replaced all five, and it does not travel this way at all: the initial
+# command is recorded on the session as `@qb_initial_cmd` (see the build) and read
+# back by `--add`. A tmux option is the better carrier for exactly the reason the
+# forwarding was fragile — it is read by this screen's own tooling and by nothing
+# else, where an environment variable is inherited by every shell in every pane
+# and by whatever the user starts in one.
 # ---- args -------------------------------------------------------------------
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -1486,8 +1620,14 @@ while [ $# -gt 0 ]; do
     -C) REPO=${2:-}; shift 2 ;;
     -s) SESSION=${2:-}; shift 2 ;;
     --staged) STAGED=1; shift ;;
-    --yolo) YOLO=1; shift ;;
-    --no-yolo) YOLO=0; shift ;;
+    # `$# -ge 2` and not `-n "${2:-}"`: `--cmd ''` is a screen of bare shells and
+    # is the one value that has to survive being asked for explicitly, which a
+    # non-empty test would drop on the floor and answer with the default.
+    --cmd)
+      [ $# -ge 2 ] || die "--cmd needs a command line (--cmd '' for bare shells)"
+      INITIAL_CMD=$2; INITIAL_CMD_SET=flag; shift 2 ;;
+    --yolo) INITIAL_CMD=$SEAT_CMD_DEFAULT; INITIAL_CMD_SET=flag; shift ;;
+    --no-yolo) INITIAL_CMD=$SEAT_CMD_PROMPTS; INITIAL_CMD_SET=flag; shift ;;
     --add)  ACTION="add";  shift ;;
     --kill) ACTION="kill"; shift ;;
     # Bare words, and the `--` spellings too, because a user who has just learnt
@@ -1596,10 +1736,23 @@ fi
 
 if [ "$ACTION" = add ]; then
   have_session || die "no session $SESSION — start it with $PROG first"
-  require_qb_seat
-  # Highest seat number in use, plus one — not a count, so a seat whose pane was
-  # closed does not hand its number to the next one and collide on the board.
-  next=$(seat_panes | awk '{ n = $2 + 0; if (n > m) m = n } END { print m + 1 }')
+  # THE LOWEST FREE NUMBER, and it may be one a closed seat used to have.
+  #
+  # This was max+1, to stop a reused number reaching the board as the old agent
+  # coming back: the number was half of `seat-<repo>-<n>`, so handing seat 2's
+  # name to a new pane made the board's returning-key rule give it seat 2's
+  # identity. Since #540 the number is a pane option that never leaves this box
+  # and the board keys on the session id, so the collision it guarded against
+  # cannot happen — and "close seat 2 of 4, add one, get seat 2 back" is what
+  # somebody opening and closing panes actually wants. It also keeps the row's
+  # numbering dense, which max+1 stopped doing after the first close.
+  #
+  # sort -n over the numbers in use, then walk from 1 for the first gap; awk's
+  # END prints max+1 when there is no gap, which is the old behaviour on a screen
+  # nobody has closed a seat in.
+  next=$(seat_panes | awk '{ print $2 + 0 }' | sort -n \
+    | awk 'BEGIN { want = 1 } { if ($1 > want) exit; if ($1 == want) want++ }
+           END { print want }')
   # Reflow the seat ROW only: -E spreads the target pane and its neighbours. The
   # board was split off full-width, so even-horizontal on the whole window would
   # fold it back into the row. This is the tmux answer to zellij's
@@ -1609,14 +1762,11 @@ if [ "$ACTION" = add ]; then
   # pane-base-index says, and a config setting it to 1 — a common one — leaves
   # every `.0` target failing with "can't find pane: 0".
   first_seat=$(seat_panes | awk 'NR == 1 { print $1 }')
-  # A pane inherits the SESSION environment as it is created, so a seat added to a
-  # screen built with the same knobs already has them and this adds nothing.
-  # Passing one to --add is the other case: -e scopes it to the pane being added
-  # rather than rewriting the session under the seats already working in it. The
-  # list and the predicate are seat_env_fill's, deliberately — see the note there
-  # for why writing them out a second time here is how QB_SEAT_BRIEF got dropped
-  # from this path.
-  seat_env_fill
+  # What this seat is told: what the screen was built with, unless this call says
+  # otherwise. Resolved BEFORE the pane is split, so a pace refusal costs the
+  # command rather than the pane — see pace_gate.
+  inherit_initial_cmd
+  pace_gate
   # The dash is in the row `select-layout -E` is about to spread, so note its width
   # now and put that back afterwards. Nothing about the WINDOW is changing, so the
   # width it has right this second is the right answer — including one the user set
@@ -1626,18 +1776,11 @@ if [ "$ACTION" = add ]; then
   dash=$(dash_pane)
   dash_was=""
   [ -z "$dash" ] || dash_was=$(tmux display-message -p -t "$dash" '#{pane_width}')
-  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO" \
-    ${seat_env[@]+"${seat_env[@]}"})
+  pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO")
   tmux set-option -p -t "$pane" @qb_seat "$next"
-  # Recorded as well as forwarded, and see the note by the session-wide one: the
-  # variable tells the SEAT what it is called, this tells everything that reads
-  # the screen from outside — and --add scopes it to the pane it just made, for
-  # the same reason its -e list is scoped there.
-  [ -z "${QB_SEAT_SCOPE+set}" ] \
-    || tmux set-option -p -t "$pane" @qb_scope "$QB_SEAT_SCOPE"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   [ -z "$dash_was" ] || dash_resize "$dash_was"
-  start_seat "$pane" "$next"
+  start_seat "$pane"
   printf '%s: added seat %s to %s\n' "$PROG" "$next" "$SESSION"
   exit 0
 fi
@@ -1649,8 +1792,9 @@ if have_session; then
   exit 0
 fi
 
-require_qb_seat
+resolve_initial_cmd
 pace_note
+pace_gate
 
 # QB_SEATS_DASH_SIZE reaches `split-window -l` and `resize-pane -x` verbatim, so it
 # is checked here, where nothing exists yet. `QB_SEATS_DASH_SIZE=78px` makes
@@ -1714,9 +1858,6 @@ esac
 # a fourth seat does not fit at all. tmux resizes to the client on attach, which is
 # the whole reason dash_hooks exists.
 #
-# The knobs the seats need come from seat_env_fill — read the note there before
-# changing the list or the tests that pin it.
-seat_env_fill
 # -P -F, because THE NAME TMUX MAKES IS NOT ALWAYS THE NAME IT WAS ASKED FOR, and
 # every `-t` below addresses the session exactly (`=$SESSION`) — so a rename tmux
 # does quietly turns the very next command into a fatal "no such session", with the
@@ -1746,7 +1887,7 @@ SESSION_ASKED=$SESSION
 # a space in it still arrives whole.
 _created=$(tmux new-session -d -P -F '#{session_id} #{session_name}' -s "$SESSION" \
   -n seats -c "$REPO" -x "$WINDOW_COLS" -y "$WINDOW_ROWS" \
-  -e QB_SEATS=1 -e FLEET_NO_MOTD=1 ${seat_env[@]+"${seat_env[@]}"})
+  -e QB_SEATS=1 -e FLEET_NO_MOTD=1)
 # CHECKED ON THE SHAPE, not by comparing the two halves. `${_created%% *}` and
 # `${_created#* }` both return the whole string when there is no space in it, so
 # "they came back different" reads as "there were two fields" — except for a
@@ -1785,21 +1926,17 @@ tmux set-option -w -t "$SESSION_ID:seats" pane-border-format \
 SELF=$(beside_me qb-seats)
 tmux set-option -t "$SESSION_ID:" @qb_repo "$REPO"
 
-# THE SCOPE IS RECORDED AS WELL AS FORWARDED, and the two are for different
-# readers. The variable tells the seat what to call itself; this tells whatever
-# reads the screen from OUTSIDE which board identity a pane holds — the dashboard
-# joins `zeus/seat-lexray-1` to a tmux pane, and `@qb_repo` alone answers for the
-# default scope only. Two screens on ONE repository with different scopes is the
-# case the knob exists for, and it is exactly the case the repository cannot
-# distinguish (#208).
+# WHAT THIS SCREEN IS MADE OF, recorded on the screen, for `--add` and the bar's
+# ＋ to read back — see inherit_initial_cmd for why neither can be told any other
+# way. ALWAYS set, including to the empty string: "these are bare shells" is an
+# answer, and the only thing that must never happen is a later `--add` mistaking it
+# for "nobody said" and starting an agent on a screen built without one.
 #
-# Only when a scope was actually given. Unset means the seats derive the default
-# from their own cwd, which `@qb_repo` already says — and an explicitly EMPTY one
-# is indistinguishable from unset in a tmux format, which costs nothing: an empty
-# scope asks for machine-wide numbering, in which no second screen can hold the
-# same seat number for a reader to confuse it with.
-[ -z "${QB_SEAT_SCOPE+set}" ] \
-  || tmux set-option -t "$SESSION_ID:" @qb_scope "$QB_SEAT_SCOPE"
+# A tmux option and not a session `-e`, which is how the knobs it replaces
+# travelled. An option is read by this screen's own tooling; an environment
+# variable is inherited by every pane's shell and by whatever a human starts in
+# one, which is a wider blast radius than the value needs.
+tmux set-option -t "$SESSION_ID:" @qb_initial_cmd "$INITIAL_CMD"
 tmux set-option -t "$SESSION_ID:" @qb_seats_bin "$SELF"
 
 # The bar is opt-out because turning it on is not free: it takes over the status
@@ -1942,7 +2079,10 @@ fi
 # whose loss is silent, because an empty pane under a border reading 'dash' looks
 # like a dashboard that has not drawn yet.
 [ -z "$DASH_CMD" ] || type_into "$dash" "$DASH_CMD"
-while read -r pane n; do start_seat "$pane" "$n"; done < <(seat_panes)
+# Every seat gets the same line — see the header on why that is the design and not
+# an omission. `n` is read and unused: seat_panes prints the number beside the pane
+# and the number is no longer part of what a seat is told.
+while read -r pane _; do start_seat "$pane"; done < <(seat_panes)
 
 # awk rather than `head -1`, which would close the pipe under `set -o pipefail`
 # and abort the script on SIGPIPE just as the screen finished building.

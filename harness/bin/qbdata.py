@@ -522,104 +522,28 @@ def clip(s: str | None, n: int) -> str:
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
-#: How a seat spells itself on the board: `seat-<scope>-<n>`, where the scope is
-#: the project the seat sits in and is what stops two screens on one machine both
-#: wanting seat 1 (#208). The scope is optional because a seat whose scope slugged
-#: away to nothing — or that was deliberately started with an empty QB_SEAT_SCOPE —
-#: keeps the bare `seat-<n>` this had before, and the dashboard must go on
-#: recognising those.
-#:
-#: The NUMBER is the last hyphenated field, not the first: a scope may contain
-#: hyphens of its own, and `seat-nix-fleet-3` is seat 3 of nix-fleet rather than
-#: anything about `nix`. The bound is qb-seat's own 1-99.
-SEAT_RE = re.compile(r"^seat-(?:(.+)-)?([1-9][0-9]?)$")
-
-#: The most of `seat-<scope>-<n>` a scope may take, mirroring SEAT_SCOPE_MAX in
-#: qb-seat: the board allows 40 characters and `seat-`, a hyphen and two digits
-#: account for the other eight.
-SCOPE_MAX = 32
-
-
-def _seat(holder: str | None) -> "re.Match[str] | None":
-    """The seat match for a board identity, on the name half of `machine/name`."""
-    if not holder:
-        return None
-    return SEAT_RE.match(holder.rsplit("/", 1)[-1])
-
-
-def seat_number(holder: str | None) -> int | None:
-    """1 for 'zeus/seat-lexray-1' and for 'zeus/seat-1'.
-
-    None for anything that is not a seat.
-    """
-    match = _seat(holder)
-    return int(match.group(2)) if match else None
-
-
-def seat_machine(holder: str | None) -> str | None:
-    """'zeus' for 'zeus/seat-lexray-1'. None for anything that is not a seat.
-
-    The board is the FLEET's, not this box's: two machines can each hold a
-    `seat-lexray-1`, so the machine half is part of what identifies a seat and
-    leaving it out shows a remote agent's state against a local pane.
-    """
-    if _seat(holder) is None:
-        return None
-    machine, sep, _ = (holder or "").partition("/")
-    return machine if sep else None
-
-
-def seat_scope(holder: str | None) -> str | None:
-    """'lexray' for 'zeus/seat-lexray-1'.
-
-    None for 'zeus/seat-1', which is a seat numbered across the whole machine,
-    and None for anything that is not a seat at all. The two cases are told
-    apart by :func:`seat_number`, which answers for the first and not the second.
-    """
-    match = _seat(holder)
-    return match.group(1) if match else None
-
-
-def slug_scope(text: str | None) -> str | None:
-    """Turn a requested scope into the one a seat will actually carry.
-
-    MIRRORS `seat_scope_slug` in qb-seat, and is pinned to it by
-    test_the_scope_rule_is_the_one_qb_seat_actually_applies — two implementations
-    of one rule is exactly how a dashboard ends up showing one seat's state
-    against another seat's pane. Case folding is ASCII-only for the same reason:
-    qb-seat folds with `tr '[:upper:]' '[:lower:]'`, which is bytes, where
-    str.lower() is Unicode.
-    """
-    if not text:
-        return None
-    lowered = "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
-    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")[:SCOPE_MAX].rstrip("-")
-    return slug or None
-
-
-def scope_of(repo_path: str | None) -> str | None:
-    """The scope qb-seat gives a seat working in ``repo_path`` and told nothing else.
-
-    The default half of the rule: a seat is named after its repository's own
-    directory.
-    """
-    return slug_scope(os.path.basename((repo_path or "").rstrip("/")))
-
-
-def pane_scope(seat: dict) -> str | None:
-    """The scope of the seat in a tmux pane, or None when the pane cannot say.
-
-    `@qb_scope` first, because a screen given an explicit QB_SEAT_SCOPE is the one
-    case the repository cannot answer for: two screens on ONE repository, which is
-    precisely what that knob exists for. `@qb_repo` otherwise, which is the default
-    the seat itself computed from its cwd.
-
-    An explicitly EMPTY scope reads here as "the pane cannot say", and that is the
-    right answer rather than a gap: an empty scope asks for the machine-wide seat
-    numbering, in which a second screen cannot hold the same number at all — so
-    there is never a second candidate for the caller to confuse it with.
-    """
-    return slug_scope(seat.get("scope")) or scope_of(seat.get("repo"))
+# ---- a seat is a pane, and a pane says which agent is in it (#540) ----------
+#
+# A vocabulary lived here for parsing `seat-<scope>-<n>` back out of a board
+# identity — SEAT_RE, seat_number, seat_machine, seat_scope, slug_scope, scope_of
+# and pane_scope, plus a test pinning its slug rule byte-for-byte against the one
+# `qb-seat` applied. All of it existed to answer one question: which tmux pane is
+# this board row sitting in?
+#
+# The board answers that itself and always did. `GET /active` returns a `session`
+# for every agent, and `qb-hook` stamps that same session id on the pane it is
+# running in (`@qb_session`, at SessionStart) — which is how the ✕ on the seat bar
+# has been ending the right agent since long before this. So the join is an
+# equality on the session id, and every one of those helpers went with the seat
+# name that made them necessary.
+#
+# It is also a better answer than the one it replaces, which had to narrow three
+# times and could still come back ambiguous: two screens on one box could each
+# hold a seat 1 (#208), two machines on the fleet could each hold a seat-lexray-1,
+# and the second narrowing was against a GUESS at this host's board name. A
+# session id is unique across all of it by construction — and a pane running an
+# agent this screen did not start now resolves too, where a name-derived seat
+# number could only ever see agents that had called themselves seats.
 
 
 class BoardConfig:
@@ -654,7 +578,7 @@ class BoardConfig:
 def resolve_config() -> BoardConfig:
     """Environment first, then the per-host config file.
 
-    The same contract qb-seat implements in bash, and read the same way: the
+    The same contract `qb-env` implements in bash, and read the same way: the
     config is an unrestricted shell script, so it is SOURCED IN A SUBSHELL with
     three values read back out. Sourcing it into this process would let it
     replace anything it liked; parsing it with a regex would get the quoting
@@ -2831,7 +2755,10 @@ def dials_url(cfg, repo: str | None = None) -> str:
 # ones whose agent has exited and left a shell behind. Only the second can be
 # closed with a click.
 
-SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "repo", "scope")
+#: ``agent`` is the CONVERSATION in the pane (`@qb_session`), where ``session`` is
+#: the tmux session the pane is in. Two different things one word away from each
+#: other, so both are spelled out wherever they are read.
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "agent")
 
 
 def tmux_seats() -> list[dict]:
@@ -2841,14 +2768,16 @@ def tmux_seats() -> list[dict]:
     them and the only handle that survives a pane being added or closed — the
     index shifts and the agent rewrites the title.
 
-    `@qb_repo` and `@qb_scope` come back with it because `list-panes -a` is the
-    whole SERVER and not this screen: since #208 two screens can each have a seat
-    1, so the number alone no longer says which board identity a pane is. Both are
-    set on the SESSION (or, for `--add`, on the pane) and formats resolve a user
-    option up through the hierarchy, so every pane of a screen answers for its own
-    screen. Either can be empty — `@qb_scope` whenever the screen was not given an
-    explicit one, `@qb_repo` on a screen built by a qb-seats old enough not to set
-    it — which is why the dashboard falls back to matching on the number.
+    `@qb_session` comes back with it, and it is what joins a pane to the board.
+    `qb-hook` stamps the agent's session id there at SessionStart, and `/active`
+    returns that same id for every live agent, so :meth:`seat_state` is a dict
+    lookup rather than the three-way narrowing this needed while a pane could only
+    be identified through the agent's NAME (#540).
+
+    It is empty for a pane holding no agent — a seat someone closed the agent in,
+    a screen of bare shells, a pane whose agent predates the stamp — and that is a
+    state worth showing rather than a gap: those are exactly the seats free to be
+    given something to do.
 
     Returns [] rather than raising when there is no tmux, no server, or no
     screen: the dashboard runs inside the screen most of the time and in a bare
@@ -2859,8 +2788,7 @@ def tmux_seats() -> list[dict]:
         return []
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
-                     "pane_current_command", "pane_current_path", "@qb_repo",
-                     "@qb_scope"))
+                     "pane_current_command", "pane_current_path", "@qb_session"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
@@ -3259,8 +3187,8 @@ def pace_line(verdict: dict) -> str:
     """The verdict on one line, in one place.
 
     Shared rather than formatted at each call site for the same reason
-    `limit_cells` is: `qb-pace` prints this, `qb-seat` prints this before it
-    starts an agent, and two spellings of one judgement is how a fleet ends up
+    `limit_cells` is: `qb-pace` prints this, `qb-seats` prints this before it
+    starts a screen, and two spellings of one judgement is how a fleet ends up
     arguing with itself about whether it is allowed to spend.
     """
     out = f"pace: {verdict['verdict'].upper()} — {verdict['reason']}"

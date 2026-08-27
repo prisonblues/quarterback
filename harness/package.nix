@@ -43,8 +43,6 @@ stdenvNoCC.mkDerivation {
   # so need PATH — the second of those is a refusal a brief is told to obey, and a
   # `command not found` that a brief reads as "fine, carry on" is the failure it
   # was written to stop (#340);
-  # `qb-seat`, which a multiplexer layout names as the command for each pane —
-  # a layout is data on another machine, so it can only refer to it by name;
   # `qb-board`, which is a thing a human types on a headless box, which is
   # the whole point of it existing; `qb-reconcile`, which a systemd timer names
   # as its ExecStart, for the same reason as the layout; `qb-doctor`, which is

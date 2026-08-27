@@ -204,7 +204,7 @@ sandbox_env(){  # sandbox_env <box>   — exports into the calling subshell
     export XDG_CACHE_HOME="$box/home/.cache"
     export CLAUDE_CONFIG_DIR="$box/home/.claude"
     export QUARTERBACK_CONFIG="$box/home/no-such-quarterback-config"
-    export QB_SEAT_PACE=off
+    export QB_SEATS_PACE=off
 }
 
 run_create(){   # run_create <repo> <branch>

@@ -535,13 +535,12 @@ class Dash(App):
         # client had already made.
         self.board: dict = {}
         self.seats: list[dict] = []           # the seat PANES, off tmux
-        # (machine, scope, seat number) -> the board's live agent. All three,
-        # because neither of the first two is enough on its own: `list-panes -a` is
-        # the whole tmux server and since #208 two screens can each hold a seat 1,
-        # and the BOARD is the whole fleet, where two machines can each hold a
-        # `seat-lexray-1`. Keyed on the number alone, one of those overwrites the
-        # other and a pane is shown a state that belongs to something else.
-        self.seat_states: dict[tuple[str | None, str | None, int], dict] = {}
+        # session id -> the board's live agent, which is the id the pane carries
+        # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
+        # number) while a pane could only be identified through the agent's name,
+        # and all three were needed because none of them was unique on its own
+        # (#540).
+        self.seat_states: dict[str, dict] = {}
         self.prs: list[dict] = []
         # The derived review queue, kept for the same reason as `board`: `s`
         # redraws from it, and it rides the gh clock so a re-fetch on a toggle
@@ -830,8 +829,20 @@ class Dash(App):
             # is tmux's answer (is a process there); `state` is the agent's own.
             agent = self.seat_state(s)
             word, style = qd.agent_state(agent)
-            scope = qd.pane_scope(s)
-            label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
+            # WHICH SCREEN, when there is more than one — off the tmux session
+            # name, which is what tmux calls that screen and what `qb-seats
+            # resume` takes. It was the seat's board SCOPE, which had to be
+            # derived from two pane options that existed to carry it; the screen
+            # itself has always known its own name (#540).
+            #
+            # Minus the `seats-` that `qb-seats` puts on the front of its default
+            # name, which every screen on a box shares and so distinguishes none
+            # of them — dropping it is what keeps this cell reading `quarterback 1`
+            # rather than `seats-qu…` in the thirteen columns it has.
+            screen_name = s["session"]
+            if screen_name.startswith("seats-") and len(screen_name) > 6:
+                screen_name = screen_name[6:]
+            label = f"{screen_name} {s['seat']}" if len(screens) > 1 \
                 else f"seat {s['seat']}"
             key = table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
@@ -994,6 +1005,20 @@ class Dash(App):
                        key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
         agents, elsewhere = qd.in_scope(every, self.scope)
 
+        # WHICH OF THESE ARE IN A PANE IN FRONT OF YOU. It marks the rows a click
+        # can jump to and counts them beside the fleet's total, and it is the same
+        # `@qb_session` join the SEATS panel makes — an agent is a seat here if its
+        # conversation is in one of this box's seat panes.
+        #
+        # That reads slightly differently from the seat NAME it replaces, and more
+        # honestly: `seat-lexray-1` on another machine used to count towards this
+        # box's "3 seats" and highlight a row no click could reach (#540).
+        #
+        # `self.seats` is filled by the SEATS worker on its own clock, so on the
+        # first board tick of a fresh dashboard this is empty and nothing is marked.
+        # It fills within seconds, and it is the same trade `seat_states` makes below
+        # for the same reason: two panels, two workers, one join between them.
+        here = {s.get("agent") for s in getattr(self, "seats", []) if s.get("agent")}
         head = self.query_one("#head", Static)
         if data.get("error"):
             head.update(Text(f"● board unreachable — {qd.clip(data['error'], 60)}",
@@ -1004,7 +1029,7 @@ class Dash(App):
             # "7 live · quarterback" next to a table holding two would be the one
             # place on this pane where the scope makes something read falsely — and
             # what is hidden is on FLEET's own title, which is where it belongs.
-            seats = sum(1 for a in agents if qd.seat_number(a.get("holder")))
+            seats = sum(1 for a in agents if a.get("session") in here)
             head.update(Text(f"● {self.cfg.base_url}   {len(agents)} live · {seats} seats"
                              f"   {self.scope.label()}", style="green"))
 
@@ -1012,11 +1037,14 @@ class Dash(App):
         table.clear()
         for i, a in enumerate(agents):
             key = f"agent:{i}"
-            seat = qd.seat_number(a.get("holder"))
+            # Not "is this agent a seat" — that is not a property of an agent any
+            # more. It is "is this row in a pane in front of you", which is what
+            # the styling is actually for: these are the rows a click can jump to.
+            in_pane = a.get("session") in here
             who = (a.get("holder") or "?").split("/", 1)[-1]
             word, style = qd.agent_state(a)
             key = table.add_row(
-                Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
+                Text(qd.clip(who, 13), style="bold green" if in_pane else "bold"),
                 Text(word or "—", style=style),
                 # What `state` cannot say: `working` reads the same writing the
                 # first cut and coming out of the third review round, and so do
@@ -1030,7 +1058,7 @@ class Dash(App):
                 Text(qd.scope_mark(self.scope, a.get("repo"))
                      + qd.clip(a.get("title") or a.get("branch") or "—",
                                40 if self.scope.column else 50),
-                     style="white" if seat else "grey70"),
+                     style="white" if in_pane else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
             ).value
@@ -1051,9 +1079,11 @@ class Dash(App):
         # pane belonging to another project's screen is on that panel either way, and
         # narrowing here would leave its `state` cell reading `—` — which is how a
         # reader sees which seat is waiting on them.
+        # Keyed on the SESSION id, which is what the pane carries. An agent with no
+        # session is dropped rather than filed under "": a pane with no agent looks
+        # up the empty string, and a bucket there would answer it with somebody.
         self.seat_states = {
-            (qd.seat_machine(a.get("holder")), qd.seat_scope(a.get("holder")), n): a
-            for a in every if (n := qd.seat_number(a.get("holder"))) is not None}
+            s: a for a in every if (s := a.get("session"))}
 
         claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
         ctable = self.query_one("#claims", DataTable)
@@ -1638,35 +1668,25 @@ class Dash(App):
     def seat_state(self, seat: dict) -> dict:
         """What the board says about the agent in this pane, or {}.
 
-        NARROW, THEN NARROW AGAIN, AND NEVER GUESS. Start from every agent with
-        this seat number; keep the ones in this pane's project, then the ones on
-        this machine; take the survivor only if there is exactly one. Each step is
-        skipped when it would leave nothing, which is what lets a pane that cannot
-        say which project it is in — a screen built before `@qb_repo` — still match
-        the only agent answering to its number.
+        ONE LOOKUP, ON THE SESSION ID. The pane carries `@qb_session` — the
+        conversation `qb-hook` stamped on it — and every agent `/active` returns
+        carries the same id, so the two sides join exactly.
 
-        Both narrowings earn their place, and one of them is why this is not just a
-        dict lookup. `list-panes -a` is the whole tmux server, so since #208 one box
-        holds `zeus/seat-lexray-1` and `zeus/seat-nix-fleet-1` at once; and the
-        BOARD is the whole fleet, so `zeus/seat-lexray-1` and `laptop/seat-lexray-1`
-        are both on it. Either collision, resolved by taking the first, is a wrong
-        answer that looks exactly like a right one.
+        This used to narrow three times and could still answer nothing. It started
+        from every agent whose NAME parsed to this pane's seat number, kept the
+        ones whose project matched, then the ones on this machine, and took the
+        survivor only if exactly one was left. Both narrowings were needed and
+        neither was sound: `list-panes -a` is the whole tmux server, so two screens
+        could each hold a seat 1 (#208); the board is the whole fleet, so two
+        machines could each hold a `seat-lexray-1`; and the machine half was a
+        GUESS at this host's board name, which comes from the token map and need
+        not be the hostname. A session id has none of those problems, and a pane
+        running an agent nobody named a seat resolves too (#540).
 
-        The machine is this host's name as the harness reads it, which is a GUESS —
-        the board's machine name comes from the token map and need not be the
-        hostname. It can only ever narrow a set that was already ambiguous, so a
-        wrong guess costs the state cell and never fills it in with the wrong agent.
+        Empty `agent` — a pane with no agent in it — matches nothing, which is the
+        answer: the state cell stays blank because there is no state.
         """
-        try:
-            number = int(seat["seat"])
-        except (KeyError, TypeError, ValueError):
-            return {}
-        here = getattr(self.cfg, "agent", None)
-        found = [(k, a) for k, a in self.seat_states.items() if k[2] == number]
-        scope = qd.pane_scope(seat)
-        found = [c for c in found if c[0][1] == scope] or found
-        found = [c for c in found if c[0][0] == here] or found
-        return found[0][1] if len(found) == 1 else {}
+        return self.seat_states.get(seat.get("agent") or "", {})
 
     def seat_session(self) -> str | None:
         """Which screen to act on: the one the seats are in, not the cursor's.
@@ -1716,9 +1736,9 @@ class Dash(App):
     def jump_pane(self, seat: dict) -> None:
         """Move the tmux cursor to a seat's pane, by pane id.
 
-        By ID and not by seat number, because this row already knows the pane —
-        jump_to_seat's search over `list-panes -a` is for the FLEET table, whose
-        rows come off the board and only carry a holder name.
+        By ID, because this row already knows the pane — jump_to_agent's search
+        over `list-panes -a` is for the FLEET table, whose rows come off the board
+        and know a session id rather than a pane.
         """
         pane = seat.get("pane")
         if not pane or not os.environ.get("TMUX"):
@@ -1778,8 +1798,9 @@ class Dash(App):
         conclusion was still wrong: a review in a window is a review you go and
         find later, and the reason to click a PR here rather than open it on
         GitHub is to watch the thing happen. run_in_pane keeps it out of the
-        seat machinery — see @qb_label there. It runs the agent the same way
-        qb-seat does: the brief positionally, after `--`.
+        seat machinery — see @qb_label there. It runs the agent with its brief
+        positionally, after `--`, so a prompt beginning with `-` is read as a
+        prompt rather than as a flag.
         """
         number = pr.get("number")
         # The same refusal the ⚒ on an issue row makes, for the same reason and
@@ -2088,9 +2109,8 @@ class Dash(App):
         self.say(f"'{name}' is in the seat row — Ctrl-b x closes it")
 
     def click_agent(self, agent: dict) -> None:
-        seat = qd.seat_number(agent.get("holder"))
-        if seat is not None and self.jump_to_seat(seat, qd.seat_scope(agent.get("holder"))):
-            self.say(f"jumped to seat {seat} — {agent.get('holder')}")
+        if self.jump_to_agent(agent.get("session")):
+            self.say(f"jumped to {agent.get('holder')}")
             return
         self.say(
             f"{agent.get('holder')} · {agent.get('model') or '?'} · "
@@ -2098,37 +2118,30 @@ class Dash(App):
             f"{agent.get('cwd') or '?'}"
         )
 
-    def jump_to_seat(self, seat: int, scope: str | None = None) -> bool:
-        """Move the tmux cursor to the pane wearing @qb_seat = seat.
+    def jump_to_agent(self, session: str | None) -> bool:
+        """Move the tmux cursor to the pane this agent's conversation is in.
 
-        `scope` says which screen, and it has to: a FLEET row carries a board
-        identity, two screens can each have a seat 1 (#208), and jumping to
-        whichever tmux listed first is a jump to the wrong project half the time.
-        Narrowed and never guessed, exactly as seat_state does it — a screen too
-        old to carry `@qb_repo` still gets a working click when it is the only
-        candidate, and two panes that cannot be told apart get none.
+        ON THE SESSION ID, which the pane carries as `@qb_session` — so a click on
+        a FLEET row lands on the right pane or on none, with nothing to narrow and
+        nothing to guess. It used to jump by seat NUMBER parsed out of the holder's
+        name, which meant a screen had to be picked between: two screens can each
+        have a seat 1 (#208), so the click went to the wrong project about half the
+        time until a scope was threaded through to break the tie (#540).
 
-        No machine to narrow on here, and none wanted: every pane tmux lists is on
-        this box by definition.
-
-        Tab-separated, not space: `@qb_repo` is a filesystem path and a directory
-        with a space in it made the previous split return four fields, which matched
-        no seat at all.
+        A FLEET row for an agent on another machine simply matches no pane here,
+        which is the honest answer and the same one it gave before.
         """
-        if not os.environ.get("TMUX"):
+        if not session or not os.environ.get("TMUX"):
             return False
         try:
             out = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F",
-                 "#{pane_id}\t#{@qb_seat}\t#{@qb_repo}\t#{@qb_scope}"],
+                ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{@qb_session}"],
                 capture_output=True, text=True, timeout=5,
             ).stdout
         except Exception:                          # noqa: BLE001
             return False
         found = [p for p in (line.split("\t") for line in out.splitlines())
-                 if len(p) == 4 and p[1] == str(seat)]
-        found = [p for p in found
-                 if qd.pane_scope({"repo": p[2], "scope": p[3]}) == scope] or found
+                 if len(p) == 2 and p[1] == session]
         pane = found[0][0] if len(found) == 1 else None
         if pane is None:
             return False

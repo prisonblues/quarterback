@@ -223,15 +223,14 @@ async def _drive() -> list[str]:
     app.render_dials = lambda *a, **k: None
 
     opened: list[int] = []
-    jumped: list[int] = []
+    jumped: list[str | None] = []
     app.open_pr = lambda pr: (opened.append(pr.get("number")),
                               app.say(f"opened #{pr.get('number')}"))[1]
-    # `scope` too, and not as decoration: `jump_to_seat` grew a second parameter
-    # when seat identity became per-project (#208), and this stub did not — so
-    # every run of this test died on a TypeError from inside the lambda rather
-    # than on anything it asserts. A stub of a real method has to keep that
-    # method's signature or it stops standing in for it.
-    app.jump_to_seat = lambda seat, scope=None: (jumped.append(seat), True)[1]
+    # THE STUB HAS TO KEEP THE REAL METHOD'S SIGNATURE. It did not when
+    # `jump_to_seat` grew a scope parameter (#208), and every run of this test then
+    # died on a TypeError from inside the lambda rather than on anything it
+    # asserts. It takes a session id now (#540) and takes only that.
+    app.jump_to_agent = lambda session: (jumped.append(session), True)[1]
 
     failures: list[str] = []
     async with app.run_test(size=(80, 44)) as pilot:
@@ -1727,11 +1726,14 @@ def test_with_no_seat_row_to_join_a_review_still_gets_somewhere():
     assert not any("split-window" in c for c in calls), calls
 
 
-# ---- two screens on one machine (#208) ---------------------------------------
+# ---- joining a pane to the board, on the session id (#540) -------------------
 #
-# `list-panes -a` is the whole tmux server, so since seats became per-project the
-# dashboard sees two seat 1s and has to tell them apart. Everything below is
-# synchronous: it exercises the joins, not the widgets, and does not need a pilot.
+# `list-panes -a` is the whole tmux server and the board is the whole fleet, so a
+# seat NUMBER identified a pane in neither: two screens can each hold a seat 1
+# (#208) and two machines can each hold a `seat-lexray-1`. The pane carries the
+# conversation in it instead, and the board returns the same id, so this is one
+# lookup. Everything below is synchronous: it exercises the join, not the widgets,
+# and does not need a pilot.
 
 
 def _dash():
@@ -1739,93 +1741,170 @@ def _dash():
 
 
 def _agents(*holders):
-    return {"agents": [{"holder": h, "state": "working", "reported": None}
+    """A board answer. The session is derived from the holder so a test can name
+    the one it means without a second table to keep in step."""
+    return {"agents": [{"holder": h, "session": f"sess-{h}",
+                        "state": "working", "reported": None}
                        for h in holders], "claims": []}
 
 
 def _stated(app, **seat):
     """A pane record as tmux_seats returns one, filled in only where it matters."""
-    return app.seat_state({"pane": "%0", "repo": "", "scope": "", **seat})
+    return app.seat_state({"pane": "%0", "agent": "", **seat})
 
 
-def test_a_seat_pane_is_matched_to_its_own_screens_agent():
-    """The number alone is no longer a name. Matching on it shows one screen's
-    agent against the other screen's pane — a wrong answer that looks exactly
-    like a right one."""
+def _seat_labels(app, seats):
+    """The label cell SEATS draws for each pane, without a pilot.
+
+    `render_seats` writes into a DataTable, so the labels are read back off the
+    stub's calls rather than off a widget — this is about which words it chooses,
+    which the panel's own driver above does not assert on.
+    """
+    written: list = []
+
+    class Table:
+        def clear(self, *a, **k): pass
+
+        def add_row(self, *cells, key=None, **k):
+            written.append([str(getattr(c, "plain", c)) for c in cells])
+            return SimpleNamespace(value=key)
+
+    app.query_one = lambda sel, *a, **k: Table() if sel == "#seats" else _Sink()
+    app.render_seats(seats)
+    # Minus the ＋, which render_seats appends as a row of its own so the panel can
+    # be driven by the mouse alone. It is not a seat and has no label to assert on.
+    return [row[2] for row in written[:len(seats)]]
+
+
+def test_one_screen_calls_a_pane_what_the_bar_and_the_border_call_it():
+    """`seat 1`, in the three places a human reads it. Renaming it here when there
+    is nothing to disambiguate would be a third spelling for one thing."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
-                       ("zeus", "nix-fleet", 1): {"holder": "zeus/seat-nix-fleet-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
-        == "zeus/seat-lexray-1"
-    assert _stated(app, seat="1", repo="/home/rich/nix-fleet")["holder"] \
-        == "zeus/seat-nix-fleet-1"
+    labels = _seat_labels(app, [{"pane": "%0", "seat": "1", "session": "seats-lexray",
+                                 "agent": "", "command": "bash", "path": "/x"}])
+    assert labels[0] == "seat 1"
 
 
-def test_two_screens_on_one_repository_are_told_apart_by_the_scope_they_were_given():
-    """The case QB_SEAT_SCOPE exists for, and the one @qb_repo cannot answer."""
+def test_two_screens_are_told_apart_by_the_screen_they_are_in():
+    """More than one screen on the server means more than one seat 1, so the number
+    stops being a name.
+
+    It was the seat's board SCOPE, carried on two pane options that existed to
+    derive it. The screen has always known its own tmux name, and `qb-seats resume`
+    takes that same name — minus the `seats-` prefix its own default naming puts on
+    every screen, which distinguishes none of them and costs six of the thirteen
+    columns this cell has (#540).
+    """
     app = _dash()
-    app.seat_states = {("zeus", "review", 1): {"holder": "zeus/seat-review-1"},
-                       ("zeus", "build", 1): {"holder": "zeus/seat-build-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="review")["holder"] \
-        == "zeus/seat-review-1"
-    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="build")["holder"] \
-        == "zeus/seat-build-1"
+    labels = _seat_labels(app, [
+        {"pane": "%0", "seat": "1", "session": "seats-lexray", "agent": "",
+         "command": "bash", "path": "/x"},
+        {"pane": "%1", "seat": "1", "session": "qbseats", "agent": "",
+         "command": "bash", "path": "/y"},
+    ])
+    assert labels == ["lexray 1", "qbseats 1"]
 
 
-def test_another_machines_seat_is_not_shown_against_a_local_pane():
-    """The board is the whole FLEET, so `zeus/seat-lexray-1` and
-    `laptop/seat-lexray-1` are both on it and the scope cannot separate them."""
+def test_a_seat_pane_is_matched_to_the_agent_whose_session_it_holds():
+    """The join that replaced three narrowings and a guess.
+
+    Two panes, both seat 1, on two screens of one box — the #208 collision that
+    made a number useless as a name. Their sessions differ, so nothing has to be
+    told apart.
+    """
     app = _dash()
-    app.cfg = SimpleNamespace(agent="zeus")
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
-                       ("laptop", "lexray", 1): {"holder": "laptop/seat-lexray-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
-        == "zeus/seat-lexray-1"
-
-    # The machine is the harness's guess at this host's board name, and it may be
-    # wrong. Then the set stays ambiguous and the cell stays empty — a wrong guess
-    # costs the state, it never fills it in with somebody else's agent.
-    app.cfg = SimpleNamespace(agent="not-this-host")
-    assert _stated(app, seat="1", repo="/home/rich/lexray") == {}
+    app.seat_states = {"sess-lex": {"holder": "zeus/thorn-sumac"},
+                       "sess-nix": {"holder": "zeus/amber-otter"}}
+    assert _stated(app, seat="1", agent="sess-lex")["holder"] == "zeus/thorn-sumac"
+    assert _stated(app, seat="1", agent="sess-nix")["holder"] == "zeus/amber-otter"
 
 
-def test_a_screen_too_old_to_say_its_repo_still_matches_when_it_can():
-    """@qb_repo is newer than @qb_seat. One agent with that number is not a
-    guess; two is, and a coin toss is the bug this join exists to avoid."""
+def test_another_machines_agent_is_not_shown_against_a_local_pane():
+    """The board is the whole FLEET. Two machines could each hold a seat of the
+    same name, and the old join broke that tie on a GUESS at this host's board
+    name — narrowing that cost the state cell whenever the guess was wrong. A
+    session id is unique across the fleet, so there is no tie and no guess."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
-    assert _stated(app, seat="1")["holder"] == "zeus/seat-lexray-1"
-
-    app.seat_states[("zeus", "nix-fleet", 1)] = {"holder": "zeus/seat-nix-fleet-1"}
-    assert _stated(app, seat="1") == {}
+    app.seat_states = {"sess-here": {"holder": "zeus/thorn-sumac"},
+                       "sess-there": {"holder": "laptop/cedar-flint"}}
+    assert _stated(app, seat="1", agent="sess-here")["holder"] == "zeus/thorn-sumac"
 
 
-def test_a_pane_with_no_agent_on_the_board_is_not_given_someone_elses():
+def test_a_pane_with_no_agent_in_it_gets_no_state_rather_than_someone_elses():
+    """A seat holding a bare shell — closed agent, or a screen built with an empty
+    initial command — carries an empty @qb_session. It must not collide with an
+    agent the board could not attribute either."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
-    assert _stated(app, seat="2", repo="/home/rich/lexray") == {}
-    assert _stated(app, seat="", repo="/home/rich/lexray") == {}
+    app.seat_states = {"sess-lex": {"holder": "zeus/thorn-sumac"}}
+    assert _stated(app, seat="2", agent="") == {}
+    assert _stated(app, seat="2") == {}
 
 
-def test_the_fleet_table_stashes_a_seat_under_its_machine_and_project():
-    """render_board is what fills seat_states, and the key it uses is the join."""
+def test_an_agent_the_board_lists_without_a_session_is_not_filed_at_all():
+    """`""` is what a pane with no agent looks up, so a bucket under it would
+    answer that pane with somebody else's agent."""
+    app = _dash()
+    app.query_one = lambda *a, **k: _Sink()
+    app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
+    app.render_board({"agents": [{"holder": "zeus/thorn-sumac", "session": None,
+                                  "state": "working", "reported": None}],
+                      "claims": []})
+    assert app.seat_states == {}
+    assert _stated(app, seat="1", agent="") == {}
+
+
+def test_the_fleet_table_stashes_every_agent_under_its_session():
+    """render_board is what fills seat_states, and the key it uses is the join.
+
+    Every agent, not only the ones that named themselves a seat: a pane running a
+    session this screen did not start resolves now, where a name-derived seat
+    number could never have seen it.
+    """
     app = _dash()
     app.query_one = lambda *a, **k: _Sink()
     # The header line names the board, and there is not one configured in CI.
     app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
-    app.render_board(_agents("zeus/seat-lexray-1", "laptop/seat-lexray-1",
-                             "zeus/seat-3", "zeus/amber-otter"))
-    assert set(app.seat_states) == {("zeus", "lexray", 1), ("laptop", "lexray", 1),
-                                    ("zeus", None, 3)}
+    app.render_board(_agents("zeus/thorn-sumac", "laptop/cedar-flint",
+                             "zeus/amber-otter"))
+    assert set(app.seat_states) == {"sess-zeus/thorn-sumac",
+                                    "sess-laptop/cedar-flint",
+                                    "sess-zeus/amber-otter"}
+
+
+def test_the_seat_count_is_the_agents_sitting_in_a_pane_on_this_box():
+    """"3 live · 1 seats" is about panes a click can reach.
+
+    It counted holders whose NAME parsed as a seat, so an agent called
+    `seat-lexray-1` on another machine counted towards this box's total and
+    highlighted a row no click could land on.
+    """
+    app = _dash()
+    said: list[str] = []
+    app.query_one = lambda *a, **k: _Sink(said)
+    app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
+    app.seats = [{"pane": "%0", "seat": "1", "agent": "sess-zeus/thorn-sumac"},
+                 {"pane": "%1", "seat": "2", "agent": ""}]
+    app.render_board(_agents("zeus/thorn-sumac", "laptop/cedar-flint"))
+    assert any("2 live · 1 seats" in t for t in said), said
 
 
 class _Sink:
     """Every widget render_board reaches for, doing nothing. The join is what is
-    under test here; the widgets have their own pilot-driven tests above."""
+    under test here; the widgets have their own pilot-driven tests above.
+
+    `said` collects what was written to it, for the one test whose subject is the
+    header text rather than a join. Optional, so every other call site stays the
+    bare `_Sink()` it was."""
 
     row_count = 0
 
-    def update(self, *a, **k): pass
+    def __init__(self, said: list | None = None) -> None:
+        self.said = said
+
+    def update(self, *a, **k):
+        if self.said is not None and a:
+            self.said.append(str(getattr(a[0], "plain", a[0])))
+
     def clear(self, *a, **k): pass
 
     def add_row(self, *a, key=None, **k):
@@ -1838,16 +1917,16 @@ class _Sink:
         return SimpleNamespace(value=key)
 
 
-def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
-    """A FLEET row carries a board identity. Jumping to whichever pane tmux
-    listed first is a jump to the wrong project half the time."""
+def test_a_fleet_click_jumps_to_the_pane_holding_that_conversation(monkeypatch):
+    """A FLEET row carries a board identity and a session id, and the pane carries
+    the same session id. Two panes both called seat 1 need no telling apart."""
     module = _load_app()
     # Built BEFORE the stub goes in: Dash.__init__ shells out to git for the repo
     # slug, and `module.subprocess` is the stdlib module itself, so patching .run
     # on it patches it for every caller in the process.
     app = module.Dash(interval=3600, gh_interval=3600)
     monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
-    panes = ["%0\t1\t/home/rich/lexray\t", "%9\t1\t/home/rich/nix-fleet\t"]
+    panes = ["%0\tsess-lex", "%9\tsess-nix"]
     selected: list[str] = []
 
     class Done:
@@ -1861,30 +1940,32 @@ def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
         return Done()
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert app.jump_to_seat(1, "nix-fleet") is True
+    assert app.jump_to_agent("sess-nix") is True
     assert selected == ["%9"]
 
-    # No scope to match and more than one candidate: no jump rather than a guess.
+    # An agent on another machine, or one whose pane has gone: no jump, and the
+    # caller falls through to printing what it knows about the row.
     selected.clear()
-    assert app.jump_to_seat(1, None) is False
+    assert app.jump_to_agent("sess-elsewhere") is False
     assert selected == []
 
-    # One candidate and nothing to match it on: the click still works.
-    panes[:] = ["%0\t1\t\t"]
-    assert app.jump_to_seat(1, "lexray") is True
-    assert selected == ["%0"]
+    # A row the board could not attribute a session to asks tmux nothing at all.
+    assert app.jump_to_agent(None) is False
+    assert app.jump_to_agent("") is False
+    assert selected == []
 
 
-def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
-    """The pane list is tab-separated because @qb_repo is a filesystem path — a
-    space-split returned three fields and matched no seat at all."""
+def test_a_pane_holding_no_agent_is_never_jumped_to(monkeypatch):
+    """Every bare shell on the box answers `@qb_session` with the empty string, so
+    a lookup that did not guard the empty case would match all of them, find more
+    than one candidate, and — with exactly one seat open — jump to it."""
     module = _load_app()
     app = module.Dash(interval=3600, gh_interval=3600)      # before the stub; see above
     monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
     selected: list[str] = []
 
     class Done:
-        stdout = "%4\t2\t/home/rich/my repos/lexray\t\n"
+        stdout = "%4\t\n"
 
     def fake_run(argv, **kw):
         if "select-pane" in argv:
@@ -1892,8 +1973,8 @@ def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
         return Done()
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert app.jump_to_seat(2, "lexray") is True
-    assert selected == ["%4"]
+    assert app.jump_to_agent("") is False
+    assert selected == []
 
 
 # ---- one number, two repos (#209) --------------------------------------------

@@ -250,13 +250,20 @@ def sandbox_env(tmp_path: Path, *dirs: os.PathLike | str,
       only one of the two override points is covered by the other;
     * the result is asserted to name no path outside `tmp_path` for any of them.
 
-    `QB_SEAT_PACE=off` is a default here for the reason `test_qb_seat.py:165-181`
-    already gives at length: `warn` is the shipped default, it starts `qb-pace`
-    beside whatever is under test, and `qb-pace` reads the developer's own
-    subscription and calls the usage endpoint. PATH cannot make it absent —
-    `qb-seat`'s `pace_cmd` falls back to `${0%/*}/qb-pace`, which resolves inside
-    `harness/bin` however bare the PATH is — so the knob is the only seam. A test
-    that is ABOUT the gate sets it back through `over`.
+    `QB_SEATS_PACE=off` is a default here because `warn` is the shipped default,
+    it starts `qb-pace` beside whatever is under test, and `qb-pace` reads the
+    DEVELOPER'S OWN subscription and calls the usage endpoint. PATH cannot make it
+    absent — `qb-seats` finds `qb-pace` through `beside_me`, which falls back to
+    `${0%/*}/qb-pace` and so resolves inside `harness/bin` however bare the PATH is
+    — so the knob is the only seam. A test that is ABOUT the pacing sets it back
+    through `over`.
+
+    It was `QB_SEAT_PACE` (singular) until #540, which is a variable nothing reads
+    any more: the estimate and the gate are one knob now and it is the plural one.
+    A stale name here would be a guard that silently stopped guarding, and the
+    failure — a suite quietly reading a real subscription — is invisible in a green
+    run, which is why `test_path_sandbox.py` asserts the name and not just the
+    behaviour.
 
     `inherit_path=True` keeps the ambient PATH (with `dirs` in front of it). It is
     for the suites whose subject is the real tools cooperating with a STUB board —
@@ -279,7 +286,7 @@ def sandbox_env(tmp_path: Path, *dirs: os.PathLike | str,
         "CLAUDE_CONFIG_DIR": str(home / ".claude"),
         # Deliberately absent, and named so the assertion below can say so.
         "QUARTERBACK_CONFIG": str(home / "no-such-quarterback-config"),
-        "QB_SEAT_PACE": "off",
+        "QB_SEATS_PACE": "off",
     })
     if inherit_path:
         # Empty entries dropped rather than joined through: an empty PATH element
@@ -324,7 +331,7 @@ def sandbox_env(tmp_path: Path, *dirs: os.PathLike | str,
     #: The names this function set itself, which are the only credential-shaped
     #: ones allowed to survive — plus whatever the caller asked for by name,
     #: which is a decision it made rather than one it inherited.
-    ours = {*HOME_VARS, "QUARTERBACK_CONFIG", "QB_SEAT_PACE", *over}
+    ours = {*HOME_VARS, "QUARTERBACK_CONFIG", "QB_SEATS_PACE", *over}
     leaked = sorted(k for k in env
                     if k.startswith(CREDENTIAL_PREFIXES) and k not in ours)
     assert not leaked, f"{leaked} was inherited from the developer's shell"
