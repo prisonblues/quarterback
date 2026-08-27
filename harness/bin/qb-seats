@@ -1352,6 +1352,26 @@ seat_panes() {
     | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
 }
 
+# THE SAME THING OVER THE WHOLE SESSION, and the difference is a pane that is not
+# in the seat window right now.
+#
+# `seat_panes` is deliberately window-scoped: its other callers want the seats of
+# the ROW — the reflow target, the pane to select, the build loop — and a pane
+# parked somewhere else is not in the row. Seat NUMBERING is the one question
+# where that is the wrong set, because a number is unique across the screen rather
+# than across the window, and a pane can leave the window without giving its number
+# up: `break-pane -d` into a holding window is how the qb key hides the tape and the
+# dash today, and #517 is about doing exactly that to a seat.
+#
+# It costs nothing today, because nothing parks a seat yet. It stops the lowest-free
+# rule below from handing a new seat the number of a parked one the moment something
+# does — which the old max+1 rule was accidentally immune to, and which would put two
+# panes on one number where the ✕, the jump and the restore all take the first match.
+seat_panes_anywhere() {
+  tmux list-panes -s -t "$SESSION_ID" -F '#{pane_id} #{@qb_seat}' \
+    | awk '$2 != "" { print $1, $2 }' | sort -k2 -n
+}
+
 # TYPE a line into a pane's shell. -l, because send-keys looks its argument up as a
 # KEY NAME first and only falls back to literal text: a QB_SEATS_DASH of `Enter`,
 # `Space`, `Tab` or `BSpace` would be sent as that key rather than typed, and one
@@ -1763,7 +1783,10 @@ if [ "$ACTION" = add ]; then
   # sort -n over the numbers in use, then walk from 1 for the first gap; awk's
   # END prints max+1 when there is no gap, which is the old behaviour on a screen
   # nobody has closed a seat in.
-  next=$(seat_panes | awk '{ print $2 + 0 }' | sort -n \
+  #
+  # OVER THE WHOLE SESSION, not the seat row — see seat_panes_anywhere. A number is
+  # unique per screen, and a pane can be outside the row while still holding one.
+  next=$(seat_panes_anywhere | awk '{ print $2 + 0 }' | sort -n \
     | awk 'BEGIN { want = 1 } { if ($1 > want) exit; if ($1 == want) want++ }
            END { print want }')
   # Reflow the seat ROW only: -E spreads the target pane and its neighbours. The

@@ -750,6 +750,29 @@ def test_add_fills_the_hole_a_closed_seat_left(screen):
     assert sorted(n for _, n in panes(screen) if n) == ["1", "2", "3"]
 
 
+def test_a_seat_parked_outside_the_row_keeps_its_number(screen):
+    """A number is unique per SCREEN, not per window.
+
+    `break-pane -d` into a holding window is how the qb key hides the tape and the
+    dash, and #517 is about doing it to a seat — the pane leaves the row without
+    giving its number up. The lowest-free rule reads the whole session for exactly
+    that reason: reading the row alone would hand the parked seat's number to a new
+    pane, and then the ✕, the jump and the restore all take whichever match tmux
+    lists first.
+
+    The old max+1 rule was accidentally immune to this, so the guard arrives with
+    the rule that needs it rather than with the feature that will.
+    """
+    screen("-n", "3")
+    parked = next(pid for pid, n in panes(screen) if n == "2")
+    screen.tmux("break-pane", "-d", "-s", parked, "-t", "t:", "-n", "qb-hidden")
+    # Gone from the row, still on the screen, still wearing its number.
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3"]
+    screen("--add")
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3", "4"], \
+        "seat 2 is parked, not free"
+
+
 def test_add_still_appends_when_the_row_has_no_hole(screen):
     """The dense case is the ordinary one, and it is unchanged: the lowest free
     number on a screen nobody has closed a seat in IS the next one up."""
