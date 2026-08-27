@@ -684,14 +684,27 @@ seat_bar() {
 "$(key_hint)"
 }
 
-# One binding for every widget on the bar, because tmux delivers every
+# One binding for every widget on BOTH status lines, because tmux delivers every
 # status-line click to MouseDown1Status and the widget is only distinguishable
 # by #{mouse_status_range}. Three things are load-bearing here:
 #
 #   * A key table is SERVER-wide, so this fires in the user's other sessions
-#     too. @qb_bar is set only on ours, so everywhere else the first condition
-#     is false and the click falls through to `switch-client -t =` — which is
+#     too. @qb_bar is set only on ours, so everywhere else the condition is
+#     false and the click falls through to `switch-client -t =` — which is
 #     verbatim what tmux binds by default. Nothing else on the box changes.
+#
+#     IT IS THE SCREEN THAT IS TESTED AND NOT THE LINE. This used to add
+#     `#{==:#{mouse_status_line},#{@qb_bar}}`, which was true of the seat bar and
+#     of nothing else — so when the ⛶ went onto line 0 it drew, registered its
+#     range, and fell through to `switch-client -t =` on every click. A widget
+#     that renders and does nothing is the worst way for one to fail, and it is
+#     the second time this bar has failed exactly that way.
+#
+#     The line test was never the right question: `status 2` and BOTH
+#     `status-format` indices are set below, so every range on either line of one
+#     of our screens is one we put there. Which widget was hit is the range's
+#     job to say and qb-seat-click's to decide — it exits 0 on a range it does
+#     not own, and on the empty range a click off any widget produces.
 #   * The range is stashed in @qb_click while the mouse event is still live.
 #     confirm-before runs its command afterwards, by which point
 #     #{mouse_status_range} expands to nothing — the stash is what survives.
@@ -733,7 +746,7 @@ install_bar() {
   inner="if-shell -F \"#{m:kill*,#{mouse_status_range}}\" \"$confirm\" \"$run\""
 
   tmux bind-key -n MouseDown1Status \
-    if-shell -F '#{&&:#{!=:#{@qb_bar},},#{==:#{mouse_status_line},#{@qb_bar}}}' \
+    if-shell -F '#{!=:#{@qb_bar},}' \
       "$stash ; $inner" \
       'switch-client -t ='
 }

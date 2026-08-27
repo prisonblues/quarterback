@@ -71,6 +71,16 @@ and a control for the pane down the right-hand side would be the exception a rea
 learn. It is not confirmed, unlike the ✕: nothing is killed, no process is touched, and the
 same click puts it back.
 
+Being the first widget on a line that never had one cost the mouse binding a rewrite.
+`MouseDown1Status` gated on `#{==:#{mouse_status_line},#{@qb_bar}}` — true of the seat bar,
+line 1, and of nothing else — so the ⛶ drew, registered its range, and fell through to
+`switch-client -t =` on every click. Both halves had passed their own tests: the widget was
+on the line, `qb-seat-click expand` did the thing, and what nobody owned was the line
+between them. The binding decides on the SCREEN now and not on the line, which is the
+question it always meant to ask: `status 2` and both `status-format` indices are ours, so
+every range on either line of one of our screens is one we put there, and which widget was
+hit is the range's job to say.
+
 It implements nothing. `qb-seat-click` hands over to `qb-seat-key`, which is the same
 delegation the `a`, `x` and digit keys make in the other direction, and for the same reason —
 two copies of "break the dash out and record the widths to put it back with" is two places

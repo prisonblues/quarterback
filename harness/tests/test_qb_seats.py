@@ -2115,6 +2115,36 @@ def test_the_expand_widget_reaches_qb_seat_key(screen):
     assert geometry(screen) == before, "the click did not put the screen back"
 
 
+def test_a_click_on_the_top_line_reaches_the_dispatcher_too(screen):
+    """The join the test above deliberately skips, and the one that was broken.
+
+    `qb-seat-click expand` worked from the moment it was written; the ⛶ still did
+    nothing, because the mouse binding gated on
+    `#{==:#{mouse_status_line},#{@qb_bar}}` — true of the seat bar, line 1, and
+    of nothing else. The widget drew, registered its range, and every click on it
+    fell through to `switch-client -t =`. Both halves of the feature passed their
+    own tests; what nobody owned was the line between them.
+
+    A status-line click cannot be synthesised — tmux routes it to the client, not
+    to a pane, so there is no `send-keys` that produces one — so this asserts the
+    property that made the click unreachable rather than the click. The binding
+    must decide on the SCREEN and not on the line: both status lines are ours,
+    every range on either is one this script put there, and which widget was hit
+    is the range's job to say.
+    """
+    screen("-n", "2")
+    lines = [ln for ln in screen.tmux("list-keys", "-T", "root").stdout.splitlines()
+             if re.search(r"-T\s+root\s+MouseDown1Status\s", ln)]
+    assert len(lines) == 1, lines
+    assert "mouse_status_line" not in lines[0], (
+        "the binding gates on which status line was clicked, so a widget on the "
+        "top line registers its range and is then dropped — which is exactly how "
+        "the ⛶ shipped inert")
+    # And the widget it could not reach is on the line that was being excluded.
+    assert "#[range=user|expand]" in top_format(screen), \
+        "the ⛶ is no longer on the top line, so this test is measuring nothing"
+
+
 def test_a_hidden_pane_keeps_the_process_that_was_in_it(screen):
     """Which is the whole reason this is `break-pane` and not "kill it and split a
     new one": a tape that restarted would lose everything it had followed, and a
