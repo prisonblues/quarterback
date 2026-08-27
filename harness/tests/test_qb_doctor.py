@@ -20,6 +20,7 @@ Run: pytest harness/tests/test_qb_doctor.py
 
 from __future__ import annotations
 
+import ast
 import importlib.machinery
 import importlib.util
 import json
@@ -1948,16 +1949,26 @@ def _board_paths(monkeypatch, answers: dict[str, tuple[int, str]]) -> None:
     monkeypatch.setattr(qd, "http_get", fake)
 
 
-def _stuck(n: int) -> tuple[int, list]:
-    """`GET /board` answers a bare ARRAY of posts, which is why this returns one.
+def _stuck(n: int, minutes: float = 5) -> tuple[int, list]:
+    """`n` stuck posts, `minutes` old, as a bare ARRAY — which is what `GET /board` answers.
 
     It used to return `{"posts": [...]}` — the shape the MCP `board_read` wrapper
-    assembles, not the shape the API has — and so did the code under test, so five
-    tests agreed with the bug and passed while the row could not read a single post on
-    any host (#531). `test_the_board_stub_answers_the_shape_the_api_declares` is what
-    now holds this to the real endpoint.
+    assembles, not the shape the API has — and so did the code under test, so five tests
+    agreed with the bug and passed while the row could not read a single post on any
+    host (#531). `test_the_board_stub_answers_the_shape_the_api_declares` is what now
+    holds this to the real endpoint.
+
+    They carry a `ts` because the row dates them itself: `window_min` is a request the
+    board is free to over-answer, so a post with no readable timestamp is not evidence
+    about any window. See `_aged_stuck`.
     """
-    return 200, [{"id": i, "type": "stuck"} for i in range(n)]
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes)} for i in range(n)]
+
+
+def _aged_stuck(*minutes: float) -> tuple[int, list]:
+    """Stuck posts at named ages — for the floor, which serves them regardless of age."""
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(m)}
+                 for i, m in enumerate(minutes)]
 
 
 def _stored(*ages: float) -> tuple[int, dict]:
@@ -2036,6 +2047,59 @@ def test_a_row_raised_in_the_future_is_not_evidence_of_health(monkeypatch, landi
     assert check.verdict == "fail"
 
 
+def test_posts_the_floor_served_from_outside_the_window_are_not_todays_escalations(
+        monkeypatch, landing_host):
+    """`/board` does not honour `window_min` for a `type=` read.
+
+    It floors a quiet slice at the ten most recent posts whatever their age
+    (`_ORIENT_FLOOR`), and `type=` is deliberately not one of the lookups that skip the
+    floor — so a day on which nothing escalated is answered with last week's stuck
+    posts. Counting the page would make `raised` non-empty against an empty blockers
+    table and report the producer severed, which is this row crying wolf on evidence
+    that predates its own question. Observed on the live board: ten posts returned, five
+    older than the cutoff.
+    """
+    _board_paths(monkeypatch, {"/board": _aged_stuck(4000, 5000, 6000),
+                               "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "quiet day" in check.detail
+    assert check.extra["posts"] == 0
+
+
+def test_a_full_oldest_first_page_of_blockers_is_unknown_and_never_fail(
+        monkeypatch, landing_host):
+    """`/blockers` orders by `raised_at` ascending and then truncates, so a full page is
+    the OLDEST rows and today's can lie entirely beyond it. Counting that page as the
+    table would report a severed producer on a board whose only fault is a long
+    history — the false alarm that would teach a person to ignore this row."""
+    full = 200, {"blockers": [{"id": str(i), "raised_at": _ago(9000)}
+                              for i in range(qd._BOARD_PAGE)]}
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": full})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "oldest-first" in check.detail
+    assert "raised-after" in check.manual
+
+
+def test_a_board_answering_nonsense_elements_is_reported_not_raised(
+        monkeypatch, landing_host):
+    """A list whose elements are not objects is a board answering nonsense. A row that
+    raises AttributeError while diagnosing is worth less than one that says what it
+    found, so both halves type-check an element before dereferencing it."""
+    _board_paths(monkeypatch, {"/board": (200, ["nope", 7, None]),
+                               "/blockers": (200, {"blockers": ["nope", 7, None]})})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra == {"posts": 0, "rows": 0, "window_minutes": 1440}
+
+
 def test_a_board_without_blockers_deployed_has_not_severed_anything(
         monkeypatch, landing_host):
     """An image predating #328 is a deploy that has not happened, not a producer that
@@ -2068,20 +2132,56 @@ def test_a_board_that_will_not_state_it_is_unknown_and_never_ok(
     assert phrase in check.detail
 
 
+@pytest.mark.parametrize("path,getter", [
+    ("/blockers", "board_get"),
+    ("/board", "board_get_list"),
+])
+def test_a_null_body_is_refused_with_a_sentence_and_not_with_a_blank(
+        monkeypatch, landing_host, path, getter):
+    """`null` decodes to None, and None is what these helpers return for failure too.
+
+    Splitting the shape check off `_board_json` (#531) put a `payload is None` test
+    between the two, which conflated them: a board answering the four bytes `null` is
+    answering the wrong SHAPE, but it came back as (None, "") — the empty reason a
+    caller then prints as its whole detail, giving a blank cell in the table where the
+    row is supposed to say what went wrong. The failure is carried by `why` alone.
+    """
+    monkeypatch.setattr(qd, "http_get", lambda _u, _h=None: (200, "null", None))
+
+    payload, why = getattr(qd, getter)(landing_host, path)
+
+    assert payload is None
+    assert why.startswith("the board did not answer")
+    assert path in why
+
+
 def test_the_board_stub_answers_the_shape_the_api_declares():
     """The stub above is only evidence if it answers what the real endpoint answers.
 
     #531 is what happens when it does not: `check_escalations` read `/board` as an
     object, `_stuck` handed it an object, and the row shipped unable to see a post while
-    its tests were green. Reading the annotation off the source — rather than importing
-    `app.api.posts`, which needs a venv and a database this file deliberately does not
-    have — ties the fixture to the API, so moving one without the other fails here
-    instead of on a host.
-    """
-    source = (BIN.parent.parent / "app" / "api" / "posts.py").read_text()
-    signature = source.split("@router.get(\"/board\")", 1)[1].split(":\n", 1)[0]
+    its tests stayed green. This ties the fixture back to the API.
 
-    assert "-> list[dict]" in signature, signature
+    Parsed rather than string-sliced, because a guard against drift that is itself
+    defeated by reformatting a decorator is not a guard. And it reads the source instead
+    of importing `app.api.posts`, which needs a venv and a database this file
+    deliberately does not have — the constraint `declared_version` already documents.
+
+    It can only see the ANNOTATION, which is why it is not the whole guard:
+    `test_board_answers_a_bare_list_not_a_wrapper_object` in tests/test_board.py asserts
+    what a client actually receives, over a real app and a real database.
+    """
+    tree = ast.parse((BIN.parent.parent / "app" / "api" / "posts.py").read_text())
+    routes = [n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
+              and any(isinstance(d, ast.Call)
+                      and isinstance(d.func, ast.Attribute) and d.func.attr == "get"
+                      and any(isinstance(a, ast.Constant) and a.value == "/board"
+                              for a in d.args)
+                      for d in n.decorator_list)]
+
+    assert len(routes) == 1, [r.name for r in routes]
+    assert ast.unparse(routes[0].returns) == "list[dict]"
     assert isinstance(_stuck(1)[1], list)
 
 
