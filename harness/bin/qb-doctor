@@ -2018,12 +2018,14 @@ def fragments_in_use(host: Host) -> bool:
     return (host.repo / "changelog.d").is_dir()
 
 
-def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+def _board_json(host: Host, path: str) -> tuple[object | None, str]:
     """One authenticated GET against the board, decoded — or a sentence saying why not.
 
-    Returns ``(payload, "")`` or ``(None, why)``. Every caller turns the `why` into an
-    `unknown`, so there is one place where "the board could not be asked" is phrased and
-    no way for a row to reach a verdict without having been answered.
+    Returns ``(payload, "")`` or ``(None, why)``, with the payload exactly as the board
+    shaped it. Nothing here judges that shape, because the board does not answer one:
+    `/blockers` returns an object and `/board` returns a bare array, and a single helper
+    that insisted on either turned every caller of the other into "could not be asked"
+    without ever reaching the question it was asked to settle (#531).
     """
     if not host.base_url:
         return None, "no board is configured (QUARTERBACK_BASE_URL unset), so nothing here " \
@@ -2038,11 +2040,39 @@ def board_get(host: Host, path: str) -> tuple[dict | None, str]:
     if status != 200:
         return None, f"the board answered {status} to {path}"
     try:
-        payload = json.loads(body)
+        return json.loads(body), ""
     except ValueError:
         return None, f"the board did not answer JSON to {path}"
+
+
+def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON object.
+
+    Every caller turns the `why` into an `unknown`, so there is one place where "the
+    board could not be asked" is phrased and no way for a row to reach a verdict without
+    having been answered.
+    """
+    payload, why = _board_json(host, path)
+    if payload is None:
+        return None, why
     if not isinstance(payload, dict):
         return None, f"the board did not answer an object to {path}"
+    return payload, ""
+
+
+def board_get_list(host: Host, path: str) -> tuple[list | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON array.
+
+    `GET /board` is one — `read_board` is annotated `-> list[dict]` and returns the posts
+    bare. The `{"posts": [...], "cursor": N}` object is assembled by the MCP `board_read`
+    wrapper on the way out, so it is the shape an agent sees and NOT the shape the API
+    has, and a row written against it cannot read a single post (#531).
+    """
+    payload, why = _board_json(host, path)
+    if payload is None:
+        return None, why
+    if not isinstance(payload, list):
+        return None, f"the board did not answer a list to {path}"
     return payload, ""
 
 
@@ -2326,16 +2356,15 @@ def check_escalations(host: Host) -> Check:
     are different sentences to be handed.
     """
     window = ESCALATION_WINDOW_MINUTES
-    posts, why = board_get(host, f"/board?type={ESCALATION_POST}&window_min={window}")
-    if posts is None:
+    # A LIST, because that is what `GET /board` answers. Reading it as an object is the
+    # whole of #531: this row shipped unable to see a single post, and said so in a
+    # sentence — "the board did not answer an object" — that pointed at the `board` and
+    # `token` rows, both of which were `ok` and neither of which was the fault.
+    raised, why = board_get_list(
+        host, f"/board?type={ESCALATION_POST}&window_min={window}")
+    if raised is None:
         return Check("escalations", host.base_url or "-", why, "unknown",
                      manual="see the board and token rows")
-    raised = posts.get("posts")
-    if not isinstance(raised, list):
-        return Check("escalations", host.base_url or "-",
-                     f"the board answered no list of {ESCALATION_POST} posts, so whether "
-                     "anything escalated in the last day could not be read", "unknown",
-                     manual=f"{host.base_url}/board?type={ESCALATION_POST}")
     rows, why = board_get(host, "/blockers?open=false&limit=1000")
     if rows is None:
         # Told apart from any other board failure, because the answer is a deploy and

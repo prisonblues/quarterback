@@ -1948,8 +1948,16 @@ def _board_paths(monkeypatch, answers: dict[str, tuple[int, str]]) -> None:
     monkeypatch.setattr(qd, "http_get", fake)
 
 
-def _stuck(n: int) -> tuple[int, dict]:
-    return 200, {"posts": [{"id": i, "type": "stuck"} for i in range(n)]}
+def _stuck(n: int) -> tuple[int, list]:
+    """`GET /board` answers a bare ARRAY of posts, which is why this returns one.
+
+    It used to return `{"posts": [...]}` — the shape the MCP `board_read` wrapper
+    assembles, not the shape the API has — and so did the code under test, so five
+    tests agreed with the bug and passed while the row could not read a single post on
+    any host (#531). `test_the_board_stub_answers_the_shape_the_api_declares` is what
+    now holds this to the real endpoint.
+    """
+    return 200, [{"id": i, "type": "stuck"} for i in range(n)]
 
 
 def _stored(*ages: float) -> tuple[int, dict]:
@@ -2044,7 +2052,8 @@ def test_a_board_without_blockers_deployed_has_not_severed_anything(
 @pytest.mark.parametrize("answers, phrase", [
     ({"/board": (500, "")}, "answered 500"),
     ({"/board": (200, "not json")}, "did not answer JSON"),
-    ({"/board": (200, {"posts": "several"})}, "no list of stuck posts"),
+    # The MCP wrapper's object, which is exactly what #531 shipped reading for.
+    ({"/board": (200, {"posts": [], "cursor": 0})}, "did not answer a list to /board"),
     ({"/board": _stuck(1), "/blockers": (200, {"blockers": 7})}, "no list of blockers"),
 ])
 def test_a_board_that_will_not_state_it_is_unknown_and_never_ok(
@@ -2057,6 +2066,23 @@ def test_a_board_that_will_not_state_it_is_unknown_and_never_ok(
 
     assert check.verdict == "unknown"
     assert phrase in check.detail
+
+
+def test_the_board_stub_answers_the_shape_the_api_declares():
+    """The stub above is only evidence if it answers what the real endpoint answers.
+
+    #531 is what happens when it does not: `check_escalations` read `/board` as an
+    object, `_stuck` handed it an object, and the row shipped unable to see a post while
+    its tests were green. Reading the annotation off the source — rather than importing
+    `app.api.posts`, which needs a venv and a database this file deliberately does not
+    have — ties the fixture to the API, so moving one without the other fails here
+    instead of on a host.
+    """
+    source = (BIN.parent.parent / "app" / "api" / "posts.py").read_text()
+    signature = source.split("@router.get(\"/board\")", 1)[1].split(":\n", 1)[0]
+
+    assert "-> list[dict]" in signature, signature
+    assert isinstance(_stuck(1)[1], list)
 
 
 def test_the_finding_names_no_command_that_backfills_the_table(landing_host):
