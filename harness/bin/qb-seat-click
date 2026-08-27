@@ -259,9 +259,12 @@ case "$range" in
     fi
     ;;
   add)
-    # --add works out the next seat number itself, and deliberately does not
-    # reuse the number of a seat that was closed: the board would read the new
-    # agent as the old one coming back.
+    # --add works out the next seat number itself, and since #540 that is the
+    # lowest FREE one, which may be a number a closed seat used to have. It was
+    # max+1 while the number was half of a seat's board name and reusing one made
+    # the board hand back the old agent's identity; the number is a pane option
+    # now and the board keys on the session id, so a ＋ after a ✕ puts the seat
+    # back where the row had a hole.
     #
     # The path is read off the session because a tmux server usually predates
     # the screen running in it, and its PATH is whatever started it — which is

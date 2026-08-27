@@ -392,11 +392,11 @@ def test_a_home_pointed_back_at_the_developer_is_refused(tmp_path):
 
 def test_the_pace_gate_is_off_unless_a_test_asks_for_it(tmp_path):
     """`qb-pace` reads the developer's own subscription and calls the usage
-    endpoint, and `qb-seat` starts it by default. PATH cannot reach it — the
+    endpoint, and `qb-seats` starts it by default. PATH cannot reach it — the
     fallback is `${0%/*}/qb-pace` inside `harness/bin` — so the knob is the seam.
     """
-    assert _path_sandbox.sandbox_env(tmp_path)["QB_SEAT_PACE"] == "off"
-    assert _path_sandbox.sandbox_env(tmp_path, QB_SEAT_PACE="obey")["QB_SEAT_PACE"] == "obey"
+    assert _path_sandbox.sandbox_env(tmp_path)["QB_SEATS_PACE"] == "off"
+    assert _path_sandbox.sandbox_env(tmp_path, QB_SEATS_PACE="obey")["QB_SEATS_PACE"] == "obey"
 
 
 def test_the_path_guarantee_survives_the_environment_wrapper(tmp_path):

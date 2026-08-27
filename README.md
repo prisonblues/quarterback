@@ -785,7 +785,7 @@ stopped; whatever stopped it is what calls it. On a machine that is `qb-hook`'s
 SessionEnd (which maps Claude Code's own `reason`, so a `/clear` lands as
 `context_reset` while its claims are still keyed to the session id that took them),
 or `qb-seat-click` reading the session id `qb-hook` stamped on the pane before its ✕
-kills it, or `qb-end` by hand. The line `qb-seat` draws — *"the board coordinates
+kills it, or `qb-end` by hand. The line `qb-seats` draws — *"the board coordinates
 work, it does not operate the machine"* — is about **dispatch**, and nothing here
 moves it: what an agent works on is still its own choice, self-selected and claimed
 atomically.
@@ -2290,8 +2290,8 @@ harness/      step 2 of the install — the workflow the board coordinates
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
-                   anything destroys one), qb-stage, qb-seat (one pane of a
-                   multiplexer, started as a seat with its own board identity),
+                   anything destroys one), qb-stage, qb-seats (a screen of
+                   agent panes in a multiplexer, plus the board),
                    qb-board (launcher for the terminal client in mcp/mcp_server/board/)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points, dbtarget.py (the DB

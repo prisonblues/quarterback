@@ -17,8 +17,7 @@ board reconnects them.**
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-mode`, which says which of the two
   ways of working a repo uses — `⌂ CLEANROOM` or `~ JUNGLE` — and exits 3 when the
-  tree you are standing in contradicts it, `qb-seat`, which turns one pane of a
-  multiplexer into a fleet seat with its own board identity, `qb-board`, which
+  tree you are standing in contradicts it, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
   on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
   that asks whether the board's plan still describes the present, `qb-pace`, which
@@ -458,7 +457,7 @@ Four decisions in it are worth stating, because each is a way this could have go
   failure it exists to prevent.
 - **One item per invocation, and it stops.** A loop over items is an agent deciding how much
   work the fleet takes on, and nothing bounds that yet (#80 measures integration cost as
-  quadratic in open PRs). `qb-seat`'s brief stops after one item for the same reason. The
+  quadratic in open PRs). The
   loops that do loop — `/fix-and-land` — loop over review *rounds* inside one issue, under
   a round cap and a spend ceiling that already exist.
 
@@ -1172,14 +1171,14 @@ fleet view can *act* on rather than only describe. Best effort throughout: no st
 board, or a refusal all fall through to closing the pane, because the pane is what the
 human clicked to close.
 
-The line `qb-seat` draws — *"the board coordinates work, it does not operate the machine"* —
+The line `qb-seats` draws — *"the board coordinates work, it does not operate the machine"* —
 is about **dispatch**, and none of this moves it. What an agent works on is still its own
 choice, self-selected and claimed atomically.
 
 ### `qb-start` — the verb that begins a session, and it ships off
 
 The other half of #277. There were three ways to start a session on this fleet and every one
-of them ended at a human hand: `qb-seat` in a pane somebody typed into, the dashboard's ⚒ on
+of them ended at a human hand: a seat screen somebody built, the dashboard's ⚒ on
 a mouse click, and `run_agent`'s headless `claude -p` inside a loop a person launched. So a
 plan could say what was next, the board could show who was on what, and nothing could act on
 either.
@@ -1301,7 +1300,7 @@ than from whenever the agent's SessionStart hook gets round to it — `qb-end <i
 immediately, the seat bar's ✕ can reach it, and the ordinary SessionEnd hook ends it with a
 reason like any other session.
 
-**It is not a dispatcher, and that line is not being moved.** `qb-seat`'s *"the board
+**It is not a dispatcher, and that line is not being moved.** `qb-seats`' *"the board
 coordinates work, it does not operate the machine"* is about **dispatch**: nothing here reads
 the plan, picks an item, or tells an agent what to work on. It is told a command and a number
 by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
@@ -1521,172 +1520,26 @@ directly, and it is the true positive this must never drop.
 [#80]: https://github.com/prisonblues/quarterback/issues/80
 [#422]: https://github.com/prisonblues/quarterback/issues/422
 
-### `qb-seat` — one pane, one seat, one identity
+### `qb-seat` — retired (#540)
 
-Starting a fleet is the part that never scaled: open a terminal, `cd`, run the agent, read
-the plan out loud to it, repeat. The human doing the reading is a dispatcher, and a
-dispatcher is exactly what the board exists to remove.
+There was a per-pane wrapper here. Each seat ran `qb-seat <n>`, which gave the agent a board
+name (`seat-<project>-<n>`), passed it a brief telling it to read the board and run
+`/get-involved`, held a pid marker so two panes could not be the same seat, and registered the
+name with the board before exec'ing the agent.
 
-```bash
-qb-seat 3                  # seat 3, in this directory
-qb-seat 3 --dry-run        # print the environment, cwd and brief; start nothing
-qb-seat 3 --model opus     # anything else is passed through to the agent
-qb-seat 3 -- --dry-run     # …and everything after -- is passed through untouched
-```
+All of it is gone, and the reason is that five of its six jobs existed only to defend the name
+it gave a seat. A seat is a pane with a shell in it; a pane holds an agent when something
+types a command into it; and the board already keys an agent by its conversation, which is
+unique across panes and machines by construction. So there is nothing left to name, nothing to
+collide, and no marker to hold. What is left — the one line a pane is given — is
+`QB_SEAT_INITIAL_CMD`, below, which belongs to the screen that makes the panes.
 
-`--dry-run` and `--help` are taken from anywhere in the arguments, not only from the
-position above: everything after the seat number goes to the agent verbatim, and a
-misplaced `--dry-run` that started five agents would be the one mistake this flag exists
-to prevent. `--` is the way to hand either word on to the agent anyway.
-
-A multiplexer supplies the panes and its layout says `qb-seat 1` … `qb-seat n`; this
-supplies what goes in one. It is deliberately thin, because everything that would make it
-thick already exists somewhere better — identity, presence, lease renewal, publish-on-push
-and transcript push all arrive from the lifecycle hooks, and the worktree with its isolated
-database arrives from `/fix-issue`. What is left is: name the seat, enter the repo, start
-the agent on a brief.
-
-The brief is **identical for every seat** — *read the board, run `/get-involved`, stop* —
-and that is the design rather than an omission. Since #424 the pickup is that command rather
-than four paragraphs of this brief: a brief is prose a model may skim, and the one step that
-must not be skimmed is the claim, so it lives in `qb-next` where it is code. (The brief it
-replaced composed its own claim key, `kind='work'`, `key='<owner>/<repo>#<number>'` — #172,
-in the one text every seat on the box reads.)
-
-**A repo with no plan now means stop, and that is a deliberate narrowing.** The old brief's
-fallback was: no plan, so scan the open issues, judge which are unclaimed and undiscussed,
-and pick one. That is work discovery outside the human-ordered plan — #63, hand-rolled, in
-the default text of every seat on the box, and with none of the appetite gates #85/#86 put
-around the real thing. A repo where nobody has ordered anything is a repo where nobody has
-decided what is worth doing. Give the seat a plan, or attach to the pane and tell it. A
-spawner that reads the plan and hands seat 1 the first item is hub-and-spoke with a hub
-that runs once, at t=0, and then stops existing. Override it wholesale with
-`QB_SEAT_BRIEF` if a fleet wants a different one — or set it to the empty string for a
-pane that should come up waiting rather than working, which starts the agent with no
-prompt at all. The seat number is the only thing that differs between panes. It also
-tells a seat to **stop after one item**, because a seat that re-claims when it finishes
-turns the fleet into a drain, and nothing yet bounds how much work a fleet may take on.
-
-**Why the instance is per seat and never host-wide.** The lifecycle hook keys its ask-poll
-cursor on `QUARTERBACK_INSTANCE` (`qb-asks-<agent>-<instance>`), so one value exported for
-the whole box gives n seats *one* cursor between them: whichever seat polls first advances
-it past everyone else's mail and the other n−1 never see an ask addressed to them. Set per
-seat it is the opposite — a stable, typeable `zeus/seat-lexray-3` instead of
-`zeus/a4f81c2e`, which survives the seat restarting in the same pane because the board
-hands a returning key its old name back.
-
-**Why the name carries the project as well as the number.** `seat-3` on its own makes the
-*namespace* the machine while the *numbering* is per screen — and `qb-seats` numbers from 1
-every time it builds one. So the second screen on a box asked for seat 1, found the first
-screen's seat 1 holding the pane marker, and refused: not an edge case reached by an unlucky
-choice of number but the guaranteed outcome of starting a second screen, which made one
-screen per project the one thing this could not do (#208).
-
-The guard was right and its key was too coarse, so the key grew a scope. A seat is
-`seat-<project>-<n>`, so `seat-lexray-1` and `seat-nix-fleet-1` are two seats while
-`seat-lexray-1` started twice is still one — every property the refusal names survives.
-The scope defaults to the basename of the seat's own repository, because a screen is per
-repository; `QB_SEAT_SCOPE` overrides it for the two cases that default cannot read, which
-are two screens on *one* repository and anyone who wants the old machine-wide numbering
-back (`QB_SEAT_SCOPE=`, empty and meaning it).
-
-The scope is **slugged**, and that is not cosmetic: an `X-Agent-Name` that does not match
-`^[a-z0-9]+(?:-[a-z0-9]+)*$` within 40 characters is refused with a 400, so a repository
-called `Foo.Bar_2` would otherwise make every seat in it fail registration. The basename is
-folded to lower case, every run of anything else becomes one hyphen, the ends are trimmed
-and the middle is capped at 32. A scope that slugs away to nothing — a directory named
-`___` — leaves the bare `seat-3` and says so on stderr, rather than inventing a project
-name nobody could type.
-
-**Why it registers that name itself, before starting anything.** Since v2.12 the board
-*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
-**request** (`X-Agent-Name`). Allocation is first-contact-wins. Measured against a live board:
-
-| First contact | Later request | Board says |
-|---|---|---|
-| key only, no name | — | `zeus/meadow-russet` |
-| key only, no name | `seat-lexray-9` | `zeus/meadow-russet` — **the request is ignored** |
-| key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
-
-When this was written the MCP server was the only client that made the request and the
-lifecycle hook was not, so the hook's `SessionStart` usually got there first and a seat came
-up as two random words about as often as not — losing the one property the numbering was for.
-**Every client asks now (#156)**, so the row is settled correctly whichever one reaches the
-board first.
-
-`qb-seat` still makes a single `GET /whoami` carrying both headers before it execs, and the
-reason is the read-back rather than the request: a name is granted only when it is *free*, so
-a second pane started as the same seat is quietly given something else, and it is worth being
-told that at the one moment a human is looking. It warns when the board's answer is not the
-name it asked for — which also happens when the key was bound to a designated name on some
-earlier run, since allocation hands a returning key the name it already had and a request
-cannot displace one that exists.
-
-*Addressing was never at risk either way*, and that is worth knowing before someone
-re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
-to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-lexray-3`. This is
-about the name a human types and reads on a status bar.
-
-**Two panes on one seat is refused, and the board cannot be the one to refuse it.**
-They export the same instance, so they send the same key, so the board hands them *one*
-identity — from its side they are indistinguishable by construction. They then share the
-ask-poll cursor, and whichever polls first swallows the other's mail: the exact bug the
-per-seat instance exists to prevent, one level down, and invisible because both seats
-otherwise work. So the check is local, where the panes actually are. `qb-seat` records its
-pid in `$XDG_RUNTIME_DIR/qb-<seat name>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
-(macOS, most containers, ssh onto a box with no systemd user session), in
-`${TMPDIR:-/tmp}/qb-<uid>-<seat name>.pid`, where the uid is in the name because `/tmp` is
-shared and a marker there is not. The marker is keyed on the **whole name** and not on the
-bare number, because the two have to agree or the guard is protecting something other than
-the identity it describes — a marker on the number alone refused the second screen's seat 1
-while the board would happily have given it its own identity. It exits **3** if a live
-process already holds that seat. A marker left by a seat that died is taken over rather than honoured, and
-`QB_SEAT_FORCE=1` overrides the refusal for a pid that has since been reused by something
-unrelated — noisily, on stderr, because being wrong about that is the shared-inbox bug
-with nothing on screen.
-
-The marker is **claimed atomically**, by hard-linking a fully written temp file into
-place, and it is claimed *before* the board call rather than after it. That is not
-fastidiousness: the case the guard exists for is a layout, a layout starts all n panes in
-the same instant, and look-then-write loses that race by construction — every pane sees a
-free seat while the one that got there first is still several seconds deep in registering
-its name. Measured on the check-then-write version: twelve panes started as seat 1 left
-between six and twelve agents running, all sharing one identity. Hard-linking leaves one.
-
-**Best-effort by construction.** No board configured, no token, no `curl`, no network: the
-registration is skipped and the seat starts anyway. A seat that refused to run because a
-cosmetic name could not be reserved would cost more than the name is worth — the same
-bargain `qb-stage` strikes, and the panel's board recording before that. Two things it is
-*not* silent about, because both are worth a line before the rest of the session goes
-wrong the same way: a board that answered **401** (a revoked token, or the other island's
-token — the lifecycle hooks are about to be refused identically) and a board that did not
-answer at all (fine on a laptop, and said differently). The token itself goes to `curl` on
-stdin, never in argv, where any local process could read it out of `/proc` for the life of
-the call.
-
-What it deliberately does **not** do: create a worktree (under self-selection a seat does
-not know its branch until it has claimed something, and `/fix-issue` owns that path and its
-per-branch database), assign work, or drive the agent past starting it.
-
-| Variable | Default | What it does |
-|---|---|---|
-| `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
-| `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
-| `QB_SEAT_AGENT` | `claude` | The agent to start |
-| `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
-| `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
-| `QB_SEAT_PACE` | `warn` | What to do about the shared subscription's window before starting. `warn` says it and starts anyway; `obey` refuses to start at `hold` and names when the window comes back (exit 4); `off` does not consult at all. See `qb-pace` below |
-| `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
-| `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
-| `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
-
-The environment beats the file variable by variable — except the *credential*, which is
-taken as a set: a `QUARTERBACK_TOKEN_CMD` in the environment means the file's static
-`QUARTERBACK_TOKEN` is not used at all. Best-of-each would authenticate one island's board
-with the other island's credential, which is the exact failure the per-host config exists
-to prevent. A config file that *errors* is reported and then ignored entirely, rather than
-half-applied and passed over in silence.
-
+The knobs that went with it: `QB_SEAT_AGENT`, `QB_SEAT_BRIEF`, `QB_SEAT_SCOPE`,
+`QB_SEAT_YOLO`, `QB_SEAT_FORCE` and `QB_SEAT_REPO`. `QB_SEAT_PACE` was folded into
+`QB_SEATS_PACE`, which is the same question and now has one spelling. The dashboard's ⚖
+had been reading `QB_SEAT_AGENT` for the binary it starts a review with, which would have
+left it the last reader of a retired variable, so that one is `QB_DASH_AGENT` now — the
+dash's own knob, beside `QB_DASH_REPO` and `QB_DASH_CONFIRM`.
 
 ### `qb-seats` — the agent screen
 
@@ -1700,6 +1553,7 @@ qb-seats              # the same, three by default
 qb-seats 10           # ten: five across, two down
 qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --no-yolo    # seats that stop and ask, as agents normally do
+qb-seats --cmd ''     # a screen of bare shells: panes, and nothing started in them
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
 qb-b list             # the screens that are up, numbered
@@ -1726,19 +1580,32 @@ against a screen that plainly existed. `qb-seat-click` — the bar's ✕ and ＋
 Names are for the messages a human reads; ids do the addressing, and
 `test_every_session_target_is_an_id_and_not_a_name` reads both scripts to keep it that way.
 
-A screen also records **what its seats are called**: `@qb_repo` is the repository it was
-built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set
-on the session — `--add` puts `@qb_scope` on the pane it creates instead, so it does not
-rewrite the session under seats already working in it — and together they are how anything
-reading the screen from outside turns a pane into a board identity. `list-panes -a` is the
-whole tmux server, so since #208 the seat number alone no longer says which seat a pane is;
-the dashboard's SEATS panel and its FLEET-row jump both go through this.
+A screen records **what it is made of**: `@qb_repo` is the repository it was built in, and
+`@qb_initial_cmd` is the line its seats were given. `--add` and the bar's ＋ read the second
+one back, because neither can see the environment the screen was built in — the ＋ arrives
+through `run-shell`, whose environment is the tmux server's. It is always set, the empty
+string included, so a screen of bare shells stays that way when a seat is added to it.
 
-One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
-bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board, run
-`/get-involved`, stop — and self-selects. Nothing reads the plan on the agents' behalf and
-nothing assigns: each seat reads it for itself and the claim is what keeps them off each
-other, which is why three seats given one brief take three different items.
+**How anything outside turns a pane into a board identity: `@qb_session`.** The lifecycle
+hook stamps the agent's session id on its pane at `SessionStart`, and `GET /active` returns
+that same id for every live agent, so the join is an equality. It used to be a seat NUMBER
+parsed out of the agent's name, which identified a pane in neither direction — `list-panes
+-a` is the whole tmux server, so two screens could each hold a seat 1 (#208), and the board
+is the whole fleet, so two machines could each hold a `seat-lexray-1`. The dashboard's SEATS
+panel and its FLEET-row jump both go through the session id now (#540), which also means a
+pane running an agent this screen did not start resolves correctly.
+
+One tmux session: N panes each holding a shell with `QB_SEAT_INITIAL_CMD` typed into it, and
+one full-width pane along the bottom running `qb-board --follow`. Every seat gets the **same**
+line — that is the design and not an omission, because the moment one seat is told something
+another is not, there is a dispatcher again.
+
+The default line starts an agent and says nothing else to it. Give it a prompt and the screen
+comes up working: `QB_SEAT_INITIAL_CMD='claude-yolo -- /get-involved'` is a screen that claims,
+and it is still self-selection rather than dispatch — the same line to every pane, with the
+board's atomic `plan_claim` deciding who gets what, which is why three seats given one line
+take three different items. Whether the fleet should be taking work at all is `tempo`'s
+question (#474), not this script's.
 
 **Why real sessions and not sub-agents.** Sub-agents are a star: one orchestrator holds the
 plan, fans out, and every result funnels back through one context window. Children are
@@ -1758,11 +1625,14 @@ Two things to know before you run it:
   swallow it. `QB_SEATS=1` is exported into every pane precisely so an rc can detect a seat
   and skip that. This is not theoretical — it cost five minutes per seat on the machine
   this was written for, where the greeter was an animation that ran until a keypress.
-- **`QUARTERBACK_INSTANCE` must be per seat, never host-wide.** `qb-seat` sets its own —
-  see its section above for why sharing one is worse than it sounds — and the layout's
-  half of that guarantee is to strip any inherited value, from the session as well as the
-  panes, so nothing split off later picks one up. Nothing in your shell profile should set
-  it.
+- **`QUARTERBACK_INSTANCE` must never be host-wide.** The board takes it as the agent KEY,
+  so two seats sharing one are not two agents with muddled inboxes — they are a single agent
+  with one history, one presence and one lease, holding each other's claims perfectly
+  legitimately. Nothing sets one per seat any more (#540): with no value, `qb-hook` falls
+  back to the session id, which is one per *conversation* and so unique across panes by
+  construction. The layout still strips any inherited value, from the session as well as the
+  panes, because one arriving from your profile would put every pane on the screen back to
+  being one agent. Nothing in your shell profile should set it.
 
 **Seats start with permission prompts off, and that is the default on purpose.** A seat is
 a pane nobody is watching. The first tool call wanting a permission the agent does not
@@ -1776,8 +1646,9 @@ It is a real trade and it is made deliberately: it hands a full shell to N agent
 a repo whose tests, hooks and scripts all run as you. What decides it is the blast radius
 either way — a seat that cannot act is useless to everybody, while a seat that can act is
 dangerous in a repo you already trusted enough to point a fleet at. Say `--no-yolo` for one
-screen, or export `QB_SEAT_YOLO=0` to have prompts back everywhere. The flag and the
-variable are the same mechanism, so they cannot drift.
+screen, or export `QB_SEAT_INITIAL_CMD=claude` to have prompts back everywhere: the flag is
+sugar for the setting, so the permission question is *which command you type* and not a
+second knob that could disagree with it.
 
 `qb-seats` deliberately does not create worktrees (a self-selecting seat does not know its
 branch until it has claimed), does not assign work, and does not drive the agents past
@@ -2672,11 +2543,18 @@ subscription is the largest single spending decision this fleet makes, and it is
 at a prompt, by a human who is not looking at the dash the caps are drawn on — so
 `qb-seats` asks `qb-pace`
 for an estimate of *this* screen's seat count and prints it before the first pane exists.
-It warns and proceeds, always: the refusal lives one layer down in `qb-seat`, off by
-default, for panes with nobody in front of them. Printed here rather than in the panes
-because a seat execs its agent moments later and the agent paints over anything printed
-before it. `QB_SEATS_PACE=off` silences it, and a `qb-pace` that is missing, broken or slow
-costs the note and never the screen.
+It warns and proceeds by default. Printed here rather than in the panes because a seat's
+agent paints over anything printed before it.
+
+`QB_SEATS_PACE` is the whole knob: `off` consults nothing, `warn` (the default) says it and
+starts anyway, `obey` brings the seats up as **bare shells** and starts nothing. What a spent
+window costs is the agents, not the panes — the refusal this replaced lived in the per-pane
+wrapper and refused to create the *pane* (#540), which is refusing somebody a terminal over a
+subscription. `obey` therefore means "this screen does not start agents right now", which is
+what it was always trying to say, and a screen already built with no initial command does not
+consult `qb-pace` at all because there is nothing to withhold. A `qb-pace` that is missing,
+broken or slow costs the note and never the screen: 3 is `hold` and only 3, and everything
+else means the gate did not run rather than that it passed.
 
 The width is per-screen state, read from the environment once when the screen is built and
 recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
@@ -2775,10 +2653,10 @@ sentence as two real numbers and be believed.
 
 **Who reads it.** `qb-seats` prints the estimate when it builds a screen — N agents on one
 subscription is the largest single spending decision the fleet makes, and it is made at a
-prompt by a human who is not looking at the dash. It warns and proceeds, always. `qb-seat`
-carries the refusal, and it is **off by default**: `QB_SEAT_PACE=obey` is for panes with
-nobody in front of them, and at `hold` such a seat does not start, says when the window
-comes back, and exits 4. `unknown` never stops a seat under either mode — refusing every
+prompt by a human who is not looking at the dash. It warns and proceeds by default.
+`QB_SEATS_PACE=obey` carries the refusal, and it is **off by default**: at `hold` the seats
+come up as bare shells, the screen says when the window comes back, and nothing is started.
+`unknown` never withholds anything under either mode — refusing every
 seat on the fleet because a laptop dropped its network is a far larger claim than this is
 making — but it is always said.
 
@@ -2960,7 +2838,7 @@ the ranker could be computed over**, not how good the order is.
 **IT FORMS NO QUEUE, ENQUEUES NOTHING AND MERGES NOTHING.** #435 asked for a driver that
 enqueues; [#476](https://github.com/prisonblues/quarterback/issues/476) supersedes that
 half, on the grounds that a central drainer is the shape this codebase has refused four
-separate times in its own docstrings — `qb-seat`'s "no orchestrator to lose", `qb-start`'s
+separate times in its own docstrings — `qb-seats`' "no orchestrator to lose", `qb-start`'s
 "a spawner that read the plan and handed seat 1 the first item would be hub-and-spoke with
 a hub that runs once", `app/review_queue.py`'s "a drainer that also ordered would be the
 hub-and-spoke shape `qb-seats` was written to refuse", and `app/api/landing.py`'s "not an
