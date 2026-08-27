@@ -993,3 +993,66 @@ def test_an_unwired_event_is_MISSING_even_though_a_field_after_it_is_set(tmp_pat
                          env={**os.environ, "HOME": str(home)}, timeout=60)
     assert "MISSING  PreToolUse" in got.stdout, got.stdout
     assert got.returncode == 1, got.stdout
+
+
+def test_qb_mcp_exports_the_agent_name_the_server_interpolates(tmp_path):
+    """`QUARTERBACK_AGENT` must reach the MCP server's ENVIRONMENT, not just qb-mcp's shell.
+
+    The server resolves one credential for itself: `client._resolve_elevated` runs
+    `QUARTERBACK_ELEVATED_TOKEN_CMD` through `subprocess.run(..., shell=True)` with no
+    `env=`, so that child sees `os.environ` and nothing else. The fleet writes that
+    command as `op read "op://…/quarterback-$QUARTERBACK_AGENT/elevated"`, and
+    `qb_load_config` sets the variable as a plain shell variable. Unexported, it expands
+    to empty in the child and the ref becomes `quarterback-/elevated` — an item name no
+    vault has.
+
+    What made it cost an evening is the shape of the failure: the board answered "this
+    host has no delegated credential", which reads as an unprovisioned machine, and the
+    variable this script dropped is nowhere in that sentence.
+
+    Asserted through the exec rather than by reading the source, because `export` is the
+    one thing a static check of the assignment cannot see. The stub stands in for the
+    server and resolves the command exactly as `client.py` does.
+    """
+    repo = tmp_path / "repo"
+    (repo / "mcp" / ".venv" / "bin").mkdir(parents=True)
+    py = repo / "mcp" / ".venv" / "bin" / "python"
+    # The interpreter by absolute path, never `/usr/bin/env` (#177): there is no
+    # `/usr/bin/env` inside a nix build sandbox, so an env-shebang stub cannot exec
+    # and the suite fails for a reason unrelated to the code under test.
+    py.write_text(
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys\n"
+        "cmd = os.environ.get('QUARTERBACK_ELEVATED_TOKEN_CMD', '')\n"
+        "out = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout\n"
+        "sys.stdout.write('AGENT=%s\\nRESOLVED=%s\\n'\n"
+        "                 % (os.environ.get('QUARTERBACK_AGENT', ''), out.strip()))\n",
+        encoding="utf-8")
+    py.chmod(0o755)
+
+    config = tmp_path / "config"
+    config.write_text(
+        # Unroutable on purpose: the self-heal probe must fail fast and fail open.
+        "QUARTERBACK_BASE_URL='http://127.0.0.1:1'\n"
+        "QUARTERBACK_TOKEN='stub-bearer'\n"
+        # The fleet's real shape, with `op read` swapped for `echo` so the test needs no
+        # vault. The interpolation is the part under test.
+        "QUARTERBACK_ELEVATED_TOKEN_CMD='echo \"quarterback-$QUARTERBACK_AGENT/elevated\"'\n",
+        encoding="utf-8")
+
+    env = {**os.environ, "QUARTERBACK_CONFIG": str(config), "QUARTERBACK_REPO": str(repo)}
+    for stray in ("QUARTERBACK_AGENT", "QUARTERBACK_TOKEN", "QUARTERBACK_BASE_URL",
+                  "QUARTERBACK_ELEVATED_TOKEN", "QUARTERBACK_ELEVATED_TOKEN_CMD"):
+        env.pop(stray, None)
+
+    done = subprocess.run([str(BIN / "qb-mcp")], capture_output=True, text=True,
+                          env=env, timeout=60)
+    assert done.returncode == 0, f"qb-mcp exited {done.returncode}: {done.stderr}"
+
+    host = subprocess.run(["hostname", "-s"], capture_output=True, text=True).stdout.strip()
+    assert f"AGENT={host}" in done.stdout, (
+        "qb-mcp did not export QUARTERBACK_AGENT into the server's environment; "
+        f"got: {done.stdout!r}")
+    assert f"RESOLVED=quarterback-{host}/elevated" in done.stdout, (
+        "the credential reference resolved with an empty agent name — this is the "
+        f"`quarterback-/elevated` failure. Got: {done.stdout!r}")
