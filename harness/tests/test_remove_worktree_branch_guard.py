@@ -31,12 +31,15 @@ REMOVE = BIN / "remove-worktree"
 
 #: What the teardown shells out to: the names grepped out of `remove-worktree`,
 #: plus the ordinary coreutils it may reach through a `$(...)` this list cannot
-#: see. Generous on purpose — `toolbox()` refuses a name this host has not got,
-#: so an unused entry is loud, while a MISSING one reads to the script as "that
-#: tool is broken" and the test would report it as the behaviour of the guard.
+#: see. Generous, but only as far as **stdenv** — `toolbox()` refuses a name this
+#: host has not got, and the nix `worktree-tests` sandbox is not this laptop.
+#: `hostname` was on this list for one CI run and is not in that sandbox, which is
+#: the guard behaving exactly as #527 designed it. A name MISSING from here is the
+#: worse direction: it reads to the script as "that tool is broken", and the test
+#: would report that as the behaviour of the guard.
 TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
-         "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "hostname")
+         "jq", "chmod", "find", "sort", "mv", "ln", "readlink")
 
 
 def git(cwd, *args):

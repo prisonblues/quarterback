@@ -38,7 +38,7 @@ HOLDER = BIN / "worktree-holder"
 HOLDERLESS_TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat",
                     "head", "tail", "wc", "date", "basename", "dirname", "rm",
                     "mkdir", "env", "timeout", "jq", "sort", "find", "readlink",
-                    "hostname", "curl", "python3")
+                    "curl", "python3")
 
 MINE = "11111111-1111-1111-1111-111111111111"
 PEER = "22222222-2222-2222-2222-222222222222"
