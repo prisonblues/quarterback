@@ -2287,6 +2287,100 @@ def _spell_prs(numbers: list[int]) -> str:
     return f"{len(numbers)} {word} ({shown}{more})"
 
 
+#: The window both halves of the `escalations` row are counted over. 24h is not a
+#: tuning choice — it is the largest `window_min` the board's own read accepts, and
+#: the two counts have to come from the same span or the comparison says nothing.
+ESCALATION_WINDOW_MINUTES = 1440
+
+#: The post type `needs_human.announce()` writes. Named here rather than spelled at
+#: the call site because this row's entire claim is that these two writes come from
+#: one function, and a typo would make it report a severed producer forever.
+ESCALATION_POST = "stuck"
+
+
+def check_escalations(host: Host) -> Check:
+    """Is the escalation path writing rows, or only ringing the bell?
+
+    #523, and the row exists because this fleet has now built the same empty queue
+    three times. The `stuck` post type measured at ZERO over thirty days. Six
+    `needs-human/*` labels shipped with no producer, no consumer and no test. #328
+    landed a `blockers` table and no producer. None of the three was the wrong shape
+    and nothing ever wrote to them — which is a failure with no symptom, because an
+    empty queue and a working queue with nothing in it look identical from outside.
+
+    So the question is asked as a PAIR, the way `landed` asks its own. A blockers
+    table with nothing in it is not a fault: it is the correct state of a day nobody
+    got stuck. `stuck` posts with nothing in the table is the fault, and it is only
+    visible because ONE function makes both writes — `announce()` posts and then
+    stores, so a post without a row in the same window is that function's second
+    half failing, or never having been deployed.
+
+    STRICTLY ANY-VERSUS-NONE, and not a ratio, because rows are legitimately fewer
+    than posts. An escalation whose refs name no subject is announced and
+    deliberately not stored (#523), so `posts > rows` is the designed behaviour and
+    a proportional test here would fail on correct data. Zero rows against any post
+    is the only divergence that cannot be explained by the design.
+
+    A board with no `/blockers` at all reads `unknown`, not `fail`: an image
+    predating #328 has not severed anything, it has not been redeployed, and those
+    are different sentences to be handed.
+    """
+    window = ESCALATION_WINDOW_MINUTES
+    posts, why = board_get(host, f"/board?type={ESCALATION_POST}&window_min={window}")
+    if posts is None:
+        return Check("escalations", host.base_url or "-", why, "unknown",
+                     manual="see the board and token rows")
+    raised = posts.get("posts")
+    if not isinstance(raised, list):
+        return Check("escalations", host.base_url or "-",
+                     f"the board answered no list of {ESCALATION_POST} posts, so whether "
+                     "anything escalated in the last day could not be read", "unknown",
+                     manual=f"{host.base_url}/board?type={ESCALATION_POST}")
+    rows, why = board_get(host, "/blockers?open=false&limit=1000")
+    if rows is None:
+        # Told apart from any other board failure, because the answer is a deploy and
+        # not a bug: `board_get` turns every non-200 into this one sentence shape.
+        missing = "404" in why
+        return Check("escalations", host.base_url or "-",
+                     ("this board serves no /blockers, so it is running an image from "
+                      "before #328 and the row half of an escalation has nowhere to land "
+                      f"— {len(raised)} {ESCALATION_POST} post(s) in the last "
+                      f"{_spell_age(window)} went to the board as posts only")
+                     if missing else why, "unknown",
+                     manual="redeploy the board (#328/#519), then re-run this row")
+    stored = rows.get("blockers")
+    if not isinstance(stored, list):
+        return Check("escalations", host.base_url or "-",
+                     "the board answered no list of blockers, so what the escalation path "
+                     "recorded could not be read", "unknown",
+                     manual=f"{host.base_url}/blockers?open=false")
+    fresh = [b for b in stored
+             if (age := _age_minutes((b or {}).get("raised_at"))) is not None
+             and 0 <= age <= window]
+    span = _spell_age(window)
+    if raised and not fresh:
+        return Check("escalations", host.base_url or "-",
+                     f"{len(raised)} {ESCALATION_POST} post(s) in the last {span} and not "
+                     "one blocker row — the escalation path is ringing the bell and "
+                     "recording nothing, so nothing can answer 'what is waiting on me'",
+                     "fail",
+                     manual="run one escalation by hand and read the note it returns: "
+                            "`announce()` states which half failed on the line it returns "
+                            "(harness/loops/needs_human.py)",
+                     extra={"posts": len(raised), "rows": 0, "window_minutes": window})
+    if not raised and not fresh:
+        return Check("escalations", host.base_url or "-",
+                     f"nothing escalated in the last {span}, so an empty blockers table is "
+                     "the state of a quiet day and not evidence of a severed producer",
+                     "ok", extra={"posts": 0, "rows": 0, "window_minutes": window})
+    # Rows and no posts is not a fault either: a person can raise one by hand, and the
+    # window is a day while an unanswered blocker outlives it.
+    return Check("escalations", host.base_url or "-",
+                 f"{len(fresh)} blocker row(s) recorded against {len(raised)} "
+                 f"{ESCALATION_POST} post(s) in the last {span}", "ok",
+                 extra={"posts": len(raised), "rows": len(fresh), "window_minutes": window})
+
+
 def check_generated(host: Host) -> Check:
     """Is any open pull request editing a file the release job GENERATES? (#122)
 
@@ -3718,6 +3812,37 @@ CHECKS = (
                     "behaviour #405 argued the queue exists to prevent.",
                 ),
                 needs=("ready",)),
+        }),
+    CheckSpec(
+        "escalations", "landing", check_escalations,
+        explanation=(
+            "Three times now this fleet has built a place for work that is stuck to be "
+            "recorded, and three times nothing wrote to it: the `stuck` post type "
+            "measured at zero across thirty days, six `needs-human/*` labels shipped with "
+            "no producer, and #328's `blockers` table landed with none either. That "
+            "failure has no symptom — an empty queue and a working queue with nothing in "
+            "it are the same table — so it can only be caught by asking a second source "
+            "the same question. One function makes both writes, which is what makes the "
+            "comparison meaningful: a `stuck` post with no row beside it is `announce()`'s "
+            "second half failing, and nothing else."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The escalation path posted {posts} time(s) and stored nothing. Both "
+                      "writes come from `announce()` in harness/loops/needs_human.py, so "
+                      "the post half works and the row half does not. Run one escalation "
+                      "and read the note it returns — it names which half failed and why. "
+                      "The usual causes are a board without #328 deployed, a token without "
+                      "the `delegated` tier, and a subject the refs did not name."),
+                constraints=(
+                    "Do not write rows by hand to clear this. The row is measuring whether "
+                    "the producer works, and backfilling it makes the measurement lie "
+                    "while leaving every future escalation just as unrecorded.",
+                    "An escalation whose refs name no subject is announced and NOT stored, "
+                    "by design (#523). If that turns out to be all of them, the fix is in "
+                    "the callers' refs, not in the storing.",
+                ),
+                needs=("posts",)),
         }),
     CheckSpec(
         "tags", "landing", check_tags,
