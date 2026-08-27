@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -2758,6 +2759,17 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     # an int in Python and `max_rounds: true` would otherwise resolve to one round.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return f"`{path}` must be a number, not {value!r}"
+    # NaN AND THE INFINITIES, before the sign test and not after it. `json.loads`
+    # accepts all three as bare literals, and `NaN` compares false against every
+    # bound there is — so `NaN < 0` is false and a floor, a round cap or a budget
+    # would take it. `-Infinity` only fails below by luck, and `Infinity` does not
+    # fail at all. `app/api/dials.py` refuses them at the board with `allow_nan=
+    # False`; this is the same refusal made where the value is typed, which is the
+    # whole point of a client that owns the vocabulary.
+    if isinstance(value, float) and not math.isfinite(value):
+        return (f"`{path}` must be a finite number, and is {value!r} — JSON's "
+                f"`NaN` and `Infinity` are values Postgres will not store and "
+                f"nothing here can compare against")
     if value < 0:
         return f"`{path}` must not be negative, and is {value!r}"
     return ""

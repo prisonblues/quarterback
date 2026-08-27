@@ -276,7 +276,8 @@ class DialEdit(ModalScreen[dict | None]):
 
     def __init__(self, row: dict | None = None, repo: str | None = None,
                  scope_label: str = "", vocabulary: dict | None = None,
-                 in_force: dict | None = None, now: str | None = None) -> None:
+                 in_force: dict | None = None, now: str | None = None,
+                 trouble: str = "") -> None:
         super().__init__()
         self.row = row or {}
         self.repo = repo
@@ -284,6 +285,11 @@ class DialEdit(ModalScreen[dict | None]):
         #: `{}` is "this box cannot read the harness's table", not "no dial is
         #: settable" — see the class docstring.
         self.vocabulary = vocabulary or {}
+        #: WHY it is empty, in the caller's words (`qbdata.dial_trouble`). Handed
+        #: in beside the vocabulary rather than fetched here, so the sentence and
+        #: the table it explains come from one read: a screen that asked the loader
+        #: a second question could answer with a state the first one never saw.
+        self.trouble = trouble
         #: `GET /dials`' own answer, so the spec line can say what is in force
         #: beside what the built-in default is. Moving a floor without being told
         #: it was already moved is how one gets nudged twice.
@@ -393,8 +399,14 @@ class DialEdit(ModalScreen[dict | None]):
             # Said once, plainly, and NOT as an empty dial list: a form that drew
             # "0 dials settable" would state as fact the one thing it failed to
             # find out. The write still goes through; the board is the judge.
-            return Text("no harness/loops beside this dashboard, so the names and "
-                        "values are not checked here", style="italic")
+            #
+            # AND IT SAYS WHICH FAILURE. An absent harness, one that will not
+            # import and one older than the dial table all end here, and telling
+            # all three as the first sends somebody to look for a directory that is
+            # sitting right there. `qbdata.dial_trouble` carries the distinction.
+            return Text(f"{self.trouble or 'the dial table cannot be read here'}, "
+                        f"so the names and values are not checked here",
+                        style="italic")
         spec = self._spec_of(dial)
         if not spec:
             # A name that is not in the table is a person who has probably mistyped
@@ -494,10 +506,16 @@ class DialEdit(ModalScreen[dict | None]):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """Filter as the name is typed, and re-state what the named dial takes."""
-        if event.input.id in ("f_dial", "f_value"):
+        if event.input.id in ("f_dial", "f_value") and not self._armed():
             # The two fields a refusal is ever about. Editing either is a person
             # acting on it, and a refusal left standing beside the field it has
             # stopped describing is read as a second, still-live objection.
+            #
+            # UNLESS THE UNKNOWN-NAME WARNING IS ARMED. That one is not a complaint
+            # about the value — it says the NAME is one nothing here applies, and it
+            # stays true while the name does. Clearing it on a value edit hid the
+            # sentence while `_insisted` went on holding the next ctrl+s open, which
+            # is a confirmation nobody can see they have given.
             self.query_one("#err", Static).display = False
         if event.input.id != "f_dial":
             return
@@ -566,6 +584,10 @@ class DialEdit(ModalScreen[dict | None]):
             names.focus()
 
     # -- saving ----------------------------------------------------------------
+
+    def _armed(self) -> bool:
+        """Is the unknown-name warning outstanding for the name in the box?"""
+        return bool(self._insisted) and self._insisted == self._dial_name()
 
     def _refuse(self, message: str) -> None:
         """Say why, and stay open.
@@ -2562,6 +2584,7 @@ class Dash(App):
         # refusal (#539).
         self.push_screen(DialEdit(row, repo, label,
                                   vocabulary=qd.dial_vocabulary(),
+                                  trouble=qd.dial_trouble(),
                                   in_force=self.dials,
                                   now=(self.dials or {}).get("now")),
                          self.dial_written)

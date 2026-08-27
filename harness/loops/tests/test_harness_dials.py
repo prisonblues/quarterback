@@ -628,3 +628,17 @@ def test_the_default_reviewer_scope_is_one_of_the_words_offered():
     take."""
     default, known = hr._dial_default("review_panel.reviewer_scope")
     assert known and default in hr.dial_choices("review_panel.reviewer_scope")
+
+
+def test_a_number_dial_refuses_the_values_that_are_not_numbers_after_all():
+    """`json.loads` accepts `NaN`, `Infinity` and `-Infinity` as bare literals, and
+    `NaN` compares false against every bound — so `value < 0` let it through and a
+    floor, a round cap or a budget took a value nothing can compare against.
+    `app/api/dials.py` refuses all three at the board (`allow_nan=False`, because
+    Postgres will not store them), and a validator that disagreed with the endpoint
+    it guards would send the refusal back a round later instead of at the keyboard."""
+    for value in (float("nan"), float("inf"), float("-inf")):
+        said = hr.dial_problem("review_panel.max_rounds", value)
+        assert "finite" in said, (value, said)
+    assert hr.dial_problem("review_panel.max_rounds", 2) == ""
+    assert hr.dial_problem("review_panel.max_fix_growth", 3.5) == ""

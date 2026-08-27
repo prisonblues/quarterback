@@ -754,3 +754,102 @@ def test_every_dial_says_what_it_decides_in_one_line():
     vocab = qd.dial_vocabulary()
     assert all(spec["what"] for spec in vocab.values())
     assert max(len(spec["what"]) for spec in vocab.values()) <= 2 * 66
+
+
+def _box(tmp_path, name, harness_rules_source=None):
+    """A fake install: `bin/qbdata.py` with or without a `loops/harness_rules.py`."""
+    box = tmp_path / name
+    (box / "bin").mkdir(parents=True)
+    if harness_rules_source is not None:
+        (box / "loops").mkdir()
+        (box / "loops" / "harness_rules.py").write_text(harness_rules_source)
+    return str(box / "bin" / "qbdata.py")
+
+
+@pytest.fixture
+def fresh(monkeypatch):
+    """A process that has not yet resolved the table, and does not leak one.
+
+    Three things have to be undone and each is a real hazard rather than tidying.
+    `_DIAL_RULES` caches the module, so without a reset the `script` argument is
+    ignored. `sys.modules` is what `import harness_rules` actually consults — a
+    suite that has already imported the real one gets it back whatever directory is
+    on the path, which is the isolation hazard this fixture exists to make visible.
+    And `_dial_rules` PREPENDS to `sys.path`, so a test pointing at a broken harness
+    would leave it importable for everything after it.
+    """
+    monkeypatch.setattr(qd, "_DIAL_RULES", [])
+    monkeypatch.setattr(qd, "_DIAL_TROUBLE", "")
+    monkeypatch.delitem(sys.modules, "harness_rules", raising=False)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+
+def test_a_harness_that_is_absent_broken_or_old_are_three_different_answers(
+        tmp_path, fresh, monkeypatch):
+    """All three end in an empty vocabulary and unvalidated writes, and the screen
+    used to tell all three as the first — so a `harness_rules.py` sitting right
+    there with a syntax error in it reported itself as an install that had never
+    happened. The board layer draws the same distinction one level up
+    (`_dials_unreadable` is "we could not find out", never "there is no dial")."""
+    absent = _box(tmp_path, "absent")
+    assert qd.dial_vocabulary(absent) == {}
+    assert qd.dial_trouble(absent) == "no harness/loops beside this dashboard"
+
+    monkeypatch.setattr(qd, "_DIAL_RULES", [])
+    monkeypatch.delitem(sys.modules, "harness_rules", raising=False)
+    broken = _box(tmp_path, "broken", "def dial_specs(:\n")
+    assert qd.dial_vocabulary(broken) == {}
+    said = qd.dial_trouble(broken)
+    assert "would not import" in said and "SyntaxError" in said
+
+    monkeypatch.setattr(qd, "_DIAL_RULES", [])
+    monkeypatch.delitem(sys.modules, "harness_rules", raising=False)
+    old = _box(tmp_path, "old", "BOARD_DIALS = {}\n")
+    assert qd.dial_vocabulary(old) == {}
+    assert "predates the dial table" in qd.dial_trouble(old)
+
+
+def test_a_readable_table_has_nothing_to_report(fresh):
+    """`""` is the fourth state and it has to be distinguishable from all three:
+    the screen prints this sentence only when there is one."""
+    assert qd.dial_vocabulary() and qd.dial_trouble() == ""
+
+
+def test_a_harness_installed_after_the_dashboard_opened_is_picked_up(
+        tmp_path, fresh, monkeypatch):
+    """The failure is NOT cached, and an earlier cut of this cached it — on the
+    stated grounds that the modal asks on every keystroke, which it does not: it
+    asks once when the modal opens. So the saving was imaginary and the cost was a
+    dashboard that went on saying the table could not be read until somebody
+    restarted it."""
+    box = tmp_path / "later"
+    (box / "bin").mkdir(parents=True)
+    script = str(box / "bin" / "qbdata.py")
+    assert qd.dial_vocabulary(script) == {}
+
+    (box / "loops").mkdir()
+    (box / "loops" / "harness_rules.py").write_text(
+        "from collections import namedtuple\n"
+        "Dial = namedtuple('Dial', 'kind nullable rule what')\n"
+        "BOARD_DIALS = {'a.b': Dial('number', False, 'either', 'what it does')}\n"
+        "def dial_specs():\n"
+        "    return {'a.b': {'dial': 'a.b', 'what': 'what it does', 'kind': 'number',\n"
+        "                    'nullable': False, 'rule': 'either', 'default': 1,\n"
+        "                    'default_known': True, 'choices': [], 'hint': 'a number',\n"
+        "                    'note': ''}}\n")
+    monkeypatch.delitem(sys.modules, "harness_rules", raising=False)
+    assert list(qd.dial_vocabulary(script)) == ["a.b"]
+    assert qd.dial_trouble(script) == ""
+
+
+def test_a_value_no_number_can_be_is_refused_before_the_board_has_to_refuse_it():
+    """`json.loads` accepts `NaN` and `Infinity` as bare literals, and `NaN`
+    compares false against every bound there is — so a floor, a round cap or a
+    budget took it. `POST /dials` refuses all three (`allow_nan=False`, because
+    Postgres will not store them); this is that refusal made where the value is
+    typed, which is what a client owning the vocabulary is for."""
+    for text in ("NaN", "Infinity", "-Infinity"):
+        value = qd.parse_dial_value(text)
+        said = qd.dial_refusal("review_panel.max_rounds", value)
+        assert "finite" in said, (text, said)
+    assert qd.dial_refusal("review_panel.max_rounds", 2) == ""

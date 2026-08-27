@@ -2881,34 +2881,75 @@ def loops_dir(script: str | None = None) -> str | None:
     return None
 
 
-#: Resolved once and remembered, INCLUDING the failure. The modal asks on every
-#: keystroke of the name box, and a lookup that re-imported a large module (or
-#: re-walked two directories to fail again) per character would make typing the
-#: thing this exists to make easier the slow part of it.
+#: The module once it has been found, so that opening the modal a second time does
+#: not re-import a large one. SUCCESS ONLY — a failure is deliberately NOT
+#: remembered, and an earlier cut of this cached both on the grounds that "the
+#: modal asks on every keystroke", which is simply not true: `dial_vocabulary` is
+#: asked once when the modal opens and the keystrokes filter the dict it returned.
+#: So the saving was imaginary and the cost was real — a dashboard left open across
+#: a harness install would have gone on saying the table could not be read until
+#: somebody restarted it, which is the failure `expires_at` exists to prevent one
+#: layer up.
 _DIAL_RULES: list = []
+
+#: Why the table could not be read, in a sentence, or `""`. Written by
+#: `_dial_rules` and asked for by `dial_trouble` — see that function for why the
+#: two failures must not be told the same way.
+_DIAL_TROUBLE = ""
 
 
 def _dial_rules(script: str | None = None):
-    """The `harness_rules` module, or None where it is not beside this file.
+    """The `harness_rules` module, or None where it cannot be read.
 
     Never raises. An import that fails — a partial install, a syntax error in a
     checkout mid-edit — leaves the form exactly as useful as it was before this
     landed, which is a worse form and not a broken one.
     """
+    global _DIAL_TROUBLE
     if _DIAL_RULES:
         return _DIAL_RULES[0]
     where = loops_dir(script)
-    module = None
-    if where:
-        if where not in sys.path:
-            sys.path.insert(0, where)
-        try:
-            import harness_rules  # noqa: PLC0415 — resolved at call time, by design
-            module = harness_rules
-        except Exception:                      # noqa: BLE001 — degrade, don't die
-            module = None
-    _DIAL_RULES.append(module)
-    return module
+    if not where:
+        _DIAL_TROUBLE = "no harness/loops beside this dashboard"
+        return None
+    if where not in sys.path:
+        sys.path.insert(0, where)
+    try:
+        import harness_rules  # noqa: PLC0415 — resolved at call time, by design
+    except Exception as exc:                   # noqa: BLE001 — degrade, don't die
+        _DIAL_TROUBLE = (f"{where}/harness_rules.py would not import: "
+                         f"{type(exc).__name__}: {exc}")
+        return None
+    if not hasattr(harness_rules, "dial_specs"):
+        # The harness beside this script can be OLDER than this file — a checkout on
+        # a branch that predates #539, or a half-updated install. Not the same fact
+        # as an absent directory, and not the same fact as a broken one.
+        _DIAL_TROUBLE = (f"the harness at {where} predates the dial table "
+                         f"(no dial_specs)")
+        return None
+    _DIAL_TROUBLE = ""
+    _DIAL_RULES.append(harness_rules)
+    return harness_rules
+
+
+def dial_trouble(script: str | None = None) -> str:
+    """Why the vocabulary is empty, in a sentence a screen can print, or `""`.
+
+    **THREE FAILURES, NOT ONE.** No `harness/loops` beside the dashboard is a box
+    that never had the table; a `harness_rules.py` that will not import is a box
+    that has it and is broken; a harness older than `dial_specs` is a box mid-
+    upgrade. All three end in an empty vocabulary and unvalidated writes, and until
+    this existed the screen told all three as the first one — so a partial upgrade
+    reported itself as an install that had never happened, which is a sentence that
+    sends somebody to look in the wrong place.
+
+    The board layer makes the same distinction one level up and for the same
+    reason: `_dials_unreadable` is "we could not find out", never "there is no
+    dial". A screen that cannot tell those apart is a screen that reports a
+    misconfigured box as a healthy one.
+    """
+    _dial_rules(script)
+    return _DIAL_TROUBLE
 
 
 def dial_vocabulary(script: str | None = None) -> dict[str, dict]:
@@ -2920,10 +2961,7 @@ def dial_vocabulary(script: str | None = None) -> dict[str, dict]:
     thing it failed to find out.
     """
     rules = _dial_rules(script)
-    if rules is None or not hasattr(rules, "dial_specs"):
-        # `hasattr`, because the harness beside the script can be OLDER than this
-        # file — a checkout on a branch that predates #539, or a half-updated
-        # install. A missing table is the same answer as a missing directory.
+    if rules is None:
         return {}
     try:
         return rules.dial_specs()
@@ -2942,7 +2980,7 @@ def dial_refusal(dial: str, value, script: str | None = None) -> str:
     """
     rules = _dial_rules(script)
     if rules is None or not hasattr(rules, "dial_problem"):
-        return ""
+        return ""  # `hasattr` for `dial_specs`' reason, one function up
     try:
         return rules.dial_problem(dial, value) or ""
     except Exception:                          # noqa: BLE001 — degrade, don't die

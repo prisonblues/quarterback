@@ -2453,11 +2453,19 @@ is drawn.
 
 None of this is a second copy of the dial table. `qbdata.dial_vocabulary()` reads
 `harness_rules.dial_specs()` at call time — names, kinds, defaults, directions, all still
-settled by `BOARD_DIALS` and `DEFAULTS` — and a box with no `harness/loops` beside the
-dashboard gets `{}`, which is *cannot tell* and never *nothing is settable*: the picker is
-hidden, the line under the value says so, and the write goes through exactly as it did
-before, with the board as the only judge. A form that refused there would leave the person at
-that keyboard with no door at all.
+settled by `BOARD_DIALS` and `DEFAULTS` — and a box that cannot read it gets `{}`, which is
+*cannot tell* and never *nothing is settable*: the picker is hidden, the line under the value
+says so, and the write goes through exactly as it did before, with the board as the only
+judge. A form that refused there would leave the person at that keyboard with no door at all.
+
+**And it says WHICH cannot-tell.** Three states end in an empty vocabulary — no
+`harness/loops` beside the dashboard, a `harness_rules.py` that will not import, and a
+harness older than the dial table — and `qbdata.dial_trouble()` tells them apart, because a
+partial upgrade reported as an install that never happened sends somebody to look for a
+directory that is sitting right there. It is the distinction the board layer already draws one
+level up: `_dials_unreadable` is *we could not find out*, never *there is no dial*. The
+failure is not cached either, so a harness installed while the dashboard is open is picked up
+the next time the modal opens rather than at the next restart.
 
 **What that credential costs is [#479](https://github.com/prisonblues/quarterback/issues/479),
 and it is stated rather than implied**: the key sits on this workstation, readable by the

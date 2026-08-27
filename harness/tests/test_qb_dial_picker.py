@@ -681,3 +681,82 @@ def test_the_lines_under_the_boxes_line_up_with_the_text_in_them(tui, vocabulary
         assert screen.query_one("#err").content_region.x == want
 
     drive(tui, modal(tui, vocabulary), steps)
+
+
+def test_the_form_still_fits_with_the_list_up_and_a_wrapped_refusal(tui, vocabulary):
+    """The tallest state there is, and the one the earlier fit tests did not reach:
+    the picker still showing (an unknown name that filters to several), a two-line
+    description under the value box, and a refusal wrapped onto a second line. This
+    form grows downward as it objects, and what a Textual modal does when it
+    outgrows its screen is clip whatever was composed last."""
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = "budget"
+        field(screen, "#f_value").value = "x"
+        field(screen, "#f_reason").value = "capping the drain"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+        assert screen.query_one("#names").display, "the list is up in this state"
+        assert screen.query_one("#err").region.height >= 2, "and the refusal wrapped"
+        for selector in ("#f_dial", "#names", "#f_value", "#spec", "#f_reason",
+                         "#f_expiry", "#err", "#hint"):
+            assert visible(screen, selector), selector
+
+    drive(tui, modal(tui, vocabulary), steps)
+
+
+def test_the_longest_refusal_a_known_dial_can_raise_also_fits(tui, vocabulary):
+    """The other tall state: no list, the full four-line block, and the harness's
+    own sentence about a value — which names the dial, so the longest dial name
+    makes the longest refusal."""
+    longest = max(vocabulary, key=len)
+
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = longest
+        field(screen, "#f_value").value = '"not a value"'
+        field(screen, "#f_reason").value = "an experiment"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+        assert longest in text_of(screen, "#err")
+        for selector in ("#f_dial", "#f_value", "#spec", "#f_reason", "#f_expiry",
+                         "#err", "#hint"):
+            assert visible(screen, selector), selector
+
+    drive(tui, modal(tui, vocabulary), steps)
+
+
+def test_an_armed_warning_stays_on_screen_while_it_is_armed(tui, vocabulary):
+    """The unknown-name warning is not a complaint about the value — it says the
+    NAME is one nothing here applies, and it stays true while the name does. Cleared
+    on a value edit, the sentence vanished while the next ctrl+s went on being held
+    open: a confirmation nobody can see they have given."""
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = "tempo"
+        field(screen, "#f_reason").value = "draining"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+        assert "nothing this box knows applies" in text_of(screen, "#err")
+        field(screen, "#f_value").value = "eager"
+        await pilot.pause()
+        assert screen.query_one("#err").display, "the warning went while it still held"
+        # And a NEW name disarms it, so the next unknown one is warned about again.
+        field(screen, "#f_dial").value = "review_panel.invented"
+        await pilot.pause()
+        assert not screen.query_one("#err").display
+
+    drive(tui, modal(tui, vocabulary), steps)
+
+
+def test_the_reason_the_table_is_unreadable_is_the_one_that_is_printed(tui):
+    """An absent harness, one that will not import and one older than the dial table
+    all end in an empty vocabulary, and the screen used to tell all three as the
+    first — sending somebody to look for a directory that is sitting right there."""
+    said = "…/loops/harness_rules.py would not import: SyntaxError: invalid syntax"
+
+    async def steps(screen, pilot):
+        assert said in text_of(screen, "#spec")
+        assert "not checked here" in text_of(screen, "#spec")
+
+    drive(tui, modal(tui, {}, in_force={}, trouble=said), steps)
