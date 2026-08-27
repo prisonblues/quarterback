@@ -3611,17 +3611,29 @@ lies.** It prints *"Done. The new configuration is …"* even when
 not apply and the switch says nothing about it. For `qb-bump` that is not a neighbouring
 subsystem's bug: the harness scripts it exists to deliver arrive through exactly that
 activation, so a bypassed wrapper reports #267's own failure as a success. The wrapper is
-**called, not reimplemented** — the same argument that makes the drift verdict `qb-doctor`'s
-— and only when it can be *shown* to target the flake and attribute that were just built.
+**called, not reimplemented** — the same argument that makes the drift verdict `qb-doctor`'s.
 
-It is shown by **reading** the wrapper, never running it: there is no `--print-target` to
-ask, and finding out by executing an arbitrary script on an arbitrary host is a worse trade
-than a read whose worst outcome is falling back to a command that was already correct. The
-text is scanned for flakerefs, and the answer is used only when there is exactly one and it
-is this flake. None, two, or somebody else's all mean *cannot show it*, which means the
-explicit `sudo nixos-rebuild switch --flake` this file resolved itself; `--no-wrapper` asks
-for that outright. `QUARTERBACK_REBUILD_CMD` (environment or site config) is the door for a
-fleet whose wrapper is spelled differently — a declaration is consent and skips the check.
+It is **read** to decide that, never run: there is no `--print-target` to ask, and finding
+out by executing an arbitrary script on an arbitrary host is a worse trade than a read whose
+worst outcome is falling back to a command that was already correct. Whole-line comments are
+dropped — a commented-out `flake=` naming the right directory, above a live
+`--flake "path:$other#rescue"`, is the decoy that made that necessary — and the answer is
+used only when exactly one flake directory is named and it is this one. None, two, or
+somebody else's all mean *cannot tell*, which means the explicit
+`sudo nixos-rebuild switch --flake` this file resolved itself; `--no-wrapper` asks for that
+outright.
+
+**This is a heuristic, and it is worth being precise about what it does not establish.** A
+regex is not a shell parser, so a target assembled out of variables can hide from it. And
+the *attribute* is not checked at all — it cannot be, because it never appears in a
+wrapper's text: a wrapper derives it from the live hostname. That is precisely why the
+wrapper is used only when the attribute was **matched** rather than named. `resolve_attr`
+matches this machine's `hostName` too, so wrapper and bump agree by construction; `--host
+laptop` run on a desktop agrees only by luck, and would switch this machine onto a
+configuration the run never built — so `--host` refuses the wrapper outright.
+`QUARTERBACK_REBUILD_CMD` (environment or site config, or `consumer.rebuild` in the module)
+is the door for a fleet whose wrapper is spelled differently — a declaration is consent and
+skips the check.
 
 **A proposal that has not been built is a proposal to break somebody's machine.** The first
 bump on 2026-08-22 failed: quarterback's module had started installing

@@ -112,10 +112,23 @@ exists to deliver do not arrive and the switch reports that they did. That is no
 a hypothetical failure elsewhere in the system; it is precisely #267's failure,
 reached by a different road. This fleet's `rebuild` exists to surface it. It is
 not reimplemented here — that is the second-detector mistake this file already
-refuses to make about drift — it is CALLED, and only when it can be SHOWN to
-target the same flake and attribute that was just built. Anything short of shown
-falls back to the explicit `sudo nixos-rebuild switch --flake` this file resolved
-itself, which is always correct and merely misses the guard.
+refuses to make about drift — it is CALLED. Anything short of confident falls back
+to the explicit `sudo nixos-rebuild switch --flake` this file resolved itself,
+which is always correct and merely misses the guard.
+
+**What the wrapper check actually establishes, said plainly, because it is less
+than it looks.** The wrapper's TEXT is read — never run — and used only when it
+names exactly one flake directory and that directory is this one. That is a
+heuristic and not a proof: a regex is not a shell parser, so whole-line comments
+are dropped (a commented-out `flake=` above a live `--flake "path:$other#rescue"`
+was the decoy that made that necessary) but a target assembled from variables can
+still hide from it. The ATTRIBUTE is not read at all and cannot be — it never
+appears in the text, because a wrapper derives it from the live hostname. That is
+exactly why a MATCHED attribute is required: `resolve_attr` matches this machine's
+hostName too, so the two agree by construction, while `--host laptop` on a desktop
+agrees only by luck and is refused. Three things therefore bound this: the
+flakeref must be this one and the only one, `--host` refuses the wrapper outright,
+and `--no-wrapper` turns the path off.
 
 **One command, because two is where the job used to stop.** `--apply` refused
 whenever the cached proposal had gone stale, which is the state it is in most
@@ -346,17 +359,38 @@ def fast_forward(where: Path, timeout: int = FETCH_TIMEOUT) -> Pulled:
     they have done it on this fleet five times. Deciding what happens to somebody's
     divergence is not this file's business at any level of confidence.
 
-    A tree with no upstream — a detached HEAD, a branch tracking nothing — is not a
-    failure and must not read as one. There is nothing to pull it up to, which is
-    reported and stepped over with `blocked` left False, because a caller's only
-    use for this is deciding whether it is still entitled to say "nothing to carry".
+    A branch that tracks nothing is not a failure and must not read as one. There is
+    nothing to pull it up to, so it is reported and stepped over with `blocked` left
+    False — a caller's only use for this is deciding whether it is still entitled to
+    say "nothing to carry", and a signal that fires on every worktree on the fleet is
+    one that gets ignored inside a week. A **detached HEAD** is the opposite case and
+    is separated out above: it looks the same to `@{u}` and means the one thing this
+    is looking for.
+
+    **`@{u}` is taken at its word, and that is an assumption.** A checkout on a branch
+    tracking `origin/release-old` fast-forwards happily and is still behind whatever
+    landed on `main`. Nothing here second-guesses that: which branch a checkout is on
+    is a decision somebody made, and a tool that overrode it would pull a worktree onto
+    a branch its owner is not working on. What this rules out is a checkout that is
+    behind *the thing it is tracking*, which is the state the fleet actually gets into.
     """
     got = Pulled(path=str(where))
+    rc, _, _ = run(["git", "-C", str(where), "symbolic-ref", "--quiet", "HEAD"])
+    if rc != 0:
+        # Separated from "no upstream" below, because the two look alike and mean
+        # opposite things. A branch that tracks nothing cannot be behind anything.
+        # A DETACHED HEAD can be sitting on a commit from three weeks ago, which is
+        # precisely the staleness this pull exists to rule out, so it is doubt.
+        got.why = (f"{where} is a detached HEAD, so there is no branch to pull — and a "
+                   "detached checkout can be sitting on an old commit, which is the state "
+                   "this pull exists to rule out")
+        got.blocked = True
+        return got
     rc, upstream, _ = run(["git", "-C", str(where), "rev-parse", "--abbrev-ref",
                            "--symbolic-full-name", "@{u}"])
     if rc != 0 or not upstream:
-        got.why = (f"{where} has no upstream branch — a detached HEAD, or a branch that "
-                   "tracks nothing — so there is nothing to pull it up to")
+        got.why = (f"{where} is on a branch that tracks nothing, so there is nothing to "
+                   "pull it up to")
         return got
     got.upstream = upstream
     got.before = head_of(where)
@@ -845,6 +879,11 @@ class Proposal:
     #: plus one moved input, so a consumer who commits afterwards has a system
     #: nothing here has built, and `--apply` refuses rather than switch onto it.
     base_head: str = ""
+    #: True when `--host` named the attribute rather than it being matched against
+    #: this machine's hostname. It is the wrapper question: a `rebuild` wrapper picks
+    #: its attribute from the live hostname, so it agrees with a MATCHED attr by
+    #: construction and agrees with a NAMED one only by luck.
+    attr_named: bool = False
     #: Tracked files that were modified in the consumer when this was built,
     #: `flake.lock` aside. They were NOT part of what was built — preparation
     #: reads HEAD — but `nixos-rebuild --flake <dir>` builds the working tree, so
@@ -918,8 +957,8 @@ def lock_is_committed(flake: Path) -> str:
             "applying the result would discard them — commit or revert that file first")
 
 
-def prepare(consumer: Consumer, attr: str, script: str,
-            drift: Drift) -> tuple[Proposal | None, str, str]:
+def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
+            attr_named: bool = False) -> tuple[Proposal | None, str, str]:
     """Update the pin, build the system, and keep what a person needs to switch.
 
     Returns ``(proposal, build log, why-there-is-none)``. A build that fails
@@ -936,6 +975,12 @@ def prepare(consumer: Consumer, attr: str, script: str,
     """
     tmp = Path(tempfile.mkdtemp(prefix="qb-bump-"))
     try:
+        # Read BEFORE the archive, not after the build. `base_head` is the guard
+        # `--apply` uses to refuse a consumer that has committed since — and recorded
+        # afterwards it recorded whatever the consumer had become during an hour-long
+        # build, blessing a commit that was never archived and never built.
+        base_head = head_of(consumer.flake)
+        base_dirty = dirty_tracked(consumer.flake)
         base_lock = (consumer.flake / "flake.lock").read_text(encoding="utf-8")
         why = export_head(consumer.flake, tmp)
         if why:
@@ -957,8 +1002,16 @@ def prepare(consumer: Consumer, attr: str, script: str,
             save_refusal(new_rev, log)
             return None, log, (f"the bumped flake does not build "
                                f"(nix build exited {rc}) — not proposing it")
+        moved_under_us = head_of(consumer.flake)
+        if moved_under_us and base_head and moved_under_us != base_head:
+            # Somebody committed in the consumer while this was building. What was
+            # proven is the tree as it was an hour ago; recording the new HEAD would
+            # make `--apply`'s own guard wave it through.
+            return None, log, (f"{consumer.flake} committed {base_head[:12]} -> "
+                               f"{moved_under_us[:12]} while this was building, so what "
+                               "was built is not what a switch would build. Re-run it.")
         proposal = Proposal(
-            base_head=head_of(consumer.flake), dirty=dirty_tracked(consumer.flake),
+            base_head=base_head, dirty=base_dirty, attr_named=attr_named,
             flake=str(consumer.flake), attr=attr, input=consumer.input,
             old_rev=consumer.rev, new_rev=new_rev, out_path=out.splitlines()[-1] if out else "",
             base_lock_sha=sha(base_lock), new_lock_sha=sha(new_lock),
@@ -1101,11 +1154,27 @@ def wrapper_targets(script: Path) -> tuple[set[str], str]:
     and it is that flake. No match, two matches, or a flakeref assembled out of shell
     variables this cannot evaluate all mean "cannot show it", and "cannot show it"
     means the explicit command.
+
+    **And it is a heuristic, which is said here rather than left to be discovered.**
+    A regex is not a shell parser. Commented-out lines are dropped for that reason —
+    a `# flake=path:/the/real/one` above a live `--flake "path:$other#rescue"` was the
+    exact decoy that made this necessary — but a target assembled from variables can
+    still hide from it, and a wrapper whose text disagrees with its behaviour will be
+    trusted. Three things bound the damage: the flakeref has to be *this* flake and
+    the only one in the file, `--host` refuses the wrapper outright (see
+    :func:`rebuild_wrapper`), and `--no-wrapper` turns the whole path off. What is
+    NOT claimed is proof.
     """
     try:
-        text = script.read_text(encoding="utf-8", errors="replace")
+        raw = script.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return set(), f"the `rebuild` on PATH ({script}) cannot be read: {exc}"
+    # Whole-line comments only. A trailing `#` is left alone deliberately: it is how
+    # every flakeref in a wrapper is written (`path:/dir#${host}`), and stripping from
+    # the first `#` could delete a second, real target and turn "two directories, so
+    # cannot tell" into "one directory, so trusted" — the wrong direction.
+    text = "\n".join("" if ln.lstrip().startswith("#") else ln
+                     for ln in raw.splitlines())
     found = {os.path.realpath(m.group(1)) for m in re.finditer(
         r"""(?:--flake[= ]|\bflake=)["']?(?:path:)?(/[^\s"'#$]+)""", text)}
     # And every bare `path:/…` too, whatever variable it is being assigned to. A wrapper
@@ -1121,11 +1190,18 @@ def wrapper_targets(script: Path) -> tuple[set[str], str]:
     return found, ""
 
 
-def rebuild_wrapper(proposal: Proposal, cfg: dict[str, str]) -> tuple[list[str] | None, str]:
+def rebuild_wrapper(proposal: Proposal,
+                    cfg: dict[str, str]) -> tuple[list[str] | None, str, str]:
     """The host's `nixos-rebuild` wrapper, when it can be SHOWN to build what was built.
 
-    ``(argv, why it is being used)`` or ``(None, why it is not)`` — and the second
-    is not an error, it is the ordinary answer on every host that has no wrapper.
+    ``(argv, why it is being used, what a person would type)`` or ``(None, why it is
+    not, "")`` — and the second is not an error, it is the ordinary answer on every
+    host that has no wrapper.
+
+    **`argv[0]` is a resolved path and the third value is not.** What runs has to be
+    the file that was read, so `argv[0]` is the realpath; what a REPORT says has to be
+    something a person recognises, and `/nix/store/…-hm_rebuild switch` is not that.
+    Both, rather than one of them wrongly.
 
     **Why a wrapper at all.** `nixos-rebuild switch` prints "Done. The new
     configuration is …" even when `home-manager-<user>.service` has failed, so
@@ -1140,40 +1216,64 @@ def rebuild_wrapper(proposal: Proposal, cfg: dict[str, str]) -> tuple[list[str] 
     """
     declared = os.environ.get(REBUILD_KEY) or cfg.get(REBUILD_KEY)
     if declared:
-        argv = shlex.split(declared)
+        try:
+            argv = shlex.split(declared)
+        except ValueError as exc:
+            # An unbalanced quote in a config file must not be a traceback out of a
+            # tool whose next act is switching a machine.
+            return None, f"{REBUILD_KEY} ({declared!r}) will not parse as an argv: {exc}", ""
         if not argv:
-            return None, f"{REBUILD_KEY} is set to an empty command, so it says nothing"
-        if not shutil.which(argv[0]):
-            return None, f"{REBUILD_KEY} names {argv[0]}, which is not on PATH"
-        return argv, f"{REBUILD_KEY} declares `{' '.join(argv)}`"
+            return None, f"{REBUILD_KEY} is set to an empty command, so it says nothing", ""
+        binary = shutil.which(argv[0])
+        if not binary:
+            return None, f"{REBUILD_KEY} names {argv[0]}, which is not on PATH", ""
+        typed = " ".join(argv)
+        return [binary, *argv[1:]], f"{REBUILD_KEY} declares `{typed}`", typed
+
+    if proposal.attr_named:
+        # A wrapper derives its attribute from the live hostname; `resolve_attr` also
+        # matches this machine's hostname unless somebody overrode it. So a MATCHED
+        # attr and the wrapper's agree by construction, and a NAMED one — `--host
+        # laptop` on a desktop — agrees only by luck. Getting that wrong switches this
+        # machine onto a configuration this run never built, which is the whole thing
+        # the file is arranged to prevent, and no reading of the wrapper can rule it
+        # out because the attribute never appears in the text.
+        return None, (f"--host named {proposal.attr!r} rather than it being matched against "
+                      "this machine's hostname, and a `rebuild` wrapper picks its own "
+                      "attribute from the hostname — so it cannot be shown to build the "
+                      "one that was built"), ""
 
     found = shutil.which("rebuild")
     if not found:
-        return None, "no `rebuild` wrapper on PATH"
-    targets, why = wrapper_targets(Path(os.path.realpath(found)))
+        return None, "no `rebuild` wrapper on PATH", ""
+    # The file that gets READ is the file that gets EXEC'd: `shutil.which` and a later
+    # `execvp` are two independent PATH lookups, and inspecting one file while running
+    # whatever the second lookup turns up is the check quietly reopening itself.
+    binary = os.path.realpath(found)
+    targets, why = wrapper_targets(Path(binary))
     if why:
-        return None, why
+        return None, why, ""
     want = os.path.realpath(proposal.flake)
     if targets != {want}:
         return None, (f"the `rebuild` on PATH builds {', '.join(sorted(targets))}, not "
-                      f"{want} — so it is not this flake's wrapper")
-    return ["rebuild", "switch"], (f"`rebuild` ({found}) builds {want}, and it surfaces a "
-                                   "failed home-manager activation that `nixos-rebuild` "
-                                   "reports as success")
+                      f"{want} — so it is not this flake's wrapper"), ""
+    return ([binary, "switch"],
+            f"`rebuild` ({found}) builds {want}, and it surfaces a failed home-manager "
+            "activation that `nixos-rebuild` reports as success",
+            "rebuild switch")
 
 
 def switch_command(proposal: Proposal, cfg: dict[str, str] | None = None,
-                   wrapper: bool = True) -> tuple[list[str], str]:
-    """What switches this machine, and the one line saying why it is that and not the other."""
+                   wrapper: bool = True) -> tuple[list[str], str, str]:
+    """``(argv, why it is that and not the other, what a person would type)``."""
+    explicit = ["sudo", "nixos-rebuild", "switch", "--flake",
+                f"{proposal.flake}#{proposal.attr}"]
     if not wrapper:
-        return (["sudo", "nixos-rebuild", "switch", "--flake",
-                 f"{proposal.flake}#{proposal.attr}"],
-                "--no-wrapper: the explicit command was asked for")
-    argv, why = rebuild_wrapper(proposal, cfg or {})
+        return explicit, "--no-wrapper: the explicit command was asked for", " ".join(explicit)
+    argv, why, typed = rebuild_wrapper(proposal, cfg or {})
     if argv:
-        return argv, why
-    return (["sudo", "nixos-rebuild", "switch", "--flake",
-             f"{proposal.flake}#{proposal.attr}"], why)
+        return argv, why, typed
+    return explicit, why, " ".join(explicit)
 
 
 def apply(proposal: Proposal | None, dry_run: bool, cfg: dict[str, str] | None = None,
@@ -1234,7 +1334,7 @@ def apply(proposal: Proposal | None, dry_run: bool, cfg: dict[str, str] | None =
               "was proven is not a build of this tree any more. Re-run `qb-bump`.",
               file=sys.stderr)
         return 3
-    cmd, how = switch_command(proposal, cfg, wrapper)
+    cmd, how, _typed = switch_command(proposal, cfg, wrapper)
     if dry_run:
         print(f"would write {lock} ({proposal.input} -> {proposal.new_rev[:12]})"
               if not already else f"{lock} already carries {proposal.new_rev[:12]}")
@@ -1247,7 +1347,18 @@ def apply(proposal: Proposal | None, dry_run: bool, cfg: dict[str, str] | None =
               f"  {proposal.prepared_by} --apply", file=sys.stderr)
         return 3
     if not already:
-        lock.write_text(fresh, encoding="utf-8")
+        # Same directory, then rename: `write_text` truncates first, so a full disk or
+        # a signal between the truncate and the write leaves the consumer with an empty
+        # `flake.lock` and no way to tell it was this that did it.
+        scratch = lock.with_name(f".flake.lock.qb-bump.{os.getpid()}")
+        try:
+            scratch.write_text(fresh, encoding="utf-8")
+            os.replace(scratch, lock)
+        except OSError as exc:
+            scratch.unlink(missing_ok=True)
+            print(f"qb-bump: could not install the prepared lock into {lock}: {exc}. "
+                  "Nothing was changed.", file=sys.stderr)
+            return 3
         print(f"wrote {lock}: {proposal.input} {proposal.old_rev[:12]} -> "
               f"{proposal.new_rev[:12]}")
         print("(that file is the ONLY thing this wrote; committing it is yours)")
@@ -1272,9 +1383,9 @@ def apply(proposal: Proposal | None, dry_run: bool, cfg: dict[str, str] | None =
 
 def render_proposal(proposal: Proposal, drift: Drift, checkout: Checkout,
                     consumer: Consumer, announced: str, pulls: list[str] | None = None,
-                    because: str = "", how: str = "") -> str:
+                    because: str = "", how: str = "", caveat: str = "") -> str:
     n = len(drift.missing) + len(drift.differ)
-    lines = [because or f"stale: {drift.detail}", ""]
+    lines = [(because or f"stale: {drift.detail}") + caveat, ""]
     lines += pulls or []
     lines += [
         f"harness    {drift.subject or 'the one on PATH'}",
@@ -1362,21 +1473,54 @@ def prepared_bump(args, cfg: dict[str, str],
             pulls["consumer"] = asdict(consumer_pull)
             notes.append(pull_note(consumer_pull, "consumer"))
             if consumer_pull.moved:
-                # The pull moves `flake.lock` too, and with it the rev this bump
-                # is FROM. Re-read it rather than report the one from before.
-                consumer, consumer_why = resolve_consumer(args.flake, cfg, slug)
+                # The pull moves `flake.lock` too, and with it the rev this bump is
+                # FROM. Re-read THAT path — not `resolve_consumer` again: rerunning
+                # discovery after the pull can land on a different flake (the pulled one
+                # stops pinning this repo, a sibling starts), and then `consumer_pull`
+                # and the reason printed would describe one tree while the bump was
+                # prepared in another.
+                consumer, consumer_why = named_consumer(consumer.flake, slug,
+                                                        consumer.found_by)
+
+    # **Which tree's blocked pull is doubt, and which is a footnote.** The verdict is
+    # a claim about the CHECKOUT, so a checkout that could not be brought level with its
+    # upstream makes the verdict itself unsafe to report either way — that is #414's
+    # lesson and it downgrades to `unknown`. A consuming flake that could not be fetched
+    # is the same class of thing as one that could not be found: it does not weaken the
+    # harness comparison by one word, it only means the SECOND reason to act was never
+    # looked for. Downgrading on it would be worse than useless — a consumer whose
+    # remote wants a credential no non-interactive session has would make every agent
+    # run of this answer "cannot tell" forever, and a tool that always says that is a
+    # tool nobody reads. So it is said, in the same sentence, and not hidden.
+    if pulled is not None and pulled.blocked:
+        return {**out, "outcome": "unknown",
+                "detail": f"cannot tell: {pulled.why} — so neither an all-clear nor a bump "
+                          "would be a claim about a checkout that is level with what it "
+                          f"tracks ({installed}{against})"}, 1, None, None
+
+    caveat = ""
+    if args.no_pull:
+        caveat = (" — neither tree was pulled (--no-pull), so this is not a claim about "
+                  "what has landed on their upstreams")
+    elif consumer_pull is not None and consumer_pull.blocked:
+        caveat = (f" — the consuming flake could not be brought up to date "
+                  f"({consumer_pull.why}), so anything landed there is not accounted for")
+    elif consumer is None:
+        unchecked = ("there is no nix on this host" if not nix_here else
+                     "this checkout has no origin remote" if not slug else consumer_why)
+        caveat = (f" — the consuming flake was not checked ({unchecked}), so this is a "
+                  "claim about the harness and not about that flake")
 
     because = ""
     if drift.current:
-        if pulled is not None and pulled.blocked:
-            return {**out, "outcome": "unknown",
-                    "detail": f"cannot tell: {pulled.why} — so 'nothing to carry' would be a "
-                              f"claim about a checkout that may be behind its upstream "
-                              f"({installed}{against})"}, 1, None, None
+        # What "nothing to carry" does NOT cover is said in the same sentence. It is a
+        # positive assertion of health that a reader stops looking after, and since the
+        # consuming flake having moved is now a reason to act on its own, a run that
+        # never got as far as looking at one must not imply that it did.
         if consumer_pull is None or not consumer_pull.moved:
             return {**out, "outcome": "current",
                     "detail": f"nothing to carry: {drift.detail} "
-                              f"({installed}{against})"}, 0, None, None
+                              f"({installed}{against}){caveat}"}, 0, None, None
         because = (f"the harness on PATH is this checkout's, but {consumer_pull.path} moved "
                    f"{consumer_pull.before[:12]} -> {consumer_pull.after[:12]} on the pull, "
                    "so this machine is behind the flake it is built from")
@@ -1403,7 +1547,8 @@ def prepared_bump(args, cfg: dict[str, str],
         return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     out["attr"] = attr
 
-    proposal, log, why = prepare(consumer, attr, script, drift)
+    proposal, log, why = prepare(consumer, attr, script, drift,
+                                 attr_named=bool(args.attr))
     if proposal is None:
         announced = "" if args.no_announce else escalate(
             script,
@@ -1419,8 +1564,8 @@ def prepared_bump(args, cfg: dict[str, str],
         return ({**out, "outcome": "refused", "detail": why, "log": tail(log),
                  "announced": announced}, 4, None, text)
 
-    cmd, how = switch_command(proposal, cfg, not args.no_wrapper)
-    out["switch"] = {"command": cmd, "how": how}
+    cmd, how, typed = switch_command(proposal, cfg, not args.no_wrapper)
+    out["switch"] = {"command": cmd, "how": how, "typed": typed}
 
     me = socket.gethostname().split(".", 1)[0]
     n = len(drift.missing) + len(drift.differ)
@@ -1450,7 +1595,7 @@ def prepared_bump(args, cfg: dict[str, str],
                           f"`{proposal.prepared_by} --apply`"})
     return (out, 2, proposal,
             render_proposal(proposal, drift, checkout, consumer, announced, pulls=notes,
-                            because=because, how=" ".join(cmd)))
+                            because=because, how=typed, caveat=caveat))
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -77,14 +77,19 @@ def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setenv("QUARTERBACK_CONFIG", str(tmp_path / "no-such-config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(qb, "CACHE", tmp_path / "cache" / "quarterback" / "harness-bump")
-    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, qb.REBUILD_KEY, "QUARTERBACK_CONSUMER_ROOTS",
-                "QUARTERBACK_REPO"):
+    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, qb.REBUILD_KEY, "QUARTERBACK_REPO"):
         monkeypatch.delenv(var, raising=False)
+    # The consumer scan runs on every path now, the no-op included, and its default
+    # roots are `~/source` and `~` — the developer's REAL ones. Left unset, this suite
+    # found the actual nix-fleet on this machine and tried to `git fetch` it. Pointed
+    # at tmp_path, which contains only what a test put there.
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(tmp_path / "no-consumers-here"))
     # The host running the suite has a real `rebuild` on PATH, and whether it is picked
     # up would otherwise depend on which machine ran the tests. Stubbed to "there isn't
     # one" so the fallback is the default everywhere; the wrapper's own tests restore
     # REAL_REBUILD_WRAPPER and put a wrapper of their own in front of it.
-    monkeypatch.setattr(qb, "rebuild_wrapper", lambda *a, **k: (None, "no `rebuild` on PATH"))
+    monkeypatch.setattr(qb, "rebuild_wrapper",
+                        lambda *a, **k: (None, "no `rebuild` on PATH", ""))
 
 
 REAL_REBUILD_WRAPPER = qb.rebuild_wrapper
@@ -1100,7 +1105,7 @@ def test_a_checkout_that_could_not_get_level_is_not_nothing_to_carry(quarterback
     monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
     assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
     err = capsys.readouterr().err
-    assert "no route to host" in err and "may be behind its upstream" in err
+    assert "no route to host" in err and "level with what it tracks" in err
 
 
 def test_a_tree_with_nothing_to_pull_from_still_allows_nothing_to_carry(quarterback_repo,
@@ -1189,8 +1194,9 @@ def test_the_wrapper_is_used_when_it_builds_the_flake_that_was_just_built(prepar
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, prepared.flake)}{os.pathsep}"
                                f"{os.environ['PATH']}")
-    cmd, how = qb.switch_command(prepared, {})
-    assert cmd == ["rebuild", "switch"]
+    binn = _wrapper(tmp_path, prepared.flake)
+    cmd, how, _typed = qb.switch_command(prepared, {})
+    assert cmd == [str(binn / "rebuild"), "switch"]
     assert "home-manager" in how, "the report has to say why the wrapper is worth using"
 
 
@@ -1201,7 +1207,7 @@ def test_a_wrapper_that_builds_another_flake_is_not_this_flakes_wrapper(prepared
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, '/somewhere/else')}{os.pathsep}"
                                f"{os.environ['PATH']}")
-    cmd, how = qb.switch_command(prepared, {})
+    cmd, how, _typed = qb.switch_command(prepared, {})
     assert cmd[:2] == ["sudo", "nixos-rebuild"]
     assert "not this flake's wrapper" in how
 
@@ -1214,7 +1220,7 @@ def test_a_wrapper_naming_no_flake_falls_back_rather_than_guessing(prepared, tmp
     (binn / "rebuild").chmod(0o755)
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
-    cmd, how = qb.switch_command(prepared, {})
+    cmd, how, _typed = qb.switch_command(prepared, {})
     assert cmd[:2] == ["sudo", "nixos-rebuild"]
     assert "names no flake directory" in how
 
@@ -1243,7 +1249,7 @@ def test_the_wrapper_is_read_and_never_run(prepared, tmp_path, monkeypatch):
     (binn / "rebuild").chmod(0o755)
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
-    assert qb.switch_command(prepared, {})[0] == ["rebuild", "switch"]
+    assert qb.switch_command(prepared, {})[0] == [str(binn / "rebuild"), "switch"]
     assert not marker.exists()
 
 
@@ -1254,8 +1260,8 @@ def test_a_declared_rebuild_command_is_taken_as_consent(prepared, tmp_path, monk
     binn = _wrapper(tmp_path, "/somewhere/else", name="fleet-rebuild")
     monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv(qb.REBUILD_KEY, "fleet-rebuild switch --fast")
-    cmd, how = qb.switch_command(prepared, {})
-    assert cmd == ["fleet-rebuild", "switch", "--fast"]
+    cmd, how, _typed = qb.switch_command(prepared, {})
+    assert cmd == [str(binn / "fleet-rebuild"), "switch", "--fast"]
     assert qb.REBUILD_KEY in how
 
 
@@ -1263,7 +1269,7 @@ def test_a_declared_command_that_is_not_on_path_falls_back_rather_than_failing(p
                                                                               monkeypatch):
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv(qb.REBUILD_KEY, "no-such-rebuild switch")
-    cmd, how = qb.switch_command(prepared, {})
+    cmd, how, _typed = qb.switch_command(prepared, {})
     assert cmd[:2] == ["sudo", "nixos-rebuild"]
     assert "not on PATH" in how
 
@@ -1271,14 +1277,15 @@ def test_a_declared_command_that_is_not_on_path_falls_back_rather_than_failing(p
 def test_no_wrapper_asks_for_the_explicit_command_without_looking(prepared, monkeypatch):
     monkeypatch.setattr(qb, "rebuild_wrapper",
                         lambda *a, **k: pytest.fail("--no-wrapper went looking for one"))
-    cmd, how = qb.switch_command(prepared, {}, wrapper=False)
+    cmd, how, _typed = qb.switch_command(prepared, {}, wrapper=False)
     assert cmd[:2] == ["sudo", "nixos-rebuild"]
     assert "--no-wrapper" in how
 
 
 def test_the_wrapper_and_not_sudo_is_what_gets_execd(prepared, tmp_path, monkeypatch):
     """`execvp` used to be hard-coded to `sudo`, which would have run the wrapper's argv
-    under the wrong argv[0]. A wrapper is not sudo; it calls sudo itself."""
+    under the wrong argv[0]. A wrapper is not sudo; it calls sudo itself. And what is
+    exec'd is the resolved path that `wrapper_targets` read, not the bare name."""
     monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
     monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, prepared.flake)}{os.pathsep}"
                                f"{os.environ['PATH']}")
@@ -1286,7 +1293,10 @@ def test_the_wrapper_and_not_sudo_is_what_gets_execd(prepared, tmp_path, monkeyp
     execd: list = []
     monkeypatch.setattr(qb.os, "execvp", lambda file, argv: execd.append((file, argv)))
     assert qb.apply(prepared, dry_run=False) == 0
-    assert execd == [("rebuild", ["rebuild", "switch"])]
+    wrapper = str(tmp_path / "wrapperbin" / "rebuild")
+    assert execd == [(wrapper, [wrapper, "switch"])], \
+        "the file that was READ has to be the file that is RUN — a second PATH lookup " \
+        "at exec time reopens exactly the question wrapper_targets just answered"
 
 
 # --------------------------------------------------------------------------- #
@@ -1401,3 +1411,205 @@ def test_cached_applies_what_is_in_the_cache_and_prepares_nothing(prepared, cons
 def test_cached_without_apply_is_a_typo_and_says_so(capsys):
     assert qb.main(["--cached"]) == 3
     assert "about --apply" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# what a second reader found: the ways the new paths could still be wrong
+# --------------------------------------------------------------------------- #
+
+def test_a_detached_head_is_doubt_and_not_nothing_to_pull_from(tmp_path):
+    """The two look identical to `@{u}` and mean opposite things. A branch tracking
+    nothing cannot be behind anything; a detached HEAD can be sitting on a commit from
+    three weeks ago, which is the entire state this pull exists to rule out."""
+    clone, source = _paired(tmp_path, "repo")
+    _land(source, "two\n", "landed")
+    _git(clone, "checkout", "-q", "--detach", "HEAD")
+    got = qb.fast_forward(clone)
+    assert got.blocked, "a detached checkout can be stale, so it is not an all-clear"
+    assert "detached" in got.why
+
+
+def test_a_detached_checkout_is_not_reported_as_nothing_to_carry(tmp_path, quarterback_repo,
+                                                                 monkeypatch, capsys):
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(
+        path=str(where), why=f"{where} is a detached HEAD", blocked=True))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
+    assert "detached HEAD" in capsys.readouterr().err
+
+
+def test_a_consumer_that_could_not_be_fetched_is_a_caveat_and_not_a_downgrade(
+        consumer_repo, quarterback_repo, monkeypatch, capsys):
+    """A consuming flake that cannot be reached does not weaken the harness comparison by
+    one word — it only means the second reason to act was never looked for. Downgrading on
+    it would make every agent run on a host whose remote wants a credential answer "cannot
+    tell" forever, and a tool that always says that is one nobody reads."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: (
+        qb.Pulled(path=str(where), why="`git fetch` failed: could not read Username",
+                  blocked=True)
+        if Path(where) == consumer_repo else qb.Pulled(path=str(where))))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    out = capsys.readouterr().out
+    assert "could not be brought up to date" in out
+    assert "not accounted for" in out
+
+
+def test_nothing_to_carry_says_when_it_never_looked_at_a_consumer(quarterback_repo,
+                                                                  monkeypatch, capsys):
+    """`current`/0 is a positive assertion of health, and since a moved consuming flake is
+    now a reason to act on its own, a run that never found one must not imply it checked."""
+    monkeypatch.setattr(qb, "have_nix", lambda: False)
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    assert "no nix on this host" in capsys.readouterr().out
+
+
+def test_no_pull_says_its_answer_is_not_about_any_upstream(quarterback_repo, monkeypatch,
+                                                           capsys):
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-pull", "--no-announce"]) == 0
+    assert "--no-pull" in capsys.readouterr().out
+
+
+def test_a_named_host_refuses_the_wrapper_because_the_wrapper_names_its_own(prepared,
+                                                                           tmp_path,
+                                                                           monkeypatch):
+    """`--host laptop` on a desktop builds `laptop` while the wrapper derives `desktop`
+    from the hostname and switches THAT — a configuration this run never built. No reading
+    of the wrapper can rule it out, because the attribute never appears in its text."""
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, prepared.flake)}{os.pathsep}"
+                               f"{os.environ['PATH']}")
+    prepared.attr_named = True
+    cmd, how, _typed = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "--host named" in how
+
+
+def test_a_matched_host_is_what_lets_the_wrapper_be_used_at_all(prepared, tmp_path,
+                                                                monkeypatch):
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    binn = _wrapper(tmp_path, prepared.flake)
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    assert prepared.attr_named is False, "the fixture matched rather than named it"
+    assert qb.switch_command(prepared, {})[0] == [str(binn / "rebuild"), "switch"]
+
+
+def test_a_named_host_is_recorded_on_the_proposal_so_cached_still_refuses(consumer_repo,
+                                                                         quarterback_repo,
+                                                                         monkeypatch):
+    """`--apply --cached` reads a proposal off disk with no argv to consult, so the fact
+    has to travel with it rather than be re-derived."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    assert qb.main(["--repo", str(quarterback_repo), "--host", "laptop",
+                    "--no-announce"]) == 2
+    assert qb.load().attr_named is True
+
+
+def test_a_commented_out_flakeref_is_not_evidence_of_anything(prepared, tmp_path,
+                                                              monkeypatch):
+    """The decoy this was found by: a commented-out `flake=` naming the right directory,
+    above a live line that builds something else out of a variable. With the comment
+    counting as evidence, the file "names one directory and it is ours" and the wrapper is
+    trusted — while what it actually switches is `recovery-fleet#rescue`.
+
+    With whole-line comments dropped the file names *nothing* this can read (the live
+    target is assembled from a variable and is invisible to a regex either way), and
+    nothing means the explicit command. That is the point: the scan's failures all have to
+    land on the fall-back side, and a comment is not a statement about what a script does."""
+    binn = tmp_path / "wrapperbin"
+    binn.mkdir()
+    (binn / "rebuild").write_text(
+        "#!/bin/sh\n"
+        f"# flake=path:{prepared.flake}#desktop\n"
+        'root="${EMERGENCY_FLAKE:-/home/rich/source/recovery-fleet}"\n'
+        'exec sudo nixos-rebuild switch --flake "path:$root#rescue"\n')
+    (binn / "rebuild").chmod(0o755)
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    cmd, why, _typed = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"], \
+        "a comment is not a statement about what the wrapper does"
+    assert "names no flake directory" in why
+    assert qb.wrapper_targets(binn / "rebuild")[0] == set(), \
+        "with the comment counted, this would have been {the right directory} and trusted"
+
+
+def test_a_malformed_declared_rebuild_command_is_a_sentence_not_a_traceback(prepared,
+                                                                           monkeypatch):
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv(qb.REBUILD_KEY, 'rebuild "switch')
+    cmd, how, _typed = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "will not parse" in how
+
+
+def test_head_is_recorded_from_before_the_archive_not_after_the_build(consumer_repo,
+                                                                     monkeypatch):
+    """An hour-long build is long enough for somebody to commit in the consumer. Recording
+    HEAD afterwards recorded whatever it had BECOME, so `--apply`'s own "the consumer has
+    committed since" guard waved through a commit that was never archived and never built."""
+    before = _git(consumer_repo, "rev-parse", "HEAD")
+    real_nix = _fake_nix("b" * 40)
+
+    def commits_mid_build(*args, **kw):
+        if args and args[0] == "build":
+            (consumer_repo / "NEW").write_text("landed while we were compiling\n")
+            _commit(consumer_repo, "a commit that arrived during the build")
+        return real_nix(*args, **kw)
+
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", commits_mid_build)
+    proposal, _log, why = qb.prepare(
+        qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),
+        "desktop", str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
+    assert proposal is None, "what was built is not what a switch would build now"
+    assert "while this was building" in why
+    assert _git(consumer_repo, "rev-parse", "HEAD") != before
+
+
+def test_the_lock_is_installed_atomically(prepared, consumer_repo, monkeypatch):
+    """`write_text` truncates before it writes, so a failure between the two leaves the
+    consumer with an empty `flake.lock` and nothing saying it was this that did it."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    renamed: list = []
+    real_replace = qb.os.replace
+    monkeypatch.setattr(qb.os, "replace",
+                        lambda a, b: (renamed.append((str(a), str(b))), real_replace(a, b))[1])
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.apply(prepared, dry_run=False) == 0
+    assert renamed and renamed[0][1] == str(consumer_repo / "flake.lock")
+    assert (consumer_repo / "flake.lock").read_text() == _lock("b" * 40)
+    assert not list(consumer_repo.glob(".flake.lock.qb-bump.*")), "no scratch left behind"
+
+
+def test_a_pull_that_moved_the_consumer_re_reads_that_tree_and_does_not_rescan(
+        consumer_repo, quarterback_repo, tmp_path, monkeypatch):
+    """Rerunning discovery after the pull can land on a DIFFERENT flake — the pulled one
+    stops pinning this repo, a sibling starts — and then the reason printed describes one
+    tree while the bump was prepared in another."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+
+    scans: list = []
+    real_resolve = qb.resolve_consumer
+    monkeypatch.setattr(qb, "resolve_consumer",
+                        lambda *a: (scans.append(1), real_resolve(*a))[1])
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: (
+        qb.Pulled(path=str(where), upstream="origin/main", before="1" * 40, after="2" * 40)
+        if Path(where) == consumer_repo else qb.Pulled(path=str(where))))
+
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    assert len(scans) == 1, "discovery runs once; the re-read is of the path it found"
+    assert qb.load().flake == str(consumer_repo)

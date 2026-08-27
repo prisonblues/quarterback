@@ -413,12 +413,15 @@ in
           `sudo nixos-rebuild switch --flake <consumer>#<attr>`. Emitted as
           `QUARTERBACK_REBUILD_CMD`.
 
-          Leave it and `qb-bump` looks for a `rebuild` wrapper on PATH and uses it only
-          when it can be SHOWN — by reading the wrapper, not running it — to target the
-          same flake and attribute that were just built. That covers this fleet, whose
-          `rebuild` exists because `nixos-rebuild switch` prints "Done" over a failed
-          `home-manager-<user>.service`, which is precisely how the harness scripts
-          `qb-bump` delivers fail to arrive while the switch reports success.
+          Leave it and `qb-bump` looks for a `rebuild` wrapper on PATH, READS it (never
+          runs it), and uses it only when it names exactly one flake directory and that
+          is the one just built — and only when the attribute was matched against this
+          machine's hostname rather than named with `--host`, since a wrapper picks its
+          own attribute from the hostname and nothing in its text can be checked against
+          a named one. That covers this fleet, whose `rebuild` exists because
+          `nixos-rebuild switch` prints "Done" over a failed `home-manager-<user>.service`,
+          which is precisely how the harness scripts `qb-bump` delivers fail to arrive
+          while the switch reports success.
 
           Set it on a host whose wrapper is named something else, or is assembled out of
           shell variables no read can resolve. Doing so is CONSENT: a declared command is
