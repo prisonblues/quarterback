@@ -2171,7 +2171,18 @@ def test_the_board_stub_answers_the_shape_the_api_declares():
     `test_board_answers_a_bare_list_not_a_wrapper_object` in tests/test_board.py asserts
     what a client actually receives, over a real app and a real database.
     """
-    tree = ast.parse((BIN.parent.parent / "app" / "api" / "posts.py").read_text())
+    # The harness is packaged and tested WITHOUT the app tree — `nix flake check`'s
+    # worktree-tests build has only harness sources under /build, which is the same
+    # constraint that makes every other test here synthesize a repo instead of reading
+    # the real one. A fake `posts.py` would prove nothing about drift, so this skips
+    # where the API is genuinely absent rather than asserting against something it
+    # wrote itself. Nothing is lost: it runs in the repo suite and in CI's harness job,
+    # and `test_board_answers_a_bare_list_not_a_wrapper_object` carries the runtime half
+    # where a real app and database exist.
+    api = BIN.parent.parent / "app" / "api" / "posts.py"
+    if not api.is_file():
+        pytest.skip("no app tree here — the harness is packaged without one")
+    tree = ast.parse(api.read_text())
     routes = [n for n in ast.walk(tree)
               if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
               and any(isinstance(d, ast.Call)
