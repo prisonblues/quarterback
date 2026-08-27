@@ -2018,12 +2018,14 @@ def fragments_in_use(host: Host) -> bool:
     return (host.repo / "changelog.d").is_dir()
 
 
-def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+def _board_json(host: Host, path: str) -> tuple[object | None, str]:
     """One authenticated GET against the board, decoded — or a sentence saying why not.
 
-    Returns ``(payload, "")`` or ``(None, why)``. Every caller turns the `why` into an
-    `unknown`, so there is one place where "the board could not be asked" is phrased and
-    no way for a row to reach a verdict without having been answered.
+    Returns ``(payload, "")`` or ``(None, why)``, with the payload exactly as the board
+    shaped it. Nothing here judges that shape, because the board does not answer one:
+    `/blockers` returns an object and `/board` returns a bare array, and a single helper
+    that insisted on either turned every caller of the other into "could not be asked"
+    without ever reaching the question it was asked to settle (#531).
     """
     if not host.base_url:
         return None, "no board is configured (QUARTERBACK_BASE_URL unset), so nothing here " \
@@ -2038,11 +2040,49 @@ def board_get(host: Host, path: str) -> tuple[dict | None, str]:
     if status != 200:
         return None, f"the board answered {status} to {path}"
     try:
-        payload = json.loads(body)
+        return json.loads(body), ""
     except ValueError:
         return None, f"the board did not answer JSON to {path}"
+
+
+def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON object.
+
+    Every caller turns the `why` into an `unknown`, so there is one place where "the
+    board could not be asked" is phrased and no way for a row to reach a verdict without
+    having been answered.
+    """
+    # `if why`, not `if payload is None`: a body of `null` decodes to None with nothing
+    # wrong with the request, and testing the payload would hand back an EMPTY reason
+    # for it — a blank cell in the table where a sentence belongs. The failure is
+    # carried by `why` alone, so `null` falls through to the shape check below and gets
+    # the same sentence as any other answer of the wrong shape.
+    payload, why = _board_json(host, path)
+    if why:
+        return None, why
     if not isinstance(payload, dict):
         return None, f"the board did not answer an object to {path}"
+    return payload, ""
+
+
+def board_get_list(host: Host, path: str) -> tuple[list | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON array.
+
+    `GET /board` is one — `read_board` is annotated `-> list[dict]` and returns the posts
+    bare. The `{"posts": [...], "cursor": N}` object is assembled by the MCP `board_read`
+    wrapper on the way out, so it is the shape an agent sees and NOT the shape the API
+    has, and a row written against it cannot read a single post (#531).
+    """
+    # `if why`, not `if payload is None`: a body of `null` decodes to None with nothing
+    # wrong with the request, and testing the payload would hand back an EMPTY reason
+    # for it — a blank cell in the table where a sentence belongs. The failure is
+    # carried by `why` alone, so `null` falls through to the shape check below and gets
+    # the same sentence as any other answer of the wrong shape.
+    payload, why = _board_json(host, path)
+    if why:
+        return None, why
+    if not isinstance(payload, list):
+        return None, f"the board did not answer a list to {path}"
     return payload, ""
 
 
@@ -2287,6 +2327,12 @@ def _spell_prs(numbers: list[int]) -> str:
     return f"{len(numbers)} {word} ({shown}{more})"
 
 
+#: The API ceiling for `/board` and `/blockers` alike. Named because the `escalations`
+#: row has to REASON about it: a full page is not the same fact on the two endpoints —
+#: `/board` pages newest-first, so a full page still contains the whole window, while
+#: `/blockers` pages oldest-first, where a full page can exclude the window entirely.
+_BOARD_PAGE = 1000
+
 #: The window both halves of the `escalations` row are counted over. 24h is not a
 #: tuning choice — it is the largest `window_min` the board's own read accepts, and
 #: the two counts have to come from the same span or the comparison says nothing.
@@ -2326,17 +2372,34 @@ def check_escalations(host: Host) -> Check:
     are different sentences to be handed.
     """
     window = ESCALATION_WINDOW_MINUTES
-    posts, why = board_get(host, f"/board?type={ESCALATION_POST}&window_min={window}")
+    # A LIST, because that is what `GET /board` answers. Reading it as an object is the
+    # whole of #531: this row shipped unable to see a single post, and said so in a
+    # sentence — "the board did not answer an object" — that pointed at the `board` and
+    # `token` rows, both of which were `ok` and neither of which was the fault.
+    posts, why = board_get_list(
+        host,
+        f"/board?type={ESCALATION_POST}&window_min={window}&limit={_BOARD_PAGE}")
     if posts is None:
         return Check("escalations", host.base_url or "-", why, "unknown",
                      manual="see the board and token rows")
-    raised = posts.get("posts")
-    if not isinstance(raised, list):
-        return Check("escalations", host.base_url or "-",
-                     f"the board answered no list of {ESCALATION_POST} posts, so whether "
-                     "anything escalated in the last day could not be read", "unknown",
-                     manual=f"{host.base_url}/board?type={ESCALATION_POST}")
-    rows, why = board_get(host, "/blockers?open=false&limit=1000")
+    # Dated HERE, because `window_min` is a request and not a promise: `/board` floors a
+    # quiet window at the ten most recent posts of the slice whatever their age
+    # (_ORIENT_FLOOR, app/api/posts.py), and `type=` is deliberately not one of the
+    # lookups that skip the floor. So asking for a day and being handed last week's ten
+    # makes `raised` non-empty on a day nobody escalated — and this row would read that
+    # as a severed producer and say so, on the evidence of posts that predate the
+    # question. Observed: the live board answered exactly ten, five of them older than
+    # the cutoff. The blocker half below has always dated its own rows; both halves now
+    # describe the same span, which is the only way their comparison means anything.
+    #
+    # `isinstance` before `.get`, on both halves: a list whose ELEMENTS are not objects
+    # is a board answering nonsense, and a diagnostic that raises AttributeError while
+    # diagnosing is worth less than one that reports what it found.
+    raised = [p for p in posts
+              if isinstance(p, dict)
+              and (age := _age_minutes(p.get("ts"))) is not None
+              and 0 <= age <= window]
+    rows, why = board_get(host, f"/blockers?open=false&limit={_BOARD_PAGE}")
     if rows is None:
         # Told apart from any other board failure, because the answer is a deploy and
         # not a bug: `board_get` turns every non-200 into this one sentence shape.
@@ -2354,10 +2417,27 @@ def check_escalations(host: Host) -> Check:
                      "the board answered no list of blockers, so what the escalation path "
                      "recorded could not be read", "unknown",
                      manual=f"{host.base_url}/blockers?open=false")
-    fresh = [b for b in stored
-             if (age := _age_minutes((b or {}).get("raised_at"))) is not None
-             and 0 <= age <= window]
     span = _spell_age(window)
+    if len(stored) >= _BOARD_PAGE:
+        # `/blockers` orders by raised_at ASCENDING and then truncates, so a full page is
+        # the OLDEST rows and every row raised today can sit beyond it. Left unsaid, this
+        # row would count zero fresh rows against a real escalation and report the
+        # producer severed — the precise false alarm it exists to make trustworthy. An
+        # honest `unknown` is the only verdict available until the endpoint can be asked
+        # for a window rather than a page.
+        return Check("escalations", host.base_url or "-",
+                     f"the board returned a full page of {_BOARD_PAGE} blocker(s) and it "
+                     "pages oldest-first, so rows raised in the last "
+                     f"{span} can lie beyond it — this row cannot tell a severed producer "
+                     "from a long table", "unknown",
+                     manual="give /blockers a raised-after filter or a newest-first order, "
+                            "then count the window instead of the page",
+                     extra={"posts": len(raised), "page": len(stored),
+                            "window_minutes": window})
+    fresh = [b for b in stored
+             if isinstance(b, dict)
+             and (age := _age_minutes(b.get("raised_at"))) is not None
+             and 0 <= age <= window]
     if raised and not fresh:
         return Check("escalations", host.base_url or "-",
                      f"{len(raised)} {ESCALATION_POST} post(s) in the last {span} and not "
