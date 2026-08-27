@@ -32,7 +32,6 @@ Run: pytest harness/tests
 """
 
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -40,18 +39,17 @@ from pathlib import Path
 
 import pytest
 
+# A sibling module, imported by bare name the way the other shared fixtures here
+# are: the sandboxes that run this suite put `harness/tests` on the path by
+# running pytest from `harness/`, and a developer running `pytest harness/tests`
+# from the repo root does not. One entry, both work.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
+
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "create-worktree"
 
 BASH = shutil.which("bash")
-
-#: Where a real `python3` lives, asked of the interpreter running this suite
-#: rather than assumed to be `/usr/bin`. The two rollback tests below need the
-#: real one — the release goes THROUGH qbdata's own client, which is the property
-#: they exist to pin — and inside a nix build sandbox there is no /usr/bin/python3
-#: at all: they failed there with `python3: command not found` and an assertion
-#: about a file the rollback never got far enough to write. Same lesson as the
-#: stub shebangs above (#177), one directory along.
-PY_DIR = os.path.dirname(sys.executable)
 
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not on PATH")
 
@@ -81,18 +79,35 @@ die() { echo "Error: $1" >&2; exit 1; }
 
 def run_stanza(branch: str, *, claim="true", require="false", ttl="60",
               stub: str | None = None, py: str | None = None, after: str = "",
+              tools: tuple[str, ...] = (),
               tmp_path: Path) -> subprocess.CompletedProcess:
     """Run `claim_the_branch` with a stub `qb-claim` of the caller's choosing.
 
-    `stub=None` means no qb-claim on PATH at all, which is a real deployment
-    state (a host with the board tooling absent) and one of the "cannot tell"
-    cases the policy is about.
+    `stub=None` means no qb-claim ANYWHERE, which is a real deployment state (a
+    host with the board tooling absent) and one of the "cannot tell" cases the
+    policy is about. Two things have to be arranged for that to be true, and
+    until #472 neither was:
+
+    * `PATH` comes from `_path_sandbox`, so every entry on it is a directory this
+      test filled plus symlinks to the named `tools`. The old spelling was
+      `bindir` plus `dirname(bash)`, and on a host where the harness is installed
+      by home-manager that second directory IS the profile directory holding the
+      real `qb-claim` — so the absent case ran the production tool and this
+      suite's own comment about the hazard described what it was doing.
+    * the stanza runs as a **script file** in a directory of its own, because it
+      falls back to `${0%/*}/qb-claim` when `PATH` gives it nothing. Under
+      `bash -c` that `$0` is the interpreter's absolute path, which on this same
+      host reaches the same profile directory by a second route — the trap
+      `test_create_worktree_bound.py` and `test_remove_worktree_claim.py` already
+      run as files to avoid.
 
     `py` stubs the `python3` the rollback releases THROUGH, and `after` is script
     run once the claim has been taken — which is where the rest of the checkout
     would be, and therefore where its failure has to be simulated. The EXIT trap
     fires either way, so a test that passes neither is asserting that nothing was
-    released, which is also a thing worth asserting.
+    released, which is also a thing worth asserting. `tools=("python3",)` asks for
+    the REAL interpreter; without it there is none, which is what
+    `test_no_python3_is_not_a_crash` needs and never had.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -118,13 +133,19 @@ def run_stanza(branch: str, *, claim="true", require="false", ttl="60",
               + claim_block()
               + f'\nclaim_the_branch {branch!r}\n'
               + after + "\n")
-    # PATH is the stub directory plus bash's OWN directory and nothing else. Not
-    # the inherited PATH: the `stub=None` case has to mean "no qb-claim anywhere",
-    # and on a machine where the harness is installed the real one is on PATH —
-    # which would make that test assert the opposite of what it says.
+    return _run(script, tmp_path, bindir, tools=tools)
+
+
+def _run(script: str, tmp_path: Path, bindir: Path, *,
+         tools: tuple[str, ...] = (), env: dict | None = None
+         ) -> subprocess.CompletedProcess:
+    """The stanza as a file, on a PATH holding only what this test put there."""
+    stanza = _path_sandbox.sibling_dir(tmp_path) / "stanza.sh"
+    stanza.write_text(script)
     return subprocess.run(
-        [BASH, "-c", script], capture_output=True, text=True,
-        env={"PATH": f"{bindir}:{os.path.dirname(BASH)}", "HOME": str(tmp_path)})
+        [BASH, str(stanza)], capture_output=True, text=True,
+        env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir, tools=tools),
+             "HOME": str(tmp_path), **(env or {})})
 
 
 # ------------------------------------------------- the number comes off the branch
@@ -299,10 +320,8 @@ def test_the_environments_session_is_not_inherited(tmp_path):
               + f'MAIN_REPO={tmp_path}\n'
               + claim_block()
               + "\nclaim_the_branch 'feat/issue-172'\nCLAIM_KEPT=true\n")
-    got = subprocess.run(
-        [BASH, "-c", script], capture_output=True, text=True,
-        env={"PATH": f"{bindir}:{os.path.dirname(BASH)}", "HOME": str(tmp_path),
-             "CLAUDE_CODE_SESSION_ID": "the-parents-session"})
+    got = _run(script, tmp_path, bindir,
+               env={"CLAUDE_CODE_SESSION_ID": "the-parents-session"})
     assert got.returncode == 0, got.stderr
     assert argv.read_text() == "", (
         "the parent's session id reached the claim, which is the F04 defect")
@@ -378,7 +397,13 @@ def test_a_release_that_fails_says_what_to_release_by_hand(tmp_path):
 def test_no_python3_is_not_a_crash(tmp_path):
     """The release goes through qbdata's own client, so it needs an interpreter.
     A host without one must still get its real error, not a second one from the
-    cleanup."""
+    cleanup.
+
+    No `tools=("python3",)`, and that is the whole test: on the old PATH — the
+    stub directory plus bash's own — a home-manager profile supplied a real
+    python3 and this ran the rollback for real, failing on the missing `qbdata`
+    and reaching the same message by a different route (#472). The interpreter is
+    now genuinely absent."""
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
                      stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0', after="false")
     assert got.returncode != 0
@@ -423,9 +448,7 @@ def test_the_real_rollback_leaves_a_renewed_claim_alone(tmp_path):
               + f'MAIN_REPO={tmp_path}\n'
               + claim_block()
               + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
-    got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
-                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:{PY_DIR}",
-                              "HOME": str(tmp_path)})
+    got = _run(script, tmp_path, bindir, tools=("python3",))
     assert got.returncode != 0
     assert not (tmp_path / "touched").exists(), got.stderr
     assert "left alone" in got.stderr, got.stderr
@@ -455,9 +478,7 @@ def test_the_real_rollback_posts_the_release_through_qbdata(tmp_path):
               + f'MAIN_REPO={tmp_path}\n'
               + claim_block()
               + "\nclaim_the_branch 'feat/issue-9'\nfalse\n")
-    got = subprocess.run([BASH, "-c", script], capture_output=True, text=True,
-                         env={"PATH": f"{bindir}:{os.path.dirname(BASH)}:{PY_DIR}",
-                              "HOME": str(tmp_path)})
+    got = _run(script, tmp_path, bindir, tools=("python3",))
     assert got.returncode != 0
     assert (tmp_path / "posted").exists(), got.stderr
     path, body = json.loads((tmp_path / "posted").read_text())
