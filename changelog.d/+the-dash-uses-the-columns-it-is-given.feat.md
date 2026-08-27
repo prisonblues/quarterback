@@ -1,26 +1,28 @@
 # the dash uses the columns it is given
 
-Seven panels have been sharing one column of a 78-column pane, and the arithmetic was
-never going to work: SEATS takes its content off the top and the six left over divide
-what remains as `2fr 1fr 2fr 2fr 1fr 2fr`. On a 50-row screen that is five rows for
-FLEET, five for the PLAN, five for OPEN PRs, five for ISSUES — and **two** for CLAIMED
-and two for REVIEW QUEUE. Widening the pane with `C-q >` made the cells longer and the
-panels no taller, so the answer to "I cannot see enough of this" was to look at
-something else.
+Eight panels have been sharing one column of a 78-column pane, and the arithmetic was
+never going to work: DIALS and SEATS take their content off the top and the six left
+over divide what remains as `2fr 1fr 2fr 2fr 1fr 2fr`. On a 50-row screen that is eight
+rows for FLEET, eight for the PLAN, eight for OPEN PRs, nine for ISSUES — and **four**
+for CLAIMED and four for REVIEW QUEUE. Widening the pane with `C-q >` made the cells
+longer and the panels no taller, so the answer to "I cannot see enough of this" was to
+look at something else.
 
-Above 157 columns the panels now go **two across**, and what that buys is height. Every
-panel is between two and five times taller, and none of it was taken from another panel:
+Above 157 columns the six panels below them go **two across**, and what that buys is
+height. Every one is between one and a half and three times taller, and none of it was
+taken from another panel:
 
 | panel | one column | two |
 |---|---|---|
-| FLEET | 8 | 11 |
-| CLAIMED | 5 | 11 |
-| PLANS | 9 | 17 |
-| OPEN PRs | 8 | 17 |
-| REVIEW QUEUE | 5 | 17 |
-| ISSUES | 9 | 17 |
+| FLEET | 8 | 12 |
+| CLAIMED | 4 | 12 |
+| PLANS | 8 | 19 |
+| OPEN PRs | 8 | 12 |
+| REVIEW QUEUE | 4 | 12 |
+| ISSUES | 9 | 19 |
 
-Rows on a 200×50 pane, panel including its title.
+Rows on a 200×50 pane, panel including its title. DIALS and SEATS are their content in
+either layout, so they are unchanged and span both columns — see below.
 
 **157 is not a taste.** 78 columns is what one of these tables wants before it wraps —
 it is `QB_SEATS_DASH_SIZE`'s default, quoted from `qb-seats` — so two of them side by
@@ -31,11 +33,14 @@ and a value that is not a positive number of columns is ignored rather than fata
 dashboard that refused to start over a typo in a tuning variable would be trading the
 panel you are trying to read for the knob you were adjusting.
 
-### SEATS spans both columns, and REVIEW QUEUE moves
+### DIALS and SEATS span both columns, and REVIEW QUEUE moves
 
-SEATS is its content in either layout and a second column would only put the ＋ somewhere
-new, which is the one thing this panel has to keep: it is the only way to add a seat with
-the mouse, and it has already fallen off the bottom of a screen once.
+Both are their content in either layout, so a column of their own would buy them nothing
+and cost the panel beside them half its width. SEATS keeps the ＋ where it can be found,
+which is the one thing that panel has to do — it is the only way to add a seat with the
+mouse, and it has already fallen off the bottom of a screen once. DIALS keeps the place
+#477 gave it, at the top: it is the configuration every panel below is running under, and
+a setting in force is not something to go looking for in the second column.
 
 The other placement is the one CSS could not do. A grid fills row by row in DOM order, so
 the order that puts REVIEW QUEUE **directly under OPEN PRs** — #273's arrangement, where

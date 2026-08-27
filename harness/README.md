@@ -2228,59 +2228,6 @@ What the dash does with the room is its own business and is not arranged here: i
 Textual app that lays out to the width it is given, so a window-wide pane simply crosses the
 threshold above and goes two columns across. This verb moves a pane.
 
-#### Moving a plan item from the pane (#443)
-
-The plan has been readable from the terminal and orderable only from a browser. The ⇕ in
-the PLANS panel closes that: click it on an item to take it, click it on the row it should
-go above to place it, or press `[` / `]` to move the selected row one place. `u` puts back
-the last move **this pane** made.
-
-**It goes through a different door from everything else on this screen, and it has to.**
-`POST /plan/reorder` is `app.auth.human`, which no bearer token satisfies — and the agent
-vhost strips `X-Edge-Auth`, so the call cannot be made against `QUARTERBACK_BASE_URL`
-however it is authenticated. `qbdata.HumanClient` is that second door: the **browser**
-vhost (`QUARTERBACK_HUMAN_URL`) with a signed-in session cookie
-(`QUARTERBACK_EDGE_COOKIE`), and deliberately without the bearer token, because the
-reference deployment is one where the two never arrive together. It is the same handshake
-`qb-doctor`'s edge row already probes.
-
-Both of those live in the config file and nowhere else, which is why `resolve_config` had
-to learn about them: the condition that decides whether to source the file asked only about
-the URL and the token, so a host carrying **those** in its environment never read the file
-at all and the human credential sitting in it was invisible.
-
-**What this widens is not the plan's order.** The cookie is in a file readable by every
-process running as the user, so anything on the box can make any human-only write — the
-dials, an exemption grant, a scope declaration. That is `app.auth.human`'s own argument
-turned around, it is a deliberate choice rather than a consequence of this feature, and
-[#479](https://github.com/prisonblues/quarterback/issues/479) is the record of what it
-costs and the menu for narrowing it again.
-
-Four things the panel refuses rather than guesses at:
-
-- **A move between scopes.** Two scopes are two lists, and `plan.html`'s guarantee that a
-  reorder of one "can never renumber [another's] by accident" is a property of sending one
-  scope's whole order and nothing else — not of the endpoint. So the ⇕ goes grey on rows a
-  held item cannot land on, and a crossing says so.
-- **A no-op.** An order identical to the one in force is still a write, and `rank_source`
-  becomes `ordered` for every item in it — so a move that changes nothing would claim a
-  person had chosen positions they had not (#183's argument, one surface along).
-- **A move whose plan changed underneath it.** If either end is missing from the list by
-  the time the second click lands, nothing is sent.
-- **Anything at all with no cookie.** The icon is grey and says which variable to set,
-  rather than looking live and failing at the POST — against a board that is perfectly
-  healthy, because what is missing is on this host.
-
-`u` is one deep and in memory. It reaches the reorder this pane sent and nothing else: not
-a move made in the browser, not one made by an agent's tools, and not anything at all after
-the pane is closed. A stored previous order on the board is the real version and it is
-#479's, not this.
-
-**It is not a sort and it is not unbidden.** The verb moves the item a person clicked to
-the place the same person clicked. An agent forming an order from `plan_order` and applying
-it is [#478](https://github.com/prisonblues/quarterback/issues/478), is a different
-question about a different credential, and is not this.
-
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
 PLANS every repo's list — while a screen is built for one repository. So most rows were

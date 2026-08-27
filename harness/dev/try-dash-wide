@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # try-dash-wide — build a throwaway seat screen from THIS worktree, to try the
-# wide dash, the ⇕ and the ⛶ on before any of it is installed.
+# wide dash and the ⛶ on before any of it is installed.
 #
 #   harness/dev/try-dash-wide            two seats, shells rather than agents
 #   harness/dev/try-dash-wide --agents   two seats running the real agent
@@ -52,10 +52,7 @@ cat <<EOF
     C-q z     the dash full screen, and back
     ⛶         same thing, top-left of the screen, with the mouse
     z         same thing again, from inside the dash
-    [ ]       move the selected PLANS row up or down
-    u         undo the last move this pane made
+    C-q > <   nudge the dash wider or narrower, 8 columns at a time — which is
+              how to walk it across the threshold without resizing the terminal
     ?         the whole key list
-
-  The ⇕ column is grey until QUARTERBACK_EDGE_COOKIE is set, and clicking it
-  says so. \`qb-doctor --only edge\` is the check that it took.
 EOF
