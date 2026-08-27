@@ -69,7 +69,7 @@ from textual.containers import Vertical
 from textual.coordinate import Coordinate
 from textual.events import Click, Resize
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Input, Static
+from textual.widgets import DataTable, Footer, Input, OptionList, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
@@ -180,67 +180,274 @@ class DialEdit(ModalScreen[dict | None]):
     action, because `POST /dials` takes `app.auth.human` and this program
     authenticates with the machine bearer token every agent on the box holds.
     What changed is the credential, not the gate: :class:`qbdata.HumanClient`
-    presents a signed-in session to the browser vhost, so the person at this
-    keyboard writes as themselves and the board records `human/<user>` as it
-    always has.
+    presents a person's own key to the agent host, so the person at this keyboard
+    writes as themselves and the board records `human/<user>` as it always has.
 
     **What that costs is written down rather than implied** — prisonblues/quarterback#479
-    is the record. The session is readable by everything running as this user, so
+    is the record. The key is readable by everything running as this user, so
     "the dash can set a dial" and "anything on this box can set a dial" are one
     fact, and the second is the one to design against.
 
-    Four fields and no dropdowns, because a modal in a 78-column pane has room
-    for labels or for widgets and not both:
+    ## The vocabulary is on screen, because it has to be somewhere (#539)
 
-      * **dial** — the dotted path. Fixed when editing a row that exists; a dial
-        is identified by its name, so letting this be edited would silently
+    The first cut of this modal had four empty boxes and one placeholder each, and
+    the value placeholder read `P3, 2, true, null` — four value kinds in one line,
+    because it had to cover all 29 dials at once and therefore could not answer the
+    only question a person actually has, which is what THIS one takes. Nothing said
+    which dials exist, what this one is set to now, or which way it may move. A
+    misspelt name saved clean: the board stores `dial` as opaque text on purpose,
+    so the refusal arrives from a round three hours later, on the old value.
+
+    Everything needed was two directories away the whole time. `harness_rules`
+    owns the dial table, `qbdata.dial_vocabulary` reads it at call time rather than
+    copying it, and this screen renders what it gets:
+
+      * **dial** — the dotted path, with the names filtered under it as you type
+        (`↓` to walk them, enter or a click to take one). **Scrolling them says what
+        each one does**: the line under the value box describes the name under the
+        CURSOR, not the name in the box, because reading down 29 dotted paths is the
+        moment "which of these did I mean" is being asked and answering it after the
+        choice is made answers it too late. Fixed when editing a row that exists; a
+        dial is identified by its name, so letting this be edited would silently
         create a second dial rather than change the one on screen.
       * **value** — JSON where it parses, the string it looks like otherwise
-        (`qbdata.parse_dial_value`, and `dials.html` does the same).
+        (`qbdata.parse_dial_value`, and `dials.html` does the same). Once a name is
+        chosen the list retires and the line under this box grows the rest of the
+        answer: what the dial accepts, what it defaults to, what is in force and at
+        which scope. The two states are the two questions, and they do not both fit
+        a 78x24 pane. `ctrl+s` refuses a value the harness would not apply — in the
+        box, naming the field, instead of storing it and finding out later.
       * **reason** — required, by the board and here. A dial whose argument was
         never written down is one nobody can decide to remove.
       * **for** — `30m`, `4h`, `7d`, or empty for a dial with no end. Empty is a
-        real answer and not a missing one.
+        real answer and not a missing one, and it is parsed here now rather than
+        after the modal closes, so a mistyped duration costs a keystroke instead
+        of the other three fields.
+
+    **A bad VALUE is a refusal; an unknown NAME is a warning and then a write.**
+    The table is the harness beside THIS dashboard and the two are installed
+    separately, so a hard refusal would make a box one release behind a box that
+    cannot set a dial the rest of the fleet already applies — `tempo` (#474) is the
+    standing case, drawn by both dashboards and absent from `BOARD_DIALS`. A value
+    for a name this box DOES know gets no such benefit of the doubt: the kind came
+    from the same table as the name, so there is no version of the harness in which
+    `max_rounds: "2"` is a value somebody applies.
+
+    **A box that cannot find the table still writes.** `dial_vocabulary` answers
+    `{}` on a host with no `harness/loops` beside the dashboard, and then this is
+    the form it always was: free text, no picker, no refusal, the board taking
+    both. Refusing to open would make the dashboard less useful than it was, and
+    an empty vocabulary is "cannot tell", never "nothing is settable" — so it is
+    said on the line under the value rather than shown as a dial list of length 0.
     """
 
     BINDINGS = [("escape", "cancel", "cancel"), ("ctrl+s", "save", "save"),
-                ("ctrl+x", "clear", "clear")]
+                ("ctrl+x", "clear", "clear"), ("down", "to_names", "names")]
 
+    #: A 78x24 pane is the size this has to fit, and the picker cost it four rows
+    #: it did not have. What paid for them: the per-field margins (the spec line
+    #: reads as the value box's caption without one), the scope, which moved into
+    #: the title where it is always visible rather than last where it was first to
+    #: be clipped, and the refusal line, which takes no room until there is one.
+    #: The list and the spec line then take turns — four rows of names while a name
+    #: is being chosen, three of description once one has been — so the tall state
+    #: is the only one either of them is in.
+    #: `overflow-y` is the backstop for a pane shorter still — a modal that clips
+    #: silently loses whichever control is last, and here that was the scope.
     CSS = """
     DialEdit { align: center middle; }
-    #box { width: 90%; max-width: 76; height: auto; padding: 1 2;
+    #box { width: 90%; max-width: 76; height: auto; max-height: 100%;
+           overflow-y: auto; padding: 1 2;
            background: $panel; border: thick $accent; }
-    #box Input { margin-bottom: 1; }
     #hint { color: $text-muted; }
-    #warn { color: $warning; }
+    /* ALIGNED WITH THE TEXT IN THE BOXES, not with the box edge. An `Input` draws
+       a border and pads inside it, so its text starts three columns in; a bare
+       `Static` starts at the panel's own padding, and the description sat three
+       columns to the left of every field it describes. The title and the key line
+       keep the edge — they frame the form rather than belonging to a field. */
+    #spec { color: $text-muted; padding-left: 3; }
+    #err { color: $error; padding-left: 3; }
+    /* Four NAMES and no more: the names are an aid to the field above them, not
+       the form. `border: none` because the default one costs two rows of the four
+       — a frame around a list that sits directly under the box it belongs to, paid
+       for in half the names it can show. */
+    #names { height: auto; max-height: 4; border: none; padding-left: 3; }
     """
 
     def __init__(self, row: dict | None = None, repo: str | None = None,
-                 scope_label: str = "") -> None:
+                 scope_label: str = "", vocabulary: dict | None = None,
+                 in_force: dict | None = None, now: str | None = None) -> None:
         super().__init__()
         self.row = row or {}
         self.repo = repo
         self.scope_label = scope_label
+        #: `{}` is "this box cannot read the harness's table", not "no dial is
+        #: settable" — see the class docstring.
+        self.vocabulary = vocabulary or {}
+        #: `GET /dials`' own answer, so the spec line can say what is in force
+        #: beside what the built-in default is. Moving a floor without being told
+        #: it was already moved is how one gets nudged twice.
+        self.in_force = in_force or {}
+        #: The BOARD's clock, for the expiry. A box an hour slow otherwise writes
+        #: "in one hour" as a time already past.
+        self.now = now
+        #: The names currently offered, in the order they are drawn — what an
+        #: option index means. Set before the list can be clicked, because an
+        #: empty one is the honest state of a modal that has not mounted yet.
+        self.matches: list[str] = []
+        #: The unknown name this screen has already objected to once. See
+        #: `action_save`: an unrecognised dial is warned about and then allowed,
+        #: because the table it is being judged against is THIS BOX'S harness.
+        self._insisted = ""
+        #: The name under the cursor in the list, which is NOT the name in the box.
+        #: Scrolling the picker describes what it lands on — a person reading down a
+        #: list of 29 dotted paths is asking which one they want, and answering that
+        #: only after the choice is made is answering it too late.
+        self._preview = ""
 
     def compose(self) -> ComposeResult:
         existing = bool(self.row.get("dial"))
         with Vertical(id="box"):
-            yield Static(Text("set a dial" if not existing else
-                              f"dial · {self.row.get('dial')}", style="bold"))
+            # WHICH LAYER this will be written to, on the title line and not at the
+            # bottom. `fleet` and `this repo` are different settings with the same
+            # name and it is the one mistake a person cannot see afterwards, so it
+            # is the line that must never be the one a short pane clips.
+            title = Text("set a dial" if not existing else
+                         f"dial · {self.row.get('dial')}", style="bold")
+            title.append(f"  ·  {self.scope_label or 'fleet (every repo)'}",
+                         style="bold yellow")
+            yield Static(title)
             if not existing:
                 yield Input(placeholder="review_panel.fix_severity_floor", id="f_dial")
-            yield Input(value=self._value_text(), placeholder="P3, 2, true, null",
+                # Populated in `on_mount` rather than here: the whole list is the
+                # right first answer to "which dials are there", and it is the
+                # same call every keystroke makes afterwards.
+                yield OptionList(id="names")
+            yield Input(value=self._value_text(), placeholder=self._value_hint(),
                         id="f_value")
+            yield Static(self._spec(self._dial_name()), id="spec")
             yield Input(placeholder="why is this value in force?", id="f_reason")
             yield Input(placeholder="30m · 4h · 7d — empty for no end", id="f_expiry")
-            # WHICH LAYER this will be written to, said before it is written and
-            # not after. `fleet` and `this repo` are different settings with the
-            # same name, and the one thing a person cannot recover from here is
-            # setting the fleet's value while believing they set one repo's.
-            yield Static(Text(f"scope: {self.scope_label or 'fleet (every repo)'}",
-                              style="bold"), id="warn")
-            yield Static(Text("ctrl+s save · ctrl+x clear this dial · esc cancel",
-                              style="bold $accent"), id="hint")
+            # Not drawn at all until something is actually wrong: a refusal line
+            # that is always there is one a person stops reading, and an empty one
+            # would spend a row of a modal that has none to spare.
+            err = Static("", id="err")
+            err.display = False
+            yield err
+            # The keys, and only the ones that do something here. `ctrl+x` clears a
+            # dial that is ON the board, so on a new one it is a key that can only
+            # bell — and `↓` is where the list of names went when the line under the
+            # value box started describing them instead of counting them.
+            keys = ("ctrl+s save · ctrl+x clear this dial · esc cancel" if existing
+                    else "↓ names · ctrl+s save · esc cancel")
+            yield Static(Text(keys, style="bold $accent"), id="hint")
+
+    # -- what the chosen dial is, and what it takes ----------------------------
+
+    def _dial_name(self) -> str:
+        """The dial this modal is about — the fixed one, or whatever is typed."""
+        return (self.row.get("dial") or self._field("f_dial")).strip()
+
+    def _spec_of(self, dial: str) -> dict:
+        return self.vocabulary.get(dial) or {}
+
+    #: The value box's placeholder before any dial is named — four spellings from
+    #: four different dials, which is what a form can say when it does not know
+    #: which one it is on. Everywhere else it is replaced by that dial's own.
+    GENERIC_HINT = "P3, 2, true, null"
+
+    def _value_hint(self) -> str:
+        """The value box's placeholder, for THIS dial where one is known.
+
+        The old placeholder listed four spellings from four different dials, which
+        is what a form says when it cannot tell which dial it is on. With a name
+        already chosen it can, and the generic line is kept only for the case
+        where it is still true — a new dial with nothing typed yet.
+        """
+        spec = self._spec_of(self._dial_name())
+        return spec.get("hint") or self.GENERIC_HINT
+
+    def _browsing(self) -> bool:
+        """Is the list up? Then the line below it is describing a row, not a choice."""
+        names = self._names()
+        return names is not None and names.display
+
+    def _spec(self, dial: str, brief: bool = False) -> Text:
+        """The line under the value box: what this dial takes, and where it stands.
+
+        Four facts answering four different questions. WHAT IT DECIDES answers "is
+        this the one I meant". The kind answers "what do I type". The DEFAULT
+        answers "what happens if I clear it", which is the other half of every
+        decision to set one. And what is IN FORCE answers "am I the second person to
+        move this today" — the board returns the row it replaced for the same
+        reason, and a person who reads it here does not have to undo anything to
+        find out.
+
+        `brief` is the first of those on its own, and it is what the list is drawn
+        with: scrolling 29 names is the moment the first question is being asked and
+        none of the other three are. It is also what makes room — the names and the
+        full block cannot both be on a 78x24 pane, and the choice between them is
+        settled by which question the person is currently asking.
+        """
+        if not self.vocabulary:
+            # Said once, plainly, and NOT as an empty dial list: a form that drew
+            # "0 dials settable" would state as fact the one thing it failed to
+            # find out. The write still goes through; the board is the judge.
+            return Text("no harness/loops beside this dashboard, so the names and "
+                        "values are not checked here", style="italic")
+        spec = self._spec_of(dial)
+        if not spec:
+            # A name that is not in the table is a person who has probably mistyped
+            # it, and it has to LOOK different before ctrl+s says so — yellow rather
+            # than red, because `action_save` warns about this and then writes it:
+            # the table is this box's harness, and being ahead of it is not an error.
+            #
+            # The empty case is the FIRST PAINT and only that: `compose` draws this
+            # line before `on_mount` has filled the list, so for one frame there is
+            # no name anywhere to describe. It says what the list under the box is
+            # rather than nothing, because a person whose eye lands there first
+            # should not have to infer it.
+            if not dial:
+                return Text(f"{len(self.vocabulary)} dials are settable — "
+                            f"type to filter, ↓ to pick one", style="italic")
+            return Text(f"nothing this box knows applies this"
+                        f"{self._did_you_mean(dial)}", style="bold yellow")
+        # WHAT IT DECIDES, first. The kind, the default and the layer below it are
+        # all answers to "how do I set this one"; this is the answer to "is this the
+        # one I meant", which is the question actually being asked at the moment a
+        # name is picked out of a list of 29.
+        out = Text(spec["what"] or dial, style="bold")
+        if brief:
+            return out
+        # The HINT and not the kind beside it: `number · a number` is the kind said
+        # twice, and the hint is the half written in the words that go in the box.
+        out.append(f"\n{spec['hint']}", style="none")
+        # `default_known` and not a bare `default`: a dial absent from DEFAULTS is a
+        # bug in the harness's table, and drawing its `null` as the shipped answer
+        # would hide that behind a plausible value.
+        out.append(f"\ndefault {json.dumps(spec['default'])}"
+                   if spec.get("default_known") else "\nno built-in default")
+        row = qd.dial_of(self.in_force, dial, self.repo)
+        out.append(f" · in force {qd.dial_value(row, 24)} "
+                   f"({'this repo' if row.get('repo') else 'fleet'})" if row
+                   else " · no board dial — this repo's own value stands")
+        if spec.get("note"):
+            out.append("\n" + spec["note"], style="yellow")
+        return out
+
+    def _did_you_mean(self, dial: str) -> str:
+        """` — ↓ takes review_panel.max_rounds`, where that is unambiguous.
+
+        The commonest way to arrive at an unknown name is to type the half of it a
+        person actually remembers: `max_rounds` for `review_panel.max_rounds`,
+        `pi.enabled` for `reviewers.pi.enabled`. A refusal that only said "not a
+        dial" would be technically right and leave the answer sitting one row
+        below, unmentioned — so where the filter has narrowed to exactly one, the
+        refusal names it. Several matches name none: picking the first would be
+        this screen guessing which dial somebody meant to move.
+        """
+        hit = qd.dial_matches(self.vocabulary, dial, limit=2)
+        return f" — ↓ takes {hit[0]}" if len(hit) == 1 else ""
 
     def _value_text(self) -> str:
         """The current value, spelled the way this box would accept it back."""
@@ -249,21 +456,203 @@ class DialEdit(ModalScreen[dict | None]):
         value = self.row.get("value")
         return value if isinstance(value, str) else json.dumps(value)
 
+    # -- the picker ------------------------------------------------------------
+
+    def _names(self) -> OptionList | None:
+        found = self.query("#names")
+        return found.first(OptionList) if found else None
+
+    def _refill(self, typed: str) -> None:
+        """The names worth offering for what has been typed, redrawn."""
+        names = self._names()
+        if names is None:
+            return
+        self.matches = qd.dial_matches(self.vocabulary, typed)
+        names.clear_options()
+        names.add_options(self.matches)
+        # HIDDEN ONCE THE NAME IS ONE OF THEM, and not only to buy back the rows the
+        # spec line then spends. A list of names is help with choosing, and it has
+        # stopped helping the moment a choice is made — leaving it up would keep four
+        # rows of alternatives under a field that is already answered, on a form
+        # whose next question is one line further down. Typing again brings it back.
+        names.display = bool(self.matches) and not self._spec_of(typed.strip())
+        # Highlight the first one, because `clear_options` leaves nothing
+        # highlighted and an OptionList with no highlight answers `enter` by doing
+        # nothing at all — which reads as a picker that does not work.
+        names.highlighted = 0 if self.matches else None
+        # And the line below describes it straight away. Waiting for a key would
+        # leave the first row — the one a person's eye is already on — as the only
+        # one in the list with nothing said about it.
+        self._preview = self.matches[0] if self.matches and names.display else ""
+
     def on_mount(self) -> None:
         # The field a person came here to change. Editing an existing dial that is
         # its value; creating one, it is the name.
+        self._refill("")
         self.query_one("#f_dial" if not self.row.get("dial") else "#f_value",
                        Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Filter as the name is typed, and re-state what the named dial takes."""
+        if event.input.id in ("f_dial", "f_value"):
+            # The two fields a refusal is ever about. Editing either is a person
+            # acting on it, and a refusal left standing beside the field it has
+            # stopped describing is read as a second, still-live objection.
+            self.query_one("#err", Static).display = False
+        if event.input.id != "f_dial":
+            return
+        self._refill(event.value)
+        self._redraw_spec()
+
+    def _redraw_spec(self) -> None:
+        """The line under the value box, for whatever is being looked at right now.
+
+        The PREVIEW wins over the typed name while the list is up, and that is the
+        whole of this feature: the name in the box is what will be written, and the
+        name under the cursor is what is being read about. The value's placeholder
+        follows the box rather than the cursor — it belongs to the field it sits in,
+        and flickering it through 29 dials as somebody scrolls would be describing
+        one thing in the widget for another.
+        """
+        browsing = self._browsing()
+        dial = (self._preview if browsing and self._preview else self._dial_name())
+        self.query_one("#spec", Static).update(self._spec(dial, brief=browsing))
+        # AND THE VALUE BOX FOLLOWS IT TOO. An earlier cut kept the placeholder on
+        # the typed name, on the reasoning that a widget should describe its own
+        # field — which is the wrong way round here, because the placeholder IS the
+        # guide to what may be typed, and the dial being read about is the one the
+        # question is about. Scrolling the list now says what each dial decides AND
+        # what it will take, which is the pair a person needs before choosing.
+        spec = self._spec_of(dial)
+        self.query_one("#f_value", Input).placeholder = (
+            spec["hint"] if spec else self.GENERIC_HINT)
+
+    def on_option_list_option_highlighted(
+            self, event: OptionList.OptionHighlighted) -> None:
+        """Scrolling the list describes what it lands on."""
+        if 0 <= event.option_index < len(self.matches):
+            self._preview = self.matches[event.option_index]
+            self._redraw_spec()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """A name taken from the list: fill the box and move on to the value.
+
+        Indexed into the list this screen filtered rather than read off the
+        widget's own option, so what is written into the box is the string that
+        went in — a prompt is a renderable, and rendering one back to text is a
+        round trip through Rich that a dotted path does not need to take.
+        """
+        if not (0 <= event.option_index < len(self.matches)):
+            return
+        field = self.query_one("#f_dial", Input)
+        field.value = self.matches[event.option_index]
+        # `on_input_changed` refills and redraws off the back of that assignment;
+        # the focus move is what is left, and it goes to the box a person picking
+        # a name is on their way to.
+        self.query_one("#f_value", Input).focus()
+
+    def action_to_names(self) -> None:
+        """`↓` from the NAME box walks into the list under it.
+
+        `Input` binds neither arrow, so this key would otherwise do nothing at all
+        in the one field it is the obvious gesture for. From any other field it
+        still does nothing, deliberately: a `↓` typed in the reason box is somebody
+        reaching for the next line, and throwing the focus three fields backwards
+        is a worse answer than ignoring it.
+        """
+        names = self._names()
+        if names is not None and names.display and self.focused is self.query_one(
+                "#f_dial", Input):
+            names.focus()
+
+    # -- saving ----------------------------------------------------------------
+
+    def _refuse(self, message: str) -> None:
+        """Say why, and stay open.
+
+        The alternative is what this modal did before #539: dismiss, and let the app
+        say it afterwards. That spends the other three fields to report a mistake in
+        one of them, and the person retypes a reason they already wrote.
+        """
+        err = self.query_one("#err", Static)
+        err.update(Text(message, style="bold red"))
+        err.display = True
+        self.app.bell()
 
     def _field(self, name: str) -> str:
         found = self.query(f"#{name}")
         return found.first(Input).value if found else ""
 
     def action_save(self) -> None:
+        """Everything the board would refuse, and everything the harness would
+        ignore, judged here — then dismissed with what the caller asked for.
+
+        The two are not the same list and both matter. A blank reason is refused by
+        `POST /dials` and a 422 would say so; a dial name the harness does not know
+        is ACCEPTED by the board, stored, and reported as in force for ever while
+        nothing applies it. Only this side can catch the second, because only this
+        side has the table.
+
+        The raw strings go back to `Dash.dial_written` unparsed, so the app's own
+        checks still run on the path where this screen had no vocabulary to check
+        against. Parsing twice is cheaper than one of the two forgetting.
+        """
+        dial = self._dial_name()
+        if not dial:
+            self._refuse("which dial? Type a name, or press ↓ to pick one")
+            return
+        reason = self._field("f_reason")
+        if not reason.strip():
+            self._refuse("a dial needs a reason — why is this value in force? "
+                         "The board refuses one without, and so does this")
+            return
+        try:
+            value = qd.parse_dial_value(self._field("f_value"))
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            self._refuse(str(exc))
+            return
+        # GATED ON THE TABLE THIS SCREEN WAS GIVEN, not on whether `qbdata` can
+        # find one of its own. They are the same answer in the app — the modal is
+        # handed `dial_vocabulary()` — and keeping the judgement on the screen's
+        # own copy is what stops a form that says "not checked here" from refusing
+        # a write anyway, which is the one behaviour a person cannot argue with.
+        if self.vocabulary and not self._spec_of(dial):
+            # **AN UNKNOWN NAME IS A WARNING AND THEN A WRITE**, and the asymmetry
+            # with the value check below is the whole argument.
+            #
+            # The table this is judged against is the harness beside THIS DASHBOARD,
+            # and the two are installed separately: a box a release behind would
+            # otherwise be a box that cannot set a dial the rest of the fleet
+            # already applies. `tempo` (#474) is the standing case — both dashboards
+            # draw it, `BOARD_DIALS` does not hold it, and a hard refusal here would
+            # take a dial the fleet uses away from the one screen that sets it.
+            #
+            # A value for a name this box DOES know gets no such benefit of the
+            # doubt: the kind came from the same table as the name, so there is no
+            # version story in which `max_rounds: "2"` is a value somebody's harness
+            # applies. That one stays a refusal.
+            if self._insisted != dial:
+                self._insisted = dial
+                self._refuse(f"nothing this box knows applies `{dial}`"
+                             f"{self._did_you_mean(dial)} — ctrl+s again to set it "
+                             f"anyway")
+                return
+        elif self.vocabulary:
+            problem = qd.dial_refusal(dial, value)
+            if problem:
+                self._refuse(problem)
+                return
+        try:
+            # Parsed for its refusal only — the app parses it again against the
+            # same board clock when it writes.
+            qd.parse_dial_expiry(self._field("f_expiry"), self.now)
+        except (ValueError, OverflowError) as exc:
+            self._refuse(str(exc))
+            return
         self.dismiss({
-            "dial": (self.row.get("dial") or self._field("f_dial")).strip(),
+            "dial": dial,
             "value": self._field("f_value"),
-            "reason": self._field("f_reason"),
+            "reason": reason,
             "expiry": self._field("f_expiry"),
             "repo": self.repo,
         })
@@ -2166,7 +2555,16 @@ class Dash(App):
         # answer that can mean "change what I am looking at".
         repo = (row or {}).get("repo") if row else self.new_dial_scope()
         label = repo or "fleet (every repo)"
-        self.push_screen(DialEdit(row, repo, label), self.dial_written)
+        # The harness's own dial table, the board's answer, and the board's clock —
+        # the three things the modal cannot work out for itself. `dial_vocabulary`
+        # resolves once per process and answers `{}` on a box with no harness/loops
+        # beside this script, which is the form as it shipped: free text and no
+        # refusal (#539).
+        self.push_screen(DialEdit(row, repo, label,
+                                  vocabulary=qd.dial_vocabulary(),
+                                  in_force=self.dials,
+                                  now=(self.dials or {}).get("now")),
+                         self.dial_written)
 
     def new_dial_scope(self) -> str | None:
         """Which repo a NEW dial belongs to — off the SCOPE, never off the cwd.

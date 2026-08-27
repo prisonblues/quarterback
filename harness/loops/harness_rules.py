@@ -2314,6 +2314,20 @@ class Dial(NamedTuple):
     kind: str
     nullable: bool
     rule: str
+    #: ONE LINE on what this dial decides, for the screen that offers it (#539).
+    #:
+    #: A summary, and the argument stays where it was — beside the key in
+    #: `DEFAULTS`, at whatever length it needed. That prose is Python comments and
+    #: nothing can read it, which is why a person opening `set a dial` was handed 29
+    #: dotted paths and no way to tell which one they meant. This is the shortest
+    #: thing that answers that question, and it is not the place to re-argue a
+    #: number: a reader who wants the reasoning is one `grep` from the comment that
+    #: carries it.
+    #:
+    #: Defaulted, so a `Dial(...)` written with three fields still constructs. Every
+    #: entry below carries one; a new dial that forgets is a picker row that says
+    #: nothing, rather than a crash on the dashboard of whoever pulls it next.
+    what: str = ""
 
 
 #: `reviewers.<seat>.enabled` is the interesting boundary and it gets the narrow
@@ -2350,41 +2364,57 @@ _NARROW_ONLY_ENABLED = "narrow"
 BOARD_DIALS: dict[str, Dial] = {
     # The two floors #305 is named for: which findings a fix pass may touch, and
     # which ones buy another round.
-    "review_panel.fix_severity_floor": Dial("severity", False, "either"),
-    "review_panel.round_trigger_floor": Dial("severity", False, "either"),
+    "review_panel.fix_severity_floor": Dial("severity", False, "either",
+        'the lowest severity a fix pass may act on; under it is deferred, not fixed'),
+    "review_panel.round_trigger_floor": Dial("severity", False, "either",
+        'the lowest severity that buys another round; under it never extends the cycle'),
     # #482's third floor: which deferrals get a GitHub issue as well as their board
     # row. A `deferral_gate` and not a `severity` because its two ends are words —
     # `always` and `never` — which no severity band can spell: "below P4" has no band
     # and `P0` is deliberately not a severity this panel has.
-    "review_panel.file_deferral_issues": Dial("deferral_gate", False, "either"),
+    "review_panel.file_deferral_issues": Dial("deferral_gate", False, "either",
+        'how severe a deferral must be to open a GitHub issue as well as its board row'),
     # #297's budget for the band between them, and #298's growth ceiling.
-    "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
-    "review_panel.max_fix_growth": Dial("number", True, "either"),
+    "review_panel.low_severity_fix_lines": Dial("number", False, "either",
+        'churned lines a round may spend on findings over the fix floor and under the round floor'),
+    "review_panel.max_fix_growth": Dial("number", True, "either",
+        'how many times its round-1 size the change may grow before the cycle stops'),
     # #492's absolute half of that ceiling. Settable on its own and nullable on its
     # own, which is the whole reason it is a second key rather than a pair inside the
     # one above.
-    "review_panel.max_fix_growth_chars": Dial("number", True, "either"),
+    "review_panel.max_fix_growth_chars": Dial("number", True, "either",
+        'how many chars past its round-1 size it may grow; whichever ceiling binds first'),
     # What a cycle costs: how many rounds, how much of the change each seat reads,
     # how much diff it is handed, and whether a second model adjudicates.
-    "review_panel.max_rounds": Dial("number", False, "either"),
-    "review_panel.reviewer_scope": Dial("scope", False, "either"),
-    "review_panel.max_diff_chars": Dial("number", True, "either"),
-    "review_panel.judge_max_diff_chars": Dial("number", True, "either"),
-    "review_panel.judge_model": Dial("text", False, "either"),
+    "review_panel.max_rounds": Dial("number", False, "either",
+        'how many rounds one review cycle may run before it stops and hands over'),
+    "review_panel.reviewer_scope": Dial("scope", False, "either",
+        'whether a finding must be in the change, or may be anywhere it touches'),
+    "review_panel.max_diff_chars": Dial("number", True, "either",
+        'chars of diff each reviewer is handed; null hands over the whole thing'),
+    "review_panel.judge_max_diff_chars": Dial("number", True, "either",
+        'chars of diff the judge is handed; inherits max_diff_chars when unset'),
+    "review_panel.judge_model": Dial("text", False, "either",
+        'which model adjudicates the seats, and it must not be one of their own'),
     # #278's dial, and #84's futility brake.
-    "review_panel.distant_merge_lines": Dial("number", True, "either"),
-    "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
-    "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either"),
+    "review_panel.distant_merge_lines": Dial("number", True, "either",
+        "lines a base merge may change in this PR's own files before the round is redone"),
+    "review_panel.escalate_on.premise_repeated": Dial("number", True, "either",
+        'how many times one rejected premise may be declared before the cycle escalates'),
+    "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either",
+        'escalate as soon as a fixer says the runtime cannot observe what is asserted'),
     # #489's injection gate, `nullable` for its sibling's reason: `null` is how a
     # repo switches a futility brake off, and a board that could move the number but
     # not turn it off would be a channel with half a policy in it.
-    "review_panel.escalate_on.fix_injection": Dial("number", True, "either"),
+    "review_panel.escalate_on.fix_injection": Dial("number", True, "either",
+        "share of a round's new findings that its own previous fix pass may have created"),
     # #505's volume rung, on the same terms. A fleet mid-drain wants a shorter
     # window than a fleet reviewing one careful pull request, which is exactly the
     # decision the dial layer exists for — and `nullable` for its sibling's reason:
     # a board that could move the number but not turn the brake off would be a
     # channel carrying half a policy.
-    "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either"),
+    "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either",
+        'consecutive rounds whose new-finding count may fail to fall before escalating'),
     # #507's constructive pass. `either`, because it is the one dial here whose two
     # directions cost different things and neither is a merge policy: switching it ON
     # spends a fan-out on cycles that escalate, switching it OFF sends a human to a
@@ -2392,7 +2422,8 @@ BOARD_DIALS: dict[str, Dial] = {
     # want the first answer and a fleet reviewing one careful pull request the second,
     # which is exactly the decision a settings channel exists for — and it can move no
     # verdict either way, so there is nothing here a board could loosen.
-    "review_panel.propose_on_escalation": Dial("flag", False, "either"),
+    "review_panel.propose_on_escalation": Dial("flag", False, "either",
+        'whether an escalation arrives with a proposed change or only with complaints'),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are
@@ -2400,12 +2431,18 @@ BOARD_DIALS: dict[str, Dial] = {
     # applied to a run, and `panel_caps` treats the layer that answered as part of
     # the answer: a ceiling the board stated cannot be exceeded by the repo's own
     # file, by `--max-rounds`, or by `--force`. See `panel_caps.ceiling_of`.
-    "review_panel.budget.tokens_per_day": Dial("number", True, "either"),
-    "review_panel.budget.runs_per_day": Dial("number", True, "either"),
-    "review_panel.budget.tokens_per_pr": Dial("number", True, "either"),
-    "review_panel.budget.runs_per_pr": Dial("number", True, "either"),
-    "review_panel.budget.fleet_tokens_per_day": Dial("number", True, "either"),
-    "review_panel.budget_window_hours": Dial("number", False, "either"),
+    "review_panel.budget.tokens_per_day": Dial("number", True, "either",
+        'tokens this repo may spend on panels in the rolling window'),
+    "review_panel.budget.runs_per_day": Dial("number", True, "either",
+        'panel runs this repo may spend in the rolling window'),
+    "review_panel.budget.tokens_per_pr": Dial("number", True, "either",
+        'tokens one PR may spend across every cycle and every head it has had'),
+    "review_panel.budget.runs_per_pr": Dial("number", True, "either",
+        'panel runs one PR may spend across every cycle and every head it has had'),
+    "review_panel.budget.fleet_tokens_per_day": Dial("number", True, "either",
+        'tokens every watched repo combined may spend in the rolling window'),
+    "review_panel.budget_window_hours": Dial("number", False, "either",
+        'how long the rolling window is that the per-day ceilings are counted over'),
     # #55's fourth acceptance criterion: turning the watcher off for a repo takes
     # ONE setting and takes effect on the next resolution rather than the next
     # restart — which is what a dial is, since `resolve_repo` reads them on every
@@ -2413,11 +2450,14 @@ BOARD_DIALS: dict[str, Dial] = {
     # a repo that has switched its own reviews off knows something the board does
     # not, so the board may turn a repo OFF and may not turn one back ON over the
     # top of a file that said no.
-    "enabled": Dial("flag", False, _NARROW_ONLY_ENABLED),
+    "enabled": Dial("flag", False, _NARROW_ONLY_ENABLED,
+        'whether this repo is reviewed at all'),
     # The boundary case, narrow-only. Filled in below from DEFAULTS' seat list so
     # that a seat added there is settable without a second edit here — a seat named
     # in two places is a seat the two places can disagree about.
-    **{f"{_LOCAL_BLOCK}.{seat}.enabled": Dial("flag", False, _NARROW_ONLY_ENABLED)
+    **{f"{_LOCAL_BLOCK}.{seat}.enabled": Dial(
+           "flag", False, _NARROW_ONLY_ENABLED,
+           f"whether the {seat} seat is dispatched on a round")
        for seat in DEFAULTS[_LOCAL_BLOCK]},
 }
 
@@ -2429,16 +2469,34 @@ BOARD_DIALS: dict[str, Dial] = {
 #: is: every severity entering the panel is stripped and upper-cased, so a layer
 #: that refused `"p2"` while the sample beside it accepted it would make one written
 #: value mean two things depending on which layer carried it.
-_SEVERITY_RE = re.compile(r"^[Pp][1-4]$")
+#:
+#: SPELLED OUT AS A TUPLE, with the pattern built from it, because #539 needs the
+#: bands as words — a form that offers a floor's four legal values cannot read them
+#: out of a regex, and a screen that listed `P1..P4` in its own prose would be a
+#: second copy of the ladder that goes stale the day a band is added.
+_SEVERITY_BANDS = ("P1", "P2", "P3", "P4")
+_SEVERITY_RE = re.compile(f"^[Pp][{''.join(b[1] for b in _SEVERITY_BANDS)}]$")
 
 #: The two ends of `file_deferral_issues`, beside the P1..P4 bands (#482). Lower-cased
 #: on the way in for `_SEVERITY_RE`'s reason: one written value must not mean two
 #: things depending on which layer carried it.
 _DEFERRAL_GATE_ENDS = ("always", "never")
 
-#: What `reviewer_scope` accepts. Two words, and a third would silently review the
-#: whole PR every round.
-_SCOPES = ("diff", "increment")
+#: What `reviewer_scope` accepts: defects in the change (`diff`), or in the change
+#: and everything it touches (`repo`, the pre-#165 posture). Two words, and a third
+#: would silently review the whole PR every round.
+#:
+#: **`increment` USED TO BE HERE AND IS `round_scope`'S WORD** (`panel_core.
+#: ROUND_SCOPES`), which made this layer wrong in both directions at once and
+#: neither was visible from the board: the documented value `repo` was REFUSED here
+#: and never applied, while `increment` passed this check, was written into the
+#: resolved config, and then met `panel_seats.reviewer_scope` — which refuses a word
+#: it does not know with `SystemExit`. A board dial that validates and then kills
+#: the run is the worst of the three outcomes, and it is the one this spelling
+#: produced. `test_harness_dials` now holds the tuple against `REVIEWER_SCOPES`
+#: itself, which is the only thing that can stop it drifting again: `panel_core`
+#: imports THIS module, so the constant cannot simply be imported from there.
+_SCOPES = ("diff", "repo")
 
 
 def _config_file(path: Path) -> dict[str, str]:
@@ -2703,6 +2761,143 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     if value < 0:
         return f"`{path}` must not be negative, and is {value!r}"
     return ""
+
+
+#: One line per `kind`, in the words a person types into a box — the answer to
+#: "what does THIS dial take", which no single placeholder over 29 dials and six
+#: kinds can give. Built from the same constants `_dial_problem` judges by, so the
+#: hint and the refusal cannot drift apart: a form that offered `always` for a
+#: `severity` would be a second, wrong statement of the vocabulary, which is the
+#: failure #56's rule and #305 both exist to end.
+_KIND_HINTS = {
+    "severity": f"a severity band — {', '.join(_SEVERITY_BANDS)}",
+    "deferral_gate": (f"a severity band ({', '.join(_SEVERITY_BANDS)}) "
+                      f"or {' / '.join(_DEFERRAL_GATE_ENDS)}"),
+    "scope": " or ".join(_SCOPES),
+    "flag": "true or false, unquoted",
+    "number": "a number",
+    "text": "a string",
+}
+
+#: Said whenever a `narrow` dial is about to be typed into, because the direction
+#: rule is invisible in the value and only discoverable by having a write ignored.
+#: A WARNING AND NOT A REFUSAL: whether `true` is a widening depends on what this
+#: box's overlay and the repo's own sample already say, and neither is knowable
+#: from a screen that has not resolved the repo — `apply_dials` is where the two
+#: meet and where the ignoring actually happens.
+_NARROW_NOTE = "narrow only — the board may switch this off, never back on"
+
+
+def dial_choices(path: str) -> tuple[str, ...]:
+    """The values this dial accepts, when there is a closed set of them.
+
+    **AS TYPED, not as judged.** These are the words that go in a value box, and a
+    box holds text: `true` here is the four characters, and it reaches
+    `dial_problem` as the boolean only once the client has taken it through its own
+    `parse_dial_value` — JSON where it parses, the string it looks like otherwise.
+    Every entry below survives that round trip, and `harness/tests` asserts it from
+    the side that has both halves; returning real booleans instead would make the
+    two closed sets that are words (`P1`, `always`) and the one that is not disagree
+    about what a choice is.
+
+    Empty for `number` and `text`, which are not lists and must not be offered as
+    though a form could enumerate them.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return ()
+    if dial.kind == "severity":
+        return _SEVERITY_BANDS
+    if dial.kind == "deferral_gate":
+        return _SEVERITY_BANDS + _DEFERRAL_GATE_ENDS
+    if dial.kind == "scope":
+        return _SCOPES
+    if dial.kind == "flag":
+        return ("true", "false")
+    return ()
+
+
+def dial_hint(path: str) -> str:
+    """What to type into this dial's value box, in one line.
+
+    The nullable half is appended rather than written per dial: `null` is the
+    documented OFF SWITCH wherever `Dial.nullable` is true and means "inherit the
+    default" everywhere else, and a person cannot tell which from the value box.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return ""
+    hint = _KIND_HINTS.get(dial.kind, dial.kind)
+    return hint + (" — or `null`, which switches it off" if dial.nullable else "")
+
+
+def dial_specs() -> dict[str, dict]:
+    """Every board-settable dial as plain data, for a client drawing a form — #539.
+
+    Setting a dial used to be four empty boxes and one placeholder covering all of
+    them at once (`P3, 2, true, null`), so the question a person actually has —
+    what does THIS one take, what is it now, which way may it move — had no answer
+    on the screen where it is asked. The names, kinds, directions and defaults were
+    all here the whole time, two directories from the dashboard that draws the box.
+
+    NOT A NEW STATEMENT OF ANY OF IT. `BOARD_DIALS` still settles the list and the
+    shapes, `DEFAULTS` still holds every default, and this reads both back — the
+    same thing `_dial_default` does and for the same reason. A client rendering
+    this is reading the one copy, which is what #56's rule asks for; a client that
+    hard-coded the same table would be the second place a dial is written down.
+
+    **IN THE TABLE'S ORDER, and that is part of the answer.** `BOARD_DIALS` is
+    written grouped — the two floors first, then what a cycle costs, then the
+    futility brakes, then the budgets, then the switches — and a client that sorted
+    the names would open on `enabled`, which is alphabetically first, is the one
+    dial that turns this repo's reviews off entirely, and is nobody's answer to
+    "what did I come here to change".
+    """
+    out: dict[str, dict] = {}
+    for path, dial in BOARD_DIALS.items():
+        default, known = _dial_default(path)
+        out[path] = {
+            "dial": path,
+            #: What it decides, in one line. First in the entry because it is first
+            #: in the question a person is asking: which of these did I want.
+            "what": dial.what,
+            "kind": dial.kind,
+            "nullable": dial.nullable,
+            "rule": dial.rule,
+            #: The built-in default, and whether `DEFAULTS` actually had one. A
+            #: dial with no default is a bug in this table rather than a dial that
+            #: defaults to null, and the flag is how a form can say so instead of
+            #: drawing `null` as if it were the shipped answer.
+            "default": default,
+            "default_known": known,
+            "choices": list(dial_choices(path)),
+            "hint": dial_hint(path),
+            "note": _NARROW_NOTE if dial.rule == "narrow" else "",
+        }
+    return out
+
+
+def dial_problem(path: str, value: Any) -> str:
+    """Why this dial cannot carry this value, or `""` — asked BEFORE the write.
+
+    The same judgement `board_dials` makes on the way in, made one step earlier so
+    that a person typing gets the sentence instead of a round three hours later
+    getting the default. `POST /dials` cannot make it: the board stores `dial` as
+    opaque text and `value` as opaque JSON on purpose, so a misspelt name or a
+    quoted `"2"` is accepted, stored, returned and then ignored by every harness
+    that reads it (#305, #539).
+
+    The unknown-name sentence is not `board_dials`' and should not be: that one is
+    about a row already on the board that this run is dropping, and this one is
+    about a write that has not happened yet, where the fix is to type a different
+    name rather than to go and clear something.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return (f"`{path}` is not a board-settable dial. This harness settles that "
+                f"list, not the board — a dial the board holds and nothing applies "
+                f"is worse than no dial at all")
+    return _dial_problem(path, dial, value)
 
 
 def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:

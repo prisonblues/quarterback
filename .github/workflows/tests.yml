@@ -156,14 +156,16 @@ jobs:
           # want a live board and a `gh` still skip here and are meant to; these
           # are the ones whose data is a literal in the file.
           # EVERY dashboard suite, named one at a time. Each is skip-guarded on its
-          # own dependency — test_qb_dash.py on textual, test_qb_dash_plain.py and
-          # test_qb_dials_surface.py on rich — so a single run over all of them would
+          # own dependency — test_qb_dash.py and test_qb_dial_picker.py on textual,
+          # test_qb_dash_plain.py and test_qb_dials_surface.py on rich — so a single
+          # run over all of them would
           # report `N passed` while one contributed nothing, which is the reading this
           # step exists to deny. Serial, and not `-n auto` like the step above: this
           # reads pytest's own summary line back out, and it is sixty-odd tests to
           # begin with.
           for suite in harness/tests/test_qb_dash.py harness/tests/test_qb_dash_plain.py \
-                       harness/tests/test_qb_dials_surface.py; do
+                       harness/tests/test_qb_dials_surface.py \
+                       harness/tests/test_qb_dial_picker.py; do
             echo "--- did $suite actually run?"
             out=$(uv run --extra dev --extra tui pytest "$suite" -q -rs 2>&1)
             echo "$out"

@@ -2769,7 +2769,15 @@ def test_a_refused_write_is_reported_and_does_not_take_the_dashboard_down():
 
 def test_ctrl_s_in_the_editor_is_what_sends_it():
     """The keystroke path, end to end: the ✎ opens the modal, the fields are
-    typed, and ctrl+s is the only thing that spends a request."""
+    typed, and ctrl+s is the only thing that spends a request.
+
+    TWICE, because the dial on this screen is `tempo` — which both dashboards draw
+    and `harness_rules.BOARD_DIALS` does not hold, so nothing this box knows applies
+    it. #539 warns on the first ctrl+s and writes on the second: the vocabulary is
+    the harness beside THIS dashboard, and the two are installed separately, so a
+    hard refusal would make a box one release behind a box that cannot set a dial
+    the rest of the fleet already applies. The first press spending nothing is the
+    half this test used to assert on its own, and it still holds."""
     module = _load_app()
 
     async def go():
@@ -2802,6 +2810,10 @@ def test_ctrl_s_in_the_editor_is_what_sends_it():
             for ch in "draining":
                 await pilot.press(ch)
             assert not human.set, "a keystroke wrote before ctrl+s did"
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.4)
+            assert not human.set, (
+                "an unrecognised dial was written without being confirmed")
             await pilot.press("ctrl+s")
             await pilot.pause(0.4)
             return human.set

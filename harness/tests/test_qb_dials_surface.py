@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -612,3 +613,144 @@ def test_a_key_command_that_hangs_names_the_prompt_nobody_answered():
         sp.run = real
     said = str(caught.value)
     assert "desktop" in said and "✎" in said, said
+
+
+# ---------------------------------------------------------------------- #539
+# The vocabulary a person needs in order to SET one.
+#
+# The read half above renders what the board said and asserts nothing about what
+# it means, which is right for a reader — the board stores `dial` as opaque text
+# and `value` as opaque JSON on purpose. A WRITER cannot work that way: `POST
+# /dials` takes any dotted path and any JSON, so a misspelt name or a quoted `"2"`
+# is stored, returned as in force, and then ignored by every harness that reads
+# it. This is the only side that can catch that, and these are the three ways of
+# being wrong about it:
+#
+#   * a SECOND COPY of the table — the failure #56's rule exists to end, and the
+#     one that would look right for months
+#   * a form that refuses what the board would take, on a box that cannot read the
+#     table at all, leaving a person with no door
+#   * choices offered as words and judged as values, which is a picker whose own
+#     suggestions are refused
+
+
+def test_the_vocabulary_is_the_harness_table_and_not_a_copy_of_it():
+    """Read out of `harness_rules` at call time. A test that listed the names would
+    be the second place they are written down, so this compares the two."""
+    sys.path.insert(0, str(BIN.parent / "loops"))
+    import harness_rules as hr
+
+    assert set(qd.dial_vocabulary()) == set(hr.BOARD_DIALS)
+
+
+def test_every_word_the_picker_offers_survives_the_box_it_is_typed_into():
+    """The coupling only this suite can assert: the choices are TYPED TEXT and the
+    judge takes VALUES, so `true` is four characters here and a boolean by the time
+    `dial_problem` sees it. A picker whose own suggestions come back refused is
+    worse than no picker."""
+    for path, spec in qd.dial_vocabulary().items():
+        for choice in spec["choices"]:
+            value = qd.parse_dial_value(choice)
+            assert qd.dial_refusal(path, value) == "", (path, choice, value)
+
+
+def test_a_default_is_offered_back_in_the_spelling_the_box_accepts():
+    """The other direction, and the one a person actually walks: the spec line
+    prints a default, somebody types it back, and it has to survive. `P3` round
+    trips as itself and `3.0` as a number — the two halves of `parse_dial_value`."""
+    vocab = qd.dial_vocabulary()
+    for path, spec in vocab.items():
+        if not spec["default_known"] or spec["default"] is None:
+            continue
+        typed = spec["default"] if isinstance(spec["default"], str) \
+            else json.dumps(spec["default"])
+        assert qd.dial_refusal(path, qd.parse_dial_value(typed)) == "", (path, typed)
+
+
+def test_a_misspelt_name_is_refused_here_because_the_board_cannot_refuse_it():
+    """`POST /dials` accepts it, stores it, and reports it as in force for ever
+    while nothing applies it. The sentence names who settles the list, because the
+    fix is to type a different name and not to go and clear something."""
+    said = qd.dial_refusal("review_panel.fix_sevrity_floor", "P2")
+    assert "not a board-settable dial" in said
+
+
+def test_a_value_of_the_wrong_shape_is_refused_with_the_harness_own_sentence():
+    """Not a sentence of the dashboard's own: the reason a quoted `"2"` is wrong is
+    a fact about the harness that will ignore it, and two spellings of that reason
+    would be two things to keep true."""
+    assert "must be a number" in qd.dial_refusal("review_panel.max_rounds", "2")
+    assert qd.dial_refusal("review_panel.max_rounds", 2) == ""
+
+
+def test_a_box_that_cannot_read_the_table_refuses_nothing_and_says_so(monkeypatch):
+    """An empty vocabulary is "cannot tell", never "nothing is settable" — and a
+    form that refused a write the board would have taken would leave the person at
+    that keyboard with no door at all. The cost of the false negative is the
+    behaviour that shipped; the cost of a false refusal is a dial nobody can set."""
+    monkeypatch.setattr(qd, "_DIAL_RULES", [None])
+    assert qd.dial_vocabulary() == {}
+    assert qd.dial_refusal("anything.at.all", "nonsense") == ""
+
+
+def test_a_harness_older_than_this_file_is_the_same_answer_as_no_harness(monkeypatch):
+    """The dashboard and the loops are installed separately and can be different
+    ages. A `harness_rules` with no dial table must read as "cannot tell" rather
+    than raising into a modal, which takes the whole dashboard down."""
+    monkeypatch.setattr(qd, "_DIAL_RULES", [object()])
+    assert qd.dial_vocabulary() == {}
+    assert qd.dial_refusal("review_panel.max_rounds", "2") == ""
+
+
+def test_the_names_are_filtered_by_the_half_a_person_remembers():
+    """Substring and not prefix: the useful half of a dial's name is in the middle
+    of it. A prefix filter answers `budget` with nothing until `review_panel.` has
+    been typed — which is the part nobody is unsure about."""
+    vocab = qd.dial_vocabulary()
+    assert len(qd.dial_matches(vocab, "budget")) >= 5
+    assert qd.dial_matches(vocab, "max_rounds") == ["review_panel.max_rounds"]
+    assert qd.dial_matches(vocab, "FLOOR") == qd.dial_matches(vocab, "floor")
+    assert qd.dial_matches(vocab, "") == list(vocab)
+    assert qd.dial_matches(vocab, "no such thing") == []
+
+
+def test_an_exact_name_sorts_above_the_names_that_merely_contain_it():
+    """Typing one in full has to put it at the top, or the completion offered on a
+    refusal names something the person did not ask for."""
+    vocab = qd.dial_vocabulary()
+    hit = qd.dial_matches(vocab, "enabled")
+    assert hit[0] == "enabled" and len(hit) > 1
+
+
+def test_the_lookup_finds_the_loops_beside_this_file_in_both_layouts(tmp_path):
+    """`bin/` and `loops/` are siblings in a checkout; `bin/` and
+    `share/quarterback-harness/loops` are siblings in the store. A dashboard
+    installed with neither gets None, which is the "cannot tell" above."""
+    assert qd.loops_dir() == str(BIN.parent / "loops")
+    packaged = tmp_path / "share" / "quarterback-harness" / "loops"
+    packaged.mkdir(parents=True)
+    (packaged / "harness_rules.py").write_text("")
+    (tmp_path / "bin").mkdir()
+    assert qd.loops_dir(str(tmp_path / "bin" / "qbdata.py")) == str(packaged)
+    bare = tmp_path / "elsewhere" / "bin"
+    bare.mkdir(parents=True)
+    assert qd.loops_dir(str(bare / "qbdata.py")) is None
+
+
+def test_the_list_opens_on_a_floor_and_not_on_the_off_switch():
+    """`BOARD_DIALS` is written grouped — the two floors, then what a cycle costs,
+    then the brakes, the budgets and the switches — and that order is carried
+    through. Sorted alphabetically the picker opens on `enabled`, which switches
+    this repo's reviews off entirely and is nobody's answer to "what did I come here
+    to change"."""
+    first = qd.dial_matches(qd.dial_vocabulary(), "")[0]
+    assert first == "review_panel.fix_severity_floor", first
+
+
+def test_every_dial_says_what_it_decides_in_one_line():
+    """The gap #539 is actually about: 29 dotted paths and no way to tell which one
+    you wanted. One line each, short enough to sit under the value box at 78
+    columns, and it is a summary — the argument stays beside the key in DEFAULTS."""
+    vocab = qd.dial_vocabulary()
+    assert all(spec["what"] for spec in vocab.values())
+    assert max(len(spec["what"]) for spec in vocab.values()) <= 2 * 66
