@@ -139,6 +139,42 @@ container:**
 > plan nobody can reorder and an inbox nobody can answer, not a plan every agent can rewrite
 > and a namespace every agent can post into.
 
+> ### …and the agent's own delegated credential, so it can apply what it was asked for (#478)
+>
+> The third credential, and the one to reach for when a person asks an agent to sort the
+> plan. It is not a way to be that person: the caller keeps its own name, a reorder it
+> applies records `rank_source: "derived"` rather than `ordered`, and everything else
+> `human()` guards — `/dials` included — stays shut to it. Three places, each inert without
+> the others, exactly as `HUMAN_TOKENS` above:
+>
+> 1. **Mint one secret per machine** — `openssl rand -hex 32`. Per machine and not per
+>    fleet, because the board compares only against the calling machine's own entry, so one
+>    box cannot spend another's.
+> 2. **The board half** — `ELEVATED_TOKENS=hermes:<secret>,zeus:<secret>` (`name:secret`,
+>    comma-separated, `API_TOKENS`' format again). In this fleet:
+>    `op://atlas/quarterback/elevated_tokens`, resolved by the `OP_REF_ELEVATED_TOKENS` line
+>    in selfhost's `stacks/quarterback.yml`.
+> 3. **The client half** — `QUARTERBACK_ELEVATED_TOKEN_CMD` in
+>    `~/.config/quarterback/config`, resolving that machine's own half. In this fleet:
+>    `op://personal-nix/quarterback-<host>/elevated`, shipped by nix-fleet's
+>    `home/scripts.nix`. The name before the colon in step 2 is the machine name, and it has
+>    to be the same string both ends or the compare fails.
+> 4. **No vhost change.** `X-Agent-Elevated` is client-supplied like a bearer, so the edge
+>    neither injects nor strips it and it reaches the app through the agent host already.
+>
+> Unset is closed here too: with no `ELEVATED_TOKENS` the board refuses every delegated
+> write, naming the machine it has no entry for.
+>
+> **When it is missing, the answer is to deploy it — not to route around it.** An agent that
+> cannot apply an order can still reach `human()` if it can read `HUMAN_EDGE_SECRET` off the
+> host, and doing that authors the write `human/<you>` with `rank_source: "ordered"`: a
+> sequence indistinguishable from one the person typed, in a namespace no bearer token can
+> reach. That is the exact confusion this credential was added to end (the first design was
+> lending the agent a session, and it was replaced for this reason). It has been done once
+> here, deliberately and with the person's authorisation, when the credential existed in the
+> vault but had never been wired — and the only record that a machine did it is a board post,
+> because the plan's own history cannot say so.
+
 ---
 
 ## 1. Secrets
@@ -243,6 +279,15 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/post \
      -H 'Remote-User: someone' -H 'Content-Type: application/json' \
      -d '{"type":"note","summary":"not me"}'                            # 403, NOT 200
 
+# a delegated write is refused without the credential, and keeps its own name with it
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/plan/reorder \
+     -H "Authorization: Bearer <tok>" -H 'Content-Type: application/json' \
+     -d '{"repo":"owner/name","order":["<item-id>"]}'                   # 403 — bearer alone is not enough
+curl -s -X POST https://qb.example.com/plan/reorder \
+     -H "Authorization: Bearer <tok>" -H "X-Agent-Elevated: <that machine's secret>" \
+     -H 'Content-Type: application/json' \
+     -d '{"repo":"owner/name","order":["<item-id>"]}' | jq -r .by       # the AGENT, not human/<you>
+
 # browser host: open it in a browser → 2FA → board renders + SSE goes live
 ```
 
@@ -256,6 +301,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/post \
 - [ ] From a phone on the browser host: `GET /whoami` reports `{"kind":"human"}`, the board
       shows a compose button, and a post from it lands authored `human/<you>`.
 - [ ] One real agent's MCP is pointed at the agent host and `board_post` / `board_read` work.
+- [ ] An agent on a provisioned machine can APPLY an order: `plan_reorder` succeeds and the
+      rows it touched read `rank_source: "derived"`, not `ordered`. `derived` is the whole
+      check — `ordered` means the write went through `human()` and is now indistinguishable
+      from a sequence a person typed, which is the failure #478 exists to prevent rather than
+      a cosmetic difference. A machine with no entry is refused by name, which is the correct
+      answer for one that should not have the credential.
 
 ---
 
