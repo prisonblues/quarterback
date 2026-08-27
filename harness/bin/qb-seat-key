@@ -326,6 +326,18 @@ pane_exists() {
 # the size into it.
 hidden_state() { tmux show-options -v -t "$SID:" "@qb_hidden_$1" 2>/dev/null || true; }
 
+# BOTH OPTIONS DESCRIBE ONE PANE, so a pane that is gone must take both with it.
+# `@qb_hidden_dash` is where it is parked and `@qb_dash_expanded` is which of the
+# two ways it got there; clearing only the first leaves a screen marked expanded
+# with nothing recorded, and every later `z` then takes the expanded branch and
+# reports "nothing recorded to put back" — the wrong problem named, on a screen
+# where the real one is that the dash process died. Neither key can put that
+# right, because the marker is the only thing either of them reads.
+forget_dash() {
+  tmux set-option -t "$SID:" -u @qb_hidden_dash
+  tmux set-option -t "$SID:" -u @qb_dash_expanded
+}
+
 # Every pane in the window as `<id>:<width>`, in reading order — top row left to
 # right, then the row under it. `resize-pane -x` moves a boundary inside one row
 # only, so laying them out in that order is what makes the reassert converge: the
@@ -446,7 +458,7 @@ restore_dash() {
   if [ -n "$state" ]; then
     read -r p size widths <<<"$state"
     if ! pane_exists "$p"; then
-      tmux set-option -t "$SID:" -u @qb_hidden_dash
+      forget_dash
       die "the hidden dash is gone — nothing to bring back"
     fi
     target=$(first_seat)
@@ -557,13 +569,19 @@ expand_dash() {
   # the other key.
   if [ -n "$(tmux show-options -t "$SID:" -qv @qb_dash_expanded)" ]; then
     restore_dash && return 0
-    die "expand: the dash is marked expanded and there is nothing recorded to put back"
+    # THE MARKER IS WRONG AND THIS IS THE PROOF, so it does not survive being
+    # disproved: `restore_dash` returning 1 means there is no `@qb_hidden_dash`
+    # to go back to, and a marker saying "expanded" with nothing recorded
+    # describes no pane. Left set, it makes this the answer to every later `z`.
+    tmux set-option -t "$SID:" -u @qb_dash_expanded
+    die "expand: the dash was marked expanded with nothing recorded to put back — \
+the marker is cleared, so the next z reads the screen as it actually is"
   fi
   state=$(hidden_state dash)
   if [ -n "$state" ]; then
     read -r p size widths <<<"$state"
     if ! pane_exists "$p"; then
-      tmux set-option -t "$SID:" -u @qb_hidden_dash
+      forget_dash
       die "the hidden dash is gone — nothing to expand"
     fi
     # NOTHING IS BROKEN OUT AND NOTHING IS RECORDED. `hide_pane` already put this

@@ -51,6 +51,17 @@ which of the two states they are refusing for: "hidden" about a dash filling the
 front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
 state.
 
+Two options carry that third state — `@qb_hidden_dash` is where the pane is parked and
+`@qb_dash_expanded` is which of the two ways it got there — and they are cleared together
+wherever either stops being true. Separately was worse than it sounds: closing the window an
+expanded dash is sitting in is `C-q z` followed by the ordinary reflex of closing a window
+you are done with, and the pane-is-gone branch dropped only the first. What was left was a
+screen marked expanded with nothing recorded, so every later `z` took the expanded branch and
+answered "nothing recorded to put back" — naming the marker's problem rather than the
+screen's, which is that the dashboard died. Neither key could put it right, because that
+marker is the only thing either of them reads. `restore_dash` returning empty-handed is now
+taken as proof the marker is wrong, and it does not survive being disproved.
+
 ### The ⛶ is the first clickable widget on the top line
 
 `#[range=…]` is honoured in `status-format` and nowhere else, which is the whole reason a

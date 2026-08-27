@@ -2019,6 +2019,66 @@ def test_the_dash_toggle_also_brings_back_an_expanded_dash(screen):
         "the expanded marker outlived a collapse made with `d`"
 
 
+def test_killing_the_expanded_dash_takes_both_markers_with_it(screen):
+    """A dead pane must not leave a screen describing one.
+
+    Two options describe the expanded dash — `@qb_hidden_dash` is where it is
+    parked, `@qb_dash_expanded` is which of the two ways it got there — and the
+    pane-is-gone branch used to clear only the first. What was left was a screen
+    marked expanded with nothing recorded, so every later `z` took the expanded
+    branch and reported "nothing recorded to put back": the wrong problem named,
+    on a screen whose real one is that the dash process died. Neither key could
+    put it right, because the marker is the only thing either of them reads.
+
+    Closing the window the dash was expanded into is not a contrived way to reach
+    that — it is `C-q z` followed by the reflex of closing a window you are done
+    with, and the dash is the only pane in it.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    assert seat_key(screen, "expand", "t").returncode == 0
+    dash = screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip()
+    assert dash, "the dash did not record itself as expanded"
+
+    screen.tmux("kill-pane", "-t", dash)
+    # It refuses, and that is right — there is no dash to bring back. What it
+    # must not do is refuse the same way for ever.
+    assert seat_key(screen, "expand", "t").returncode != 0
+    for option in ("@qb_dash_expanded", "@qb_hidden_dash"):
+        left = screen.tmux("show-options", "-t", "t:", "-qv", option).stdout.strip()
+        assert left == "", f"{option} outlived the pane it describes: {left!r}"
+
+    # And the message now names the screen's actual state rather than the marker's.
+    again = seat_key(screen, "expand", "t")
+    assert "marked expanded" not in again.stderr, \
+        f"still answering from a marker that was cleared: {again.stderr!r}"
+
+
+def test_a_marker_left_without_a_record_clears_itself(screen):
+    """The other order the same contradiction can arrive in, and its only exit.
+
+    `expand_dash` asks `@qb_dash_expanded` first and hands off to `restore_dash`,
+    which answers from `@qb_hidden_dash`. A marker with no record is a state that
+    describes no pane, and leaving it set made this refusal the answer to every
+    later `z` — so `restore_dash` returning 1 is taken as the proof the marker is
+    wrong, and it does not survive being disproved.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    screen.tmux("set-option", "-t", "t:", "@qb_dash_expanded", dash)
+
+    first = seat_key(screen, "expand", "t")
+    assert first.returncode != 0, "a marker with no record was acted on"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == "", \
+        "the disproved marker survived being disproved"
+    # With it gone, `z` reads the screen as it is — a dash in the row, to expand.
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") is None, "the second z did not expand the dash"
+
+
 def test_the_top_line_carries_a_clickable_expand(screen):
     """`#[range=…]` is honoured in status-format and nowhere else, which is the
     whole reason a control can live on a status line — and the top line is where
