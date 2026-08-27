@@ -592,6 +592,60 @@ def test_cmd_with_an_empty_string_is_a_screen_of_shells(screen):
     assert not typed.exists() or typed.read_text() == "", typed.read_text()
 
 
+def test_an_initial_command_with_a_newline_in_it_is_refused(screen):
+    """RED/GREEN. `send-keys -l` writes bytes into a pty, and a newline in a pty is
+    Enter — so a value carrying one is not a line that gets typed, it is several
+    commands, and the first runs whatever --staged was asked for.
+
+    Measured before this guard existed: `--staged --cmd $'echo FIRST\necho SECOND'`
+    left `echo FIRST` already executed in the pane with no C-m sent at all. A safety
+    control that silently does not hold is worse than no control.
+    """
+    done = screen("-n", "1", "--staged", "--cmd", "echo FIRST\necho SECOND")
+    assert done.returncode != 0, done.stdout
+    assert "single line" in done.stderr, done.stderr
+    # And nothing was built: the check runs before a session exists.
+    assert screen.tmux("has-session", "-t", "t").returncode != 0
+
+
+def test_a_tab_in_the_initial_command_is_refused_too(screen):
+    """The other control bytes are terminal editing rather than text — a tab is
+    completion in an interactive shell, which is not what the caller typed."""
+    done = screen("-n", "1", "--cmd", "seat-stub\targ")
+    assert done.returncode != 0
+    assert "single line" in done.stderr, done.stderr
+
+
+def test_an_ordinary_initial_command_with_a_prompt_is_not_caught(screen):
+    """The guard must not fire on the shape the setting exists for."""
+    screen("-n", "1", "--cmd", "seat-stub -- /get-involved")
+    assert "args=-- /get-involved" in wait_for_log(screen.log, 1)[0]
+
+
+def test_add_refuses_past_the_seat_ceiling(screen):
+    """The ceiling is a property of the SCREEN, and the check by the argument parser
+    validates what this call was asked to BUILD — for `--add` that is the untouched
+    default and says nothing about the screen being grown. So a screen could be
+    added to indefinitely, past the point where the layout note stops applying."""
+    screen("-n", str(10))                      # MAX_SEATS
+    assert len([n for _, n in panes(screen) if n]) == 10
+    done = screen("--add")
+    assert done.returncode != 0, done.stdout
+    assert "ceiling" in done.stderr, done.stderr
+    assert len([n for _, n in panes(screen) if n]) == 10, "and nothing was added"
+
+
+def test_add_fills_a_hole_even_on_a_full_screen(screen):
+    """The ceiling tests `next` rather than a count, so a screen with a hole in it
+    has room by construction — which is the case that would be wrong if the check
+    counted panes instead."""
+    screen("-n", str(10))
+    victim = next(pid for pid, n in panes(screen) if n == "4")
+    screen.tmux("kill-pane", "-t", victim)
+    assert screen("--add").returncode == 0
+    assert sorted(int(n) for _, n in panes(screen) if n) == list(range(1, 11))
+
+
 def test_cmd_without_a_value_is_refused_rather_than_read_as_empty(screen):
     """A caller bug, and it says so: silently reading a missing value as "bare
     shells" would build a screen that starts nothing and look deliberate."""

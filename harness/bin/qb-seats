@@ -1429,6 +1429,39 @@ start_seat() {
 # `:-` test cannot express, because it reads as "unset" and hands the pane the
 # default instead. That exact bug had a name in the version of this file that
 # forwarded QB_SEAT_BRIEF, and it is worth keeping the spelling that avoided it.
+# ONE LINE, AND THE SCRIPT CHECKS RATHER THAN TRUSTING IT.
+#
+# `type_into` sends the value with `send-keys -l`, which writes the bytes into the
+# pane's pty — and a newline in a pty is Enter. So a value carrying one is not a
+# line that gets typed, it is two commands, and the FIRST of them runs whatever
+# `--staged` was asked for: measured, with no C-m sent at all,
+#
+#     qb-seats --staged --cmd $'echo FIRST\necho SECOND'
+#
+# leaves `echo FIRST` already executed in the pane. `--staged` exists so a layout
+# can be eyeballed before anything starts, so a value that defeats it silently is
+# worse than one refused loudly. Carriage returns do the same thing, and the other
+# control bytes are terminal editing and signals rather than text.
+#
+# This is not a quoting hole — `send-keys` gets one correctly quoted argv, and the
+# value never reaches a shell as code this script composes. It is a contract: the
+# setting is documented as the line typed into a seat, and it has to be one line.
+#
+# It is checked wherever the value is settled rather than at the point of use, so
+# the refusal happens before a session, a pane or an option exists — and it covers
+# the flag, the environment and a hand-set `@qb_initial_cmd` alike.
+initial_cmd_check() {
+  case $INITIAL_CMD in
+    *[[:cntrl:]]*) ;;
+    *) return 0 ;;
+  esac
+  die "the initial command must be a single line, and this one carries a control
+       character (a newline, a tab or worse). It is TYPED into the pane, where a
+       newline is Enter — so it would not be one line typed, it would be several
+       commands run, and the first of them would run even under --staged.
+       Put the extra steps in a script and name that instead."
+}
+
 resolve_initial_cmd() {
   if [ -z "$INITIAL_CMD_SET" ]; then
     if [ -n "${QB_SEAT_INITIAL_CMD+set}" ]; then
@@ -1440,6 +1473,7 @@ resolve_initial_cmd() {
     fi
   fi
   INITIAL_CMD_ASKED=$INITIAL_CMD
+  initial_cmd_check
   return 0
 }
 
@@ -1482,6 +1516,7 @@ inherit_initial_cmd() {
     INITIAL_CMD=$recorded
     INITIAL_CMD_SET=screen
     INITIAL_CMD_ASKED=$recorded
+    initial_cmd_check
     return 0
   fi
   resolve_initial_cmd
@@ -1789,6 +1824,19 @@ if [ "$ACTION" = add ]; then
   next=$(seat_panes_anywhere | awk '{ print $2 + 0 }' | sort -n \
     | awk 'BEGIN { want = 1 } { if ($1 > want) exit; if ($1 == want) want++ }
            END { print want }')
+  # THE CEILING APPLIES TO A SCREEN, NOT TO ONE INVOCATION. The check up by the
+  # argument parsing validates `$SEATS` — what this call was asked to BUILD, which
+  # for `--add` is the untouched default of 3 and says nothing about the screen
+  # being grown. So a screen could be added to indefinitely, past the point where
+  # the layout note stops applying and a pane is too narrow to read an agent in.
+  #
+  # `next` is the right thing to test rather than a count: the allocator hands back
+  # the lowest FREE number, so a screen with a hole in it has room by construction
+  # and a full one is the only case where `next` exceeds the ceiling.
+  [ "$next" -le "$MAX_SEATS" ] \
+    || die "this screen already has $MAX_SEATS seats, which is the ceiling (five
+       across, two down). Past that a pane is too narrow to read an agent in, and a
+       human cannot follow it anyway — close one before adding another."
   # Reflow the seat ROW only: -E spreads the target pane and its neighbours. The
   # board was split off full-width, so even-horizontal on the whole window would
   # fold it back into the row. This is the tmux answer to zellij's
