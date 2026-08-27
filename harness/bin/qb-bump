@@ -997,7 +997,7 @@ def dirty_tracked(flake: Path) -> list[str]:
 
 
 def lock_is_committed(flake: Path) -> str:
-    """``""`` if the consumer's `flake.lock` is what HEAD says, else why that matters.
+    """``""`` if the consumer's `flake.lock` is safe to prepare over, else why it is not.
 
     The preparation builds `HEAD` plus one moved input, and `--apply` writes that
     result over the file in the working tree. If those two locks already differ,
@@ -1007,14 +1007,41 @@ def lock_is_committed(flake: Path) -> str:
     does not build somebody's uncommitted work.
 
     So it stops and says so, which costs a `git commit` or a `git checkout` and is
-    the only outcome that neither loses their change nor builds a tree nobody
-    wrote.
+    the only outcome that neither loses their change nor builds a tree nobody wrote.
+
+    **Except when the uncommitted lock is this tool's OWN handwriting, which is the
+    normal state after a successful run (#537).** `--apply` writes the prepared lock
+    into the consumer and deliberately leaves it *modified* — committing it belongs to
+    whoever owns that repository. Which meant a successful `--apply` created the exact
+    state that refused the next one, and since #533 made `--apply` re-prepare every
+    time, that fired on the second run rather than in some corner: two commands in a
+    row, the second wedged by the first.
+
+    The cache records precisely what was last written (`Proposal.new_lock_sha`), so
+    "somebody's in-flight nixpkgs bump" and "the lock I installed ten minutes ago" are
+    distinguishable rather than both being "not HEAD". When it is ours, preparing over
+    it replaces this tool's own lock with a newer version of it and discards nothing.
+    A lock that has been edited since, one from a cleared cache, one from another
+    machine — none of those match, and all of them still refuse.
     """
     rc, _, _ = run(["git", "-C", str(flake), "diff", "--quiet", "HEAD", "--", "flake.lock"])
     if rc == 0:
         return ""
-    return (f"{flake}/flake.lock has uncommitted changes. This prepares against HEAD, so "
-            "applying the result would discard them — commit or revert that file first")
+    mine = load()
+    if mine is not None and Path(mine.flake) == flake:
+        try:
+            current = (flake / "flake.lock").read_text(encoding="utf-8")
+        except OSError:
+            current = ""
+        if current and sha(current) == mine.new_lock_sha:
+            say(f"{flake}/flake.lock is uncommitted, and is the one this installed "
+                f"({mine.input} -> {mine.new_rev[:12]}) — preparing over it, not "
+                "over anything of yours")
+            say("committing it is still yours to do", indent=True)
+            return ""
+    return (f"{flake}/flake.lock has uncommitted changes that this did not write. It "
+            "prepares against HEAD, so applying the result would discard them — commit "
+            "or revert that file first")
 
 
 def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,

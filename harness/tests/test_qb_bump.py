@@ -91,6 +91,9 @@ def _hermetic(monkeypatch, tmp_path):
     # REAL_REBUILD_WRAPPER and put a wrapper of their own in front of it.
     monkeypatch.setattr(qb, "rebuild_wrapper",
                         lambda *a, **k: (None, "no `rebuild` on PATH", ""))
+    # `main` sets NARRATE once and never puts it back — one process per invocation in
+    # real life, but in a suite a single `--json` run silences every test after it.
+    monkeypatch.setattr(qb, "NARRATE", True)
 
 
 REAL_REBUILD_WRAPPER = qb.rebuild_wrapper
@@ -1704,3 +1707,73 @@ def test_json_is_a_document_and_never_a_document_plus_a_commentary(quarterback_r
     got = capsys.readouterr()
     assert json.loads(got.out)["outcome"] == "current"
     assert got.err == "", "a caller redirecting both streams into a parser gets a surprise"
+
+
+# --------------------------------------------------------------------------- #
+# a successful run must not wedge the next one (#537)
+# --------------------------------------------------------------------------- #
+
+def test_the_lock_this_installed_does_not_block_the_next_run(prepared, consumer_repo,
+                                                             monkeypatch, capsys):
+    """`--apply` writes the prepared lock and leaves it MODIFIED on purpose — committing it
+    belongs to whoever owns that repository. Which meant a successful run created the exact
+    state that refused the next one, and since #533 made `--apply` re-prepare every time,
+    that fired on the second command rather than in some corner."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.apply(prepared, dry_run=False) == 0
+    assert _git(consumer_repo, "status", "--porcelain").split() == ["M", "flake.lock"], \
+        "the premise: a successful apply leaves the lock uncommitted"
+    assert qb.lock_is_committed(consumer_repo) == "", "and the next run is not wedged by it"
+    assert "is the one this installed" in capsys.readouterr().err
+
+
+def test_a_lock_somebody_else_touched_still_refuses(prepared, consumer_repo, monkeypatch):
+    """The refusal's reasoning is untouched: an uncommitted lock is normally a nixpkgs bump
+    somebody was part-way through, and preparing against HEAD would discard it."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.apply(prepared, dry_run=False) == 0
+    (consumer_repo / "flake.lock").write_text(_lock("f" * 40))  # edited since
+    why = qb.lock_is_committed(consumer_repo)
+    assert "did not write" in why
+
+
+def test_an_uncommitted_lock_with_no_proposal_behind_it_still_refuses(consumer_repo):
+    """A cleared cache, another machine, a lock that predates any run here. None of those
+    are this tool's handwriting and none of them may be prepared over."""
+    (consumer_repo / "flake.lock").write_text(_lock("f" * 40))
+    assert qb.load() is None, "the premise: nothing in the cache to compare against"
+    assert "did not write" in qb.lock_is_committed(consumer_repo)
+
+
+def test_a_proposal_for_a_different_consumer_is_not_this_ones_handwriting(prepared,
+                                                                         consumer_repo,
+                                                                         tmp_path,
+                                                                         monkeypatch):
+    """The cached proposal names the flake it was prepared for. A second consumer whose
+    lock happens to be dirty is not covered by it."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.apply(prepared, dry_run=False) == 0
+    other = tmp_path / "other-fleet"
+    other.mkdir()
+    _git(other, "init", "-q", "-b", "main")
+    (other / "flake.lock").write_text(_lock("a" * 40))
+    _commit(other)
+    (other / "flake.lock").write_text((consumer_repo / "flake.lock").read_text())
+    assert "did not write" in qb.lock_is_committed(other)
+
+
+def test_apply_twice_in_a_row_is_the_ordinary_thing_it_looks_like(consumer_repo,
+                                                                  quarterback_repo,
+                                                                  monkeypatch):
+    """End to end, because the wedge was only visible across two invocations: the second
+    `--apply` has to prepare and switch, not refuse on the file the first one wrote."""
+    _whole_job(monkeypatch, consumer_repo)
+    execd: list = []
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: execd.append(argv))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 0
+    assert _git(consumer_repo, "status", "--porcelain").split() == ["M", "flake.lock"]
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 0
+    assert len(execd) == 2, "the second run switched too, rather than refusing"
