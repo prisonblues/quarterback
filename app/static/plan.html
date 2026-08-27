@@ -82,6 +82,21 @@
     border:1px solid var(--line); color:var(--muted); }
   .chip.hold { color:#9fddc7; border-color:#2e5c48; }
   .chip.block { color:#f0b429; border-color:#5c4a1e; }
+  /* A human blocker is a DIFFERENT chip from the dependency one above, not a
+     variant of it: the remedy differs — one waits on work finishing, the other on
+     somebody answering — and #279's line is that five `ui` checks and one
+     `decision` is a different afternoon from six decisions, which is only true if
+     the class is visible. Red rather than amber because it is the one kind of
+     blocked that will not clear on its own. */
+  .chip.human { color:#ff8f6b; border-color:#6b3524; cursor:pointer; }
+  .chip.human.mine { color:#ffd0c0; border-color:#a5533a; background:#3a201a; }
+  .answer { margin:6px 0 2px 0; padding:8px; border:1px solid #6b3524;
+            border-radius:6px; background:#1c1613; }
+  .answer .q { color:#ff8f6b; font-size:12px; margin-bottom:6px; }
+  .answer .detail { color:var(--muted); font-size:11px; white-space:pre-wrap;
+                    margin-bottom:6px; }
+  .answer input { width:100%; box-sizing:border-box; }
+  .answer .row { display:flex; gap:6px; margin-top:6px; align-items:center; }
   .chip.stale { color:#e5484d; border-color:#5c2626; }
   /* What the last reconcile pass found (#463). Amber like the other "somebody has
      to look at this" chips rather than red: the item is not broken, the plan is
@@ -241,6 +256,10 @@ let busy = false;      // a write is in flight — the 20s tick must not read ba
 // untouched by any of it.
 const JUMP = 5;            // "a down 5", in the words this was asked for. Fixed, so it is one tap.
 let openRow = null;        // whose action bar is open — one at a time, and it survives the tick
+//: Which blocker's answer box is open. Separate from `openRow` because a row can
+//: carry several blockers and because answering is a different act from the action
+//: bar's verbs: those move or drop the ROW, this replies to a QUESTION.
+let openBlocker = null;
 let moveIds = [];          // the order render() drew, so a row knows where it sits in it
 let dragging = false;      // a lift is in progress: the 20s tick must not repaint under it
 
@@ -444,6 +463,7 @@ function row(it, s){
   // is a row a drag refuses to pick up, and — just as important — a row nobody
   // else's drag can displace, which is what keeps the order read back off the DOM
   // honest. `data-id` is how that read names the rows.
+  const asked = (it.waiting_on_a_human||[]).find(w => w.blocker_id === openBlocker) || null;
   el.className = "item " + it.state + (held?" claimed":"") + (blocked?" blocked":"")
     + (canMove?" movable":"");
   el.dataset.id = it.item_id;
@@ -519,6 +539,20 @@ function row(it, s){
         ${held?`<span class="chip hold">held by ${who(held.holder)} · expires ${until(held.expires)}</span>`:""}
         ${!held&&it.covered_by?`<span class="chip covered">in ${esc((it.plan&&it.plan.label)||"a plan")} held by ${who(it.covered_by.holder)}</span>`:""}
         ${blocked?`<span class="chip block">waiting on ${it.blocked_by.map(b=>esc(b.ref?("#"+b.ref):b.title)).join(", ")}</span>`:""}
+        ${(it.waiting_on_a_human||[]).map(w=>{
+          // `data-why` as well as `title`, and not only to satisfy the guard: a
+          // tap has to reach the question. It DOES open the answer box below,
+          // which says more — but the box is a write surface and the header note
+          // is a read one, and somebody scanning the list on a phone should not
+          // have to open an editor to find out what is being asked.
+          const why = `${w.question} — ${w["class"]}, raised by ${w.raised_by}`
+            + (w.idle_days!=null?`, ${w.idle_days}d ago`:"")
+            + (w.owner?`, of ${w.owner}`:", of any human");
+          return `<span class="chip human${w.owner&&me&&w.owner===me?" mine":""}"
+            data-blocker="${esc(w.blocker_id)}" data-why="${esc(why)}"
+            title="${esc(why)}">⛔ ${esc(w["class"])} — waiting on ${
+            esc(w.owner?who(w.owner):"a human")}</span>`;
+        }).join("")}
         ${rv(it).exempt?`<span class="chip exempt" data-why="${esc(grantWhy)}"
           title="${esc(grantWhy)}">review exempt</span>`:""}
         ${!rv(it).exempt&&rv(it).requested?`<span class="chip asked" data-why="${
@@ -531,6 +565,20 @@ function row(it, s){
         ${it.stale?`<span class="chip stale">stale ${it.idle_days}d</span>`:""}
         ${it.state!=="open"?`<span class="chip">${esc(it.state)}</span>`:""}
       </div>
+      ${asked?`<div class="answer" role="group" aria-label="answer this blocker">
+        <div class="q">⛔ ${esc(asked["class"])} — ${esc(asked.question)}</div>
+        ${asked.detail?`<div class="detail">${esc(asked.detail)}</div>`:""}
+        <div class="meta">asked by ${who(asked.raised_by)}${
+          asked.idle_days!=null?` · ${asked.idle_days}d ago`:""}${
+          asked.owner?` · of ${who(asked.owner)}`:" · of any human"}</div>
+        <div class="row">
+          <input id="ans-${esc(asked.blocker_id)}" type="text"
+            placeholder="your answer — the next agent reads this, so say the decision, not that you made one"
+            aria-label="the answer">
+          <button data-answer="${esc(asked.blocker_id)}">answer</button>
+          <button data-answer-cancel>cancel</button>
+        </div>
+      </div>`:""}
       ${it.note?`<div class="note">${esc(it.note)}</div>`:""}
       <div class="meta">${esc(scopeLabel(it.repo))}${
         elsewhere?" · ordered there, not here":""} · added by ${who(it.added_by)} · touched ${ago(it.updated)} ago${
@@ -604,7 +652,8 @@ function render(){
   // counts — and the per-row chip explains one row, not the two places a reader looks
   // first.
   countsEl.textContent = `${counts.open||0} open · ${counts.claimed||0} held · ` +
-    `${counts.covered||0} in a held plan · ${counts.blocked||0} waiting · ` +
+    `${counts.covered||0} in a held plan · ${counts.blocked||0} waiting on an item · ` +
+    `${counts.waiting_on_a_human||0} waiting on a human · ` +
     `${counts.stale||0} stale`;
   // `next` walks rank order, so it is exactly as good as the ranks are. The page
   // says so in the same panel rather than somewhere a reader has to go looking:
@@ -743,6 +792,33 @@ listEl.addEventListener("click", async (e)=>{
   // is answered even on a row that cannot be reordered — the drop button is on that
   // bar too, and a row whose ORDER this page may not touch is still a row a person
   // may drop.
+  // A blocker chip opens its answer box, and tapping it again closes it. Before
+  // the grip, because the chip sits inside the row's header and a fall-through
+  // would open the action bar instead — the wrong verb for the thing tapped.
+  const chip = e.target.closest(".chip.human[data-blocker]");
+  if(chip){
+    openBlocker = openBlocker === chip.dataset.blocker ? null : chip.dataset.blocker;
+    render();
+    return;
+  }
+  if(e.target.closest("button[data-answer-cancel]")){ openBlocker = null; render(); return; }
+  const answer = e.target.closest("button[data-answer]");
+  if(answer){
+    const box = document.getElementById("ans-" + answer.dataset.answer);
+    const text = (box && box.value || "").trim();
+    if(!text){
+      // Refused here rather than at the server, because the server's refusal would
+      // be a 422 about a field and this is the one thing the page can say better:
+      // an empty resolution is how "waiting on a human" turns back into a guess.
+      say("an answer is required — it is what the next agent reads, and an empty "
+          + "one leaves the question unanswered while looking answered.");
+      return;
+    }
+    const out = await post("/blockers/resolve",
+                           {blocker_id: answer.dataset.answer, resolution: text});
+    if(out){ openBlocker = null; load(); }
+    return;
+  }
   const grip = e.target.closest("button[data-grip]");
   if(grip){
     openRow = openRow === grip.dataset.id ? null : grip.dataset.id;
@@ -927,12 +1003,19 @@ function eatTheClick(){
 // leaving the refusal to arrive as a bare 403 under a thumb. Same banner, same
 // colours and the same reasoning as fleet.html — one vocabulary for "the verb on
 // this page may not be yours", not two.
+// Set once `loadMe` has an answer, and only for a person. A blocker chip reads it
+// to say "waiting on YOU" rather than "waiting on a human" — and it stays null for
+// an agent on purpose: a chip that claimed unowned work was yours would be the
+// `N waiting on you` count lying, which is the one number on this page somebody
+// acts on without reading further.
+let me = null;
+
 async function loadMe(){
   let r;
   try { r = await fetch("/whoami", {headers:{Accept:"application/json"}}); }
   catch(err){ return; }   // offline: the list read reports the connection
   const body = await r.json().catch(()=>null);
-  if(r.ok && body && body.kind === HUMAN) return;   // a person — nothing to warn about
+  if(r.ok && body && body.kind === HUMAN){ me = body.agent || null; return; }
   let msg;
   if(r.ok && body)
     // Flatly, because here it IS flat: unlike ending a session on your own machine,

@@ -6,6 +6,7 @@ import sys
 from fastapi import FastAPI
 
 from app.api.blobs import router as blobs_router
+from app.api.blockers import router as blockers_router
 from app.api.board_view import router as board_view_router
 from app.api.claims import router as claims_router
 from app.api.dials import router as dials_router
@@ -46,6 +47,7 @@ app.include_router(merge_queue_router)
 app.include_router(board_view_router)
 app.include_router(plan_router)
 app.include_router(landing_router)
+app.include_router(blockers_router)
 app.include_router(dials_router)
 
 

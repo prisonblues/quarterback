@@ -1578,6 +1578,128 @@ def plan_finish(ctx: Context, plan_id: str, note: str | None = None,
 
 
 @mcp.tool()
+def plan_block(ctx: Context, question: str, kind: str = "decision",
+               item_id: str | None = None, issue: int | None = None,
+               pr: int | None = None, owner: str | None = None,
+               detail: str | None = None, repo: str | None = None) -> dict:
+    """Say that something is waiting on a HUMAN, and what you need from them (#328).
+
+    Not `depends_on`, which says *this item waits on that item* and can only point
+    at a plan row. This says *this waits on a person*, names which kind of person's
+    judgement it needs, and carries the question — so somebody can answer it
+    without reconstructing what you were thinking.
+
+    **Raise one rather than guessing, and rather than writing it in a note.** The
+    measurement this exists for: `counts.blocked` read 0 across 20 open items on a
+    plan where three of them carried a blocker as English inside `note` — "RANK IS
+    WRONG AND A HUMAN MUST FIX IT" among them. Countable by nobody, and handed to
+    the next agent that asked. A note is where a judgement goes to be lost.
+
+    **What it costs and what it buys.** It costs a person a glance. It buys: the
+    item stops being `next`, so nobody else picks it up and guesses the same thing
+    you declined to guess; the question is counted, so "how many decisions are
+    owed" is answerable; and the answer, when it comes, is stored where the next
+    agent reads it rather than in a conversation that ended.
+
+    **Also post a `stuck`** addressed to whoever should see it (#274). This is the
+    queue; the post is the doorbell, and they are not alternatives — a queue nobody
+    is told about is the `note` field again with better typing.
+
+    Args:
+        question: one line, required. What you need decided. A blocker that cannot
+            state its question in a sentence is not a blocker yet, it is a feeling
+            about some work.
+        kind: `decision` (which of these, or whether at all) · `taste` (right name,
+            right shape) · `ui` (does it look right on a real screen) ·
+            `environment` (does it work on the box it has to) · `auth` (does the
+            credential path work) · `other` — and `other` wants the specifics in
+            `detail`, because a class that keeps turning up under it with the same
+            reason is how the vocabulary earns a new word.
+        item_id / issue / pr: what is blocked — exactly one. A plan item is the
+            usual one and is what makes `next` skip it; an issue or PR nobody has
+            planned can still be blocked, which is the case `depends_on`
+            structurally cannot express.
+        owner: who you are asking, as a board identity. Omit for "any human" —
+            which is a real answer and not a missing one, and it is the difference
+            between the queue everyone can see and the one somebody's chip claims
+            is theirs.
+        detail: the long half — the options, what each costs, and **what you would
+            do absent an answer**. That last part is what lets a person reply "just
+            do that" in four words.
+
+    Asking the same question twice is one blocker, not two: an identical open
+    question comes back with `raised: false` and the original row.
+    """
+    subject = [(k, v) for k, v in (("item", item_id), ("issue", issue), ("pr", pr))
+               if v is not None]
+    if len(subject) != 1:
+        raise ToolError(
+            "plan_block: name exactly one of item_id, issue or pr — "
+            f"got {len(subject)}. What is blocked has to be one thing, or the "
+            "queue cannot say what answering it would release.")
+    kind_, value = subject[0]
+    body = {"subject_kind": kind_, "subject_value": str(value), "kind": kind,
+            "question": question, "owner": owner, "detail": detail,
+            "repo": _derive_repo(".") if repo is None and kind_ != "item" else repo}
+    try:
+        return _get_client(ctx).blocker_write("", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_block")
+
+
+@mcp.tool()
+def plan_unblock(ctx: Context, blocker_id: str, resolution: str) -> dict:
+    """Record the answer to a blocker — or withdraw one you raised yourself.
+
+    **Which of the two it was is decided by who you are, not by a flag.** A person
+    answering writes the resolution the next agent reads. An agent calling this
+    WITHDRAWS, and only a question it raised itself — withdrawing somebody else's
+    is answering it, which is the act this whole table routes to a human.
+
+    So: use it when you asked something and then found the answer yourself, and say
+    where you found it. Do not use it to record what a person told you in
+    conversation — ask them to answer it, or the record says an agent decided.
+
+    `resolution` is required and is the payload rather than bookkeeping: an unblock
+    with nothing in it is how "waiting on a human" turns quietly back into a guess.
+    A resolved blocker cannot be re-resolved; raise a new one if the answer changes.
+    """
+    try:
+        return _get_client(ctx).blocker_write(
+            "/resolve", {"blocker_id": blocker_id, "resolution": resolution})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_unblock")
+
+
+@mcp.tool()
+def blockers(ctx: Context, repo: str | None = None, owner: str | None = None,
+             kind: str | None = None, include_resolved: bool = False) -> dict:
+    """What is waiting on a human — oldest first, grouped by what kind of answer.
+
+    Read it when you are about to ask a person something (somebody may already
+    have), when you want to know what the fleet is parked on, or with
+    `owner='@me'`-style filtering to see what is yours.
+
+    Oldest first because age is the only signal here nobody has to maintain, and
+    the oldest unanswered question is the one most likely to have been forgotten.
+    `by_class` is split because five `ui` checks and one `decision` is a different
+    afternoon from six decisions.
+
+    `include_resolved` brings back the answers too — which is the point of the row
+    over a label: the resolution is a human's own words about a question somebody
+    already had, and reading it is cheaper than asking again.
+    """
+    params: dict = {"open": "false" if include_resolved else "true"}
+    for key, val in (("repo", repo), ("owner", owner), ("kind", kind)):
+        if val is not None:
+            params[key] = val
+    try:
+        return _get_client(ctx).blockers(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "blockers")
+
+
+@mcp.tool()
 def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
     """Record what an item is waiting on. You may: a dependency is a fact, not an order.
 

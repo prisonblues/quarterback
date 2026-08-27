@@ -479,6 +479,24 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def blockers(self, params: dict) -> dict:
+        """``GET /blockers`` — the queue of questions a human owes an answer to."""
+        resp = self._http.get(self._url("/blockers"), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def blocker_write(self, path: str, body: dict) -> dict:
+        """``POST /blockers`` and ``/blockers/resolve`` (#328).
+
+        Ordinary agent auth. Resolving is NOT a second credential: the endpoint
+        takes `author` and the caller's identity decides whether the call was an
+        answer or a withdrawal, so an agent needs nothing extra to take back its
+        own question and cannot get anything extra by asking.
+        """
+        resp = self._http.post(self._url(f"/blockers{path}"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def plan_verb(self, path: str, body: dict) -> dict:
         """One of the whole-PLAN verbs (claim / release / done).
 
