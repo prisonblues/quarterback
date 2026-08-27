@@ -3550,18 +3550,41 @@ including the `qb-reconcile` whose systemd units had therefore never been instal
 bumped at 10:19, and was stale again by 14:00.
 
 ```bash
-qb-bump                     # stale? prepare the bump, BUILD it, propose it
+qb-bump                     # pull; if stale, prepare the bump, BUILD it, propose it
 qb-bump --json              # the same answer as a document
-qb-bump --apply             # what a PERSON runs: install the prepared lock and switch
-qb-bump --apply --dry-run   # print that command rather than running it
+qb-bump --apply             # the WHOLE job, by a PERSON: pull, bump, build, switch
+qb-bump --apply --dry-run   # all of that except the switch, whose command is printed
+qb-bump --apply --cached    # switch onto the cached proposal; prepare nothing
+qb-bump --no-pull           # compare and build the two trees exactly as they stand
+qb-bump --no-wrapper        # switch with `sudo nixos-rebuild`, not this host's `rebuild`
 
 #   exit 0  nothing to carry — the harness on PATH is this checkout's
 #   exit 1  cannot tell — not in a quarterback checkout, a harness row that is
-#           neither ok nor fail, no qb-doctor, no nix, no consuming flake, or
-#           more than one
-#   exit 2  a bump is prepared and BUILT; one command by a person finishes it
+#           neither ok nor fail, no qb-doctor, no nix, no consuming flake, more
+#           than one, or a checkout that could not be brought level with origin
+#   exit 2  a bump is prepared and BUILT; --apply switches onto it
 #   exit 4  the bump does not build — refused to propose it
 ```
+
+**It pulls before it compares, because a comparison against a stale checkout is worth
+nothing.** The drift verdict answers *"is the harness on PATH the one **this checkout**
+has"*, so a checkout twenty commits behind origin agrees with an installed harness twenty
+commits behind and the answer comes back "nothing to carry" about a box that is nothing of
+the sort. #414 closed this for a checkout that was the wrong *directory*; #533 closes it for
+the right directory at the wrong *commit*. Both trees are brought up to date first — the
+quarterback checkout because it is what the comparison is against, and the consuming flake
+because its HEAD is what gets built.
+
+**The pull is `fetch` plus `merge --ff-only`, and the refusals are the feature.** A tree with
+a local commit or a conflicting edit is *reported*, with the tree exactly as it was found;
+nothing here merges, rebases, resets or stashes, for the same reason the harness refuses
+those outright in a shared tree. A tree with no upstream is not a failure — there is nothing
+to pull it up to, and saying so and stepping over it is what stops every worktree on this
+fleet answering "cannot tell" forever. A fetch that **fails** or a fast-forward that is
+**refused** is the other case: there is a remote and this could not get level with it, so a
+`current` verdict downgrades to `unknown`/1. Having pulled the consuming flake, it also
+*acts* on it: a commit that landed there from another box is a rebuild this machine owes even
+when the harness pin has not moved.
 
 **It does not detect anything.** The drift verdict is `qb-doctor --json --only harness`,
 read and not re-derived. A second comparison here would be a second opinion about a fact
@@ -3573,9 +3596,32 @@ would say.
 
 **The ceiling is `sudo`, and it is designed around rather than fought.** A
 `nixos-rebuild switch` needs root. An agent has no root and should not go looking for it, so
-this stops one step short of it — prepare, build, prove, and hand a person one command. That
-is the ten minutes; the `sudo` is the ten seconds. `--apply` refuses without a terminal, so
-a timer, a CI job or an agent that invokes it changes nothing and prints the command instead.
+the agent path stops one step short of it — pull, prepare, build, prove. That is the ten
+minutes; the `sudo` is the ten seconds. `--apply` refuses without a terminal, so a timer, a
+CI job or an agent that invokes it changes nothing and prints the command instead. What
+`--apply` no longer does is *refuse a stale proposal*: it runs the whole preparation itself
+and switches onto what it has just proven, rather than onto what somebody proved an hour and
+three merges ago. `--apply --cached` is the door back, for a host that lost its network
+between the preparation and the person. It also raises no needs-human escalation — the human
+is holding the keyboard, and #274's door is not a logbook.
+
+**The switch goes through this host's `rebuild` wrapper, because `nixos-rebuild switch`
+lies.** It prints *"Done. The new configuration is …"* even when
+`home-manager-<user>.service` has failed, so `home.file` links, user units and dotfiles do
+not apply and the switch says nothing about it. For `qb-bump` that is not a neighbouring
+subsystem's bug: the harness scripts it exists to deliver arrive through exactly that
+activation, so a bypassed wrapper reports #267's own failure as a success. The wrapper is
+**called, not reimplemented** — the same argument that makes the drift verdict `qb-doctor`'s
+— and only when it can be *shown* to target the flake and attribute that were just built.
+
+It is shown by **reading** the wrapper, never running it: there is no `--print-target` to
+ask, and finding out by executing an arbitrary script on an arbitrary host is a worse trade
+than a read whose worst outcome is falling back to a command that was already correct. The
+text is scanned for flakerefs, and the answer is used only when there is exactly one and it
+is this flake. None, two, or somebody else's all mean *cannot show it*, which means the
+explicit `sudo nixos-rebuild switch --flake` this file resolved itself; `--no-wrapper` asks
+for that outright. `QUARTERBACK_REBUILD_CMD` (environment or site config) is the door for a
+fleet whose wrapper is spelled differently — a declaration is consent and skips the check.
 
 **A proposal that has not been built is a proposal to break somebody's machine.** The first
 bump on 2026-08-22 failed: quarterback's module had started installing
@@ -3669,7 +3715,7 @@ is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
 The proposal is a claim that *one particular system* was built. Every refusal below is the
 same sentence in a different place: what would be switched onto is not what was proven.
 
-- **Nothing prepared** — run `qb-bump` first.
+- **Nothing prepared** — only reachable under `--cached`; drop it and `--apply` prepares one.
 - **No terminal** — the next thing it does is ask for a password, so a timer, a CI job or an
   agent gets the command printed and nothing else.
 - **The consumer's `flake.lock` moved** since the build. Re-preparing costs minutes.
@@ -3704,6 +3750,8 @@ still an escalation.
 stale: behind this checkout: 5 absent (check-db-isolation, qb-admit, qb-release, qb-start,
        +1 more), 5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)
 
+pulled     checkout: 83fe1e7db2c8 -> f03644fd5787 (origin/main)
+pulled     consumer: already level with origin/master
 harness    /nix/store/…-quarterback-harness-0.1.0/bin
 checkout   /home/rich/source/quarterback (the working directory)
 consumer   /home/rich/source/nix-fleet (found by scanning /home/rich/source)
@@ -3714,8 +3762,8 @@ built      desktop: /nix/store/…-nixos-system-zeus-26.05.20260707.0ad6f47
 10 scripts arrive on PATH when a person runs:
   /home/rich/source/quarterback/harness/bin/qb-bump --apply
 
-That writes the prepared flake.lock into the consumer and runs `nixos-rebuild switch`, which
-needs a password; nothing above it did.
+That writes the prepared flake.lock into the consumer and then switches this machine with
+`rebuild switch`, which needs a password; nothing above it did.
 ```
 
 That path rather than the bare name is deliberate and is the normal case: the harness

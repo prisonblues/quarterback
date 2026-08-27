@@ -42,6 +42,8 @@ let
     QUARTERBACK_CONSUMER_FLAKE="${consumer.flake}"
   '' + lib.optionalString (consumer.attr != null) ''
     QUARTERBACK_CONSUMER_ATTR='${consumer.attr}'
+  '' + lib.optionalString (consumer.rebuild != null) ''
+    QUARTERBACK_REBUILD_CMD='${consumer.rebuild}'
   '';
 
   # What `qb-start` compiles in (its SPAWNABLE table). Restated here so a bad
@@ -401,6 +403,28 @@ in
           slow, and can be defeated by a host that does not evaluate here at all.
         '';
       };
+
+      rebuild = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "rebuild switch";
+        description = ''
+          The command `qb-bump --apply` switches this machine with, when it is not
+          `sudo nixos-rebuild switch --flake <consumer>#<attr>`. Emitted as
+          `QUARTERBACK_REBUILD_CMD`.
+
+          Leave it and `qb-bump` looks for a `rebuild` wrapper on PATH and uses it only
+          when it can be SHOWN — by reading the wrapper, not running it — to target the
+          same flake and attribute that were just built. That covers this fleet, whose
+          `rebuild` exists because `nixos-rebuild switch` prints "Done" over a failed
+          `home-manager-<user>.service`, which is precisely how the harness scripts
+          `qb-bump` delivers fail to arrive while the switch reports success.
+
+          Set it on a host whose wrapper is named something else, or is assembled out of
+          shell variables no read can resolve. Doing so is CONSENT: a declared command is
+          used without the target check, because somebody has said what it builds.
+        '';
+      };
     };
   };
 
@@ -416,12 +440,14 @@ in
         (noSingleQuote "board.url" board.url)
         (noSingleQuote "board.agent" board.agent)
         (noSingleQuote "consumer.attr" consumer.attr)
+        (noSingleQuote "consumer.rebuild" consumer.rebuild)
         {
           # The consumer keys ride in the file `board.url` decides to render, so
           # declaring one without the other is a value that silently reaches nothing —
           # and the symptom is `qb-bump` scanning, finding two candidates and refusing,
           # on a host that thought it had said which. Named at eval time instead.
-          assertion = (consumer.flake == null && consumer.attr == null) || wantConfig;
+          assertion = (consumer.flake == null && consumer.attr == null
+            && consumer.rebuild == null) || wantConfig;
           message = ''
             programs.quarterback-harness.consumer is set but board.url is null, so this
             module renders no ~/.config/quarterback/config and the value would reach

@@ -12,6 +12,13 @@
    a second comparison here would be a second opinion about a fact that has one. The
    test for that is behavioural: a stub doctor reporting `ok` has to be believed.
 
+5. **Destroy uncommitted work while catching a tree up.** The pull is `fetch` plus
+   `merge --ff-only` and must never become `rebase`, `reset` or `stash`. A diverged
+   branch and a half-written file both have to come out the other side untouched.
+6. **Switch onto a system nobody built.** The `rebuild` wrapper is used only when it can
+   be SHOWN to target the flake that was just built — and it is read to find that out,
+   never run.
+
 Everything runs with no network, no nix and no board: `nix` and the escalation are
 monkeypatched, and the repositories are real ones built in `tmp_path`. That is
 deliberate rather than convenient — this suite runs inside flake.nix's
@@ -70,8 +77,17 @@ def _hermetic(monkeypatch, tmp_path):
     monkeypatch.setenv("QUARTERBACK_CONFIG", str(tmp_path / "no-such-config"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(qb, "CACHE", tmp_path / "cache" / "quarterback" / "harness-bump")
-    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, "QUARTERBACK_CONSUMER_ROOTS", "QUARTERBACK_REPO"):
+    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, qb.REBUILD_KEY, "QUARTERBACK_CONSUMER_ROOTS",
+                "QUARTERBACK_REPO"):
         monkeypatch.delenv(var, raising=False)
+    # The host running the suite has a real `rebuild` on PATH, and whether it is picked
+    # up would otherwise depend on which machine ran the tests. Stubbed to "there isn't
+    # one" so the fallback is the default everywhere; the wrapper's own tests restore
+    # REAL_REBUILD_WRAPPER and put a wrapper of their own in front of it.
+    monkeypatch.setattr(qb, "rebuild_wrapper", lambda *a, **k: (None, "no `rebuild` on PATH"))
+
+
+REAL_REBUILD_WRAPPER = qb.rebuild_wrapper
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -89,6 +105,58 @@ def _lock(rev: str, owner: str = "prisonblues", repo: str = "quarterback",
              node: {"locked": {"type": "github", "owner": owner, "repo": repo, "rev": rev}}}
     nodes.update(extra or {})
     return json.dumps({"nodes": nodes, "root": "root", "version": 7})
+
+
+def _commit(repo: Path, msg: str = "base") -> str:
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", msg)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _paired(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """``(clone, source)`` — a bare origin with one commit, a clone tracking it, and a
+    second working copy to land things through.
+
+    A real remote on disk rather than a doubled one: `fast_forward` IS `git fetch` plus
+    `git merge --ff-only`, and the whole question these tests ask is what git does with a
+    divergence and with a dirty file. Doubling either call would test the double.
+    """
+    bare = tmp_path / f"{name}.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    source = tmp_path / f"{name}-source"
+    source.mkdir()
+    _git(source, "init", "-q", "-b", "main")
+    _git(source, "remote", "add", "origin", str(bare))
+    (source / "README").write_text("one\n")
+    _commit(source)
+    _git(source, "push", "-q", "-u", "origin", "main")
+    clone = tmp_path / name
+    subprocess.run(["git", "clone", "-q", str(bare), str(clone)], check=True)
+    return clone, source
+
+
+def _land(source: Path, text: str, msg: str) -> str:
+    """Put a commit on the shared origin, the way a peer's push arrives."""
+    (source / "README").write_text(text)
+    rev = _commit(source, msg)
+    _git(source, "push", "-q", "origin", "main")
+    return rev
+
+
+def _wrapper(tmp_path: Path, flake: str, name: str = "rebuild") -> Path:
+    """A `rebuild` in the shape this fleet's is: one literal flakeref assigned into a
+    variable, then several uses that name no directory at all."""
+    binn = tmp_path / "wrapperbin"
+    binn.mkdir(exist_ok=True)
+    script = binn / name
+    script.write_text(
+        "#!/bin/sh\n"
+        f'flake="path:{flake}#${{host}}"\n'
+        'sudo nixos-rebuild "$action" --flake "$flake"\n'
+        'nixos-rebuild "$action" --flake "$flake" --target-host "$target"\n')
+    script.chmod(0o755)
+    return binn
 
 
 @pytest.fixture
@@ -613,10 +681,10 @@ def test_the_module_declares_the_consumer_options():
     where it is, once, in the config file every board client already reads."""
     text = (Path(__file__).resolve().parent.parent / "hm-module.nix").read_text()
     assert "consumer = {" in text, "no `consumer` block in hm-module.nix"
-    for leaf in ("flake", "attr"):
+    for leaf in ("flake", "attr", "rebuild"):
         assert f"{leaf} = lib.mkOption {{" in text.replace("\n", "\n"), \
             f"no `consumer.{leaf}` option in hm-module.nix"
-    for var in (qb.FLAKE_KEY, qb.ATTR_KEY):
+    for var in (qb.FLAKE_KEY, qb.ATTR_KEY, qb.REBUILD_KEY):
         assert var in text, f"{var} is never emitted into the site config"
 
 
@@ -930,3 +998,406 @@ def test_the_environment_beats_the_site_config_for_the_declared_checkout(tmp_pat
     monkeypatch.setenv("QUARTERBACK_REPO", str(quarterback_repo))
     checkout, why = qb.resolve_repo(None, {"QUARTERBACK_REPO": str(tmp_path / "from-the-file")})
     assert why == "" and checkout.path.resolve() == quarterback_repo.resolve()
+
+
+# --------------------------------------------------------------------------- #
+# the pull — a fast-forward, and never anything that can lose work (#533)
+# --------------------------------------------------------------------------- #
+
+def test_a_tree_is_fast_forwarded_onto_what_a_peer_pushed(tmp_path):
+    clone, source = _paired(tmp_path, "repo")
+    landed = _land(source, "two\n", "landed")
+    got = qb.fast_forward(clone)
+    assert got.why == "" and got.blocked is False and got.moved
+    assert got.after == landed
+    assert _git(clone, "rev-parse", "HEAD") == landed
+
+
+def test_a_tree_already_level_with_its_upstream_has_nothing_to_say(tmp_path):
+    clone, _ = _paired(tmp_path, "repo")
+    got = qb.fast_forward(clone)
+    assert got.why == "" and not got.moved and not got.blocked
+
+
+def test_a_tree_with_no_upstream_is_reported_and_is_not_doubt(consumer_repo):
+    """`blocked` is False, and the distinction is the whole point of the field: a worktree
+    tracking nothing cannot be behind anything, so it must not turn every `nothing to
+    carry` on this fleet into `cannot tell`. A signal that fires on every run is ignored."""
+    got = qb.fast_forward(consumer_repo)
+    assert got.why and "nothing to pull it up to" in got.why
+    assert got.blocked is False
+
+
+def test_a_diverged_branch_is_reported_and_never_rebased_or_reset(tmp_path):
+    """The refusal is the feature. Resolving somebody's divergence is not this file's
+    business at any level of confidence, and the commands that would (`pull --rebase`,
+    `reset --hard`) are the ones the harness refuses outright in a shared tree."""
+    clone, source = _paired(tmp_path, "repo")
+    _land(source, "theirs\n", "theirs")
+    (clone / "README").write_text("mine\n")
+    mine = _commit(clone, "mine")
+    got = qb.fast_forward(clone)
+    assert got.blocked and "will not fast-forward" in got.why
+    assert _git(clone, "rev-parse", "HEAD") == mine, "a divergence is the person's to resolve"
+
+
+def test_an_uncommitted_edit_survives_a_pull_that_would_have_overwritten_it(tmp_path):
+    """The file class this fleet has lost five times. `merge --ff-only` refuses rather than
+    clobbering, and nothing here is allowed to answer that refusal with a `checkout --`."""
+    clone, source = _paired(tmp_path, "repo")
+    _land(source, "theirs\n", "theirs")
+    (clone / "README").write_text("half-written\n")
+    got = qb.fast_forward(clone)
+    assert got.blocked
+    assert (clone / "README").read_text() == "half-written\n"
+
+
+def test_a_fetch_that_fails_is_blocked_rather_than_a_traceback(tmp_path):
+    clone, _ = _paired(tmp_path, "repo")
+    _git(clone, "remote", "set-url", "origin", str(tmp_path / "no-such-remote.git"))
+    got = qb.fast_forward(clone)
+    assert got.blocked and "git fetch" in got.why
+
+
+# --------------------------------------------------------------------------- #
+# the pull is BEFORE the comparison, and a pull that failed is not an all-clear
+# --------------------------------------------------------------------------- #
+
+def test_the_pull_happens_before_the_comparison_and_not_after(quarterback_repo, monkeypatch):
+    """Order, not presence. The verdict is *about* the checkout, so pulling afterwards
+    would answer about the tree as it was found — which is the stale-checkout all-clear
+    this closes, with an extra `git fetch` run for nothing."""
+    order: list[str] = []
+
+    def pulled(where, **kw):
+        order.append("pull")
+        return qb.Pulled(path=str(where))
+
+    def compared(*a):
+        order.append("compare")
+        return qb.Drift("ok", "same"), ""
+
+    monkeypatch.setattr(qb, "fast_forward", pulled)
+    monkeypatch.setattr(qb, "harness_drift", compared)
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+    assert order[:2] == ["pull", "compare"]
+
+
+def test_no_pull_touches_neither_tree(quarterback_repo, monkeypatch):
+    monkeypatch.setattr(qb, "fast_forward",
+                        lambda *a, **k: pytest.fail("--no-pull pulled something"))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-pull", "--no-announce"]) == 0
+
+
+def test_a_checkout_that_could_not_get_level_is_not_nothing_to_carry(quarterback_repo,
+                                                                    monkeypatch, capsys):
+    """#414's lesson at a different commit. A checkout that could not be brought up to date
+    agrees with an installed harness that is equally behind, and "nothing to carry" is a
+    positive assertion of health that a person who reads it stops looking after."""
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(
+        path=str(where), why="`git fetch` failed: no route to host", blocked=True))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 1
+    err = capsys.readouterr().err
+    assert "no route to host" in err and "may be behind its upstream" in err
+
+
+def test_a_tree_with_nothing_to_pull_from_still_allows_nothing_to_carry(quarterback_repo,
+                                                                       monkeypatch):
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(
+        path=str(where), why="no upstream branch", blocked=False))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 0
+
+
+def test_a_consumer_that_moved_on_the_pull_is_reason_enough_on_its_own(consumer_repo,
+                                                                      quarterback_repo,
+                                                                      monkeypatch, capsys):
+    """Having pulled the consuming flake, act on it. A commit landed there from another box
+    is a rebuild this machine owes even when the harness pin has not budged, and pulling it
+    in and then printing "nothing to carry" leaves a silently-changed checkout and no
+    follow-through — worse than never having pulled it."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift",
+                        lambda *a: (qb.Drift("ok", "the harness on PATH IS this checkout"), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: (
+        qb.Pulled(path=str(where), upstream="origin/main", before="1" * 40, after="2" * 40)
+        if Path(where) == consumer_repo else qb.Pulled(path=str(where))))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    out = capsys.readouterr().out
+    assert "111111111111 -> 222222222222" in out
+    assert "behind the flake it is built from" in out
+
+
+def test_the_report_says_what_each_pull_did(consumer_repo, quarterback_repo, monkeypatch,
+                                            capsys):
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(
+        path=str(where), upstream="origin/main", before="1" * 40, after="2" * 40))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    out = capsys.readouterr().out
+    assert "pulled     checkout: 111111111111 -> 222222222222" in out
+    assert "pulled     consumer: 111111111111 -> 222222222222" in out
+
+
+def test_a_consumer_pull_that_moved_the_lock_is_re_read_before_it_is_bumped(consumer_repo,
+                                                                           quarterback_repo,
+                                                                           monkeypatch):
+    """The pull moves `flake.lock` too, and with it the rev this bump is FROM. Reporting the
+    pre-pull rev would print a pin transition that never happened."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+
+    def moved(where, **kw):
+        if Path(where) == consumer_repo:
+            (consumer_repo / "flake.lock").write_text(_lock("c" * 40))
+            _commit(consumer_repo, "a lock that arrived with the pull")
+            return qb.Pulled(path=str(where), upstream="origin/main",
+                             before="1" * 40, after="2" * 40)
+        return qb.Pulled(path=str(where))
+
+    monkeypatch.setattr(qb, "fast_forward", moved)
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    assert qb.load().old_rev == "c" * 40, "the bump is FROM what the pull left behind"
+
+
+# --------------------------------------------------------------------------- #
+# the rebuild wrapper — used only when it can be shown to build what was built
+# --------------------------------------------------------------------------- #
+
+def test_the_scan_reads_the_one_flake_a_wrapper_names(tmp_path):
+    """This fleet's `rebuild` in the shape it is actually in: one literal `path:<dir>#$host`
+    assignment, and several later `--flake "$flake"` uses that name no directory."""
+    binn = _wrapper(tmp_path, "/home/rich/source/nix-fleet")
+    found, why = qb.wrapper_targets(binn / "rebuild")
+    assert why == "" and found == {"/home/rich/source/nix-fleet"}
+
+
+def test_the_wrapper_is_used_when_it_builds_the_flake_that_was_just_built(prepared, tmp_path,
+                                                                         monkeypatch):
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, prepared.flake)}{os.pathsep}"
+                               f"{os.environ['PATH']}")
+    cmd, how = qb.switch_command(prepared, {})
+    assert cmd == ["rebuild", "switch"]
+    assert "home-manager" in how, "the report has to say why the wrapper is worth using"
+
+
+def test_a_wrapper_that_builds_another_flake_is_not_this_flakes_wrapper(prepared, tmp_path,
+                                                                       monkeypatch):
+    """Switching onto a system nobody here built is the single outcome this whole file is
+    arranged to prevent, and a wrapper pointed somewhere else does exactly that."""
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, '/somewhere/else')}{os.pathsep}"
+                               f"{os.environ['PATH']}")
+    cmd, how = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "not this flake's wrapper" in how
+
+
+def test_a_wrapper_naming_no_flake_falls_back_rather_than_guessing(prepared, tmp_path,
+                                                                   monkeypatch):
+    binn = tmp_path / "wrapperbin"
+    binn.mkdir()
+    (binn / "rebuild").write_text('#!/bin/sh\nsudo nixos-rebuild switch --flake "$f"\n')
+    (binn / "rebuild").chmod(0o755)
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    cmd, how = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "names no flake directory" in how
+
+
+def test_a_wrapper_with_two_flakes_in_it_cannot_be_shown_to_build_this_one(prepared, tmp_path,
+                                                                          monkeypatch):
+    binn = tmp_path / "wrapperbin"
+    binn.mkdir()
+    (binn / "rebuild").write_text(
+        f'#!/bin/sh\nflake="path:{prepared.flake}#a"\nother="path:/somewhere/else#b"\n')
+    (binn / "rebuild").chmod(0o755)
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    assert qb.switch_command(prepared, {})[0][:2] == ["sudo", "nixos-rebuild"]
+
+
+def test_the_wrapper_is_read_and_never_run(prepared, tmp_path, monkeypatch):
+    """Finding out what a wrapper targets by RUNNING it would mean executing an arbitrary
+    script on an arbitrary host to answer a question about it. The read cannot do anything;
+    its worst outcome is falling back to a command that was already correct."""
+    binn = tmp_path / "wrapperbin"
+    binn.mkdir()
+    marker = tmp_path / "the-wrapper-ran"
+    (binn / "rebuild").write_text(
+        f'#!/bin/sh\ntouch {marker}\nflake="path:{prepared.flake}#desktop"\n')
+    (binn / "rebuild").chmod(0o755)
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    assert qb.switch_command(prepared, {})[0] == ["rebuild", "switch"]
+    assert not marker.exists()
+
+
+def test_a_declared_rebuild_command_is_taken_as_consent(prepared, tmp_path, monkeypatch):
+    """A declaration is somebody saying what their wrapper builds, which is the one input
+    this file is not entitled to argue with — the same door `--flake` and `--repo` are."""
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    binn = _wrapper(tmp_path, "/somewhere/else", name="fleet-rebuild")
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv(qb.REBUILD_KEY, "fleet-rebuild switch --fast")
+    cmd, how = qb.switch_command(prepared, {})
+    assert cmd == ["fleet-rebuild", "switch", "--fast"]
+    assert qb.REBUILD_KEY in how
+
+
+def test_a_declared_command_that_is_not_on_path_falls_back_rather_than_failing(prepared,
+                                                                              monkeypatch):
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv(qb.REBUILD_KEY, "no-such-rebuild switch")
+    cmd, how = qb.switch_command(prepared, {})
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "not on PATH" in how
+
+
+def test_no_wrapper_asks_for_the_explicit_command_without_looking(prepared, monkeypatch):
+    monkeypatch.setattr(qb, "rebuild_wrapper",
+                        lambda *a, **k: pytest.fail("--no-wrapper went looking for one"))
+    cmd, how = qb.switch_command(prepared, {}, wrapper=False)
+    assert cmd[:2] == ["sudo", "nixos-rebuild"]
+    assert "--no-wrapper" in how
+
+
+def test_the_wrapper_and_not_sudo_is_what_gets_execd(prepared, tmp_path, monkeypatch):
+    """`execvp` used to be hard-coded to `sudo`, which would have run the wrapper's argv
+    under the wrong argv[0]. A wrapper is not sudo; it calls sudo itself."""
+    monkeypatch.setattr(qb, "rebuild_wrapper", REAL_REBUILD_WRAPPER)
+    monkeypatch.setenv("PATH", f"{_wrapper(tmp_path, prepared.flake)}{os.pathsep}"
+                               f"{os.environ['PATH']}")
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    execd: list = []
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: execd.append((file, argv)))
+    assert qb.apply(prepared, dry_run=False) == 0
+    assert execd == [("rebuild", ["rebuild", "switch"])]
+
+
+# --------------------------------------------------------------------------- #
+# --apply — one command that does the whole job (#533)
+# --------------------------------------------------------------------------- #
+
+def _whole_job(monkeypatch, consumer_repo, *, drift=None, nix=None):
+    """The doubles every end-to-end `--apply` test needs, and nothing else."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", nix or _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (
+        drift or qb.Drift("fail", "behind: 1 absent (qb-admit)", missing=["qb-admit"]), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+
+
+def test_apply_pulls_bumps_builds_and_switches_in_one_command(consumer_repo, quarterback_repo,
+                                                              monkeypatch):
+    """What #533 is about. `--apply` used to refuse whenever the cached proposal had gone
+    stale, which is the state it is in most times a person reaches for it — the agent
+    prepared it an hour and three merges ago."""
+    _whole_job(monkeypatch, consumer_repo)
+    execd: list = []
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: execd.append(argv))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 0
+    assert (consumer_repo / "flake.lock").read_text() == _lock("b" * 40)
+    assert execd == [["sudo", "nixos-rebuild", "switch", "--flake",
+                      f"{consumer_repo}#desktop"]]
+
+
+def test_apply_switches_onto_what_it_just_proved_with_nothing_in_the_cache(consumer_repo,
+                                                                          quarterback_repo,
+                                                                          monkeypatch):
+    _whole_job(monkeypatch, consumer_repo)
+    assert qb.load() is None, "the premise: there is no proposal to fall back on"
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 0
+    assert qb.load().new_rev == "b" * 40
+
+
+def test_apply_never_switches_onto_a_bump_that_did_not_build(consumer_repo, quarterback_repo,
+                                                             monkeypatch):
+    _whole_job(monkeypatch, consumer_repo,
+               nix=_fake_nix("b" * 40, build_rc=1, build_err="error: conflicting definition"))
+    monkeypatch.setattr(qb.os, "execvp",
+                        lambda *a: pytest.fail("switched onto a build that failed"))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 4
+    assert (consumer_repo / "flake.lock").read_text() == _lock("a" * 40)
+
+
+def test_apply_with_nothing_to_carry_does_not_rebuild_for_the_sake_of_it(consumer_repo,
+                                                                        quarterback_repo,
+                                                                        monkeypatch):
+    _whole_job(monkeypatch, consumer_repo, drift=qb.Drift("ok", "the harness on PATH IS it"))
+    monkeypatch.setattr(qb.os, "execvp", lambda *a: pytest.fail("switched with nothing to do"))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 0
+
+
+def test_apply_does_not_escalate_because_the_person_is_already_at_the_keyboard(
+        consumer_repo, quarterback_repo, monkeypatch):
+    """#274's door is not a logbook. An escalation raised at the exact moment it is being
+    answered is noise on a board somebody else has to read."""
+    _whole_job(monkeypatch, consumer_repo)
+    monkeypatch.setattr(qb, "escalate",
+                        lambda *a, **k: pytest.fail("escalated while a person was applying"))
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: None)
+    assert qb.main(["--repo", str(quarterback_repo), "--apply"]) == 0
+
+
+def test_apply_dry_run_does_everything_except_the_switch(consumer_repo, quarterback_repo,
+                                                         monkeypatch, capsys):
+    """The build is not skipped, and that is deliberate: a dry run of "the whole job" that
+    left out the part most likely to fail would be lying about the job."""
+    _whole_job(monkeypatch, consumer_repo)
+    monkeypatch.setattr(qb.os, "execvp", lambda *a: pytest.fail("a dry run switched"))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--dry-run",
+                    "--no-announce"]) == 0
+    assert (consumer_repo / "flake.lock").read_text() == _lock("a" * 40)
+    assert "sudo nixos-rebuild switch --flake" in capsys.readouterr().out
+
+
+def test_apply_still_refuses_without_a_terminal_however_much_it_now_does(consumer_repo,
+                                                                        quarterback_repo,
+                                                                        monkeypatch, capsys):
+    """The ceiling did not move. A timer, a CI job or an agent that reaches for `--apply`
+    changes nothing, whatever else this command has learned to do."""
+    _whole_job(monkeypatch, consumer_repo)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+    monkeypatch.setattr(qb.os, "execvp", lambda *a: pytest.fail("switched without a tty"))
+    assert qb.main(["--repo", str(quarterback_repo), "--apply", "--no-announce"]) == 3
+    assert (consumer_repo / "flake.lock").read_text() == _lock("a" * 40)
+    assert "needs a terminal" in capsys.readouterr().err
+
+
+def test_cached_applies_what_is_in_the_cache_and_prepares_nothing(prepared, consumer_repo,
+                                                                  monkeypatch):
+    """The door back, for a host that lost its network between the preparation and the
+    person: `nix flake update` cannot run, and a proposal that was already proven is still
+    worth applying."""
+    monkeypatch.setattr(qb, "prepared_bump",
+                        lambda *a: pytest.fail("--cached prepared something"))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    execd: list = []
+    monkeypatch.setattr(qb.os, "execvp", lambda file, argv: execd.append(argv))
+    assert qb.main(["--apply", "--cached"]) == 0
+    assert (consumer_repo / "flake.lock").read_text() == _lock("b" * 40)
+    assert len(execd) == 1
+
+
+def test_cached_without_apply_is_a_typo_and_says_so(capsys):
+    assert qb.main(["--cached"]) == 3
+    assert "about --apply" in capsys.readouterr().err

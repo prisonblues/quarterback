@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """qb-bump — carry a landed harness change onto this machine, as far as sudo allows (#267).
 
-  qb-bump                       stale? prepare the flake bump, BUILD it, propose it
+  qb-bump                       pull; if stale, prepare the flake bump, BUILD it, propose it
   qb-bump --json                the same answer as a document
-  qb-bump --apply               what a PERSON runs: install the prepared lock and switch
-  qb-bump --apply --dry-run     print that command rather than running it
+  qb-bump --apply               the WHOLE job, run by a PERSON: pull, bump, build, switch
+  qb-bump --apply --dry-run     all of that except the switch, whose command is printed
+  qb-bump --apply --cached      switch onto the proposal already in the cache, prepare nothing
+  qb-bump --no-pull             compare against the two trees exactly as they stand
 
   0  nothing to carry — the harness on PATH is this checkout's
   1  cannot tell — not in a quarterback checkout, a harness row that is neither
@@ -71,6 +73,60 @@ repo — and refuses rather than guessing when the scan finds two. The third of
 those is the door a consumer declares itself through
 (`programs.quarterback-harness.consumer.flake`); the fourth is what runs on a
 fleet that has declared nothing, which is every fleet today.
+
+**A comparison against a stale checkout is the false all-clear wearing a different
+hat.** The drift verdict answers "is the harness on PATH the one THIS CHECKOUT
+has", so a checkout twenty commits behind origin agrees with an installed harness
+twenty commits behind, and the answer comes back `current`/0 — "nothing to carry"
+— about a box that is nothing of the sort. #414 closed this hole for a checkout
+that was the wrong DIRECTORY; #533 closes it for a checkout that is the right
+directory at the wrong COMMIT. So both trees are brought up to date before
+anything is compared: the quarterback checkout, because it is what the comparison
+is against, and the consuming flake, because its HEAD is what gets built.
+
+**The pull is a fast-forward and is never allowed to become anything else.**
+`git fetch`, then `git merge --ff-only`. A tree carrying a local commit or a
+conflicting edit is REPORTED, not merged, rebased or reset — nothing here is
+entitled to resolve somebody's divergence, and the commands that would
+(`pull --rebase`, `reset --hard`, `stash`) are the ones that have eaten
+uncommitted work on this fleet five times. A tree with no upstream is not a
+failure; there is simply nothing to pull it up to, and that is said and stepped
+over. A fetch that FAILS or a fast-forward that is REFUSED is a different thing:
+there is a remote and this could not get level with it, so a `current` verdict
+downgrades to `unknown`/1. Not knowing is the honest answer and it is the entire
+reason #414 exists.
+
+**Having pulled the consumer, it acts on the consumer.** A `nix-fleet` commit that
+landed from another box is a rebuild this machine owes even when the harness pin
+has not moved an inch. Pulling that in and then printing "nothing to carry" would
+leave the person with a silently-changed checkout and no follow-through, which is
+worse than never having pulled it. So a consumer that MOVED on the pull is enough
+to prepare and switch on its own, and the report says which of the two reasons it
+is acting on.
+
+**The switch goes through the host's `rebuild` wrapper, because `nixos-rebuild
+switch` lies.** It prints "Done. The new configuration is …" even when
+`home-manager-<user>.service` has failed — so `home.file` links, user units and
+dotfiles silently do not apply, which for this tool means the harness scripts it
+exists to deliver do not arrive and the switch reports that they did. That is not
+a hypothetical failure elsewhere in the system; it is precisely #267's failure,
+reached by a different road. This fleet's `rebuild` exists to surface it. It is
+not reimplemented here — that is the second-detector mistake this file already
+refuses to make about drift — it is CALLED, and only when it can be SHOWN to
+target the same flake and attribute that was just built. Anything short of shown
+falls back to the explicit `sudo nixos-rebuild switch --flake` this file resolved
+itself, which is always correct and merely misses the guard.
+
+**One command, because two is where the job used to stop.** `--apply` refused
+whenever the cached proposal had gone stale, which is the state it is in most
+times a person reaches for it — the agent prepared it an hour and three merges
+ago. So `--apply` now runs the whole preparation itself and switches onto what it
+has just proven rather than onto what somebody proved earlier; nix's own caching
+makes re-proving an unchanged build a matter of seconds. `--cached` is the door
+back to the old behaviour, for a host that has lost its network between the
+preparation and the person. **The agent path is unchanged and still stops at the
+password**: `qb-bump` with no flags never runs `sudo`, and the test that says so
+is the design ceiling, not an assertion about the current code.
 """
 
 from __future__ import annotations
@@ -81,6 +137,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -105,6 +162,11 @@ UPDATE_TIMEOUT = 300
 #: tell, since a false refusal trains a reader to ignore the true one.
 BUILD_TIMEOUT = 3600
 
+#: How long each `git fetch` gets. Short on purpose: a fetch that cannot finish in
+#: two minutes is a network problem, and the honest answer to a network problem is
+#: "this tree could not be brought up to date" rather than a run that hangs.
+FETCH_TIMEOUT = 120
+
 #: How much of a failed build's output is carried into the report and the board
 #: post. The tail, not the head: nix prints the trace last and the "these N
 #: derivations will be built" list first.
@@ -127,6 +189,12 @@ DEFAULT_ROOTS = ("~/source", "~")
 #: writes and `qb-doctor` parses, so a consumer that declares itself does it once.
 FLAKE_KEY = "QUARTERBACK_CONSUMER_FLAKE"
 ATTR_KEY = "QUARTERBACK_CONSUMER_ATTR"
+
+#: The site key naming this host's `nixos-rebuild` wrapper, for a fleet whose
+#: wrapper is not called `rebuild` or cannot be read. Declaring it is consent: a
+#: declared command is used without the target check below, because somebody has
+#: said what it builds and this file is not going to argue with them.
+REBUILD_KEY = "QUARTERBACK_REBUILD_CMD"
 
 #: The needs-human class this escalates under. `environment` from #279's
 #: vocabulary: the decision is not a matter of taste or design, it is that this
@@ -235,7 +303,98 @@ def tail(text: str, lines: int = ERROR_LINES) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 0. the checkout the comparison is ABOUT — resolved, and always named
+# 0. git — both trees brought up to date, by fast-forward and by no other means
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class Pulled:
+    """What happened when one tree was asked to catch up with its upstream."""
+
+    path: str
+    upstream: str = ""
+    before: str = ""
+    after: str = ""
+    #: Empty when the tree is level with its upstream. Otherwise, why it is not.
+    why: str = ""
+    #: True when there WAS an upstream and this could not get level with it — a
+    #: failed fetch, a refused fast-forward. False when `why` merely records that
+    #: there is nothing to pull from, which is not doubt about anything: a tree
+    #: with no upstream cannot be behind one.
+    blocked: bool = False
+
+    @property
+    def moved(self) -> bool:
+        return bool(self.before) and bool(self.after) and self.before != self.after
+
+
+def fast_forward(where: Path, timeout: int = FETCH_TIMEOUT) -> Pulled:
+    """Fetch `where`'s upstream and fast-forward onto it. Never merge, rebase or reset.
+
+    **The whole tool rests on a comparison, and a comparison against a stale tree
+    is worth nothing.** `qb-doctor` answers "is the harness on PATH the one this
+    checkout has"; run against a checkout that is itself behind origin, that
+    question has a true answer and the wrong meaning, and this file turns it into
+    "nothing to carry" — a positive assertion of health about a box several
+    releases behind. So the tree is pulled before it is asked.
+
+    **`--ff-only`, and the refusals are the feature.** A diverged branch, a local
+    commit, a modified file the fast-forward would overwrite: each of those ends
+    here as a sentence, with the tree exactly as it was found. The commands that
+    would resolve them instead — `pull --rebase`, `reset --hard`, `checkout --`,
+    `stash` — are the ones the harness refuses outright in a shared tree, for the
+    reason they are refused there: they destroy uncommitted work, silently, and
+    they have done it on this fleet five times. Deciding what happens to somebody's
+    divergence is not this file's business at any level of confidence.
+
+    A tree with no upstream — a detached HEAD, a branch tracking nothing — is not a
+    failure and must not read as one. There is nothing to pull it up to, which is
+    reported and stepped over with `blocked` left False, because a caller's only
+    use for this is deciding whether it is still entitled to say "nothing to carry".
+    """
+    got = Pulled(path=str(where))
+    rc, upstream, _ = run(["git", "-C", str(where), "rev-parse", "--abbrev-ref",
+                           "--symbolic-full-name", "@{u}"])
+    if rc != 0 or not upstream:
+        got.why = (f"{where} has no upstream branch — a detached HEAD, or a branch that "
+                   "tracks nothing — so there is nothing to pull it up to")
+        return got
+    got.upstream = upstream
+    got.before = head_of(where)
+    rc, _, err = run(["git", "-C", str(where), "fetch", "--quiet"], timeout=timeout)
+    if rc != 0:
+        got.why = f"`git fetch` in {where} failed: {tail(err, 3) or f'exit {rc}'}"
+        got.blocked = True
+        return got
+    rc, _, err = run(["git", "-C", str(where), "merge", "--ff-only", upstream])
+    if rc != 0:
+        got.why = (f"{where} will not fast-forward onto {upstream}: "
+                   f"{tail(err, 3) or f'exit {rc}'}. Nothing was merged, rebased or reset — "
+                   "a diverged branch or a conflicting local edit is a decision, and it is "
+                   "yours to make")
+        got.blocked = True
+        return got
+    got.after = head_of(where)
+    return got
+
+
+def pull_note(got: Pulled | None, what: str) -> str:
+    """One line about `got`, for the report a person reads.
+
+    Labelled `pulled` rather than by which tree it is, because the rows below it are
+    already `checkout` and `consumer` and a report with two differently-meaning rows
+    under one label is a report that gets misread once and distrusted after that.
+    """
+    if got is None:
+        return f"{'pulled':<11}{what}: not pulled (--no-pull)"
+    if got.moved:
+        return f"{'pulled':<11}{what}: {got.before[:12]} -> {got.after[:12]} ({got.upstream})"
+    if got.why:
+        return f"{'pulled':<11}{what}: NOT pulled — {got.why}"
+    return f"{'pulled':<11}{what}: already level with {got.upstream}"
+
+
+# --------------------------------------------------------------------------- #
+# 1. the checkout the comparison is ABOUT — resolved, and always named
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -332,7 +491,7 @@ def resolve_repo(repo_arg: str | None, cfg: dict[str, str]) -> tuple[Checkout | 
 
 
 # --------------------------------------------------------------------------- #
-# 1. the drift — asked of qb-doctor, never worked out here
+# 2. the drift — asked of qb-doctor, never worked out here
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -411,7 +570,7 @@ def harness_drift(repo: Path, script: str) -> tuple[Drift | None, str]:
 
 
 # --------------------------------------------------------------------------- #
-# 2. the consumer — the flake that PINS this repo, which is not this repo
+# 3. the consumer — the flake that PINS this repo, which is not this repo
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -603,7 +762,7 @@ def resolve_consumer(flake_arg: str | None, cfg: dict[str, str],
 
 
 # --------------------------------------------------------------------------- #
-# 3. the attribute — which nixosConfiguration IS this machine
+# 4. the attribute — which nixosConfiguration IS this machine
 # --------------------------------------------------------------------------- #
 
 def host_attrs(flake: Path) -> list[str]:
@@ -664,7 +823,7 @@ def resolve_attr(flake: Path, attr_arg: str | None, cfg: dict[str, str]) -> tupl
 
 
 # --------------------------------------------------------------------------- #
-# 4. preparation — on a copy of HEAD, and never on the consumer's working tree
+# 5. preparation — on a copy of HEAD, and never on the consumer's working tree
 # --------------------------------------------------------------------------- #
 
 @dataclass
@@ -873,7 +1032,7 @@ def invocation(script: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 5. the escalation — through #274's door, in #279's vocabulary
+# 6. the escalation — through #274's door, in #279's vocabulary
 # --------------------------------------------------------------------------- #
 
 def loops_dir(script: str) -> Path | None:
@@ -921,15 +1080,104 @@ def escalate(script: str, *, summary: str, reason: str, detail: str, repo: str,
 
 
 # --------------------------------------------------------------------------- #
-# 6. --apply — the one command, run by the person who has the sudo
+# 7. --apply — the whole job, run by the person who has the sudo
 # --------------------------------------------------------------------------- #
 
-def switch_command(proposal: Proposal) -> list[str]:
-    return ["sudo", "nixos-rebuild", "switch", "--flake",
-            f"{proposal.flake}#{proposal.attr}"]
+def wrapper_targets(script: Path) -> tuple[set[str], str]:
+    """Every flake directory `script` names, read out of its own text.
+
+    **Read rather than run.** A `rebuild` wrapper is a shell script that ends in
+    `nixos-rebuild switch --flake <somewhere>#<attr>` and nothing can ask it which
+    `<somewhere>` — there is no `--print-target`. Finding out by running it under a
+    shimmed `nixos-rebuild` would mean EXECUTING an arbitrary script on an arbitrary
+    host in order to answer a question about it, which is a worse trade than reading
+    it: the read cannot do anything, and its failure mode is falling back to a
+    command that was already correct.
+
+    **Read rather than trust.** The flake this file resolved and built is not
+    necessarily the one a wrapper targets — a host can have several, and switching
+    onto a system nobody here built is the single outcome the whole file is arranged
+    to prevent. So the answer is used only when the scan finds exactly one directory
+    and it is that flake. No match, two matches, or a flakeref assembled out of shell
+    variables this cannot evaluate all mean "cannot show it", and "cannot show it"
+    means the explicit command.
+    """
+    try:
+        text = script.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return set(), f"the `rebuild` on PATH ({script}) cannot be read: {exc}"
+    found = {os.path.realpath(m.group(1)) for m in re.finditer(
+        r"""(?:--flake[= ]|\bflake=)["']?(?:path:)?(/[^\s"'#$]+)""", text)}
+    # And every bare `path:/…` too, whatever variable it is being assigned to. A wrapper
+    # that sets `target="path:/other"` and passes `--flake "$target"` later would slip past
+    # the pattern above, leaving one unrelated `flake=` looking like agreement. This can
+    # only ever widen the set, and a wider set falls back to the explicit command — the
+    # safe direction for a check whose entire job is being sure.
+    found |= {os.path.realpath(m.group(1))
+              for m in re.finditer(r"""\bpath:(/[^\s"'#$]+)""", text)}
+    if not found:
+        return set(), (f"the `rebuild` on PATH ({script}) names no flake directory this can "
+                       "read, so there is no way to show that it builds this one")
+    return found, ""
 
 
-def apply(proposal: Proposal | None, dry_run: bool) -> int:
+def rebuild_wrapper(proposal: Proposal, cfg: dict[str, str]) -> tuple[list[str] | None, str]:
+    """The host's `nixos-rebuild` wrapper, when it can be SHOWN to build what was built.
+
+    ``(argv, why it is being used)`` or ``(None, why it is not)`` — and the second
+    is not an error, it is the ordinary answer on every host that has no wrapper.
+
+    **Why a wrapper at all.** `nixos-rebuild switch` prints "Done. The new
+    configuration is …" even when `home-manager-<user>.service` has failed, so
+    `home.file` links, user units and dotfiles do not apply and the switch says
+    nothing about it. For this file that is not somebody else's bug: the harness
+    scripts it exists to deliver arrive through exactly that activation, so a
+    bypassed wrapper means #267's own failure — a machine that did not get the
+    change — reported as a success. This fleet's `rebuild` surfaces it, and the
+    right response to a guard that already exists is to call it, not to grow a
+    second copy of it here (the same argument that makes the drift verdict
+    `qb-doctor`'s and not this file's).
+    """
+    declared = os.environ.get(REBUILD_KEY) or cfg.get(REBUILD_KEY)
+    if declared:
+        argv = shlex.split(declared)
+        if not argv:
+            return None, f"{REBUILD_KEY} is set to an empty command, so it says nothing"
+        if not shutil.which(argv[0]):
+            return None, f"{REBUILD_KEY} names {argv[0]}, which is not on PATH"
+        return argv, f"{REBUILD_KEY} declares `{' '.join(argv)}`"
+
+    found = shutil.which("rebuild")
+    if not found:
+        return None, "no `rebuild` wrapper on PATH"
+    targets, why = wrapper_targets(Path(os.path.realpath(found)))
+    if why:
+        return None, why
+    want = os.path.realpath(proposal.flake)
+    if targets != {want}:
+        return None, (f"the `rebuild` on PATH builds {', '.join(sorted(targets))}, not "
+                      f"{want} — so it is not this flake's wrapper")
+    return ["rebuild", "switch"], (f"`rebuild` ({found}) builds {want}, and it surfaces a "
+                                   "failed home-manager activation that `nixos-rebuild` "
+                                   "reports as success")
+
+
+def switch_command(proposal: Proposal, cfg: dict[str, str] | None = None,
+                   wrapper: bool = True) -> tuple[list[str], str]:
+    """What switches this machine, and the one line saying why it is that and not the other."""
+    if not wrapper:
+        return (["sudo", "nixos-rebuild", "switch", "--flake",
+                 f"{proposal.flake}#{proposal.attr}"],
+                "--no-wrapper: the explicit command was asked for")
+    argv, why = rebuild_wrapper(proposal, cfg or {})
+    if argv:
+        return argv, why
+    return (["sudo", "nixos-rebuild", "switch", "--flake",
+             f"{proposal.flake}#{proposal.attr}"], why)
+
+
+def apply(proposal: Proposal | None, dry_run: bool, cfg: dict[str, str] | None = None,
+          wrapper: bool = True) -> int:
     """Install the prepared lock into the consumer and hand the terminal to `sudo`.
 
     Every refusal here is about applying something OTHER than what was built. The
@@ -945,7 +1193,8 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
     command instead, which is the correct outcome for every non-human caller.
     """
     if proposal is None:
-        print("qb-bump: no prepared bump to apply — run `qb-bump` first", file=sys.stderr)
+        print("qb-bump: no prepared bump in the cache to apply. Run `qb-bump --apply` "
+              "without --cached and it will prepare one.", file=sys.stderr)
         return 3
     flake = Path(proposal.flake)
     lock = flake / "flake.lock"
@@ -985,10 +1234,11 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
               "was proven is not a build of this tree any more. Re-run `qb-bump`.",
               file=sys.stderr)
         return 3
-    cmd = switch_command(proposal)
+    cmd, how = switch_command(proposal, cfg, wrapper)
     if dry_run:
         print(f"would write {lock} ({proposal.input} -> {proposal.new_rev[:12]})"
               if not already else f"{lock} already carries {proposal.new_rev[:12]}")
+        print(f"then, because {how}:")
         print(" ".join(cmd))
         return 0
     if not sys.stdin.isatty():
@@ -1010,21 +1260,23 @@ def apply(proposal: Proposal | None, dry_run: bool) -> int:
         print(f"note: {len(proposal.dirty)} modified file(s) in {proposal.flake} "
               f"({', '.join(proposal.dirty[:3])}) were NOT part of what was built — the "
               "switch below builds your working tree, so it includes them.")
+    print(f"switching, because {how}:")
     print(" ".join(cmd))
-    os.execvp("sudo", cmd)
+    os.execvp(cmd[0], cmd)
     return 0  # unreachable; execvp does not return
 
 
 # --------------------------------------------------------------------------- #
-# 7. the report
+# 8. the report
 # --------------------------------------------------------------------------- #
 
 def render_proposal(proposal: Proposal, drift: Drift, checkout: Checkout,
-                    consumer: Consumer, announced: str) -> str:
+                    consumer: Consumer, announced: str, pulls: list[str] | None = None,
+                    because: str = "", how: str = "") -> str:
     n = len(drift.missing) + len(drift.differ)
-    lines = [
-        f"stale: {drift.detail}",
-        "",
+    lines = [because or f"stale: {drift.detail}", ""]
+    lines += pulls or []
+    lines += [
         f"harness    {drift.subject or 'the one on PATH'}",
         f"checkout   {checkout.path} ({checkout.found_by})",
         f"consumer   {consumer.flake} ({consumer.found_by})",
@@ -1038,103 +1290,121 @@ def render_proposal(proposal: Proposal, drift: Drift, checkout: Checkout,
     lines += [
         f"built      {proposal.attr}: {proposal.out_path or 'ok'}",
         "",
-        f"{n} script{'s' if n != 1 else ''} arrive on PATH when a person runs:",
+        # `n` is 0 when the reason to act is the consumer having moved rather than the
+        # harness having drifted, and "0 scripts arrive on PATH" is a true sentence that
+        # reads as an argument for doing nothing.
+        (f"{n} script{'s arrive' if n != 1 else ' arrives'} on PATH when a person runs:" if n else
+         "This machine catches up with the flake it is built from when a person runs:"),
         f"  {proposal.prepared_by} --apply",
         "",
-        "That writes the prepared flake.lock into the consumer and runs "
-        "`nixos-rebuild switch`, which needs a password; nothing above it did.",
+        "That writes the prepared flake.lock into the consumer and then switches this "
+        f"machine with `{how or 'nixos-rebuild switch'}`, which needs a password; nothing "
+        "above it did.",
     ]
     if announced:
         lines += ["", announced]
     return "\n".join(lines)
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="qb-bump",
-        description="Carry a landed harness change onto this machine: prepare the consuming "
-                    "flake's bump, build it, and hand a person one command (#267).")
-    parser.add_argument("--repo", metavar="DIR",
-                        help="the quarterback checkout the harness is compared against "
-                             "(default: the cwd's, then $QUARTERBACK_REPO; with neither, "
-                             "this refuses rather than reporting no drift)")
-    parser.add_argument("--flake", metavar="DIR",
-                        help="the consuming flake (default: $" + FLAKE_KEY + ", the site "
-                             "config, then a scan)")
-    parser.add_argument("--host", metavar="ATTR", dest="attr",
-                        help="the nixosConfigurations output that IS this machine "
-                             "(default: matched by hostName)")
-    parser.add_argument("--apply", action="store_true",
-                        help="what a person runs: install the prepared lock and switch")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="with --apply, print what it would do and change nothing")
-    parser.add_argument("--json", action="store_true", dest="as_json",
-                        help="the outcome as a document")
-    parser.add_argument("--no-announce", action="store_true",
-                        help="do not post the escalation to the board")
-    args = parser.parse_args(argv)
+# --------------------------------------------------------------------------- #
+# 9. the run — everything that needs no password, then the one thing that does
+# --------------------------------------------------------------------------- #
 
-    if args.dry_run and not args.apply:
-        print("qb-bump: --dry-run is about --apply; preparing a bump changes nothing on "
-              "this machine anyway, which is the point of it", file=sys.stderr)
-        return 3
-    if args.apply:
-        return apply(load(), args.dry_run)
+def prepared_bump(args, cfg: dict[str, str],
+                  script: str) -> tuple[dict, int, Proposal | None, str | None]:
+    """Pull both trees, compare, move the pin, build it. No `sudo` on any path through here.
 
-    script = __file__
-    cfg = site_config()
+    ``(report, exit code, proposal, rendered text)``. Exit **2 and only exit 2**
+    carries a proposal; every other code is a reason not to switch, and `--apply`
+    propagates it rather than reaching for a password anyway. Splitting this out of
+    `main` is what lets `--apply` be one command: the person's path and the agent's
+    path now run the identical preparation and diverge only at the end of it.
+    """
     out: dict = {"outcome": "", "detail": ""}
 
     checkout, why = resolve_repo(args.repo, cfg)
     if checkout is None:
-        return report(args, {"outcome": "unknown", "detail": why}, 1)
+        return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     repo = checkout.path
     out["repo"] = {"path": str(repo), "found_by": checkout.found_by}
     against = f"compared against {repo} ({checkout.found_by})"
 
+    # Before the comparison, never after it: the verdict is *about* this tree.
+    pulled = None if args.no_pull else fast_forward(repo)
+    pulls: dict = {"checkout": asdict(pulled) if pulled else None}
+    out["pull"] = pulls
+    notes = [pull_note(pulled, "checkout")]
+
     drift, why = harness_drift(repo, script)
     if drift is None:
-        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+        return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     out["drift"] = {"verdict": drift.verdict, "detail": drift.detail,
                     "subject": drift.subject, "missing": drift.missing, "differ": drift.differ}
     installed = f"{drift.subject}, " if drift.subject else ""
-    if drift.current:
-        return report(args, {**out, "outcome": "current",
-                             "detail": f"nothing to carry: {drift.detail} "
-                                       f"({installed}{against})"}, 0)
-    if not drift.stale:
-        return report(args, {**out, "outcome": "unknown",
-                             "detail": f"cannot tell: qb-doctor's harness row is "
-                                       f"{drift.verdict}, not ok — {drift.detail} "
-                                       f"({installed}{against})"}, 1)
+    if not drift.current and not drift.stale:
+        return {**out, "outcome": "unknown",
+                "detail": f"cannot tell: qb-doctor's harness row is {drift.verdict}, not ok "
+                          f"— {drift.detail} ({installed}{against})"}, 1, None, None
 
-    if not have_nix():
-        return report(args, {**out, "outcome": "unknown",
-                             "detail": "no nix on this host, and a flake bump is the only "
-                                       "thing this knows how to prepare"}, 1)
-    slug = repo_slug(repo)
+    # The consumer is resolved for BOTH verdicts, because pulling it can itself be
+    # the reason to act: a flake commit landed from another box is a rebuild this
+    # machine owes whether or not the harness pin moved. Its refusals are still
+    # only *reported* on the path that needs one, in the order they were reported
+    # before — a host with no nix must hear about the nix, not about a consumer.
+    nix_here, slug = have_nix(), repo_slug(repo)
+    consumer: Consumer | None = None
+    consumer_why = ""
+    consumer_pull: Pulled | None = None
+    if nix_here and slug:
+        consumer, consumer_why = resolve_consumer(args.flake, cfg, slug)
+        if consumer is not None and not args.no_pull:
+            consumer_pull = fast_forward(consumer.flake)
+            pulls["consumer"] = asdict(consumer_pull)
+            notes.append(pull_note(consumer_pull, "consumer"))
+            if consumer_pull.moved:
+                # The pull moves `flake.lock` too, and with it the rev this bump
+                # is FROM. Re-read it rather than report the one from before.
+                consumer, consumer_why = resolve_consumer(args.flake, cfg, slug)
+
+    because = ""
+    if drift.current:
+        if pulled is not None and pulled.blocked:
+            return {**out, "outcome": "unknown",
+                    "detail": f"cannot tell: {pulled.why} — so 'nothing to carry' would be a "
+                              f"claim about a checkout that may be behind its upstream "
+                              f"({installed}{against})"}, 1, None, None
+        if consumer_pull is None or not consumer_pull.moved:
+            return {**out, "outcome": "current",
+                    "detail": f"nothing to carry: {drift.detail} "
+                              f"({installed}{against})"}, 0, None, None
+        because = (f"the harness on PATH is this checkout's, but {consumer_pull.path} moved "
+                   f"{consumer_pull.before[:12]} -> {consumer_pull.after[:12]} on the pull, "
+                   "so this machine is behind the flake it is built from")
+
+    if not nix_here:
+        return {**out, "outcome": "unknown",
+                "detail": "no nix on this host, and a flake bump is the only thing this "
+                          "knows how to prepare"}, 1, None, None
     if not slug:
-        return report(args, {**out, "outcome": "unknown",
-                             "detail": f"{repo} has no origin remote, so nothing here knows "
-                                       "which repository a consumer would be pinning"}, 1)
-    consumer, why = resolve_consumer(args.flake, cfg, slug)
+        return {**out, "outcome": "unknown",
+                "detail": f"{repo} has no origin remote, so nothing here knows which "
+                          "repository a consumer would be pinning"}, 1, None, None
     if consumer is None:
-        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+        return {**out, "outcome": "unknown", "detail": consumer_why}, 1, None, None
     out["consumer"] = {"flake": str(consumer.flake), "input": consumer.input,
                        "found_by": consumer.found_by}
 
     why = lock_is_committed(consumer.flake)
     if why:
-        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+        return {**out, "outcome": "unknown", "detail": why}, 1, None, None
 
     attr, why = resolve_attr(consumer.flake, args.attr, cfg)
     if not attr:
-        return report(args, {**out, "outcome": "unknown", "detail": why}, 1)
+        return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     out["attr"] = attr
 
     proposal, log, why = prepare(consumer, attr, script, drift)
     if proposal is None:
-        detail = why
         announced = "" if args.no_announce else escalate(
             script,
             summary=f"the flake bump for {consumer.flake.name} does not build — "
@@ -1145,13 +1415,19 @@ def main(argv: list[str] | None = None) -> int:
             detail=f"{why}\n\n{tail(log)}", repo=slug,
             key_parts=["qb-bump", "build-failed", str(consumer.flake), attr,
                        sha(tail(log, 5))])
-        text = "\n".join([detail, "", tail(log)] + ([announced] if announced else []))
-        return report(args, {**out, "outcome": "refused", "detail": detail,
-                             "log": tail(log), "announced": announced}, 4, text=text)
+        text = "\n".join([why, "", tail(log)] + ([announced] if announced else []))
+        return ({**out, "outcome": "refused", "detail": why, "log": tail(log),
+                 "announced": announced}, 4, None, text)
+
+    cmd, how = switch_command(proposal, cfg, not args.no_wrapper)
+    out["switch"] = {"command": cmd, "how": how}
 
     me = socket.gethostname().split(".", 1)[0]
     n = len(drift.missing) + len(drift.differ)
-    announced = "" if args.no_announce else escalate(
+    # No "a human must do this" under --apply: the human is holding the keyboard.
+    # An escalation raised at the moment it is being answered is noise on a board
+    # somebody else has to read, and #274's door is not a logbook.
+    announced = "" if (args.no_announce or args.apply) else escalate(
         script,
         summary=(f"{n} harness scripts are not on {me}: a built bump is waiting"
                  if proposal.moved else
@@ -1172,8 +1448,66 @@ def main(argv: list[str] | None = None) -> int:
     out.update({"outcome": "prepared", "proposal": asdict(proposal), "announced": announced,
                 "detail": f"a bump to {proposal.new_rev[:12]} is built and waiting for "
                           f"`{proposal.prepared_by} --apply`"})
-    return report(args, out, 2,
-                  text=render_proposal(proposal, drift, checkout, consumer, announced))
+    return (out, 2, proposal,
+            render_proposal(proposal, drift, checkout, consumer, announced, pulls=notes,
+                            because=because, how=" ".join(cmd)))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="qb-bump",
+        description="Carry a landed harness change onto this machine: pull, bump the "
+                    "consuming flake, build it, and — with --apply — switch onto it (#267).")
+    parser.add_argument("--repo", metavar="DIR",
+                        help="the quarterback checkout the harness is compared against "
+                             "(default: the cwd's, then $QUARTERBACK_REPO; with neither, "
+                             "this refuses rather than reporting no drift)")
+    parser.add_argument("--flake", metavar="DIR",
+                        help="the consuming flake (default: $" + FLAKE_KEY + ", the site "
+                             "config, then a scan)")
+    parser.add_argument("--host", metavar="ATTR", dest="attr",
+                        help="the nixosConfigurations output that IS this machine "
+                             "(default: matched by hostName)")
+    parser.add_argument("--apply", action="store_true",
+                        help="the whole job, run by a person: pull, bump, build and switch")
+    parser.add_argument("--cached", action="store_true",
+                        help="with --apply, switch onto the proposal already in the cache "
+                             "and prepare nothing (for a host that has lost its network)")
+    parser.add_argument("--no-pull", action="store_true",
+                        help="compare and build the two trees exactly as they stand")
+    parser.add_argument("--no-wrapper", action="store_true",
+                        help="switch with `sudo nixos-rebuild` rather than this host's "
+                             "`rebuild` wrapper")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --apply, do everything but the switch and print its "
+                             "command")
+    parser.add_argument("--json", action="store_true", dest="as_json",
+                        help="the outcome as a document")
+    parser.add_argument("--no-announce", action="store_true",
+                        help="do not post the escalation to the board")
+    args = parser.parse_args(argv)
+
+    if args.dry_run and not args.apply:
+        print("qb-bump: --dry-run is about --apply; preparing a bump changes nothing on "
+              "this machine anyway, which is the point of it", file=sys.stderr)
+        return 3
+    if args.cached and not args.apply:
+        print("qb-bump: --cached is about --apply; there is nothing else it could mean",
+              file=sys.stderr)
+        return 3
+
+    script = __file__
+    cfg = site_config()
+
+    if args.cached:
+        return apply(load(), args.dry_run, cfg=cfg, wrapper=not args.no_wrapper)
+
+    out, code, proposal, text = prepared_bump(args, cfg, script)
+    if not args.apply or code != 2:
+        return report(args, out, code, text=text)
+    print(text)
+    print("")
+    return apply(proposal, args.dry_run, cfg=cfg, wrapper=not args.no_wrapper)
 
 
 def report(args, out: dict, code: int, text: str | None = None) -> int:
