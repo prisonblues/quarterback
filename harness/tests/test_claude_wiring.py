@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -1049,10 +1050,69 @@ def test_qb_mcp_exports_the_agent_name_the_server_interpolates(tmp_path):
                           env=env, timeout=60)
     assert done.returncode == 0, f"qb-mcp exited {done.returncode}: {done.stderr}"
 
-    host = subprocess.run(["hostname", "-s"], capture_output=True, text=True).stdout.strip()
+    # `platform.node()`, never a `hostname` subprocess: the nix check sandbox has no
+    # such binary, and a test that shells out to one fails on its environment rather
+    # than on its assertion — which is what this test exists to stop happening to the
+    # SCRIPT. Split on the dot for the same reason qb-env does.
+    host = platform.node().split(".")[0]
     assert f"AGENT={host}" in done.stdout, (
         "qb-mcp did not export QUARTERBACK_AGENT into the server's environment; "
         f"got: {done.stdout!r}")
     assert f"RESOLVED=quarterback-{host}/elevated" in done.stdout, (
         "the credential reference resolved with an empty agent name — this is the "
         f"`quarterback-/elevated` failure. Got: {done.stdout!r}")
+
+
+def test_qb_env_resolves_an_agent_name_without_a_hostname_binary(tmp_path):
+    """`qb_load_config` must name this machine on a box with no `hostname` on PATH.
+
+    The old fallback could not do what it looked like it did — `hostname -s 2>/dev/null
+    || hostname` calls the SAME binary twice, so the `||` covered a failing `hostname`
+    and never an absent one. Absent, it expanded to empty, and an empty agent name is
+    refused by nothing: it becomes `quarterback-` in every `op://` reference built from
+    it (#556), and the failure surfaces a layer away as "this host has no delegated
+    credential".
+
+    A nix check sandbox is exactly that box, which is how this was found — a test that
+    shelled out to `hostname` failed on its environment rather than its assertion.
+    """
+    # A PATH holding only what the fallbacks legitimately need. `hostname` is excluded by
+    # construction rather than by hiding it: a stub that exits non-zero would exercise the
+    # arm the old code already had, not the one that was missing.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("uname", "cat", "sh", "hostname"):
+        found = shutil.which(tool)
+        if found and tool != "hostname":
+            (bin_dir / tool).symlink_to(found)
+    assert (bin_dir / "uname").exists(), "no uname to fall back to — the test proves nothing"
+    assert not (bin_dir / "hostname").exists()
+
+    probe = (
+        f'. "{BIN / "qb-env"}"; qb_load_config; printf "%s" "$QUARTERBACK_AGENT"'
+    )
+    # bash by absolute path: PATH below is the SCRIPT's world, deliberately thin, and
+    # resolving the interpreter through it would fail for a reason unrelated to the test.
+    bash = shutil.which("bash")
+    assert bash, "no bash to run qb-env with"
+    done = subprocess.run([bash, "-c", probe], capture_output=True, text=True,
+                          env={"PATH": str(bin_dir), "HOME": str(tmp_path),
+                               "QUARTERBACK_CONFIG": str(tmp_path / "no-such-config")},
+                          timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip(), (
+        "qb_load_config produced an EMPTY agent name with no `hostname` on PATH — every "
+        f"op:// reference built from it becomes `quarterback-`. stderr: {done.stderr!r}")
+    assert done.stdout.strip() == platform.node().split(".")[0]
+
+
+def test_qb_env_leaves_an_explicitly_set_agent_name_alone():
+    """The dot-stripping is for a `uname -n` that carried a domain, not for a name somebody
+    typed. An operator naming a machine is making a decision; this function guessing one is
+    not, and only the guess should be normalised."""
+    probe = f'. "{BIN / "qb-env"}"; qb_load_config; printf "%s" "$QUARTERBACK_AGENT"'
+    done = subprocess.run(["bash", "-c", probe], capture_output=True, text=True,
+                          env={**os.environ, "QUARTERBACK_AGENT": "box.example.com",
+                               "QUARTERBACK_CONFIG": "/nonexistent"}, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "box.example.com"
