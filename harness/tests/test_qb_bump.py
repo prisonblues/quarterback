@@ -37,6 +37,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -1613,3 +1614,93 @@ def test_a_pull_that_moved_the_consumer_re_reads_that_tree_and_does_not_rescan(
     assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
     assert len(scans) == 1, "discovery runs once; the re-read is of the path it found"
     assert qb.load().flake == str(consumer_repo)
+
+
+# --------------------------------------------------------------------------- #
+# it says what it is doing — a blank terminal is indistinguishable from a hang
+# --------------------------------------------------------------------------- #
+
+def test_each_slow_step_says_what_it_is_before_it_starts(consumer_repo, quarterback_repo,
+                                                         monkeypatch, capsys):
+    """Two fetches, a `qb-doctor`, a scan, a `nix flake update` and a whole NixOS build ran
+    without printing one word until the last of them finished. Several minutes of a cursor
+    and no output is indistinguishable from a hang, and the first thing anybody does with a
+    hang is Ctrl-C it — which here means killing a build that was nearly done."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift",
+                        lambda *a: (qb.Drift("fail", "behind: 1 absent (qb-admit)",
+                                             missing=["qb-admit"]), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    said = capsys.readouterr().err
+    for step in ("asking qb-doctor", "looking for the flake that pins",
+                 "which nixosConfiguration this machine is", "updating the",
+                 "building nixosConfigurations.desktop"):
+        assert step in said, f"nothing said before {step!r}"
+
+
+def test_the_build_is_followable_while_it_runs(consumer_repo, quarterback_repo, monkeypatch,
+                                               capsys):
+    """The forty-minute step. `run` hands both streams over when the process ends, so a
+    build that compiles is forty minutes of nothing followed by everything; nix's output is
+    written to the log AS IT HAPPENS, and the line above it says where."""
+    monkeypatch.setenv("QUARTERBACK_CONSUMER_ROOTS", str(consumer_repo.parent))
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("fail", "behind"), ""))
+    monkeypatch.setattr(qb, "resolve_attr", lambda *a: ("desktop", ""))
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    assert qb.main(["--repo", str(quarterback_repo), "--no-announce"]) == 2
+    assert f"tail -f {qb.CACHE / 'build.log'}" in capsys.readouterr().err
+
+
+def test_nix_writes_the_build_log_while_it_is_still_running(tmp_path, monkeypatch):
+    """A real subprocess, because the point is timing: the log has to be on disk and
+    growing WHILE the command runs, or `tail -f` on it is a file that turns up once there
+    is nothing left to follow.
+
+    The `nix` here is a shell script on PATH — there is no nix inside `worktree-tests`,
+    and a test that skipped there would be green about the thing it exists to check."""
+    log = tmp_path / "deep" / "build.log"
+    binn = tmp_path / "nixbin"
+    binn.mkdir()
+    (binn / "nix").write_text("#!/bin/sh\necho 'building …' >&2\ncat \"$QB_WAIT\" "
+                              ">/dev/null\necho '/nix/store/out'\n")
+    (binn / "nix").chmod(0o755)
+    gate = tmp_path / "gate"
+    monkeypatch.setenv("PATH", f"{binn}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("QB_WAIT", str(gate))
+
+    mid: list = []
+    real_popen = qb.subprocess.Popen
+
+    def watching(argv, **kw):
+        proc = real_popen(argv, **kw)
+        # The child is blocked on a file that does not exist yet only in spirit; what
+        # matters is that we look at the log before `communicate` reaps the process.
+        for _ in range(200):
+            if log.exists() and log.read_text():
+                break
+            time.sleep(0.01)
+        mid.append(log.read_text() if log.exists() else "")
+        gate.write_text("go\n")
+        return proc
+
+    monkeypatch.setattr(qb.subprocess, "Popen", watching)
+    rc, out, err = qb.nix("build", log=log)
+    assert rc == 0 and out == "/nix/store/out"
+    assert "building" in mid[0], "the log was empty until the process ended"
+    assert "building" in err, "and it is still readable afterwards, for the refusal"
+
+
+def test_json_is_a_document_and_never_a_document_plus_a_commentary(quarterback_repo,
+                                                                   monkeypatch, capsys):
+    monkeypatch.setattr(qb, "fast_forward", lambda where, **kw: qb.Pulled(path=str(where)))
+    monkeypatch.setattr(qb, "harness_drift", lambda *a: (qb.Drift("ok", "same"), ""))
+    assert qb.main(["--repo", str(quarterback_repo), "--json", "--no-announce"]) == 0
+    got = capsys.readouterr()
+    assert json.loads(got.out)["outcome"] == "current"
+    assert got.err == "", "a caller redirecting both streams into a parser gets a surprise"

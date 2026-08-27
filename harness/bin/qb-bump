@@ -237,7 +237,39 @@ def run(argv: list[str], cwd: str | None = None, timeout: int = 60,
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
-def nix(*args: str, timeout: int = 60, cwd: str | None = None) -> tuple[int, str, str]:
+#: Whether this run narrates what it is doing. Off under `--json`, whose caller
+#: wants a document rather than a commentary. A module global rather than a flag
+#: threaded through six functions that would each carry it only to hand it on.
+NARRATE = True
+
+
+def say(line: str, *, indent: bool = False) -> None:
+    """One line about what is happening NOW, on stderr, flushed.
+
+    **A blank terminal is a bug report waiting to happen.** This command fetches two
+    remotes, shells out to `qb-doctor`, scans for a consuming flake, runs `nix flake
+    update` and then builds a whole NixOS system — and until #533 it printed nothing at
+    all until the last of those finished. A person who runs it sees a cursor and no
+    output for several minutes, which is indistinguishable from a hang, and the first
+    thing anybody does with a hang is Ctrl-C it. So each slow step says what it is
+    before it starts, and what it found after.
+
+    stderr rather than stdout, because stdout is the report — under `--json` it is a
+    document, and a narration interleaved into it would be a parse error rather than a
+    nuisance.
+    """
+    if NARRATE:
+        print(f"qb-bump: {'  ' if indent else ''}{line}", file=sys.stderr, flush=True)
+
+
+def took(since: float) -> str:
+    """`47s` / `3m12s` — how long a step that was worth narrating actually took."""
+    secs = int(time.monotonic() - since)
+    return f"{secs}s" if secs < 60 else f"{secs // 60}m{secs % 60:02d}s"
+
+
+def nix(*args: str, timeout: int = 60, cwd: str | None = None,
+        log: Path | None = None) -> tuple[int, str, str]:
     """`nix` with the two experimental features this file needs, asked for explicitly.
 
     `--extra-experimental-features` rather than relying on the host's `nix.conf`:
@@ -245,8 +277,35 @@ def nix(*args: str, timeout: int = 60, cwd: str | None = None) -> tuple[int, str
     Nix feature 'nix-command' is disabled" is a refusal that has nothing to do
     with the question being asked.
     """
-    return run(["nix", "--extra-experimental-features", "nix-command flakes", *args],
-               timeout=timeout, cwd=cwd)
+    argv = ["nix", "--extra-experimental-features", "nix-command flakes", *args]
+    if log is None:
+        return run(argv, timeout=timeout, cwd=cwd)
+
+    # **Streamed rather than captured, for the one call that takes minutes.** `run`
+    # hands both streams over when the process ends, which for a build that compiles is
+    # forty minutes of nothing followed by everything. Written to `log` as nix produces
+    # it, so `tail -f` on that file works WHILE the build runs — and it is the same file
+    # the refusal keeps afterwards, so this costs a redirection rather than a mechanism.
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("w", encoding="utf-8") as sink:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=sink,
+                                    text=True, cwd=cwd)
+            try:
+                out, _ = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return 124, "", f"nix: timed out after {timeout}s"
+    except FileNotFoundError:
+        return 127, "", "nix: not found"
+    except OSError as exc:
+        return 127, "", f"nix: {exc}"
+    try:
+        err = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        err = ""
+    return proc.returncode, (out or "").strip(), err
 
 
 def have_nix() -> bool:
@@ -394,6 +453,7 @@ def fast_forward(where: Path, timeout: int = FETCH_TIMEOUT) -> Pulled:
         return got
     got.upstream = upstream
     got.before = head_of(where)
+    say(f"fetching {where} ({upstream}) …")
     rc, _, err = run(["git", "-C", str(where), "fetch", "--quiet"], timeout=timeout)
     if rc != 0:
         got.why = f"`git fetch` in {where} failed: {tail(err, 3) or f'exit {rc}'}"
@@ -985,6 +1045,8 @@ def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
         why = export_head(consumer.flake, tmp)
         if why:
             return None, "", why
+        say(f"updating the {consumer.input!r} input, on a copy of {consumer.flake.name}'s "
+            "HEAD …")
         rc, out, err = nix("flake", "update", consumer.input, "--flake", f"path:{tmp}",
                            timeout=UPDATE_TIMEOUT)
         if rc != 0:
@@ -994,10 +1056,16 @@ def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
             new_rev = str(json.loads(new_lock)["nodes"][consumer.node]["locked"]["rev"])
         except (ValueError, KeyError, TypeError):
             return None, "", "the updated lock has no rev for the input that was updated"
+        say(f"pin {consumer.rev[:12]} -> {new_rev[:12]}", indent=True)
+        say(f"building nixosConfigurations.{attr} — the slow part. Follow it with:")
+        say(f"tail -f {CACHE / 'build.log'}", indent=True)
+        started = time.monotonic()
         rc, out, err = nix("build", f"path:{tmp}#nixosConfigurations.{attr}"
                                     ".config.system.build.toplevel",
-                           "--no-link", "--print-out-paths", timeout=BUILD_TIMEOUT)
+                           "--no-link", "--print-out-paths", timeout=BUILD_TIMEOUT,
+                           log=CACHE / "build.log")
         log = err or out
+        say(f"{'built' if rc == 0 else 'FAILED'} in {took(started)}", indent=True)
         if rc != 0:
             save_refusal(new_rev, log)
             return None, log, (f"the bumped flake does not build "
@@ -1441,17 +1509,22 @@ def prepared_bump(args, cfg: dict[str, str],
     against = f"compared against {repo} ({checkout.found_by})"
 
     # Before the comparison, never after it: the verdict is *about* this tree.
+    say(f"checkout: {repo} ({checkout.found_by})")
     pulled = None if args.no_pull else fast_forward(repo)
     pulls: dict = {"checkout": asdict(pulled) if pulled else None}
     out["pull"] = pulls
     notes = [pull_note(pulled, "checkout")]
+    say(notes[0].split(":", 1)[1].strip() if pulled else "not pulled (--no-pull)",
+        indent=True)
 
+    say("asking qb-doctor whether the harness on PATH is this checkout's …")
     drift, why = harness_drift(repo, script)
     if drift is None:
         return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     out["drift"] = {"verdict": drift.verdict, "detail": drift.detail,
                     "subject": drift.subject, "missing": drift.missing, "differ": drift.differ}
     installed = f"{drift.subject}, " if drift.subject else ""
+    say(f"{drift.verdict} — {drift.detail}", indent=True)
     if not drift.current and not drift.stale:
         return {**out, "outcome": "unknown",
                 "detail": f"cannot tell: qb-doctor's harness row is {drift.verdict}, not ok "
@@ -1467,11 +1540,15 @@ def prepared_bump(args, cfg: dict[str, str],
     consumer_why = ""
     consumer_pull: Pulled | None = None
     if nix_here and slug:
+        say(f"looking for the flake that pins {slug} …")
         consumer, consumer_why = resolve_consumer(args.flake, cfg, slug)
+        say(f"{consumer.flake} ({consumer.found_by})" if consumer else consumer_why,
+            indent=True)
         if consumer is not None and not args.no_pull:
             consumer_pull = fast_forward(consumer.flake)
             pulls["consumer"] = asdict(consumer_pull)
             notes.append(pull_note(consumer_pull, "consumer"))
+            say(notes[-1].split(":", 1)[1].strip(), indent=True)
             if consumer_pull.moved:
                 # The pull moves `flake.lock` too, and with it the rev this bump is
                 # FROM. Re-read THAT path — not `resolve_consumer` again: rerunning
@@ -1542,10 +1619,12 @@ def prepared_bump(args, cfg: dict[str, str],
     if why:
         return {**out, "outcome": "unknown", "detail": why}, 1, None, None
 
+    say("working out which nixosConfiguration this machine is …")
     attr, why = resolve_attr(consumer.flake, args.attr, cfg)
     if not attr:
         return {**out, "outcome": "unknown", "detail": why}, 1, None, None
     out["attr"] = attr
+    say(f"{attr} ({'named by --host' if args.attr else 'matched by hostName'})", indent=True)
 
     proposal, log, why = prepare(consumer, attr, script, drift,
                                  attr_named=bool(args.attr))
@@ -1643,6 +1722,11 @@ def main(argv: list[str] | None = None) -> int:
 
     script = __file__
     cfg = site_config()
+    # `--json` promises a document. Everything `say` writes goes to stderr and would
+    # not corrupt it, but a caller redirecting both streams into a parser is a normal
+    # thing to do and would get a surprise, so the narration is simply off there.
+    global NARRATE  # one flag, set once here, read everywhere
+    NARRATE = not args.as_json
 
     if args.cached:
         return apply(load(), args.dry_run, cfg=cfg, wrapper=not args.no_wrapper)

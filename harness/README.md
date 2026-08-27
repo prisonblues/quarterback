@@ -3566,6 +3566,15 @@ qb-bump --no-wrapper        # switch with `sudo nixos-rebuild`, not this host's 
 #   exit 4  the bump does not build — refused to propose it
 ```
 
+**It says what it is doing.** Two `git fetch`es, a `qb-doctor`, a scan, a `nix flake
+update` and a whole NixOS build used to run without printing one word until the last of
+them finished — which on a box that has to compile is forty minutes of a cursor and no
+output, indistinguishable from a hang. Each slow step now narrates to stderr before it
+starts and reports what it found after, and nix's build output is written to
+`~/.cache/quarterback/harness-bump/build.log` **as it happens**, so `tail -f` on it works
+while the build is running. `--json` turns the narration off: stdout is the report, and a
+caller redirecting both streams into a parser is a normal thing to do.
+
 **It pulls before it compares, because a comparison against a stale checkout is worth
 nothing.** The drift verdict answers *"is the harness on PATH the one **this checkout**
 has"*, so a checkout twenty commits behind origin agrees with an installed harness twenty
