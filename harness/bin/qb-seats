@@ -684,14 +684,27 @@ seat_bar() {
 "$(key_hint)"
 }
 
-# One binding for every widget on the bar, because tmux delivers every
+# One binding for every widget on BOTH status lines, because tmux delivers every
 # status-line click to MouseDown1Status and the widget is only distinguishable
 # by #{mouse_status_range}. Three things are load-bearing here:
 #
 #   * A key table is SERVER-wide, so this fires in the user's other sessions
-#     too. @qb_bar is set only on ours, so everywhere else the first condition
-#     is false and the click falls through to `switch-client -t =` — which is
+#     too. @qb_bar is set only on ours, so everywhere else the condition is
+#     false and the click falls through to `switch-client -t =` — which is
 #     verbatim what tmux binds by default. Nothing else on the box changes.
+#
+#     IT IS THE SCREEN THAT IS TESTED AND NOT THE LINE. This used to add
+#     `#{==:#{mouse_status_line},#{@qb_bar}}`, which was true of the seat bar and
+#     of nothing else — so when the ⛶ went onto line 0 it drew, registered its
+#     range, and fell through to `switch-client -t =` on every click. A widget
+#     that renders and does nothing is the worst way for one to fail, and it is
+#     the second time this bar has failed exactly that way.
+#
+#     The line test was never the right question: `status 2` and BOTH
+#     `status-format` indices are set below, so every range on either line of one
+#     of our screens is one we put there. Which widget was hit is the range's
+#     job to say and qb-seat-click's to decide — it exits 0 on a range it does
+#     not own, and on the empty range a click off any widget produces.
 #   * The range is stashed in @qb_click while the mouse event is still live.
 #     confirm-before runs its command afterwards, by which point
 #     #{mouse_status_range} expands to nothing — the stash is what survives.
@@ -733,7 +746,7 @@ install_bar() {
   inner="if-shell -F \"#{m:kill*,#{mouse_status_range}}\" \"$confirm\" \"$run\""
 
   tmux bind-key -n MouseDown1Status \
-    if-shell -F '#{&&:#{!=:#{@qb_bar},},#{==:#{mouse_status_line},#{@qb_bar}}}' \
+    if-shell -F '#{!=:#{@qb_bar},}' \
       "$stash ; $inner" \
       'switch-client -t ='
 }
@@ -774,10 +787,21 @@ install_bar() {
 # dimmer and prefixed `~`, which is the mark the dashboard already uses for "at
 # most this long ago" — a stale ceiling is still the best estimate anyone has,
 # and blanking it would throw that away to avoid looking confident.
+#
+# THE ⛶ IS THE FIRST WIDGET ON THIS LINE, and it is on THIS line rather than the
+# seat bar because that bar is about seats — every cell on it names one, and a
+# control for the pane down the right-hand side would be the exception a reader
+# has to learn. `#[range=…]` is honoured in status-format and nowhere else, which
+# is the whole reason a clickable control can live on a status line at all; see
+# install_bar for the binding that turns a range into an action, and note that
+# this one is NOT confirmed — expanding a pane is as reversible as an act gets,
+# and the same click puts it back.
 top_line() {
   local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
   printf '%s' \
-"#[fill=$BAR_BG]#[align=left]$ground #{@qb_top}"\
+"#[fill=$BAR_BG]#[align=left]"\
+"#[range=user|expand]#[fg=colour110]#[bg=$BAR_BG] ⛶ $ground#[norange]"\
+" #{@qb_top}"\
 "#[align=right]"\
 "#{?@qb_pace,"\
 "#{?#{==:#{@qb_pace_sev},stale},#[fg=colour248]#[bg=$BAR_BG]~,#{?#{==:#{@qb_pace_sev},critical},#[fg=colour210]#[bg=$BAR_BG],#{?#{==:#{@qb_pace_sev},warning},#[fg=colour214]#[bg=$BAR_BG],#[fg=colour108]#[bg=$BAR_BG]}}}"\
@@ -948,6 +972,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$dd close $here\\\"\"" \
     "t|show or hide the tape|run-shell -b \"$d tape $here\"" \
     "d|show or hide the dash|run-shell -b \"$d dash $here\"" \
+    "z|the dash full screen, and back|run-shell -b \"$d expand $here\"" \
     "=|the dash back to the width it asked for|run-shell -b \"$d fit $here\"" \
     ">|the dash wider|run-shell -b \"$d wider $here\"" \
     "<|the dash narrower|run-shell -b \"$d narrower $here\"" \
@@ -955,7 +980,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
     "||" \
     "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$dd kill $here\\\"\"" \
-    "?|these keys, in full|display-popup -w 72 -h 27 \"$d guide\""
+    "?|these keys, in full|display-popup -w 72 -h 28 \"$d guide\""
   # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
   # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
   # the guide asks tmux which session it is in instead. `display-message -p` with

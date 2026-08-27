@@ -40,6 +40,12 @@ one-project screen that column is the same word on every row and the pane is
 78 columns wide (#261). `s` widens it to the whole fleet and brings the column
 back; QB_DASH_SCOPE=all opens that way.
 
+It also opens in ONE COLUMN, and lays the panels out in two above 157 of them —
+which is two of the 78 a table wants before it wraps, plus the gutter. What the
+second column buys is height: seven panels dividing one column's rows is why
+CLAIMED and REVIEW QUEUE are two rows tall on a screen nobody would call short.
+`QB_DASH_WIDE` moves the threshold; below it nothing about the layout changes.
+
 Textual requests mouse tracking from the terminal, and tmux forwards events to
 a pane that asks for them — so this needs no tmux configuration beyond the
 `mouse on` that makes borders draggable. Hold Shift to reach tmux's own mouse
@@ -61,7 +67,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
-from textual.events import Click
+from textual.events import Click, Resize
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Static
 
@@ -82,6 +88,20 @@ def sibling(name: str) -> str:
     """
     from shutil import which
     return which(name) or os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def env_columns(name: str, fallback: int) -> int:
+    """A column count from the environment, or the fallback — never an exception.
+
+    The one knob here is a layout threshold, and a dashboard that refused to
+    start over `QB_DASH_WIDE=wide` would be trading the panel somebody is trying
+    to read for a typo in a tuning variable. A value that is not a positive
+    number of columns is not honoured and is not fatal; it is simply not there.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw.isdigit() or int(raw) < 1:
+        return fallback
+    return int(raw)
 
 
 def spawn_answer(name: str, done: "subprocess.CompletedProcess") -> str:
@@ -356,11 +376,21 @@ class Dash(App):
               color: $text-muted; }
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
 
+    /* THE SHARE IS ON THE PANEL, NOT ON THE TABLE. Each title and its table are
+       one `.panel` so that the wide layout has something to place: a grid puts
+       CELLS in columns, and a title in one column with its table in the other is
+       what happens if the seven pairs are left loose in the container. The table
+       then takes `1fr` of its own panel — everything the title left — so the
+       shares below still read as shares of the pane. */
+    #body { layout: vertical; }
+    .panel { layout: vertical; }
+    .panel > DataTable { height: 1fr; }
+
     /* A share of the pane each, and each scrolls inside its share. With
        `height: auto` the four tables simply stack past the bottom of a 42-row
        pane: the PRs then cannot be clicked, because they are not on screen —
        which is how the click test caught it. */
-    /* SEATS sizes to its CONTENT, and it is the only table here that may.
+    /* SEATS sizes to its CONTENT, and it is the only panel here that may.
        Every other one is unbounded — the fleet, the plan and the issue list are
        as long as the board is — so `height: auto` on those is what put the PR
        table off the bottom of the pane and made its rows unclickable. This one
@@ -374,7 +404,8 @@ class Dash(App):
        ＋ out of view on a full screen and reintroduce the bug above four seats
        below the ceiling the script already enforces — a cap and a maximum have to
        be quoted from the same place or one of them silently wins. */
-    #seats  { height: auto; max-height: 12; }
+    #p_seats  { height: auto; }
+    #seats    { height: auto; max-height: 12; }
     /* Sized to its CONTENT like SEATS, and for SEATS' reason: a fleet with nothing
        set is two rows, and an fr share would spend the rest on blank space that
        comes straight off ISSUES — already the panel that falls below the fold
@@ -383,16 +414,52 @@ class Dash(App):
        rest (DIAL_ROWS), and this one does not, so nothing is hidden by it. 7 is
        four dials and the row that says where to turn one; a fleet with more than
        that in force has a configuration question rather than a layout one. */
-    #dials  { height: auto; max-height: 7; }
-    #fleet  { height: 2fr; }
-    #claims { height: 1fr; }
-    #plan   { height: 2fr; }
-    #prs    { height: 2fr; }
+    #p_dials  { height: auto; }
+    #dials    { height: auto; max-height: 7; }
+    #p_fleet  { height: 2fr; }
+    #p_claims { height: 1fr; }
+    #p_plan   { height: 2fr; }
+    #p_prs    { height: 2fr; }
     /* 1fr, not 2: the queue is at most as deep as OPEN PRs above it and is
        usually shorter, and every row it takes here comes off ISSUES — which is
        already the panel that falls below the fold (#269). */
-    #queue  { height: 1fr; }
-    #issues { height: 2fr; }
+    #p_queue  { height: 1fr; }
+    #p_issues { height: 2fr; }
+
+    /* ---- and the same panels in two columns, when there are columns to spare.
+       Textual has no media query, so the class is set from `on_resize` and the
+       whole of the wide layout is this block. `layout` is a property like any
+       other, which is why the narrow layout above says `vertical` explicitly
+       rather than leaning on the default: the two rules have to be able to
+       disagree.
+
+       WHAT TWO COLUMNS BUY IS HEIGHT, not width. Seven panels sharing one
+       column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a pane
+       nobody would call short; the same seven over four grid rows are three to
+       five times that, and no panel's share had to be taken from another's.
+
+       DIALS AND SEATS SPAN BOTH, and for one reason said twice: they are the two
+       panels whose height is their CONTENT, so a column of their own would buy
+       them nothing and cost the panel beside them half its width. DIALS keeps
+       its place at the top for the reason it was put there — it is the
+       configuration every panel below is running under — and SEATS keeps the ＋
+       findable, which is the one thing that panel has to do (see the cap above).
+       They are also the only `auto` rows: the three under them divide what is
+       left.
+
+       THE WEIGHTS ARE THE NARROW ONES, PAIRED. A row is as tall as the taller of
+       the two panels in it wants to be, and narrow that is 2fr for all three
+       pairs — (FLEET, CLAIMED), (OPEN PRs, REVIEW QUEUE), (PLANS, ISSUES) — so
+       equal thirds is the faithful translation. PLANS and ISSUES get the extra
+       because they are the two panels that are always long: the plan is every
+       repo's list and the issue list is every open issue, while OPEN PRs is
+       usually under ten and is often zero. Both short panels ride with a long
+       one rather than with each other, so no row is dead space on a quiet day. */
+    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto auto 2fr 2fr 3fr;
+                  grid-gutter: 0 1; }
+    #body.-wide .panel { height: 100%; }
+    #body.-wide #p_dials { column-span: 2; height: auto; }
+    #body.-wide #p_seats { column-span: 2; height: auto; }
     """
 
     BINDINGS = [
@@ -407,8 +474,17 @@ class Dash(App):
         # shows the screen's own, and a person who wants to compare two projects
         # wants the page. The ✎ on a row is the control; this is the map.
         ("d", "open_dials", "dials"),
+        ("z", "expand", "expand"),
         ("question_mark", "help", "keys"),
     ]
+
+    # WHEN THE PANELS GO TWO ACROSS, in columns of the pane. Not a taste: 78 is
+    # what one of these tables wants before it wraps — it is `QB_SEATS_DASH_SIZE`'s
+    # default, and quoted from there — so two of them side by side plus the gutter
+    # between is the narrowest screen on which the second column is not paid for
+    # out of the first. `QB_DASH_WIDE` moves it, which is how a terminal whose
+    # font makes 157 columns comfortable can have the wide layout sooner.
+    WIDE_COLUMNS = 157
 
     # The ⚖ lives in its own column so that clicking it means something
     # different from clicking the row. Column 1 of the PR table.
@@ -520,6 +596,13 @@ class Dash(App):
         self.start_bin = sibling("qb-start")
         self.confirm = os.environ.get("QB_DASH_CONFIRM", "1") != "0"
         self.pr_err: str | None = None
+        # WHICH LAYOUT IS UP, and it starts narrow because that is what the pane
+        # `qb-seats` splits off is. `relayout` compares against this rather than
+        # against the class, so a resize that does not cross the threshold — which
+        # is most of them, since attaching a client resizes every pane on the
+        # screen — costs a comparison and no reflow.
+        self.wide = False
+        self.wide_at = env_columns("QB_DASH_WIDE", self.WIDE_COLUMNS)
 
     # ---- layout ---------------------------------------------------------
 
@@ -529,31 +612,45 @@ class Dash(App):
         # towards is the one number none of the tables can show.
         yield Static("", id="limits")
         yield Static("quarterback — connecting…", id="head")
-        with Vertical():
+        # A PANEL PER TABLE, and the pairing is structural rather than visual: a
+        # grid places cells, so a title loose in the container is a cell of its
+        # own and lands in a different column from the table it names. Wrapping
+        # them changes nothing about the narrow screen — one `Vertical` inside
+        # another lays out identically — and is the whole of what the wide one
+        # needed from the tree.
+        with Vertical(id="body"):
             # Above the seats, and above everything the seats then do: this is the
             # configuration every panel below is running under, which is the caps
             # line's own argument for being at the top. It is two rows when nothing
             # is set — the printed renderer makes the same choice in the same place
             # (qb-dash.panel_dials).
-            yield Static("DIALS", classes="title", id="t_dials")
-            yield ClickTable(id="dials", cursor_type="row")
-            yield Static("SEATS", classes="title", id="t_seats")
-            yield ClickTable(id="seats", cursor_type="row")
-            yield Static("FLEET", classes="title", id="t_fleet")
-            yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
-            yield Static("CLAIMED", classes="title", id="t_claims")
-            yield ClickTable(id="claims", cursor_type="row")
-            yield Static("PLANS", classes="title", id="t_plan")
-            yield ClickTable(id="plan", cursor_type="row")
-            yield Static("OPEN PRs", classes="title", id="t_prs")
-            yield ClickTable(id="prs", cursor_type="row")
+            with Vertical(classes="panel", id="p_dials"):
+                yield Static("DIALS", classes="title", id="t_dials")
+                yield ClickTable(id="dials", cursor_type="row")
+            with Vertical(classes="panel", id="p_seats"):
+                yield Static("SEATS", classes="title", id="t_seats")
+                yield ClickTable(id="seats", cursor_type="row")
+            with Vertical(classes="panel", id="p_fleet"):
+                yield Static("FLEET", classes="title", id="t_fleet")
+                yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
+            with Vertical(classes="panel", id="p_claims"):
+                yield Static("CLAIMED", classes="title", id="t_claims")
+                yield ClickTable(id="claims", cursor_type="row")
+            with Vertical(classes="panel", id="p_plan"):
+                yield Static("PLANS", classes="title", id="t_plan")
+                yield ClickTable(id="plan", cursor_type="row")
+            with Vertical(classes="panel", id="p_prs"):
+                yield Static("OPEN PRs", classes="title", id="t_prs")
+                yield ClickTable(id="prs", cursor_type="row")
             # Directly under OPEN PRs, which is where it answers the question that
             # panel raises and cannot: that one says a PR exists and CI is green,
             # this one says whether anybody has reviewed it (#273).
-            yield Static("REVIEW QUEUE", classes="title", id="t_queue")
-            yield ClickTable(id="queue", cursor_type="row")
-            yield Static("ISSUES", classes="title", id="t_issues")
-            yield ClickTable(id="issues", cursor_type="row")
+            with Vertical(classes="panel", id="p_queue"):
+                yield Static("REVIEW QUEUE", classes="title", id="t_queue")
+                yield ClickTable(id="queue", cursor_type="row")
+            with Vertical(classes="panel", id="p_issues"):
+                yield Static("ISSUES", classes="title", id="t_issues")
+                yield ClickTable(id="issues", cursor_type="row")
         yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
                      "plan row→why, queue row→what it waits on, dial row→why it is "
                      "set, ⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
@@ -562,6 +659,11 @@ class Dash(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        # BEFORE the board client, which is allowed to fail: a machine with no
+        # board configured still gets a laid-out dashboard saying so, and a
+        # `return` above this would leave a wide pane in the narrow layout for as
+        # long as it stayed exactly that wide.
+        self.relayout()
         self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         # NOT in build_columns, and that is the one table here for which that is
@@ -758,7 +860,8 @@ class Dash(App):
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
 
-    def render_limits(self, limits: list[dict], err: str | None) -> None:
+    def render_limits(self, limits: list[dict], err: str | None,
+                      width: int | None = None) -> None:
         """Claude Code's own caps, as bars — `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
 
         A failed call keeps the last figures rather than blanking the line: they
@@ -779,7 +882,11 @@ class Dash(App):
             bar = self.query_one("#limits", Static)
         except Exception:                         # noqa: BLE001 — a resize before mount
             return
-        cells = qd.limit_cells(self.limits, max(20, self.size.width - 2))
+        # `width` when a resize handed one over — see on_resize for why the app's
+        # own size is a resize behind in there. Everywhere else it is unset and
+        # the app's size is the current one.
+        pane = self.size.width if width is None else width
+        cells = qd.limit_cells(self.limits, max(20, pane - 2))
         tempo = qd.tempo_cell(self.dials)
         bar.display = bool(cells or self.queue or tempo)
         if not (cells or self.queue or tempo):
@@ -830,10 +937,56 @@ class Dash(App):
                 text.append(f" {life}", style="grey50")
         bar.update(text)
 
-    def on_resize(self) -> None:
-        """Re-lay the bars to the new width — they are sized to the pane, and the
-        dash pane is resized every time the screen is."""
-        self.render_limits(self.limits, self.limits_err)
+    def on_resize(self, event: Resize) -> None:
+        """Re-lay to the new width — the bars are sized to the pane, the panels
+        are one column or two by it, and the dash pane is resized every time the
+        screen is.
+
+        THE WIDTH COMES OFF THE EVENT, NEVER OFF `self.size`, and that is not
+        style. Measured on textual 8.2: the handler runs BEFORE the app's own
+        size is updated, so a `self.size.width` read here is the width the pane
+        had before the resize being handled. The caps bar has been laying itself
+        out one resize behind ever since it was sized to the pane — invisible,
+        because dragging a border emits a stream of them and the last-but-one is
+        near enough — and a layout threshold read the same way is not invisible
+        at all: it would take two crossings to go two-across, and a pane that
+        crossed once and stopped would sit in the wrong layout indefinitely.
+        """
+        self.relayout(event.size.width)
+        self.render_limits(self.limits, self.limits_err, width=event.size.width)
+
+    def relayout(self, width: int | None = None) -> None:
+        """One column or two, decided by the width the pane actually has.
+
+        Textual has no media query, so this is the media query: `on_resize` fires
+        on every width the pane is given — a client attaching, a seat closing, a
+        `C-q >`, a zoom — and the class it sets is the whole of what `#body.-wide`
+        keys off.
+
+        THE ORDER IS NOT THE SAME IN BOTH LAYOUTS, and that is the only part of
+        this that is not CSS. A grid fills row by row in DOM order, so the narrow
+        order lays OPEN PRs and REVIEW QUEUE into different rows — and "the queue
+        sits directly under the PRs" is the arrangement #273 asked for, not a
+        coincidence of the order they were added in. Wide, `directly under`
+        becomes `directly beside`: PLANS moves down one, which pairs PRs with the
+        queue that reviews them and PLANS with the issues its items point at.
+
+        `move_child` and not a remount, because the panels hold DataTables with a
+        cursor, a scroll offset and the row keys every click resolves through —
+        all of which a remove-and-mount would throw away, and the width crossing
+        the threshold is not news the panel should lose its place over.
+        """
+        wide = (self.size.width if width is None else width) >= self.wide_at
+        if wide == self.wide:
+            return
+        self.wide = wide
+        body = self.query_one("#body", Vertical)
+        body.set_class(wide, "-wide")
+        plan = self.query_one("#p_plan", Vertical)
+        if wide:
+            body.move_child(plan, after=self.query_one("#p_queue", Vertical))
+        else:
+            body.move_child(plan, before=self.query_one("#p_prs", Vertical))
 
     def render_board(self, data: dict) -> None:
         self.board = data
@@ -1542,6 +1695,24 @@ class Dash(App):
             return
         self.seat_click("add", session, f"add a seat to {session}?")
 
+    def action_expand(self) -> None:
+        """`z` — this pane to a window of its own, and back.
+
+        THROUGH `qb-seat-click`, exactly as the ＋ and the ✕ do, and for their
+        reason: the ⛶ on the top line, `C-q z` and this key are three front ends
+        onto ONE definition of what expanding means, which is `qb-seat-key
+        expand`. Two copies of the break-and-rejoin would be two places for the
+        geometry lore to drift.
+
+        NOT CONFIRMED, unlike the ✕. Nothing is killed, no process is touched —
+        the dash keeps polling across the move — and the same key puts it back.
+        """
+        session = self.seat_session()
+        if not session:
+            self.say("no seat screen on this server — nothing to expand into")
+            return
+        self.run_seat_click("expand", session)
+
     def jump_pane(self, seat: dict) -> None:
         """Move the tmux cursor to a seat's pane, by pane id.
 
@@ -2161,7 +2332,8 @@ class Dash(App):
 
     def action_help(self) -> None:
         self.say("o open on GitHub · p panel-review · f fix the selected issue or "
-                 "plan item · d the board's dials page · s this project's rows or the "
+                 "plan item · d the board's dials page · z this pane full screen "
+                 "and back · s this project's rows or the "
                  "whole fleet's · r refresh · q quit · click ⚖ to review, ⚒ to fix, "
                  "✎ to set or clear a dial (ctrl+s saves, ctrl+x clears), a plan row "
                  "for why it is there, a seat to jump to its pane")

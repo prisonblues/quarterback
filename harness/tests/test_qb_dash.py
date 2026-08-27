@@ -699,6 +699,169 @@ def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
         "the ＋ row was not what a click at its offset reached"
 
 
+# ---- one column or two ------------------------------------------------------
+#
+# The complaint the wide layout answers is HEIGHT: seven panels sharing one
+# column's rows leave CLAIMED and REVIEW QUEUE two rows tall on a pane nobody
+# would call short. So these measure heights and positions rather than reading
+# the class back off the widget — a class that is set while the grid does
+# nothing is exactly the bug worth catching, and it would pass an assertion
+# about the class.
+
+
+def _panels(app) -> dict:
+    """Every panel's region, by id. Position and size, which is the whole claim."""
+    return {pid: app.query_one("#" + pid).region
+            for pid in ("p_dials", "p_seats", "p_fleet", "p_claims", "p_plan",
+                        "p_prs", "p_queue", "p_issues")}
+
+
+def _stub_fetches(app) -> None:
+    """Nothing is fetched because nothing here depends on the rows: an empty
+    table still occupies its share of the pane, and a layout test that waited on
+    `gh` would be a layout test that skips in CI."""
+    for stub in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, stub, lambda: None)
+
+
+async def _laid_out(width: int, height: int = 50) -> dict:
+    """Drive the app at one size with every fetch stubbed out, and measure."""
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    _stub_fetches(app)
+    async with app.run_test(size=(width, height)) as pilot:
+        await pilot.pause(0.2)
+        return {"wide": app.wide, "panels": _panels(app)}
+
+
+def test_a_narrow_pane_is_one_column_and_a_wide_one_is_two():
+    """The threshold is a width, and below it nothing changes at all.
+
+    78 columns is what one of these tables wants before it wraps, so the pane
+    `qb-seats` splits off must come out EXACTLY as it did before this existed —
+    a dash that went two-across at 78 would be two columns of 39, which is worse
+    than the problem being solved.
+    """
+    narrow = asyncio.run(_laid_out(90))
+    assert narrow["wide"] is False
+    assert {r.x for r in narrow["panels"].values()} == {0}, \
+        "a 90-column pane put panels in more than one column"
+
+    wide = asyncio.run(_laid_out(200))
+    assert wide["wide"] is True
+    lefts = {r.x for r in wide["panels"].values()}
+    assert len(lefts) == 2, f"a 200-column pane did not use two columns: {lefts}"
+
+
+def test_two_columns_is_bought_for_height_not_for_width():
+    """The point of the second column, asserted as the thing it is for.
+
+    Every panel but SEATS — which is its content in both layouts, and spans both
+    columns for that reason — has to come out TALLER wide than narrow. If it
+    does not, the grid is drawing two columns and the rows are still being cut
+    into sevenths, which looks like a success and fixes nothing.
+    """
+    narrow = asyncio.run(_laid_out(90))["panels"]
+    wide = asyncio.run(_laid_out(200))["panels"]
+    shorter = {pid: (narrow[pid].height, wide[pid].height)
+               for pid in narrow if pid not in ("p_seats", "p_dials")
+               and wide[pid].height <= narrow[pid].height}
+    assert not shorter, f"no taller in two columns (narrow, wide): {shorter}"
+    assert wide["p_seats"].width > narrow["p_seats"].width, \
+        "SEATS did not span both columns — the ＋ is in half a pane"
+    # DIALS spans for the same reason and is asserted the same way: it is the
+    # other content-sized panel, so a column of its own would buy it nothing and
+    # cost the panel beside it half its width.
+    assert wide["p_dials"].width > narrow["p_dials"].width, \
+        "DIALS did not span both columns"
+
+
+def test_the_review_queue_stays_with_the_prs_it_reviews():
+    """#273's arrangement survives the second column, by moving with it.
+
+    Narrow, the queue is directly UNDER OPEN PRs: that one says a PR exists and
+    CI is green, this one says whether anybody has reviewed it, and they are
+    read together. A grid fills row by row in DOM order, so leaving the order
+    alone would have put the queue in the row below PLANS and a column away from
+    the panel it exists to answer. Wide, `under` becomes `beside` — same row,
+    next column — which is `relayout`'s one job that CSS could not do.
+    """
+    narrow = asyncio.run(_laid_out(90))["panels"]
+    assert narrow["p_queue"].y == narrow["p_prs"].y + narrow["p_prs"].height, \
+        "narrow: REVIEW QUEUE is not directly under OPEN PRs"
+
+    wide = asyncio.run(_laid_out(200))["panels"]
+    assert wide["p_queue"].y == wide["p_prs"].y, \
+        "wide: REVIEW QUEUE is not in OPEN PRs' row"
+    assert wide["p_queue"].x > wide["p_prs"].x, \
+        "wide: REVIEW QUEUE is not beside OPEN PRs"
+
+
+def test_crossing_the_threshold_and_coming_back_restores_the_narrow_order():
+    """A resize is not a one-way door, and the reorder has to undo exactly.
+
+    `>` and `<` nudge the pane by 8 columns at a time, so a dash crossing the
+    threshold twice in ten seconds is an ordinary afternoon rather than an edge
+    case — and `move_child` mutates the tree, so an undo that is not exact
+    leaves a screen whose panels are in an order nobody chose. Measured by the
+    positions, which is where a wrong order shows up.
+    """
+    async def drive() -> tuple:
+        app_module = _load_app()
+        app = app_module.Dash(interval=3600, gh_interval=3600)
+        _stub_fetches(app)
+        async with app.run_test(size=(90, 50)) as pilot:
+            await pilot.pause(0.2)
+            first = _panels(app)
+            await pilot.resize_terminal(200, 50)
+            await pilot.pause(0.2)
+            wide = app.wide
+            await pilot.resize_terminal(90, 50)
+            await pilot.pause(0.2)
+            return first, wide, app.wide, _panels(app)
+
+    first, went_wide, came_back, again = asyncio.run(drive())
+    assert went_wide is True and came_back is False
+    assert again == first, "the narrow layout did not come back the way it went"
+
+
+def test_the_add_row_is_still_clickable_in_two_columns():
+    """The ＋ again, at the width that rearranges everything around it.
+
+    The last two defects in this panel were both a click reaching the wrong row
+    or no row, and both came from a layout change that read fine. A grid that
+    spans SEATS across two columns and reorders the panels under it is the same
+    class of change, so it is checked the same way: by clicking, not by
+    measuring.
+    """
+    async def drive() -> list:
+        app_module = _load_app()
+        app = app_module.Dash(interval=3600, gh_interval=3600)
+        app.refresh_limits = lambda: None
+        app.refresh_seats = lambda: None
+        clicked: list = []
+        app.run_seat_click = lambda tag, session: clicked.append((tag, session))
+        app.jump_pane = lambda seat: clicked.append(("jump", seat["pane"]))
+        full = [{"pane": f"%{n}", "seat": str(n), "session": "seats-demo",
+                 "window": "0", "command": "claude", "path": "/tmp/demo"}
+                for n in range(1, 11)]
+        async with app.run_test(size=(200, 50)) as pilot:
+            assert app.wide is True, "200 columns did not reach the wide layout"
+            app.render_seats(full)
+            await pilot.pause(0.2)
+            seats = app.query_one("#seats")
+            await pilot.click(seats, offset=(4, len(full) + 1))
+            await pilot.pause(0.3)
+            if isinstance(app.screen, app_module.Confirm):
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+            return clicked
+
+    assert asyncio.run(drive()) == [("add", "seats-demo")], \
+        "the ＋ row was not what a click at its offset reached in two columns"
+
+
 # ---- the scope (#261) -------------------------------------------------------
 #
 # Board data as literals, so this runs wherever textual does: the question is not

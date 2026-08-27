@@ -1883,6 +1883,268 @@ def test_the_dash_comes_back_above_the_tape_and_not_beside_it(screen):
     assert geometry(screen) == before, "the dash came back to a different screen"
 
 
+def test_expanding_the_dash_gives_it_a_window_and_puts_the_screen_back_exactly(screen):
+    """`z` — out of the row into a window of its own, and back with the geometry.
+
+    The same break-and-rejoin `d` uses, so it inherits the thing that was hard
+    about that one: the widths are recorded BEFORE the break, because afterwards
+    the dash's columns have already gone to a neighbour and recording then puts
+    the screen back the way the break left it. Asserted on the whole screen and
+    not on the dash alone — a rejoined dash at the right width with the seats
+    beside it wrong is the failure that looks like success.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+    dash = pane_id(screen, "dash")
+    assert dash, "this screen was supposed to have a dash"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") is None, "the dash is still in the seats window"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == dash
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") == dash, "a different pane came back"
+    assert geometry(screen) == before, "the screen came back a different shape"
+    for option in ("@qb_dash_expanded", "@qb_hidden_dash"):
+        left = screen.tmux("show-options", "-t", "t:", "-qv", option).stdout.strip()
+        assert left == "", f"{option} outlived the collapse: {left!r}"
+
+
+def test_an_expanded_dash_is_visible_rather_than_parked(screen):
+    """The whole difference between this and `d`, and it is one flag.
+
+    `break-pane -d` leaves the pane in a window nobody is looking at, which is
+    what hiding means; without it the client follows the pane to its new window,
+    which is what expanding means. Same recording, same way back — so the only
+    thing worth asserting is that the window is the current one and is named for
+    reading rather than for parking.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert seat_key(screen, "expand", "t").returncode == 0
+
+    name = screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_name}").stdout.strip()
+    assert name == "qb-dash", f"the expanded dash landed in {name!r}"
+    assert screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_panes}").stdout.strip() == "1", \
+        "the expanded dash is sharing its window"
+
+
+def test_expanding_keeps_the_process_that_was_in_the_pane(screen):
+    """Which is the whole argument for `break-pane` over a popup running a second
+    dashboard: the expanded pane is the SAME process, so it has everything it had
+    already polled and there is no "waiting for gh" caption on the way in."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    was = screen.tmux("display-message", "-p", "-t", dash, "#{pane_pid}").stdout.strip()
+    assert was.isdigit(), f"the dash has no process at all: {was!r}"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") == dash, "the pane was replaced rather than moved"
+    assert screen.tmux("display-message", "-p", "-t", dash,
+                       "#{pane_pid}").stdout.strip() == was, \
+        "the dash came back with a different process in it"
+
+
+def test_expanding_a_hidden_dash_shows_it_rather_than_putting_it_in_the_row(screen):
+    """The one crossing between the two toggles that had to be decided.
+
+    `d` means "in the row or not" and `z` means "full screen or not", so a hidden
+    dash asked to expand is asked for the thing it is one step from — not brought
+    back to its 78-column column, which is `d`'s answer to a different question,
+    and not refused, which answers nothing. It is also the cheap direction: the
+    pane is already alone in a window, so this is a rename and a select and no
+    geometry moves. A `break-pane` here would fail outright.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+    dash = pane_id(screen, "dash")
+
+    assert seat_key(screen, "dash", "t").returncode == 0            # hide it
+    assert seat_key(screen, "expand", "t").returncode == 0          # now show it big
+    assert pane_id(screen, "dash") is None, "the dash went back into the row"
+    assert screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_name}").stdout.strip() == "qb-dash"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == dash
+
+    # And the way back is still one route, with the geometry hide_pane recorded
+    # before any of this — which is the thing a rename could quietly have lost.
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert geometry(screen) == before, "the round trip through both states lost the row"
+
+
+def test_a_nudge_says_which_of_the_two_states_the_dash_is_in(screen):
+    """"Hidden" about a dash filling the screen in front of you is the kind of
+    wrong answer that makes somebody doubt the tool rather than the state."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    nudged = seat_key(screen, "wider", "t")
+    assert nudged.returncode != 0
+    assert "expanded" in nudged.stderr, nudged.stderr
+    assert "hidden" not in nudged.stderr, \
+        f"an expanded dash was reported as hidden: {nudged.stderr}"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    hidden = seat_key(screen, "wider", "t")
+    assert hidden.returncode != 0
+    assert "hidden" in hidden.stderr, hidden.stderr
+
+
+def test_the_dash_toggle_also_brings_back_an_expanded_dash(screen):
+    """One route into the row, whichever route left it.
+
+    Expanded and hidden are both "the dash is not in the seats window", and they
+    come back the same way — so `d` on an expanded dash must put it back rather
+    than refusing or, worse, breaking it out a second time.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert geometry(screen) == before, "`d` brought an expanded dash back wrong"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == "", \
+        "the expanded marker outlived a collapse made with `d`"
+
+
+def test_killing_the_expanded_dash_takes_both_markers_with_it(screen):
+    """A dead pane must not leave a screen describing one.
+
+    Two options describe the expanded dash — `@qb_hidden_dash` is where it is
+    parked, `@qb_dash_expanded` is which of the two ways it got there — and the
+    pane-is-gone branch used to clear only the first. What was left was a screen
+    marked expanded with nothing recorded, so every later `z` took the expanded
+    branch and reported "nothing recorded to put back": the wrong problem named,
+    on a screen whose real one is that the dash process died. Neither key could
+    put it right, because the marker is the only thing either of them reads.
+
+    Closing the window the dash was expanded into is not a contrived way to reach
+    that — it is `C-q z` followed by the reflex of closing a window you are done
+    with, and the dash is the only pane in it.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    assert seat_key(screen, "expand", "t").returncode == 0
+    dash = screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip()
+    assert dash, "the dash did not record itself as expanded"
+
+    screen.tmux("kill-pane", "-t", dash)
+    # It refuses, and that is right — there is no dash to bring back. What it
+    # must not do is refuse the same way for ever.
+    assert seat_key(screen, "expand", "t").returncode != 0
+    for option in ("@qb_dash_expanded", "@qb_hidden_dash"):
+        left = screen.tmux("show-options", "-t", "t:", "-qv", option).stdout.strip()
+        assert left == "", f"{option} outlived the pane it describes: {left!r}"
+
+    # And the message now names the screen's actual state rather than the marker's.
+    again = seat_key(screen, "expand", "t")
+    assert "marked expanded" not in again.stderr, \
+        f"still answering from a marker that was cleared: {again.stderr!r}"
+
+
+def test_a_marker_left_without_a_record_clears_itself(screen):
+    """The other order the same contradiction can arrive in, and its only exit.
+
+    `expand_dash` asks `@qb_dash_expanded` first and hands off to `restore_dash`,
+    which answers from `@qb_hidden_dash`. A marker with no record is a state that
+    describes no pane, and leaving it set made this refusal the answer to every
+    later `z` — so `restore_dash` returning 1 is taken as the proof the marker is
+    wrong, and it does not survive being disproved.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    screen.tmux("set-option", "-t", "t:", "@qb_dash_expanded", dash)
+
+    first = seat_key(screen, "expand", "t")
+    assert first.returncode != 0, "a marker with no record was acted on"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == "", \
+        "the disproved marker survived being disproved"
+    # With it gone, `z` reads the screen as it is — a dash in the row, to expand.
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") is None, "the second z did not expand the dash"
+
+
+def test_the_top_line_carries_a_clickable_expand(screen):
+    """`#[range=…]` is honoured in status-format and nowhere else, which is the
+    whole reason a control can live on a status line — and the top line is where
+    this one belongs, since every cell on the seat bar names a seat and a control
+    for the pane down the right would be the exception a reader has to learn."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert "#[range=user|expand]" in fmt, f"no expand widget on the top line: {fmt}"
+    assert "⛶" in fmt, "the range is there and has nothing in it"
+    # `norange` and not `default`: the note in seat_bar applies here too — a
+    # `#[default]` jumps back to status-style, which is the theme's green.
+    after = fmt.split("#[range=user|expand]", 1)[1]
+    assert "#[norange]" in after.split("#{@qb_top}", 1)[0], \
+        "the range is never closed, so the whole line is one click target"
+
+
+def test_the_expand_widget_reaches_qb_seat_key(screen):
+    """The ⛶, `C-q z` and the dash's own `z` are three front ends onto ONE
+    definition of expanding, and this is the join for the first of them.
+
+    Driven through qb-seat-click by the range name the status line would send,
+    which is the part that can be tested without synthesising a mouse event —
+    the same split the seat bar's own widgets are tested along.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    before = geometry(screen)
+
+    done = click(screen, "expand", "t")
+    assert done.returncode == 0, done.stderr
+    assert pane_id(screen, "dash") is None, "the click did not expand the dash"
+
+    assert click(screen, "expand", "t").returncode == 0
+    assert geometry(screen) == before, "the click did not put the screen back"
+
+
+def test_a_click_on_the_top_line_reaches_the_dispatcher_too(screen):
+    """The join the test above deliberately skips, and the one that was broken.
+
+    `qb-seat-click expand` worked from the moment it was written; the ⛶ still did
+    nothing, because the mouse binding gated on
+    `#{==:#{mouse_status_line},#{@qb_bar}}` — true of the seat bar, line 1, and
+    of nothing else. The widget drew, registered its range, and every click on it
+    fell through to `switch-client -t =`. Both halves of the feature passed their
+    own tests; what nobody owned was the line between them.
+
+    A status-line click cannot be synthesised — tmux routes it to the client, not
+    to a pane, so there is no `send-keys` that produces one — so this asserts the
+    property that made the click unreachable rather than the click. The binding
+    must decide on the SCREEN and not on the line: both status lines are ours,
+    every range on either is one this script put there, and which widget was hit
+    is the range's job to say.
+    """
+    screen("-n", "2")
+    lines = [ln for ln in screen.tmux("list-keys", "-T", "root").stdout.splitlines()
+             if re.search(r"-T\s+root\s+MouseDown1Status\s", ln)]
+    assert len(lines) == 1, lines
+    assert "mouse_status_line" not in lines[0], (
+        "the binding gates on which status line was clicked, so a widget on the "
+        "top line registers its range and is then dropped — which is exactly how "
+        "the ⛶ shipped inert")
+    # And the widget it could not reach is on the line that was being excluded.
+    assert "#[range=user|expand]" in top_format(screen), \
+        "the ⛶ is no longer on the top line, so this test is measuring nothing"
+
+
 def test_a_hidden_pane_keeps_the_process_that_was_in_it(screen):
     """Which is the whole reason this is `break-pane` and not "kill it and split a
     new one": a tape that restarted would lose everything it had followed, and a
@@ -1943,6 +2205,42 @@ def test_two_screens_disagree_about_whether_their_tape_is_showing(screen):
     assert len(aux_panes(screen, "two")) == 1, "hiding one screen's tape hid the other's"
     assert screen.tmux("show-options", "-v", "-t", "=two:",
                        "@qb_hidden_tape").stdout.strip() == ""
+
+
+@pytest.mark.parametrize("action", ["dash", "expand", "tape"])
+def test_a_pane_taken_out_of_the_row_stays_in_its_own_session(screen, action):
+    """`break-pane` with no `-t` uses the CLIENT'S CURRENT session, not the source
+    pane's — so on a server running two screens, taking a pane out of the one you
+    are not looking at parks it in the other one's window list.
+
+    Everything downstream then fails to find it: `pane_exists` and the whole
+    restore path search `list-panes -s -t "$SID"`, which is scoped to the session,
+    so the pane is at once alive, stranded, and reported as gone. There is no way
+    back for it through this script.
+
+    IT CANNOT BE SEEN WITH ONE SESSION ON THE SERVER, which is why it survived the
+    hide/show tests entirely and only turned up when a screen was built beside a
+    real one on a developer's box: the dash landed in `seats-quarterback:qb-dash`
+    while its own screen reported it missing. Two screens, and the second is the
+    current one — which is what makes the wrong answer available.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2", name="one")
+    screen("-n", "2", name="two")          # built last, so it is the current session
+
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+
+    stranded = [line for line in screen.tmux(
+        "list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_name}"
+    ).stdout.splitlines() if line.startswith(("%",)) and " two:" in line
+        and not line.endswith(":seats")]
+    assert stranded == [], f"`{action}` on screen one put a pane in screen two: {stranded}"
+
+    # And the round trip still works, which is the thing the stranding broke: the
+    # pane was findable enough to break out and not findable enough to bring back.
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+    assert len(aux_panes(screen, "one")) == 2, \
+        f"`{action}` could not put the pane back on its own screen"
 
 
 def test_a_nudge_records_the_width_it_landed_at(screen):

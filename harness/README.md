@@ -2126,6 +2126,108 @@ nothing records when a head moved or when a branch started conflicting, so those
 measured from the round or from the PR's opening. Nothing here starts a review — the panel
 is a reader, and the thing that would act on it is #53.
 
+**Above 157 columns the panels go TWO ACROSS, and what that buys is height.** Seven
+panels dividing one column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a
+50-row screen while four others get five each; the same seven over four grid rows are
+between two and five times that, and no panel's share was taken from another's. The
+threshold is quoted rather than chosen: 78 columns is what one of these tables wants
+before it wraps — `QB_SEATS_DASH_SIZE`'s default, from `qb-seats` — so two side by side
+plus the gutter is the narrowest pane on which the second column is not paid for out of
+the first. Below it nothing changes at all, which is the point: the pane `qb-seats`
+splits off is 78 columns and must come out exactly as it did before this existed.
+`QB_DASH_WIDE` moves it, and a value that is not a positive number of columns is ignored
+rather than fatal.
+
+SEATS spans both columns — it is its content in either layout, and a second column would
+only move the ＋, which is the one widget here that has already fallen off a screen once.
+The other placement is the part CSS could not do. **A grid fills row by row in DOM
+order**, so the order that puts REVIEW QUEUE directly under OPEN PRs above lays them into
+different rows the moment there are two of them, and the pairing #273 asked for is gone.
+So `Dash.relayout` moves PLANS down one when it goes wide: `under` becomes `beside`, and
+PLANS pairs with the ISSUES its items point at. It moves back on the way down, exactly —
+`>` and `<` nudge by eight columns, so crossing the threshold twice in a minute is
+ordinary. The reorder is `move_child` and never a remount: a DataTable carries a cursor, a
+scroll offset and the row keys every click resolves through, and a pane getting wider is
+not news worth losing your place over.
+
+**Take the width off the resize EVENT, never off `self.size`.** Measured on textual 8.2:
+`on_resize` runs before the app's own size is updated, so a `self.size.width` read in
+there is the width the pane had *before* the resize being handled. The caps bar had been
+laying itself out one resize behind since it was first sized to the pane, and nobody
+noticed because dragging a border emits a stream of resizes and the last-but-one is near
+enough. A layout threshold is not forgiving in the same way — a pane that crossed once and
+stopped would sit in the wrong layout until the next resize — which is how the older bug
+came to light.
+
+#### The dash full screen — `z`, `C-q z`, and the ⛶
+
+The wide layout is only worth having if the pane can be made wide, and 78 columns down the
+right of a seat screen never will be. `z` inside the dash, `C-q z` from anywhere on the
+screen, and the ⛶ on the top line all reach one verb — `qb-seat-key expand` — which
+**breaks the dash out into a window of its own**, and puts it back on the next press.
+
+**It is `break-pane`, and deliberately not `resize-pane -Z`.** Zoom was the obvious answer
+and is the wrong one: zoom is a property of the window and tmux drops it on any layout
+change, which this screen makes constantly — `select-layout -E` when a seat is closed, and
+the `window-resized` hook reasserting `@qb_dash_width` on every client attach. A dash zoomed
+to read would pop back to 78 columns the moment somebody attached a phone, with nothing on
+screen to say why. It is also not a `display-popup` running a second dashboard: that is a
+second board poll, a second `gh` poll, and a cold start whose ISSUES panel says "waiting for
+gh" for up to a minute. `break-pane` moves the pane the process is already in.
+
+It is the same move `d` makes, minus the `-d` that leaves the pane parked where nobody is
+looking — so it inherits everything that was hard about that one, including the rule that
+the widths are recorded **before** the break. That rule bites differently here and it cost a
+test to find: `hide_pane` is handed its size by a caller that read it first, while
+`expand_dash` does its own break, so reading afterwards is one line away and looks
+identical. It is not — after the break the pane fills its new window, so the recorded size
+is the whole terminal, and the join back asks for a 240-column pane inside a 240-column
+window and fails with `create pane failed: pane too small`.
+
+**Two toggles over three states**, and the crossings are decided rather than accidental. `d`
+means "in the row or not"; `z` means "full screen or not".
+
+| | `d` | `z` |
+|---|---|---|
+| in the row | → hidden | → expanded |
+| hidden | → in the row | → **expanded** |
+| expanded | → in the row | → in the row |
+
+The middle row is the one worth stating. Somebody pressing `z` on a hidden dash is asking
+for a dash they can read, and a hidden one is one step from that rather than in the wrong
+state for it — so it is shown rather than restored to its column, and rather than refused.
+It is also the cheap direction: the pane is already alone in a window, so that crossing is a
+rename and a `select-window` and no geometry moves at all. A `break-pane` there would fail
+outright, having nothing to break.
+
+Both routes out of the row record the same state and come back through the same
+`restore_dash`, so there is one way back however it left — which is why `@qb_dash_expanded`
+is cleared there rather than in `expand_dash`. `>` and `<` refuse while it is out, and say
+which of the two states they are refusing for: "hidden" about a dash filling the screen in
+front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
+state.
+
+**`break-pane` must name the session, and until now none of these did.** With no `-t`,
+`break-pane` puts the new window in the **client's current** session rather than the source
+pane's — so on a server running two screens, taking a pane out of the one you are not
+looking at parks it in the other one's window list. Everything downstream then fails to find
+it: `pane_exists` and the restore path both search `list-panes -s -t "$SID"`, which is scoped
+to the session, so the pane is at once alive, stranded, and reported as gone, with no way
+back through this script. It is not reachable with one session on the server, which is why
+`d` and `t` carried it from the day they shipped and the hide/show tests never saw it — it
+turned up the first time a test screen was built beside a real one, with the dash landing in
+`seats-quarterback:qb-dash` while its own screen said it was missing. All three breaks name
+`-t "$SID:"` now, and the regression test builds two screens because one cannot show it.
+
+**Nothing had to be taught about this mode for the resize hook to leave it alone.**
+`qb-seats`' own `dash_pane` looks in `$SESSION_ID:seats` and nowhere else, so an expanded
+dash is outside its reach and cannot be shrunk back to 78 columns by an attaching client.
+That is a property of where the pane went, not a special case anybody wrote.
+
+What the dash does with the room is its own business and is not arranged here: it is a
+Textual app that lays out to the width it is given, so a window-wide pane simply crosses the
+threshold above and goes two columns across. This verb moves a pane.
+
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
 PLANS every repo's list — while a screen is built for one repository. So most rows were
