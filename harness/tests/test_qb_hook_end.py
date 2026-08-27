@@ -25,16 +25,28 @@ Run: pytest harness/tests
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 HOOK = BIN / "qb-hook"
+
+#: What `qb-hook` shells out to — the list `test_qb_hook_shared_tree.py` already
+#: keeps, for the same reason it keeps one: symlinked by name, so that a `qb-*`
+#: this hook can reach is reachable only when a test put it there.
+HOOK_TOOLS = ("jq", "curl", "git", "timeout", "sed", "grep", "sort", "tr", "cat",
+              "date", "stat", "basename", "dirname", "cut", "sha256sum", "bash",
+              "sh", "mktemp", "tail", "head", "python3", "rm", "printf", "env",
+              "uname", "wc", "awk", "id", "readlink", "paste")
 
 # jq and curl are not incidental: the hook exits 0 without either, so a sandbox
 # missing one would run every test below against a hook that no-op'd and report
@@ -78,6 +90,15 @@ class Hooked:
         )
         (self.stub / "curl").chmod(0o755)
 
+        # `qb-mode`, silent, stubbed for EVERY fixture here rather than by the
+        # tests that care — `test_qb_hook_shared_tree.py`'s `Guarded` learned this
+        # the hard way (#473): without it, whether a composed note carries #178's
+        # mode line is decided by whether the box running the suite has `qb-mode`
+        # installed. The PATH below now makes the installed one absent, so a hook
+        # that starts consulting it reads a silent answer rather than the host's.
+        (self.stub / "qb-mode").write_text('#!/bin/sh\nprintf \'{"label":null}\'\n')
+        (self.stub / "qb-mode").chmod(0o755)
+
         # A cwd that is deliberately not a git checkout: `repo` and `branch` then
         # stay empty and the hook makes no git subprocesses, which is one less
         # thing between the payload and the call under test.
@@ -87,13 +108,30 @@ class Hooked:
         self.run_dir.mkdir()
 
     def env(self, **over) -> dict:
-        base = {k: v for k, v in os.environ.items()
-                if k not in ("TMUX", "TMUX_PANE", "QUARTERBACK_INSTANCE")}
-        return {**base,
-                "PATH": f"{self.stub}:{os.environ['PATH']}",
-                "XDG_RUNTIME_DIR": str(self.run_dir),
-                "HOME": str(self.root / "home"),
-                **over}
+        """The hook's whole environment, built where the other half is (#528).
+
+        The `PATH` used to be `self.stub` followed by whatever the developer had,
+        which made `test_no_qb_catchup_on_path_is_not_an_error` a test of the
+        opposite of its name: `command -v qb-catchup` found the INSTALLED one and
+        ran it — measured, one real invocation per run — so the fail-open branch
+        it is named for was never taken. The stub directory plus a toolbox of
+        named binaries makes the absence real, and `${0%/*}/qb-catchup` cannot
+        put it back because the hook under test is a copy in `hookbin/`.
+
+        `HOME` was already pointed here, which is why this file made no board
+        calls; the rest of the credential surface (`$XDG_CONFIG_HOME`,
+        `$QUARTERBACK_*` inherited from the shell) was not, and `qb-env` resolves
+        `${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/…}`.
+        """
+        over.setdefault("XDG_RUNTIME_DIR", str(self.run_dir))
+        env = _path_sandbox.sandbox_env(
+            self.root, self.stub, tools=HOOK_TOOLS, **over)
+        # The developer's own multiplexer, out — unless a test asked for one.
+        # "There is no tmux here" is a state several of these assert on.
+        for pane in ("TMUX", "TMUX_PANE"):
+            if pane not in over:
+                env.pop(pane, None)
+        return env
 
     def fire(self, event: str, env: dict | None = None, **payload):
         body = {"session_id": "sid-1", "cwd": str(self.cwd),

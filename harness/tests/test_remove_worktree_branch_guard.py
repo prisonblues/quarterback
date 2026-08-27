@@ -17,12 +17,26 @@ Run: pytest harness/tests
 """
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
+
 BIN = Path(__file__).resolve().parent.parent / "bin"
 REMOVE = BIN / "remove-worktree"
+
+#: What the teardown shells out to: the names grepped out of `remove-worktree`,
+#: plus the ordinary coreutils it may reach through a `$(...)` this list cannot
+#: see. Generous on purpose — `toolbox()` refuses a name this host has not got,
+#: so an unused entry is loud, while a MISSING one reads to the script as "that
+#: tool is broken" and the test would report it as the behaviour of the guard.
+TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
+         "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
+         "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "hostname")
 
 
 def git(cwd, *args):
@@ -85,8 +99,26 @@ def add_worktree(repo, name, branch):
     return wt
 
 
-def run_remove(repo, name):
-    return subprocess.run([str(REMOVE), name], cwd=repo, capture_output=True, text=True)
+def run_remove(repo, name, tmp_path):
+    """The real script, with a `PATH` and a `HOME` this test owns.
+
+    It used to be `subprocess.run([...], cwd=repo)` with no `env=` at all, and
+    that is #528: the inherited `PATH` found the installed `worktree-holder`,
+    `qb-admit` and `qb-release`, the inherited `HOME` found
+    `~/.config/quarterback/config`, and the three tests below made three
+    authenticated `GET /active` calls to the PRODUCTION board with this machine's
+    own bearer token on every local run. The guard under test is about `git
+    branch -d`; the board had nothing to do with it and was reached anyway.
+
+    Both halves are needed and neither substitutes for the other. A sandboxed
+    `PATH` alone still leaves `${0%/*}/worktree-holder` resolving inside
+    `harness/bin`, because the script is invoked from there by absolute path —
+    so the tool is reachable no matter what `PATH` says, and the only thing that
+    stops it reaching the board is having no credential to reach it with.
+    """
+    return subprocess.run(
+        [str(REMOVE), name], cwd=repo, capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(tmp_path, tools=TOOLS))
 
 
 def branches(repo):
@@ -94,12 +126,12 @@ def branches(repo):
     return set(r.stdout.split())
 
 
-def test_a_worktree_parked_on_main_does_not_take_main_with_it(repo):
+def test_a_worktree_parked_on_main_does_not_take_main_with_it(repo, tmp_path):
     """The bug, end to end: teardown must remove the worktree and keep main."""
     add_worktree(repo, "feat-issue-82", "main")
     assert "main" in branches(repo)
 
-    proc = run_remove(repo, "feat-issue-82")
+    proc = run_remove(repo, "feat-issue-82", tmp_path)
 
     assert "main" in branches(repo), (
         f"remove-worktree deleted the default branch.\n"
@@ -111,7 +143,7 @@ def test_a_worktree_parked_on_main_does_not_take_main_with_it(repo):
     assert not (repo.parent / "proj-feat-issue-82").exists()
 
 
-def test_the_guard_holds_when_origin_head_is_missing(repo):
+def test_the_guard_holds_when_origin_head_is_missing(repo, tmp_path):
     """`origin/HEAD` is a local cache and a clone can simply not have it.
 
     Whichever way the default branch is worked out, deleting it is still wrong,
@@ -121,13 +153,13 @@ def test_the_guard_holds_when_origin_head_is_missing(repo):
     git(repo, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
     add_worktree(repo, "feat-issue-82", "main")
 
-    proc = run_remove(repo, "feat-issue-82")
+    proc = run_remove(repo, "feat-issue-82", tmp_path)
 
     assert "main" in branches(repo), (
         f"guard failed with no origin/HEAD.\nstdout:\n{proc.stdout}")
 
 
-def test_an_ordinary_feature_branch_is_still_deleted(repo):
+def test_an_ordinary_feature_branch_is_still_deleted(repo, tmp_path):
     """The guard must not turn into "never delete anything".
 
     Pruning the branch is the teardown's job for every branch that is not the
@@ -137,7 +169,7 @@ def test_an_ordinary_feature_branch_is_still_deleted(repo):
     add_worktree(repo, "fix-issue-43", "fix/issue-43")
     assert "fix/issue-43" in branches(repo)
 
-    proc = run_remove(repo, "fix-issue-43")
+    proc = run_remove(repo, "fix-issue-43", tmp_path)
 
     assert "fix/issue-43" not in branches(repo), (
         f"ordinary branch survived teardown.\nstdout:\n{proc.stdout}")
