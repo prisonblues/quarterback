@@ -162,6 +162,16 @@ SEAT_CMD_PROMPTS="claude"
 
 INITIAL_CMD=""          # resolved by resolve_initial_cmd; "" means type nothing
 INITIAL_CMD_SET=""      # non-empty once resolved, since "" is a real answer
+
+# WHAT THE SCREEN WAS ASKED FOR, which is not always what this invocation types.
+# `pace_gate` withholds the command when the shared window is spent, and that is a
+# decision about RIGHT NOW — so the screen records this one and not the gated one.
+# Recording the gated value would make a transient hold permanent: the option is
+# what `--add` reads back, so a screen built while the window was spent would go on
+# adding bare shells for the rest of its life, long after the window came back, and
+# the gate would have nothing left to re-check because there would be no command to
+# withhold.
+INITIAL_CMD_ASKED=""
 BOARD_SIZE="25%"        # tape pane height, bottom of the window, full width
 KEY_DEFAULT="C-q"       # the qb key, when QB_SEATS_KEY does not say otherwise
 BAR_BG=colour235        # the seat bar's OWN ground — see seat_bar for why it
@@ -1400,14 +1410,16 @@ start_seat() {
 # default instead. That exact bug had a name in the version of this file that
 # forwarded QB_SEAT_BRIEF, and it is worth keeping the spelling that avoided it.
 resolve_initial_cmd() {
-  [ -n "$INITIAL_CMD_SET" ] && return 0
-  if [ -n "${QB_SEAT_INITIAL_CMD+set}" ]; then
-    INITIAL_CMD=$QB_SEAT_INITIAL_CMD
-    INITIAL_CMD_SET=env
-  else
-    INITIAL_CMD=$SEAT_CMD_DEFAULT
-    INITIAL_CMD_SET=default
+  if [ -z "$INITIAL_CMD_SET" ]; then
+    if [ -n "${QB_SEAT_INITIAL_CMD+set}" ]; then
+      INITIAL_CMD=$QB_SEAT_INITIAL_CMD
+      INITIAL_CMD_SET=env
+    else
+      INITIAL_CMD=$SEAT_CMD_DEFAULT
+      INITIAL_CMD_SET=default
+    fi
   fi
+  INITIAL_CMD_ASKED=$INITIAL_CMD
   return 0
 }
 
@@ -1449,6 +1461,7 @@ inherit_initial_cmd() {
   if recorded=$(tmux show-options -t "$SESSION_ID:" -v @qb_initial_cmd 2>/dev/null); then
     INITIAL_CMD=$recorded
     INITIAL_CMD_SET=screen
+    INITIAL_CMD_ASKED=$recorded
     return 0
   fi
   resolve_initial_cmd
@@ -1936,7 +1949,10 @@ tmux set-option -t "$SESSION_ID:" @qb_repo "$REPO"
 # travelled. An option is read by this screen's own tooling; an environment
 # variable is inherited by every pane's shell and by whatever a human starts in
 # one, which is a wider blast radius than the value needs.
-tmux set-option -t "$SESSION_ID:" @qb_initial_cmd "$INITIAL_CMD"
+#
+# `INITIAL_CMD_ASKED` and not `INITIAL_CMD`: see the note by that variable. A pace
+# hold is about this moment and must not be written into what the screen IS.
+tmux set-option -t "$SESSION_ID:" @qb_initial_cmd "$INITIAL_CMD_ASKED"
 tmux set-option -t "$SESSION_ID:" @qb_seats_bin "$SELF"
 
 # The bar is opt-out because turning it on is not free: it takes over the status

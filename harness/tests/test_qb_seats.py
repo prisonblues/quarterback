@@ -3023,7 +3023,7 @@ def test_a_dash_command_that_collides_with_a_key_name_is_still_typed(screen):
 
 
 def test_no_dash_command_means_no_dash_pane(screen):
-    """Set-and-empty is the off switch, matching QB_SEAT_BRIEF's spelling."""
+    """Set-and-empty is the off switch, matching QB_SEAT_INITIAL_CMD's spelling."""
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "2")
     got = aux_panes(screen)
@@ -3805,6 +3805,29 @@ def test_obey_brings_the_seats_up_as_shells_rather_than_refusing_the_screen(scre
     assert "resets in 12m" in done.stderr, "and it says when it comes back"
     time.sleep(1.0)
     assert not typed.exists() or typed.read_text() == "", typed.read_text()
+
+
+def test_a_pace_hold_does_not_become_what_the_screen_is(screen):
+    """A held window is a fact about right now, not about the screen.
+
+    The recording is what `--add` reads back, so writing the WITHHELD value into it
+    would make a transient hold permanent: the screen would go on adding bare shells
+    for the rest of its life, long after the window came back, and the gate would
+    have nothing left to re-check because there would be no command to withhold.
+    """
+    _pace_stub(screen, "echo 'pace: HOLD'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "obey"
+    screen("-n", "1", "--cmd", "seat-stub original")
+    # Nothing was started — the gate did its job for this invocation …
+    assert len(wait_for_log(screen.log, 1, timeout=2)) == 0
+    # … and the screen still knows what it is made of.
+    assert screen.tmux("show-options", "-v", "-t", "t:",
+                       "@qb_initial_cmd").stdout.strip() == "seat-stub original"
+
+    # So when the window comes back, an --add is a seat again.
+    _pace_stub(screen, "echo 'pace: go'\nexit 0\n")
+    screen("--add")
+    assert "args=original" in wait_for_log(screen.log, 1)[0]
 
 
 def test_warn_says_the_window_is_spent_and_starts_the_seats_anyway(screen):

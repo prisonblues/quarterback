@@ -587,7 +587,17 @@ class Dash(App):
         # and resolves the repository from the checkout it runs in. The panels
         # list several repos now, so "issue #12" is not an address on its own.
         self.repo_slug = qd.repo_slug(self.repo)
-        self.agent_bin = os.environ.get("QB_SEAT_AGENT", "claude")
+        # WHICH AGENT THE ⚖ RUNS, and it is the dash's own knob rather than a
+        # seat's. It read `QB_SEAT_AGENT` until #540 retired that family, which
+        # would have left this the last reader of a variable nothing else sets and
+        # no documentation mentions — a knob that looks live and is not.
+        #
+        # NOT `QB_SEAT_INITIAL_CMD`, which is the nearest surviving thing and is
+        # the wrong shape: that is a whole command LINE and may carry a prompt of
+        # its own, so composing it with the one below would produce
+        # `claude-yolo -- /get-involved -- /panel-review-pr 42`. A binary is what
+        # this needs and a binary is what it asks for.
+        self.agent_bin = os.environ.get("QB_DASH_AGENT", "claude")
         # The ⚒ runs this rather than the agent directly (#371). Resolved once
         # and kept, so that a test can point it somewhere and so that the two
         # calls the button makes — `--policy` before the click and the spawn

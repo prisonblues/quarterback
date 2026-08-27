@@ -35,11 +35,19 @@ export QB_SEATS_PACE=off
 
 # SHELLS BY DEFAULT. This screen exists to be looked at, and two agents started
 # to look at a layout is two agents' worth of the shared subscription spent on it.
-if [ "${1:-}" != "--agents" ]; then
-  export QB_SEAT_AGENT="sh -c 'echo \"[try-dash-wide] a shell, not an agent — --agents for the real thing\"; exec \$SHELL -i'"
+#
+# `--cmd ''` since #540, and it is a plainer way to say the same thing: a seat is
+# given one line and an empty one leaves the pane's own shell. This used to export
+# QB_SEAT_AGENT with an `sh -c` that printed a notice and re-exec'd the shell —
+# which stopped being read when that variable was retired, and a guard that
+# silently stops guarding is worse here than no guard at all: the failure is two
+# real agents started to look at a layout, which is the one thing this avoids.
+SEATS_CMD=("--cmd" "")
+if [ "${1:-}" = "--agents" ]; then
+  SEATS_CMD=()
 fi
 
-"$BIN/qb-seats" -s "$SESSION" -n 2 -C "$HERE/.."
+"$BIN/qb-seats" -s "$SESSION" -n 2 -C "$HERE/.." ${SEATS_CMD[@]+"${SEATS_CMD[@]}"}
 
 cat <<EOF
 

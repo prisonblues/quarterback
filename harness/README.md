@@ -1536,7 +1536,10 @@ collide, and no marker to hold. What is left — the one line a pane is given �
 
 The knobs that went with it: `QB_SEAT_AGENT`, `QB_SEAT_BRIEF`, `QB_SEAT_SCOPE`,
 `QB_SEAT_YOLO`, `QB_SEAT_FORCE` and `QB_SEAT_REPO`. `QB_SEAT_PACE` was folded into
-`QB_SEATS_PACE`, which is the same question and now has one spelling.
+`QB_SEATS_PACE`, which is the same question and now has one spelling. The dashboard's ⚖
+had been reading `QB_SEAT_AGENT` for the binary it starts a review with, which would have
+left it the last reader of a retired variable, so that one is `QB_DASH_AGENT` now — the
+dash's own knob, beside `QB_DASH_REPO` and `QB_DASH_CONFIRM`.
 
 ### `qb-seats` — the agent screen
 
