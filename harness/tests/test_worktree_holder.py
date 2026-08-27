@@ -16,17 +16,29 @@ Run: pytest harness/tests
 """
 
 import json
-import os
 import shutil
 import subprocess
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
+
 BIN = Path(__file__).resolve().parent.parent / "bin"
 HOLDER = BIN / "worktree-holder"
+
+#: What `prune-worktrees` shells out to. Named one at a time so that
+#: `worktree-holder` — the thing the "not installed" test is ABOUT — cannot
+#: arrive with them.
+HOLDERLESS_TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat",
+                    "head", "tail", "wc", "date", "basename", "dirname", "rm",
+                    "mkdir", "env", "timeout", "jq", "sort", "find", "readlink",
+                    "curl", "python3")
 
 MINE = "11111111-1111-1111-1111-111111111111"
 PEER = "22222222-2222-2222-2222-222222222222"
@@ -121,22 +133,30 @@ def wt(tmp_path):
 
 
 def run(target, *, board_url=None, markers=None, session=MINE, args=(), token="tok"):
-    env = dict(os.environ)
-    env.pop("QUARTERBACK_BASE_URL", None)
-    env.pop("QUARTERBACK_TOKEN", None)
-    # A config file that does not exist is the "unconfigured host" case.
-    env["QUARTERBACK_CONFIG"] = "/nonexistent/quarterback/config"
+    """`worktree-holder` against the stub board, and against nothing else.
+
+    The sandbox root is the target's parent, which for every fixture here is the
+    test's own `tmp_path`. `inherit_path` because the subject is the real tool
+    talking to a stub board: it wants curl, jq and git for real, and there is no
+    absence being asserted.
+
+    `sandbox_env` supplies the "unconfigured host" case that the three lines this
+    replaced were trying to spell — `QUARTERBACK_CONFIG` at a file that is not
+    there — and also the part they could not, `$HOME` and `$XDG_CONFIG_HOME`
+    somewhere empty, so the fallback the config rule reaches for second is empty
+    as well (#528).
+    """
+    over = {}
     if board_url:
-        env["QUARTERBACK_BASE_URL"] = board_url
-        env["QUARTERBACK_TOKEN"] = token
+        over["QUARTERBACK_BASE_URL"] = board_url
+        over["QUARTERBACK_TOKEN"] = token
     if markers:
-        env["QB_SESSION_CWD_DIR"] = str(markers)
+        over["QB_SESSION_CWD_DIR"] = str(markers)
     if session:
-        env["CLAUDE_CODE_SESSION_ID"] = session
-    else:
-        env.pop("CLAUDE_CODE_SESSION_ID", None)
+        over["CLAUDE_CODE_SESSION_ID"] = session
     return subprocess.run(
-        [str(HOLDER), *args, str(target)], capture_output=True, text=True, env=env
+        [str(HOLDER), *args, str(target)], capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(Path(target).parent, inherit_path=True, **over)
     )
 
 
@@ -239,16 +259,12 @@ def test_branch_name_resolves_to_its_worktree(tmp_path, board):
     mark(markers, PEER, linked)
     b = board(agents=[lease(PEER)])
 
-    env = dict(os.environ)
-    env.update(
-        QUARTERBACK_CONFIG="/nonexistent/quarterback/config",
-        QUARTERBACK_BASE_URL=b.url,
-        QUARTERBACK_TOKEN="tok",
-        QB_SESSION_CWD_DIR=str(markers),
-        CLAUDE_CODE_SESSION_ID=MINE,
-    )
     r = subprocess.run(
-        [str(HOLDER), "fix/issue-43"], cwd=str(main), capture_output=True, text=True, env=env
+        [str(HOLDER), "fix/issue-43"], cwd=str(main), capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(
+            tmp_path, inherit_path=True,
+            QUARTERBACK_BASE_URL=b.url, QUARTERBACK_TOKEN="tok",
+            QB_SESSION_CWD_DIR=str(markers), CLAUDE_CODE_SESSION_ID=MINE),
     )
     assert r.returncode == 3, r.stderr
     assert str(linked) in r.stderr
@@ -334,15 +350,15 @@ def test_environment_beats_the_config_file(wt, board, tmp_path):
     b = board(agents=[lease(PEER, cwd=str(wt))])
     cfg = tmp_path / "config"
     cfg.write_text("QUARTERBACK_BASE_URL=http://127.0.0.1:1\nQUARTERBACK_TOKEN_CMD=\"printf wrong\"\n")
-    env = dict(os.environ)
-    env.update(
-        QUARTERBACK_CONFIG=str(cfg),
-        QUARTERBACK_BASE_URL=b.url,
-        QUARTERBACK_TOKEN="right",
-        QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
-        CLAUDE_CODE_SESSION_ID=MINE,
+    r = subprocess.run(
+        [str(HOLDER), str(wt)], capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(
+            tmp_path, inherit_path=True,
+            QUARTERBACK_CONFIG=str(cfg), QUARTERBACK_BASE_URL=b.url,
+            QUARTERBACK_TOKEN="right",
+            QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
+            CLAUDE_CODE_SESSION_ID=MINE),
     )
-    r = subprocess.run([str(HOLDER), str(wt)], capture_output=True, text=True, env=env)
     assert r.returncode == 3, r.stderr
     assert b.auth_seen == ["Bearer right"]
 
@@ -353,15 +369,14 @@ def test_an_environment_token_command_beats_the_config_files(wt, board, tmp_path
     b = board(agents=[lease(PEER, cwd=str(wt))])
     cfg = tmp_path / "config"
     cfg.write_text(f'QUARTERBACK_BASE_URL={b.url}\nQUARTERBACK_TOKEN_CMD="printf from-file"\n')
-    env = dict(os.environ)
-    env.pop("QUARTERBACK_TOKEN", None)
-    env.update(
-        QUARTERBACK_CONFIG=str(cfg),
-        QUARTERBACK_TOKEN_CMD="printf from-env",
-        QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
-        CLAUDE_CODE_SESSION_ID=MINE,
+    r = subprocess.run(
+        [str(HOLDER), str(wt)], capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(
+            tmp_path, inherit_path=True,
+            QUARTERBACK_CONFIG=str(cfg), QUARTERBACK_TOKEN_CMD="printf from-env",
+            QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
+            CLAUDE_CODE_SESSION_ID=MINE),
     )
-    r = subprocess.run([str(HOLDER), str(wt)], capture_output=True, text=True, env=env)
     assert r.returncode == 3, r.stderr
     assert b.auth_seen == ["Bearer from-env"]
 
@@ -370,15 +385,13 @@ def test_the_config_file_supplies_the_board_when_the_environment_does_not(wt, bo
     b = board(agents=[lease(PEER, cwd=str(wt))])
     cfg = tmp_path / "config"
     cfg.write_text(f"QUARTERBACK_BASE_URL={b.url}\nQUARTERBACK_TOKEN_CMD=\"printf from-cmd\"\n")
-    env = dict(os.environ)
-    env.pop("QUARTERBACK_BASE_URL", None)
-    env.pop("QUARTERBACK_TOKEN", None)
-    env.update(
-        QUARTERBACK_CONFIG=str(cfg),
-        QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
-        CLAUDE_CODE_SESSION_ID=MINE,
+    r = subprocess.run(
+        [str(HOLDER), str(wt)], capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(
+            tmp_path, inherit_path=True, QUARTERBACK_CONFIG=str(cfg),
+            QB_SESSION_CWD_DIR=str(wt.parent / "markers"),
+            CLAUDE_CODE_SESSION_ID=MINE),
     )
-    r = subprocess.run([str(HOLDER), str(wt)], capture_output=True, text=True, env=env)
     assert r.returncode == 3, r.stderr
     assert b.auth_seen == ["Bearer from-cmd"]
 
@@ -402,17 +415,29 @@ def _repo_with_leftover(tmp_path, leftover_name):
     return main, left
 
 
-def _caller_env(board_url, markers, path_extra):
-    env = dict(os.environ)
-    env.update(
-        PATH=f"{path_extra}:{env['PATH']}",
-        QUARTERBACK_CONFIG="/nonexistent/quarterback/config",
+def _caller_env(tmp_path, board_url, markers, path_extra):
+    """A caller pointed at the STUB board, and at nothing of the developer's.
+
+    `inherit_path` on purpose: these tests are about the real `prune-worktrees`
+    and `remove-worktree` finding the real `worktree-holder` and believing what
+    it says, so making the tools absent would delete the test. The board they all
+    reach is `board_url`, which is the fixture's own HTTP server.
+
+    It used to be `dict(os.environ)` with the same three overrides on top. That
+    was already pointed away from the real board — but by NAME, and the names
+    were the two that existed when it was written: the config on this fleet also
+    carries `QUARTERBACK_TOKEN_CMD`, `QUARTERBACK_TOKEN_REFRESH_CMD` and
+    `QUARTERBACK_HUMAN_URL`, and `~/.config` was still where a tool honouring
+    only `$XDG_CONFIG_HOME` would have looked. #528's point is that the list is
+    the wrong mechanism; the sandbox drops the whole prefix and empties the home.
+    """
+    return _path_sandbox.sandbox_env(
+        tmp_path, path_extra, inherit_path=True,
         QUARTERBACK_BASE_URL=board_url,
         QUARTERBACK_TOKEN="tok",
         QB_SESSION_CWD_DIR=str(markers),
         CLAUDE_CODE_SESSION_ID=MINE,
     )
-    return env
 
 
 def test_prune_leaves_a_held_directory_alone(tmp_path, board):
@@ -426,7 +451,7 @@ def test_prune_leaves_a_held_directory_alone(tmp_path, board):
     r = subprocess.run(
         [str(BIN / "prune-worktrees"), "--remove-dirs", "--project", "proj"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
     assert left.is_dir(), "a held worktree must survive --remove-dirs"
     assert "Held by a live agent" in r.stdout
@@ -443,7 +468,7 @@ def test_prune_still_removes_an_unheld_leftover(tmp_path, board):
     subprocess.run(
         [str(BIN / "prune-worktrees"), "--remove-dirs", "--project", "proj"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
     assert not left.exists()
 
@@ -470,7 +495,7 @@ def test_remove_worktree_refuses_a_held_worktree(tmp_path, board):
     r = subprocess.run(
         [str(BIN / "remove-worktree"), "fix-issue-43"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
     assert r.returncode != 0
     assert linked.is_dir(), "refusal must happen before anything is destroyed"
@@ -501,7 +526,7 @@ def test_remove_worktree_force_overrides_the_holder(tmp_path, board):
     subprocess.run(
         [str(BIN / "remove-worktree"), "--force", "fix-issue-43"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
     assert not linked.exists()
 
@@ -512,13 +537,16 @@ def test_callers_proceed_when_the_holder_check_is_not_installed(tmp_path, board)
     lone = tmp_path / "lonely-bin"
     lone.mkdir()
     shutil.copy(BIN / "prune-worktrees", lone / "prune-worktrees")
-    env = dict(os.environ)
-    env["QUARTERBACK_CONFIG"] = "/nonexistent/quarterback/config"
-    env.pop("QUARTERBACK_BASE_URL", None)
-    env.pop("QUARTERBACK_TOKEN", None)
+    # The copy into `lonely-bin/` defeats the `${0%/*}/worktree-holder` fallback.
+    # The PATH used to be `dict(os.environ)`, which re-opened the exact leak that
+    # copy exists to close: the installed `worktree-holder` was found by name and
+    # ran, so "no helper" was never the state under test and this test could not
+    # have failed if the degradation were removed (#528, and #472 before it).
+    # Measured before the fix: one real `worktree-holder` invocation per run.
     subprocess.run(
         [str(lone / "prune-worktrees"), "--remove-dirs", "--project", "proj"],
-        cwd=str(main), capture_output=True, text=True, env=env,
+        cwd=str(main), capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(tmp_path, lone, tools=HOLDERLESS_TOOLS),
     )
     assert not left.exists()
 
@@ -535,7 +563,7 @@ def test_create_worktree_names_the_holder_of_a_path_it_refuses(tmp_path, board):
     r = subprocess.run(
         [str(BIN / "create-worktree"), "--no-fetch", "--shared-db", "fix/issue-43"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
     assert r.returncode != 0
     assert "already exists" in r.stderr
@@ -641,7 +669,7 @@ def test_a_held_worktree_is_protected_from_every_sweep_not_just_the_directory(
     r = subprocess.run(
         [str(BIN / "prune-worktrees"), "--project", "proj"],
         cwd=str(main), capture_output=True, text=True,
-        env=_caller_env(b.url, markers, str(BIN)),
+        env=_caller_env(tmp_path, b.url, markers, str(BIN)),
     )
 
     assert "Held by a live agent" in r.stdout

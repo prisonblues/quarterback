@@ -27,6 +27,10 @@ sys.path.insert(0, str(BIN))
 
 import qbdata as qd                                       # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox                                      # noqa: E402
+
 QB_SEAT = BIN / "qb-seat"
 
 
@@ -111,13 +115,29 @@ def test_the_scope_rule_is_the_one_qb_seat_actually_applies(tmp_path, dirname):
     subprocess.run(["git", "init", "-q", str(d)], check=True)
     # A runtime dir of our own: --dry-run reads the pane markers, and a suite that
     # read the developer's would refuse whenever a real seat held that number.
+    #
+    # And an environment of our own, which this did not have (#528). It carried
+    # the developer's, minus two knobs — so `QB_SEAT_PACE` arrived at its shipped
+    # default of `warn` and each of these nine parametrisations started the real
+    # `qb-pace` beside the seat, which reads the developer's own subscription out
+    # of `~/.claude` and calls the usage endpoint. Measured: nine invocations per
+    # run, on figures that decide nothing about the scope rule under test.
+    #
+    # `sandbox_env` turns that knob off and empties the home the tool would read,
+    # which are two different fixes for two different halves — PATH cannot supply
+    # either, because `qb-seat`'s `pace_cmd` falls back to `${0%/*}/qb-pace` and
+    # resolves inside `harness/bin` however bare the PATH is.
+    #
+    # `inherit_path`, deliberately: this test's subject is the scope `qb-seat`
+    # ACTUALLY applies, so it wants the real tools the real script shells out to.
+    # Nothing here asserts on a tool being absent.
     run = tmp_path / "run"
     run.mkdir()
-    env = {k: v for k, v in os.environ.items()
-           if k not in ("QB_SEAT_SCOPE", "QB_SEAT_REPO")}
     done = subprocess.run(
         [str(QB_SEAT), "1", "--dry-run"], cwd=str(d), capture_output=True, text=True,
-        env={**env, "XDG_RUNTIME_DIR": str(run), "QB_SEAT_BRIEF": ""},
+        env=_path_sandbox.sandbox_env(
+            tmp_path, inherit_path=True,
+            XDG_RUNTIME_DIR=str(run), QB_SEAT_BRIEF=""),
     )
     assert done.returncode == 0, done.stderr
     instance = next(line.split(":", 1)[1].strip() for line in done.stdout.splitlines()

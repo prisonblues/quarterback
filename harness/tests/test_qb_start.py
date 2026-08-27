@@ -37,7 +37,6 @@ Run: pytest harness/tests/test_qb_start.py
 """
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -47,6 +46,10 @@ import uuid
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
 START = BIN / "qb-start"
@@ -163,20 +166,35 @@ def board_client():
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
 
     return {"script": copied, "policy": policy_path, "config": config, "repo": repo,
-            "tools": tools, "log": log, "posts": posts}
+            "tools": tools, "log": log, "posts": posts, "root": tmp_path}
 
 
 def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
         env: dict | None = None, cwd: Path | None = None):
     """`qb-start` inside the sandbox. `tmux` is what $TMUX is set to — empty means
     there is no multiplexer, which is a different answer from a broken one."""
-    where = {**os.environ,
-             "XDG_CONFIG_HOME": str(box["config"]),
-             "PATH": f"{box['tools']}{os.pathsep}{os.environ['PATH']}",
-             **(env or {})}
-    where.pop("TMUX", None)
+    over = {"XDG_CONFIG_HOME": str(box["config"]), **(env or {})}
     if tmux:
-        where["TMUX"] = tmux
+        over["TMUX"] = tmux
+    # `box["tools"]` and a toolbox of named binaries, not the developer's PATH
+    # (#528). `qb-start` resolves its neighbours with `shutil.which`, so the
+    # inherited PATH found the INSTALLED `qb-claim` the moment a test deleted the
+    # stub — `test_a_qb_claim_that_is_not_installed_refuses_the_spawn` ran a real
+    # `qb-claim issue 277` against a throwaway repo, measured once per run, and
+    # got its verdict from that tool failing for an unrelated reason rather than
+    # from the tool being missing. `sibling()`'s `${script dir}/qb-claim` fallback
+    # cannot restore it either: the copy under test sits in `stub/`, which holds
+    # only what this fixture wrote.
+    #
+    # `sleep` is on the list because tmux hands the pane it opens THIS PATH, and
+    # the real-tmux tests below use `sleep 60` as their still-running agent —
+    # measured: without it the pane's command dies at once and `@qb_spawn_ended`
+    # is set before the test can read it.
+    where = _path_sandbox.sandbox_env(
+        box["root"], box["tools"], tools=("git", "sh", "bash", "sleep"), **over)
+    if not tmux:
+        where.pop("TMUX", None)
+    where.pop("TMUX_PANE", None)
     got = subprocess.run(
         [sys.executable, str(box["script"]),
          "--repo-path", repo_path or str(box["repo"]), *args],

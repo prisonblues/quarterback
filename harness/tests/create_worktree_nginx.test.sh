@@ -113,6 +113,38 @@ exit 0
 STUB
     chmod +x "$box/bin/docker"
 
+    # A home with no quarterback config in it, and board tools that record what
+    # they were handed instead of doing it. #528: these two functions ran the
+    # real scripts with no environment of their own at all, so `worktree-holder`,
+    # `qb-admit` and `qb-claim` were found on the developer's PATH and read the
+    # developer's `~/.config/quarterback/config` — one authenticated `GET /active`
+    # against the PRODUCTION board on every run of this file, with a live bearer
+    # token, in a suite whose entire subject is an nginx config block.
+    #
+    # Both halves, for the reason the python side gives: the stubs stop the tools
+    # RUNNING, and the empty home stops anything that reaches them by another
+    # route (a `${0%/*}` sibling, a name this list has not got) from having a
+    # credential when it gets there. Neither alone is the property.
+    mkdir -p "$box/home/.config" "$box/home/.cache"
+    for tool in worktree-holder qb-admit qb-claim qb-release qb-mode qb-catchup; do
+        cat > "$box/bin/$tool" <<STUB
+#!/bin/sh
+# Records the environment it was handed, so the isolation is asserted rather
+# than assumed — see "the board is out of reach" below.
+{
+  printf '%s\n' "tool=$tool"
+  printf '%s\n' "HOME=\${HOME:-}"
+  printf '%s\n' "XDG_CONFIG_HOME=\${XDG_CONFIG_HOME:-}"
+  printf '%s\n' "QUARTERBACK_CONFIG=\${QUARTERBACK_CONFIG:-}"
+  printf '%s\n' "QUARTERBACK_BASE_URL=\${QUARTERBACK_BASE_URL:-}"
+  printf '%s\n' "QUARTERBACK_TOKEN=\${QUARTERBACK_TOKEN:-}"
+  printf '%s\n' "QUARTERBACK_TOKEN_CMD=\${QUARTERBACK_TOKEN_CMD:-}"
+} >> "$box/board.calls"
+exit 0
+STUB
+        chmod +x "$box/bin/$tool"
+    done
+
     printf 'FROM scratch\n' > "$repo/Dockerfile"
     cat > "$repo/.worktree.json" <<CONF
 {
@@ -148,17 +180,53 @@ CONF
     echo "$repo"
 }
 
+# The environment both runners hand the script under test (#528). Two halves:
+# this box's own board credentials removed by name, and every path a board client
+# would resolve pointed inside the sandbox.
+# `${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}` is
+# the one rule `qb-env:57` and `qbdata.resolve_config()` both apply, so all three
+# of those are set — a tool honouring any one of them lands somewhere this suite
+# made and left empty.
+#
+# Called INSIDE each runner's subshell rather than emitting `NAME=value` words for
+# `env` to split: a box path with a space in it would otherwise arrive as two
+# arguments, and the failure would look like a broken script rather than a broken
+# fixture.
+sandbox_env(){  # sandbox_env <box>   — exports into the calling subshell
+    local box="$1"
+    unset QUARTERBACK_BASE_URL QUARTERBACK_TOKEN QUARTERBACK_TOKEN_CMD \
+          QUARTERBACK_TOKEN_REFRESH_CMD QUARTERBACK_HUMAN_URL \
+          QUARTERBACK_HUMAN_KEY QUARTERBACK_HUMAN_KEY_CMD \
+          QUARTERBACK_INSTANCE QUARTERBACK_AGENT QUARTERBACK_ELEVATED_TOKEN \
+          QUARTERBACK_ELEVATED_TOKEN_CMD
+    export HOME="$box/home"
+    export XDG_CONFIG_HOME="$box/home/.config"
+    export XDG_CACHE_HOME="$box/home/.cache"
+    export CLAUDE_CONFIG_DIR="$box/home/.claude"
+    export QUARTERBACK_CONFIG="$box/home/no-such-quarterback-config"
+    export QB_SEAT_PACE=off
+}
+
 run_create(){   # run_create <repo> <branch>
-    local repo="$1" branch="$2"
-    ( cd "$repo" && PATH="$(dirname "$repo")/bin:$PATH" \
+    local repo="$1" branch="$2" box
+    box="$(dirname "$repo")"
+    (
+        cd "$repo" || return 1
+        sandbox_env "$box"
+        PATH="$box/bin:$PATH" \
         DOCKER_PS_NAMES="myproj-${branch//\//-}" \
-        bash "$CREATE" --no-workspace --no-fetch "$branch" 2>&1 )
+            bash "$CREATE" --no-workspace --no-fetch "$branch" 2>&1
+    )
 }
 
 run_remove(){   # run_remove <repo> <branch>
-    local repo="$1" branch="$2"
-    ( cd "$repo" && PATH="$(dirname "$repo")/bin:$PATH" \
-        bash "$REMOVE" --keep-branch "$branch" 2>&1 )
+    local repo="$1" branch="$2" box
+    box="$(dirname "$repo")"
+    (
+        cd "$repo" || return 1
+        sandbox_env "$box"
+        PATH="$box/bin:$PATH" bash "$REMOVE" --keep-branch "$branch" 2>&1
+    )
 }
 
 # The generated block for <safe name>, so assertions cannot pick up a sibling's.
@@ -251,6 +319,39 @@ hasnt "the template's Host default is replaced, not duplicated" "$repo/block.txt
     'proxy_set_header Host $host:$server_port;'
 has "unrelated extras are still appended" "$repo/block.txt" \
     'proxy_set_header X-Product $x_product;'
+
+# ---------------------------------------------------------------------------
+echo "The board is out of reach (#528)"
+# ---------------------------------------------------------------------------
+# The regression test for the reason this file was changed at all. It is not
+# enough that the assertions above pass: they passed before too, while every run
+# of this suite made an authenticated call to the production board. So the board
+# tools record the environment they were handed and it is read back here.
+#
+# Asserted against the tools that DID run rather than against the runner's own
+# source, because what matters is what arrived — a stanza that resolved its
+# credential by some other route would still be caught.
+repo=$(make_sandbox)
+box="$(dirname "$repo")"
+run_create "$repo" fix/issue-42 >/dev/null
+run_remove "$repo" fix/issue-42 >/dev/null
+
+eq "a board tool was actually reached, so this case can fail" \
+    "$([ -s "$box/board.calls" ] && echo yes || echo no)" "yes"
+hasnt "no board URL reached the tools" "$box/board.calls" "QUARTERBACK_BASE_URL=http"
+eq "no bearer token reached the tools" \
+    "$(grep -c '^QUARTERBACK_TOKEN=.' "$box/board.calls")" "0"
+eq "no token command reached the tools" \
+    "$(grep -c '^QUARTERBACK_TOKEN_CMD=.' "$box/board.calls")" "0"
+# The config file the ONE rule in qb-env:57 and qbdata.resolve_config() resolves.
+eq "every HOME they were given is inside the sandbox" \
+    "$(grep '^HOME=' "$box/board.calls" | grep -cv "^HOME=$box/")" "0"
+eq "every config path they were given is inside the sandbox" \
+    "$(grep '^QUARTERBACK_CONFIG=' "$box/board.calls" | grep -cv "^QUARTERBACK_CONFIG=$box/")" "0"
+eq "and that config file does not exist" \
+    "$([ -e "$box/home/no-such-quarterback-config" ] && echo yes || echo no)" "no"
+eq "nor does the one \$XDG_CONFIG_HOME points at" \
+    "$([ -e "$box/home/.config/quarterback/config" ] && echo yes || echo no)" "no"
 
 echo ""
 printf 'passed %d, failed %d\n' "$pass" "$fail"
