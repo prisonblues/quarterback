@@ -615,6 +615,70 @@ def test_a_key_command_that_hangs_names_the_prompt_nobody_answered():
     assert "desktop" in said and "✎" in said, said
 
 
+# ---------------------------------------------------------------------- #577
+# The variable every site's key command interpolates, and the reason no dial had
+# ever been set on this fleet.
+#
+# `qb-env` sets QUARTERBACK_AGENT after sourcing the config and before evaluating
+# anything out of it, so a reader that pulls the commands out and runs them itself
+# has to export it too. `qb-doctor` always did; this module did not, in two places.
+# The token got away with it because this fleet's TOKEN_CMD falls back to a file
+# that exists. The human key has no fallback, so what it read was
+# `op://…/quarterback-/human` — an item with an empty segment where the host name
+# belongs, which does not exist and never errored in a way anybody saw.
+
+
+def test_the_key_command_is_run_with_the_agent_name_it_interpolates():
+    """The #577 regression, in one line. Every site's command names the host —
+    `op read "op://personal-nix/quarterback-$QUARTERBACK_AGENT/human"` — and an
+    unset variable turns that into a path with an empty segment."""
+    assert human(cmd='echo "item-quarterback-$QUARTERBACK_AGENT"').key() \
+        == "item-quarterback-hermes"
+
+
+def test_an_unset_agent_would_have_read_a_path_with_an_empty_segment():
+    """What the bug actually produced, pinned so the shape is recognisable if it
+    ever comes back: the vault path is well-formed, addresses nothing, and `op`
+    does not fail in a way the dashboard could show."""
+    got = human(cmd='echo "op://personal-nix/quarterback-$QUARTERBACK_AGENT/human"').key()
+    assert got == "op://personal-nix/quarterback-hermes/human"
+    assert "quarterback-/" not in got
+
+
+def test_the_agent_a_host_names_itself_beats_the_hostname(tmp_path, monkeypatch):
+    """`qb-env`'s precedence: an explicit QUARTERBACK_AGENT is somebody naming a
+    machine and the hostname is a guess. A fleet that renames a host in its config
+    and not in its DNS would otherwise authenticate as the wrong one."""
+    config = tmp_path / "config"
+    config.write_text("QUARTERBACK_BASE_URL='https://qb.invalid'\n"
+                      "QUARTERBACK_AGENT='the-named-one'\n"
+                      "QUARTERBACK_TOKEN_CMD='echo tok-$QUARTERBACK_AGENT'\n")
+    for name in ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN", "QUARTERBACK_AGENT",
+                 "QUARTERBACK_TOKEN_CMD", "QUARTERBACK_HUMAN_URL",
+                 "QUARTERBACK_HUMAN_KEY", "QUARTERBACK_HUMAN_KEY_CMD"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("QUARTERBACK_CONFIG", str(config))
+    cfg = qd.resolve_config()
+    assert cfg.agent == "the-named-one"
+    # AND the token command saw it, which is the half that actually authenticates.
+    assert cfg.token == "tok-the-named-one"
+
+
+def test_a_host_that_names_no_agent_still_gets_the_short_hostname(tmp_path, monkeypatch):
+    """The fallback, and shortened the way `qb-env` shortens it — the board's
+    machine names are bare, and `uname -n` can carry a domain."""
+    config = tmp_path / "config"
+    config.write_text("QUARTERBACK_BASE_URL='https://qb.invalid'\n"
+                      "QUARTERBACK_TOKEN_CMD='echo tok'\n")
+    for name in ("QUARTERBACK_BASE_URL", "QUARTERBACK_TOKEN", "QUARTERBACK_AGENT",
+                 "QUARTERBACK_TOKEN_CMD", "QUARTERBACK_HUMAN_URL",
+                 "QUARTERBACK_HUMAN_KEY", "QUARTERBACK_HUMAN_KEY_CMD"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("QUARTERBACK_CONFIG", str(config))
+    cfg = qd.resolve_config()
+    assert cfg.agent and "." not in cfg.agent, cfg.agent
+
+
 # ---------------------------------------------------------------------- #539
 # The vocabulary a person needs in order to SET one.
 #

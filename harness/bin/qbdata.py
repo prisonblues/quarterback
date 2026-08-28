@@ -687,14 +687,47 @@ class BoardConfig:
         self.human_key_cmd = human_key_cmd or ""
 
 
+def command_env(agent: str) -> dict:
+    """The environment a config `*_CMD` is evaluated in.
+
+    One function because there is one rule and it has been got wrong three times
+    in this file's history: **`QUARTERBACK_AGENT` must be exported before any
+    command out of the site config runs.** Every site's commands interpolate it —
+    `op read "op://…/quarterback-$QUARTERBACK_AGENT/human"` on this fleet — and
+    `qb-env` sets it after sourcing the file and before evaluating anything from
+    it, so a reader that pulls the commands out and runs them itself inherits the
+    obligation along with the strings.
+
+    Without it the command reads a path with an EMPTY SEGMENT — `quarterback-`,
+    no host name — and what comes back is not an error a person can act on. The
+    token path survived it by luck for months, because this fleet's
+    `QUARTERBACK_TOKEN_CMD` begins `cat /run/op-secrets/quarterback-token ||` and
+    that file exists, so `op` was never reached; #235 is the record of the same
+    defect in the two clients that had no such fallback. The human key has none
+    either, and prisonblues/quarterback#577 is what that cost: every dial write
+    from the dashboard since #477 resolved a 1Password item that does not exist,
+    and the board's `/dials` was still empty fleet-wide when somebody finally
+    went looking.
+
+    `qb-doctor` has done this correctly all along, which is why it could see a
+    token on a host where this module could not.
+    """
+    return {**os.environ, "QUARTERBACK_AGENT": agent}
+
+
 def resolve_config() -> BoardConfig:
     """Environment first, then the per-host config file.
 
     The same contract `qb-env` implements in bash, and read the same way: the
-    config is an unrestricted shell script, so it is SOURCED IN A SUBSHELL with
-    three values read back out. Sourcing it into this process would let it
+    config is an unrestricted shell script, so it is SOURCED IN A SUBSHELL and
+    the values printed back out. Sourcing it into this process would let it
     replace anything it liked; parsing it with a regex would get the quoting
     wrong on the day someone puts a `$(…)` in their token command.
+
+    Reading the same names is not the whole contract, and #577 is what the rest
+    of it cost: the commands in that file are written to be evaluated with
+    `QUARTERBACK_AGENT` already exported, so anything that runs one has to go
+    through `command_env`.
 
     Deliberately no mcp_server import. Depending on it made the dashboard need a
     built checkout of this repo's mcp/ — which is a thing an INSTALLED harness
@@ -704,6 +737,13 @@ def resolve_config() -> BoardConfig:
     url = os.environ.get("QUARTERBACK_BASE_URL", "")
     token = os.environ.get("QUARTERBACK_TOKEN", "")
     token_cmd = os.environ.get("QUARTERBACK_TOKEN_CMD", "")
+    # READ, because every command in that file interpolates it. `qb-env` sets
+    # this AFTER sourcing the config and before evaluating anything out of it, so
+    # a caller that reads the commands and runs them itself has to do the same —
+    # see `command_env`. An explicit value beats the hostname, which is the
+    # precedence `qb-env` documents: naming a machine is somebody's decision and
+    # the hostname is this function's guess.
+    agent = os.environ.get("QUARTERBACK_AGENT", "")
     # The browser vhost and a signed-in session for it. Both optional and both
     # usually only in the file — a shell has no reason to carry them — which is
     # why the condition below asks about them too. It used to read "no url or no
@@ -733,7 +773,8 @@ def resolve_config() -> BoardConfig:
                       'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n'
                       'printf "human_url=%s\\n" "${QUARTERBACK_HUMAN_URL:-}"\n'
                       'printf "human_key=%s\\n" "${QUARTERBACK_HUMAN_KEY:-}"\n'
-                      'printf "human_key_cmd=%s\\n" "${QUARTERBACK_HUMAN_KEY_CMD:-}"\n')
+                      'printf "human_key_cmd=%s\\n" "${QUARTERBACK_HUMAN_KEY_CMD:-}"\n'
+                      'printf "agent=%s\\n" "${QUARTERBACK_AGENT:-}"\n')
             got = subprocess.run(["bash", "-c", script], capture_output=True,
                                  text=True, timeout=15)
             if got.returncode == 0:
@@ -751,16 +792,23 @@ def resolve_config() -> BoardConfig:
                         human_key = value
                     elif name == "human_key_cmd" and not human_key_cmd:
                         human_key_cmd = value
+                    elif name == "agent" and not agent:
+                        agent = value
+
+    # The hostname is the FALLBACK and not the answer, and it is shortened the
+    # way `qb-env` shortens it: `uname -n` and `/etc/hostname` can carry a domain
+    # where the board's machine names are bare.
+    agent = agent or socket.gethostname().split(".", 1)[0]
 
     if not token and token_cmd:
         got = subprocess.run(["bash", "-c", token_cmd], capture_output=True,
-                             text=True, timeout=30)
+                             text=True, timeout=30, env=command_env(agent))
         token = got.stdout.strip() if got.returncode == 0 else ""
 
     if not url:
         raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset "
                            "and the site config did not supply one)")
-    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0],
+    return BoardConfig(url, token, agent,
                        human_url=human_url, human_key=human_key,
                        human_key_cmd=human_key_cmd)
 
@@ -869,7 +917,8 @@ class HumanClient:
                                "the _CMD form")
         try:
             got = subprocess.run(["bash", "-c", self.cfg.human_key_cmd],
-                                 capture_output=True, text=True, timeout=30)
+                                 capture_output=True, text=True, timeout=30,
+                                 env=command_env(self.cfg.agent))
         except subprocess.TimeoutExpired as exc:
             # THE LIKELY CAUSE, NAMED. `op read` against a desktop-app
             # integration raises a biometric prompt, and a prompt nobody answers
