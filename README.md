@@ -1784,6 +1784,7 @@ full — including what was broken before it, which is the part no diff recovers
   matters most.
 - **v3.20** — an existing backlog can be ordered, and an actionable issue can be picked up.
 - **v3.21** — the fleet hands out its own work, and what stops it becomes a row.
+- **v3.22** — a panel can earn its stop, and work that was dropped leaves a trail.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps

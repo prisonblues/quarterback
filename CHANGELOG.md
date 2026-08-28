@@ -17,6 +17,428 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.22 — a panel can earn its stop, and work that was dropped leaves a trail
+
+### a fifth vendor, and the seat that would not review without its tools
+
+The panel could reach four vendors: claude, codex, antigravity (Google) and pi
+(everything OpenRouter fronts). xAI's `grok` is now the fifth, off by default like
+the other two workstation CLIs, and enabled per repo through `reviewers.grok` in
+`.harness-rules`. A round's confidence comes from independent readers, and until now
+this host ran two-of-four more often than not.
+
+**Its prompt travels in a file, so it is not a second `agy`.** `grok -p` wants the
+prompt as a flag value and reads nothing from stdin, which is exactly the shape
+that makes `antigravity` the one seat the kernel's 120,000-byte argv limit binds.
+But it also takes `--prompt-file`, so the diff goes in a file and nothing in the
+argv-clamping path — `argv_clamp`, `ARGV_PROMPT_MAX_BYTES`, the "truncated for
+antigravity" note — grew a second member. The file is written into the member's
+private temp dir and not into the sandbox repo it is given as a cwd, and that is
+load-bearing: a trial run with the prompt inside the cwd had grok `list_dir` the
+directory, find `prompt.txt` and read its own instructions back as if they were
+the code under review.
+
+**This seat keeps read tools, reversing what every other seat learned.** codex and
+pi are driven toward `--no-tools` because tools in an empty sandbox are wasted
+turns. Measured twice on grok-4.6, taking them ALL away does not produce a quiet
+reviewer — it produces no review at all: the seat streams "I'll look at
+app/util.py and any tests or callers" over and over, 21 KB of the same sentence in
+the run that was let go, until the CLI timeout takes it. That costs a whole vendor
+and a full turn of tokens for nothing. Given `read_file`/`grep`/`list_dir` it calls
+them, finds the empty repo `member_sandbox` built, and reviews the diff it was
+handed. The seat is still `code_blind` in the v2.50 sense — what it can read is an
+empty directory — so nothing above it changes.
+
+**What makes that safe is the sandbox profile, and the obvious spelling is the
+wrong one.** grok's `read-only` profile restricts writes and leaves reads
+unrestricted at filesystem root: under it the seat read this repo's
+`panel_core.py` from its sandbox and quoted the first line. `strict` is the
+profile that bounds READS to the cwd, and under it the same request comes back
+"Permission denied". It is Landlock-enforced over the whole process and
+irreversible once applied, so it holds where tool filtering does not.
+
+**`--tools` does not disable the tool injection it documents.** An allowlist of
+`read_file` alone still left the seat holding MCP's `search_tool`/`use_tool`, and
+it enumerated 31 quarterback tools and offered to call them. grok reads MCP
+servers from `~/.claude.json` (Claude Code compat) as well as its own config, so
+these are the USER's servers and no clean cwd closes it — this is codex's
+`features.apps=false` lesson arriving at a second vendor. They are denied
+explicitly, along with `Agent`.
+
+**`--permission-mode` is pinned because this fleet's `~/.grok/config.toml` says
+`always-approve`.** An unpinned seat inherits it and runs yolo, auto-approving
+every tool call with no confirmation a headless run could withhold — a workstation
+preference leaking into a reviewer.
+
+**Pin `reviewers.grok.model`.** grok's own default is `[models] default` from the
+user's config, which on this fleet routes through OpenRouter rather than to the
+first-party model: an unpinned seat would review on a different model, through a
+different account, than the report names. `effort` is `low|medium|high|xhigh` —
+narrower than codex's or pi's — and the CLI validates it locally, so a typo costs
+a startup rather than a turn.
+
+Known and not fixed here: grok executes the user's Claude Code lifecycle hooks
+from `~/.claude/settings.json`, so every grok seat fires `qb-hook SessionStart` and
+registers a phantom agent on the board. There is no flag to turn that off. It is
+board noise rather than a wrong review, and is tracked as
+[#234](https://github.com/prisonblues/quarterback/issues/234).
+
+### a row that says when work exists only on this disk
+
+Eleven branches on zeus carried twenty-eight commits that existed on no remote anywhere,
+the oldest nineteen days old. If that disk had failed the work was gone, nothing anywhere
+said so, and there were ninety-four worktrees to hide it in. `qb-doctor` now has an
+`unpushed` row in the `landing` group, which asks `landed`'s question one step earlier: not
+whether finished work is reaching the branch it has to reach, but whether it has left the
+machine it was written on.
+
+#### The query, and the near-miss it is not
+
+`git rev-list <branch> --not --remotes` — reachable from a local branch and from no remote
+ref at all. Comparing each branch to its own `origin/<branch>` instead looks equivalent and
+is much worse: measured on the same hundred branches the same afternoon, it reported eight
+branches carrying 133 commits, of which **five were ancestors of `origin/main` in their
+entirety** — a merged branch whose remote was deleted keeps its local merge commits, and
+comparing against a ref that no longer exists calls every one of them lost. It also missed
+seven of the twelve real cases, because a branch that was never pushed has no `origin/` ref
+to be compared against. Wrong five times in eight, silent seven times in twelve.
+
+#### Age is the verdict, and there is no baseline
+
+Something is always in flight, so a row that failed on a non-zero count would be red on a
+healthy afternoon and skipped within a week. Under a day the row reports the number and
+stays `ok`; over it, it fails and names the oldest date. There is deliberately no stored
+first-run baseline: it would go green on exactly the nineteen-day backlog that is the
+exposure, would make the verdict depend on a state file one host holds, and answers a
+premise that is false anyway — this count falls the moment a branch is pushed,
+cherry-picked or deleted. It moved 11 → 12 while the row was being written, because another
+agent committed on a branch mid-measurement.
+
+The remedy is a decision per branch — push it, cherry-pick the part worth keeping, or
+delete it — so this is a `human` brief and not an `agent` one. Several of these are
+abandoned experiments whose remote nobody wants, and at least one duplicated work that had
+already landed by another route.
+
+A host that cannot make the measurement gets `unknown` and never `ok`: `--not --remotes`
+against stale refs answers confidently and wrongly in both directions. That covers a fetch
+that failed, a configured remote that is not there, and a remote whose refspec does not bring
+back `refs/heads/*` — a single-branch clone would otherwise report every feature branch on
+the server as stranded. Every remote is refreshed and not only the configured one, since the
+query subtracts the tracking refs of all of them. A repository with no remote at all gets
+`ok`, because there is no elsewhere for its commits to be.
+
+`qb-doctor` also now fetches once per remote per run rather than once per row that needs it,
+and its `--only` help no longer breaks a row name across two lines.
+
+### a pickup says where the last agent to take this issue left the work
+
+The link from an issue to the worktree its work is in has always been recorded, and nothing
+could read it. `create-worktree` writes `worktree <branch> on <host>` on every claim it takes —
+the standard pickup path, not a convention — so a claim on issue N carries the tree that was
+made for issue N. When that claim decays, `_sweep_lapsed` retires the row rather than deleting
+it, because "the holder let go" and "the holder vanished" are different facts. Then every query
+on the table filtered `released_at IS NULL`, so a decayed claim was invisible to every consumer
+and the `lapsed` column was written and never read. Two agents wrote #179 twice; #196 has been
+open for ten days with five unpushed commits sitting on `feat/qb-dash-buttons` and a lapsed
+claim that could have said so.
+
+#### `GET /claims/lapsed` — the vanished half, and only that half
+
+A sibling endpoint rather than a flag. "What is claimed right now" has a correct answer and a
+lot of callers, and widening that listing for one new consumer would change what all of them
+see. `include_released=true` is unchanged and still says "history too", undifferentiated.
+
+A released claim means the holder said they were done, so pointing a new agent at merged work
+is noise. Only the lapsed half is returned, and rows past their expiry that nothing has swept
+count as lapsed: the sweep is passive, so the column alone is not the population. On the live
+board 8 rows carried the flag and 73 more had simply gone quiet, #196's among them.
+
+Each row carries `worktree` — the branch and host parsed off the note — plus `stopped_answering`
+(the expiry, not the sweep, which can be days later) and a `redirect` sentence. The worktree is
+what was **recorded**: the board makes no outbound calls and cannot see another machine's disk,
+so it never asserts that a tree is still there.
+
+#### The redirect arrives at the moment of pickup
+
+A fresh `POST /claim` or `POST /plan/item/claim` answers `previously` when this exact key was
+taken by somebody who then stopped renewing — so `/fix-issue` (via `create-worktree` and
+`qb-claim`) and `/get-involved` (via `qb-next`) both say where to look, without asking. Silent
+on a renew, silent on a key with no history, and never a refusal: "abandoned for a reason, carry
+on" stays a legitimate answer.
+
+The client adds the half the board cannot know. On the box the tree was recorded on, it reports
+whether the worktree is still there, or gone with its branch still holding unpushed commits, or
+gone entirely; from anywhere else it says the disk cannot be checked from here rather than
+implying there is nothing to find. When the note recorded no worktree — a claim taken by hand,
+as #196's was — it falls back to local commits citing the issue that are on no remote, which is
+what finds `feat/qb-dash-buttons`. That search stays the fallback: it runs only because an exact
+claim already said somebody was here, so it can never become the check that fires on every issue.
+
+`lapsed_claims` asks the same question over MCP for a key you have not claimed.
+
+### a round where nothing ran no longer reads like one with a green suite
+
+The panel's own confidence signal could not tell a PR whose full test suite passed
+on the exact commit from one where **no run exists at all**. `ci_status` reached the
+report, where it printed a warning, and reached `coverage_veto` — the function that
+decides whether a quiet round is evidence of a quiet PR — not at all. Its signature
+was `reviewer_meta`, `judge_skip`, `flagged`, `diff_chars`, and CI was in none of them.
+
+Nothing had gone wrong yet, because the gap was being held shut by an accident: told
+"CI is still running" or "no run exists", four seats each declare in prose that they
+cannot verify the runtime, and each declaration becomes a veto line. So the round
+carried one fact stated four times, from the wrong level, and the number was doing
+the work. Remove those declarations — which is exactly what #547 proposes — and a
+round where nothing executed reports as confident.
+
+Now the round carries **one veto naming a cause somebody can discharge**, and it is
+discharged by making CI run rather than by a human acknowledging anything.
+
+#### Which states cost the round its confidence, and which do not
+
+`PASS` and `FAIL` do not. A red suite is *evidence*: the seats are already told to
+treat it as a fact they may reason from rather than a finding to re-report, and
+`preland.check_ci` refuses the merge on it regardless. A round that read a real
+failure is not a round that read nothing. That split is only sound while both gates
+are applied — it says the round *had* evidence, never that red is harmless.
+
+The other four each veto **in their own sentence**, and only two of them are claims
+about execution at all:
+
+- `none` — nothing ran, the case this fixes;
+- `blocked` — a run exists and will not execute until a person approves it, so it
+  contributes nothing. It must not borrow `none`'s wording; conflating the two is
+  how PR #282 sat for two days looking untouched;
+- `PENDING` — the suite had not settled by the time the seats were dispatched, after
+  the bounded wait #501 already takes. Not "nothing ran": its other checks may be green;
+- `unknown` — CI could not be read. **Could-not-check is not nothing-to-report**, so
+  this one names execution only as the question it leaves open.
+
+Filling the empty channel at source, so fewer rounds reach any of these, is #548 and
+is deliberately not folded in here.
+
+#### The repo that genuinely has no CI says so once, and is not asked again
+
+`coverage_veto`'s standing rule is that a constant never vetoes: an observation true
+of every round distinguishes nothing, makes a confident stop unreachable rather than
+rare, and trains its reader to ignore the signal. On a repo with no CI configured,
+`none` would be exactly that.
+
+It already has somewhere to say so. `preland` refuses `none` by naming the remedy in
+its own refusal — `"preland": {"disabled_checks": ["ci"]}` in `.harness-rules`,
+*"rather than reading silence as green"* — so a repo that has written it has answered
+this question in writing, and the round stops asking. Exactly `none` is exempted: the
+declaration explains an **absent** run, not a gated one, an unsettled one or a lookup
+that failed, and a repo with no CI cannot produce those anyway. An **unexplained**
+`none` still vetoes, which is the whole distance between "this repo has no CI" and
+"nothing ran on this commit".
+
+#### Two things that make it hard to lose again
+
+The rule is written as the two states that do **not** veto, so a CI state added to
+the vocabulary later costs the round its confidence until somebody argues it out —
+rather than passing in silence, which is how `none` reached today. And `ci_status`
+is keyword-only with no default: a caller that forgets it raises, instead of quietly
+buying a confident stop for a round with no settled CI result behind it.
+
+### a capability limit stops reading like a reviewer that could not be bothered
+
+A `could_not_assess` line from a seat that did not open a file it could have opened,
+and one from a seat that would need a running Postgres and a browser, produced the
+same thing: a veto line, `stop_confident: false`, a HOLD. The first impugns the round.
+The second is not a statement about the round at all — it is a statement about what
+kind of instrument a panel of models reading a diff **is**, and it is true of every PR
+about runtime behaviour the repo will ever open.
+
+That is `coverage_veto`'s own forbidden constant, and the cost is not noise. A veto
+that fires on every PR touching runtime behaviour stops discriminating, and the
+rational response is to drop `--require-earned-stop` — **an unsatisfiable gate is a
+gate that gets removed, and then there is no gate.** It is also what kept
+`/fix-and-land`'s confidence-gated merge permanently out of reach on exactly the
+changes it exists for.
+
+#### The split was already being made, in prose, and thrown away
+
+The master judge is asked to adjudicate these declarations already, and on the run
+that prompted this it did the job unprompted: it went through all four, ruled that the
+jsonb-ceiling, mixed-corpus and browser-payload questions "require running code or
+data this checkout cannot provide", and that one seat's html-import question "was
+trivially checkable by reading the test file's imports and was not". Then the veto
+list was built from the raw declarations regardless.
+
+It now answers in `coverage_rulings` beside the note it already writes — no extra
+model call. One entry per **claim** rather than per declaration, pointing at
+declarations by the **number** the panel minted rather than at their wording, which is
+the rule every other exemption in that function keeps and states twice.
+
+#### A ruling exempts nothing. It converts.
+
+The two existing exemptions are read off recorded state: a seat whose CLI this box
+does not carry, a seat with no access to the code. Those are things the host and the
+sandbox did. A ruling is a model's opinion about a model's sentence, and an exemption
+resting on one alone would be a confidence gate the panel could open by writing about
+itself.
+
+So `resolvable_in_harness: false` turns the declaration into a **named obligation**
+with a key, and the obligation goes on vetoing until a person passes that key to
+`--acknowledge`. What a model can change is what the veto line says. What it cannot do
+is remove one — which means the incentive to declare everything unanswerable arrives
+at a longer ledger rather than a shorter one.
+
+Only a literal `false` counts. A missing key, a string spelling of the word, a claim
+with no name, a declaration two entries both claim, two identical declarations from
+one seat, a second claim colliding with an existing key, a reply that will not parse,
+a judge that did not run: every one of them leaves the declaration vetoing exactly as
+it did before. The exemption takes an affirmative typed act and silence never buys
+one, and every unreadable case fails towards the veto rather than away from it.
+
+Merging deletes lines — four seats stating one limit become one obligation where they
+were four vetoes, which is the whole of the seat-count fix below. What no ruling can
+do is delete the last one, so a set of declarations that cost a round its confidence
+before still costs it afterwards.
+
+#### What a confident stop now requires that it did not before
+
+An explicit, per-claim human acknowledgement, by key, of every assertion this PR makes
+that nothing in the review could check — recorded on the command line and carried in
+the payload. Before, such a round could not stop confidently at all; there was no act
+that would have let it. There is still no flag that accepts them all at once, because
+a gate that always passes is worse than one that always holds: it looks like
+assurance.
+
+#### The claims are kept, which was always the valuable part
+
+"Nobody checked whether stored rows are now a mixed corpus" is the best output of the
+round that raised it. Every unverifiable claim reaches the payload's
+`unresolved_claims` ledger with its key, what would settle it, and whether it has been
+accepted — and gets a GitHub issue whatever `review_panel.file_deferral_issues` says,
+on an escalation's footing, because it carries a question past the end of the session
+rather than filing a task. `panel-review-pr.md` §4c is the orchestrator's half.
+
+It is the one road here with **no board row**, and that is stated rather than quietly
+skipped: `qb record-outcome` keys on a finding key, an obligation has none — no
+reporter, no severity, no chain — and giving it one would need a schema change this
+does not take. The payload and the issue are the record.
+
+#### Adding a reviewer no longer costs a confident stop
+
+Under `confident = not veto` each extra seat contributed its own copy of the same
+capability limit and every copy was a veto, so a fifth seat made a confident stop
+strictly *less* reachable while adding findings rather than evidence. Now the judge
+merges the copies and the ledger carries one entry. What a new seat can still cost the
+round is a gap it found that the others missed and that this panel **could** have
+closed — which is diligence, is discharged by going and looking, and is the behaviour
+worth keeping.
+
+#### It cannot lengthen the veto list anywhere
+
+An obligation stands in only for a line that would have been emitted anyway, so a
+blind seat's declarations and an absent seat's cannot become one — they cost the round
+nothing today and must not start costing it something here. And #546's separation is
+untouched: a round with no settled CI result still vetoes on `ci_status`, whatever the
+seats did or did not say, so a round where nothing executed cannot reach a confident
+stop through this door.
+
+### one condition, one bell — and an escalation that says what raised it
+
+`qb-doctor --announce` runs on a timer on every enrolled box and deduplicates in that box's
+own cache file, so a fault the whole fleet can see is announced once per machine. On
+2026-08-28 zeus and hermes posted *3 pull requests (#566, #564, #538) ready to land* six
+minutes apart, and did it again nine minutes later; the same day's board also carried *"7
+harness scripts are not on hermes"* and *"8 harness scripts are not on zeus"*, which are two
+facts and not a duplicate. Duplicate alarms are how an alarm becomes background noise, and
+the second pair is why "just dedupe on the fault" is the wrong fix.
+
+#### Whose fault a row describes is now a declaration, not an inference
+
+Every `qb-doctor` check registers `scope="repo"` or `scope="host"` beside its group and its
+explanation, and there is no default: a new row will not construct without its author
+deciding. A `repo` row is about something the fleet shares — a queue, a branch, a forge
+setting, the board's own escalation path — and every machine watching that repository
+reaches the same verdict about it. A `host` row is about this box.
+
+The two directions of a mistake here are not symmetric, which is why this is a declaration
+and not a rule derived from something already present. Calling a shared row `host` costs a
+duplicate post. Calling a host row `repo` **silences a real per-machine fault** — the first
+box to notice speaks for boxes it knows nothing about. So a row whose scope is not obvious
+is `host`, the direction that only ever costs noise, and a `Check` built anywhere but the
+registry is `host` too.
+
+The tempting inference was the group, and seven of the ten rows outside the `host` group
+are nonetheless about one machine. `unpushed` counts commits on this disk; `briefs` reads
+the briefs this host would open — the ones the harness on PATH ships, a different set the
+moment that harness falls behind — and `instructions` asks the same of the same host's
+prose. A Codex pass over the first cut found four more that only look fleet-wide: `merges`
+reads the pre-push hook installed here as well as the repo's tagger, `stamper` reads this
+checkout's files and its own `git config`, and `generated` and `tags` answer through
+locally fetched refs and a checkout that can be stale. All seven are `host`; three rows are
+`repo` — `queue`, `landed` and `escalations`. A dedupe keyed on the group would have
+silenced every one of the seven.
+
+**The subject is a second lock, and it is why a wrong answer degrades safely.** A peer is
+matched on the headline — repo, class, row name and the row's own subject — so a row whose
+subject is a path on this disk cannot match another machine's post even when it is
+classified `repo` by mistake. That is not luck: a subject naming something host-local is
+exactly what makes a row host-local. The rule for a new row is therefore a test somebody
+can apply — a row may be `repo` only if every machine watching that repository would
+compute the same subject.
+
+#### The board is the record of what has already been said
+
+No new table and no new endpoint: the record of an announcement is the announcement. Before
+raising a `repo` row, the doctor reads the recent `stuck` posts for that repository and
+stays quiet if another machine's is already there — matching on the headline prefix (repo,
+class, row name, subject) composed by the same `needs_human.headline` that writes it, so a
+reader and a writer cannot drift into a matcher that silently stops matching.
+
+**Own posts are excluded, so a single host behaves exactly as it did.** zeus announced two
+ready pull requests, then three, then four, because its local key carries *which* ones are
+ready; matching a host against its own history would have collapsed that escalation into one
+post. What is removed is only the second telling.
+
+The subject is now part of the summary rather than the detail, which is what makes that
+match exact — a line stopped on `test` used to be indistinguishable from a line stopped on
+`main`, and `board_read` shows summaries only, so the subject reached nobody who did not
+open the post.
+
+Every failure announces. An unreachable board, an answer of the wrong shape, a
+`needs_human` older than this change and unable to say how a headline is spelled: all of
+them post, and the post says the fleet-wide dedupe could not run, so a reader can tell a
+duplicate nobody tried to prevent from one that arrived anyway. A board that will not say
+which machine this token belongs to is in that list too, and the obvious fallback is the
+one trap left: reading the OS hostname instead would make a box whose token was minted
+under another name fail to recognise its own posts, read them as a peer's, and suppress its
+own escalation — on a half-reachable board, which is to say at the moment nobody is
+watching.
+
+Posts are dated against the window here rather than trusted from it, because `/board` floors a quiet window at the ten
+most recent posts of the slice whatever their age — trusting that floor would suppress a
+live escalation on the evidence of last week's. A `host` row's dedupe key now carries the
+hostname as well, so two machines finding the byte-identical local fault cannot produce the
+identical key however they are stored.
+
+#### A `stuck` post says what raised it
+
+All ten of those posts carried `from: zeus` and `session: null`, and a null session reads as
+an agent that failed to identify itself. Under a timer it means something else: a systemd
+unit is not an agent and has no session. Stamping `INVOCATION_ID` into the post's `session`
+would put a plausible identity in a field that joins against leases, `/sessions` and every
+session-scoped read, and resolve in none of them — the same null in a better costume.
+
+So the post says what it actually is. When Claude Code is running the doctor there is a
+session and the post is filed under it, which is the case where *ask the thing that raised
+this* has an answer. When a timer is running it, the detail names the unit, the host and the
+systemd invocation instead — and the invocation is what makes two escalations from one box
+two escalations rather than one box twice.
+
+#### Not in this change
+
+The escalation still has no destination beyond the board. Whether that becomes **pull** (the
+board surfaces open blockers prominently), **push** (a real notification out of the fleet)
+or **act** (a lander takes the head of the line, which #405 is emphatic is its own decision)
+is open, and nothing here forecloses it. This makes the thing that would be pulled, pushed or
+acted on say one true thing once, and name who said it.
+
 ## v3.21 — the fleet hands out its own work, and what stops it becomes a row
 
 ### the dash full screen, from the keyboard or the ⛶
