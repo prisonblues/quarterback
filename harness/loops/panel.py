@@ -918,8 +918,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # further down, beside the CI settle — the one place that knows whether GitHub
     # had anything to say — because running the suite is only ever the answer to
     # that question. Nothing is executed by this read.
-    local_cmds = local_suite_commands(panel)
-    local_timeout = local_suite_timeout(panel)
+    #
+    # And NOT from `panel`, which is the only reader in this function that does not
+    # use the resolved block. `panel` includes the working tree on the interactive
+    # path, and a round is usually run from a worktree checked out at the PR's own
+    # head — so `panel["local_suite"]` would be a command the pull request under
+    # review chose, executed by the thing reviewing it. `trusted_panel_block` reads
+    # the default branch in both modes; `harness_rules.default_branch_rules` has the
+    # argument, and PR #604 has the review that found this.
+    trusted = trusted_panel_block(cfg, notes)
+    local_cmds = local_suite_commands(trusted)
+    local_timeout = local_suite_timeout(trusted)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -1974,10 +1983,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # repo declares a suite and the checkout was in no state to run it" is the
         # fact a reader of a `none` round now needs, and it is invisible in
         # `ci_status`, which is unchanged in exactly that case.
+        # NO `output` KEY, and its absence is the point. The payload is POSTed to the
+        # board, so persisting a failing command's own text there would take the
+        # thing this feature keeps out of a public PR comment — output from code
+        # under review, which on this fleet has included a `DATABASE_URL` with a
+        # password in it — and put it on a remote service instead, where it is
+        # retained by something with a different retention policy from this process.
+        # Moving a leak is not closing one. The operator's terminal gets it (below),
+        # and that is the only place with no retention at all.
         local_record = {"commands": list(local_cmds), "status": local_status or None,
                         "failed": list(local_failing), "seconds": local_secs,
-                        "why": local_why or None, "output": local_output or None,
-                        "instead_of": instead_of, "timeout": local_timeout}
+                        "why": local_why or None, "instead_of": instead_of,
+                        "timeout": local_timeout}
         if local_status:
             ci_status, ci_failing = local_status, local_failing
             # The seats get the harness's own sentence for a run that told us
@@ -1992,12 +2009,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 + (f" — {local_why}" if local_why else "")
                 + ". A local run is weaker evidence than a green CI run and buys no "
                   "merge: the gate still reads GitHub (#548)")
-            # The command's own OUTPUT goes here and nowhere else in this block.
-            # `config_notes` is published as a public PR comment by `--post`, and a
-            # failing test prints whatever it was holding — which on this fleet has
-            # included a `DATABASE_URL` with a password in it. The operator running
-            # the round sees it, the payload records it, and neither the PR nor a
-            # reviewer's prompt is where it lands.
+            # The command's own OUTPUT goes here and NOWHERE else — not the note
+            # above (`--post` publishes `config_notes` as a public PR comment), not
+            # the prompt (`ci_brief` renders into four reviewers and the judge), and
+            # not the payload (it is POSTed to the board). A failing test prints
+            # whatever it was holding, which on this fleet has included a
+            # `DATABASE_URL` with a password in it. This stream is read by the person
+            # who started the round and retained by nothing.
             if local_output:
                 print(f"! local suite: {local_output}", file=chatter)
         else:

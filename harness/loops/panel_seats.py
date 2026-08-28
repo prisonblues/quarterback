@@ -1801,6 +1801,54 @@ def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
 #: sitting on it.
 LOCAL_SUITE_TIMEOUT_MAX = 3600
 
+#: And the least. One second, which no test suite finishes in — the floor is not a
+#: guess at a fast suite, it is what makes "greater than zero" mean something. `1e-300`
+#: is greater than zero, passes a bare positivity check, and produces a budget that has
+#: run out before the first command starts: a permanent `local-unknown` veto wearing the
+#: costume of a measurement. A value below this is a typo or a unit confusion, and both
+#: are better refused than honoured.
+LOCAL_SUITE_TIMEOUT_MIN = 1
+
+
+def trusted_panel_block(cfg: dict, notes: list[str]) -> dict:
+    """The `review_panel` block as the DEFAULT BRANCH states it, merged over DEFAULTS.
+
+    The layer `resolve_repo` hands every other reader is the resolved one — working
+    tree included on the interactive path, board dials on top. That is right for a
+    number and wrong for a command line, and #548's `local_suite` is the only command
+    line in the file. See :func:`harness_rules.default_branch_rules` for the argument;
+    the short version is that a panel round usually runs from a worktree checked out
+    at the PR's own head, so "the repo's rules" and "this pull request's rules" are
+    the same file there.
+
+    One level of merge and no overlay, because the two layers this deliberately drops
+    are exactly the two that must not name a command: the untracked per-box overlay
+    is unreviewed by construction (`_LOCAL_KEYS` already forbids it anything but a
+    seat's model and effort), and a board dial would be a way to run code on every
+    machine in the fleet with one `POST`.
+
+    A failure to read the branch leaves DEFAULTS, where `local_suite` is `None`.
+
+    **It says so only when somebody was evidently asking for a suite** — when the
+    resolved config in front of us declares one that this could not confirm from the
+    branch. A repo with no remote, or an unfetched default branch, and no interest in
+    the feature would otherwise carry a config note on every round for a setting it
+    never wrote, and `config_notes` is read by a human and published by `--post`. A
+    line that appears on rounds where nothing is wrong is the noise that teaches its
+    reader to skip the ones where something is. The untrusted value is read HERE for
+    that test alone and never executed.
+    """
+    raw, why = harness_rules.default_branch_rules(cfg.get("path") or "")
+    asked = (cfg.get("review_panel") or {}).get("local_suite")
+    if not raw and asked:
+        notes.append(f"`review_panel.local_suite` is set in this checkout but was not "
+                     f"resolved — {why}. It names a command to run, so it is read from "
+                     "the default branch and never from the working tree; an unreadable "
+                     "branch means no run (#548)")
+    over = raw.get("review_panel")
+    return {**harness_rules.DEFAULTS["review_panel"],
+            **(over if isinstance(over, dict) else {})}
+
 
 def local_suite_commands(panel: dict) -> tuple[str, ...]:
     """`review_panel.local_suite` (#548) — what to run when GitHub CI has nothing to
@@ -1823,6 +1871,10 @@ def local_suite_commands(panel: dict) -> tuple[str, ...]:
     saying "not here", not a repo getting it wrong.
     """
     raw = panel.get("local_suite")
+    # `false` is honoured as off and NAMED as such in the refusal below, unlike
+    # `local_suite_timeout`'s: this key IS the feature's off switch, so a repo that
+    # wrote the other spelling of "no" meant it, and refusing that would be the
+    # harness telling somebody their "off" was a typo.
     if raw is None or raw is False or raw == "" or raw == []:
         return ()
     if isinstance(raw, str):
@@ -1831,8 +1883,8 @@ def local_suite_commands(panel: dict) -> tuple[str, ...]:
             and all(isinstance(c, str) and c.strip() for c in raw)):
         return tuple(c.strip() for c in raw)
     _refuse_value("local_suite", raw,
-                  "a command string, or a list of command strings (`null` or `[]` "
-                  "for off)")
+                  "a command string, or a list of command strings (`null`, `false` "
+                  "or `[]` for off)")
     return ()                  # unreachable; `_refuse_value` always raises
 
 
@@ -1854,10 +1906,10 @@ def local_suite_timeout(panel: dict) -> float:
     if raw is None or raw == "":
         return float(LOCAL_SUITE_TIMEOUT)
     if (not isinstance(raw, bool) and isinstance(raw, (int, float))
-            and 0 < raw <= LOCAL_SUITE_TIMEOUT_MAX):
+            and LOCAL_SUITE_TIMEOUT_MIN <= raw <= LOCAL_SUITE_TIMEOUT_MAX):
         return float(raw)
     _refuse_value("local_suite_timeout", raw,
-                  f"a number of seconds greater than 0 and at most "
+                  f"a number of seconds between {LOCAL_SUITE_TIMEOUT_MIN} and "
                   f"{LOCAL_SUITE_TIMEOUT_MAX} (omit it for {LOCAL_SUITE_TIMEOUT})")
     return float(LOCAL_SUITE_TIMEOUT)   # unreachable; `_refuse_value` always raises
 
@@ -4258,7 +4310,8 @@ import panel_scope               # noqa: F401
 #: them silently. Generated from the module's own top level, so a helper added here
 #: is exported without anyone remembering to list it.
 __all__ = [
-    "LOCAL_SUITE_TIMEOUT_MAX", "local_suite_commands", "local_suite_timeout",
+    "LOCAL_SUITE_TIMEOUT_MAX", "LOCAL_SUITE_TIMEOUT_MIN", "trusted_panel_block",
+    "local_suite_commands", "local_suite_timeout",
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",

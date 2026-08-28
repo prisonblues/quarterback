@@ -1852,6 +1852,44 @@ def _read_rules(root: Path, default_branch: str,
     return {}, "none (defaults)", "", [], False
 
 
+def default_branch_rules(root: Path | str) -> tuple[dict, str]:
+    """The repo's tracked rules as ``origin/<default branch>`` has them, and the
+    sentence saying where they came from — **never the working tree's** (#548).
+
+    `resolve_repo` reads the working tree on the interactive path, which is right for
+    everything it governs: those are numbers and switches, a person is present, and
+    reading the branch in front of you is the whole convenience. It is wrong for a
+    setting that names a COMMAND to execute. A panel round is frequently run from a
+    worktree checked out at the PR's own head — that is where the fix loop lives — so
+    the working tree's `.harness-rules.sample` is the PR's, and a `local_suite` read
+    from it would be a command the pull request chose, run by the thing reviewing it.
+    "Checking a branch out is already consent to run it" is not true: checkout writes
+    files, it does not execute them.
+
+    So the one executable setting takes the protection the unattended path already
+    has, in BOTH modes: `from_default_branch=True`, the same argument
+    `.harness-rules.sample`'s own `_two_refs` note makes — a poisoned PR cannot
+    rewrite the rules governing its own review. The cost is that a change to the
+    command does not take effect until it lands on the default branch, which is the
+    intended shape: it is a policy edit, and policy is reviewed.
+
+    Returns `({}, why)` on any failure — an unfetched branch, no rules file, a
+    checkout with no remote — and the caller falls back to DEFAULTS, where
+    `local_suite` is `None`. Fail-closed by construction: a command that cannot be
+    read from the protected branch is not run.
+    """
+    root = Path(root)
+    try:
+        branch = detect_default_branch(root)
+        rules, provenance, _baseline, _problems, unreadable = _read_rules(
+            root, branch, True)
+    except Exception as e:                       # never raises; see the contract above
+        return {}, f"the default branch's rules could not be read ({e.__class__.__name__})"
+    if unreadable:
+        return {}, f"`origin/{branch}` could not be read"
+    return strip_comments(rules), provenance
+
+
 def _is_tracked(root: Path, name: str) -> bool:
     """Is `name` committed to this repo? FAILS CLOSED — see the last paragraph.
 

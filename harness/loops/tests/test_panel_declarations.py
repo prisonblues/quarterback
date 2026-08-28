@@ -2321,13 +2321,13 @@ def test_an_unrecognised_ci_state_vetoes_rather_than_passing():
     confidence until somebody argues it into `CI_EXECUTED` — rather than passing
     silently, which is exactly how `none` reached today.
 
-    #548's `local-pass` is the first state argued in, and it is spelled out here
-    rather than derived so that the next one is also somebody's decision: a suite
-    that RAN on this commit and passed is execution evidence, which is the only
-    thing this veto asks about. Its two siblings are not in it — `local-fail`
-    because no merge gate reads a local failure, and `local-unknown` because a
-    command that reported nothing established nothing."""
-    assert sorted(panel.CI_SETTLED) == ["FAIL", "PASS", panel.LOCAL_PASS]
+    #548's two are the first states argued in, and they are spelled out here rather
+    than derived so that the next one is also somebody's decision: a suite that RAN
+    on this commit and reported is execution evidence, which is the only thing this
+    veto asks about. `local-unknown` is not in it — a command that reported nothing
+    established nothing."""
+    assert sorted(panel.CI_SETTLED) == ["FAIL", "PASS", panel.LOCAL_FAIL,
+                                        panel.LOCAL_PASS]
     covered = set(panel.CI_UNSETTLED) | set(panel.CI_SETTLED)
     # Every state `ci_status` can arrive as: the six the forge can report, plus the
     # three a local run produces. A state in neither mapping falls to the generic

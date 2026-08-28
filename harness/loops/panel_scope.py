@@ -2184,6 +2184,10 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
       and each of them opens by saying so before it says anything else. They are
       weaker evidence than the state they stand in for, and a seat that cannot tell
       which it was handed would draw a conclusion the evidence does not carry.
+      They open on "no settled result" rather than "no run exists", which is the
+      narrower claim and the only one true of both states they can stand in for:
+      `unknown` is a lookup that FAILED, and a run may well exist behind it. Saying
+      the stronger thing would have put a confident falsehood in five prompts.
     * **A pass is not a licence to stop looking.** It says every test we thought
       to write passed — not that the code is correct. A reviewer treating green as
       evidence of correctness has stopped reviewing, and this repo's whole
@@ -2233,8 +2237,8 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
         # stronger conclusion than the evidence carries, which is the failure the
         # first bullet above names — so the weakness is stated in the same breath as
         # the refutation rather than in a footnote nothing reads.
-        body = ("NO GITHUB RUN EXISTS for this commit, so the repo's own suite was run "
-                "HERE instead, on a checkout at this exact commit, and it PASSED. That "
+        body = ("GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was "
+                "run HERE instead, on a checkout at this exact commit, and it PASSED. That "
                 "REFUTES findings of the form \"this new test never runs\", \"this may "
                 "not even import\", or \"this migration looks syntactically incomplete\" "
                 "— do not spend a finding or a `could_not_assess` entry on them. Two "
@@ -2245,14 +2249,14 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
                 "guarantee this is the commit that will merge.")
     elif status == LOCAL_FAIL:
         named = ", ".join(failing) if failing else "command names unavailable"
-        body = (f"NO GITHUB RUN EXISTS for this commit, so the repo's own suite was run "
-                f"HERE instead, on a checkout at this exact commit, and it FAILED: "
+        body = (f"GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was "
+                f"run HERE instead, on a checkout at this exact commit, and it FAILED: "
                 f"{named}. Something the project already tests is broken by this diff. "
                 "Treat that as a fact you may reason from, not as a finding to "
                 "re-report — it is already visible to everyone.")
     elif status == LOCAL_UNREAD:
-        body = ("NO GITHUB RUN EXISTS for this commit. The repo's own suite was run HERE "
-                "instead and produced no result"
+        body = ("GITHUB HAS NO SETTLED RESULT for this commit. The repo's own suite was run "
+                "HERE instead and produced no result"
                 + (f" ({skip})" if skip else "")
                 + ". This is not a pass, and it is not a failure either: nothing was "
                 "established either way, so anything you would have checked against a "
@@ -2463,13 +2467,23 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
 # answered none of the three. This is the structural fix for a class, not a fix for
 # that round.
 
-#: The CI states a local run may answer FOR: the three where GitHub has nothing to
-#: say. `PASS` and `FAIL` are real results about this exact commit and a weaker
-#: reading must never displace either. `PENDING` is excluded because it belongs to
-#: #501's bounded wait, which is in the business of turning it into one of those
-#: two — running a local suite instead of waiting would spend minutes to arrive at
-#: a worse answer than the one already on its way.
-LOCAL_SUITE_WHEN = frozenset({"none", "blocked", "unknown"})
+#: The CI states a local run may answer FOR: the two where GitHub has no result and
+#: nothing is coming. `PASS` and `FAIL` are real results about this exact commit and a
+#: weaker reading must never displace either. `PENDING` is excluded because it belongs
+#: to #501's bounded wait, which is in the business of turning it into one of those
+#: two — running a local suite instead of waiting would spend minutes to arrive at a
+#: worse answer than the one already on its way.
+#:
+#: **`blocked` is excluded, and it is the one that had to be argued out.** #324 gave
+#: that state a name precisely because it is ACTIONABLE and distinguishable: a run
+#: exists for this commit, it is waiting on a person to click, and nothing changes
+#: until they do. Replacing it with `local-pass` overwrites `ci_status` — the field
+#: every downstream consumer reads, from `app.ordering` to the review queue — with a
+#: value that says nothing about the click, and buys the round the confident stop that
+#: is the only thing still making anyone look. The remedy for a gated run is the
+#: approval, and a feature that quietly makes the gate stop mattering is not a floor
+#: under the seats, it is a way past a control somebody chose to put there.
+LOCAL_SUITE_WHEN = frozenset({"none", "unknown"})
 
 #: The three states a local run can produce. Deliberately NOT members of
 #: `CI_STATE_WORDS`: that mapping is `qbdata.CI_STATES` in this module's vocabulary
@@ -2519,18 +2533,31 @@ def _local_head_problem(root: str, head_sha: str) -> str:
     checked that branch out has accepted this code on this box, and running its test
     suite adds no capability that `git checkout` did not: the fix loop that calls the
     panel is sitting in exactly that worktree, which is the case this exists to
-    serve. It also means the command, the rules file and the code under test are one
-    commit, so a :data:`LOCAL_PASS` is attributable to the sha the round reports.
-    Anything else and the panel keeps today's behaviour and the seats are told CI
-    reports nothing, which remains true.
+    serve. It also means a :data:`LOCAL_PASS` is attributable to the sha the round
+    reports, because the tree that ran is the tree that commit names.
 
-    Tracked edits are refused for the second half of that: a dirty tree runs a suite
-    against code that is in no commit, while `local-pass` claims one. UNTRACKED files
-    are tolerated, and the boundary is stated rather than left silent — a worktree
-    from `create-worktree` carries a `.env`, a virtualenv and scratch of its own, so
-    refusing those would mean this never runs anywhere real, and an untracked file
-    genuinely CAN change what a suite does. The answer for a repo that cannot accept
-    that is not to declare a `local_suite`.
+    What it does NOT mean is that the code and the COMMAND come from the same place,
+    and an earlier draft of this docstring claimed they did. The command is read from
+    the DEFAULT BRANCH — :func:`harness_rules.default_branch_rules`, deliberately —
+    and the code under test is the PR head. Two refs, on purpose: a pull request that
+    supplied its own command would be choosing what the thing reviewing it executes,
+    and "the operator checked this branch out" is consent to POSSESS these files, not
+    to run one of them. Anything else and the panel keeps today's behaviour and the
+    seats are told CI reports nothing, which remains true.
+
+    Edits are refused for the second half of that: a tree with changes in it runs a
+    suite against code that is in no commit, while `local-pass` claims one.
+
+    **Untracked files are refused too, and IGNORED ones are not**, which is the line
+    `git status --porcelain` already draws and the reason this asks it without
+    `--untracked-files=no`. A worktree from `create-worktree` carries a `.env`, a
+    virtualenv and scratch of its own — all of it gitignored, none of it listed, and
+    refusing that would mean this never runs anywhere real. A file that is untracked
+    and NOT ignored is a different animal: a stray `conftest.py` is loaded by pytest
+    before a line of the suite runs, a shadowing executable is found on `PATH` first,
+    and either can decide the result of a run that will be recorded as evidence about
+    a commit neither of them is in. That the ignore list is itself part of the commit
+    is what makes this a line the repo drew rather than one drawn around it.
 
     Never raises, and every branch returns a sentence a human can act on: this runs
     inside a round that must not die because a checkout was somewhere unexpected.
@@ -2545,13 +2572,19 @@ def _local_head_problem(root: str, head_sha: str) -> str:
     if at != head_sha:
         return (f"the checkout is at {at[:8]}, not the PR head {head_sha[:8]} — a "
                 "run there would be a run of different code")
-    dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
+    dirty = _git(root, "status", "--porcelain")
     if dirty is None:
         return f"the working tree at {root} could not be read"
     if dirty.strip():
-        n = len(dirty.strip().splitlines())
-        return (f"the checkout has {n} uncommitted change(s) to tracked files, so a "
-                f"run there would not be a run of {head_sha[:8]}")
+        # NOT `dirty.strip().splitlines()`: porcelain v1 is `XY PATH`, and an
+        # unstaged edit's X is a SPACE — so stripping the blob before splitting eats
+        # the first line's status column and takes a character off the one filename
+        # this sentence quotes. Caught by the name it printed.
+        lines = [ln for ln in dirty.splitlines() if ln.strip()]
+        first = (lines[0][3:].strip() or "?") if len(lines[0]) > 3 else "?"
+        return (f"the checkout has {len(lines)} uncommitted or unignored file(s) — "
+                f"{first}{' and others' if len(lines) > 1 else ''} — so a run there "
+                f"would not be a run of {head_sha[:8]}")
     return ""
 
 
@@ -2574,6 +2607,14 @@ def _kill_group(proc) -> None:
     reap that hangs: this is cleanup on the timeout path, and an exception raised
     here would replace `TimeoutExpired` — turning "the suite did not finish", which
     the caller has a state for, into a crash it has none for.
+
+    **Two limits, stated rather than implied.** A descendant that calls `setsid`,
+    double-forks, or hands its work to a container runtime or a service manager has
+    left this group and survives; bounding that needs a cgroup or a systemd scope,
+    which is a heavier feature than this one. And the reap below can add up to ten
+    seconds past the configured budget before the caller returns — SIGKILL is not
+    catchable, so that only bites a process already stuck in the kernel, but the
+    number a repo writes bounds the RUN and not the call.
     """
     import signal                                            # noqa: PLC0415
     try:
@@ -2663,6 +2704,11 @@ def review_local_suite(commands, root: str, head_sha: str, *,
     collecting a second opinion from a DB-backed target delays the seats for
     information the round will not use.
 
+    **The checkout is checked before the first command and again after the last**, and
+    a pass whose tree moved underneath it becomes :data:`LOCAL_UNREAD` rather than a
+    pass. See the comment at that second call for the three ways one instant's answer
+    stops being true, none of which needs an adversary.
+
     **A failing command's OUTPUT does not travel into the reviewer prompt**, only its
     name. Two reasons, and the first is enough on its own: that output is text
     produced by code from the PR under review, and pasting it into four reviewers and
@@ -2721,6 +2767,22 @@ def review_local_suite(commands, root: str, head_sha: str, *,
             return (LOCAL_FAIL, [cmd], f"`{cmd}` exited {code}",
                     harness_rules.tail_gist(output, LOCAL_SUITE_GIST),
                     round(now() - started, 1))
+    # ASKED AGAIN, and only on the way out. The guard above is a statement about one
+    # instant, and three things can have falsified it since: another agent working the
+    # same box, a command in this very list that rewrote a tracked file or moved HEAD,
+    # and the ordinary race between the check and the first `execve`. None of them is
+    # a hostile-actor story — a fix pass committing while a round runs is a Tuesday —
+    # and all three end the same way: a `local-pass` attributed to a commit whose
+    # files are not what ran. Re-reading costs one `git` call against a run measured
+    # in minutes, and it converts the whole class into `local-unknown`, the state for
+    # "something executed and established nothing". A pass is the ONLY outcome worth
+    # re-checking: a failure and an unread run already veto, and asking again could
+    # only turn a veto into a differently-worded veto.
+    moved = _local_head_problem(root, head_sha)
+    if moved:
+        return (LOCAL_UNREAD, [], "the suite passed, but the checkout no longer "
+                                  f"matches the commit it was run against — {moved}",
+                "", round(now() - started, 1))
     return LOCAL_PASS, [], "", "", round(now() - started, 1)
 
 
