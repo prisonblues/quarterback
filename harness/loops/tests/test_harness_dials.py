@@ -485,9 +485,10 @@ def test_a_specs_default_is_the_one_DEFAULTS_holds():
 
 
 def test_a_dial_with_no_default_says_so_rather_than_offering_null(monkeypatch):
-    """A dial in `BOARD_DIALS` and absent from `DEFAULTS` is a bug in this module,
-    and `null` is a value several dials really take — so drawing one for the other
-    would hide the bug behind a plausible answer."""
+    """A RULES dial in `BOARD_DIALS` and absent from `DEFAULTS` is a bug in this
+    module, and `null` is a value several dials really take — so drawing one for the
+    other would hide the bug behind a plausible answer. The FLEET dials are the case
+    where the same absence is the truth, and they say which they are (#563)."""
     monkeypatch.setitem(hr.BOARD_DIALS, "review_panel.invented",
                         hr.Dial("number", False, "either"))
     spec = hr.dial_specs()["review_panel.invented"]
@@ -642,3 +643,106 @@ def test_a_number_dial_refuses_the_values_that_are_not_numbers_after_all():
         assert "finite" in said, (value, said)
     assert hr.dial_problem("review_panel.max_rounds", 2) == ""
     assert hr.dial_problem("review_panel.max_fix_growth", 3.5) == ""
+
+
+# --------------------------------- #563: a dial the panel's rules tree does not hold
+
+def test_the_registry_is_the_fleets_and_says_which_dials_are_not_the_panels():
+    """The namespace question #563 had to answer before it could build anything, and
+    the answer was already shipped: `app/api/dials.py` stores a dial name as opaque
+    text and says the client owns the vocabulary, so the CHANNEL was never the
+    panel's. The only thing that was is the two lines here that assume a dial names a
+    key in `DEFAULTS` — and `applies` is that assumption made explicit rather than a
+    second settings channel."""
+    assert {d.applies for d in hr.BOARD_DIALS.values()} == {"rules", "fleet"}
+    fleet = {p for p, d in hr.BOARD_DIALS.items() if d.applies == "fleet"}
+    assert fleet == {"spawn.max_sessions", "spawn.max_sessions_fleet"}
+    assert all(d.applies == "rules" for p, d in hr.BOARD_DIALS.items()
+               if p.startswith("review_panel.")), (
+        "a review_panel dial IS a path into the rules tree — if one is not, the "
+        "panel has grown a setting nothing overlays")
+
+
+def test_a_fleet_dial_has_no_default_here_and_that_is_the_answer_not_a_hole():
+    """`default_known: False` means two different things now and a client has to be
+    able to tell them apart: on a rules dial it is a bug in this table, and on a
+    fleet dial it is the truth — `spawn.max_sessions` falls back to a per-machine
+    file that no repo and no board can read."""
+    for path, spec in hr.dial_specs().items():
+        if spec["applies"] == "fleet":
+            assert spec["default_known"] is False and spec["default"] is None, path
+            assert "no repo's rules hold it" in spec["note"], path
+        else:
+            assert "no repo's rules hold it" not in spec["note"], path
+
+
+def test_a_fleet_dial_is_offered_and_judged_like_any_other():
+    """The whole claim of `applies` is that it changes ONE thing. A fleet dial that
+    the picker would not offer, or that the judge would not check, would be a second
+    channel wearing the first one's name."""
+    assert hr.dial_problem("spawn.max_sessions", 3) == ""
+    assert "must be a number" in hr.dial_problem("spawn.max_sessions", "3")
+    assert "must be a number" in hr.dial_problem("spawn.max_sessions_fleet", "lots")
+    # `null` is not an off switch on either: clearing the dial is how you hand the
+    # ceiling back, and it leaves nothing behind saying otherwise.
+    assert "null is not this dial's off switch" in hr.dial_problem(
+        "spawn.max_sessions", None)
+
+
+def test_a_fleet_dial_is_not_applied_to_a_repos_rules_and_is_not_a_problem(
+        repo, monkeypatch, capsys):
+    """The one line `applies` actually changes, and the reason it is a `continue`
+    rather than a `problems.append`: `spawn.max_sessions` is not in any repo's
+    resolved rules and never will be, so complaining about it would put a line about
+    the fleet's spawn ceiling into the provenance of every panel round on every
+    repo — which is how a correct setting comes to read as a misconfiguration."""
+    board(monkeypatch, dial("spawn.max_sessions", 5, scope="fleet"),
+          dial(FLOOR, "P3", scope="fleet"))
+    cfg = hr.resolve_repo(str(repo))
+    assert "spawn" not in cfg
+    assert cfg["review_panel"]["fix_severity_floor"] == "P3", (
+        "a fleet dial beside it must not stop a rules dial applying")
+    said = capsys.readouterr().err
+    assert "spawn.max_sessions" not in said, said
+    assert "spawn.max_sessions" not in cfg["_dials"], (
+        "the provenance table is one entry per dial IN THE RESOLVED CONFIG, and "
+        "this one is not in it")
+
+
+def test_a_fleet_dial_is_still_recognised_rather_than_refused_as_unknown(
+        repo, monkeypatch, capsys):
+    """The failure this is pinned against is the OTHER way a fleet dial could have
+    been ignored: left out of `BOARD_DIALS` entirely, so every resolution reports it
+    as a name nothing applies. That is `tempo`'s state today and it is exactly what
+    #563 is fixing, so it must not be reintroduced by the fix."""
+    board(monkeypatch, dial("spawn.max_sessions_fleet", 10, scope="fleet"))
+    hr.resolve_repo(str(repo))
+    said = capsys.readouterr().err
+    assert "not a board-settable dial" not in said, said
+
+
+def test_a_fleet_dial_has_no_per_repo_answer_and_the_scope_is_judged_before_the_write():
+    """`POST /dials` takes either scope for any dial — `dial` is opaque text there
+    and `repo` is just a column — so the only side that can refuse this is the one
+    holding the vocabulary. `spawn.max_sessions` bounds panes on one tmux server,
+    counted without knowing which checkout each pane is in, so a per-repo answer is
+    not one."""
+    said = hr.dial_scope_problem("spawn.max_sessions", "acme/widget")
+    assert "cannot be set for one repo" in said and "acme/widget" in said
+    assert hr.dial_scope_problem("spawn.max_sessions", None) == ""
+    assert hr.dial_scope_problem("spawn.max_sessions", "") == ""
+
+
+def test_a_rules_dial_is_legitimate_at_either_scope():
+    """The direction deliberately not refused: a fleet-scoped rules dial is how one
+    value covers every watched repo, which is how most of this fleet's are set."""
+    for scope in (None, "acme/widget"):
+        assert hr.dial_scope_problem(FLOOR, scope) == ""
+
+
+def test_a_name_the_table_does_not_know_gets_no_scope_verdict():
+    """`dial_problem` is what answers an unknown name, in its own sentence about who
+    settles the list. Two refusals for one mistake would put the person's attention
+    on the scope line, which is not where the mistake is."""
+    assert hr.dial_scope_problem("tempo", "acme/widget") == ""
+

@@ -664,6 +664,17 @@ class DialEdit(ModalScreen[dict | None]):
             if problem:
                 self._refuse(problem)
                 return
+            # And WHERE the row goes, which is a second question about a different
+            # field and gets its own answer (#563). The board takes either scope for
+            # any dial — `dial` is opaque text there and `repo` is just a column — so
+            # a fleet dial written for one repo is accepted, stored, reported as in
+            # force, and read by nothing. That is a misspelt name's failure arriving
+            # through the scope line, and it is caught in the same place for the same
+            # reason: this side is the only one that knows what a dial IS.
+            problem = qd.dial_scope_refusal(dial, self.repo)
+            if problem:
+                self._refuse(problem)
+                return
         try:
             # Parsed for its refusal only — the app parses it again against the
             # same board clock when it writes.
@@ -2379,6 +2390,16 @@ class Dash(App):
         every click rather than cached at mount, so opting a machine in takes
         effect on the next click instead of on the next dashboard.
 
+        **`--no-board` is what keeps that true, and it is deliberate (#563).**
+        `--policy` now reads the board's `spawn.max_sessions` by default, because
+        the callers that read a ceiling before acting want the one in force. This
+        one is not such a caller — it asks two questions, *is this machine on* and
+        *is this command allowed*, and both are answered by the file — and it runs
+        on the UI thread, where a board that is down would freeze the screen for
+        five seconds on every keystroke. So it opts out of the read it does not
+        use, and gives up nothing: a ceiling this button never consulted is still
+        applied by the spawn itself, one step later, in `qb-start`'s own words.
+
         **AND IT DOES NOT FALL BACK TO THE OLD SPAWN.** The tempting shape is
         obvious — refuse through `qb-start`, and when the machine has not opted
         in start the session the way this button did last week — and it is wrong
@@ -2392,7 +2413,7 @@ class Dash(App):
         somebody wants this on.
         """
         try:
-            got = subprocess.run([self.start_bin, "--policy", "--json"],
+            got = subprocess.run([self.start_bin, "--policy", "--no-board", "--json"],
                                  capture_output=True, text=True, timeout=15)
         except Exception as exc:                       # noqa: BLE001
             # Fails CLOSED, and says which failure it was. `qb-start` missing is

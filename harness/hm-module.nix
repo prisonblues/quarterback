@@ -185,6 +185,20 @@ in
 
           The count is spawned tmux panes whose agent has not exited, so a
           window left open to read is not one of them.
+
+          THE FALLBACK, not the only source (#563). The board's
+          `spawn.max_sessions` dial answers first and this applies when no dial
+          is set, when the board cannot be reached, or when what it holds is not
+          a number — so a host with no dial behaves exactly as it did before.
+          The other two keys here are permissions and deliberately have no such
+          layer: whether this machine may spawn AT ALL, and what may come
+          through the gate, must not depend on a board being reachable or on
+          anything an agent can reach. A ceiling only counts a resource, dial
+          writes are human-only, and needing a nix build, a PR and a rebuild to
+          change a number is what this option is being relieved of.
+
+          `qb-start --policy` reports the effective ceiling and names the layer
+          that gave it.
         '';
       };
 
