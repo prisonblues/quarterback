@@ -451,12 +451,13 @@ class Host:
     #: same pull requests, which is both slow and a way for them to disagree. Per-Host
     #: rather than module-level so a test drives one survey and not a leftover.
     gh_cache: dict = field(default_factory=dict)
-    #: One `git fetch` per run, for the same reason and with a sharper one behind it.
-    #: `checkout` fetches so that "0 behind" is a sentence about now; `unpushed` fetches
-    #: because its whole query is answered out of the remote-tracking refs, and against
-    #: week-old ones it reports work as stranded that was pushed on Tuesday. Two rows
-    #: needing the same refresh must not pay for it twice, and must not be able to
-    #: disagree about whether it succeeded.
+    #: One `git fetch` per REMOTE per run, for the same reason and with a sharper one
+    #: behind it. `checkout` fetches so that "0 behind" is a sentence about now; `unpushed`
+    #: fetches because its whole query is answered out of the remote-tracking refs, and
+    #: against week-old ones it reports work as stranded that was pushed on Tuesday. Two
+    #: rows needing the same refresh must not pay for it twice, and must not be able to
+    #: disagree about whether it succeeded. Keyed by remote name because the two rows do
+    #: not ask about the same set: `checkout` about one, `unpushed` about all of them.
     git_cache: dict = field(default_factory=dict)
 
 
