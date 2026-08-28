@@ -17,6 +17,2929 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.21 — the fleet hands out its own work, and what stops it becomes a row
+
+### the dash full screen, from the keyboard or the ⛶
+
+Two columns are only worth having if the pane can be made wide, and 78 columns down the
+right of a seat screen never will be. `z` inside the dash, `C-q z` from anywhere on the
+screen, and a new ⛶ on the top line all reach one verb — `qb-seat-key expand` — which breaks
+the dash out into a window of its own and puts it back on the next press. The dash notices
+the width and lays its panels out two across; nothing had to tell it to.
+
+#### Why `break-pane` and not the two obvious alternatives
+
+**`resize-pane -Z`** was the first answer and is the wrong one. Zoom is a property of the
+window and tmux drops it on any layout change — and this screen makes them constantly:
+`select-layout -E` when a seat is closed, and the `window-resized` hook reasserting
+`@qb_dash_width` on every client attach. A dash zoomed to read would pop back to 78 columns
+the moment somebody attached a phone, with nothing on screen to say why.
+
+**`display-popup` running a second dashboard** is a second board poll, a second `gh` poll,
+and a cold start whose ISSUES panel says "waiting for gh" for up to a minute. `break-pane`
+moves the pane the process is already in — the same argument that made hiding a pane a
+break-and-rejoin rather than a kill-and-respawn.
+
+So this is `d`'s move without the `-d` that parks the pane where nobody is looking, and it
+inherits everything that was hard about that one. Including the rule that the widths are
+recorded **before** the break, which bites differently here and cost a test to find:
+`hide_pane` is handed its size by a caller that read it first, while `expand_dash` does its
+own break, so reading afterwards is one line away and looks identical. It is not — after the
+break the pane fills its new window, so the recorded size is the whole terminal, and the join
+back asks for a 240-column pane inside a 240-column window and fails with `create pane
+failed: pane too small`.
+
+#### Two toggles over three states
+
+`d` means "in the row or not". `z` means "full screen or not".
+
+| | `d` | `z` |
+|---|---|---|
+| in the row | → hidden | → expanded |
+| hidden | → in the row | → **expanded** |
+| expanded | → in the row | → in the row |
+
+The middle row is the crossing that had to be decided. Somebody pressing `z` on a hidden
+dash is asking for a dash they can read, and a hidden one is one step from that rather than
+in the wrong state for it — so it is shown rather than put back in its column, and rather
+than refused. It is also the cheap direction: the pane is already alone in a window, so that
+crossing is a rename and a `select-window` and no geometry moves at all. A `break-pane`
+there would fail outright, having nothing to break.
+
+Both routes out of the row record the same state and return through the same `restore_dash`,
+so there is one way back however it left. `>` and `<` refuse while it is out and now say
+which of the two states they are refusing for: "hidden" about a dash filling the screen in
+front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
+state.
+
+Two options carry that third state — `@qb_hidden_dash` is where the pane is parked and
+`@qb_dash_expanded` is which of the two ways it got there — and they are cleared together
+wherever either stops being true. Separately was worse than it sounds: closing the window an
+expanded dash is sitting in is `C-q z` followed by the ordinary reflex of closing a window
+you are done with, and the pane-is-gone branch dropped only the first. What was left was a
+screen marked expanded with nothing recorded, so every later `z` took the expanded branch and
+answered "nothing recorded to put back" — naming the marker's problem rather than the
+screen's, which is that the dashboard died. Neither key could put it right, because that
+marker is the only thing either of them reads. `restore_dash` returning empty-handed is now
+taken as proof the marker is wrong, and it does not survive being disproved.
+
+#### The ⛶ is the first clickable widget on the top line
+
+`#[range=…]` is honoured in `status-format` and nowhere else, which is the whole reason a
+control can live on a status line — the seat bar's ✕ and ＋ have used it since it shipped.
+This one goes on line 0 rather than on the bar, because every cell on the bar names a seat
+and a control for the pane down the right-hand side would be the exception a reader has to
+learn. It is not confirmed, unlike the ✕: nothing is killed, no process is touched, and the
+same click puts it back.
+
+Being the first widget on a line that never had one cost the mouse binding a rewrite.
+`MouseDown1Status` gated on `#{==:#{mouse_status_line},#{@qb_bar}}` — true of the seat bar,
+line 1, and of nothing else — so the ⛶ drew, registered its range, and fell through to
+`switch-client -t =` on every click. Both halves had passed their own tests: the widget was
+on the line, `qb-seat-click expand` did the thing, and what nobody owned was the line
+between them. The binding decides on the SCREEN now and not on the line, which is the
+question it always meant to ask: `status 2` and both `status-format` indices are ours, so
+every range on either line of one of our screens is one we put there, and which widget was
+hit is the range's job to say.
+
+It implements nothing. `qb-seat-click` hands over to `qb-seat-key`, which is the same
+delegation the `a`, `x` and digit keys make in the other direction, and for the same reason —
+two copies of "break the dash out and record the widths to put it back with" is two places
+for the geometry lore to drift, and the drift shows up as a screen nobody chose the shape of.
+
+#### One thing that needed no code
+
+`qb-seats`' own `dash_pane` looks in `$SESSION_ID:seats` and nowhere else, so an expanded
+dash is outside the resize hook's reach and cannot be shrunk back to 78 columns by an
+attaching client. That is a property of where the pane went rather than a case anybody wrote.
+
+### the dash sets a dial, on a key of its own — and Authelia is not in the path
+
+#477 made what is in force legible from a terminal and left the verb in the
+browser: `POST /dials` takes `app.auth.human`, and a dashboard authenticates with
+the machine bearer token every agent on the box holds — precisely the credential
+that gate exists to refuse. So the panel read, and printed a URL.
+
+**The gate has not moved.** `human()` gains a second METHOD, not a lower bar:
+`HUMAN_TOKENS`, `name:secret` pairs in `API_TOKENS`' format, presented as
+`X-Human-Key` to the **agent vhost**. `rich:<secret>` authors as `human/rich`,
+which is the same identity the edge produces, by a different door.
+
+Why a second door at all: the first one cannot serve a terminal. An edge session
+expires on a wall clock, so anything built on one dies whenever it lapses and
+stays dead until somebody re-mints it by hand. A key rotates when somebody
+decides to rotate it. **Nothing here touches Authelia, so nothing here rotates
+with it.**
+
+Two things separate this from the browser session that was considered first, and
+**provenance is not one of them** — a cookie would have authenticated the same
+person to the same `human()` and recorded the same `human/rich`. What separates
+them is **scope** (an Authelia session is SSO for everything behind that edge; a
+key is this board only, which is most of what a rogue agent would gain by finding
+one) and **expiry** (a session rotates on a clock nobody here controls, so the
+capability breaks on a schedule rather than when somebody decides).
+
+The `✎` on a dial row opens an editor — **value**, **reason**, **for** (`30m`,
+`4h`, `7d`, or empty for no end) — with the dial's name fixed, because a dial is
+identified by its name and an editable one would create a second dial rather than
+change the one on screen. `ctrl+s` saves, `ctrl+x` clears it and hands the repo
+back its own default, `esc` cancels. The last row sets a new one. What a write
+replaced comes back on the detail line: moving a dial without being told what it
+was is how one gets nudged twice by two people who each believed they were
+starting from the default.
+
+Three refusals happen before a request is spent, each where the sentence can name
+the box that was wrong rather than arriving as a 422 about a field nobody typed: a
+blank reason, a duration that is not one, and an expiry measured from the wrong
+clock — the board's own `now` is on the wire, so a slow host does not have its "in
+four hours" refused as being in the past.
+
+#### What it costs, which is #479 and not a footnote
+
+The key sits on a workstation, readable by the processes running there, so **an
+agent that goes looking can find it and author as a person**. That is accepted
+deliberately and it is narrower than what it replaced: the design considered
+before it was a signed-in Authelia session, which is SSO for an entire estate.
+This is per person and revoked by editing one line. Narrowing it further is
+deferred, not overlooked — do not deploy it to unattended hosts that do not need
+it.
+
+It is also why the delegated **agent** credential (`X-Agent-Elevated`, #480) is a
+different thing and stays narrow: that one is for an agent acting unattended and
+names the two endpoints it may reach, and `/dials` is deliberately not among them.
+Two credentials, two blast radii, and #479's exclusion survives intact — an
+unattended agent still cannot set a dial.
+
+#### And the board records which door was used
+
+`human/rich` is `human/rich` by either method — a person is one author however they arrived —
+so the identity alone cannot tell an afternoon's browser write from a dashboard's, and the
+dashboard's is the one carrying the residual above. `dial_settings` gains `set_via` and
+`cleared_via` (`edge`, `key`, `dev`); `GET /dials` returns `set_via`; the page draws it as a
+chip beside the author, and a dial row's detail line reads *"set by human/rich with a key"*.
+
+`null` is **not recorded** — a row older than the column — and never "some other method".
+Nothing is back-filled: a guess there would be the one value a reader must be able to distrust,
+sitting in the field they consult to decide whether to trust the row.
+
+#### With no key, nothing changed
+
+Which is every box until one is deployed. `why_not()` is asked once per paint, the
+`✎` greys, the last row says why in place of the verb, and a click opens
+`/dials/view` as before — #443's option (3), still carrying the fallback while
+option (2) carries the verb.
+
+### the dash uses the columns it is given
+
+Eight panels have been sharing one column of a 78-column pane, and the arithmetic was
+never going to work: DIALS and SEATS take their content off the top and the six left
+over divide what remains as `2fr 1fr 2fr 2fr 1fr 2fr`. On a 50-row screen that is eight
+rows for FLEET, eight for the PLAN, eight for OPEN PRs, nine for ISSUES — and **four**
+for CLAIMED and four for REVIEW QUEUE. Widening the pane with `C-q >` made the cells
+longer and the panels no taller, so the answer to "I cannot see enough of this" was to
+look at something else.
+
+Above 157 columns the six panels below them go **two across**, and what that buys is
+height. Every one is between one and a half and three times taller, and none of it was
+taken from another panel:
+
+| panel | one column | two |
+|---|---|---|
+| FLEET | 8 | 12 |
+| CLAIMED | 4 | 12 |
+| PLANS | 8 | 19 |
+| OPEN PRs | 8 | 12 |
+| REVIEW QUEUE | 4 | 12 |
+| ISSUES | 9 | 19 |
+
+Rows on a 200×50 pane, panel including its title. DIALS and SEATS are their content in
+either layout, so they are unchanged and span both columns — see below.
+
+**157 is not a taste.** 78 columns is what one of these tables wants before it wraps —
+it is `QB_SEATS_DASH_SIZE`'s default, quoted from `qb-seats` — so two of them side by
+side plus the gutter between is the narrowest pane on which the second column is not
+paid for out of the first. Below it nothing changes at all: the pane `qb-seats` splits
+off comes out exactly as it did before this existed. `QB_DASH_WIDE` moves the threshold,
+and a value that is not a positive number of columns is ignored rather than fatal — a
+dashboard that refused to start over a typo in a tuning variable would be trading the
+panel you are trying to read for the knob you were adjusting.
+
+#### DIALS and SEATS span both columns, and REVIEW QUEUE moves
+
+Both are their content in either layout, so a column of their own would buy them nothing
+and cost the panel beside them half its width. SEATS keeps the ＋ where it can be found,
+which is the one thing that panel has to do — it is the only way to add a seat with the
+mouse, and it has already fallen off the bottom of a screen once. DIALS keeps the place
+#477 gave it, at the top: it is the configuration every panel below is running under, and
+a setting in force is not something to go looking for in the second column.
+
+The other placement is the one CSS could not do. A grid fills row by row in DOM order, so
+the order that puts REVIEW QUEUE **directly under OPEN PRs** — #273's arrangement, where
+one panel says a PR exists and CI is green and the next says whether anybody has reviewed
+it — lays them into different rows and different columns the moment there are two. So
+`relayout` moves PLANS down one when it goes wide: `under` becomes `beside`, the queue
+keeps the panel it exists to answer, and PLANS pairs with the ISSUES its items point at.
+It moves back on the way down, exactly, because `>` and `<` nudge by eight columns and
+crossing the threshold twice in a minute is an ordinary afternoon.
+
+Textual has no media query, so the switch is a class set from `on_resize` — and the
+panels are reordered with `move_child` rather than remounted, because a DataTable carries
+a cursor, a scroll offset and the row keys every click resolves through, and a pane
+getting wider is not news worth losing your place over.
+
+#### The caps bar was a resize behind
+
+Found while wiring the threshold up, and it had been true since the caps line was first
+sized to the pane. `on_resize` runs **before** the app's own size is updated, so the
+`self.size.width` it read was the width the pane had before the resize being handled.
+On the caps bar that was invisible — dragging a border emits a stream of resizes and the
+last-but-one is near enough. On a layout threshold it would not have been: crossing it
+once and stopping would have left the pane in the wrong layout indefinitely. Both now
+take the width off the event.
+
+### the ⬇️ advisory gets an ending
+
+The board already knew a push had landed and already said so: `published` is emitted when a
+push reaches the remote, and the lifecycle hook turns it into a "⬇️ pull before you build on
+this checkout" advisory. That was the right diagnosis and a manual ending — whoever it
+reached did the re-integration by hand, once per worktree, which was most of the eleven
+integration merges it took to land six PRs on the day #80 was filed.
+
+`qb-catchup` is the ending. It sweeps every worktree of a repo on this machine and
+**fast-forwards, refusing everything else**: a live holder (named), "could not tell", a dirty
+tree, unpushed commits (loudly — that is the state #45 was actually in), a branch that has
+diverged. One fetch covers every worktree, because linked worktrees share the common git
+directory and so share remote-tracking refs.
+
+Exit 4 is a refusal here and permission in `prune-worktrees`, which looks like an
+inconsistency and is the opposite: there, refusing on a board outage leaves real debris
+uncollected; here it would mean rewriting a live checkout because the board was down.
+
+#### Two triggers, and only one of them acts
+
+`gh pr merge` is now matched in `qb-hook`'s `PostToolUse` the same way `git push` already
+was, and the sweep runs. That is the trigger that bites: a forge merge creates the commit
+**server-side and runs no local push**, so the session that just landed the work is the one
+now stale and nothing local moved to tell it. It is also why the sweep must fetch there
+despite `gh` having just been to the remote — skipping it would report "already current"
+about everything and look like it had worked. `QB_CATCHUP=0` turns it off.
+
+When somebody *else* publishes, the advisory names the command rather than running it.
+Acting unbidden at the top of a turn is #45's disaster class even when every refusal is
+correct, and that advisory fires on every prompt while behind, so acting would mean a fetch
+per prompt.
+
+#### The markers had to start answering subtractively
+
+`worktree-holder` used them only additively, which left a false positive on the one checkout
+this needed. A lease records the directory an agent was *launched* in — the main checkout,
+for the worktree workflow — so "launched under this path" was true of every live agent in
+the repo whenever the path was the main checkout. Measured while writing this: it named
+`hermes/seat-quarterback-5` as holding the main checkout, whose own marker said
+`…/quarterback-fix-issue-458`.
+
+Benign for `remove-worktree` and `prune-worktrees`, which only ask about linked worktrees and
+for which a false positive is a refusal to delete. Not benign for anything acting **on** the
+main checkout: the catch-up would have declined forever on any box with an agent running.
+A session marked for a different worktree is no longer counted; a session with no marker
+keeps the lease-cwd clause, because that is the agent launched inside a checkout directly.
+
+#### And the hook now writes one document, not two
+
+`hookSpecificOutput` is a stream specified to carry one object. The ask courier already wrote
+to that stdout, and a second alongside it would be dropped silently — and only when both
+fired in the same tool call. The notes are accumulated and emitted once.
+
+### the fleet's two ways of working have names, and a repo says which one it is
+
+Two ways of working exist here, both legitimate, and nothing named them, declared them, or
+showed which one you were in. **CLEANROOM** takes an issue, cuts its own worktree and lands
+through a PR; **JUNGLE** takes a plan item, works in the shared checkout and commits straight
+to the branch. Both ship. The cost of neither being written down was paid twice by this repo:
+on 2026-08-17 three agents shared one checkout and a `nix build` compiled one agent's
+in-progress edits as another agent's evidence, and on 2026-08-25 four did it again and a
+`git reset --hard` destroyed a second agent's uncommitted review fixes. Neither time did
+anybody *choose* the shared tree. The session started there and nothing said this repo is not
+worked that way.
+
+#### The mode is declared, never derived
+
+`mode` in `.harness-rules`, resolved through the same layering as every other setting, so it
+is not a second place a fact is written down. Deriving it from who happens to be in the tree
+was considered and rejected: an empty tree at 06:00 is not a cleanroom, it is an empty jungle,
+so a derived mode would be a setting that lies at exactly the moment you check it. Live
+presence is evidence that a declaration is being *violated*, which is a different and more
+useful signal.
+
+The default is `cleanroom` — the isolating end of both axes — so an unconfigured repo asks for
+a worktree and a PR, and a typo costs ceremony rather than a tree.
+
+#### Two axes, separable on purpose
+
+`isolation` (`worktree` | `shared`) and `landing` (`pr` | `direct`) move together today and
+need not. A mode name is a preset over both, and either can be overridden alone, so "cleanroom
+tree, jungle plan" is a way a repo can actually be — it resolves, and it renders as
+`⌂ CLEANROOM tree · JUNGLE plan` rather than as one word that would have to lie.
+
+#### `qb-mode`, and the alarm it can raise
+
+```
+qb-mode           # ⌂ CLEANROOM   own worktree · lands via PR
+qb-mode --bar     # the status-bar form alone
+qb-mode --json    # every field, including `violation`
+```
+
+Exit `0` when the tree agrees, `3` when it does not, `4` when it cannot tell — three answers
+rather than the shrug of a truthy exit code.
+
+How much evidence it takes depends on who asked. A repo that **declared** cleanroom has stated
+that its primary checkout is not a place to work, so standing in it is enough on its own. A
+repo that merely inherited the default gets the benefit of the doubt until the checkout is one
+that actually hands out worktrees — a `.worktree.json`, or a live linked worktree — because
+there it might be somebody's private clone that no second agent will ever open. One rule for
+both would either nag every lone clone on the box or stay silent about a repo that asked to be
+protected.
+
+The mode is read from `origin/<default branch>`, never from the working tree. That is not the
+default `resolve_repo` behaviour, and the departure is deliberate: the interactive default
+rests on "a human who typed a command is the authorization", and nothing types this — it runs
+from a session-start hook, on whatever happened to be checked out. Left on the working tree,
+writing `{"mode": {"name": "jungle"}}` into the rules file turned the alarm off. Uncommitted,
+not even on a branch. A guard whose whole purpose is to be hard to ignore had an off switch in
+the file it reads.
+
+It is advisory and stops nothing, in one direction only. A jungle repo worked in its shared
+checkout is the mode working, and nothing says a word about it.
+
+It also asks no board — not for the mode, which no board setting can move, and not for the
+alarm. So a host with no board configured, no token, or no `curl` still gets the warning,
+which is the half of the fleet least likely to have anybody watching.
+
+#### And you are told before the first tool call
+
+`qb-hook` now injects the mode at session start, above the "who else is live here" note and
+deliberately so — *several agents are live in this repo* reads completely differently
+depending on whether the repo expects them to share a tree. On a cleanroom repo entered
+through the shared checkout, the note carries the remedy (`create-worktree`) and what happens
+if it is skipped. That is the sentence that would have prevented both incidents above.
+
+### the board refuses one thing now, and it is the one that cannot be undone
+
+Five times on this fleet, agents sharing one working tree destroyed each other's uncommitted
+work. Four in `65lowther` — the incidents #185 was filed on — and twice on 2026-08-25 in
+quarterback's own checkout, where a `git reset --hard` took a peer's in-flight review fixes
+while they were still editing.
+
+Everything else this board does is advisory, because for everything else advisory is enough:
+you can act on a signal later. Not this. The bytes are gone at the instant the command runs,
+so there is no later moment at which a warning would still have helped. That asymmetry is the
+whole argument, and it is why this is the only refusal on the board.
+
+`qb-hook` now gates `Bash` at `PreToolUse`. Three facts have to be true together before
+anything is refused:
+
+- the command destroys uncommitted work — `git reset --hard`, `checkout -- `, `restore`,
+  `clean -fd`, `switch -f`, `worktree remove --force` — but **not** `stash`, which the
+  `reference-transaction` hook already refuses more thoroughly;
+- this working tree actually holds some, untracked files included;
+- and a peer is live in **this exact cwd**, which `GET /active?cwd=` has been able to answer
+  since v2.6.
+
+Take any one away and nothing happens: a clean tree is never refused, `git status` never
+reaches the board at all, and alone in a tree your own uncommitted work stays yours to throw
+away. Two agents in two worktrees of one repo are not in each other's way and are never
+refused — a gate that blocked people who are free is the failure #185 warns about for the path
+key, in a different spelling.
+
+The refusal names the holder and says what to do instead, because a refusal that names nobody
+is a wall rather than the conversation that should have happened first. `QB_ALLOW_SHARED_TREE=1`
+in front of the command proceeds anyway: an advisory gate needs a way past or it gets disabled
+wholesale, and putting the override in the command makes taking it deliberate and visible.
+
+#### Where the bar ended up, and why it is lower than it started
+
+A second panel round found 44 more findings, 13 P1, every one new — my own fix pass being the
+thing that created them, which is #165's measurement arriving on schedule. And they were the next
+premise, not thirteen defects: that a *static* reading of command text can determine what a command
+will do. It cannot. The shell is Turing-complete and the list of spellings is unbounded.
+
+So the bar moved, deliberately (Rich, 2026-08-25): **a tripwire for an accident, not a gate against
+an adversary.** Counting #185's own five incidents by mechanism is what settled it —
+
+| incident | mechanism | covered before this? |
+|---|---|---|
+| board 3860 | *"whoever runs `git commit -a` first sweeps up the other's half-finished work"* | no |
+| board 3879 | exactly that — an in-flight `clash.py` committed by another agent | no |
+| board 4004 | a half-wired include, everyone's red build | no — not a command |
+| board 3853 | a claim race | no — not a command |
+| 2026-08-25 ×2 | `git reset --hard` | yes |
+
+— two of five, with the commonest mechanism on the list absent from the verb list entirely. Two
+rounds and eighty-four findings went into hardening the 2-of-5 case against spellings that have
+never occurred.
+
+What that bought, in the end: **a second harm class.** In a shared tree you cannot tell your
+uncommitted files from a peer's, so `git commit -a` and `git add .`/`-A` take theirs into your
+commit under your message. Nothing is destroyed and its author has still lost the work — so the
+refusal says that, rather than telling them their commit destroys something. `git add app.py`
+is untouched: naming your files is the thing that stays safe.
+
+Two verbs with no incident behind them (`read-tree --reset -u`, `checkout-index -f`) came back
+out. They were reach, and reach is what the thirteen P1s were made of.
+
+#### And what a panel round changed after that
+
+Three reviewers and a judge read the result and returned **40 findings, nine of them P1**. Two
+reproduced in ten seconds. They were not nine defects — they were one premise wearing nine faces:
+
+    git -c core.filemode=false reset --hard    # not matched AT ALL
+    git clean -n && git reset --hard           # dry run in ANOTHER clause excused it
+    git status --help; git reset --hard        # --help, same
+    QB_ALLOW_SHARED_TREE=1 echo hi             # grep's ^ is a per-LINE anchor,
+    git reset --hard                           #   so the hatch excused the next line
+
+A regular expression cannot parse a shell command. Patching those where they were found is how
+#67's loop starts — the special case is the next round's finding — so the premise went instead of
+the symptoms. `qb-classify-command` tokenises the command, splits it into clauses, and classifies
+each on its own. It follows `-C`/`--work-tree` (preferring `--work-tree`, since that is the tree
+whose files change), reads inside `bash -c '…'`, and knows that `echo git reset --hard` is not a
+reset.
+
+The regex survives in one job: a **prefilter** that decides nothing. It now runs *before* the hook
+resolves its token, which took a non-git Bash call from 137ms to 48ms — a cost the widened matcher
+did not create but did expose, on the hottest path there is.
+
+Two of the round's findings were introduced by the previous fix pass, and they are the argument for
+running a second round at all: the `--help` and dry-run exemptions added to answer a first review's
+false positives were applied to the whole command instead of the clause that matched, and each
+became a bypass.
+
+Also fixed: `qb-claude-setup --check` compared only the hook's *command*, so every host wired
+before this change reported `ok` while carrying `matcher: "Task"` — the hook present, and deaf to
+every Bash call. It compares the matcher now.
+
+#### What an adversarial review changed before it landed
+
+A second-opinion pass (Codex, different vendor) found seven defects in the first cut and every one
+of them reproduced. They are fixed here, and they are worth listing because most are the shape of
+mistake a guard like this fails by:
+
+- **It checked the wrong tree.** `git -C ../peer-tree reset --hard` was matched but evaluated
+  against the payload cwd — so it would allow a peer's checkout to be destroyed from a clean cwd,
+  and refuse a private checkout from a shared one. It now resolves the tree the command names.
+- **It compared directories, not worktree roots** — so a peer one directory down was invisible,
+  though #185 warns about precisely that. Both spellings are now asked for.
+- **It refused things that destroy nothing**: `git clean -fdn`, `--dry-run --force`, and any
+  `--help`.
+- **The escape hatch was a bare substring**, so `QB_ALLOW_SHARED_TREE=10 …` and a trailing comment
+  both walked through. It must be a leading assignment now.
+- **`git switch -f|--discard-changes` was missing entirely** — the modern spelling of the verb the
+  list was built around.
+- **The git calls were unbounded** on a path that now runs on every Bash call.
+- **The startup note counted agents while the gate counted agents and sub-agents**, so a tree
+  occupied by a peer's fan-out warned nobody and then refused them.
+
+The tests had the matching hole: the stub board answered with the peer list whatever it was asked,
+so every test named "this exact tree" proved only that the regex had matched. The stub answers the
+question it was asked now, which is what lets the target-tree tests mean anything.
+
+#### The note that preceded it was wrong in the same place
+
+`SessionStart`'s occupancy note scopes by `repo` when there is one — which, inside a git repo, is
+always — so it has never once asked about a working tree. On the night it named the very agents
+whose work was about to be destroyed and closed with "no need to hold off". That sentence is
+right about a repo and backwards about a tree.
+
+The hook now asks both questions and gives them opposite answers. Sharing a repo is still
+company, in the same words as before. Sharing a working tree gets its own ⚠️ line, its own names,
+and a `git worktree add` to get out of it.
+
+#### What #185 asked for, and why this is not that
+
+The issue proposes gating "the first write to a path", and sizing the two candidates before
+building either. Sized: neither would have caught any of the five. Not one went through
+`Edit`/`Write` — they were git subcommands in `Bash`, a different event with a different
+matcher, so an `Edit`/`Write` gate would not have been late, it would never have fired.
+
+The two candidates keep their value and stay open. Per-worktree dirty paths would say *what*
+is at risk, which this gate currently counts rather than lists; a `kind='path'` claim would say
+*whose*, which nothing can today — `worktrees` is keyed `(device, path)`, so N agents in one
+shared checkout are one row.
+
+#### Fail-open, unchanged
+
+A board that cannot be reached, a `cwd` that is not a checkout, a timeout, an answer that will
+not parse: all of them let the command through. A coordination board is not in the critical
+path of anyone's work, and a guard that failed closed would turn every board outage into a
+fleet-wide one.
+
+### a screen gets a keyboard
+
+Everything a seat screen could do to itself was a click. The seat bar gives `seat n`, `✕` and
+`＋` through one `MouseDown1Status` binding, and off the bar there was nothing: adding a seat
+from the keyboard meant dropping to a shell for `qb-seats --add`, killing the screen meant
+`--kill` in the same shell, and the tape and the dash could not be got out of the way at all
+without dragging borders. Turning the bar on also costs `mouse on`, i.e. shift-less text
+selection, which is a real price to pay for the only way in.
+
+**`C-q` is the qb key.** Press it, then `a` to add a seat, `x` to close this one (it asks —
+the agent in it goes too), `1`-`9` to jump, `t` and `d` to show or hide the tape and the dash,
+`=` `>` `<` to size the dash, `s` for the screens that are up, `K` to kill the screen (it asks)
+and `?` for the list. Anything else opens a menu carrying the same accelerators.
+
+#### A key table, and a menu you reach by not knowing
+
+`bind-key -n C-q switch-client -T qb` plus `bind-key -T qb <key>` is how tmux implements its
+own prefix, and it costs nothing: `C-q t` is one chord whether or not a menu was drawn, while
+a menu on every press is a flash across the screen you were looking at. So the menu is bound
+to `Any` — a key the table does not have opens it instead of being swallowed — which is the
+whole of "the menu teaches the shortcut it is about to replace". Both the bindings and the
+menu are generated from one table, so an accelerator cannot drift from the key it names.
+
+#### The bar says the key is waiting
+
+Switching into a key table is invisible in tmux. Its own prefix is the same and its users
+know; here nobody did. The first press looked like a dead key, so the natural next move was to
+press it again — that lands on `Any` and opens the menu, and a `display-menu` has no digit
+accelerators, so `1`-`9` did nothing at all while the menu's own title promised they jumped to
+a seat. One invisible state, reported as three separate bugs.
+
+`#{client_key_table}` is the whole fix, and it costs one conditional in the seat bar: press
+the key and a strip appears carrying every key it accepts, and it goes as soon as the next one
+lands. Mode indicator and cheatsheet at once, which the menu had been carrying alone. The menu
+keeps its place for the press where you do not know the key, but its title no longer promises
+the digits — it carries a `j` row that hands you back to the table, which is the one place a
+digit means a seat. And the guide is wrapped to fit the popup it opens in: it shipped 79
+columns wide inside a 78-column popup whose border takes two more, and the last paragraph
+folded. A test now reads the width out of the binding rather than trusting the text.
+
+#### The screen's top line was always there and always blank
+
+`status 2` makes room for the seat bar and tmux numbers the two lines 0 and 1; `install_bar`
+only ever wrote index 1. Writing one index of an array option at session level stops tmux
+inheriting the global array, so index 0 — which nothing set — resolved to empty, and every
+screen has carried a full-width blank strip in whatever `status-style` is since the bar
+shipped. It was never a design decision; it was a line nobody had written.
+
+It now says which screen this is on the left and `qb-pace`'s verdict on the right — the shared
+subscription's caps being the only hard ceiling this fleet has, and their one on-screen home
+having just become hideable with a keystroke. Not through `#(qb-pace)`: a status line
+re-expands every `status-interval`, per attached client, so the new `qb-seat-top` writes the
+answers into session options on its own timer and the format merely reads them.
+
+The line decrypts into place — lexray's `decrypt_text.js` effect, same parameters — replaying
+every `QB_SEATS_TOP_EVERY` seconds (30; `0` draws it once and leaves nothing running).
+`QB_SEATS_TOP_ANIMATE=0` writes it straight out, and the reveal settles on precisely what that
+would have shown. Measured before it was written, because a status line is not obviously
+capable of one: a `tmux set-option` round trip is 3.5ms, and all 50 frames of a 24-character
+reveal reached the terminal with none coalesced, at 21fps. Three things it needed that the
+browser version does not — single-width scramble characters (the originals include ambiguous-
+width glyphs that make the line jitter sideways), no subshell per character (580 forks a reveal
+became none), and no animation to a detached screen.
+
+Neither test catches a frame. A frame is on screen for 40ms, so polling for one races it — the
+first spelling passed locally, passed in the flake sandbox, and failed in the flake sandbox on
+the same commit, for no reason but load. `qb-seat-top --frames TEXT` prints the reveal with no
+tmux and no clock near it, and the assertions are arithmetic; `@qb_top_reveals` counts completed
+reveals, which is still true a minute later where a frame is not.
+
+And a missing `qb-seat-top` must not take the build down, which is `dash_hooks`' lesson
+arriving again: `run-shell -b` on a command that is not there fails with `no current client`
+and a non-zero exit, killing `qb-seats` under `set -e` with the session, seats and tape already
+created. The copy is asked for before it is run.
+
+#### The bar paints its own colours
+
+Every span on the seat bar set a foreground only and inherited whatever `status-style` was,
+which on a stock tmux is `bg=green,fg=black`. Read off the wire with a real client attached,
+the terminal was being sent `ESC[38;5;108m ESC[42m` for the ＋ — green on green, 2.08:1 — and
+`ESC[38;5;167m ESC[42m` for the ✕, at 1.39:1. Against a 4.5:1 floor, nothing on the bar
+cleared it. It now names a background on every span, fills its own line (tmux pre-fills the
+status line with `status-style` and draws the format over it, so without a fill the cells are
+dark islands in the theme's green), and picks foregrounds against that ground: 6.0:1 to 8.2:1,
+with the ✕ moved off colour167, which fell short even on the new ground.
+
+`#[default]` is not a reset in a status format — it jumps back to `status-style` — so the gaps
+between cells set the ground explicitly too. The tests check the property rather than the
+palette: no foreground without a background beside it, and every pair the format sets computed
+against the WCAG ratio.
+
+#### A key table is server-wide, so the binding is gated
+
+The same hazard `MouseDown1Status` has and the same answer. `@qb_key` is set on this session
+and on nothing else, so everywhere else the condition is false and the else branch does
+verbatim what tmux would have done: sends the key on to the pane. A session that is not a
+screen is not quietly missing a keystroke.
+
+`C-q` has prior claims — it is XON under `stty ixon`, and quoted-insert in readline and emacs
+— so `QB_SEATS_KEY` picks another and `QB_SEATS_KEY=` (empty) binds none at all. Empty means
+*none* and unset means *pick for me*, the same `${VAR+set}` spelling as `QB_SEATS_DASH`. Your
+own tmux prefix is untouched either way.
+
+#### Hiding a pane keeps the process in it, and putting it back is the hard half
+
+`break-pane -d` to a holding window and `join-pane` back, so the tape keeps following the
+board across a round trip. Two things that look like the way to restore the geometry are not,
+both measured on 3.6a: saving `#{window_layout}` and handing it back to `select-layout`
+restores the shape and *reassigns the panes* — its leaves are pane indexes, a rejoined pane
+lands at a different one, and a restored screen put the tape in seat 2's cell and seat 3 in
+the strip along the bottom, exiting 0 while doing it. And `select-layout -E` evens the row
+*including* the dash, which then reclaims its 78 columns from one neighbour and leaves seats
+of 50, 49 and 20 where they had been 39, 39 and 41. So widths are recorded by pane id before
+the break and reasserted after the join.
+
+Showing the dash replays the build order — tape out, dash in, tape back — because `qb-seats`
+splits the dash off the whole window first and takes the tape's strip off the bottom
+afterwards. Joined back with the tape already in place, `-f` gives the dash the full height of
+the window instead: a 78x44 dash down the side of a 121-column tape. What is hidden is
+recorded on the session, never the server: two screens must be able to disagree about whether
+their tape is showing.
+
+#### The screen and the pane travel in the binding
+
+`qb-seat-click` stashes the click's target in a server option and reads it back, because
+`#{mouse_status_range}` is scoped to a mouse *event* and is gone by the time `confirm-before`
+runs its command. A session and a pane are *client* state, so the qb key's bindings simply
+expand and pass them — measured against a real client and a real keystroke, from a plain
+binding and from behind a y/n alike. The id and not the name: the value crosses tmux's
+expansion into a shell command line, where a session called `it's` would leave an unterminated
+quote. `display-popup` turns out not to format-expand its command at all, so `?` — the only
+action reached through a popup — asks tmux which session it is in instead.
+
+And a real keystroke is tested, which the bar's click never could be: a click means SGR mouse
+bytes and a status line whose geometry the test has to work out, while `C-q t` is two bytes
+written to a pty. That is the only assertion covering the join between the key table and the
+actions.
+
+#### Four found by a second opinion
+
+An independent review (a different-vendor model, read-only over the branch) found the first
+three; the fourth fell out of chasing them.
+
+**The dispatcher's path was quoted for the shell and not for tmux.** It is written into a tmux
+command string, so it needs `sh_quote` *and* `tmux_quote` — the rule `tmux_quote` itself states.
+The failure is silent: a checkout under `a$Bdir` bound every key to `/…/a/qb-seat-key`, because
+tmux expanded `$Bdir` to nothing, and `run-shell -b` discards both streams. A `"` in the path is
+the loud version — `syntax error`, and a half-built screen. The escaping does not scale evenly
+either: `\`, `"` and `$` are consumed once per parse pass, and a confirmed action crosses two,
+while `#` must be doubled exactly once because only the single format expansion consumes it.
+
+**A key press could run another screen's copy of qb-seat-key.** `bind-key -T qb` is server-wide
+and holds one path, so the last screen built wins. The screen now records `@qb_key_bin` and the
+dispatcher hands over, once.
+
+**A pace verdict that could not be refreshed read as current.** Kept and marked `stale` — drawn
+dimmer and prefixed `~`, the mark the dashboard already uses for "at most this long ago" —
+rather than either lying or being blanked.
+
+**And a toggle stole the cursor.** `join-pane` leaves the joined pane active, so showing the tape
+landed you in the tape: the next keystroke went to a board follower instead of the agent, and the
+next `C-q x` refused with "that pane is not a seat".
+
+#### Two bugs the keyboard found on its way in
+
+**`session_id` left the pipeline non-zero unless the screen it was asked about was listed
+last.** Its loop body was `[ "${line#* }" = "$1" ] && printf …`, so a final line that did not
+match made the `while` exit 1 — and under `pipefail` that is the status of the pipeline and so
+of the command substitution around it. `sid=$(session_id "$s") || sid=""` then threw away the
+id it had just been handed. Every button on the seat bar reported "no screen named 'one' is
+up" about a screen tmux was listing on the line above, on any box running a second screen.
+One screen on a server could never show it, which is why it shipped.
+
+**`qb-seats --kill -s NAME` needed a git repo it never used.** The kill path sat below the
+repo derivation, so it refused with "not in a git repo" against a screen it could see —
+reached from a `run-shell`, whose cwd is the tmux *server's* and need not be a repo at all. It
+now sits with `list`, `resume` and `--dash-fit`, which are above that derivation for the same
+reason: all four are about a screen that already exists.
+
+### "waiting on a human" is a row now, and `next` stops handing that work out
+
+The fleet could say *item A waits on item B* and could not say *this waits on Rich to
+answer a question*. Measured before this landed: **`counts.blocked` read 0 across 20 open
+items** on a plan where three carried a blocker written as English inside `note` — *"RANK
+IS WRONG AND A HUMAN MUST FIX IT"* among them. Countable by nobody, rendered as ordinary
+open work, and handed to the next agent that asked.
+
+Two mechanisms already looked like they might serve and both were measured **empty**: the
+`stuck` post type, and the six `needs-human/*` labels #279 created. One reason — an event
+is easy to skip and impossible to chase. The three questions worth asking about a blocker
+are all state questions (*how many, how old, whose*) and none is answerable over an
+append-only stream.
+
+**`plan_block` / `plan_unblock` / `blockers`**, over the API and MCP. The interesting rule
+is who may close one, and it is `exempt_item`'s shape: one endpoint, and the caller's
+credential decides which act happened. A **person answers** — the resolution is the payload
+the next agent reads. An **agent may only withdraw, and only its own**: a loop that finds
+the answer in the docs two minutes later should take its question out of a person's queue,
+and withdrawing somebody else's is answering it. Raising is ungated on purpose — a blocker
+costs a person a glance, and the failure being fixed is judgements never written down, so
+the friction belongs on answering and never on asking.
+
+`next` now skips an item waiting on a human, and answering it puts the item back. `counts`
+splits into `blocked` and `waiting_on_a_human` — one waits on work finishing, the other on
+somebody answering — with `blocked` keeping its exact previous meaning so nothing that
+predates this is silently handed a new number.
+
+**Six classes, not seven.** #328 proposed adding `authorisation` (*may I do this*) beside
+#279's `auth` (*does the credential path work*). `app/needs_human.py` states its own rule
+for growth — a word is earned by turning up under `other` with the same reason — and
+nothing has ever been filed under `other`, because until this table nothing was filed at
+all. Rich, on whether the evidence is likely to arrive: *"agents are highly trusted, and
+have full and wide autonomy to do gh actions. I don't think auth based limits are likely
+to be common."* Widening the CHECK later is a fifteen-line migration.
+
+Still to come, and deliberately not bundled: the `⛔ N waiting on you` chip on the human
+board, the per-class chip on the plan page, and the BLOCKED panel on both dashboards —
+`plan_counts` gains its third number for those.
+
+**The two surfaces a person answers on.** The plan page carries a `⛔ decision — waiting on
+rich` chip, distinct from the dependency chip and coloured by class, and tapping it opens an
+inline answer box — the question, the detail, who asked and how long ago, and a field whose
+own placeholder says *"the next agent reads this, so say the decision, not that you made
+one."* An empty answer is refused by the page rather than the server, because the server's
+422 is about a field and the page can say the thing that matters: an empty resolution leaves
+the question unanswered while looking answered. The footer splits into *"N waiting on an
+item · N waiting on a human"*.
+
+The human board carries a persistent `⛔ N waiting on you` chip in the **sticky header**,
+not in the stream — a `stuck` post scrolls past, and a blocker is a thing that is still
+true. Two numbers, because they are two sentences: how many the fleet is parked on, and how
+many are addressed to the reader. Unowned blockers count toward the first and never the
+second; a chip claiming unowned work was yours would make the one number somebody acts on a
+lie. A board that will not answer renders nothing rather than `0 waiting` (#244).
+
+The dashboards are hermes/seat-quarterback-2's half by agreement — they own that file and
+the pane budget #269/#272 is about.
+
+### how much of the backlog could be ordered at all
+
+`GET /merge-queue` has computed an order since v3.18 and named its own blind spots. It has
+never described a drain. Nothing enumerates a repo's open pull requests, so the queue holds
+only the PRs whose agent happened to run `/fix-and-land` step 4a — four rows against a
+thirty-six PR backlog — and one unenrolled straggler nulls `suggested_order` for everyone.
+
+`qb-line` walks the open PRs instead of the queued ones and asks each the same question,
+sorting them into five tiers with the repair for each: `never-panelled`, `no-file-list`
+(the 404 from `/review/collisions`, and the commonest answer on a backlog assembled over
+weeks), `stale-evidence`, `prefix-list` and `orderable`. The headline is the number #435
+says nobody has ever seen — **how much of a real backlog the ranker could be computed
+over**, rather than how good the order is.
+
+#### It forms no queue
+
+#435 asked for a driver that enumerates and **enqueues**. #476 supersedes that half, and
+its argument is that a central drainer is the shape this codebase has refused four separate
+times in its own docstrings — `qb-seat`'s "no orchestrator to lose", `qb-start`'s "a spawner
+that read the plan and handed seat 1 the first item would be hub-and-spoke with a hub that
+runs once", `app/review_queue.py`'s "a drainer that also ordered would be the hub-and-spoke
+shape `qb-seats` was written to refuse", and `app/api/landing.py`'s "not an orchestrator…
+not a ranker… not a trigger".
+
+What #476 does not supersede is #435's last paragraph — *"the report naming them is what
+turns 'the order is null' into a work list"* — and that is what shipped. Every request the
+tool makes is a `GET`, asserted from the board's side rather than promised in a docstring,
+so the day somebody adds an enqueue to it the suite goes red.
+
+#### What review changed
+
+An earlier cut had a `--preland` flag. It could not keep the tool's one promise:
+`preland.py` fetches the base branch's remote-tracking ref, and `announce_hold` posts to
+the board for a HOLD — so sweeping a backlog with it would have written once per holding
+PR, and its `--repo` means a checkout path rather than `owner/name` besides. It is gone,
+and a test asserts it stays gone.
+
+The enumeration is capped at 200 open PRs and announces the cap when it binds. The
+headline of this report is a fraction; a silently truncated denominator would make it read
+better than the truth, which is the one direction a report about unfinished work must
+never be wrong in.
+
+And the sharpest one: the collisions response carries **no `head_sha`**. A first cut read
+`coll["head_sha"]` and fell back to the newest run's head, which calls stale evidence
+*current* whenever the newest run happens to sit at the PR's head — a false all-clear on
+the one tier that is a safety claim. The answering run is now resolved through `/reviews`,
+and a PR whose evidence commit cannot be established is `head-unknown` rather than
+`orderable`. The test fixture had invented the missing field, so the suite was agreeing
+with itself rather than with the server; it now sends the endpoint's real keys.
+
+And the one that shaped the tool: every tier is judged on the PR's **newest** run, because
+that is the run the ranker uses. `merge_queue` takes one unconditional `DISTINCT ON (pr)
+ORDER BY ts DESC` with no file-list predicate — "a run that recorded no paths must come back
+as 0 and stay in the population" — while `/review/collisions` reaches back for the newest run
+*bearing a list*. A first cut followed collisions, which would have reported a PR
+`orderable` while the queue counted it blind: a false all-clear about the exact number this
+report exists to produce. Two more tiers came out of the same pass — `inconsistent-counts`
+(the queue's own fault class) and a base-branch comparison, since a retargeted PR is a
+different diff at the same commit.
+
+### the plan says when the work behind an item is already finished
+
+`qb-reconcile` has been right and unheard. It runs every fifteen minutes on two hosts,
+walks the plan's refs against GitHub, and posts what it finds — and on 2026-08-25 at
+10:40Z a plan read still answered `next: #449`. #449 had been closed as completed at
+07:33Z. The pass seven minutes earlier had said so, naming it by rank, and the caveat that
+did fire told the reader to go and ask the agent who put it down whether it had been
+abandoned rather than finished. The board already knew.
+
+Three of the top nine items were closed. One had been closed for over two days, named
+every fifteen minutes throughout.
+
+Both facts were on this board and nothing joined them. Now they meet:
+
+```
+next.caveat: THE LAST RECONCILE PASS SAYS THIS IS ALREADY FINISHED — open item, but
+issue#449 is closed as completed. It has said so in the last hour, and the plan has not
+caught up — the item is open here because nobody called `plan_done`, not because the work
+is outstanding.
+```
+
+`POST /plan/reconcile` takes one scope's findings and replaces that scope's set, so a ref
+the pass stops naming is resolved and an empty report is the message that says so. Each
+item in a plan read carries `reconcile` — the condition, the pass's own sentence, and how
+long it has been saying it. That last number exists only here: a pass holds no history, so
+"a done candidate since Sunday" cannot be said by the thing that found it.
+
+**It decides nothing, and that is the design.** No item is marked done, dropped or
+reordered; `next` still returns a flagged item rather than skipping it. `qb-reconcile`'s
+refusal to write is right about the conditions that are judgements — `dropped_candidate`
+above all, where "the work was abandoned" is a decision somebody has to make and inferring
+it would erase the distinction the plan's model exists to keep. What was missing was never
+the decision. It was that the pass and the plan were two facts on one board with nothing
+between them.
+
+The condition had to travel as data rather than through the post's `refs`, which is why
+this is an endpoint and not a reader: `Ref` is a generic dev-context link with four fields,
+so a `done_candidate` and a `dropped_candidate` arrive through a post identical — and those
+two are exactly the pair that must not be confused.
+
+**Unknown conditions are stored and shown.** The list belongs to a client on another host
+that updates when its harness does; a board that refused a pass for one word it had not
+been taught would fail closed on the day somebody added a condition, losing the rest of
+that report with it.
+
+### which dials are in force, on the screens the fleet is actually driven from
+
+A dial is a setting: the repo supplies a default, the board states the value in force, and
+the layer that answered is part of the answer (#305). And until now **no screen showed one**
+— not `qb-dash`, not `qb-dash-tui`, not `qb-board`, not the web board:
+
+```
+$ grep -rn "dial" app/templates app/static harness/bin
+(nothing but the word "dialog")
+```
+
+A dial was set from an endpoint with curl and read back by one function in
+`harness/loops/panel_seats.py`. The value governing what every round on the fleet costs was
+invisible everywhere a person or an agent looks. That was tolerable while a dial only
+configured a review; it stops being tolerable with `tempo` (#474), which is the answer to
+*"is this fleet working right now, and how hard"* — a fact that has to be legible at a
+glance from a terminal.
+
+Both dashboards now carry a **DIALS** panel, above the seats, because it is the
+configuration every panel below it is running under. Each row is the dial, its value, the
+layer it came from (`fleet`, or the repo), and what is left of it; the argument for it — the
+board requires one on every write — is on the line under it with who set it and when. A repo
+dial beats a fleet dial, so the beaten one is counted in the title as `overridden` rather
+than drawn as though it were in force. `tempo` also gets a cell of its own on the caps line,
+beside the budget it exists to protect.
+
+**An indefinite dial and an expiring one do not render alike.** A `tempo: eager` with forty
+minutes on it and one set indefinitely are different situations: the countdown is the quiet
+cell and `no end` is the loud one, because a dial that expires takes itself off the board
+with nobody remembering it, while one with no end stays until a person comes and clears it.
+That is #244's rule — being idle and being broken must not look alike — applied to a switch
+instead of a queue.
+
+#### Turning one is a browser action, and the terminal says where
+
+`GET /dials` takes `app.auth.reader`, which a machine bearer token passes, so reading is free
+from a terminal. `POST /dials` takes `app.auth.human` — `Remote-User` plus the `X-Edge-Auth`
+secret the edge injects — and every agent on a box holds the same machine token, so nothing
+inside a request from one distinguishes it from a person. A tempo an agent could raise for
+itself is the self-approval shape #85, #86, #78, #232 and #335 each settled separately, and
+it is not being reopened by a keybinding.
+
+So this is #443's option (3), one endpoint over: the dash reads, and names the door. The
+panel's last row is `set one in a browser: <board>/dials/view?repo=…`, `d` opens that page
+from anywhere, and the `✎` on any row does the same. The URL is printed rather than implied
+because #443 is the record of what the silent version costs — a person told the reorder was
+theirs to do, in a terminal, whose reply was *"i don't know how to re-order"*.
+
+#### And there is now a page at the end of that URL
+
+`/dials/view` shows what is in force for a repo and for the fleet, what each overrides, and
+a form that sets or clears one. It asks `/whoami` first and says plainly when the answer is
+an agent, so a refusal arrives as a sentence rather than as a dead button. A value typed
+there is sent as JSON where it parses (`2`, `true`, `null`, a list) and as the string it
+looks like otherwise (`P3`, `eager`): a `max_rounds` of `"2"` is a dial the harness refuses
+to apply and reports by name, which is a puzzle to be handed at a keyboard. Every page with
+a nav now links to it.
+
+**None of these surfaces knows what a dial MEANS.** The harness owns the vocabulary
+(`harness/loops/harness_rules.py`) and the server image carries no `harness/` directory at
+all, so a copy in a dashboard would be a second place a dial is written down — the confusion
+#56's rule and #305 exist to end. A `tempo` with no board dial therefore reads `unset`
+rather than naming a default, and a dial no harness recognises is stored, returned and
+ignored, loudly.
+
+Not in scope, deliberately: **who may write a dial**. As #443 puts it about the plan, the
+question is whether a person at a terminal can reach the door, not whether the door should
+be there.
+
+### an agent asked to sort the plan can now do it — with a credential of its own
+
+`plan_order` has always computed the order the facts imply and handed back the exact
+payload that would apply it, ending with *"You cannot apply this."* So the answer went to
+a person to re-enact by eye against a list of forty rows — and correcting an item's own
+stale reasoning was equally out of reach, because `POST /plan/item/update` is gated the
+same way.
+
+`plan_reorder` and `plan_item_update` are the MCP tools that apply it. What makes them
+safe is a **new, narrow credential**: `ELEVATED_TOKENS`, one `name:secret` pair per
+machine in the same shape as `API_TOKENS`, presented as `X-Agent-Elevated` beside the
+ordinary bearer, to the ordinary agent host. It is client-supplied like a bearer and
+unlike `Remote-User`, so the edge neither injects nor strips it and no vhost changes.
+
+**It is not a way to be a person, and that is the design.** The rejected alternative was
+to lend an agent a signed-in session: the agent would have become `human/rich`, every
+human-only endpoint would have opened at once — including granting a review exemption,
+which is #335 reopened by a longer route — and a reorder an agent applied would have been
+indistinguishable in history from one somebody typed. Instead `delegated()` authorises a
+**named pair of endpoints** and the caller keeps its own name. `/dials`, `POST
+/plan/scope` and `exempt`'s grant path stay `human`-only and are untouched.
+
+Three properties fall out of it:
+
+- **Per machine.** The secret is looked up by the machine the bearer authenticated as, so
+  one minted for `hermes` is refused when presented by `zeus`, and a leak is revoked by
+  editing one line. Unconfigured is closed, not open, exactly as `HUMAN_EDGE_SECRET` is.
+- **Provenance, in the row rather than in discipline.** A new `derived` rank source (with
+  its migration) says an order was computed and applied on somebody's instruction.
+  `order_trust` counts it beside `unchosen` and deliberately does **not** flip `trusted` —
+  the `picked-up` migration already settled that a new source must not make a plan read as
+  less trustworthy for the sole reason that agents were working.
+- **A person still writes `ordered`**, and the browser board's ▲▼ are untouched.
+
+Client-side the secret may be a value (`QUARTERBACK_ELEVATED_TOKEN`) or a command that
+prints one (`QUARTERBACK_ELEVATED_TOKEN_CMD`), matching `QUARTERBACK_TOKEN`/`_CMD`. The
+command is resolved **lazily** — this client is constructed once per MCP session on every
+session start, and the command is usually `op read`, which can prompt, so resolving eagerly
+would put a credential prompt in front of every agent that starts to serve two tools it
+will probably never call. A 403 re-runs it once past the cached value and retries, so a
+rotation costs a retry rather than a restart.
+
+### the board holds the fiddly tail, and the tracker stops filling up with it
+
+A panel round that leaves findings unfixed has to say where they went, and `panel-review-pr.md`
+§4b had exactly one answer: open a GitHub issue. Its reason was sound as far as it went —
+`deferred_to` names an issue ref, and a `deferred` with nowhere to go is the markdown list
+this replaced — but it treated two records as one.
+
+The **board row** is the durable one. It chains by finding key across rounds, it feeds
+`/panel`, and it is what stops the leaderboard rewarding a reviewer for being confident
+rather than right. The **GitHub issue** is a work item on a human's tracker. For a P1 or P2
+deferral those coincide. For the P3/P4 tail they do not, and the tail is where the volume is.
+
+Measured on this repo on 2026-08-26: roughly twenty open issues are that exhaust and nothing
+else — #66, #69, #72, #74, #95, #104, #111, #119, #120, #126, #132, #133, #140, #223, #237,
+#285, #286, #288, #300. Every one is a capped or below-floor round with nowhere to put what
+was left. #283 is a rescue *from* one of them: three live defects that had been sitting inside
+a deferred-findings dump nobody read, which is what a tracker looks like after it has stopped
+being a queue and started being a place things go to not be found. Each one also dilutes the
+issue list that #435's queue and the drainer are supposed to rank.
+
+So `review_panel.file_deferral_issues` — a severity gate rather than a boolean, because the
+useful answer is "not for the tail":
+
+```json
+"review_panel": { "file_deferral_issues": "P2" }
+```
+
+At or above it a deferral gets its GitHub issue and names it in `deferred_to`, exactly as
+before. Below it the row carries **no `deferred_to`** and **a one-line `note`** instead.
+`"always"` is the old behaviour in one word and `"never"` files none at all.
+
+#### The note is the difference between a record and a dumping ground
+
+With an issue behind it, the issue's title and body are what somebody reads later. With no
+issue, the note is — so below the gate it is not optional, and `GET /review/findings` is named
+in both briefs as the read that write exists for. A row that is only ever written is the
+markdown list again under a new name; a row something queries is a memory.
+
+#### Three things it deliberately does not do
+
+An **escalation is exempt at every setting**, `"never"` included: its issue *asks* a question
+about the change's premise rather than filing a task, and it is what carries that question past
+the end of the session — the same exemption a Sonar hard-gate issue gets from both severity
+floors, and for the same reason.
+
+If the board write **fails**, the issue is filed whatever the gate says. Below the gate the row
+is the only record, so a refused write and a suppressed issue would between them lose the
+finding outright — the one outcome this setting must never produce.
+
+An **unreadable severity files the issue**. An issue nobody needed costs a line on a tracker;
+silently withholding one leaves the finding in a row nothing can sort by.
+
+#### And a `deferred` row may now genuinely point at nothing
+
+That was the open question this rested on, and it needed no second half: `deferred_to` is
+nullable, the API accepts a `deferred` outcome without one, `/panel` renders a targetless row
+rather than treating it as broken, and such a row still retires the finding from
+`needs-human` — so a quieter tracker does not cost a queue that drains.
+
+Board-settable like the floors beside it, as a new `deferral_gate` kind: its two ends are words
+that no severity band can spell. Fixing its value check turned up the same bug one door down —
+`fix_severity_floor` and `round_trigger_floor` refused a board value written `" P2 "` while the
+rules file beside them accepted `" p2 "`, so one written value meant two things depending on
+which layer carried it. All three strip before they judge now.
+
+### the panel stops when the fix pass is generating the work
+
+From round 2 what a panel round reviews **is the previous round's fix**. So `round_stop`'s
+rule 1 — new findings buy another round — is fed by the loop's own output, and a
+termination test fed by its own output can only end on the cap. The panel has been
+measuring exactly that all along and doing nothing with it: `_provenance` sorts every new
+finding into `introduced` / `missed` / `missed-unread` / `unknown`, the round tallies it,
+the report prints "**N introduced** by the last fix pass", and nothing read it to stop
+anything.
+
+Now `review_panel.escalate_on.fix_injection` does. A round where more than **half** its new
+outstanding findings were introduced by the fix pass before it ends the cycle — with a veto
+line naming the dial, `confident` false, and a `reason` that says a human decides whether
+the fix passes are working. Default **0.5**; `null` switches it off.
+
+**The withholding was deliberate and this is not it being overturned as an oversight.**
+`panel.py` says in as many words that nothing reads these tallies to stop a run, that #67
+asks for the instrument before the gate — "two pull requests in one day is an observation,
+not a calibrated rule" — and that "a few dozen cycles of it are what would justify wiring
+it to anything". The cycles came in. 128 of 201 new findings across seven PRs were created
+by the fix pass immediately before them; 39 of 53 after round 1 on PR #299, and 17 of 17 in
+its round 2; 64% then 87% on the cycle this was filed from, over a pull request whose actual
+change was 113 lines. Every one of those is far above 0.5, and every one of those cycles ran
+to its cap.
+
+The two neighbouring tallies stay withheld, and now for reasons of their own rather than by
+inheritance. Recurrence cannot carry a threshold at all: replayed over 36 rounds of this
+board's history it fires on four new findings in five, on the circling cycles and the healthy
+ones alike, and a number that does not separate the populations cannot gate on the difference
+between them. The judge's per-finding premise verdict is nearer to earning one and is waiting
+on the same condition provenance just met.
+
+**Three properties keep a false positive cheap**, which matters because what is still
+uncalibrated is where a *healthy* cycle sits:
+
+- it can only ever turn a `go again` into a stop, never the reverse, so no value of it can
+  make a review look cleaner than it is — a dry round, a below-floor policy stop and a round
+  holding an escalation all keep the reason and the confidence they earned;
+- it may only take away the round **rule 1** was buying. A round going again for a P1 the fix
+  did not clear, or for a finding an earlier round already raised, is going again for work the
+  fix pass *failed* to do rather than work it generated — so a rate computed over four
+  below-floor findings cannot cancel that repair round. The payload keeps `over` (the
+  measurement crossed) and `fired` (this rule is why the cycle stopped) apart for the same
+  reason;
+- under the shipped `max_rounds: 2` the only round it can fire on is the one the cap would
+  have ended anyway, so what a default-on costs a repo that changed nothing is a better
+  `reason` and one more veto line rather than an earlier finish. It bites where the loop
+  actually runs away: a repo that raised the cap, or one driving `--loop`;
+- a false positive costs one printed question, which is #67's own required output; a false
+  negative is #299's five-round cycle, which nothing stopped.
+
+**One round, not two consecutive.** The field report proposed two, and it cannot work:
+provenance is only attributable from round 2, so a two-round rule cannot fire before round 3
+while `max_rounds` defaults to 2. It would have shipped switched off for every repo on the
+defaults.
+
+**A threshold on this number errs safe**, because `_provenance` documents its own bias:
+`introduced` requires exact membership in the fix pass's added lines and misses anything the
+fix introduced by *deleting*, so the count "should be read as a floor rather than as a
+measurement". A measured 0.64 is at least 0.64, and a threshold crossed is genuinely crossed.
+The unattributable buckets sit in the denominator for the same reason — they depress the
+rate, so a round the harness could not place is a round that does not end a cycle.
+
+`panel_rounds.FIX_INJECTION_MIN_NEW` (4) is the minimum denominator and is a constant rather
+than a second dial: a rate over two findings is not a rate, and the honest answer to one
+uncalibrated number is not to ship two of them. Every round records
+`round_stop.fix_injection` — the rate, the dial and the verdict — whether it fired or not.
+
+### a round's report shows the cycle, not just the round
+
+Every round's report stated that round's own figures and nothing else. There was no line
+anywhere that put the rounds beside each other, so the reader — human or orchestrator — had
+to hold three reports in their head and do the arithmetic to see which way a cycle was going.
+
+Read one round at a time, a diverging cycle looks flat. A reader shown "14 findings" and then
+"15 findings" reads that as converging. It was 8 → 14 → 15 against a PR that tripled, on an
+underlying change of 113 lines — the opposite reading, and it was available from data every
+round already had. On the cycle this was noticed on, three rounds ran to the cap before anyone
+computed the trend, and the answer took about ninety seconds of arithmetic on numbers that had
+been in the payload since round 2.
+
+From round 2 onward the report now carries the cycle:
+
+```
+round  findings  P1/P2  introduced  whole PR  vs r1
+   r1         8      2           —   113,402  1.00x
+   r2        14      5     9 (64%)   236,187  2.08x
+   r3        15      4    13 (87%)   340,341  3.00x
+```
+
+`introduced` is that round's `provenance_counts["introduced"]` and its share of that round's own
+findings, in three states. `—` is round 1, where the question does not arise. `?` is a round that
+was asked and could not answer — `unknown` was the only bucket with anything in it, so the fix
+range was unreadable. `0` is the round that attributed and had nothing to attribute, which is what
+a round of repeats looks like. A failed attribution is never printed as `0`: a claim about the fix
+pass, made from a measurement that did not happen, is the flattering direction. And a round that
+reviewed nothing prints `not run` rather than `0 findings`, which would put the strongest
+convergence signal the block can show against a round that never happened.
+
+The size column is `pr_chars`, the whole PR whatever that round reviewed (#298) — never
+`diff_chars`, which under `increment` scope is one fix commit and would show the change
+shrinking exactly while it grows. The ratio's denominator is `Baseline.first_reviewed`, which is
+`max_fix_growth`'s own: one denominator, so the block's ratio and the ceiling's veto line are the
+same measurement, and where it is missing the ceiling does not run either and the column says `?`
+rather than picking a substitute.
+
+#### No density metric, deliberately
+
+While reading that cycle by hand, the reporter computed findings-per-10k-chars and got **9.46 →
+7.97 → 4.82** — a number that falls every round, reads as steady improvement, and is describing a
+cycle that was diverging. It falls because the denominator is growing, which is the problem
+rather than evidence against it.
+
+Nothing in the tree emitted that figure, and nothing does now. Any per-size figure added here
+must sit beside **both** the absolute count and the growth ratio, or it will mislead in exactly
+the case the block exists to expose. `tests/test_panel_trend.py` asserts the rendered rows whole
+and computes those three numbers from the issue's own fixture to insist they appear nowhere.
+
+#### A count never degrades to a smaller number
+
+The rest of `load_baseline` reads the finding buckets tolerantly, because what those reads build is
+the "has anyone raised this before" set, where a dropped record makes a repeat read as new and buys
+a round nobody needed — the safe direction. A count has no such direction: `"to_fix": "corrupt"`
+iterates into single characters, each fails the mapping test, and a tolerant count reports **0
+findings** from a payload nothing was read out of. A bucket that is present and is not a list of
+finding records therefore makes that row's counts `?`; an absent bucket is still empty, which is
+what an older schema's silence means. `introduced` is bounded by the population it is a share of
+for the same reason, so a payload claiming more introduced than found reads `?` rather than
+`20 (2000%)`.
+
+Two payloads claiming one round render one row — the last-written, which is the tie-break that
+already decides which of them supplies the anchor and the coverage record. Two `r2` rows with
+different figures cannot be read down a column, which is the whole of what the block is for.
+
+#### It is reporting, and it stays reporting
+
+No dial, no gate, nothing that can end a cycle. `round_stop` does not read it, no ceiling in
+`panel_caps` reads it, and it reaches no model the round puts anything in front of — every seat's
+prompt and the judge's briefs are captured in a live round and asserted to carry none of it, on top
+of a scan of the stop rule's and the ceiling's own source. A reviewer told the cycle is diverging
+is a reviewer told what to conclude before it has read anything, and a feature drifting into a stop
+condition is the kind of change that looks harmless in a diff. It is worth having whether or not the injection-rate stop of #489
+is ever wired to `round_stop`; chaining a cheap reporting improvement to a policy argument is how
+the cheap half waits on the expensive one.
+
+The payload carries the same rows as `cycle_trend`, rebuilt from each baseline's **raw** per-round
+fields every round rather than chained from an earlier round's computed copy — so a cycle with a
+skipped round in the middle, or one spanning this release, still gets a complete block instead of
+a tail.
+
+### the escalation test the premise counter cannot ask
+
+#84's futility brake counts DECLARATIONS of one premise. A fixer replacing one proxy with a
+better one declares a genuinely different premise every round — honestly, because that is
+what its fix now assumes — so the counter sits at 1 while the cycle circles. One measured
+cycle declared four premises, no two of which matched, while three fix passes went by; the
+brake never fired, and all three of `review-pr.md` step 3a's escalation tests passed
+correctly every time. Test 3 screens for *"this fix is pinned to one instance"*, and a better
+approximation of an unobservable property is generally testable.
+
+The answer is not a better comparison between declarations. `same_premise` already records
+why — two proxies for one premise share almost no words — and #84 rules out building a
+similarity heuristic. It is one more question, put to each declaration on its own, whose
+answer does not depend on the words the fixer chose.
+
+#### Step 3a gets a fourth test, and it stands alone
+
+> **Is the property your fix asserts decidable in the runtime the assertion runs in?**
+
+If it is not, every fix for it is an approximation, the next round's findings are the gap
+between the approximation and the property, and the round count is unbounded by construction.
+Tests 1-3 remain a conjunction; test 4 escalates on its own, and it has to — requiring it to
+hold *alongside* test 3 would guarantee it never fired, since test 3 passes precisely when
+test 4 is failing.
+
+#### `--premise-decidable`, and a brake that fires on the FIRST declaration
+
+`panel.py --premise` takes `--premise-decidable yes|no`, recorded in the cycle's register and
+reported on every declaration — including the ones it does not stop, because a fixer that has
+never seen the question does not know it was asked. `no` refuses the fix under the new
+`review_panel.escalate_on.premise_undecidable` (default `true`).
+
+It brakes on the first occurrence rather than the second, and the asymmetry with
+`premise_repeated` is the point: one counts because a single declaration is not evidence, and
+this one reads a fact about the runtime that a repeat cannot make truer. Waiting for a second
+buys a fix pass and a whole panel to confirm what the first answer already said.
+
+A `no` sticks to the premise: a later `yes`, or a later declaration with the flag omitted,
+neither clears it nor gets past the brake, which reads the register entry rather than the
+declaration in front of it. Everything else would let the one agent whose fix is being refused
+lift its own refusal by changing its answer — the self-report `round_stop`'s docstring already
+says the loop cannot take on trust.
+
+Omitting the flag on a premise with no answer yet is `unknown` and brakes nothing — #84's rule for an undeclared fix pass, one
+level down: report the gap, never guess at it. `round_stop` carries the late half, ending a
+cycle whose fix pass was written anyway, with a veto line and `confident` false.
+
+### the growth ceiling gains an absolute half, and the panel starts watching guard-to-guarded
+
+`max_fix_growth` is the backstop against a fix pass that writes a second change instead of a
+fix. It is the right idea measured two ways that both let a case through, and a field report
+on a cycle that ran to its end while circling showed both.
+
+#### It scaled its rope with the starting size
+
+The ceiling is a **multiple** — `pr_chars` over the size the cycle's first round read the PR
+at — so the absolute growth it permits is proportional to how big the PR was to begin with.
+At 3.0x a 113-line PR may grow about 226 lines before the check fires, and a 2,000-line PR
+may grow four thousand. The second row is four thousand lines of fix-pass output on a change
+that was already large, waved through by the same dial that stops the first at 226. "A fix
+pass that multiplies the diff has written a second change" is a claim about *absolute*
+second-change-ness, and one multiple cannot make it at both ends of the range.
+
+So there is now `review_panel.max_fix_growth_chars` (**30,000**) beside it, and the cycle
+stops on **whichever is crossed first**. Both are ceilings, so the pair can only ever
+tighten: nothing this arrangement lets through would have been caught by the multiple alone,
+which is what makes it cheap to reverse.
+
+**A second key rather than a two-part value**, which is the question the report left open. A
+pair would avoid a fifth growth-adjacent name in a `review_panel` block already near 25 keys,
+and it would cost more than that saves — `BOARD_DIALS` types this dial as a scalar `number`,
+the board's column stores one JSON value per dial, and `null` is already the documented off
+switch for `max_fix_growth`, so a pair would have to answer which half a bare `null` switched
+off. Two keys, two nulls, two independent answers, and either settable from the board alone.
+
+**Chars rather than lines**, and the unit is in the name. The multiple beside it already
+divides `pr_chars` by `pr_chars`; two halves of one ceiling read off two different
+measurements is #298's defect one level up, where a numerator came from a different string
+than its denominator and the guard read as configured while stopping nothing. A churned-line
+count also does not exist on any baseline written before this key did, so a `_lines` dial
+would have declined to run on every cycle already in flight. 30,000 is roughly 380-450
+churned lines at PR #188's own measured 66 chars a line — it stops #188's growth of 536 lines
+and #236's of 1,954, with margin.
+
+One migration note, and the round says it out loud rather than guessing: a repo that wrote
+`max_fix_growth: null` meant "no growth check", because that key was the whole check. It now
+switches off the multiple only, and a round resolving that combination emits a `config_notes`
+line naming `max_fix_growth_chars` and the value it is still in force at.
+
+#### Nothing watched the apparatus outgrow the change
+
+The same cycle produced **406 lines of test for a 66-line config change**. That ratio is the
+"this has become two changes" signal `max_fix_growth` is reaching for, it is available from
+**round 1's diffstat**, and it is a different failure from raw growth — a fix pass can sit
+well under 3.0x overall while the test-to-source ratio inside it goes to 6:1.
+
+So every reviewed round now measures it: `guard_ratio` in the payload, a **Guard-to-guarded**
+line in the report, test and doc lines *added* against source lines added over the whole PR.
+
+**It gates nothing.** #67's rule is instrument-before-gate and this repo has applied it
+consistently — the panel's existing attribution tallies are recorded, counted and printed
+with nothing stopping on them. A guard ratio earns a ceiling the same way, over a few dozen
+cycles, rather than shipping with a threshold invented on the day it was built.
+
+#### Naming findings does not lift the churn budget
+
+`low_severity_fix_lines` caps *accumulation*, and its docstring is emphatic that the question
+is mechanical rather than discretionary. On the reported cycle the orchestrator **lifted** it
+for round 2 because the human had named which findings to fix — reading a narrowed finding
+list as the budget having been spent by decision. The result was a 422-line fix pass that
+produced 13 new findings, which is the exact shape the budget exists to prevent, with the one
+brake still capable of firing being the one that was removed.
+
+*Which* findings a pass may touch and *how much* churn one pass may add are independent
+controls. `panel-review-pr.md` now says so where the budget is relayed, and says that a pass
+which runs out of budget reports its unpaid findings exactly as it reports below-floor ones.
+
+### a rebase no longer disarms the round that follows it
+
+Three of a review cycle's convergence instruments read the same fix range — provenance (#48),
+recurrence (#67) and `--scope increment` — and a rebase between rounds took all three out at
+once. `compare/a...b` is the three-dot form, so once the merge base has moved the span widens
+toward the whole PR; #500 correctly refused to attribute from it, and #509 made the round say
+so out loud with a veto line and `confident: false`. What neither did was give the round its
+measurement back. Every finding landed in `unknown`, and `escalate_on.fix_injection` (#497)
+could not fire on the shape it is worth most on — a fixer working against a base that moved.
+
+#500's own observation is what makes the repair available: **the range is wrong, not the
+history.** The commits the fix pass wrote are still on the branch, wearing new SHAs.
+
+#### The pass is identified by what it CHANGED, not by where it sits
+
+`git patch-id` hashes a commit's content with the line numbers, hunk headers and whitespace
+taken out — exactly the property a rebase preserves and a SHA does not. So the round takes the
+commits the last round had reviewed, takes the commits the branch carries now, and calls the
+fix pass whatever is in the second with no patch-equivalent in the first. Both sides are
+bounded by the branch's fork point as GitHub reports it, never as the local clone guesses it:
+a stale `origin/main` is an ancestor of the rebased head, so `git merge-base` would answer with
+the stale tip and hand the fixer every base-branch commit the rebase moved onto.
+
+`payload.fix_range_source` says `reconstructed` when this is what answered, beside #512's
+`increment` and `compare`.
+
+#### It is exact, or it refuses
+
+Where the fix pass is the tail of the branch and every commit the last round reviewed came through
+the rewrite intact, the round reads the pass as one two-dot diff from the commit before it to the
+head: the exact net change, numbered in the head's own tree, which is what findings are reported
+against. That is the ordinary rebase, and it is the case worth having.
+
+Everything else declines and says which: a commit whose content changed in the rewrite (a conflict
+resolved during the rebase, an amended tip — it is somewhere among the leftovers and nothing can
+say which one); a pass that is not the branch's tail, where no single diff is the pass; an
+ambiguous patch-id, where the branch carries more copies of a patch than the last round had; a
+rewrite with no correspondence at all; and a branch reset backwards, where the pass was removed
+rather than rewritten and the round says so in those words.
+
+Refusing rather than leaning is the trade this change makes, and the reason is what the number
+does. `escalate_on.fix_injection` ends a cycle, and the case for its 0.5 threshold is that
+`introduced` is a documented FLOOR — "a measured 0.64 is at least 0.64". A source that over-counts
+breaks that argument, and the price is a cycle stopped with real findings unfixed. A caveat in
+`config_notes` does not prevent it: nothing reads a note before firing a brake. A decline costs
+only what was already lost.
+
+#### It needs a local checkout, and says so when it has not got one
+
+`patch-id` is git rather than the compare API, so a repo with no `path` in its rules — or a box
+that never held the pre-rebase head — cannot rebuild anything. Every such case declines, names
+which refusal it hit, and leaves the round exactly as blind as #500 found it: #509's veto still
+fires and nothing is attributed. Nothing here is a fallback that guesses.
+
+Not repaired by this, and named in the round's notes so nobody reads it as covered:
+`--scope increment` (scope is settled before the seats run) and #506's revert proposal, which
+reads the compare range.
+
+### the panel stops when the new-finding count stops falling
+
+`review_panel.escalate_on` gains a second convergence rung beside #489's:
+`new_findings_not_falling`, the number of **consecutive rounds whose new-finding count did
+not decrease** before the cycle ends. Default **1**, on; `null` switches it off.
+
+**It is a different question from the one already asked, not a second stopping system.**
+`fix_injection` asks *did the fix cause this?* — the fraction of a round's new findings
+`_provenance` attributed to the previous fix pass. This asks *is the count still falling?*,
+which is the rule stated on #480 over a cycle of this board's own: 44 findings, then 15 new,
+then 18 new — stop the cycle and triage the remainder rather than running a fourth.
+
+Those 18 need not be attributable to the fix at all. A reviewer reading deeper, a seat that
+woke up, a scope that widened, a vendor added mid-cycle — all produce news no fix pass wrote.
+And `_provenance` under-counts the ones that were: a defect a fix introduced by *deleting* a
+guard has no added line to sit on, which is why #489 documents its own number as a floor. Both
+together mean a genuinely diverging cycle can sit under `0.5` for its whole life and be
+stopped only by `max_rounds` — and a cap fires in the same place whether the round found two
+findings or twenty.
+
+**1, for `fix_injection`'s own "one round, not two consecutive" reason**, and the structure of
+the argument is identical. A count can only be compared against a predecessor, so round 1 is
+never a not-falling round and a value of `2` could not fire before round 3 — while
+`max_rounds` defaults to 2. Shipped at 2 this rung would be OFF for every repo that did not
+configure it and armed only for the ones driving `--loop`, which is a brake that is off
+wherever it was not configured. At 1 the earliest round it can fire on is round 2, and 1 is
+also exactly the rule as it was stated: 44 → 15 falls and buys round 3; 15 → 18 does not fall
+and ends the cycle there, which is where the human ended it.
+
+**The same three properties earn it the same default-on** that #489's rung got:
+
+- it can only ever turn a `go again` into a stop, never the reverse, and `round_stop` checks
+  that condition rather than merely obeying it — so no value of it can make a review look
+  cleaner than it is. A dry round, a below-floor policy stop and a round holding an escalation
+  all keep the reason and the confidence they earned;
+- it may only take away the round **rule 1** was buying, for #489's reason: a round going
+  again for a P1 the fix did not clear is going again for work the fix pass *failed* to do,
+  not work it generated, and a count of news must not cancel that repair round. That bound is
+  now enforced as what it says rather than as "rule 1 won the `reason`", for **both** rungs.
+  Rules 1–3 are an `if`/`elif` chain, so a round with four triggering news *and* an outstanding
+  P1 an earlier round raised reports rule 1 while going again for both — and testing
+  `triggering` alone let either rung end it with that P1 unfixed, which is what `round_stop`'s
+  own "a statistic may end the loop it is a statistic about; it may not overrule a named P1"
+  forbids. What disarms the rungs is a P1/P2 or gate issue an **earlier** round raised, or a
+  repeat; this round's own new P1s do not, and must not, since they are the news being counted
+  — bounded on every outstanding P1/P2 instead, neither rung could fire on the cycle #489 was
+  measured from, where every new finding was a P2. The corrected condition is shared, because
+  two brakes stating the same rule in the same words must not mean two different things by it,
+  and it is a strict narrowing: a round either now declines to stop goes again and is read
+  again;
+- under the shipped `max_rounds: 2` the only round it can fire on is round 2, which is the
+  round the cap would have ended anyway — so what a default-on costs a repo that changed
+  nothing is a better `reason` and one more veto line, not an earlier finish;
+- a false positive costs one printed question: the stop is vetoed and `confident` is false, so
+  the answer a human gives is "go again", not a merge nobody looked at.
+
+**And one property `fix_injection` cannot claim.** This is computed from the rounds' own
+counts and never from provenance, so **#500** — rebasing between rounds silently disarms
+provenance, and therefore silently disarms `fix_injection` — cannot disarm it. On a busy queue
+most PRs are rebased mid-cycle, which is precisely where the one shipped convergence brake
+stops being computable. That is the argument for a second rung existing rather than for
+tightening the threshold on the first.
+
+`panel_rounds.NOT_FALLING_MIN_NEW` (**4**) is the noise floor and is a constant rather than a
+second dial, for `FIX_INJECTION_MIN_NEW`'s reason: 1 → 2 is arithmetic, not divergence, and
+the honest answer to one uncalibrated number is not to ship two of them. It applies at **both
+ends** of every comparison — "not falling" is a claim about a series and a series needs two
+volumes to be one, so a round that went from one finding to four has not stopped falling, it
+was never falling. A round's count is withheld — never guessed — when the round reviewed nothing,
+when its payload cannot say which round it is, or when its BASELINE HISTORY was incomplete (a
+baseline this run could not read makes findings an earlier round did raise count as new, and an
+inflated count against a sound predecessor is the direction that ends a cycle). An unknown count
+resets the streak, and so does a **missing round** — round 3 holding only round 1's baseline has a round missing between
+the two counts, and comparing across it would both let missing data end a cycle and make the
+stop's own "the round before" untrue. A flat series counts, because fifteen new findings a round
+forever is not converging. Every round records
+`round_stop.new_findings_not_falling` — the whole series, the streak, the dial and the verdict
+— whether it fired or not, and the trend block's payload carries the same per-round column.
+
+**What it does not do**, said out loud because #505 asks for both clauses: *stop the cycle and
+triage the remainder into an issue*. The second half is #42, which is open. This rung ends the
+round; the outstanding findings are handed to nobody, exactly as `fix_injection`'s stop and
+the cap's hand theirs to nobody. It trades a round for a stop a human has to act on.
+
+### when the fix pass is the problem, the panel now names it and prices undoing it
+
+`escalate_on.fix_injection` (#489) has ended the cycle since v2.36 when more than half
+a round's new outstanding findings were attributed to the fix pass immediately before
+them. That was the right call and it was half an answer.
+
+**The fix pass that caused the damage stayed on the branch.** The pull request shipped
+carrying a change the panel had just finished saying generated more of the round's work
+than the pull request did — minus the round that would have found the rest of it.
+Stopping meant the loop no longer made it worse; it did not make it better. In every
+one of the measured cycles (128 of 201 new findings across seven PRs; 64% then 87% on
+the cycle #489 was filed from, over a change of 113 lines) the outcome was a stop with
+the injected complexity left in place.
+
+A stop says *we ran out of confidence*. A revert says *we know which change made it
+worse* — a much stronger claim, and one that needs attribution to make. `_provenance`
+is that attribution and #489 shipped it calibrated, so the claim is now sayable.
+
+#### What a round that fires the gate says now
+
+One more veto line, and a `round_stop.revert` block beside `round_stop.fix_injection`:
+
+```
+the fix pass that did it is `aaa111..bbb222` — everything that landed after round 1 —
+and it is STILL ON THE BRANCH: the cycle ending does not take it off … Reverting it
+(`git revert --no-commit aaa111..bbb222`) would REMOVE the 3 finding(s) attributed to
+it (3×P2) and COST the 1 it was sent to answer that this round no longer raises
+(1×P1). A PROPOSAL AND NOT AN ACTION …
+```
+
+The range is `prior.head_sha..head_sha` — the **same** range provenance attributed
+against, so the proposal cannot accuse a different pass from the one the rate accused.
+
+#### A proposal, and the reason it can only be one
+
+Reverting a pass reverts the real fixes in it. A pass that cleared three P2s and
+introduced eight P3s is a net loss to undo wholesale, and nothing in the loop knows
+which is which without asking. So nothing here runs anything: the two columns are
+assembled, the command is written down, and a human decides.
+
+**The columns are biased in opposite directions on purpose.** The cost is an upper
+bound — matched on finding keys alone, deliberately declining `raised_before`'s
+reworded-title fallback, because that match would shrink the downside of the revert
+this exists to price; and under the default `increment` scope it includes complaints
+the round did not re-read, which the veto line says out loud. The benefit is a lower
+bound: `introduced` is a documented floor and not a measurement (#48). Cost high,
+benefit low — a revert these numbers still argue for is not one they talked anybody
+into.
+
+#### On a rebased branch there is no proposal, and it says so
+
+#500's finding was that a rewrite between rounds silently disarms provenance. #509
+made that visible; this reads the same range, so it goes dark with it — and the range
+that would NAME the offending pass is exactly the range a rewrite removes.
+
+`round_stop.revert.kind` therefore carries `_fix_range_diff`'s own verdict rather than
+a second vocabulary for the same blindness: `ok`, `no-fix`, `blind`, or `not-asked`
+for a round 1 that never had a pass to attribute. `offered` is apart from `kind` for
+the reason `fired` is apart from `over` — a readable range on a converged round is not
+a proposal, and a blind round is not "nothing to propose". #509's veto line now says
+the same missing range also leaves the pass unnameable.
+
+#### Four defects Codex found, all about what the range actually is
+
+Naming a range and offering a command to undo it are not the same claim, and the
+second needs more than the first.
+
+**A base-branch merge inside the range.** `_fix_range_diff`'s docstring already
+records the lean: merging main INTO the PR between rounds leaves the old head an
+ancestor, the compare still reads `ahead`, and main's own commits fall inside the
+range. For attribution that over-counts `introduced` and is a documented bias. For a
+proposal it is not a bias — the offered command would revert other people's commits,
+and `git revert` refuses a merge outright without `-m`, so it could not run as
+written. The round now reads the commits inside the range (one extra `gh api` call,
+made **only** on a round whose rate crossed the threshold) and withholds the command
+when any of them is a merge. The range is still named — that is the requirement, and
+it costs nothing to state — and `revert.no_command` says what is in the way. A shape
+that could not be read withholds it too: "we did not check" must not render as "we
+checked and it is clean".
+
+**A merge past the compare endpoint's ceiling.** The same argument one level down, on
+a second pass. GitHub's compare returns at most 250 commits and names the real figure
+in `total_commits`, so on a longer range the merge count is a *floor* — the check
+above would have handed out its command for a range whose merge it never saw. The read
+now compares the two and carries `complete`, and a proposal requires it.
+
+**A range that is more than one fix pass.** `Baseline.head_sha` is the latest earlier
+round that *supplied* a commit, not the latest that ran, so a round whose payload
+recorded none leaves the next one anchored further back and the range spans two fix
+phases. Reported rather than refused, and the difference is which claim goes wrong: the
+range is still exactly the one provenance attributed over, so the rate accused every
+commit in it and so does the proposal. What goes wrong is the word *pass*, singular —
+so `revert.spans` counts them and the veto line says how many.
+
+**Abbreviated SHAs in a command meant to be executed.** The `range` label uses the
+eight-character form the rest of this payload uses. The command now carries the full
+ones — a display span is read, a command is run, and an abbreviation ambiguous in the
+repository resolves to nothing or to something else.
+
+#### What it does not do
+
+It decides nothing. `revert` is the only argument to `round_stop` that cannot move
+`stop` in either direction, and that is asserted rather than assumed.
+
+Two follow-ons named on #506 are deliberately not built: **revert-and-re-run** as an
+explicit mode, and **re-fix with a narrower brief** instead of reverting. Both are
+decisions a human takes today, and both want the proposal above to exist first.
+
+### on an escalation, the panel asks the seats what they would DO
+
+Every seat returns **findings** — a defect, a severity, a location — and for an ordinary round
+that is the right contract. A reviewer that proposed a patch for every nit would be a second
+author, and the leaderboard measures whether a reviewer is *right*, not whether it is helpful.
+
+On a cycle that will not converge the fixer is doing something else entirely: **inferring the
+reviewer's intent from a criticism**, and then guessing at a change that satisfies it. That guess
+is what the next round reads, and #489's measured numbers are what the guessing costs — 128 of
+201 new findings across seven PRs were created by the fix pass immediately before them. Nothing
+anywhere asked a seat the obvious question.
+
+So `review_panel.propose_on_escalation` (**true**, on) adds one constructive pass. When an
+`escalate_on` rung fires, each seat that still has outstanding findings on the PR is asked:
+*given these findings of yours, what is the smallest change that resolves them?* The answers go
+in the escalation output, in front of whoever the escalation goes to — a human at the veto line,
+who until now got a list of complaints and no proposal.
+
+**It is not a fifth `escalate_on` rung**, which is why it is not filed inside that block. Every
+key there answers one question — *does this end the cycle?* This one ends nothing, extends
+nothing and moves no verdict. It decides what an escalation arrives with.
+
+**On escalation, not every round.** It fires where a rung FIRED — `fix_injection`,
+`new_findings_not_falling`, `premise_repeated`, `premise_undecidable` — and on `fired` rather
+than `over`, because a measurement crossing a threshold is true of plenty of rounds those rules
+deliberately do not touch (a below-floor policy stop, a round holding an escalation, a round
+going again under rule 2 for a P1). So it costs one fan-out on a PR whose cycle was already
+ending badly, and nothing on a healthy round. The round **cap** does not trigger it: a cap is a
+cost bound that ends healthy cycles in the same place as diverging ones, and firing on it would
+be the "every round" this exists to avoid. All four rungs rather than the three the issue names —
+`premise_undecidable` is the same kind of event and the rung where the fixer has most obviously
+been guessing, and a rule covering "some escalations" is one a reader has to memorise the
+membership of.
+
+**`--ask` (#129) is the machinery and the wrong question.** That path fans a *premise* out to the
+same seats and tallies `holds`/`fails`/`unresolved`/`unchallenged`; it adjudicates a claim
+somebody already wrote. Here nobody has written one, because the whole problem is that the fixer
+does not know what the claim should be. The fan-out, the sandbox, the one retry and the
+attribution are shared; the question, the reply shape and — deliberately — the **tally** are not.
+
+**The three properties this had to hold, which were also its review criteria:**
+
+- **A proposal is not a finding.** It enters no leaderboard, no cross-round defect chain and no
+  severity floor, it reaches `round_stop` through nothing, and it rides in the payload under a
+  key the board's `extra="ignore"` ingest drops — so the first property is enforced by the
+  plumbing rather than by anyone remembering it. A reviewer that proposes is not thereby right
+  (#79's answer-versus-panel distinction is the precedent). The prompt says as much to the seat:
+  a reviewer that believed this was scored would propose in order to score.
+- **Disagreement is the signal, not the noise.** There is no tally and no computed agreement.
+  Four seats proposing four incompatible changes is the most useful possible answer on a stuck
+  cycle — it says the finding set has no small resolution, which is the thing nobody currently
+  learns until round five — and a verdict struck over them would average exactly that away.
+  `no small change` is a first-class answer beside `change` and `cannot tell`, so a seat that
+  does not believe in a small change is not made to invent one. Deciding whether two proposals
+  are the *same* change would be the similarity heuristic #84 rules out for premises, one level
+  down, so the report prints them side by side, attributed, and lets the reader compare.
+- **It cannot make a review look cleaner than it is.** It runs after `stop`, `reason`, `veto` and
+  `confident` are final and writes to none of them, and its section is printed **under** the veto
+  lines rather than over them — a plan at the top of an escalation is precisely the "cleaner"
+  this must not produce. An escalated finding is shown and **marked** as the human's to answer:
+  it is outstanding and the human at the veto line is who needs a proposal on it, but it is never
+  offered as work for a fixer, and `round_stop`'s subtraction of escalated keys is untouched.
+
+**What a codex second opinion changed.** A seat is shown **what it wrote**, not the judge's
+merge of it: `Canonical.synthesis` is one sentence over every reporter of a defect, so a finding
+three seats raised carried a wording none of them wrote — and the whole premise is *given these
+findings of yours*. Its own title, detail and location now lead, with the merged wording beside
+them where they differ (it is what the PR comment and the next round call that defect, so a
+proposal against a wording nobody uses names a finding nobody can find). And a `change` verdict
+with **no change in it** is now unreadable rather than recorded: the whole content of that
+verdict is the proposal, and without it the reply says a small change exists and does not say
+what it is — the criticism-without-a-proposal this feature exists to remove, wearing the
+feature's own label. `cannot tell` still needs none. Two further findings are answered rather
+than patched, and both are recorded in `panel_propose.propose_llm`: this pass hands out no
+checkout, so `reviewer_code_budget_usd` — documented as the code-reading seat's cap, and emitted
+only under `reads_code` — does not apply and would only add a way to lose a proposal to a cap;
+and the tokens it spends reach no column `panel_caps` counts, exactly as `--ask`'s do today,
+because folding them into the round's own reviewer rows would charge a question about existing
+findings to the review and inflate every cost-per-finding on the leaderboard.
+
+The findings a seat is shown are its own, still outstanding, labelled `F1`, `F2` — ordinals
+rather than finding keys, because a model echoing back a hex digest is one transposed character
+from naming a finding that does not exist and nothing could tell that from a real answer. The map
+back is in the payload beside the answers, a label naming nothing the seat was shown is
+**recorded** rather than dropped, and a seat shown only some of its findings says so.
+
+`false` switches it off in one line, and a round that then escalates says so in `config_notes` —
+a repo that declined this must not be indistinguishable from one where nothing fired.
+
+**What it does not do.** It does not give the fixer a narrower brief for another round (that is
+#506's second follow-on), it does not triage the outstanding findings anywhere (#42, open), and
+it does not adjudicate the proposals it collects. It ends where the escalation ends: with a human
+who now has something to act on other than a list of complaints.
+
+### every escalation the harness raises is now a row, not only a post
+
+#328 landed a `blockers` table and no producer, which is how the two mechanisms before it
+died: the `stuck` post type measured at **zero** over thirty days, and six `needs-human/*`
+labels with no producer, no consumer and no test. Neither was the wrong shape. Nothing
+wrote to them.
+
+`needs_human.announce()` now records the row as well as making the post — and **the six
+producers do not change at all**. That was the design `announce`'s own docstring committed
+to: *"it is deliberately the only place that knows the post type, the addressee and the
+wire format, so #328's `blockers` row can become the store by changing this function and
+nothing else."* `preland`, `panel`, `epic`, `issue_watch`, `qb-bump` and `qb-doctor` all
+become producers without a line of their own changing.
+
+The subject comes off the refs the caller already supplies — PR before issue before repo,
+because a `stuck` carrying both is about the PR, and a blocker filed against the issue
+would sit on the wrong phase once #521 splits fix from land. An escalation naming nothing
+is announced and **not** stored: a blocker's whole value is answering *"what is waiting on
+me"* with rows, and one whose subject is "something, somewhere" answers it with noise.
+
+The post is made first and independently. A board that accepts the post and refuses the row
+has still rung the doorbell, and the returned note says which half failed — on the line an
+operator is already reading rather than in a log nobody opens.
+
+**A hole in the test double, found by this change.** `test_needs_human.py`'s fixture stubbed
+`_post`; the new write went straight past it and the suite made real HTTP requests to
+whatever board the host resolves. Every test still passed, because the blocker write
+swallows failures by design — the apparatus reported success for a call it was supposed to
+prevent. The fixture now doubles `_board_json`, the single function that touches the
+network, and refuses `urlopen` outright for the duration so a write added later fails loudly
+instead of quietly posting to a live board.
+
+#### and a row that notices it going quiet again
+
+The producer above is the third attempt at this. The first two are not remembered as
+failures because they had no symptom: an empty table and a working table with nothing in
+it are the same table, so the `stuck` type sat at zero for thirty days and nobody noticed
+it had never worked.
+
+`qb-doctor` grows an `escalations` row that asks the two halves together, the way `landed`
+does. It counts `stuck` posts over the last day, counts blocker rows raised in that same
+day, and fails only on **posts with no rows** — the one divergence the design cannot
+explain. Rows are legitimately fewer than posts (an escalation naming no subject is
+announced and not stored), so a proportional test here would fail on correct data. Nothing
+escalating at all is an `ok` and says so: that is a quiet day, not a severed producer.
+
+A board with no `/blockers` route reads `unknown`, never `fail` — an image predating #328
+has not broken anything, it has not been redeployed, and those want different sentences.
+That is the branch this row is on today.
+
+The `fail` brief tells an agent **not** to write rows by hand to clear it. The row measures
+whether the producer works; backfilling it makes the measurement lie while leaving every
+future escalation just as unrecorded.
+
+### qb-bump does the whole job now: pull, bump, build, switch — in one command
+
+`qb-bump` prepared a flake bump and stopped. Three things it was not doing turned out to be
+the difference between "carries a landed change onto this machine" and "does most of that".
+
+#### It never pulled, so it could still tell the one lie it exists to prevent
+
+The drift verdict answers *"is the harness on PATH the one **this checkout** has"*. A checkout
+that is itself twenty commits behind origin agrees perfectly with an installed harness that
+is twenty commits behind, and `qb-bump` printed `current`/0 — **nothing to carry** — about a
+box that was nothing of the sort. #414 closed this hole for a checkout that was the wrong
+*directory*; this closes it for the right directory at the wrong *commit*.
+
+Both trees are now brought up to date before anything is compared: the quarterback checkout,
+because it is what the comparison is against, and the consuming flake, because its HEAD is
+what gets built.
+
+**The pull is a fast-forward and is never allowed to become anything else.** `git fetch`, then
+`git merge --ff-only`. A tree carrying a local commit or a conflicting edit is *reported*, not
+merged, rebased or reset — the commands that would resolve it (`pull --rebase`, `reset --hard`,
+`stash`) are the ones the harness refuses outright in a shared tree, for the reason they are
+refused there. A branch that tracks nothing is not a failure and does not read as one: there
+is nothing to pull it up to, which is said and stepped over, or every worktree on this fleet
+would answer "cannot tell" forever and the real signal would be ignored inside a week. A
+**detached HEAD** looks identical to `@{u}` and means the opposite — it can be sitting on a
+commit from three weeks ago, which is the whole state this exists to rule out — so it is
+separated out and counts as doubt.
+
+**Which tree's failed pull is doubt, and which is a footnote.** A fetch that fails or a
+fast-forward that is refused *in the checkout* makes the verdict itself unsafe to report
+either way, because the verdict is a claim about that tree: `current` downgrades to
+`unknown`/1. The same failure *in the consuming flake* is a different animal — it does not
+weaken the harness comparison by one word, it only means the second reason to act was never
+looked for. Downgrading on it would be worse than useless: a consumer whose remote wants a
+credential no non-interactive session has would make every agent run answer "cannot tell"
+forever. So it is stated in the same sentence as the answer, and `current`/0 now always says
+what it did *not* cover — the flake it never checked, or the `--no-pull` that means this is
+no claim about any upstream at all.
+
+**And having pulled the consumer, it acts on the consumer.** A `nix-fleet` commit that landed
+from another box is a rebuild this machine owes whether or not the harness pin moved. Pulling
+that in and then printing "nothing to carry" would leave a silently-changed checkout and no
+follow-through, which is worse than never having pulled it.
+
+#### The switch goes through the host's `rebuild` wrapper, because `nixos-rebuild` lies
+
+`nixos-rebuild switch` prints *"Done. The new configuration is …"* even when
+`home-manager-<user>.service` has failed — so `home.file` links, user units and dotfiles
+silently do not apply. For `qb-bump` that is not somebody else's bug in a neighbouring
+subsystem: the harness scripts it exists to deliver arrive through exactly that activation, so
+a bypassed wrapper means #267's own failure — a machine that did not get the change — reported
+as a success.
+
+The wrapper is **called, not reimplemented** — the same argument that makes the drift verdict
+`qb-doctor`'s and not this file's. It is **read** to decide whether to use it, never run:
+executing an arbitrary script on an arbitrary host to find out what it does is a worse trade
+than a read whose worst outcome is falling back to a command that was already correct. Whole-
+line comments are dropped, and the answer is used only when exactly one flake directory is
+named and it is this one. None, two, or somebody else's all mean *cannot tell*, and that means
+the explicit `sudo nixos-rebuild switch --flake` this file resolved itself. The file that gets
+read is the file that gets `exec`'d — a `shutil.which` here and an `execvp` later are two
+independent PATH lookups, and inspecting one file while running whatever the second turns up
+is the check quietly reopening itself.
+
+**What this establishes is less than it looks, and the code says so.** A regex is not a shell
+parser, so a target assembled from variables can hide from it. And the *attribute* is not
+checked at all — it cannot be, since it never appears in a wrapper's text: a wrapper derives
+it from the live hostname. Which is exactly why the wrapper is used only when the attribute
+was **matched** rather than named. `resolve_attr` matches this machine's `hostName` too, so
+the two agree by construction; `--host laptop` on a desktop agrees only by luck and would
+switch the machine onto a configuration the run never built, so `--host` refuses the wrapper
+outright. `--no-wrapper` turns the whole path off, and `QUARTERBACK_REBUILD_CMD` (or
+`consumer.rebuild`) is the door for a wrapper spelled differently — a declaration is consent
+and skips the check.
+
+#### And it says what it is doing
+
+Two `git fetch`es, a shell-out to `qb-doctor`, a scan for the consuming flake, a
+`nix flake update` and a whole NixOS build — and until now it printed **nothing at all**
+until the last of those finished. On a box that is nearly current that is a few seconds; on
+one that has to compile it is forty minutes of a cursor and no output, which is
+indistinguishable from a hang, and the first thing anybody does with a hang is Ctrl-C it —
+here, killing a build that was nearly done.
+
+Each slow step now says what it is before it starts and what it found after:
+
+```
+qb-bump: checkout: /home/rich/source/quarterback (named by --repo)
+qb-bump: fetching /home/rich/source/quarterback (origin/main) …
+qb-bump:   already level with origin/main
+qb-bump: asking qb-doctor whether the harness on PATH is this checkout's …
+qb-bump:   fail — behind this checkout: 1 differ (qb-doctor)
+qb-bump: looking for the flake that pins prisonblues/quarterback …
+qb-bump:   /home/rich/source/nix-fleet (found by scanning /home/rich/source)
+qb-bump: fetching /home/rich/source/nix-fleet (origin/master) …
+qb-bump:   already level with origin/master
+qb-bump: working out which nixosConfiguration this machine is …
+qb-bump:   hermes (matched by hostName)
+qb-bump: updating the 'quarterback' input, on a copy of nix-fleet's HEAD …
+qb-bump:   pin 83fe1e7db2c8 -> e09fd986bd12
+qb-bump: building nixosConfigurations.hermes — the slow part. Follow it with:
+qb-bump:   tail -f ~/.cache/quarterback/harness-bump/build.log
+qb-bump:   built in 47s
+```
+
+**And the build is followable while it runs.** `run()` captures both streams and hands them
+over when the process ends, so a build that compiles was forty minutes of nothing followed
+by everything. nix's output now goes to the log *as it happens* — the same file the refusal
+already kept, so this costs a redirection rather than a mechanism — and the line above it
+says where.
+
+It all goes to **stderr**, and `--json` turns it off: stdout is the report, and a caller
+redirecting both streams into a parser is a normal thing to do.
+
+#### One command, because two is where the job used to stop
+
+`--apply` refused whenever the cached proposal had gone stale — which is the state it is in
+most times a person reaches for it, the agent having prepared it an hour and three merges ago.
+It now runs the whole preparation itself and switches onto what it has **just** proven rather
+than onto what somebody proved earlier; nix's own caching makes re-proving an unchanged build
+a matter of seconds. `--apply --cached` is the door back to the old behaviour, for a host that
+lost its network between the preparation and the person.
+
+**The ceiling did not move.** `qb-bump` with no flags still never runs `sudo`, `--apply` still
+refuses without a terminal so a timer or an agent changes nothing, and the tests that say so
+are the design, not a description of the current code. What did change is that `--apply` no
+longer raises a needs-human escalation: the human is holding the keyboard, and #274's door is
+not a logbook.
+
+#### Four older sharp edges, found while reviewing this
+
+- **`base_head` was recorded after the build, not before the archive.** Preparation archives
+  `HEAD`, builds for up to an hour, and used to record HEAD *afterwards* — so a commit landing
+  in the consumer mid-build was written down as the thing that had been proven, and `--apply`'s
+  own "the consumer has committed since" guard waved it through. HEAD and the dirty list are
+  now read before the archive, and a consumer that moved during the build is refused.
+- **The lock was installed with `write_text`**, which truncates before it writes; a failure
+  between the two left the consumer with an empty `flake.lock` and nothing saying what did it.
+  Same-directory temp file, then `os.replace`.
+- **A detached HEAD looked exactly like a branch tracking nothing.** They mean opposite things
+  — a branch that tracks nothing cannot be behind anything; a detached checkout can be sitting
+  on a commit from three weeks ago, which is the whole state the pull exists to rule out. It is
+  now doubt, not an all-clear.
+- **The consumer scan reached the developer's real `~/source`** from inside the test suite,
+  because the scan now runs on every path rather than only the stale one. The hermetic fixture
+  pins `QUARTERBACK_CONSUMER_ROOTS` inside `tmp_path`; it is how the suite came to try a `git
+  fetch` on this machine's actual `nix-fleet`.
+
+### setting a dial no longer starts with knowing its name
+
+`set a dial` in `qb-dash-tui` was four empty boxes. The value placeholder read `P3, 2, true,
+null` — four value kinds in one line, because it had to cover all 29 settable dials at once
+and therefore could not answer the only question a person has at that moment, which is what
+*this* one takes. Nothing on screen said which dials exist, what one is set to now, what it
+defaults to, or which way it may move.
+
+And a typo saved clean. `POST /dials` stores `dial` as opaque text and `value` as opaque
+JSON on purpose — the board must not learn a vocabulary the harness owns (#56, #305) — so a
+misspelt name or a quoted `"2"` is accepted, stored, and reported as in force while every
+harness that reads it ignores it. The refusal arrived from a round hours later, running on
+the old value.
+
+The name field now filters the settable dials as you type — `↓` walks them, enter takes one —
+and matches on the half of a name people actually remember (`budget` finds the five
+`review_panel.budget.*`; `enabled` finds the seats), in the table's own order rather than
+alphabetically, which used to open the list on `enabled`: the dial that switches this repo's
+reviews off, first, unexplained.
+
+**Scrolling the list says what each one does, and what it will take** — the line under the
+value box describes the name under the cursor rather than the name in the box (*the lowest
+severity a fix pass may act on; under it is deferred, not fixed*), and the value box's own
+placeholder becomes that dial's accepted values (`a severity band — P1, P2, P3, P4`). Reading
+down 29 dotted paths now answers the question the reading is for, in both halves. The name box
+is untouched while you browse: what is highlighted is being read, what is typed is what will
+be written.
+
+Nothing could say that before. Every dial's argument is a Python comment beside its key in
+`DEFAULTS`, unreadable by any program, so a form could show a dial's shape and never its
+point. `Dial.what` is a one-line summary — two wrapped lines at 66 columns is the ceiling, and
+a test measures it against the pane rather than guessing — and the argument stays where it is.
+
+Once the name IS one of the 29 the list retires and the description grows into the rest: what
+the dial takes, its default, what is in force and at which scope, and — for `enabled` and the
+per-seat switches — that they are **narrow only**, the board may turn one off and never back
+on, which is invisible in the value and otherwise discoverable only by having a write silently
+dropped. Two states for two questions, because they do not both fit a 78×24 pane.
+
+The lines describing a field now line up with the text inside it. An `Input` draws a border and
+pads inside it, so its text starts three columns in while a bare `Static` starts at the panel's
+padding — which left the description, the names and the refusal three columns adrift of
+everything they describe.
+
+#### A dial that validated and then killed the run
+
+Writing those descriptions turned one up. `reviewer_scope` decides whether a finding has to be
+in the change or may be anywhere it touches, and the two words for that are `diff` and `repo`
+(`panel_core.REVIEWER_SCOPES`). The board layer's validator had `("diff", "increment")` —
+`increment` is `round_scope`'s word — so it was wrong in both directions at once, and neither
+was visible from the board:
+
+- `repo`, the documented value, was **refused** by `harness_rules` and never applied.
+- `increment` **passed** that check, was written into the resolved config, and then met
+  `panel_seats.reviewer_scope`, which refuses a scope it does not know with `SystemExit`.
+
+A dial that validates and then kills the panel is the worst of the three outcomes and it is
+the one that spelling produced. `_SCOPES` is now `("diff", "repo")`, and a test holds it
+against `REVIEWER_SCOPES` itself — `panel_core` imports `harness_rules`, so the constant
+cannot live in one place and has to be pinned to the other. The one existing test that
+exercised a scope end to end was asserting on `increment` too, so nothing was checking the
+value the panel actually takes.
+
+`ctrl+s` now refuses in the box, in the harness's own words, keeping the other three fields:
+*`review_panel.max_rounds` must be a number, not '2'*. The expiry is parsed there too, so a
+mistyped `4hrs` costs a keystroke instead of the reason you had already written.
+
+A bad **value** is a refusal; an unknown **name** is a warning and then a write. The table is
+the harness beside *this dashboard*, and the two are installed separately — a hard refusal
+would make a box one release behind a box that cannot set a dial the rest of the fleet already
+applies. So an unrecognised name says *nothing this box knows applies `tempo`* and the next
+`ctrl+s` sets it; confirming one name does not wave the next one through. Where the filter has
+narrowed to exactly one, the message names it: *— ↓ takes `review_panel.max_rounds`*.
+
+**It is not a second copy of the dial table.** `harness_rules.dial_specs()` reads `BOARD_DIALS`
+and `DEFAULTS` back out — the names, kinds, directions and defaults are still written down in
+exactly one place — and `qbdata.dial_vocabulary()` imports it at call time from beside the
+script. `harness_rules.dial_problem()` is `board_dials`' own judgement asked one step earlier,
+so a value refused at the keyboard is exactly a value a round would have dropped.
+
+A dashboard with no `harness/loops` beside it answers `{}`, and that is *cannot tell*, never
+*nothing is settable*: the picker hides, the line under the value says so, and the write goes
+through as it always did with the board as the only judge. A form that refused there would
+leave the person at that keyboard with no door at all.
+
+`tempo` (#474) is the dial that shaped that rule. Both dashboards give it a cell, it is absent
+from `BOARD_DIALS`, and nothing in this repo reads it — so the picker cannot offer it and the
+first `ctrl+s` says so, but the second still writes it.
+
+The scope moved onto the title line, and not for tidiness: the picker cost four rows a 78×24
+pane did not have, and a Textual modal that outgrows its screen clips whatever was composed
+last — which was the scope, the one control on this form whose mistake cannot be seen
+afterwards. The per-field margins and the always-drawn refusal line paid for the rest, and a
+test drives the modal at 78×24 and asserts every control is on screen.
+
+
+#### What a second opinion changed
+
+Codex read the branch and found three things worth fixing.
+
+**A broken harness was reported as an absent one.** `loops_dir` finds the directory,
+`import harness_rules` raises, and the modal said *no harness/loops beside this dashboard* —
+about a box where it is sitting right there. `dial_trouble()` now separates the three ways the
+table can be unreadable (absent, will not import, older than `dial_specs`) and the screen
+prints the real one. This repo already draws that line one level up, in `_dials_unreadable`.
+
+**`NaN` and `Infinity` passed the value check.** `json.loads` takes all three as bare
+literals, and `NaN` compares false against every bound there is — so `value < 0` let it
+through and a floor, a round cap or a budget would have taken a value nothing can compare
+against. `POST /dials` refuses them at the board (`allow_nan=False`, because Postgres will not
+store them); `_dial_problem` now refuses them where they are typed, which is the whole point
+of a client that owns the vocabulary.
+
+**The unknown-name warning vanished while it was still armed.** Editing the value cleared the
+refusal line, and `_insisted` went on holding the next `ctrl+s` open — a confirmation nobody
+can see they have given. The warning is about the NAME, so it now stays until the name
+changes.
+
+Two of its points were declined rather than fixed, and the reasons are here so the next reader
+does not have to re-derive them. Arming the confirmation on the whole payload rather than the
+name would re-warn somebody for fixing a typo in the reason field, which is not what was
+confirmed. And loading `harness_rules` by path with a path-keyed cache, instead of `import`
+plus a `sys.path` insert, closes a hazard — a different `harness_rules` already in
+`sys.modules` — that only exists in a process which has imported one, i.e. the test suite. The
+new `fresh` fixture in `test_qb_dials_surface.py` constructs exactly that state, so the
+hazard is at least written down and exercised rather than assumed away.
+
+Its claim that the pane-fit tests missed a state that breaks was half right: the state was
+untested and it does not break — measured at 23 rows of 24 with the list up and a wrapped
+refusal. It is tested now, at both of the tall states.
+
+### a spawned session can take its own next item off the plan
+
+`qb-start` could only be pointed at a number. Every entry in its compiled allowlist was
+keyed to one, and that mapping *was* the arity — so a drainer could be aimed but could not
+be let loose, and the eager half of #277 stayed unbuilt.
+
+`/get-involved` is now spawnable. It takes no argument: it reads the plan and self-selects,
+which makes it the safest entry on the axis this gate worries about most — there is no
+attacker-controlled text to carry in, because there is no argument at all.
+
+Three things had to be said out loud rather than assumed.
+
+**No claim is taken up front, and nothing goes uncounted.** The claim was doing two jobs:
+counting the session, and interlocking the work. The session count — `max_sessions` and
+`qb-admit`'s per-repo window — never needed it and is unchanged. The work interlock cannot
+be taken before the spawn, because which item the session takes is not known until it has
+read the plan; it moves inside the session, to `plan_claim`, which is atomic and is what
+makes three seats take three different items.
+
+**Allowing it implies allowing what it runs.** `/get-involved` dispatches into
+`/fix-issue`, `/fix-and-land`, `/review-pr` and `/panel-review-pr`, so a policy naming it
+and withholding `/fix-issue` would get `/fix-issue` anyway, one hop along, on an issue
+chosen from the plan — and the operator would have no way to see it, because `--policy`
+reports the allowlist. That is now **refused** at the gate rather than documented, and
+`--policy` names any command it lists but will not start.
+
+**It asks whether the plan has anything free, and that edits a sentence this file is
+emphatic about.** `qb-start` says it never reads the plan; it now does, once, to decline
+early. Asking whether anything is free is not picking what to take — nothing is passed to
+the agent, and the item it eventually claims may not be the one that was free. Without it,
+`/get-involved` against a fully-claimed plan spends a whole session to discover the same
+nothing, which at the tail of a drain is the common case. This gate fails **open**: a board
+that could not answer has said nothing about the plan.
+
+### the spawn ceiling is a dial, and there is now a second one across the whole board
+
+`~/.config/quarterback/spawn.json` carried three keys and only two of them said what a
+machine may **do**. `enabled` and `commands` are permissions and stay exactly where they
+are — nix-written, read-only, with deliberately no environment override, because a
+permission with a convenient bypass is not one. `max_sessions` says how **hard** the box may
+work, which is the `in_flight.max` side of the very line that file draws: it counts a
+resource rather than guarding a door. It was in the permission file because that is where it
+was written, and it inherited the permission file's deployment path.
+
+Measured on 2026-08-28: raising it from 2 to 3 cost a nix-fleet edit, a `nix build`, a PR, a
+merge, a `sudo nixos-rebuild switch`, and a human with the password. For a number. The
+direction that matters more is the other one — **`0` is a freeze**, the only control that
+stops a box spawning without switching the mechanism off, and calming a fleet that is
+working too hard should not require a rebuild at exactly the moment nobody wants to be
+running one.
+
+So there are two dials now, and the nix option becomes the fallback under the first:
+
+| dial | scope | counts | when unset |
+|---|---|---|---|
+| `spawn.max_sessions` | this machine | spawned panes whose agent has not exited | `spawn.json`'s number, unchanged |
+| `spawn.max_sessions_fleet` | the whole board | every live agent, spawned or not | no fleet ceiling at all |
+
+`spawn.max_sessions_fleet` is the half that did not exist. Three ceilings already sat in
+`qb-start`'s path and none of them was a board-wide session count: `qb-pace` bounds the
+shared subscription's **spend**, `qb-admit` bounds **one repo's** work, and `max_sessions`
+bounds **one box**. A fleet of five boxes each set to 3 had a ceiling of fifteen and nothing
+that knew it. It has no policy-file counterpart on purpose — a per-machine file cannot
+express a fleet-wide number, and letting each box carry a copy is how five boxes come to
+disagree about the limit.
+
+**Both fail open, alone among `qb-start`'s gates, and for `qb-admit`'s reason.** An
+unreadable dial leaves the file's number in force; an unreachable board leaves the fleet gate
+silent. A permission that failed open would start sessions nobody authorised; a ceiling that
+failed closed would stop every box on the fleet over a board hiccup, which is worse than the
+thing it guards — and the per-machine ceiling underneath is the real safety net.
+
+Safe to put on the board because dial **writes are human-only**: `POST /dials` takes
+`app.auth.human`, so an agent may read its own ceiling and cannot raise it. That is the
+whole of what makes this a throttle rather than an escalation.
+
+**The fleet number is a runaway guard, not an allocator**, and every property follows from
+that. It is advisory and non-atomic — two boxes spawning in the same second can both see
+room, exactly as `qb-admit` documents — because the failure being prevented is a hundred
+agents opening at once against a long queue, not the hundred-and-first. It counts every live
+agent off `GET /active`, spawned or not, so a busy human day consumes it too; that and the
+non-atomicity are both arguments for setting it well above the busiest legitimate day, since
+a ceiling that bites in normal use gets raised until it does not.
+
+**And it settles a question that had been left open: `DIALS` is the fleet's surface, not the
+panel's.** Every dial in the registry was `review_panel.*`, so this was the first outside
+that namespace — and the answer turned out to be already shipped rather than open. The board
+stores a dial name as opaque text and its value as opaque JSON on purpose and says the client
+owns the vocabulary; `tempo` (#474) has been drawn as a dial by both dashboards for releases
+while `BOARD_DIALS` has never held it. The only thing that was ever the panel's is the two
+lines of `harness_rules` that assume a dial names a key in `DEFAULTS`. `Dial.applies` makes
+that assumption explicit — a fleet dial is validated, listed, offered by the picker and
+rendered by the dashboards exactly like the others, and is simply never merged into a repo's
+resolved rules — which is strictly less than a second settings channel, and is the shape
+#474 and #475 need too.
+
+**Both are fleet-scoped, and the scope is now judged where a dial's meaning is known.** The
+board takes either scope for any dial — `dial` is opaque text there and `repo` is just a
+column — so a fleet dial written for one repo was accepted, stored, reported as in force and
+read by nothing, which is a misspelt dial name's failure arriving through the scope line. The
+dashboard's picker refuses it (`harness_rules.dial_scope_problem`) and `qb-start` names a
+repo-scoped row it is ignoring, because the web page and a `curl` have no vocabulary to
+refuse with. A rules dial is still legitimate at either scope.
+
+`qb-start` grows exit **10** for the fleet refusal: its own code rather than a second flavour
+of `AT_CAP`, because the codes exist so a caller can tell refusals apart by remedy and these
+two share none. `qb-start --policy` now reads both dials — bounded at five seconds and
+failing open to the file — because a caller that reads a ceiling before acting wants the one
+in force. `--policy --no-board` opts out, and the dashboard's ⚒ takes it: it asks from the UI
+thread, where a board that is down would freeze the screen for five seconds per keystroke,
+and it reads only `enabled` and `commands`, so it gives up nothing that the spawn does not
+apply one step later. A machine that never opted in still reaches nothing but its own config
+directory.
+
+### hiding a pane on one screen parked it in another screen's window list
+
+`break-pane` with no `-t` puts the new window in the **client's current** session, not in the
+one the source pane lives in. Every pane this harness takes out of a row went through such a
+call — `d` for the dash, `t` for the tape, the tape's step-aside — so on a server running two
+screens, hiding a pane on the screen you were *not* looking at put it in the other screen's
+window list.
+
+Nothing downstream could then find it. `pane_exists` and the whole restore path search
+`list-panes -s -t "$SID"`, which is scoped to the session, so the pane was at once alive,
+stranded in a window nobody expected it in, and reported as **gone** — with no way back
+through the script that moved it. The recorded `@qb_hidden_dash` still named it, so the next
+press cleared the state and said "the hidden dash is gone — nothing to bring back" about a
+pane sitting two windows away.
+
+It has been there since the toggles shipped and no test could see it: with one session on the
+server the client's current session and the pane's session are the same, so the missing `-t`
+is invisible. It surfaced the first time a throwaway screen was built beside a real one on a
+developer's box — the dash landed in `seats-quarterback:qb-dash` while `dash-wide` reported
+it missing, and recovering it took a hand-written `join-pane`.
+
+All three breaks now name `-t "$SID:"`. The regression test builds **two** screens and hides
+a pane on the first, because one screen cannot fail this way — parametrised over `dash`,
+`expand` and `tape`, since all three shared the call and all three shared the bug.
+
+### the issue list stops drawing an order it is about to rearrange
+
+The ISSUES panel sorts free issues above held ones, which needs the claims — and the
+claims and the issues arrive from two workers with nothing sequencing them. Both had an
+empty value standing in for "not asked yet": `self.held` was `{}` both before the board
+answered and when the board said nothing was held, and `self.issues` was `[]` both before
+`gh` answered and when the repo had nothing open. Neither could tell a silence from an
+answer.
+
+When `gh` won the race the panel painted every issue as free and re-sorted the moment the
+claims landed:
+
+```
+first paint : ['#427', '#426', '#422']
+after board : ['#426', '#422', '#427']
+```
+
+A reader who picked the top row in that window clicked #427 and took #426. The
+confirmation names the command, so it was never silent — but `ClickTable` exists because
+"a single click acts on the row under the pointer" was worth a test, and this was the
+panel breaking that on its own. On the other ordering — the board first, which is the
+usual one — the panel drew a confident `ISSUES · 0` about a repo `gh` had not yet been
+asked about.
+
+Both are now `None` until answered, and the panel paints when both have. The title says
+which answer is outstanding and carries a `gh` error beside it, so a stalled panel says
+which end is stalled rather than blaming the board for `gh`. `fix_issue` reads the same
+distinction instead of collapsing it: the ⚒ on a plan row refuses while the claims are
+unknown rather than treating unknown as free at the one click that spends money.
+
+**It is the first paint that is protected, not every paint.** A claim taken or dropped
+later is a real change in the answer and still re-sorts the table — that is what the
+renewal guard beside it was written to allow, and holding a stale order would be the
+opposite mistake. Neither wait can hang: `fetch_board` returns a state rather than
+raising, so a board that is *down* releases the paint, and a `gh` that fails answers with
+an empty list and an error, which is an answer and is shown as one.
+
+This is also what had been making
+`test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens` intermittently red. It
+was read as flake; it was the dashboard.
+
+### a board that cannot be reached stops reporting that nothing is claimed
+
+`fetch_board` answers a failed poll with `{"agents": [], "claims": [], "error": …}` — a
+dead board is a state rather than an exception, which is what stops the dashboard hanging
+on one. But `render_board` read the `claims` and never the `error`, so an outage arrived
+in the shape of an answer: every issue repainted as free, sorted to the top, with a claims
+table cleared beneath it.
+
+The head line did say `● board unreachable`, and that is a different widget from the row
+somebody is about to click. Worse, the ⚒'s own guard reads `held` and cannot see *why* it
+is empty — so once an outage had overwritten a real answer with `{}`, the button would
+raise its confirmation and spend a claim on work whose status was unknown.
+
+A failed poll now answers nothing about claims. The last good answer stands and only its
+freshness changes; where there is no last good answer the panel is released anyway, since
+waiting on a board that is down is the one way this gate could hang. Either way the title
+says `claims unknown: …` instead of counting issues as free, and the ⚒ refuses while it
+is unknown — unknown is not free, least of all at the click that takes a claim.
+
+Found by the reviewer panel on the PR for #433, which is the same collapse one layer up:
+an empty value standing in for an absent one. It was filed rather than fixed there on the
+reading that it predated that change — true, and beside the point, because the guard that
+change added is defeated by it.
+
+### the reviewer that cannot be told "no tools" is told so in words
+
+Every seat on the panel goes looking for the code. `codex_args` has the measurement:
+five runs in seven spent on `git status`, `rg --files`, `find` against an empty sandbox
+and then web searches for a private repo — a median third of the run, worst case 99% of
+it, over the timeout and the vendor lost. The answer has been a flag per vendor:
+`--no-tools` for pi, two `-c` overrides for codex.
+
+`agy` has no such flag. Its help offers only `--dangerously-skip-permissions`, pointing
+the other way, and `--sandbox` restricts what a tool may do rather than whether asking for
+one is fatal. And on this CLI it *is* fatal: the denial that was supposed to keep the
+reviewer off the tree ends the process instead.
+
+```
+antigravity (gemini-3.7-flash-high): exited 1
+  (Error: permission check failed for command "pwd && ls -la": user denied permission)
+```
+
+`antigravity_args` documented that auto-denial as the seat's safety property — true about
+the denial, wrong about what follows it. The seat returned no review on either round of
+one PR, so both rounds ran two seats of four.
+
+The slot this fixes was already there. A seat with the tree gets `CODE_ACCESS_BRIEF`; a
+seat without one got `""` — nothing telling it there is nothing to find, so it goes and
+finds out. It now gets `NO_TOOLS_BRIEF`, which says so and says what to do instead: name
+the question as a `could_not_assess` entry rather than hunt for the answer. Measured on
+the prompt that was failing, that text is the difference between `exit 1` and a findings
+array that reports the gap.
+
+It lives in the render rather than in `antigravity_args` so that `fit_argv_budget` counts
+it. The kernel caps one argv element, the ceiling applies to the whole prompt, and
+antigravity is both the seat this brief is for and the only seat that cap can veto —
+adding a kilobyte after the clamp would put it past the number the clamp had just
+measured.
+
+A seat downgraded late — the staging failed, so the brief is taken back out — now gets the
+no-tools brief in its place rather than an empty slot. That seat is precisely the one that
+has been told to read a checkout and then handed an empty directory.
+
+### two notes, one remedy, and it is spelled one way now
+
+#178 and #185 landed within an hour of each other and both put a "take a worktree" line into
+`SessionStart`. When both fired the reader was told twice — and told it in **two different
+commands**, which is the part that mattered: `create-worktree <branch>` is not a synonym for
+`git worktree add`. It also does the per-worktree database isolation, takes the claim, and
+installs the git hooks `qb-hooks` provides. An agent that followed the raw-git spelling got a
+worktree without any of that, in a repo that had just declared it wants all of it.
+
+They are not redundant notes, which is why neither was deleted. They answer different questions:
+
+- **#178's mode note is about POLICY** — this repo says work belongs in a worktree and you are not
+  in one. True with nobody else here, and still true after they leave.
+- **#185's is about PEOPLE** — somebody is in this tree with you *right now*, by name. That is the
+  thing the mode note cannot say.
+
+So the remedy is stated once, by the note that owns it. When the mode note has fired, the
+shared-tree note keeps the names, the count of uncommitted changes and "they cannot see you
+either", and drops its own remedy. When the mode note is silent — a jungle repo, or an undeclared
+one where this checkout is not primary — the shared-tree note keeps it, because nothing else will
+say it.
+
+`_take_a_worktree` is now the single spelling of the act across both notes and both refusals:
+`create-worktree` wherever the command exists, the raw `git worktree add` as the fallback for a
+host that has not installed the harness.
+
+Also corrected while here: the shared-tree note listed only the destructive verbs, having been
+written before #185 landed its second harm class. It now says that `git commit -a` and
+`git add .` quietly take a peer's work into *your* commit, which is the mechanism in two of the
+five incidents.
+
+Found by `hermes/seat-quarterback-2`, who landed #178 and saw the collision from the other side
+rather than patching around the suppression the other note owns.
+
+### a deleted upstream stops reading like a broken repository
+
+`qb-catchup`'s first run against real checkouts reported *"git would not say where it stands"*
+about a worktree whose branch was perfectly healthy. What was true is that its **upstream had
+been deleted** — the PR merged and the remote branch went with it, which is the ordinary end
+state of a worktree left lying around after its work landed.
+
+The check asked git for the upstream and tested the *output*. On a branch whose upstream ref is
+gone, `rev-parse --abbrev-ref --symbolic-full-name '@{u}'` does three things at once: writes the
+fatal to stderr, writes the literal string `@{u}` to **stdout**, and exits non-zero. stdout is
+not empty, so the emptiness test passed, and the failure fell through to the catch-all guard one
+step later.
+
+Nothing unsafe happened — the guard refused, as it is there to. But the diagnosis is what this
+tool is for: its whole value over `git pull` is saying *why* it left each checkout alone.
+"Its upstream is gone — the branch was probably merged and deleted" tells you to drop the
+worktree. "git would not say where it stands" sends you looking for a fault that is not there.
+
+The two no-upstream cases are now told apart, because they call for different things: a branch
+that never had one is somebody's local work in progress; one whose upstream has been deleted is
+almost always finished with.
+
+### qb-doctor's edge remedy pointed at a file that had moved
+
+`EDGE_RUNBOOK` hardcoded `~/source/selfhost/issues/**open**/160-…`. selfhost #160 was
+resolved on 2026-08-22 and the file moved to `issues/closed/`, so from that day the one
+row whose entire purpose is *"the remedy belongs to a person, and 'ask Rich' is not a
+remedy — a path is"* printed a path to nothing.
+
+A stale pointer is worse here than no pointer: it sends somebody looking in a directory
+the file is not in, for a document that does exist. And it is not a typo — the constant
+encoded a **mutable** fact, the issue's state, so the same event that made the path wrong
+is the event that made the runbook worth reading.
+
+`edge_runbook()` now resolves across both `issues/closed` and `issues/open` and never
+returns a path that is not there: a box without the checkout gets a sentence naming the
+file and the repository instead, and `SELFHOST_REPO` overrides the location — this is a
+path into another repository, which is the one thing this script cannot derive from its
+own.
+
+The same commit fixes a claim in `check_edge`'s docstring that went stale for the same
+reason and on the same day: it asserted in the present tense that `HUMAN_EDGE_SECRET`
+*"was never generated, never given to the app and never injected by nginx"*, four days
+after selfhost #160 generated it, gave it to the app and injected it. The row still
+answers `unknown`, and that part was never stale — an agent host has no forward-auth
+session, so "nothing on this host can tell" is the honest answer whatever the deployment
+does.
+
+### two delegated calls on one client could spend two credential fetches, or one empty header
+
+`QuarterbackClient` held the delegated secret in `self._elevated` and read, refreshed and
+cleared it with no lock — and `_send_delegated` read it *again* when it built the header,
+after the caller had already resolved one. FastMCP dispatches sync tools off the event loop,
+so two concurrent delegated calls interleave, and #476's drain is precisely a loop making
+these two calls.
+
+**Measured, with a working instrument.** Four callers refused the same secret, against the
+unfixed client: the command ran **4 times** for one logical fetch. `op read` is network and
+sometimes an authorisation prompt, so that is four prompts for one rotation. After: **1**.
+
+Two changes, and neither is a guard bolted on top:
+
+- **The secret is passed, not read.** `_send_delegated(path, body, secret)` takes it as an
+  argument and never touches the shared cache, so a rotation cannot change a request another
+  caller has already authorised. That removes the window rather than narrowing it.
+- **Resolution is serialised, and a retry is a compare-and-swap.** A caller passes the value
+  it was refused; if the cache has already moved past it another call did the work, and this
+  one takes the new value without running the command again. The lock is held across the
+  subprocess deliberately — the cost of serialising is one caller waiting, the cost of not
+  doing so is two prompts for one fetch.
+
+Closes the first item of #498. The other two — no compare-and-swap on `POST /plan/reorder`,
+and `elevated_map` re-reading the secrets file per request — are unchanged and still open
+there.
+
+### a blind convergence instrument is a coverage gap, and says so
+
+Rebasing a branch between panel rounds is ordinary and sometimes necessary — the base
+moves, and the alternative is reviewing against a tree nobody would merge. It also
+disarms **three** of a cycle's convergence instruments at once, because provenance (#48),
+recurrence (#67) and `--scope increment` all read the same range: the last round's
+`head_sha` to this one's. After a rewrite the old head is no longer an ancestor, GitHub
+answers `diverged`, and the panel refuses the range rather than blaming the fixer for
+every line the PR ever added.
+
+Since #497 that costs something concrete. `escalate_on.fix_injection` is computed from
+provenance, so with the range gone every new finding is recorded `unknown`, `unknown` sits
+in the denominator, and **the gate cannot fire** however badly the fix pass behaved. On the
+cycle #500 was filed from, that happened on round 3 of a three-round cycle that ended on
+the cap — the exact shape the gate exists to stop.
+
+The panel always detected it. What it said it in was a `config_notes` line in a payload,
+read afterwards by whoever thought to look, while the round reported a stop whose `reason`
+never mentioned that its main convergence test was off. It now takes a **veto line and
+`confident: false`** — the same treatment a reviewer that could not read the whole diff
+gets, which is what this is.
+
+#### Only when an instrument is BLIND, never when it is vacuous
+
+`_fix_range_diff` now returns what a missing range *means* rather than only a sentence
+about it. A head that never moved, or a fix pass that netted to nothing, leaves the
+instruments **vacuous** — there is no fix pass they failed to see — and takes no veto. A
+veto that fires on every honest empty round teaches the reader to skip the veto list,
+which is where the real coverage gaps are reported.
+
+That distinction is a value and not a substring match on the sentence, on this repo's own
+rule against deriving a fact back out of prose written for a human.
+
+#### And a word before the rebase, not only after it
+
+`panel-review-pr.md` §5 told the caller to pass every earlier payload as `--baseline` and
+said nothing about rewriting the branch. It now says what a rewrite costs, that merging the
+base branch in is preferable to rebasing it (an over-counting instrument beats a dark one,
+and it fails toward stopping the cycle), and which instruments survive — #84's premise
+register is keyed on declared text, so it comes through a rewrite intact.
+
+### a round waits for a pending build instead of telling the seats it is unknown
+
+Measured fleet-wide over five days: **19 panel rounds, `ci_status` PENDING on 9 of them,
+and `stop_confident` true on none of them.** The field that separates a converged cycle
+from one that gave up carried no information at all.
+
+A round here takes 20–40 minutes and a build about four and a half, with a 1–9 second
+queue wait — so the panel reliably told reviewers *"CI is still running"* about a build
+that finished during the round. A reviewer told so declares *"could not assess: CI result
+is unknown"*, `coverage_veto` counts that declaration, and `round_stop` computes
+`confident` as `not veto`. One stale read, and the round reports an unearned stop —
+which is also a `preland --require-earned-stop` HOLD.
+
+`review_ci_settled` gives a PENDING build a bounded chance to finish before the seats are
+dispatched. `panel.py:1830`'s reasoning for reading CI *before* them is untouched and
+still right: reviewers need the answer in their prompt or they file findings the build
+already refutes.
+
+**The cause is removed rather than the symptom filtered, and that is forced.** The obvious
+fix — read CI again when the round ends — cannot work, because the veto is not the panel's
+own. It is a reviewer's free-form prose, and `coverage_veto`'s standing rule is that
+exemptions come off recorded state and *"never off the wording of a message or a
+declaration"*. Answering it afterwards would mean matching model text for something
+CI-shaped, which is precisely what that rule forbids: a regex over prose exempts a genuine
+round-specific gap whose wording happens to match, and misses the structural one that does
+not.
+
+Bounded at ten minutes and it fails in the honest direction — a build still pending when
+the budget runs out is reported exactly as it is today, veto and all. Waiting can only turn
+an unknown into a fact. The wait is reported in `config_notes` so a round that sat for four
+minutes accounts for the time rather than looking slow for no reason.
+
+The reader is injected (`read=review_ci`, passed by `run()`) so the dozen suites that stub
+`panel.review_ci` keep working untouched — a wrapper resolving its own module binding would
+have slipped past every one of them and shelled out to `gh` in tests.
+
+**This is necessary, not sufficient.** 9 of those 19 rounds were PENDING but 16 were
+unconfident, so roughly seven were unconfident for other reasons — absent seats, truncation,
+the round cap. This removes one *systematic* false veto; it does not make a confident stop
+common on its own.
+
+### provenance attributes against the range the round actually read
+
+`_provenance` said in six places that #41 — review the increment — was what would make
+it exact. **#41 landed in v2.28** as `--scope increment` and is the default; nothing acted
+on it, and the comments went on naming a dependency that had already arrived, so anyone
+who checked concluded the work was blocked when it was available.
+
+Acting on it turned up more than a redundant call. A round computed the fix range **twice,
+through two compare-API calls, and the two were not obliged to be about the same range**:
+
+```
+panel.py   anchor = since or prior.head_sha      # what the round REVIEWS
+panel.py   _fix_range_diff(gh_repo, prior.head_sha, head_sha)   # what it ATTRIBUTES against
+```
+
+`--since` is documented and legitimate — *"pass it to review a specific range, or when the
+baseline predates that field"* — and passing it pointed the two at different spans with
+nothing reporting the mismatch. The provenance numbers then described a range nobody had
+looked at.
+
+Both now read the same anchor, so they cannot drift. And where the range is sound, the
+lines attributed are the **increment's** — narrowed to files also in the PR diff, so a
+base-branch merge's own commits no longer land in the range and inflate `introduced`, a
+bias `_fix_range_diff` documents and cannot fix.
+
+**The compare call stays, and that is the correction review forced.** The first cut dropped
+it and attributed straight off the increment, on the reasoning that the round reviewed that
+diff so it *is* the fix pass. It is not, after a rewrite: `fetch_increment` uses the
+three-dot form, so a rebase moves the merge base back and the increment widens toward the
+whole PR — "the safe failure", says its docstring, because the round merely re-reads more
+than it needed to. Safe for a review; catastrophic for an attribution, where it means every
+line the PR ever added reads `introduced`. `panel_scope` only falls back at
+`len(increment) >= len(diff)`, so a partial widening passes every guard.
+
+Where #500 was the injection gate failing to fire, that would have been the gate firing
+**wrongly** — ending a cycle with the fixer blamed for the whole PR. `_fix_range_diff` is
+the only reader that sees compare `status`, refuses `diverged` and `behind`, and drives
+#509's veto, so it keeps running and its refusal wins over the increment's lines.
+
+`payload.fix_range_source` says which range answered — `increment`, or `compare` for the
+rounds #41 never covered.
+
+#### A narrowing, not a retirement
+
+The docstrings promised "a finding in the increment is introduced by construction", which
+reads as *delete the heuristic*. It is not that, and the comments now say so rather than
+implying otherwise:
+
+* #41 is explicit that the review is **not bounded** to the increment — the seam between
+  the fix and the code it landed in is the point — so findings still arrive from context
+  files and still need attributing;
+* a repo on `round_scope: pr` has no increment at all;
+* placing a finding *in* the increment is still a comparison, so line drift and the
+  deletion blindness (a removed guard has no added line to sit on) are untouched.
+
+Exact for the target, heuristic for the rest — and `fix_range_source` is what tells the two
+apart in a payload.
+
+### the escalations row can see the board now, and no longer cries wolf about what it sees
+
+`qb-doctor`'s `escalations` row shipped in #530 unable to read a single post. It asked
+`GET /board?type=stuck` through a helper that requires a JSON object, and that endpoint
+answers a bare array — the `{"posts": [...], "cursor": N}` object it was written against
+is assembled by the MCP `board_read` wrapper, so it is the shape an agent sees and not
+the shape the API has. Every host got `unknown`, always, in a sentence ("the board did
+not answer an object") that pointed at the `board` and `token` rows, both of which were
+`ok` and neither of which was the fault. The `/blockers` half of the pair had never
+executed at all.
+
+Its five tests passed throughout, because the stub answered an object too — the fixture
+agreed with the bug. That is the same failure #523 exists to catch, so the stub is now
+held to the endpoint twice over: by a parse of the route's annotation, and by an
+assertion in `tests/test_board.py` about what a real client actually receives.
+
+Making it run then exposed two ways it could have raised a false alarm, both of which
+say the escalation path is severed when it is not:
+
+- **It counted posts the board served from outside the window it asked for.** `/board`
+  floors a quiet slice at the ten most recent posts whatever their age, and `type=` is
+  not one of the lookups that skip the floor. The live board answered ten, five of them
+  older than the cutoff. The row dates the posts itself now, as it always did the
+  blocker rows, so both halves describe the same day.
+- **It read a truncated page as the whole table.** `/blockers` orders oldest-first and
+  then truncates, so once a thousand blockers exist, every row raised today can lie
+  beyond the page — zero fresh rows against a real escalation, reported as a severed
+  producer. A full page is `unknown` now, and names what the endpoint would need.
+
+On the fleet's own board the row reads `1 blocker row(s) recorded against 5 stuck
+post(s) in the last 24h`.
+
+### a successful qb-bump no longer wedges the next one
+
+`--apply` writes the prepared `flake.lock` into the consuming flake and deliberately leaves
+it **modified** — committing it belongs to whoever owns that repository, and that is a line
+this tool has held from the start. But the guard on the other side did not know its own
+handwriting, so the very next run refused:
+
+```
+qb-bump: /home/rich/source/nix-fleet/flake.lock has uncommitted changes. This prepares
+against HEAD, so applying the result would discard them — commit or revert that file first
+```
+
+A successful run created the exact state that blocked the following one, and plain `qb-bump`
+was wedged along with it. #533 made `--apply` re-prepare on every invocation, which turned
+this from a corner into the normal path: two commands in a row, the second stopped by the
+first. It was found the first time anyone ran the two in sequence.
+
+**The refusal's reasoning is right and is untouched.** An uncommitted lock is normally a
+nixpkgs bump somebody was part-way through, preparation builds `HEAD`, and applying the
+result would silently discard their work — reading it instead is not the alternative, since
+this file's whole safety property is that it never builds somebody's uncommitted tree.
+
+What was missing is that the cache already records *precisely what was last written*
+(`Proposal.new_lock_sha`). So "somebody's in-flight nixpkgs bump" and "the lock I installed
+ten minutes ago" are distinguishable rather than both merely being "not HEAD". When the
+working-tree lock hashes to the cached proposal's, and that proposal names this flake, it is
+this tool's own output: preparing over it replaces its own lock with a newer version of the
+same thing and discards nothing. It says so on the way past, and repeats that committing the
+file is still the consumer's business.
+
+Everything else refuses exactly as before — a lock edited since it was written, a proposal
+for a different flake, a cleared cache, another machine's lock. Each of those is somebody's
+work or an unknown, and none of them may be prepared over.
+
+**And a leak the fix surfaced.** `main` sets the `NARRATE` flag once and never restores it,
+which is harmless with one process per invocation but means a single `--json` run inside the
+test suite silenced every test that ran after it — silently, since they assert on what *is*
+printed rather than what is not. The hermetic fixture resets it.
+
+### `qb record-outcome` prints the bucket that matters, so a note rewrite stops reporting as nothing
+
+`POST /review/outcomes` returns six buckets and the render in `harness/bin/qb` named three
+of them. The missing one was `amended` — the bucket a note rewrite lands in, and the one the
+endpoint separates out on the grounds that it is the one that matters, because a rewritten
+refutation is a rewritten piece of evidence.
+
+Omitting it did not read as silence. `amended` alone takes the 200 branch, so `curl -fsS`
+succeeded, the `jq` ran, and every counter it knew about was legitimately zero: an agent
+recording revert context onto five findings was told `recorded 0, changed 0, unchanged 0`,
+read it as "it didn't take", and put the context in a commit message and a new issue instead.
+All five notes had been stored. An all-zero line is not an absent report — it is a positive
+report that nothing happened, indistinguishable from the genuine no-op, and there was no
+second signal to check: `rejected` was correctly empty and the exit code was correctly 0.
+
+The count is now in the headline and each amendment is itemised the way a rejection is, naming
+which fields moved and whether each was filled or rewritten:
+
+```
+recorded 0, changed 0, amended 5, unchanged 0
+  AMENDED <key>: rewrote note
+```
+
+The render's own comment already argued for this discipline — "a silent rejection here would
+undo the whole point of naming it back" — about the failure with the sign flipped. So the
+guard against the next one reads the buckets off a live response rather than off a list
+written down beside the test: a hand-kept list would have been written on the day `amended`
+was already missing from the render.
+
+### the MCP server gets the agent name it interpolates, so a delegated credential can resolve
+
+`qb-mcp` handed the server four variables and not a fifth. `QUARTERBACK_AGENT` was set by
+`qb_load_config` but never exported, and the server resolves one credential for itself —
+`QUARTERBACK_ELEVATED_TOKEN_CMD`, through `subprocess.run(..., shell=True)` with no `env=`,
+so the child sees `os.environ` and nothing else. The fleet writes that command as
+`op read "op://…/quarterback-$QUARTERBACK_AGENT/elevated"`, which with an empty agent name
+asks the vault for `quarterback-`.
+
+The bearer never had the problem, which is why nothing found it for months: `qb_resolve_token`
+runs its command in the shell where the variable IS in scope and exports the result, so the
+elevated credential is the only one the server resolves itself, and delegated writes are rare
+enough that nobody had spent one. The first ever attempt, on 2026-08-27, failed as "this host
+has no delegated credential" — a sentence that names an unprovisioned box and sends its reader
+to the secret store rather than to a missing `export`.
+
+Asserted through the exec rather than by reading the source, because `export` is exactly what
+a static check of the assignment cannot see.
+
+### a seat is a pane with a shell in it, not a role with a name and a brief
+
+Starting a screen put four agents on the board called `hermes/seat-quarterback-1` through
+`-4` — twenty-five characters, twenty-four of them shared — each one already inside a brief
+telling it to claim a plan item, all four in the shared checkout. What a screen is wanted for
+is *n* shells you put an agent in when there is something for it to do.
+
+Every difference between those two came from one decision: a seat was a role, and the pane was
+merely where the role sat. That is now inverted. A seat is a pane with a shell in it and a
+number on it, and whether an agent lives in one is a fact the **pane** reports.
+
+#### One line is the whole of what a seat is told
+
+`QB_SEAT_INITIAL_CMD` — the initial command, default `claude-yolo`, and **empty for a pane
+that comes up as a bare shell**. `--cmd LINE` is the same answer for one invocation and beats
+it; `--yolo` / `--no-yolo` are sugar over both.
+
+`claude-yolo` and not `claude --dangerously-skip-permissions`, because the value is *typed
+into an interactive shell* rather than exec'd: it resolves aliases and functions, which is how
+a consumer puts their own wrapper in front of it, and on the fleet this was written for
+`claude-yolo` is an alias that is not on `PATH` at all. It carries a prompt if you want one —
+`QB_SEAT_INITIAL_CMD='claude-yolo -- /get-involved'` is a screen that comes up claiming work,
+which is still self-selection rather than dispatch: the same line to every pane, and the
+board's atomic `plan_claim` deciding who gets what.
+
+`qb-seat` is gone, and with it five knobs whose only job was defending the name it gave a
+seat: `QB_SEAT_AGENT`, `QB_SEAT_BRIEF`, `QB_SEAT_SCOPE`, `QB_SEAT_YOLO`, `QB_SEAT_FORCE`, and
+the careful `-e` forwarding that carried each of them into a pane. What the screen is made of
+is recorded on the session as `@qb_initial_cmd` instead, where `--add` and the bar's ＋ read
+it back — a tmux option rather than an environment variable, because an option is read by the
+screen's own tooling and an environment variable is inherited by every shell in every pane.
+
+#### The dashboard stops parsing names
+
+The seat name existed so that something could recover a tmux pane from a board identity, and
+`qbdata` carried a vocabulary to do it: `SEAT_RE`, `seat_number`, `seat_machine`, `seat_scope`,
+`slug_scope`, `scope_of`, `pane_scope`, and a test pinning that slug rule byte-for-byte against
+the one `qb-seat` applied, because two implementations of it was exactly how a dashboard came
+to show one seat's state against another seat's pane.
+
+All of it is deleted. `GET /active` returns a `session` for every agent and `qb-hook` stamps
+that same id on the pane it is running in — which is how the ✕ on the seat bar has been ending
+the right agent all along — so the join is an equality on the session id. The state cell was a
+three-way narrowing that could still come back ambiguous: two screens on one box could each
+hold a seat 1, two machines could each hold a `seat-lexray-1`, and the last tiebreak was a
+*guess* at this host's board name. It is now a dict lookup.
+
+It also answers a question the old join could not. A pane running a session the screen did not
+start resolves now, where a name-derived seat number could only ever see agents that had
+called themselves seats.
+
+#### A spent window costs the agents, not the panes
+
+The pacing refusal used to live in the per-pane wrapper and refuse to create the **pane**
+(exit 4). That was the right instinct aimed at the wrong object — a pane costs nothing, and
+refusing somebody a terminal because a subscription window is spent is a refusal they can only
+work around by not using this script.
+
+So `QB_SEATS_PACE=obey` now brings the seats up as bare shells: the panes exist, the top line
+says why, nothing is started and nothing is burnt. `warn` (the default) says it and starts
+anyway, because a human standing in front of a screen who is told the window is spent is a
+human who can decide. The estimate and the gate were two knobs a character apart —
+`QB_SEATS_PACE` and `QB_SEAT_PACE` — and are now one, in the plural spelling; `off` means
+exactly what it always did.
+
+#### And ＋ puts a seat back where ✕ left a hole
+
+`--add` took the highest seat number plus one, so that a new agent could never inherit the
+number of one that had just exited — the number was half of the seat's board name, and the
+board's returning-key rule would have handed it the old agent's identity. The number is a pane
+option now, so close seat 2 of 4, press ＋, and you get seat 2 back.
+
+#### One knob moved rather than dying with the family
+
+The dashboard's ⚖ — the button that opens a review in a pane — read `QB_SEAT_AGENT` for the
+binary to start. Retiring the seat family would have left it the last reader of a variable
+nothing else sets and no documentation mentions, which is a knob that looks live and is not.
+It is `QB_DASH_AGENT` now, beside `QB_DASH_REPO` and `QB_DASH_CONFIRM`. Not
+`QB_SEAT_INITIAL_CMD`, which is the nearest surviving thing and the wrong shape: that is a
+command line and may carry a prompt of its own, so composing it would produce
+`claude-yolo -- /get-involved -- /panel-review-pr 42`.
+
+#### And the number allocator reads the whole screen
+
+A seat number is unique per *screen*, and a pane can leave the seat row without giving its
+number up — `break-pane -d` into a holding window is how the qb key hides the tape and the
+dash today. The allocator read the ROW, which the old max+1 rule was accidentally immune to:
+a parked seat 2 was invisible, and max+1 could not collide with it anyway. The lowest-free
+rule is not immune, so it reads the session instead. Nothing parks a seat yet; the guard
+arrives with the rule that needs it rather than with the feature that will trip it.
+
+#### The initial command has to be one line, and the ceiling applies to `--add`
+
+Two guards a codex second opinion asked for.
+
+`type_into` sends the value with `send-keys -l`, which writes bytes into the pane's pty —
+and a newline in a pty is Enter. So a value carrying one is not a line that gets typed, it is
+several commands, and the first runs whatever `--staged` was asked for. Measured, with no
+`C-m` sent at all: `--staged --cmd $'echo FIRST\necho SECOND'` left `echo FIRST` already
+executed. That is a safety control silently not holding, which is worse than not having one,
+and it is newly reachable because the typed line used to be script-generated rather than
+user text. A control character in the initial command is now refused before a session, a
+pane or an option exists.
+
+And the seat ceiling is a property of a screen, not of an invocation: the check by the
+argument parser validates what a call was asked to *build*, which for `--add` is the
+untouched default and says nothing about the screen being grown. `--add` tests the number it
+allocated, so a screen with a hole in it still has room and a full one is refused.
+
+### the credential that lets an agent apply an order now says how to deploy it
+
+`DEPLOY.md` gave `HUMAN_TOKENS` a numbered recipe naming where each half lives — the secret,
+the board's env var and its vault ref, the client's command — and gave `ELEVATED_TOKENS` a
+description of what it authorises and nothing about putting it in place. So the one credential
+whose entire purpose is letting an agent APPLY an order a person asked for was the one with no
+instructions, and it duly sat unwired on this fleet while both its secrets were already minted
+and matching in the vault.
+
+It now carries the parallel block: mint per machine and why per machine, the board half and its
+ref, the client half and its command, and that the machine name is one string that has to agree
+at both ends or the comparison fails against an entry that is not there.
+
+It also says why not to route around it when it is missing. An agent that cannot apply an order
+can still reach `human()` if it can read `HUMAN_EDGE_SECRET` off the host, and that authors the
+write as the person, with `rank_source: "ordered"` — indistinguishable from a sequence they
+typed. That is the confusion this credential replaced the session-lending design to end.
+
+The post-deploy checklist gains the check that proves it end to end, which is not that the
+reorder succeeded but that the rows read `derived`. Success is not the signal; the attribution
+is.
+
+### the click tests stop aiming at a pane that is still moving
+
+The dashboard's live click drivers waited for `row_count` and then clicked. That says the
+rows are *in* the table; it does not say the pane has finished deciding where the table
+is. `Pilot.click` resolves the widget's position when it is **called**, so a click aimed
+while something above is still arriving is delivered a row high, onto the header — which
+`ClickTable.on_click` refuses, correctly, as `row: -1`:
+
+```
+before click : region y=21, caps line hidden
+at dispatch  : region y=22, caps line shown, meta row=-1   ← the header
+```
+
+Nothing is wrong with the dashboard here; the refusal is the behaviour a click test exists
+to protect. What was wrong is a driver reading "the data arrived" as "the screen has
+settled", and it cost about two failures in six runs of
+`test_a_plan_row_explains_itself_and_its_hammer_takes_the_issue` on `main`, read as flake.
+
+**The fix is upstream of the click, in every driver.** Two things on this screen move
+everything under them: the caps line APPEARS (`display: none` until its first answer) and
+SEATS GROWS, being the one table sized to its content. `refresh_limits` was already off in
+these drivers for exactly that reason — but #426 gave the caps line a second source, the
+review queue riding the gh clock, so the old guard stopped covering it. Both sources are
+off now, and the seat list with them; none of these tests is about the caps, the queue or
+the seats.
+
+`_click_row` is the backstop for what that cannot reach — the pane's own first layout
+pass. It waits for the coordinate `Pilot.click` will compute to hold still across two
+consecutive reads with a real row under it, then clicks. Deliberately not written against
+any particular mover: waiting for the caps line specifically was the first cut and it was
+wrong twice, going the moment `display` flipped (a style flag, not a completed layout) and
+spending its whole bound learning that no caps line was coming.
+
+Eight runs of the four live click tests, after: all green.
+
+### the ⚖ cancel test stops depending on the fleet having two open PRs
+
+A fix round on #433 closed a real hole: the "cancelling starts nothing" block pressed escape
+and asserted nothing had started, without first asserting anything had been raised to cancel.
+A click that missed left `started` empty and made the escape a no-op, which reads exactly
+like a cancel that worked — a pass that could not fail.
+
+The assertion was right and the row was not. It clicked row 2 unconditionally, and a second
+row is not something a test can arrange: the OPEN PRs panel shows what the fleet has open. On
+2026-08-25, with that morning's work merged, the repo had **one** open PR — so the click went
+past the last row, `ClickTable.on_click` refused it as it should, no dialog appeared, and the
+suite went red about the fleet's state rather than about the dashboard's behaviour. The
+commit that added the assertion names the hazard in its own comment and then does not guard
+it.
+
+Row 2 when there is one, row 1 otherwise. Cancelling is worth testing on any day, and which
+row it happens on was never what the test was about.
+
+### four harness tests that asked the host rather than arranging the answer
+
+Measured at `main@bb968da`, one commit, two machines:
+
+```
+CI (ubuntu-latest, harness not installed)   148 passed
+zeus (NixOS, harness installed)               4 failed, 144 passed
+```
+
+Same code, same commit. The four are now green on both, and none of them can go back to
+asking the box.
+
+#### Three of them: `stub=None` meant "run the production tool"
+
+`test_create_worktree_claim.py`, `test_prune_worktrees_claims.py` and
+`test_remove_worktree_claim.py` each drive a bash stanza lifted out of `create-worktree` /
+`prune-worktrees` / `remove-worktree` with the board tool deliberately missing — a real
+deployment state, and the one branch those tests exist to cover. They built `PATH` as the
+stub directory plus `os.path.dirname(shutil.which("bash"))`, because the stanzas shell out
+to `git`, `jq` and `tr` and those had to come from somewhere.
+
+On a home-manager install that second directory is `/etc/profiles/per-user/rich/bin` — the
+directory the harness installs *into*. It holds `bash`, `git` and `jq`, and it holds
+`qb-claim`, `qb-release` and `qb-admit` next to them. So the absent case handed the stanza
+the real tool and asserted on its output. `test_create_worktree_claim.py` already carried a
+comment naming this exact hazard; the mechanism it named was the one that fails.
+
+A fourth, `test_a_missing_qb_admit_does_not_abort_the_run_under_set_e`, was green the whole
+time and had never taken the branch it is named for: the real `qb-admit` ran against a
+throwaway repo and happened to satisfy `stderr == ""`. That is the worse of the two
+outcomes, because nothing will ever tell you. `test_no_python3_is_not_a_crash` was in the
+same position — the profile supplied a real interpreter, so the rollback ran for real and
+failed on a missing `qbdata` instead.
+
+`harness/tests/_path_sandbox.py` builds the `PATH` now. Every entry on it is a directory
+the test made and the test filled, plus a toolbox of symlinks to the **named binaries** a
+stanza needs — resolved one file at a time, never a whole directory. `sandbox_path()`
+refuses a `PATH` with an entry from anywhere else, so the property holds at every call site
+rather than at the one where somebody remembered to check it.
+
+`PATH` was only half of the leak. Each stanza falls back to `${0%/*}/qb-<tool>` when
+`command -v` finds nothing, and under `bash -c` that `$0` is the interpreter's absolute
+path — the same profile directory by a second route. All four suites now run their stanza
+as a script file in a directory of their own.
+
+#### The fourth: an assertion #464 deliberately deleted
+
+`test_the_shared_tree_note_says_the_opposite_of_the_repo_note` asserted `"your own tree" in
+shared`. `90ca5a2` (#464, "one remedy, one spelling") made that remedy conditional on
+purpose: where #178's mode note has already told you to take a worktree, the shared-tree
+note keeps the names and drops the duplicate. The test read the composed note through a
+fixture that did not stub `qb-mode`, so what it actually asserted was that the host had no
+`qb-mode` installed.
+
+It now drives **both** mode states and asserts the remedy as a function of which one —
+present where nothing else gives it, deferred where #178 already did. Restoring the removed
+remedy and deleting it outright are both caught, where before neither was. `qb-mode` is
+stubbed silent by the fixture itself rather than by the two tests that argued about it, so
+no test in that file can quietly inherit the host's mode again.
+
+#### The guard
+
+`test_path_sandbox.py` asserts the sandbox resolves none of the commands `harness/bin`
+ships — read from the directory, so a `qb-*` added tomorrow is guarded the day it lands,
+which is #385's actual point: the class grows every time a new tool gains a "what if this
+is missing" test. It also refuses `dirname(bash)` by name, and pins the four suites to
+building their `PATH` here.
+
+### five harness tests that ran the real `qb-*` tools — two of them against the live board
+
+`PATH` isolation (#527) makes a tool *absent*. It does nothing about a tool a test runs on
+purpose, and five more suites did exactly that. Two of them reached past `PATH` to `HOME`,
+which is where the machine's board credential lives.
+
+Measured on this box, before the change:
+
+```
+test_remove_worktree_branch_guard.py   3 × authenticated GET /active, 64-char bearer
+create_worktree_nginx.test.sh          1 × authenticated GET /active, 64-char bearer
+test_qbdata.py                         9 × the real qb-pace (~/.claude + the usage endpoint)
+test_qb_hook_end.py                    1 × the real qb-catchup, under a test named "no qb-catchup"
+test_worktree_holder.py                1 × the real worktree-holder, under "the check is not installed"
+test_qb_start.py                       1 × the real `qb-claim issue 277`, under "qb-claim is not installed"
+```
+
+Every full local harness run posted to production. Recorded by pointing
+`QUARTERBACK_BASE_URL` at a local recorder and reading the `Authorization` header off it —
+same code path, same credential, a different host.
+
+#### The two that made board calls
+
+`test_remove_worktree_branch_guard.py:88` ran `remove-worktree` with **no `env=` at all**:
+the inherited `PATH` found the installed `worktree-holder`, `qb-admit` and `qb-release`, and
+the inherited `HOME` found `~/.config/quarterback/config`. `create_worktree_nginx.test.sh`'s
+`run_create`/`run_remove` had the same shape. Neither suite has anything to do with the
+board — one is about `git branch -d`, the other about an nginx config block.
+
+A `PATH` sandbox does not fix this on its own, and that is the point of the issue rather
+than a detail: both scripts are invoked *from* `harness/bin` by absolute path, so
+`${0%/*}/worktree-holder` resolves however bare the `PATH` is. What stops a tool reaching
+the board is having no credential when it gets there.
+
+#### The three that were only wrong
+
+Each asserted what happens with a `qb-*` missing while the inherited `PATH` supplied it, so
+each was green on code that had never taken the branch it names. Verified by breaking that
+branch on the pre-change tree: **`qb-hook` announcing itself when `qb-catchup` is absent,
+`prune-worktrees` aborting with no `worktree-holder`, and `qb-start` spawning anyway when
+`qb-claim` is not installed all passed all three suites.** After the change each goes red,
+caught by the one test that names it.
+
+`test_qbdata.py` is the fourth shape: no `QB_SEAT_PACE=off`, so nine parametrisations
+started the real `qb-pace` beside `qb-seat`. `test_qb_seat.py:165-181` documents that exact
+hazard and defends against it; this file did not.
+
+#### Where the isolation lives
+
+`sandbox_env()`, next to `sandbox_path()` in `harness/tests/_path_sandbox.py` — one module,
+because the two halves are one property ("this test controls what the script it starts can
+reach") and splitting them is how one came to be remembered and the other forgotten. Every
+suite #527 fixed had thought about `PATH`; not one had thought about `HOME`.
+
+It drops every `QUARTERBACK_*` / `QB_*` / `ANTHROPIC_*` / `CLAUDE_*` / `GH_*` name the shell
+exported, points `$HOME` and the whole `XDG` tree inside the test's own `tmp_path`, and sets
+`QUARTERBACK_CONFIG` at a file under it that is not there — both override points, not
+either, because a tool honouring only one of them is then covered by the other. It turns
+`QB_SEAT_PACE` off by default, since `PATH` cannot reach that one at all. Then it asserts
+the result: nothing credential-shaped survived, and the config file the environment resolves
+is under `tmp_path`, by the rule `qbdata.resolve_config()` and `qb-env:57` both apply.
+
+The assertion is in the function rather than in a test of the function, so it runs at every
+call site — `sandbox_path`'s judgement, for the same reason.
+
+#### The guards
+
+`test_path_sandbox.py` asks the **production** readers, not a description of them: a decoy
+config in the shape of the real one, read by `qbdata.resolve_config()` and by `qb-env`, found
+by a control environment shaped like the five suites' old one and not found by a sandboxed
+one. The control is asserted to find it, so the test can fail.
+
+`ABSENCE_SUITES` gains the three absence suites; a wider `ISOLATED_SUITES` covers the two
+that are not about absence but hand a real script an environment, and bans two more spellings
+of the inherited copy (`os.environ.items()`, `**os.environ`). The bans are read from source
+with comments and docstrings blanked out — these files now explain at length what they no
+longer do, and the blanker keeps string literals, because `os.environ["PATH"]` is one of the
+banned idioms and has a string inside it. The shell suite cannot import any of that, so it
+carries its own case instead: the board tools are stubs that record the environment they were
+handed, and the suite reads it back.
+
 ## v3.20 — an existing backlog can be ordered, and an actionable issue can be picked up
 
 ### the issue watcher can act now, and four yeses in four places have to agree first
