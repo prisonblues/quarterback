@@ -54,6 +54,11 @@ let
   spawnableCommands = [
     "/investigate"
     "/fix-issue" "/fix-and-review" "/fix-and-land" "/review-pr" "/panel-review-pr"
+    # Takes no number: it reads the plan and self-selects (#541). Allowing it
+    # implies allowing everything it dispatches into — `qb-start` REFUSES a policy
+    # that names this without `/fix-issue`, `/fix-and-land`, `/review-pr` and
+    # `/panel-review-pr`, rather than granting them silently one hop along.
+    "/get-involved"
   ];
 
   # The machine's spawn policy, read by `qb-start` and by nothing else. Written ONLY

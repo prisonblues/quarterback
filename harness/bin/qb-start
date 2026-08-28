@@ -26,12 +26,23 @@ be one: a session that is **countable, claimable, endable, and off by default**.
 
 **IT IS NOT A DISPATCHER, and that line is not being moved.** `qb-seat:44` says
 the board coordinates work and does not operate the machine; what that sentence
-is about is *dispatch*, and nothing here reads the plan, picks an item, or tells
-an agent what to work on. It is told a command and a number by whatever pulled
-it, exactly as the dash's ⚒ is told one by a click. Which work an agent takes
-stays the agent's own choice, self-selected and claimed atomically — a spawner
-that read the plan and handed seat 1 the first item would be hub-and-spoke with a
-hub that runs once, and self-selection is the whole design.
+is about is *dispatch*, and nothing here picks an item or tells an agent what to
+work on. It is told a command by whatever pulled it, exactly as the dash's ⚒ is
+told one by a click. Which work an agent takes stays the agent's own choice,
+self-selected and claimed atomically — a spawner that read the plan and handed
+seat 1 the first item would be hub-and-spoke with a hub that runs once, and
+self-selection is the whole design.
+
+**That sentence used to say "nothing here reads the plan", and #541 edited it
+deliberately rather than crossing it quietly.** `/get-involved` takes no number,
+so before spawning one this asks the board a single question — *is anything on
+this repo's plan free* — and refuses if the answer is no. That is not picking:
+nothing is passed to the agent, and the item it eventually claims may not be the
+one that was free when the question was asked. It is what `qb-admit` already
+asks, *is there room*, with no say in what goes in the space. The distinction
+worth holding is between reading the plan to CHOOSE (still refused, still the
+whole design) and reading it to decline early (this, and it costs a session that
+would otherwise start, read the plan, find nothing and stop).
 
 **THE BRIEF IS A NAMED COMMAND, NEVER FREE TEXT.** :data:`SPAWNABLE` is the whole
 of what may be started and it is compiled in, so the spawn surface is an
@@ -107,6 +118,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 #: The exits. 1 is deliberately unused: every other `qb-` tool spends it on "the
 #: board decided against this", and here there are six distinct refusals whose
@@ -132,14 +144,73 @@ COULD_NOT_START = 9
 #: watcher's default rung is the read-only one precisely so that a close call
 #: costs a writeup instead of a PR, and a spawn allowlist that admitted only the
 #: rung that writes code would have made the safe answer the unstartable one.
+class Spawnable(NamedTuple):
+    """What a spawnable command takes, and what it can turn into.
+
+    `kind` used to be the whole value here, and it was doing two jobs at once: it
+    named the ref a number points at, and — because every entry had one — it was
+    also the assertion that a number exists. `/get-involved` (#541) takes none, so
+    the arity has to be said rather than implied. `kind is None` IS "no argument",
+    and every site that used to read the ref kind now has to decide which of the
+    two questions it was asking.
+
+    `dispatches` is the set of commands this one can run in turn, and it exists
+    for a permission reason rather than a documentary one — see :func:`admits`.
+    Empty for everything that only does its own work.
+    """
+
+    kind: str | None
+    dispatches: tuple[str, ...] = ()
+
+
 SPAWNABLE = {
-    "/investigate": "issue",
-    "/fix-issue": "issue",
-    "/fix-and-review": "issue",
-    "/fix-and-land": "issue",
-    "/review-pr": "pr",
-    "/panel-review-pr": "pr",
+    "/investigate": Spawnable("issue"),
+    "/fix-issue": Spawnable("issue"),
+    "/fix-and-review": Spawnable("issue"),
+    "/fix-and-land": Spawnable("issue"),
+    "/review-pr": Spawnable("pr"),
+    "/panel-review-pr": Spawnable("pr"),
+    #: Takes no number: it reads the plan and self-selects (#541). That makes it
+    #: the SAFEST entry on the axis this file worries about most — there is no
+    #: attacker-controlled text to carry in, because there is no argument at all —
+    #: and the most dangerous on the other lock, because it dispatches. What it
+    #: can turn into is `harness/commands/get-involved.md`'s own table, and it is
+    #: repeated here because :func:`admits` has to enforce it and a rule that
+    #: reads a markdown file is not a rule.
+    "/get-involved": Spawnable(
+        None, ("/fix-issue", "/fix-and-land", "/review-pr", "/panel-review-pr")),
 }
+
+
+def admits(command: str, allowed: set[str]) -> tuple[bool, str]:
+    """May this machine spawn `command`, given the commands its policy allows?
+
+    `(True, "")`, or `(False, why)`. The plain case is membership. The case this
+    function exists for is composition: `/get-involved` dispatches into
+    `/fix-issue`, `/fix-and-land`, `/review-pr` and `/panel-review-pr`, so a
+    policy that allows it and deliberately withholds `/fix-issue` **gets
+    `/fix-issue` anyway**, one hop along, on an issue chosen from the plan.
+
+    That is not a leak to document, it is the second lock failing to mean what it
+    says. This file's own claim is that a policy file *"can only ever NARROW"* the
+    compiled set, and the operator who withheld `/fix-issue` has no way to see
+    that it did not: `--policy` reports the allowlist, which would no longer be
+    the set of things that can run. So the rule is enforced rather than described,
+    and `--policy` reports the implication (#541).
+
+    The alternative — document it and leave the check out — is a policy file that
+    means something other than what it says, on the one gate whose entire job is
+    meaning exactly what it says.
+    """
+    if command not in allowed:
+        return False, f"{command} is not on this machine's allowlist"
+    missing = sorted(set(SPAWNABLE[command].dispatches) - allowed)
+    if missing:
+        return False, (
+            f"{command} dispatches into {', '.join(missing)}, which this machine "
+            f"does not allow — so admitting it would grant them anyway, one hop "
+            f"along. Allow them too, or withhold {command}")
+    return True, ""
 
 #: Who may be recorded as having pulled this, and why it is a closed set rather
 #: than a string the caller fills in. `--via` goes into a claim note and a board
@@ -482,14 +553,23 @@ def main() -> int:
     # And it consults nothing else — no board, no tmux, no network — so a caller
     # may ask it on every click without paying for it.
     if args.policy:
-        allows = sorted(policy.commands & set(SPAWNABLE))
+        allows = sorted(c for c in policy.commands & set(SPAWNABLE)
+                        if admits(c, policy.commands)[0])
+        # Named separately rather than silently dropped: a command the
+        # policy lists and this refuses is the operator's own file
+        # disagreeing with itself, and the one thing they cannot see
+        # from the file alone (#541).
+        withheld = sorted(set(policy.commands & set(SPAWNABLE)) - set(allows))
         if policy.enabled:
             say(f"spawning is enabled here — {policy.where}")
             say(f"  allows: {', '.join(allows) or '(nothing — `commands` is empty)'}"
                 f"; up to {policy.max_sessions} at once")
+            for c in withheld:
+                say(f"  listed but refused: {admits(c, policy.commands)[1]}")
         else:
             say(f"not enabled: {policy.refusal}")
         out(enabled=policy.enabled, policy=policy.where, commands=allows,
+            withheld=withheld,
             max_sessions=policy.max_sessions, reason=policy.refusal or None,
             spawnable=sorted(SPAWNABLE), triggers=sorted(TRIGGERS))
         return STARTED if policy.enabled else NOT_ENABLED
@@ -536,14 +616,13 @@ def main() -> int:
                       f"{command} is not a spawnable command",
                       "the set is compiled in so that a policy file cannot widen "
                       "it: " + ", ".join(sorted(SPAWNABLE)))
-    if command not in policy.commands:
+    ok, why = admits(command, policy.commands)
+    if not ok:
         allowed = ", ".join(sorted(policy.commands)) or (
             "nothing — `commands` is empty, which is the second lock: turning "
             "spawning on is one decision and saying what may come through it is "
             "another")
-        return refuse(NOT_ALLOWED,
-                      f"{command} is not on this machine's allowlist",
-                      f"{policy.where} allows: {allowed}")
+        return refuse(NOT_ALLOWED, why, f"{policy.where} allows: {allowed}")
 
     # ---- 3. the argument. One positive integer, because that is the whole of
     # what these commands take and anything else is the free text being refused.
@@ -553,13 +632,26 @@ def main() -> int:
     # number nobody typed and nothing downstream would recognise; `"½".isdigit()`
     # is False but `isnumeric` says otherwise, which is the same trap one method
     # along. The set of characters an issue number may contain is ten of them.
-    if not re.fullmatch(r"[0-9]+", args.number or "") or int(args.number) <= 0:
-        say(f"qb-start: {command} takes an issue or PR number — got "
-            f"{args.number!r}. The brief is a named command with arguments, not "
-            f"free text, so nothing else is passed through")
-        return MISUSE
-    number = str(int(args.number))
-    kind = SPAWNABLE[command]
+    #
+    # Both directions, because the arity is now a property of the command rather
+    # than an assumption about the table. A numberless command handed a number is
+    # as much a misuse as a numbered one without: it means the caller believes it
+    # is starting work on something specific, and it is not.
+    kind = SPAWNABLE[command].kind
+    if kind is None:
+        if args.number is not None:
+            say(f"qb-start: {command} takes no number — got {args.number!r}. It "
+                f"reads the plan and selects its own item, so a number here is a "
+                f"caller believing it aimed this at something. It did not")
+            return MISUSE
+        number = None
+    else:
+        if not re.fullmatch(r"[0-9]+", args.number or "") or int(args.number) <= 0:
+            say(f"qb-start: {command} takes an issue or PR number — got "
+                f"{args.number!r}. The brief is a named command with arguments, not "
+                f"free text, so nothing else is passed through")
+            return MISUSE
+        number = str(int(args.number))
 
     # ---- 4. the checkout.
     if not os.path.isdir(repo_path):
@@ -623,33 +715,91 @@ def main() -> int:
                       f"reach, or a ceiling it would not act on. An unbounded repo "
                       f"answers `room` without asking anything, so this is not that")
 
+    # ---- 7b. is there anything to get involved WITH? Numberless commands only.
+    #
+    # This edits the not-a-dispatcher paragraph at the top of this file rather
+    # than quietly slipping past it, so it is stated here too (#541): asking
+    # whether the plan has ANYTHING free is not picking what to take. Nothing is
+    # passed to the agent, and the item it eventually claims may not be the one
+    # that was free at this moment. It is the question `qb-admit` already asks —
+    # is there room — with no say in what goes in the space.
+    #
+    # What it buys is the refusal that costs nothing. Without a pre-spawn claim,
+    # `/get-involved` against a fully-claimed plan starts a session that reads the
+    # plan, finds nothing, reports it and stops: correct, and a whole session
+    # spent to reach it. Harmless once; at the tail of a drain it is the common
+    # case, and it is the case an eager fleet hits repeatedly.
+    #
+    # Fails OPEN, unlike the gates above it. A board that cannot answer "is
+    # anything free" has told us nothing about the plan, and refusing on silence
+    # would make an unreachable board look like a finished one — which is the
+    # failure this whole fleet spent a night on. The gates that fail closed are
+    # the ones counting a resource; this one is avoiding a wasted session.
+    if kind is None and not args.dry_run:
+        free, why_not = plan_has_free_item(repo_path)
+        if free is False:
+            return refuse(HELD,
+                          "nothing on the plan is free to pick up",
+                          "every open item is claimed, blocked or held. This is the "
+                          "refusal that costs nothing: without it the session would "
+                          "start, read the plan, find the same thing and stop. "
+                          "`plan_read` shows who holds what")
+        if free is None:
+            say(f"qb-start: could not ask whether the plan has anything free "
+                f"({why_not}) — starting anyway, because a board that did not "
+                f"answer has said nothing about the plan")
+
     if args.dry_run:
         session = "<a fresh uuid4>"
         say(f"policy:   {policy.where}")
         say(f"cwd:      {repo_path}")
-        say(f"claim:    {kind} {number} (no session, machine-held, as create-worktree's is)")
+        if kind is None:
+            say("claim:    none — this command selects and claims its own "
+                "item, atomically, once it has read the plan")
+        else:
+            say(f"claim:    {kind} {number} (no session, machine-held, as "
+                f"create-worktree's is)")
         say(f"via:      {args.via} — {TRIGGERS[args.via]}")
         say(f"session:  {session}")
         argv = agent_argv(command, number, policy, args.model, session)
         say(f"command:  {' '.join(shlex.quote(a) for a in argv)}")
         out(started=False, dry_run=True, enabled=True, policy=policy.where,
             command=command, number=number, via=args.via,
-            claim={"kind": kind, "value": number},
+            claim=None if kind is None else {"kind": kind, "value": number},
             repo_path=repo_path, running=len(running), max_sessions=policy.max_sessions)
         return STARTED
 
     # ---- 8. the claim, through the ordinary path, before the process exists.
+    #
+    # ONLY when the command names the work. `/get-involved` cannot take one here
+    # because which item it will take is not known until it has read the plan, and
+    # a claim on the wrong thing is worse than none (#541).
+    #
+    # The interlock is not lost, it moves inside the session: `plan_claim` is
+    # atomic and is what makes three seats take three different items —
+    # `get-involved.md` §2 already states the rule it enforces, "claims ONE item
+    # BEFORE you start". A spawned `/get-involved` is the same session a human
+    # runs, with nobody in the chair.
+    #
+    # And nothing goes uncounted, which is the property the claim was carrying two
+    # jobs for. The SESSION count — `policy.max_sessions` over `live_spawns()`,
+    # and `qb-admit`'s per-repo window — both applied above and neither needed a
+    # claim to do it. What the claim adds is the WORK interlock, and that is the
+    # only half being moved.
     session = str(uuid.uuid4())
-    claim = run_gate(
-        "qb-claim", kind, number, "--repo-path", repo_path, "--session", "",
-        "--note", f"spawned {command} {number} by qb-start via {args.via} "
-                  f"(session {session[:8]})",
-        "--quiet", timeout=60)
-    if claim.returncode == 1:
+    if kind is not None:
+        claim = run_gate(
+            "qb-claim", kind, number, "--repo-path", repo_path, "--session", "",
+            "--note", f"spawned {command} {number} by qb-start via {args.via} "
+                      f"(session {session[:8]})",
+            "--quiet", timeout=60)
+    else:
+        claim = None
+    if claim is not None and claim.returncode == 1:
         return refuse(HELD, f"{kind} {number} is already claimed",
                       "two agents on one unit of work is what the claim prevents — "
                       "run `qb-claimed` to see who has it")
-    if claim.returncode != 0:
+    if claim is not None and claim.returncode != 0:
         # An outage is NOT proceeded through here, and that is the one place this
         # differs from `create-worktree`, deliberately. A checkout that cannot
         # reach the board is a human who has already decided to work; a spawn that
@@ -662,9 +812,12 @@ def main() -> int:
                       "worse than one nobody started")
 
     refs = board_refs(repo_path, command, number)
-    board_post("status", f"spawning {command} {number} (via {args.via})",
+    what = command if number is None else f"{command} {number}"
+    board_post("status", f"spawning {what} (via {args.via})",
                provenance(f"qb-start on this machine: session {session}, cwd "
-                          f"{repo_path}, claim {kind}/{number}. Attachable in "
+                          f"{repo_path}, claim "
+                          f"{'none — it claims its own item' if kind is None else f'{kind}/{number}'}"
+                          f". Attachable in "
                           f"tmux; end it with `qb-end {session}`."), refs)
 
     # ---- 9. the pane.
@@ -680,26 +833,35 @@ def main() -> int:
         # failures: the slot is held AND the only record says it is free, so
         # nobody goes looking. The TTL is still underneath it, and eight hours is
         # exactly the wait this line exists to save somebody.
-        gave_back = run_gate("qb-release", kind, number, "--repo-path", repo_path,
-                             "--session", "", "--quiet", timeout=30)
-        handed = gave_back.returncode == 0
-        note = (f"the claim on {kind} {number} was handed back" if handed else
-                f"the claim on {kind} {number} could NOT be handed back "
-                f"(qb-release exited {gave_back.returncode}) — it holds a slot "
-                f"until its TTL runs out, or until `qb-release {kind} {number}`")
+        # Nothing to hand back when nothing was taken (#541): the claimless path
+        # simply does not reach here with a claim, and reporting "handed back"
+        # over a claim that never existed would be the same lie as reporting it
+        # over a release that failed.
+        if kind is None:
+            handed = None
+            note = "no claim was taken — this command claims its own item, and it never got that far"
+        else:
+            gave_back = run_gate("qb-release", kind, number, "--repo-path", repo_path,
+                                 "--session", "", "--quiet", timeout=30)
+            handed = gave_back.returncode == 0
+            note = (f"the claim on {kind} {number} was handed back" if handed else
+                    f"the claim on {kind} {number} could NOT be handed back "
+                    f"(qb-release exited {gave_back.returncode}) — it holds a slot "
+                    f"until its TTL runs out, or until `qb-release {kind} {number}`")
         say(f"could not start: {why}")
         say(f"  {note}")
         out(started=False, enabled=True, reason=why, session=session,
             claim_released=handed)
-        board_post("note", f"spawn failed: {command} {number} — {why}",
+        board_post("note", f"spawn failed: {what} — {why}",
                    provenance(note), refs)
         return COULD_NOT_START
 
-    say(f"started: {command} {number} in {os.path.basename(repo_path)}")
+    say(f"started: {what} in {os.path.basename(repo_path)}")
     say(f"  session {session} — attach in tmux, or end it with `qb-end {session}`")
     out(started=True, enabled=True, policy=policy.where, command=command,
         number=number, session=session, repo_path=repo_path, pane=why,
-        via=args.via, claim={"kind": kind, "value": number})
+        via=args.via,
+        claim=None if kind is None else {"kind": kind, "value": number})
     return STARTED
 
 
@@ -716,13 +878,43 @@ def board_refs(repo_path: str, command: str, number: str | None) -> list[dict]:
     if repo:
         refs.append({"kind": "repo", "value": repo})
     if number and re.fullmatch(r"[0-9]+", str(number)) and command in SPAWNABLE:
-        refs.append({"kind": SPAWNABLE[command], "value": str(number),
+        refs.append({"kind": SPAWNABLE[command].kind, "value": str(number),
                      **({"repo": repo} if repo else {})})
     return refs
 
 
-def agent_argv(command: str, number: str, policy: Policy, model: str | None,
-               session: str) -> list[str]:
+def plan_has_free_item(repo_path: str) -> tuple[bool | None, str]:
+    """Is there anything on this repo's plan to pick up? `(True|False|None, why)`.
+
+    `None` is "could not tell" and is NOT a refusal — see the call site for why
+    this one gate fails open. The board already computes the answer: `next` is the
+    first item that is open, unclaimed, unblocked and not inside a plan somebody
+    else is holding, so this is one read of a field that exists rather than a
+    judgement made here.
+
+    Scoped to the repo the spawn runs in, unlike `qbdata.fetch_plan`, which is
+    deliberately fleet-wide because its callers are dashboards. The question here
+    is about the checkout being spawned into, and a fleet-wide answer would say
+    yes on the strength of an item in another repo.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qbdata import board_client, repo_slug
+        slug = repo_slug(repo_path)
+        if not slug:
+            return None, "this checkout has no repo slug"
+        client, _cfg = board_client()
+        # limit=1: the envelope carries `next` whatever the page holds, and the
+        # items are not read here. Asking for the whole plan to look at one field
+        # is a page nobody reads, on the hot path of every spawn.
+        data = client.get("/plan", {"repo": slug, "limit": 1}) or {}
+    except Exception as exc:                                      # noqa: BLE001
+        return None, f"{type(exc).__name__}: {exc}"
+    return bool(data.get("next")), ""
+
+
+def agent_argv(command: str, number: str | None, policy: Policy,
+               model: str | None, session: str) -> list[str]:
     """What the pane runs.
 
     The brief goes after `--`, the way `qb-seat` passes one and for its reason: it
@@ -747,10 +939,15 @@ def agent_argv(command: str, number: str, policy: Policy, model: str | None,
         argv.append("--dangerously-skip-permissions")
     if model:
         argv += ["--model", model]
-    return [*argv, "--", f"{command} {number}"]
+    # The command alone when it takes no number (#541). Not `f"{command} "`
+    # with a trailing space and not `{number or ""}`: the brief is read by a
+    # slash-command parser, and "/get-involved " is a different string from
+    # "/get-involved" to anything that matches on equality.
+    brief = command if number is None else f"{command} {number}"
+    return [*argv, "--", brief]
 
 
-def spawn(command: str, number: str, policy: Policy, model: str | None,
+def spawn(command: str, number: str | None, policy: Policy, model: str | None,
           session: str, repo_path: str, via: str = DEFAULT_VIA) -> tuple[bool, str]:
     """A detached tmux window, stamped so everything else can find it.
 
