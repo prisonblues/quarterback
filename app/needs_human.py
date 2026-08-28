@@ -77,6 +77,13 @@ from __future__ import annotations
 #: watches the quieter half. #328 proposed ``authorisation`` and was refused under
 #: the old wording for want of evidence; the refusal was right, and it was right
 #: because nothing had turned up anywhere — not because nothing had turned up here.
+#:
+#: **The bar did not move with it, and this sentence is here because widening an
+#: admission rule in the same change that admits a member is how a bar quietly
+#: stops being one.** Evidence is still COUNTED rows, named: which escalations, over
+#: what period, and why each of the existing classes was wrong for them rather than
+#: merely worse. An author who can only say that a current class "does not fit" has
+#: an opinion, which is what ``other`` and its reason line are for.
 NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "chore",
                        "other")
 
@@ -89,7 +96,7 @@ NEEDS_HUMAN_CLASS_HELP = {
     "ui": "does it actually look and behave right on a real screen",
     "environment": "does it work on the box it has to work on",
     "auth": "does the credential path actually work, end to end",
-    "chore": "nobody has to judge this — the remedy is known and stated in the reason",
+    "chore": "no judgement is owed — a person may still be needed, but not to decide",
     "other": "a human judgement none of the named classes above — say which in the reason",
 }
 

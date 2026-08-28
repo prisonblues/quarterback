@@ -1745,6 +1745,55 @@ def test_the_rows_are_not_all_one_class_any_more():
     assert by_name["harness"] == "environment"
 
 
+def test_no_chore_row_hands_an_announced_failure_to_a_human():
+    """The boundary `chore` actually asserts, defended structurally.
+
+    `AUDIENCES` in qb-doctor already draws this line and says so: an `agent` brief
+    is "a piece of work with constraints and a finish line", a `human` brief is
+    "an escalation — a judgement, a password, a deploy, something nothing here may
+    decide", and "#279's `needs_human` draws the same line one layer up". So a row
+    that classes itself `chore` — nobody has to judge this — while handing its
+    announced failure to a HUMAN is contradicting itself, and one of the two is
+    wrong.
+
+    Only the verdicts in `ANNOUNCED` are checked, because those are the only ones
+    that reach a person: a `warn` brief is read by whoever ran the tool.
+
+    Deliberately NOT the stronger rule a reviewer proposed — that a `chore` brief
+    must contain an executable remedy. `chore` asserts that no JUDGEMENT is owed,
+    not that the remedy is already determined; a row can need an agent to work out
+    which of three mechanical causes applies and still owe nobody a decision. The
+    stronger rule would put `landed` back on the human surface, which is the defect
+    #578 was filed about.
+    """
+    for spec in qd.CHECKS:
+        for verdict in qd.ANNOUNCED:
+            brief = spec.briefs.get(verdict)
+            if brief is None:
+                continue
+            if brief.audience == "human":
+                assert spec.needs_human != "chore", (
+                    f"{spec.name} is classed `chore` but hands its {verdict} to a "
+                    "human — a chore is work, not a question")
+
+
+def test_every_row_that_asks_a_human_names_the_judgement_it_wants():
+    """The same invariant from the other side, which is the half that rots.
+
+    A row can drift to `chore` later without anyone noticing it still escalates to
+    a person; this is what notices. Every announced failure addressed to a human
+    must carry one of the classes that names a judgement — never `chore`, and
+    never the `other` hatch, which #279 keeps for a judgement none of the named
+    ones covers and which nothing in this tool has ever needed.
+    """
+    judgements = tuple(c for c in _REAL_DOOR.NEEDS_HUMAN_CLASSES if c != "chore")
+    for spec in qd.CHECKS:
+        for verdict in qd.ANNOUNCED:
+            brief = spec.briefs.get(verdict)
+            if brief is not None and brief.audience == "human":
+                assert spec.needs_human in judgements, spec.name
+
+
 def test_a_check_built_outside_the_registry_still_asks_for_a_person():
     """The `Check` default is the fail-safe direction and must never be `chore`.
 
