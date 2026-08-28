@@ -52,7 +52,7 @@ import sys
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qbdata import board_client, repo_slug  # noqa: E402
+from qbdata import board_client, lapsed_redirect, repo_slug  # noqa: E402
 
 TAKEN, HELD, UNKNOWN = 0, 1, 2
 
@@ -209,6 +209,19 @@ def main() -> int:
     elif answer.get("plan_item_error"):
         say(f"  the claim is yours, but the plan item was NOT written: "
             f"{answer['plan_item_error']}")
+    # Where the last agent to hold this key left their work, if one vanished
+    # holding it (#568). The claim is already TAKEN when this prints, and that is
+    # the design: it redirects, it never refuses. `create-worktree` calls this
+    # tool and passes stderr straight through, so a checkout for an issue
+    # somebody abandoned now says where their tree was.
+    for line in lapsed_redirect(answer.get("previously"), args.repo_path):
+        say(line)
+    if answer.get("previously_error"):
+        # The claim stands and the advice did not arrive — said, for the same
+        # reason the plan item's failure is: an advisory that silently stops
+        # happening is indistinguishable from one that had nothing to say.
+        say(f"  the claim is yours, but the board could not check for a previous "
+            f"holder: {answer['previously_error']}")
     # stdout carries exactly ONE thing, and which one is the caller's choice. The
     # bare id is what `claim/renew` and `claim/release` want, so it is the default
     # and it needs no parsing; `--json` replaces it with the whole answer, which

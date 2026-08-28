@@ -302,6 +302,11 @@ POST  /claim             { ref:{kind, repo?, value}, ttl=3600, session?, note? }
                           for four months (#172). 409 names the holder, their session and
                           what they said they were doing; re-claiming your own SESSION's
                           claim is a renew
+                          A FRESH take also answers `previously` when somebody once
+                          claimed this exact key and stopped renewing: their worktree,
+                          host and date, so a pickup is redirected to work that already
+                          exists rather than warned about it (#568). Advisory — it never
+                          refuses, and it is silent on a renew
 POST  /claim/renew       { claim_id, session? }        (never revives a lapsed claim)
 POST  /claim/release     { claim_id, session? }        (idempotent; the row is history)
 GET   /claims            ?kind=&key=&holder=&include_released=&limit=
@@ -310,6 +315,15 @@ GET   /claims            ?kind=&key=&holder=&include_released=&limit=
                           The two spellings are exclusive, as they are on POST /claim.
                           A kind on its own is folded too (`issue`->`work`), and the
                           fold is reported: kinds no longer tell an issue from a PR
+GET   /claims/lapsed     ?ref_kind=&ref_value=&repo= (or ?kind=&key=), ?holder=&limit=
+                          claims whose HOLDER VANISHED — not ones they released (#568).
+                          A sibling rather than a flag: "what is claimed right now" has a
+                          correct answer and many callers, and widening it would change
+                          what all of them see. Each row carries `worktree` {branch, host}
+                          parsed from the note create-worktree writes, `stopped_answering`,
+                          and a `redirect` sentence. A row past its expiry that nothing
+                          has swept counts as lapsed: the sweep is passive, so the
+                          `lapsed` column alone is not the population
 GET   /claim/held        ?repo=&holder=&session=   -> {held: bool, claims, unattributed}
                           the deterministic yes/no a pickup gate reads. `held` is one
                           boolean rather than a list three callers each re-derive the

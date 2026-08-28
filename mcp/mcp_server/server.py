@@ -189,6 +189,13 @@ mcp = FastMCP(
         "post that can prevent duplicated work; a `done` afterwards can only "
         "record it. The claim expires by itself, so a session that dies frees its "
         "item with nobody intervening. plan_done(item_id) when the issue closes.\n"
+        "**Read `previously` if the claim comes back with one.** Somebody took "
+        "this exact key before and stopped renewing, and the board still has the "
+        "worktree and host their claim recorded: go and look at that branch "
+        "before you write the work again. It is advice, not a refusal — "
+        "'abandoned for a reason, carry on' is a legitimate answer. "
+        "`lapsed_claims` asks the same question about a key you have not "
+        "claimed.\n"
         "A human orders the plan; you add items — with plan_add(after=/before=) "
         "when you are writing down a position you were GIVEN, since placing a new "
         "item reorders nothing — claim them, record what they wait on "
@@ -677,27 +684,12 @@ def release_claim(ctx: Context, claim_id: str, session: str | None = None) -> di
         _raise(e, "release_claim")
 
 
-@mcp.tool()
-def claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
-           repo_path: str = ".", kind: str | None = None, key: str | None = None,
-           holder: str | None = None) -> dict:
-    """What is claimed right now, by whom, and why. Read before you queue behind something.
+def _resource_params(ref_kind, ref_value, kind, key, holder, repo_path: str) -> dict:
+    """The query one claim lookup sends, however the caller named the resource.
 
-    To ask about ONE resource, describe it — `ref_kind='issue'`, `ref_value='163'`
-    — and the key comes off your checkout, the same way `claim` derives the one it
-    writes. Composing the key here instead is how a lookup misses a claim that is
-    right there: `kind='issue'` and `kind='work'` were two namespaces for one
-    issue, and a caller that guessed the wrong half was told nobody held it.
-
-    Args:
-        ref_kind: "issue", "pr", "branch", "plan" or "item" — the preferred way.
-        ref_value: the number, branch name or board id.
-        repo_path: the checkout whose origin remote names the repo.
-        kind: a composed kind, if you already have one. Canonicalised with `key`.
-            Not together with `ref_kind` — the answer could only be about one of
-            them, and the refusal is the same one `claim` makes.
-        key: the composed key.
-        holder: only this agent's claims.
+    One function for `claims` and `lapsed_claims`: two tools asking about one
+    row must not differ in how they name it, or "nobody holds that" and "nothing
+    was abandoned there" become answers about two different keys (#172).
     """
     params: dict = {"holder": holder}
     if ref_kind and (kind or key):
@@ -722,10 +714,85 @@ def claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = No
             params["repo"] = _derive_repo(repo_path)
     else:
         params["kind"], params["key"] = kind, key
+    return params
+
+
+@mcp.tool()
+def claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
+           repo_path: str = ".", kind: str | None = None, key: str | None = None,
+           holder: str | None = None) -> dict:
+    """What is claimed right now, by whom, and why. Read before you queue behind something.
+
+    To ask about ONE resource, describe it — `ref_kind='issue'`, `ref_value='163'`
+    — and the key comes off your checkout, the same way `claim` derives the one it
+    writes. Composing the key here instead is how a lookup misses a claim that is
+    right there: `kind='issue'` and `kind='work'` were two namespaces for one
+    issue, and a caller that guessed the wrong half was told nobody held it.
+
+    Args:
+        ref_kind: "issue", "pr", "branch", "plan" or "item" — the preferred way.
+        ref_value: the number, branch name or board id.
+        repo_path: the checkout whose origin remote names the repo.
+        kind: a composed kind, if you already have one. Canonicalised with `key`.
+            Not together with `ref_kind` — the answer could only be about one of
+            them, and the refusal is the same one `claim` makes.
+        key: the composed key.
+        holder: only this agent's claims.
+
+    This is the LIVE answer, and that is all it is. A key nobody holds may still
+    have been picked up and abandoned — ask `lapsed_claims` about that, which is a
+    different question with a different predicate.
+    """
+    params = _resource_params(ref_kind, ref_value, kind, key, holder, repo_path)
     try:
         return _get_client(ctx).claims(params)
     except httpx.HTTPStatusError as e:
         _raise(e, "claims")
+
+
+@mcp.tool()
+def lapsed_claims(ctx: Context, ref_kind: str | None = None, ref_value: str | None = None,
+                  repo_path: str = ".", kind: str | None = None, key: str | None = None,
+                  holder: str | None = None, limit: int = 50) -> dict:
+    """Who picked this up and vanished — and where they left the work (#568).
+
+    The question `claims` cannot answer. A claim on an issue records the worktree
+    and the host it was made for (`create-worktree` writes `worktree <branch> on
+    <host>` on every claim it takes), and that pointer survives the claim
+    decaying — the row is retired, not deleted. So when work was started and
+    abandoned, the board already knows where it is.
+
+    **Lapsed is not released, and only lapsed is worth reading.** Released means
+    the holder said they were done: the work landed and pointing you at it is
+    noise. Lapsed means they stopped renewing — died, machine went, session
+    killed — and their tree is still on a disk with nobody having said what state
+    it is in. Rows past their expiry that nothing has swept yet count as lapsed
+    here, because the sweep only runs when somebody asks for that exact key.
+
+    You do not normally need to call this at pickup: `claim` and `plan_claim`
+    already return `previously` on a fresh take of a key that has one. Call it
+    when you are deciding whether to start something you have not claimed, or to
+    see what a repo has abandoned.
+
+    **It is advice.** "Yes, and it was abandoned for a reason, carry on" is a
+    legitimate response to anything it returns. Nothing here refuses a pickup.
+    `worktree` is what was RECORDED — the board cannot see that disk, and the
+    tree may have been pruned since.
+
+    Args:
+        ref_kind: "issue", "pr", "branch", "plan" or "item" — the preferred way.
+        ref_value: the number, branch name or board id.
+        repo_path: the checkout whose origin remote names the repo.
+        kind / key: the composed pair, if you already have one. Never with `ref_kind`.
+        holder: only this agent's abandoned claims.
+        limit: how many rows, newest expiry first.
+    """
+    params = _resource_params(ref_kind, ref_value, kind, key, holder, repo_path)
+    params["limit"] = limit
+    try:
+        return _get_client(ctx).lapsed_claims(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "lapsed_claims")
 
 
 @mcp.tool()

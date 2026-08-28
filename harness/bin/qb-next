@@ -67,7 +67,7 @@ import sys
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from qbdata import board_client, repo_slug  # noqa: E402
+from qbdata import board_client, lapsed_redirect, repo_slug  # noqa: E402
 
 TOOK, NOTHING, UNKNOWN = 0, 1, 2
 
@@ -238,6 +238,13 @@ def _take(client, args) -> int:
                 if not _retire(client, item, args, state):
                     return UNKNOWN
                 continue
+        # Somebody took this exact key before and stopped answering (#568). Said
+        # on stderr as the item is handed over, and carried in the JSON too — the
+        # agent that reads `dispatch` is about to run /fix-issue on work that may
+        # already be sitting in a worktree, and a redirect is only worth anything
+        # before it starts.
+        for line in lapsed_redirect((taken or {}).get("previously")):
+            print(line, file=sys.stderr)
         _emit(args, _answer(item, taken, trust, nxt, passed, closed, scope))
         return TOOK
 
@@ -532,6 +539,9 @@ def _answer(item: dict, taken: dict | None, trust: dict, nxt: dict | None,
         "depends_on": item.get("depends_on") or [],
         "claim_id": (taken or {}).get("claim_id"),
         "claimed": bool(taken),
+        # Null nearly always. When it is not, a previous holder of this exact key
+        # vanished and the board knows where their worktree was (#568).
+        "previously": (taken or {}).get("previously"),
         "dry_run": dry,
         "was_next": bool(nxt) and nxt.get("item_id") == item.get("item_id"),
         "dispatch": _dispatch(item),

@@ -68,6 +68,14 @@ Then take it anyway. Refusing to work an unchosen order would make the plan unus
 is still the best answer available — what it must not have is unqualified confidence. #183 exists
 for this exact substitution.
 
+**And say so if somebody was here before you.** The JSON carries `previously` when this exact
+issue was claimed once by an agent that then stopped renewing — and `qb-next` has already printed
+it on stderr, with the branch and host their claim recorded and whether any of it is still on this
+box. That is not a duplicate warning, it is a place to look: read those commits before you write
+the work again. Then decide out loud. Carrying on is a legitimate decision — work is abandoned for
+reasons, and nothing here refuses you the item — but doing it without having looked is how #179
+came to be written twice.
+
 Read `note` and `placed_for` in the JSON as well. `note` is the sentence a human would otherwise
 have to repeat to every agent that asks, and it regularly says something the issue does not — "talk
 to zeus/lantern-fennel first", "check whether this is already closed", "the obvious implementation

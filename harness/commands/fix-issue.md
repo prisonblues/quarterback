@@ -134,6 +134,14 @@ docs. The branch is `{prefix}issue-$ISSUE_NUMBER`.
         '/^worktree /{p=substr($0,10)} $0=="branch "b{print p; exit}')
   ```
 
+**If the claim reports a previous holder, look before you implement.** `create-worktree` takes
+the issue's claim, and the board answers a fresh take with `previously` when somebody claimed this
+same issue and then stopped renewing — printed on stderr as `previously: …`, with the worktree and
+host their claim recorded and whether that tree or branch is still on this box. Go and read those
+commits: the work you are about to write may already exist, half-finished, on a branch nobody
+pushed. It is advice and not a refusal — "abandoned for a reason, carry on" is a legitimate
+conclusion — but reach it after reading them, and say in the PR body which it was.
+
 **Record the worktree for this session (drives the statusline).** The shell cwd
 resets to the launch dir between tool calls, so a plain `cd` will NOT stick and
 the statusline can't otherwise tell it's in the worktree. Write a per-session

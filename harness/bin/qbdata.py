@@ -48,6 +48,117 @@ def repo_slug(path: str = ".") -> str | None:
     return "/".join(parts[-2:]) if len(parts) >= 2 else None
 
 
+def _git(path: str, *args: str) -> str | None:
+    """One git question, answered or not. Never raises, never blocks long."""
+    try:
+        got = subprocess.run(["git", "-C", path, *args],                # noqa: S603
+                             capture_output=True, text=True, timeout=10)
+    except Exception:                             # noqa: BLE001
+        return None
+    return got.stdout.strip() if got.returncode == 0 else None
+
+
+def this_host() -> str:
+    """The short hostname, spelled the way `create-worktree` spells it in a note."""
+    return socket.gethostname().split(".")[0]
+
+
+def lapsed_redirect(previously: dict | None, repo_path: str = ".") -> list[str]:
+    """Where the last agent to take this key left the work — lines for a pickup.
+
+    `previously` is what `POST /claim` and `POST /plan/item/claim` return on a
+    fresh take of a key that somebody once claimed and then stopped renewing
+    (#568). The board composes the sentence, because every client should say the
+    same thing about the same row; this adds the half the board cannot know,
+    which is whether any of it is still on THIS disk.
+
+    **A redirect, not a warning.** "Possible duplicate" gives a picker-up a
+    feeling; a branch, a host and a date give them somewhere to look. Nothing
+    here refuses anything, and "it was abandoned for a reason, carry on" stays a
+    legitimate answer — the claim is already taken by the time this prints.
+
+    The could-not-check case is kept apart from the nothing-to-report case, as
+    `qb-doctor` keeps them apart around its edge probe: a tree recorded on
+    another machine is not a tree that is gone, and saying so would send somebody
+    to re-do work that is sitting on hermes.
+    """
+    if not previously:
+        return []
+    lines = [f"  previously: {previously.get('redirect', '')}"]
+    worktree = previously.get("worktree")
+    if worktree:
+        lines += _recorded_tree_lines(worktree, repo_path)
+    else:
+        lines += _unpushed_lines(previously.get("key"), repo_path)
+    more = previously.get("also_lapsed") or 0
+    if more:
+        lines.append(f"  ({more} older lapsed claim(s) on this key too — "
+                     f"`lapsed_claims` lists them)")
+    return lines
+
+
+def _recorded_tree_lines(worktree: dict, repo_path: str) -> list[str]:
+    """Is the recorded tree still here? Only answerable on the box it was made on."""
+    branch, host = worktree.get("branch", "?"), worktree.get("host", "?")
+    if host != this_host():
+        return [f"  recorded on {host}, and this is {this_host()} — whether that tree "
+                f"still exists cannot be checked from here. Ask {host}, or fetch "
+                f"`{branch}` if it was ever pushed."]
+    listed = _git(repo_path, "worktree", "list", "--porcelain") or ""
+    path = _worktree_path(listed, branch)
+    if path:
+        return [f"  that worktree is still on this box: {path}"]
+    if _git(repo_path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}") is not None:
+        unpushed = _git(repo_path, "rev-list", "--count", branch, "--not", "--remotes")
+        if unpushed == "0":
+            # Worth its own sentence: nothing on that branch is stranded, so the
+            # redirect is about what was done, not about work only this disk has.
+            return [f"  the worktree is gone (pruned or dropped); the branch `{branch}` "
+                    f"is here and everything on it is pushed"]
+        return [f"  the worktree is gone (pruned or dropped), but the branch `{branch}` "
+                f"is here with {unpushed or '?'} commit(s) on no remote"]
+    return [f"  neither that worktree nor `{branch}` is on this box now — it was "
+            f"pruned and the branch deleted, which usually means it landed"]
+
+
+def _worktree_path(listed: str, branch: str) -> str | None:
+    """The path `git worktree list --porcelain` gives for a branch, if any."""
+    path = None
+    for line in listed.splitlines():
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return None
+
+
+def _unpushed_lines(key: str | None, repo_path: str) -> list[str]:
+    """The fallback: local commits citing the issue that are on no remote.
+
+    Only reached when the lapsed claim recorded no worktree — a claim taken by
+    hand, or by a path that is not `create-worktree`. It is the fuzzy half and it
+    stays the fallback: it fires only where an exact claim already said somebody
+    was here, so it cannot become the check that warns on every issue.
+    """
+    m = re.search(r"#(\d+)$", key or "")
+    if not m:
+        return []
+    issue = m.group(1)
+    found = _git(repo_path, "log", "--all", "--not", "--remotes", f"--grep=#{issue}",
+                 "--format=%h %ad %s", "--date=short", "-n", "3")
+    if not found:
+        return [f"  no worktree was recorded, and no unpushed commit on this box "
+                f"cites #{issue}"]
+    lines = [f"  no worktree was recorded, but these local commits cite #{issue} "
+             f"and are on no remote:"]
+    for row in found.splitlines():
+        sha = row.split(" ", 1)[0]
+        on = _git(repo_path, "branch", "--contains", sha, "--format=%(refname:short)")
+        where = ", ".join((on or "").splitlines()[:3]) or "no branch"
+        lines.append(f"    {row}  [{where}]")
+    return lines
+
+
 _repos: list[str] | None = None
 
 
