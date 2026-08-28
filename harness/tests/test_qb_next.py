@@ -68,7 +68,8 @@ class Board:
     def __init__(self, items: list[dict], trusted: bool = True,
                  pair: bool = False, page: int | None = None,
                  envelope_override: dict | None = None,
-                 refuse: dict | None = None) -> None:
+                 refuse: dict | None = None,
+                 previously: dict | None = None) -> None:
         self.lock = threading.Lock()
         self.items = [self._row(spec, rank) for rank, spec in enumerate(items, 1)]
         self.trusted = trusted
@@ -86,6 +87,9 @@ class Board:
         #: "release": …}. The real endpoint refuses in more ways than one peer
         #: holding the row, and every one of them used to look the same here.
         self.refuse = refuse or {}
+        #: The board's answer about a previous holder who vanished (#568), or
+        #: None for the ordinary pickup where nobody was here before.
+        self.previously = previously
         self.posts: list[tuple[str, dict]] = []
 
     @staticmethod
@@ -178,8 +182,15 @@ class Board:
                 "expires": (datetime.now(timezone.utc)
                             + timedelta(hours=1)).isoformat(),
             }
-            return 200, {**item, "claimed": True, "renewed": False,
-                         "claim_id": str(uuid.uuid4())}
+            out = {**item, "claimed": True, "renewed": False,
+                   "claim_id": str(uuid.uuid4())}
+            # What the real endpoint adds when this key was taken once by an
+            # agent that then stopped renewing (#568). Set per-Board, because
+            # nearly every pickup has nothing to say and the silence is the
+            # property worth keeping.
+            if self.previously is not None:
+                out["previously"] = self.previously
+            return 200, out
 
     def done(self, body: dict) -> tuple[int, dict]:
         if "done" in self.refuse:
@@ -884,3 +895,46 @@ def test_tries_below_one_is_refused_where_it_was_typed(three, gh):
     got = run(url, "--scope", SCOPE, "--tries", "0", gh_path=gh)
     assert got.returncode == 2
     assert "at least 1" in got.stderr
+
+
+# ------------------------------------- a previous holder who vanished (#568)
+
+
+def test_an_item_whose_key_was_abandoned_hands_the_redirect_to_the_agent(gh):
+    """The `/get-involved` half of #568.
+
+    The board answers a fresh item claim with `previously` when this exact key
+    was taken once by an agent that then stopped renewing. It has to reach the
+    agent BEFORE it runs the `/fix-issue` in `dispatch`, because a redirect after
+    the work is written is a report rather than a redirect — so it goes on stderr
+    as the item is handed over, and into the JSON for the agent that reads that.
+    """
+    board = Board([{}], previously={
+        "redirect": "acme/widget#196 was claimed on 2026-08-18 by zeus/lantern-cedar, "
+                    "and that claim lapsed",
+        "worktree": {"branch": "feat/qb-dash-buttons", "host": "zeus"}})
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, "--json", gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 0, got.stderr
+    assert "previously:" in got.stderr and "lantern-cedar" in got.stderr
+    answer = json.loads(got.stdout)
+    assert answer["claimed"] is True, "it redirects; it does not refuse the item"
+    assert answer["previously"]["worktree"]["branch"] == "feat/qb-dash-buttons"
+
+
+def test_an_ordinary_pickup_says_nothing_about_a_previous_holder(gh):
+    """Nearly every pickup. An advisory printed on all of them is one nobody
+    reads by the second week, and `previously` is null rather than absent so a
+    caller reading the JSON does not have to tell the two apart."""
+    board = Board([{}])
+    httpd, url = serve(board)
+    try:
+        got = run(url, "--scope", SCOPE, "--json", gh_path=gh)
+    finally:
+        httpd.shutdown()
+    assert got.returncode == 0
+    assert "previously" not in got.stderr
+    assert json.loads(got.stdout)["previously"] is None

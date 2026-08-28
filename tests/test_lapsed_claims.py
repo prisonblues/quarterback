@@ -41,9 +41,29 @@ from .conftest import DESKTOP, LAPTOP
 
 
 @pytest.fixture
-def repo() -> str:
-    """A repo nothing else in this suite has claimed in — the schema is per session."""
-    return f"acme/lapsed-{uuid.uuid4().hex[:10]}"
+async def repo():
+    """A repo nothing else has claimed in, whose plan rows are cleaned up after.
+
+    The cleanup is not tidiness. A claim on an issue also writes a plan item
+    (#427), `GET /plan` answers with a **page** of the fleet's list, and
+    `qbdata.PLAN_LIMIT` asks for 200 — so a suite that leaves forty rows behind
+    pushes somebody else's row off the end of that page. It did exactly that on
+    the first CI run of this branch: `test_plans.py`'s co-tenant dashboard test
+    looked for its own item, did not find it, and `next()` raised StopIteration
+    inside an async test, which surfaces as `coroutine raised StopIteration`. The
+    schema is built once per session and these tests take about forty claims, so
+    the rows they write outlive them unless this removes them.
+    """
+    from sqlalchemy import delete
+
+    from app.db import async_session
+    from app.models.plan_item import PlanItem
+
+    name = f"acme/lapsed-{uuid.uuid4().hex[:10]}"
+    yield name
+    async with async_session() as s:
+        await s.execute(delete(PlanItem).where(PlanItem.repo == name))
+        await s.commit()
 
 
 async def take(client, repo: str, number: int, headers=LAPTOP, **over) -> dict:

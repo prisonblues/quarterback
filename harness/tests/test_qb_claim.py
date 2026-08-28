@@ -95,6 +95,13 @@ def board_client():
     if BOARD is None:
         raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset)")
     return _Client(), None
+
+
+def lapsed_redirect(previously, repo_path="."):
+    # The real one reads this box's disk; here it only has to prove the wiring —
+    # that qb-claim passes the board's `previously` to it and prints what comes
+    # back. What it says about a worktree is `tests/test_lapsed_claims.py`'s.
+    return ["  previously: " + previously['redirect']] if previously else []
 """)
     env = {**os.environ}
     env.pop("CLAUDE_CODE_SESSION_ID", None)
@@ -173,6 +180,45 @@ def test_taking_a_claim_prints_the_id_on_stdout(tmp_path):
     assert got.returncode == 0, got.stderr
     assert got.stdout.strip() == "abc-123"
     assert "claimed: work/acme/widget#172" in got.stderr
+
+
+def test_a_previous_holder_who_vanished_is_printed_beside_the_claim(tmp_path):
+    """#568. `create-worktree` runs this tool and passes its stderr straight to
+    the terminal, so this line is how a checkout for an abandoned issue says
+    where the last agent's worktree was. The claim is still TAKEN — exit 0 — and
+    that is the design: it redirects, it never refuses."""
+    got = run(CLAIM, "issue", "196", board="http://b", tmp_path=tmp_path,
+              answer={"claim_id": "abc-123", "kind": "work",
+                      "key": "acme/widget#196", "expires": "t", "renewed": False,
+                      "previously": {"redirect": "acme/widget#196 was claimed on "
+                                     "2026-08-18 by zeus/lantern-cedar, and that "
+                                     "claim lapsed"}})
+    assert got.returncode == 0, got.stderr
+    assert got.stdout.strip() == "abc-123", "the id still goes to stdout, alone"
+    assert "previously:" in got.stderr and "lantern-cedar" in got.stderr
+
+
+def test_a_claim_on_a_key_nobody_abandoned_says_nothing_about_it(tmp_path):
+    """The common case. An advisory that printed a line on every pickup is one
+    nobody reads by the second week."""
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer={"claim_id": "abc", "kind": "work", "key": "k",
+                      "expires": "t", "renewed": False})
+    assert got.returncode == 0
+    assert "previously" not in got.stderr
+
+
+def test_a_lapse_lookup_that_failed_is_said_rather_than_swallowed(tmp_path):
+    """The board answers `previously_error` when the claim landed and the lookup
+    did not. Silence there is indistinguishable from "nobody was here before"."""
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer={"claim_id": "abc", "kind": "work", "key": "k",
+                      "expires": "t", "renewed": False,
+                      "previously": None,
+                      "previously_error": "the claims table is on fire"})
+    assert got.returncode == 0, "the claim is yours whatever the advice did"
+    assert "could not check for a previous holder" in got.stderr
+    assert "on fire" in got.stderr
 
 
 def test_a_renew_says_renewed_rather_than_claimed(tmp_path):
