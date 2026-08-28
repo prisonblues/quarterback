@@ -978,9 +978,10 @@ def test_a_check_that_raises_becomes_an_unknown_naming_the_exception(monkeypatch
         raise RuntimeError("the host is very odd")
 
     monkeypatch.setattr(qd, "CHECKS", (
-        qd.CheckSpec("boom", "host", boom, explanation="a check that explodes"),
+        qd.CheckSpec("boom", "host", boom, scope="host",
+                     explanation="a check that explodes"),
         qd.CheckSpec("fine", "host", lambda _h: qd.Check("fine", "-", "", "ok"),
-                     explanation="a check that does not")))
+                     scope="host", explanation="a check that does not")))
     out = qd.run_checks(host_for(repo))
     assert [c.verdict for c in out] == ["unknown", "ok"]
     assert "RuntimeError: the host is very odd" in out[0].detail
@@ -1735,6 +1736,7 @@ def test_a_rows_group_comes_from_the_registration_not_from_the_check(monkeypatch
         raise RuntimeError("boom")
 
     monkeypatch.setattr(qd, "CHECKS", (qd.CheckSpec("merges", "landing", boom,
+                                                    scope="repo",
                                                     explanation="it explodes"),))
     rows = qd.run_checks(host_for(repo))
 
@@ -3193,6 +3195,21 @@ def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, t
 # --announce: the caller #405 was missing (#274's door)
 # --------------------------------------------------------------------------- #
 
+def _real_door():
+    """`harness/loops/needs_human.py`, loaded by path — the module `announce_failures`
+    imports at run time. Only its pure helpers are used here; nothing in this suite
+    posts anything."""
+    path = HARNESS / "loops" / "needs_human.py"
+    sys.path.insert(0, str(path.parent))
+    spec = importlib.util.spec_from_file_location("_real_needs_human", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_REAL_DOOR = _real_door()
+
+
 class _FakeNeedsHuman:
     """A stand-in for `harness/loops/needs_human.py` that records what it was told.
 
@@ -3203,6 +3220,12 @@ class _FakeNeedsHuman:
     """
 
     NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "other")
+
+    # Taken off the real module rather than restated. #569's peer gate matches a post
+    # this format wrote, so a fake that spelled the headline itself could pass every
+    # test below while the shipped reader recognised nothing on the shipped board.
+    headline = staticmethod(_REAL_DOOR.headline)
+    REPEAT_AFTER = _REAL_DOOR.REPEAT_AFTER
 
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -3222,8 +3245,8 @@ def door(monkeypatch) -> _FakeNeedsHuman:
     return fake
 
 
-def _rows(*specs: tuple[str, str]) -> list[qd.Check]:
-    return [qd.Check(name, "acme/repo@main", f"{name} says so", verdict)
+def _rows(*specs: tuple[str, str], scope: str = "host") -> list[qd.Check]:
+    return [qd.Check(name, "acme/repo@main", f"{name} says so", verdict, scope=scope)
             for name, verdict in specs]
 
 
@@ -3237,7 +3260,7 @@ def test_only_a_failing_row_is_announced(door, landing_host):
 
     said = qd.announce_failures(checks, landing_host, str(BIN / "qb-doctor"))
 
-    assert [c["summary"].split(":")[0] for c in door.calls] == ["queue"]
+    assert [c["summary"].split(" (")[0] for c in door.calls] == ["queue"]
     assert len(said) == 1
 
 
@@ -3357,6 +3380,318 @@ def test_announcing_changes_neither_the_report_nor_the_exit_code(
 
 
 # --------------------------------------------------------------------------- #
+# #569 — one condition, one bell; and a post that says what raised it
+# --------------------------------------------------------------------------- #
+
+def _peer_post(row: str, *, author: str = "hermes", slug: str = "acme/thing",
+               subject: str = "acme/repo", minutes_ago: float = 6,
+               tail: str = "3 pull requests ready") -> dict:
+    """A `stuck` post another machine put on the board, composed the way one is."""
+    when = datetime.now(UTC) - timedelta(minutes=minutes_ago)
+    return {"id": 1, "from": author, "type": "stuck", "ts": when.isoformat(),
+            "summary": _REAL_DOOR.headline(cls=qd.NEEDS_HUMAN_CLASS, repo=slug,
+                                           summary=f"{row} ({subject}): {tail}"),
+            "session": None, "refs": [{"kind": "repo", "value": slug}]}
+
+
+def _fleet(monkeypatch, *, machine: str = "zeus", posts: list[dict] | None = None,
+           err: str | None = None) -> None:
+    """What this box is called on the board, and what `stuck` posts it will read back."""
+    def fake(url, headers=None):
+        path = urlsplit(url).path
+        if path == "/whoami":
+            return 200, json.dumps({"machine": machine, "agent": f"{machine}/local"}), None
+        if path == "/board":
+            return (0, "", err) if err else (200, json.dumps(posts or []), None)
+        return 200, "{}", None
+    monkeypatch.setattr(qd, "http_get", fake)
+
+
+def _landed(scope: str = "repo") -> qd.Check:
+    return qd.Check("landed", "acme/repo",
+                    "3 pull requests (#566, #564, #538) ready to land, and the tip of main "
+                    "was committed 2 hours ago", "fail",
+                    extra={"open": 9, "ready": [566, 564, 538], "tip_age_minutes": 129},
+                    scope=scope)
+
+
+def test_a_peer_that_already_told_the_board_stops_this_host_repeating_it(
+        monkeypatch, door, landing_host):
+    """#569's measurement: zeus and hermes announced *3 PRs (#566, #564, #538) ready* six
+    minutes apart, twice in one day, because each host dedupes in its own cache file. The
+    condition is a property of the repository — one queue, one `main`, one fact — so the
+    second telling is noise, and duplicate alarms are how an alarm becomes background
+    noise."""
+    _fleet(monkeypatch, machine="zeus", posts=[_peer_post("landed", author="hermes")])
+
+    said = qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    assert door.calls == [], "the same condition was announced twice by two machines"
+    assert any("hermes" in line and "NOT announced" in line for line in said), (
+        "a suppressed escalation says who did tell the board, or it is indistinguishable "
+        "from one nobody raised")
+
+
+def test_a_host_row_is_still_raised_when_another_machine_said_the_same_words(
+        monkeypatch, door, landing_host):
+    """THE trap, and the reason scope is declared rather than inferred. *"8 harness
+    scripts are not on zeus"* and *"7 harness scripts are not on hermes"* are two true
+    facts about two machines and both have to reach somebody. A dedupe wide enough to
+    swallow the second silences a real per-machine fault, which is strictly worse than
+    the duplication it removes."""
+    _fleet(monkeypatch, machine="zeus",
+           posts=[_peer_post("harness", author="hermes", subject="/nix/store/xyz/bin",
+                             tail="7 harness scripts are not on hermes")])
+    mine = qd.Check("harness", "/nix/store/xyz/bin",
+                    "8 harness scripts are not on zeus", "fail", scope="host")
+
+    qd.announce_failures([mine], landing_host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1, "a per-machine fault was silenced by another machine's"
+
+
+def test_this_machines_own_earlier_post_never_suppresses_its_next_escalation(
+        monkeypatch, door, landing_host):
+    """The board gate excludes THIS box, so a single host behaves exactly as it did.
+    That is what preserves escalation: zeus announced two ready pull requests, then
+    three, then four, because its own key carries WHICH ones are ready. Matching a host
+    against its own history would collapse that growth into one post."""
+    _fleet(monkeypatch, machine="zeus",
+           posts=[_peer_post("landed", author="zeus/jasper-moss", minutes_ago=15),
+                  _peer_post("landed", author="zeus", minutes_ago=75)])
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1, "a host was silenced by its own earlier escalation"
+
+
+def test_a_peer_post_older_than_the_window_does_not_suppress(monkeypatch, door,
+                                                             landing_host):
+    """`window_min` is a request and not a promise: `/board` floors a quiet window at the
+    ten most recent posts of the slice whatever their age, and `type=` is not one of the
+    lookups that skip the floor. Trusting the floor would suppress a live escalation on
+    the evidence of last week's — the direction of this mistake that loses news."""
+    _fleet(monkeypatch, machine="zeus",
+           posts=[_peer_post("landed", author="hermes", minutes_ago=60 * 24 * 7)])
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1
+
+
+def test_a_peer_post_about_another_row_or_another_repo_does_not_suppress(
+        monkeypatch, door, landing_host):
+    """The gate matches the repo, the class and the row name. A stalled queue does not
+    speak for an unmoving `main`, and neither speaks for another repository."""
+    _fleet(monkeypatch, machine="zeus",
+           posts=[_peer_post("queue", author="hermes"),
+                  _peer_post("landed", author="hermes", slug="acme/other")])
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1
+
+
+def test_a_peer_stalled_on_another_branch_does_not_speak_for_this_one(
+        monkeypatch, door, landing_host):
+    """Codex found the first cut matching on the row name alone. `queue` is keyed on the
+    branch being landed onto, so a line stopped on `test` would have suppressed a line
+    stopped on `main` — one row name, two findings, and the second lost. The subject is
+    in the headline for exactly that, which is also why it now reaches a reader of
+    `board_read`, who never saw it before."""
+    _fleet(monkeypatch, machine="zeus",
+           posts=[_peer_post("queue", author="hermes", subject="acme/thing@test")])
+    mine = qd.Check("queue", "acme/thing@main", "7 queued on main and NONE ready", "fail",
+                    extra={"head_pr": 401}, scope="repo")
+
+    qd.announce_failures([mine], landing_host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1
+
+
+def test_a_board_that_will_not_say_who_this_machine_is_does_not_gate_at_all(
+        monkeypatch, door, landing_host):
+    """The failure Codex named, and it is the expensive direction. Falling back to the OS
+    hostname looks harmless until a token was minted under another name: this box then
+    fails to recognise its OWN posts, reads them as a peer's, and suppresses its own
+    escalation — on a half-reachable board, which is to say at the moment nobody is
+    watching. So no answer means no gate."""
+    def fake(url, headers=None):
+        if urlsplit(url).path == "/whoami":
+            return 0, "", "URLError: refused"
+        return 200, json.dumps([_peer_post("landed", author="hermes")]), None
+
+    monkeypatch.setattr(qd, "http_get", fake)
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert "the fleet-wide dedupe could not run" in call["detail"]
+
+
+def test_a_box_on_no_board_announces_without_gating(monkeypatch, door, repo):
+    """A machine that is on no board cannot tell its own posts from anybody's, and there
+    is nothing to read them off anyway."""
+    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
+    host = host_for(repo, base_url=None, token=None)
+
+    qd.announce_failures([_landed()], host, str(BIN / "qb-doctor"))
+
+    assert len(door.calls) == 1
+
+
+def test_a_board_that_cannot_be_read_announces_and_says_the_dedupe_did_not_run(
+        monkeypatch, door, landing_host):
+    """Fail-open, on the same argument as everywhere else here: a duplicate post costs a
+    glance, and a lost escalation is the fault #569 is filed about. The post says the
+    dedupe could not run, so a reader can tell a duplicate nobody tried to prevent from
+    one that arrived anyway."""
+    _fleet(monkeypatch, machine="zeus", err="URLError: refused")
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert "the fleet-wide dedupe could not run" in call["detail"]
+
+
+def test_a_needs_human_predating_this_change_announces_rather_than_guessing(
+        monkeypatch, door, landing_host):
+    """The harness on PATH goes stale — there is a row about exactly that — so the copy
+    imported at run time can predate the headline format this reader matches against.
+    Guessing the format is how a matcher silently stops matching."""
+    _fleet(monkeypatch, machine="zeus", posts=[_peer_post("landed", author="hermes")])
+    monkeypatch.setattr(type(door), "headline", None)
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert "predates #569" in call["detail"]
+
+
+def test_a_host_rows_key_carries_the_host_and_a_shared_rows_key_does_not(
+        monkeypatch, door, landing_host):
+    """Belt as well as braces. Two machines finding the byte-identical host-local fault
+    would otherwise produce the byte-identical key, and any shared record of what has
+    been said could then collapse them. A repo row's key must NOT carry it, or the same
+    condition is a different question on every box."""
+    _fleet(monkeypatch, machine="zeus", posts=[])
+    monkeypatch.setattr(qd.socket, "gethostname", lambda: "zeus")
+    per_host = qd.Check("harness", "/nix/store/xyz/bin", "8 scripts missing", "fail",
+                        scope="host")
+
+    qd.announce_failures([per_host, _landed()], landing_host, str(BIN / "qb-doctor"))
+
+    keys = {c["summary"].split(" (")[0]: c["key"] for c in door.calls}
+    assert "zeus" in keys["harness"]
+    assert "zeus" not in keys["landed"]
+
+
+def test_the_escalation_says_what_raised_it_when_a_timer_did(monkeypatch, door,
+                                                             landing_host):
+    """Every one of #569's ten posts carried `session: null`, which reads as an agent
+    that failed to identify itself. Under a timer it means something else: a unit is not
+    an agent and has no session. So the post says the unit, the host and the systemd
+    invocation — and the invocation is what makes two escalations from one box two
+    escalations rather than one box twice."""
+    _fleet(monkeypatch, machine="zeus", posts=[])
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.setenv("QB_DOCTOR_UNIT", "qb-doctor-landing.service")
+    monkeypatch.setenv("INVOCATION_ID", "0f3cabc")
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert "qb-doctor-landing.service" in call["detail"]
+    assert "0f3cabc" in call["detail"]
+    assert call["session"] is None, (
+        "a systemd invocation id is not a session: stamped into that field it would "
+        "join against leases, /sessions and every session-scoped read, and resolve in none")
+
+
+def test_an_escalation_an_agent_raised_is_filed_under_that_agents_session(
+        monkeypatch, door, landing_host):
+    """The case where "ask the thing that raised this" has an answer. When Claude Code is
+    running the doctor there IS a session, and a reader can follow it back."""
+    _fleet(monkeypatch, machine="zeus", posts=[])
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "c9f3ff06-8af9-4ead-83a2-25aeb800ce88")
+
+    qd.announce_failures([_landed()], landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert call["session"] == "c9f3ff06-8af9-4ead-83a2-25aeb800ce88"
+
+
+def test_the_board_is_not_asked_at_all_when_no_shared_row_is_failing(monkeypatch, door,
+                                                                     landing_host):
+    """A question nobody has costs nothing and grows no caveat. Every failing row being
+    host-scoped means the gate has no work, which is silence rather than a failure."""
+    asked: list[str] = []
+
+    def fake(url, headers=None):
+        asked.append(urlsplit(url).path)
+        return 200, json.dumps({"machine": "zeus"} if url.endswith("whoami") else []), None
+
+    monkeypatch.setattr(qd, "http_get", fake)
+
+    qd.announce_failures(_rows(("harness", "fail"), ("stash", "fail")),
+                         landing_host, str(BIN / "qb-doctor"))
+
+    assert asked == [], "a report of host rows alone paid for a round trip nothing read"
+    assert len(door.calls) == 2
+    assert all("dedupe could not run" not in c["detail"] for c in door.calls)
+
+
+def test_every_registered_check_declares_whose_fault_it_describes():
+    """No default, so a new row cannot be added without its author deciding. The two
+    directions of the mistake are not symmetric — a shared row called `host` costs a
+    duplicate post, a host row called `repo` silences a machine — so the decision cannot
+    be left to fall through to whichever value happened to be safe last year."""
+    assert {spec.scope for spec in qd.CHECKS} <= set(qd.SCOPES)
+    assert all(spec.scope for spec in qd.CHECKS)
+
+
+def test_three_rows_outside_the_host_group_are_still_about_one_machine():
+    """The group is the trap: it answers *which question is this*, not *whose fault is
+    it*, and it is nearly right — which is what makes reaching for it tempting.
+    `unpushed` counts commits on THIS disk, `briefs` reads the briefs THIS HOST would
+    open, and `instructions` asks the same of the same host's prose. All three sit in
+    `landing` or `semantic` beside rows that really are fleet-wide, and a dedupe keyed
+    on the group would have silenced exactly the per-machine faults #569 says must keep
+    working."""
+    by_name = {spec.name: spec for spec in qd.CHECKS}
+
+    for name in ("unpushed", "briefs", "instructions"):
+        assert by_name[name].group != "host"
+        assert by_name[name].scope == "host", f"{name} describes one machine"
+
+
+def test_a_shared_rows_subject_is_the_one_every_machine_computes_alike():
+    """The rule a new row is judged by, and the one Codex applied to four rows this list
+    got wrong on the first cut: a row may be `repo` only if every machine watching that
+    repository would compute the SAME subject. `merges` reads the pre-push hook installed
+    here, `stamper` this checkout's own `git config`, `generated` and `tags` locally
+    fetched refs — all four can differ between two boxes on one repository, and all four
+    are `host`.
+
+    Their subjects are also paths on this disk, which is the second lock and not a
+    coincidence: a subject that names something host-local cannot match another machine's
+    headline even if somebody does classify the row `repo` by mistake."""
+    by_name = {spec.name: spec for spec in qd.CHECKS}
+
+    for name in ("merges", "tags", "stamper", "generated"):
+        assert by_name[name].scope == "host", (
+            f"{name} reaches its verdict through this checkout, so two boxes can "
+            "legitimately disagree and neither may silence the other")
+    assert {n for n, spec in by_name.items() if spec.scope == "repo"} == {
+        "queue", "landed", "escalations"}
+
+
+def test_a_check_built_outside_the_registry_announces_per_machine():
+    """The fail-safe default, stated as a test because it is the one that has to hold
+    for code nobody has written yet."""
+    assert qd.Check("whatever", "-", "", "fail").scope == "host"
+
+# --------------------------------------------------------------------------- #
 # #408 — a row is a verdict, an explanation, and a brief somebody can be handed
 # --------------------------------------------------------------------------- #
 
@@ -3388,6 +3723,7 @@ def test_a_rows_explanation_comes_from_the_registration_not_from_the_check(monke
     reach."""
     monkeypatch.setattr(qd, "CHECKS", (
         qd.CheckSpec("merges", "landing", lambda _h: qd.Check("merges", "-", "x", "ok"),
+                     scope="repo",
                      explanation="the registration's paragraph, not the function's"),))
 
     rows = qd.run_checks(host_for(repo))
@@ -3400,7 +3736,8 @@ def test_an_ok_row_gets_no_brief_and_the_report_says_why(repo):
     """No brief is the DEFAULT and for an `ok` row it is the answer. What it must not
     be is silence: a caller that got `None` and no reason could not tell "nothing to
     dispatch here" from "the brief broke", and those are opposite facts."""
-    spec = qd.CheckSpec("queue", "landing", lambda _h: None, explanation="x" * 200,
+    spec = qd.CheckSpec("queue", "landing", lambda _h: None, scope="repo",
+                        explanation="x" * 200,
                         briefs={"fail": qd.Brief(audience="agent", task="do the thing")})
     check = qd.Check("queue", "-", "nothing is queued", "ok")
 
@@ -3446,7 +3783,8 @@ def test_an_empty_list_is_an_absent_fact_not_an_established_one(repo):
 
 def test_a_template_naming_a_fact_nothing_supplies_is_a_missing_brief(repo):
     """A typo in a registration is a missing brief, not a brief containing `{holder}`."""
-    spec = qd.CheckSpec("queue", "landing", lambda _h: None, explanation="x" * 200,
+    spec = qd.CheckSpec("queue", "landing", lambda _h: None, scope="repo",
+                        explanation="x" * 200,
                         briefs={"fail": qd.Brief(audience="agent",
                                                  task="ask {holdr} about it")})
     check = qd.Check("queue", "-", "stalled", "fail", extra={"head_holder": "zeus/a"})
@@ -3959,7 +4297,7 @@ def test_the_semantic_group_does_not_run_unless_it_is_asked_for(monkeypatch, rep
     ran: list[str] = []
     spec = qd.CheckSpec("costly", "semantic",
                         lambda _h: (ran.append("asked"), qd.Check("costly", "-", "", "ok"))[1],
-                        explanation="x " * 50)
+                        scope="host", explanation="x " * 50)
     monkeypatch.setattr(qd, "CHECKS", (spec,))
 
     assert qd.run_checks(host_for(repo)) == []

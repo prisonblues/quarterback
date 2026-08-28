@@ -30,6 +30,16 @@ Type=oneshot
 # for twelve hours, and the key carries the head PR, so a second stall behind a
 # different pull request is still news.
 #
+# AND THE SAME QUESTION IS NOW ASKED ONCE BY THE FLEET, not once per box (#569).
+# Every machine running this unit reaches the same verdict about the same queue, so
+# before announcing a row registered `scope="repo"` the doctor asks the board whether
+# another machine has already said it. Ten `stuck` posts over two days included two
+# pairs six minutes apart, zeus and hermes saying the identical thing, and duplicate
+# alarms are how an alarm becomes background noise. Rows about THIS box — the harness
+# installed here, the commits that have never left this disk — are never matched
+# against another machine's, because "8 harness scripts are not on zeus" and "7 are
+# not on hermes" are two facts and both have to be raised.
+#
 # --quiet so a tick with nothing to say writes nothing.
 #
 # ADVISORY, and nothing here softens that. Nothing in this unit merges anything,
