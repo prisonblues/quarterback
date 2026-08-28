@@ -51,6 +51,15 @@
 #     stops. Most re-integrations are fast-forwards; the interesting ones are
 #     exactly the ones an automaton should not attempt unattended.
 #
+# WHAT THE STRANDED-WORK LINE CANNOT SEE, stated because a limit nobody wrote down
+# is a limit nobody remembers. This sweeps WORKTREES, so a branch that is checked out
+# nowhere is outside it by construction — and on zeus that was six of the eleven
+# branches carrying commits no remote had. `qb-doctor`'s `unpushed` row asks the same
+# question of `--branches`, which is every branch in the repository, and is where the
+# whole picture lives. This one is here because it is what the reader is looking at
+# after a merge, about directories they can act on now. A detached worktree is
+# invisible for the same reason: there is no branch to ask about.
+#
 # MACHINE-LOCAL BY CONSTRUCTION, which is the right scope and not a limitation: a
 # worktree can only be rewritten from the machine holding it, and the marker half
 # of `worktree-holder` is machine-local for the same reason. The board says THAT
