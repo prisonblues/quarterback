@@ -2500,11 +2500,16 @@ def check_unpushed(host: Host) -> Check:
     stranded = {sha for sha, _ in everywhere}
     affected = [name for sha, name in tips if sha in stranded]
     rows = _enumerate(host, affected or [name for _, name in tips])
+    # `N commits on M branches`, built once: the three verdicts below differ in what they
+    # conclude and not in how they count, and spelling the same pair at three call sites is
+    # how two of them come to disagree about the number in the same report.
+    count = _plural(len(everywhere), "commit")
+    verb = _is_are(len(everywhere))
     if not rows:
-        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} {_is_are(len(everywhere))} on no remote ref and "
-                     "no local branch accounts for them, which nothing here can explain",
-                     "unknown",
+        return Check("unpushed", r, f"{count} {verb} on no remote ref and no local branch "
+                     "accounts for them, which nothing here can explain", "unknown",
                      manual=f"git -C {r} rev-list --branches --not --remotes | head")
+    where = _plural(len(rows), "branch")
     oldest = min(when for _, when in everywhere)
     age = _age_minutes(oldest)
     named = ", ".join(f"{row['branch']} ({row['commits']})" for row in rows[:UNPUSHED_SAMPLE])
@@ -2520,22 +2525,23 @@ def check_unpushed(host: Host) -> Check:
         # A committer date in the future is clock skew or a rewritten history, and either
         # way the age this row's verdict turns on is not a measurement. Report the count
         # and refuse the verdict rather than picking whichever side the skew lands on.
-        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
-                     f"{_is_are(len(everywhere))} on no remote ref, and the oldest is dated {oldest}, which is not "
-                     "an age this can measure against", "unknown",
+        return Check("unpushed", r, f"{count} on {where} {verb} on no remote ref, and the "
+                     f"oldest is dated {oldest}, which is not an age this can measure "
+                     "against", "unknown",
                      manual=f"git -C {r} log --format='%cI %h %s' --branches --not --remotes",
                      extra=extra)
     extra["age"] = _spell_since(age)
     if age < UNPUSHED_GRACE_HOURS * 60:
-        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
-                     f"{_is_are(len(everywhere))} not on any remote yet, the oldest {extra['age']} old ({named}"
-                     f"{more}){unpushed_repo or ' — work in flight, which is the ordinary state'}",
-                     "ok", extra=extra)
+        in_flight = unpushed_repo or " — work in flight, which is the ordinary state"
+        return Check("unpushed", r, f"{count} on {where} {verb} not on any remote yet, the "
+                     f"oldest {extra['age']} old ({named}{more}){in_flight}", "ok",
+                     extra=extra)
+    exist = f"exist{'s' if len(everywhere) == 1 else ''}"
     return Check("unpushed", r,
-                 f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
-                 f"exist{'s' if len(everywhere) == 1 else ''} on no remote ref, the oldest {extra['age']} old ({rows[0]['oldest']}, "
-                 f"{rows[0]['branch']}): {named}{more}{unpushed_repo} — if this disk failed "
-                 "that work is gone, and nothing else on this host says so", "fail",
+                 f"{count} on {where} {exist} on no remote ref, the oldest {extra['age']} "
+                 f"old ({rows[0]['oldest']}, {rows[0]['branch']}): {named}{more}"
+                 f"{unpushed_repo} — if this disk failed that work is gone, and nothing "
+                 "else on this host says so", "fail",
                  manual=f"git -C {r} log --format='%cI %h %s' --branches --not --remotes"
                         "   # `--not --remotes`, never `origin/<branch>`",
                  extra=extra)
