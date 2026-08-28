@@ -84,7 +84,7 @@ def _run(monkeypatch, tmp_path, *, panel_cfg=None, cfg_extra=None, force=False,
     monkeypatch.setattr(panel_core, "sh", fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     monkeypatch.setattr(panel, "record_run",
                         lambda payload: recorded.append(payload) or "")
     out = tmp_path / "r.json"

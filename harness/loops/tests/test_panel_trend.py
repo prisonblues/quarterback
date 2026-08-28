@@ -379,7 +379,8 @@ def _round(monkeypatch, tmp_path, round_no, findings, head, files, baseline=(),
                                  severity=f.severity, file=f.file, line=f.line,
                                  synthesis=f.title, verdict="confirmed",
                                  detail="detail", reported_by=[f], rationale="real")
-                 for i, grp in enumerate(clusters) for f in grp], None, "")
+                 for i, grp in enumerate(clusters) for f in grp], None,
+                panel.CoverageRuling())
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: CFG)
     monkeypatch.setattr(panel_core, "sh", fake_sh)

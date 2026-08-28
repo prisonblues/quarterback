@@ -415,7 +415,7 @@ def test_a_dead_judge_reports_why_and_suppresses_nothing(monkeypatch):
 
 def test_no_findings_is_not_a_judge_failure(monkeypatch):
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
-    assert panel.adjudicate([], "diff", "", 1) == ([], None, "")
+    assert panel.adjudicate([], "diff", "", 1) == ([], None, panel.CoverageRuling())
 
 
 # --------------------------------------------------------------- what the judge is shown
@@ -476,7 +476,7 @@ def test_a_cluster_of_empty_groups_is_not_a_judge_failure(monkeypatch):
     """The listing used to be built before the empty check — harmless, but it
     meant the "nothing to judge" answer came from a prompt nobody would send."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: None)
-    assert panel.adjudicate([[]], "diff", "", 1) == ([], None, "")
+    assert panel.adjudicate([[]], "diff", "", 1) == ([], None, panel.CoverageRuling())
 
 
 # ------------------------------------------------------------------- the payload shape

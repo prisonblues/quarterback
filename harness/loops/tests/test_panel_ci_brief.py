@@ -126,7 +126,7 @@ def test_the_reviewers_prompt_carries_the_real_result(monkeypatch, tmp_path):
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "review_ci",
                         lambda *a: ("FAIL", ["app suite"], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
 
     def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
         prompts.append(prompt)
@@ -151,7 +151,7 @@ def test_the_seat_is_told_before_it_is_dispatched(monkeypatch, tmp_path):
         "_rules_baseline": ".harness-rules.sample",
         "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}})
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff="diff --git a/a.py b/a.py\n+x\n"))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
 
     def fake_ci(*a):
         order.append("ci")

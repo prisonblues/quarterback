@@ -1004,6 +1004,39 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   the two states that do NOT veto, so a CI state added later vetoes until somebody
   argues it out, and `ci_status` is keyword-only with no default so a caller
   cannot forget it and quietly buy a confident stop.
+- **A declaration no seat here could ever resolve becomes an obligation, not a
+  permanent veto** (#547). `could_not_assess` was answering three questions with one
+  boolean. *Diligence*: did the reviewers do the job they could have done?
+  *Capability*: can a panel of models reading a diff answer this class of question at
+  all? *Evidence*: has anything actually checked the claim (the bullet above, off
+  `ci_status`)? A seat that did not open a file it could have opened and a seat that
+  would need a running Postgres and a browser produced the identical artefact, so
+  `--require-earned-stop` held forever on any PR about runtime behaviour — and an
+  unsatisfiable gate is one that gets dropped, leaving no gate.
+  The split is the **judge's**, which was already being asked to adjudicate exactly
+  these declarations and was already doing it well in prose that decided nothing. It
+  now answers in `coverage_rulings`, one entry per **claim** rather than per
+  declaration, pointing at declarations by the **number** the panel minted — never at
+  their wording, which is the rule every exemption above keeps.
+  **A ruling on its own exempts nothing.** `absent` and `code_blind` are things the
+  host and the sandbox did; a ruling is a model's opinion about a model's sentence,
+  and an exemption resting on one alone would be a confidence gate the panel could
+  open by writing about itself. So a `resolvable_in_harness: false` *converts* the
+  declaration into a named obligation with a key (`uc-` + 8 hex), which goes on
+  vetoing until a human passes that key to `--acknowledge` — recorded state of the
+  plainest kind, inherited across a cycle's rounds through `--baseline` exactly as
+  `--escalated` is. Only a literal JSON `false` counts; a missing key, a malformed
+  entry, a claim with no name, a declaration two entries both claim, and a judge that
+  did not run all leave the declaration vetoing as before.
+  **It can only ever shorten the list.** An obligation stands in only for lines this
+  would have emitted anyway, so a blind or absent seat's declarations cannot become
+  one. That is also why adding a reviewer no longer costs a confident stop by
+  construction: several seats stating one capability limit merge into one obligation,
+  where before each copy was its own veto. Every claim reaches the payload's
+  `unresolved_claims` ledger whether or not it has been acknowledged, and each gets a
+  GitHub issue whatever `review_panel.file_deferral_issues` says — on an escalation's
+  footing, because it carries a question past the end of the session rather than
+  filing a task.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause

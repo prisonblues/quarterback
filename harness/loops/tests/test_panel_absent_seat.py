@@ -159,7 +159,7 @@ def _round(monkeypatch, tmp_path, cfg, *, present, diff=BIG, baselines=(),
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff=diff))
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r.json"
     assert panel.run("e2e", 34, post=False, json_file=str(out), record=False,
                      baseline=list(baselines), max_rounds=2) == 0
@@ -307,7 +307,7 @@ def test_a_seat_that_VANISHED_since_the_budgets_were_built_records_no_budget(
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff=BIG))
     monkeypatch.setattr(panel, "review_llm", vanished)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r.json"
     assert panel.run("e2e", 34, post=False, json_file=str(out), record=False,
                      max_rounds=2) == 0
@@ -458,7 +458,9 @@ def test_the_real_adjudicate_refuses_a_box_that_cannot_run_the_judge(monkeypatch
     assert skip.startswith("judge: ") and panel.CLI_ABSENT in skip
     # Nothing is suppressed by the refusal: every finding survives, unruled.
     assert len(findings) == 1
-    assert note == ""
+    # And nothing is EXEMPTED by it either (#547): a judge that never ran ruled on
+    # no declaration, so the ruling it carries out exempts nothing.
+    assert note == panel.CoverageRuling()
 
 
 def test_the_real_adjudicate_proceeds_when_the_judge_IS_there(monkeypatch):
