@@ -4088,6 +4088,42 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     about a P4 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence.
 
+    **``outstanding`` IS THE SECOND QUESTION, AND IT IS NOT THE ONE ``stop``
+    ANSWERS (#42).** ``stop`` answers *should another PANEL run* — a question about
+    cost, the cap and convergence. It was read as also answering *should these
+    findings be FIXED*, which it is not computed from and which has a different
+    answer: by ``/panel-review-pr``'s own bar that one is always yes, for every
+    confirmed finding and every Sonar hard-gate issue. The cap is where the two come
+    apart. ``panel-review-pr.md`` §5 launched a fixer only on ``stop: false``, so a
+    capped round's findings — P1/P2s still outstanding, repeats whose fix did not
+    land, gate issues, and everything the round newly found — were found, judged,
+    posted to the PR, recorded on the board, and **handed to nobody**.
+
+    So the payload states both. ``outstanding.fixable`` /``below_floor`` /
+    ``escalated`` are the MEASUREMENT and are true of every round including a ``go
+    again``; ``handed_to`` is the VERDICT and is null unless this round is ending the
+    cycle — ``fix_injection``'s ``over``/``fired`` split, applied once more, and for
+    its reason: a caller gating a final, unreviewed fix pass on that field must not
+    have it answered by a round that is mid-cycle.
+
+    **The honest end state is the point of the block rather than a caveat on it.** A
+    cycle that ends with clearable work left ends with either unfixed findings or an
+    unreviewed fix; there is no third option, and the workflow used to pick the first
+    in silence. ``handed_to: "fixer"`` names the second as the default and ``why``
+    says in as many words that the resulting commit ships unreviewed — **a proposal
+    and not an action**, on #506's terms: nothing here runs a fixer and the choice
+    belongs to the operator.
+
+    **A futility rung's leftovers go to a human, not to a fixer**, and that is the
+    distinction the cap does not have. ``premises``, ``injection``, ``not_falling``
+    and ``unrefereed`` each end the cycle by saying, in their own ``reason``, that a
+    human answers this rather than another fix pass — so handing their remainder to
+    one would contradict a sentence the same payload is carrying. A cap says only
+    that the cycle has spent enough, which is not a claim about what the next fix
+    pass is worth. Below-floor findings are handed to nobody **deliberately** (#165's
+    policy stop), and are listed rather than dropped, because silence about them is
+    what lets such a stop read as a dry one.
+
     **THE TWO FLOORS (#165), and why there are two.** Both default to
     :data:`NO_SEVERITY_FLOOR`, so a caller that has not heard of them gets exactly
     the behaviour above; `panel.py` passes the repo's
@@ -4323,10 +4359,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     says the work is not shrinking, and both veto lines are on the record either way.
 
     **What it does not do.** #505 asks for two clauses — stop the cycle, and triage
-    the remainder into an issue — and only the first is implementable here. The
-    second is #42, which is open: this rung ends the round and the outstanding
-    findings are handed to nobody, exactly as ``injection``'s stop and the cap's hand
-    theirs to nobody. It trades a round for a stop a human has to act on.
+    the remainder into an issue — and only the first is decided here. What became of
+    the second is #42: the remainder is no longer handed to nobody, but it is handed
+    to a HUMAN rather than into an issue, because this rung's own ``reason`` says a
+    human triages what is left. ``outstanding.handed_to`` carries that and
+    ``outstanding.fixable`` carries the remainder itself; filing it is the caller's
+    step (``panel-review-pr.md`` §5). It still trades a round for a stop a human has
+    to act on.
 
     **One honest mismatch, written down rather than fixed**, on the same terms
     :func:`panel_scope._provenance` records its own two: the rate's denominator is
@@ -4573,6 +4612,32 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #: has to be true of what it counted, and "P1/P2 still outstanding" is not true
     #: of a P3 `python:S1128`.
     gated = sum(1 for c in blockers if c.key in exempt)
+    # ---- #42: WHAT THE CYCLE IS LEAVING BEHIND. The verdict about who gets it is
+    # taken at the bottom, once every rule has run; these three lists are the
+    # measurement and are computed here, where the parameters they read are still
+    # the parameters (`held` is shadowed further down, in #506's veto).
+    #
+    # ONE UNIVERSE, so that nothing falls between the parameters. Rules 2 and 3 read
+    # `outstanding` and `repeated`, rule 1 reads `new_keys`, and a key reaching only
+    # one of them would otherwise be counted for the STOP and dropped from the
+    # disposal — which is this bug one level down. In production all three are built
+    # from the same round (`panel.py` derives `new_keys` and `repeated` FROM
+    # `outstanding`), so the union changes nothing there and closes the gap for every
+    # other caller.
+    work = ({c.key for c in outstanding} | {k for k in new_keys if k}
+            | {k for k in repeated if k}) - held
+    #: Split by the FIX floor at both rules, never the trigger floor. #165's two dials
+    #: answer different questions — which findings buy another ROUND, and which a fix
+    #: pass was asked to CLEAR — and a disposal is the second question. A finding above
+    #: the trigger floor and below the fix floor bought this cycle its rounds and was
+    #: never work anybody was asked to do.
+    fixable = sorted(k for k in work if above(k, fix_floor))
+    #: Reported, not fixed here, and NOT handed to anybody — the repo's own policy.
+    #: #165 is explicit that a below-floor stop is a POLICY stop and not a failure, so
+    #: listing these as work awaiting a fixer would re-open a decision the repo has
+    #: already taken. They are named because the alternative is silence, and silence
+    #: about them is what lets a below-floor stop read as a dry one.
+    below_floor = sorted(k for k in work if not above(k, fix_floor))
     if triggering:
         stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
@@ -4865,9 +4930,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         upper = (" This round re-read only the fix commit, so some of that cost is "
                  "code nobody looked at again rather than defects the pass fixed — "
                  "read it as a ceiling." if reverting["scope"] == "increment" else "")
-        held = (f" {len(reverting['still_open'])} of its complaint(s) are still "
-                "outstanding either way, so reverting costs nothing there."
-                if reverting["still_open"] else "")
+        # NOT `held`, which is this function's frozenset of escalated keys and was
+        # shadowed here by a string. Nothing read it after this line, so it cost
+        # nothing until #42 gave the escalated set a second reader — and a name that
+        # is safe only while nobody uses it again is a trap rather than a saving.
+        still_open = (f" {len(reverting['still_open'])} of its complaint(s) are still "
+                      "outstanding either way, so reverting costs nothing there."
+                      if reverting["still_open"] else "")
         # The command is offered only where the range is known to hold nothing but the
         # fix pass's own commits; otherwise the reason is printed in its place. A
         # wholesale `git revert` over a range carrying a base-branch merge is not a
@@ -4895,7 +4964,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             "change the line above says generated more work than the pull request "
             f"did.{pass_of}{wide} {how} would REMOVE the "
             f"{len(removes)} finding(s) attributed to it ({_by_severity(removes)}) "
-            f"and {priced}.{held}{upper} A PROPOSAL AND NOT AN ACTION — reverting a "
+            f"and {priced}.{still_open}{upper} A PROPOSAL AND NOT AN ACTION — reverting a "
             "pass reverts the real fixes in it too, and nothing here knows which "
             "those are without asking. `round_stop.revert` carries the commits and "
             "both lists in full (#506)")]
@@ -4941,6 +5010,63 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "nothing in the runtime can observe, so no fix for them can be "
                        "verified where it runs and each round patches the last "
                        "approximation (#491)"]
+    # ---- #42: WHO GETS IT. The verdict half, taken here because it is the only
+    # point at which every rule has run and `stop` is final.
+    #
+    # A rung that ended the cycle by saying a HUMAN answers this. Every one of them
+    # says exactly that in its own `reason` — "a human triages what is left rather
+    # than another fix pass" (#505), "a human answers that, not another fix pass"
+    # (#489, #554, #84, #491) — so handing their leftovers to a final fix pass would
+    # contradict a sentence this same payload is carrying. That is the distinction
+    # the cap does not have and the reason #42 is about the cap: a cap is a COST
+    # bound, and "the cycle has spent enough" is not a claim about what the next fix
+    # pass would be worth. `capped` is deliberately not read here — what makes a
+    # disposal a fixer's is that no rule said otherwise, not that one particular rule
+    # fired, so a stop added later inherits the safe answer by saying so in this list
+    # rather than by being remembered here.
+    futile = bool(flat or unchecked or injected or circling or unobservable)
+    if not stop:
+        # The cycle is going again, so there is no disposal to make: §5's ordinary
+        # path hands this round's findings to the next fix pass and the round after
+        # reviews the result. Null rather than "fixer" for the reason `fix_injection`
+        # keeps `over` apart from `fired` — a caller gating a FINAL, unreviewed fix
+        # pass on this field must not have it answered by a round that is mid-cycle.
+        handed_to, why = None, None
+    elif futile and (fixable or blocking):
+        handed_to = "human"
+        why = (f"{len(fixable) + len(blocking)} finding(s) are outstanding, and this "
+               "cycle ended on a rule that says a human answers them rather than "
+               "another fix pass — sending them to one would contradict the reason "
+               "above. Triage what is left (#42)")
+    elif fixable:
+        handed_to = "fixer"
+        # The escalations beside them, said HERE and not left to the `escalated` list
+        # alone. `why` is the sentence the relay repeats, so a reader acting on it and
+        # on nothing else would otherwise send a mixed round's whole remainder to a
+        # fix pass — including the one class of finding no fix round may touch.
+        beside = (f" {len(blocking)} escalated finding(s) are outstanding beside them "
+                  "and are NOT a fixer's — those go to a human (#221)."
+                  if blocking else "")
+        why = (f"{len(fixable)} finding(s) are outstanding and a fix pass can clear "
+               "them, but no round is left to read the result. So they are fixed and "
+               "the resulting commit ships UNREVIEWED, or they are not fixed at all: "
+               "there is no third option, and until now the cycle silently took the "
+               f"second. The default is the first, said plainly in the relay.{beside} "
+               "A PROPOSAL AND NOT AN ACTION — nothing here runs a fixer, and the "
+               "choice is the operator's (#42)")
+    elif blocking:
+        # Escalations alone. Not a fixer's, at any stop: no fix round may touch an
+        # escalated finding, which is the whole of #221.
+        handed_to = "human"
+        why = (f"{len(blocking)} escalated finding(s) are outstanding and no fix round "
+               "may touch them — a human answers the premise (#221, #42)")
+    else:
+        handed_to = "nobody"
+        why = ("nothing is outstanding — the cycle ends with nothing to hand on"
+               if not below_floor else
+               f"{len(below_floor)} finding(s) are outstanding and every one is under "
+               f"the {fix_floor} fix floor: the repo's own policy is that these are "
+               "reported and not fixed here, so nothing is handed on (#165)")
     return {
         "stop": stop,
         "reason": reason,
@@ -5042,6 +5168,40 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT.
         "unrefereed_fix": {**refereeing, "fired": unchecked},
+        # #42, and it is the only block here that is not about whether to go again.
+        # Every other field answers "should another PANEL run"; this one answers the
+        # second question `stop` was being read as answering and was never computed
+        # from — "should these findings be FIXED" — which is why it is a block beside
+        # `stop` rather than a nuance inside it.
+        #
+        # ALWAYS present, for the reason its four siblings are: an absent key and "the
+        # cycle left nothing behind" are different claims, and a consumer forced to
+        # tell them apart would be reading the payload's age rather than the cycle's
+        # state. The one exception is a payload no cycle produced — a spend-ceiling
+        # refusal builds a `round_stop` by hand (`panel.py`) and has no findings to
+        # dispose of; a consumer reading `handed_to` there gets null, which is the
+        # answer.
+        #
+        # The key shares the NAME of this function's `outstanding` parameter and does
+        # not share its meaning: the parameter is the Canonical findings the cycle has
+        # to clear, and this is the disposal of what is left of them. #42 asks for it
+        # under this name and the payload is the artefact people read, so the name
+        # follows the issue rather than the local.
+        #
+        # `escalated` is `escalated_outstanding` above under a second name, off the
+        # same `blocking` local and so unable to disagree with it. It is repeated
+        # because this block is the whole answer to "who gets what is left", and a
+        # reader that had to join it against a sibling key to find the one class of
+        # finding no fixer may take is a reader who will not.
+        "outstanding": {
+            "fixable": fixable,
+            "below_floor": below_floor,
+            "escalated": sorted(blocking),
+            # null on a `go again`, where no disposal is being made; otherwise
+            # `fixer`, `human` or `nobody`. `why` is the sentence a relay repeats.
+            "handed_to": handed_to,
+            "why": why,
+        },
     }
 
 
