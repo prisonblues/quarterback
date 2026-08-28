@@ -597,6 +597,30 @@ def test_a_remote_whose_refs_do_not_cover_every_head_refuses_the_question(fleet)
     assert "on no remote ref" not in done.stdout, "it answered a question it had refused"
 
 
+def test_a_remote_with_several_refspecs_still_counts_as_covering_every_head(fleet):
+    """More than one `fetch` line is ordinary — notes, tags, a second refspec — and
+    the guard must find `refs/heads/*` among them rather than expect it alone.
+
+    This is also why the guard is parameter expansion and not `git config --get-all …
+    | sed … | grep -qx`: `set -o pipefail` is on and `grep -q` exits the instant it
+    matches, so with enough refspec lines to fill a pipe buffer the `sed` upstream
+    dies of SIGPIPE, the pipeline reports 141, and the `!` test reads a remote that
+    maps every head as one that does not. Three short lines do not fill a buffer, so
+    this test does NOT go red against that form — it pins the behaviour, and the
+    expansion removes the dependency on how much output happened to fit.
+    """
+    git(fleet.main, "config", "--add", "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*")
+    git(fleet.main, "config", "--add", "remote.origin.fetch",
+        "+refs/notes/*:refs/notes/origin/*")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "does not fetch" not in done.stdout, done.stdout
+    assert "on no remote ref" in done.stdout, done.stdout
+
+
 def test_a_repository_with_no_remote_says_nothing_about_stranded_work(fleet):
     """There is no elsewhere for a commit to be, so nothing here is stranded and the
     question does not arise. `qb-doctor` reaches the same conclusion in the same

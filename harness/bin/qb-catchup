@@ -145,8 +145,18 @@ elif [ -z "$REMOTES" ]; then
 else
   while IFS= read -r rem; do
     [ -n "$rem" ] || continue
-    if ! git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null \
-         | sed 's/^+//; s/:.*//' | grep -qx 'refs/heads/\*'; then
+    # PARAMETER EXPANSION AND NOT `sed … | grep -q`, because `set -o pipefail` is on
+    # and `grep -q` exits the moment it matches: with enough refspec lines to fill a
+    # pipe buffer the `sed` upstream dies of SIGPIPE, the pipeline reports 141, and a
+    # `!` test reads a remote that maps every head as one that does not — a refusal
+    # in place of a correct answer, on the good path. Whether it fires depends on how
+    # much output happened to fit in a buffer, which is not a property to rely on.
+    maps_every_head=0
+    while IFS= read -r spec; do
+      spec=${spec#+}          # a leading + is "force", not part of the source ref
+      [ "${spec%%:*}" = 'refs/heads/*' ] && maps_every_head=1
+    done < <(git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null)
+    if [ "$maps_every_head" = 0 ]; then
       ASK_STRANDED=0
       ASK_WHY="\`$rem\` does not fetch \`refs/heads/*\`, so its tracking refs cover some branches and not others and what exists only on this disk was not asked"
       break
