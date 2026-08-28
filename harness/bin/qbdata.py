@@ -903,8 +903,20 @@ class BoardClient:
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False) -> dict:
+    #: How long a board call waits when the caller names no bound. Generous,
+    #: because most callers here are a dashboard refresh or a one-shot script for
+    #: which a slow answer beats no answer.
+    TIMEOUT = 30
+
+    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False,
+                 timeout: float | None = None) -> dict:
         """One authenticated request. ``allow_empty`` belongs to the WRITE path only.
+
+        ``timeout`` is for the callers on a HOT PATH, where :data:`TIMEOUT` is the
+        wrong trade: ``harness_rules.DIALS_TIMEOUT`` makes the same argument for the
+        same read — a dial resolution runs on every loop tick, so a board that is
+        down must cost a moment rather than half a minute. ``None`` keeps the
+        generous default every existing caller was written against.
 
         An empty body is not ``{}``. A proxy's contentless 502, a 204 from a board
         mid-deploy, a truncated response — read as an empty object, every one of
@@ -921,17 +933,19 @@ class BoardClient:
         """
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
-        with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or self.TIMEOUT,
+                                    context=_ssl_context()) as resp:
             body = resp.read().decode()
         if allow_empty and not body.strip():
             return {}
         return json.loads(body)
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def get(self, path: str, params: dict | None = None,
+            timeout: float | None = None) -> dict:
         query = urllib.parse.urlencode(
             {k: v for k, v in (params or {}).items() if v is not None})
         url = f"{self.cfg.base_url}{path}" + (f"?{query}" if query else "")
-        return self._request(urllib.request.Request(url))
+        return self._request(urllib.request.Request(url), timeout=timeout)
 
     def post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
@@ -2907,6 +2921,25 @@ def dial_refusal(dial: str, value, script: str | None = None) -> str:
         return ""  # `hasattr` for `dial_specs`' reason, one function up
     try:
         return rules.dial_problem(dial, value) or ""
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return ""
+
+
+def dial_scope_refusal(dial: str, repo: str | None, script: str | None = None) -> str:
+    """Why this dial may not be set at this SCOPE, or `""`. `dial_refusal`'s twin.
+
+    Separate from it because they answer different questions about different fields
+    — one judges the VALUE, this judges where the row goes — and a screen that
+    folded them would have to guess which of the two boxes to put the message under.
+
+    `""` covers "cannot judge" for `dial_refusal`'s reason: a box that cannot read
+    the harness's table must not refuse a write the board would have taken.
+    """
+    rules = _dial_rules(script)
+    if rules is None or not hasattr(rules, "dial_scope_problem"):
+        return ""  # `hasattr` for `dial_specs`' reason, and for its version story
+    try:
+        return rules.dial_scope_problem(dial, repo) or ""
     except Exception:                          # noqa: BLE001 — degrade, don't die
         return ""
 

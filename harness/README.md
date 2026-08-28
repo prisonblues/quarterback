@@ -1199,6 +1199,7 @@ qb-start --via dash /fix-issue 277    # …and record what pulled it
 #   exit 7  this repo's window is full, or qb-admit could not read it
 #   exit 8  somebody holds that work, or the claim could not be taken at all
 #   exit 9  could not start it — the claim goes back, and it says if that failed
+#   exit 10 the FLEET's ceiling is spent — nothing on this box moves that
 ```
 
 **Off by default, and the default costs nothing — not even a file.** With no
@@ -1212,9 +1213,75 @@ and neither can an agent:
 programs.quarterback-harness.spawn = {
   enable      = true;
   commands    = [ "/fix-issue" ];   # empty by default: the second lock
-  maxSessions = 1;                  # 0 is a freeze
+  maxSessions = 1;                  # 0 is a freeze — and the FALLBACK, see below
 };
 ```
+
+**The ceiling is a dial; the two permissions beside it are not
+([#563](https://github.com/prisonblues/quarterback/issues/563)).** `spawn.json` carries three
+keys and only two of them say what this box MAY do. `enabled` and `commands` are permissions
+and stay in the nix-written file for the reason above. `max_sessions` says how HARD it may
+work — the `in_flight.max` side of the very line the paragraph below draws, counting a
+resource rather than guarding a door — and it was in the permission file only because that is
+where it was written, inheriting a deployment path that costs a nix edit, a build, a PR, a
+merge, a `nixos-rebuild` and a human with the password. For a number. The direction that
+matters more is the other one: **`0` is a freeze**, the only control that stops a box spawning
+without switching the mechanism off, and calming a fleet that is working too hard should not
+require a rebuild at the moment nobody wants to be running one.
+
+So there are two dials, and `maxSessions` above is the fallback under the first:
+
+| dial | scope | counts | when unset |
+|---|---|---|---|
+| `spawn.max_sessions` | this machine | spawned panes whose agent has not exited | `maxSessions` from the policy file |
+| `spawn.max_sessions_fleet` | the whole board | every live agent, spawned or not | no fleet ceiling at all |
+
+Both are **fleet-scoped** dials — set them with no repo. A machine's concurrency is not a
+property of a repository: `live_spawns()` counts panes on a tmux server without knowing which
+checkout each is in, so with one repo at 5 and another at 2 there is no question the count
+has answered. The board takes either scope for any dial (`dial` is opaque text there and
+`repo` is just a column), so the refusal is the client's: the dashboard's dial picker
+**refuses** the write (`harness_rules.dial_scope_problem`), and `qb-start` **names** a
+repo-scoped row it is ignoring — because a `curl` and the web page have no dial vocabulary
+and by design cannot have one, and a setting stored, reported as in force and read by nothing
+is the failure this whole layer exists to end. The other direction stays legitimate: a rules
+dial is set at either scope, and a fleet-scoped one is how a single value covers every
+watched repo.
+
+Both **fail open**, alone among `qb-start`'s gates and for `qb-admit`'s reason: they count a
+resource rather than guarding a door, so an unreadable dial leaves the file's number in force
+and an unreachable board leaves the fleet gate silent. A permission that failed open would
+start sessions nobody authorised; a ceiling that failed closed would stop every box on the
+fleet over a board hiccup, which is worse than the thing it guards. Safe to put on the board
+because dial **writes are human-only** (`POST /dials` takes `app.auth.human`) — an agent may
+read its own ceiling and cannot raise it, which is the whole of what makes this a throttle
+rather than an escalation.
+
+**The fleet number is a runaway guard, not an allocator.** It exists to stop a hundred agents
+opening at once against a long queue — [#476](https://github.com/prisonblues/quarterback/issues/476),
+the drainer, is the thing that would do that — and every property follows: advisory and
+non-atomic (two boxes spawning in the same second can both see room, exactly as `qb-admit`
+documents), failing open, and worth setting **well above the busiest legitimate day**, because
+a ceiling that bites in normal use gets raised until it does not and then it is not a guard.
+It counts **every live agent** off `GET /active`, not only spawned ones — a hundred agents is
+a hundred agents, and the board cannot tell a spawn from a seat somebody typed into without
+new plumbing at both ends — so a busy human day consumes it too. That is the other argument
+for a generous number.
+
+`qb-start --policy` reads both, bounded at five seconds and failing open to the file, and
+reports the effective ceiling with the layer that gave it — `max_sessions` is what will
+actually apply, `max_sessions_policy` is the file's number underneath it, and
+`max_sessions_source` says which answered. That is the one thing `--policy` leaves the box
+for, and it earns it for a caller that reads a ceiling before acting. A machine that never
+opted in still reaches nothing but its own config directory.
+
+**`--policy --no-board` opts out**, and the dashboard's ⚒ takes it. `--policy` promises a
+caller may ask on every click without paying for it, and the ⚒ asks from the UI thread, where
+a board that is down would freeze the screen for five seconds per keystroke. It reads only
+`enabled` and `commands` — both the file's — so it gives up nothing: the ceiling it never
+consulted is still applied by the spawn itself, one step later, in `qb-start`'s own words.
+The flag answers `--policy` and nothing else; on a spawn it is **refused** rather than
+ignored, because a gate must never look like it took an instruction it did not.
 
 **`/get-involved` takes no number, and allowing it implies allowing what it runs (#541).**
 Every other spawnable command is aimed at an issue or a PR; this one reads the plan and
@@ -2210,6 +2277,24 @@ value governing every round on the fleet was invisible on `qb-dash`, `qb-dash-tu
 `qb-board` and the web board alike. That was tolerable while a dial only configured what a
 review round costs; it stops being tolerable with `tempo` (#474), which is the answer to
 *"is this fleet working right now, and how hard"*.
+
+**DIALS IS THE FLEET'S SURFACE, NOT THE PANEL'S**
+([#563](https://github.com/prisonblues/quarterback/issues/563)). Every dial in the registry
+was `review_panel.*` until `spawn.max_sessions` arrived, which made the question urgent rather
+than academic — and the answer turned out to be already shipped rather than open. The board
+does not know what a dial IS: `app/api/dials.py` stores the name as opaque text and the value
+as opaque JSON on purpose, and says in as many words that the client owns the vocabulary.
+`tempo` (#474) has been drawn as a dial by both dashboards for releases while `BOARD_DIALS`
+has never held it. So the channel was never the panel's; the only thing that was is two lines
+of `harness_rules` which assume a dial names a key in `DEFAULTS`.
+
+`Dial.applies` is that distinction, and it is deliberately one field rather than a second
+settings channel — a fleet dial is validated, listed, offered by the picker and rendered by
+the dashboards exactly like every other one, and it is simply never merged into a repo's
+resolved rules, because there is no repo in the question it answers. It has no `DEFAULTS`
+entry either, so the picker's `default` line is blank and says why: `spawn.max_sessions` falls
+back to a per-machine file that no repo and no board can read. `tempo` (#474) and the plumbing
+in #475 are the same shape, and they inherit this rather than each inventing one.
 
 The panel sits at the top, above the seats, for the caps line's own reason: it is the
 configuration every panel below it is running under. Each row is the dial, its value, the

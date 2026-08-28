@@ -16,6 +16,8 @@
   8  refused    — somebody holds that work, or the claim could not be taken at all
   9  could not start it — no tmux, tmux refused, or the pane could not be stamped.
                  The claim goes back, and it says so if that failed too
+ 10  refused    — the FLEET's ceiling is spent: too many agents are live across the
+                 whole board. Nothing on this box changes that
 
 **THE HALF OF #277 THAT WAS NEVER BUILT.** There were three ways to start a
 session here and every one of them ended at a human hand: `qb-seat` in a pane
@@ -70,6 +72,55 @@ phone. `spawn.json` is a *permission*: failing open on a typo starts sessions
 nobody authorised, on a box holding `~/.claude`, `~/.config/gh` and the board
 token. Unreadable, unparseable, or `enabled` anything other than `true` — all one
 answer, and the answer is no.
+
+**AND THE CEILING IS A DIAL, WHICH THE TWO ABOVE IT DELIBERATELY ARE NOT (#563).**
+`spawn.json` carries three keys and only two of them are permissions. `enabled` and
+`commands` say what this box MAY do, and they stay in the nix-written, read-only
+file for the reason the paragraph above gives. `max_sessions` says how HARD it may
+work, which is the `in_flight.max` side of the very line that paragraph draws: it
+counts a resource rather than guarding a door. It was in the permission file because
+that is where it was written, and it inherited the permission file's deployment path
+— a nix edit, a build, a PR, a merge, a `nixos-rebuild` and a human with the
+password, for a number. So the board's `spawn.max_sessions` answers first and the
+file is the fallback; with no dial set this box behaves exactly as it did before.
+
+Two things make that a throttle rather than a hole. Dial WRITES are human-only
+(`set_dial` takes `Depends(human)`, and `app/api/dials.py` calls that the security
+argument), so an agent may read its own ceiling and cannot raise it. And the read
+FAILS OPEN, unlike its neighbours in that file and for `qb-admit`'s reason: an
+unreadable dial means the file's number applies, because this one is counting a
+resource. A permission that failed open would start sessions nobody authorised; a
+ceiling that failed closed would stop a box over a board hiccup, which is worse than
+the thing it guards.
+
+**AND THERE IS A SECOND CEILING, ACROSS THE WHOLE BOARD.** `spawn.max_sessions` is
+counted here, on this tmux server, which is right — it is a property of the box, its
+cores and whether somebody is sitting at it — and it is why five boxes each set to 3
+have a fleet ceiling of fifteen and nothing that knows it. `spawn.max_sessions_fleet`
+is that missing number: live agents across the board, counted off `GET /active`, with
+no policy-file counterpart on purpose, because a per-machine file cannot express a
+fleet-wide number and letting each box carry a copy is how five boxes come to
+disagree about the limit.
+
+It is a RUNAWAY GUARD AND NOT AN ALLOCATOR, and every property follows from that.
+It is advisory and non-atomic — two boxes spawning in the same second can both see
+room, exactly as `qb-admit` documents, and making it exact means moving admission
+into the board, which is a bigger change than the failure being prevented deserves:
+the failure is a hundred agents, not the hundred-and-first. It fails OPEN, alone
+among the gates below, and the reason is that the local ceiling is the real safety
+net: a board outage degrades five boxes from "ten across the board" to "five each",
+which is bounded and nowhere near a runaway, while a fleet gate that failed closed
+would stop every box spawning whenever the board hiccups. And it is unset by
+default, because a ceiling that bites in normal use gets raised until it does not,
+and then it is not a guard.
+
+**IT COUNTS EVERY LIVE AGENT, NOT EVERY SPAWN**, and that is a real difference from
+the ceiling above it. `GET /active` lists top-level sessions holding a lease
+whatever opened them, so a seat somebody typed into consumes the fleet ceiling and a
+spawned pane consumes both. That is the honest number for a runaway guard — a
+hundred agents is a hundred agents, and the board cannot tell a spawn from a seat
+without new plumbing at both ends — but it means a busy human day can refuse a
+legitimate spawn, which is an argument for setting this one generously.
 
 **WHAT IT STARTS IS A REAL SESSION IN A REAL PANE.** A detached tmux window, the
 same shape `qb-dash-tui.run_in_window` already uses, so a human can attach to it,
@@ -129,6 +180,13 @@ STARTED, MISUSE = 0, 2
 NOT_ENABLED, NOT_ALLOWED, AT_CAP = 3, 4, 5
 PACED, FULL, HELD = 6, 7, 8
 COULD_NOT_START = 9
+#: Its own code rather than a second flavour of `AT_CAP`, on this file's own rule:
+#: the codes exist so a caller can tell refusals apart by REMEDY, and these two have
+#: nothing in common there. `AT_CAP` is answered on this box — close a pane, or raise
+#: this machine's number. This one cannot be: the fleet is at its ceiling and the
+#: only things that move it are a dial nobody on this box can write and somebody
+#: else's session ending.
+AT_FLEET_CAP = 10
 
 #: Every command that may EVER be spawned, and the resource each one claims.
 #: Compiled in rather than configured, because a machine may narrow this and must
@@ -382,10 +440,7 @@ def read_policy() -> Policy:
     ceiling = raw.get("max_sessions", DEFAULT_MAX_SESSIONS)
     if ceiling is None:
         ceiling = DEFAULT_MAX_SESSIONS
-    # `bool` is an `int` in python and `true` is a plausible thing to type into a
-    # key next to `enabled`; refused rather than counted as 1, the rule `qb-admit`
-    # applies to its own ceiling.
-    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+    if bad_ceiling(ceiling):
         return no(f"`max_sessions` in {path} is {ceiling!r} — it takes a "
                   f"non-negative integer (0 is a freeze). Refusing")
 
@@ -394,6 +449,189 @@ def read_policy() -> Policy:
         return no(f"`skip_permissions` in {path} is {skip!r}, not a boolean — refusing")
 
     return Policy(True, frozenset(commands), ceiling, skip, str(path), "")
+
+
+# ---- the board's dials -------------------------------------------------------
+
+#: This machine's ceiling, when the board states one. The file's number is the
+#: fallback and stays exactly what it was; see the module docstring on why this one
+#: key of the three moved and the other two did not.
+DIAL_MACHINE = "spawn.max_sessions"
+
+#: And the fleet's, which has no file to fall back to because a per-machine file
+#: cannot express a fleet-wide number. Unset is NO CEILING, which is what the fleet
+#: ran under before this existed.
+DIAL_FLEET = "spawn.max_sessions_fleet"
+
+#: How long the dial read waits. `harness_rules.DIALS_TIMEOUT`'s number and its
+#: argument: this runs on every spawn AND on every `--policy`, which a dashboard
+#: asks on every click, so a board that is down must cost a moment rather than half
+#: a minute. The answer when it lapses is the policy file's number, which is a
+#: usable answer; thirty seconds of nothing is not.
+DIALS_TIMEOUT = 5
+
+#: And how long the fleet COUNT waits. Longer, because it is asked far less often —
+#: only when a fleet ceiling is actually set, and only after every cheaper refusal
+#: above it has passed — and because being wrong here costs a spawn that should have
+#: been refused rather than a dashboard that hangs.
+ACTIVE_TIMEOUT = 10
+
+
+def bad_ceiling(value: object) -> bool:
+    """Is this not a number of sessions? ONE rule, over the file and the board both.
+
+    `bool` is an `int` in python and `true` is a plausible thing to type into a key
+    next to `enabled` — or into a value box on a dashboard — so it is refused rather
+    than counted as 1, the rule `qb-admit` applies to its own ceiling.
+
+    Shared rather than written twice, because the two sources now say the same thing
+    in different places: a ceiling the file would refuse and the board would accept
+    is a ceiling whose meaning depends on which layer carried it, which is the exact
+    failure the dial layer's own `_dial_problem` exists to prevent one level up. The
+    board cannot make this check for us — `POST /dials` stores an opaque JSON value
+    on purpose — and `harness_rules.dial_problem` checks only that it is a number,
+    so `-1` reaches here having passed everything in front of it.
+    """
+    return isinstance(value, bool) or not isinstance(value, int) or value < 0
+
+
+class Ceilings(NamedTuple):
+    """What the board says about how hard this box, and this fleet, may work.
+
+    `None` on either is "the board did not say", never "zero" — and the distinction
+    is the whole of why this is a NamedTuple and not two ints. Zero is a freeze, a
+    decision somebody made and typed a reason for; None is the ordinary state of a
+    fleet that has never set one, and it is also what an outage looks like. The
+    first must refuse every spawn and the second must refuse none, so a layer that
+    collapsed them would turn a board hiccup into a fleet-wide stop.
+
+    `problem` is why there is no answer, and it is REPORTED rather than acted on:
+    every gate this feeds fails open. It is not empty on the ordinary path — a box
+    on no board at all resolves no config and says so — which is why nothing prints
+    it unless a ceiling was actually wanted.
+    """
+
+    machine: int | None
+    fleet: int | None
+    problem: str
+
+
+def read_ceilings(repo_path: str | None = None) -> Ceilings:
+    """Ask the board for both ceilings. Never raises; every failure is `problem`.
+
+    **ONLY THE FLEET SCOPE ANSWERS, and a repo-scoped row is NAMED rather than
+    dropped.** A machine's concurrency is not a property of a repository: with
+    `acme/widget` at 5 and `acme/gadget` at 2 and three live spawns across both,
+    there is no question `live_spawns()` has answered — it counts panes on this tmux
+    server and does not know which checkout each one is in. So the scope is asked for
+    with the repo (which is why this takes one at all) purely so that a row written
+    at the wrong scope can be reported. `harness_rules.dial_scope_problem` refuses
+    that write in the dashboard's picker, but the board takes either scope from
+    anything holding a human key — including a `curl` and the web page, which have
+    no dial vocabulary and by design cannot have one. A setting stored, reported as
+    in force and read by nothing is the exact failure this whole layer exists to end,
+    and the reader is the last place it can still be said out loud.
+
+    **A value this refuses is not a value it substitutes.** A malformed dial leaves
+    the ceiling where it was — on the policy file — and says so, rather than falling
+    to a compiled-in number that neither layer asked for.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qbdata import board_client, repo_slug
+        client, _cfg = board_client()
+        # Best-effort and never fatal: with no slug this asks for the fleet rows
+        # alone, which is the answer either way. The repo buys the REPORT, not the
+        # ceiling, so a checkout that cannot name itself loses a diagnostic rather
+        # than a number.
+        slug = None
+        if repo_path:
+            try:
+                slug = repo_slug(repo_path)
+            except Exception:                                     # noqa: BLE001
+                slug = None
+        body = client.get("/dials", {"repo": slug} if slug else None,
+                          timeout=DIALS_TIMEOUT)
+    except Exception as e:                                        # noqa: BLE001
+        return Ceilings(None, None, f"{type(e).__name__}: {e}")
+    # `isinstance`, not `body or {}`. A JSON ARRAY is truthy, and `[].get` is an
+    # AttributeError raised OUTSIDE the try above — so the one shape this layer
+    # exists to survive, a board answering something unexpected, would crash the
+    # spawner instead of leaving the file's ceiling in force. `_dial_body` makes the
+    # same check in the same words one directory over.
+    if not isinstance(body, dict):
+        return Ceilings(None, None,
+                        f"the board answered a {type(body).__name__}, not an object")
+    rows = body.get("dials")
+    if not isinstance(rows, list):
+        return Ceilings(None, None, "the board's `dials` was not a list")
+    found: dict[str, int] = {}
+    problems: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("dial")
+        if name not in (DIAL_MACHINE, DIAL_FLEET):
+            continue
+        if row.get("repo"):
+            problems.append(
+                f"`{name}` is set on the board for {row['repo']} — ignored. It is "
+                f"fleet configuration: this ceiling counts panes on one tmux server "
+                f"and does not know which checkout each is in, so a per-repo answer "
+                f"is not one. Set it with no repo")
+            continue
+        value = row.get("value")
+        if bad_ceiling(value):
+            problems.append(f"`{name}` on the board is {value!r}, which is not a "
+                            f"non-negative whole number of sessions — ignored")
+            continue
+        found[name] = value
+    return Ceilings(found.get(DIAL_MACHINE), found.get(DIAL_FLEET),
+                    "; ".join(problems))
+
+
+def ceiling_from(ceilings: Ceilings) -> str:
+    """The `(from …)` half of a ceiling line, or nothing at all.
+
+    Empty when the file answered, because that is the state every message in this
+    file was written against and naming it on every line would be noise. Said out
+    loud when the BOARD answered, because a number that is not the one in the
+    operator's nix config is a number they will otherwise go looking for in the
+    wrong file.
+    """
+    return "" if ceilings.machine is None else f" (from the board's `{DIAL_MACHINE}`)"
+
+
+def live_agents() -> tuple[int | None, str]:
+    """How many agents are live across the whole board. `(count, why not)`.
+
+    `None` is "could not tell", and unlike :func:`live_spawns` it is not a refusal —
+    see the module docstring. The local ceiling has already been applied by the time
+    anything calls this, so a board that will not answer degrades the fleet to its
+    per-machine bound rather than to nothing.
+
+    **Top-level agents only.** `GET /active` returns `subagents` beside them and
+    they are deliberately not counted: a fan-out is one session's own tooling, it
+    holds no pane and no seat, and counting it would make a ceiling expressed in
+    sessions bite on something that is not one.
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from qbdata import board_client
+        client, _cfg = board_client()
+        body = client.get("/active", timeout=ACTIVE_TIMEOUT)
+    except Exception as e:                                        # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+    # Checked rather than assumed, for `read_ceilings`' reason: outside the try, a
+    # `.get` on a list is an AttributeError, and this gate's whole promise is that a
+    # board it cannot read leaves the local ceiling in charge rather than stopping
+    # the spawn.
+    if not isinstance(body, dict):
+        return None, f"the board answered a {type(body).__name__}, not an object"
+    agents = body.get("agents")
+    if not isinstance(agents, list):
+        return None, "the board's `agents` was not a list"
+    return len(agents), ""
 
 
 # ---- the pane ---------------------------------------------------------------
@@ -514,10 +752,21 @@ def main() -> int:
                          + DEFAULT_VIA + ")")
     ap.add_argument("--policy", action="store_true",
                     help="say what this machine will start, and exit. Starts "
-                         "nothing, claims nothing, posts nothing and consults "
-                         "nothing but the policy file — it is the question a "
-                         "caller asks before it offers somebody a button. Exits "
-                         "0 when spawning is enabled here, 3 when it is not")
+                         "nothing, claims nothing and posts nothing — it is the "
+                         "question a caller asks before it offers somebody a "
+                         "button. On a machine that has opted in it also reads the "
+                         "board's ceiling, bounded and failing open to the policy "
+                         "file, because a freeze is exactly what such a caller "
+                         "must see; a machine that has not opted in reaches "
+                         "nothing but its own config directory. Exits 0 when "
+                         "spawning is enabled here, 3 when it is not")
+    ap.add_argument("--no-board", action="store_true",
+                    help="with --policy: answer from the policy file alone, "
+                         "consulting no board at all. For a caller that asks this "
+                         "on a UI thread, where a board that is down would cost it "
+                         "five seconds of frozen screen per keystroke. The ceiling "
+                         "reported is then the FILE's, `max_sessions_source` says "
+                         "so, and the spawn path still applies the dial")
     ap.add_argument("--dry-run", action="store_true",
                     help="make every refusal, print what would run, start nothing "
                          "— and take no claim and post nothing")
@@ -536,6 +785,18 @@ def main() -> int:
         if args.json and not args.quiet:
             print(json.dumps(fields, indent=2))
 
+    if args.no_board and not args.policy:
+        # Refused rather than ignored, and through `say` so `--quiet` still means
+        # exit code only. On the spawn path the dial is what decides whether this
+        # box may start anything at all, so a flag that appeared to switch it off
+        # would be a caller believing it had opted out of a ceiling it is still
+        # subject to — and the one thing a gate must never do is look like it took
+        # an instruction it did not.
+        say("qb-start: --no-board answers --policy and nothing else. A spawn "
+            "applies the board's ceiling; there is no opting out of it from the "
+            "command line")
+        return MISUSE
+
     # ---- 1. the machine. FIRST, and before anything is imported, looked for or
     # asked. This is the default path and it has to cost nothing at all.
     policy = read_policy()
@@ -550,9 +811,26 @@ def main() -> int:
     #
     # It is the SAME `read_policy` the spawn path uses and it happens at the same
     # point, so it can never answer yes to a machine the next line would refuse.
-    # And it consults nothing else — no board, no tmux, no network — so a caller
-    # may ask it on every click without paying for it.
+    # It consults no tmux and takes no claim, and the ONE thing it does leave the
+    # box for is the ceiling — bounded at `DIALS_TIMEOUT` and failing open to the
+    # file, on a machine that has already said yes. See the block below for why
+    # that is worth a caller's five seconds and why the not-enabled path still
+    # touches nothing at all.
     if args.policy:
+        # The one thing `--policy` now leaves this box for, and the paragraph it
+        # edits is its own: this used to consult "nothing but the policy file",
+        # which was true and stopped being the right promise the moment the ceiling
+        # could be frozen from the board (#563). A caller asks this BEFORE it offers
+        # somebody a button, and `spawn.max_sessions: 0` is exactly the answer such
+        # a caller must have — a button that looks live, takes the click and then
+        # explains that the fleet is frozen has spent somebody's attention telling
+        # them something it could have known. The cost is one bounded GET that fails
+        # open to the file, on a machine that has already said yes; a box that never
+        # opted in still reaches none of it, which is the property that mattered.
+        ceilings = (read_ceilings(args.repo_path)
+                    if policy.enabled and not args.no_board
+                    else Ceilings(None, None, ""))
+        ceiling = policy.max_sessions if ceilings.machine is None else ceilings.machine
         allows = sorted(c for c in policy.commands & set(SPAWNABLE)
                         if admits(c, policy.commands)[0])
         # Named separately rather than silently dropped: a command the
@@ -563,14 +841,28 @@ def main() -> int:
         if policy.enabled:
             say(f"spawning is enabled here — {policy.where}")
             say(f"  allows: {', '.join(allows) or '(nothing — `commands` is empty)'}"
-                f"; up to {policy.max_sessions} at once")
+                f"; up to {ceiling} at once{ceiling_from(ceilings)}")
+            if ceilings.fleet is not None:
+                say(f"  and up to {ceilings.fleet} live across the whole board "
+                    f"(`{DIAL_FLEET}`)")
+            if ceilings.problem:
+                say(f"  the board's ceiling was not used: {ceilings.problem}")
             for c in withheld:
                 say(f"  listed but refused: {admits(c, policy.commands)[1]}")
         else:
             say(f"not enabled: {policy.refusal}")
+        # `max_sessions` stays the EFFECTIVE ceiling and does not change meaning:
+        # every caller reading it is asking "how many will this box run", and the
+        # answer to that is the dial when there is one. `max_sessions_policy` is
+        # the fallback underneath, named separately so a caller can tell a box
+        # that was configured at 2 from a fleet that was dialled to 2.
         out(enabled=policy.enabled, policy=policy.where, commands=allows,
             withheld=withheld,
-            max_sessions=policy.max_sessions, reason=policy.refusal or None,
+            max_sessions=ceiling, max_sessions_policy=policy.max_sessions,
+            max_sessions_source="board" if ceilings.machine is not None else "policy",
+            max_sessions_fleet=ceilings.fleet,
+            dials_problem=ceilings.problem or None,
+            reason=policy.refusal or None,
             spawnable=sorted(SPAWNABLE), triggers=sorted(TRIGGERS))
         return STARTED if policy.enabled else NOT_ENABLED
 
@@ -665,18 +957,65 @@ def main() -> int:
         return MISUSE
 
     # ---- 5. this machine's own ceiling.
+    #
+    # The DIAL first and the file behind it (#563). Asked here rather than beside
+    # `read_policy` so that a misuse — an unknown command, a missing number, a path
+    # that is not a checkout — still costs no board call: every refusal above this
+    # line is answerable from the file, and this is the first point at which the
+    # number is actually needed.
+    ceilings = read_ceilings(repo_path)
+    ceiling = policy.max_sessions if ceilings.machine is None else ceilings.machine
+    if ceilings.problem:
+        # Said, not acted on. A dial that could not be read leaves the file's number
+        # in force — the trade `qb-admit` makes for its own restriction — and an
+        # operator who set one is the only person who can tell whether that is the
+        # number they wanted.
+        say(f"qb-start: the board's ceiling was not used ({ceilings.problem})")
+        if ceilings.machine is None:
+            # Only when the FILE is what ended up answering. A refused repo-scoped
+            # row beside a good fleet one is worth reporting and is not a fallback,
+            # and saying "the file says 2" over a board ceiling of 5 would name the
+            # wrong number as the one in force.
+            say(f"  the ceiling is {policy.where}'s {policy.max_sessions}")
     running = live_spawns()
     if running is None:
         return refuse(AT_CAP, "this machine's spawned panes could not be counted",
                       "tmux is here and would not list its panes, so the ceiling "
                       "cannot be applied — and a cap that switches itself off when "
                       "its input goes unreadable is not one")
-    if len(running) >= policy.max_sessions:
+    if len(running) >= ceiling:
+        # The remedy names the layer that actually decided, because "raise
+        # max_sessions in ~/.config/quarterback/spawn.json" sends somebody to edit a
+        # file whose number is being overridden — and on this fleet that edit is a
+        # nix build, a PR and a rebuild before they find out it changed nothing.
+        where = (f"clear or raise `{DIAL_MACHINE}` on the board"
+                 if ceilings.machine is not None
+                 else f"raise `max_sessions` in {policy.where}")
         return refuse(AT_CAP,
-                      f"{len(running)} of {policy.max_sessions} spawned session(s) "
+                      f"{len(running)} of {ceiling} spawned session(s) "
                       f"are already running on this machine",
-                      "close one, or raise `max_sessions` in " + policy.where
-                      + (" (0 is a freeze)" if policy.max_sessions == 0 else ""))
+                      f"close one, or {where}"
+                      + (" (0 is a freeze)" if ceiling == 0 else ""))
+
+    # ---- 5b. the FLEET's ceiling. Only when one is set, and it fails OPEN — the
+    # module docstring has both arguments at length. In one line each: unset is how
+    # this fleet ran before the dial existed, and a gate that refused on an
+    # unreachable board would stop every box over a hiccup while the per-machine
+    # ceiling underneath is what actually bounds a runaway.
+    if ceilings.fleet is not None:
+        live, why_not = live_agents()
+        if live is None:
+            say(f"qb-start: could not count the fleet's live agents ({why_not}) — "
+                f"starting anyway, because this machine's own ceiling of {ceiling} "
+                f"is what bounds a runaway and it has already been applied")
+        elif live >= ceilings.fleet:
+            return refuse(AT_FLEET_CAP,
+                          f"{live} of {ceilings.fleet} agent(s) are live across the "
+                          f"whole board",
+                          "nothing on this box moves that — wait for a session to "
+                          "end, or raise `" + DIAL_FLEET + "` on the board. It "
+                          "counts every live agent and not only spawned ones, so "
+                          "seats somebody opened by hand are in that number")
 
     # ---- 6 and 7. THE GATES, AND ONE RULE OVER BOTH: a spawn proceeds only on a
     # definite go. Not "anything that is not a refusal" — an outage, a malformed
@@ -752,6 +1091,10 @@ def main() -> int:
     if args.dry_run:
         session = "<a fresh uuid4>"
         say(f"policy:   {policy.where}")
+        say(f"ceiling:  {len(running)} of {ceiling} on this machine"
+            f"{ceiling_from(ceilings)}"
+            + (f"; the fleet allows {ceilings.fleet}" if ceilings.fleet is not None
+               else ""))
         say(f"cwd:      {repo_path}")
         if kind is None:
             say("claim:    none — this command selects and claims its own "
@@ -766,7 +1109,10 @@ def main() -> int:
         out(started=False, dry_run=True, enabled=True, policy=policy.where,
             command=command, number=number, via=args.via,
             claim=None if kind is None else {"kind": kind, "value": number},
-            repo_path=repo_path, running=len(running), max_sessions=policy.max_sessions)
+            repo_path=repo_path, running=len(running), max_sessions=ceiling,
+            max_sessions_policy=policy.max_sessions,
+            max_sessions_source="board" if ceilings.machine is not None else "policy",
+            max_sessions_fleet=ceilings.fleet)
         return STARTED
 
     # ---- 8. the claim, through the ordinary path, before the process exists.

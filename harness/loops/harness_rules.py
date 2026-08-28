@@ -2285,8 +2285,8 @@ DIALS_ENV = "QUARTERBACK_DIALS"
 
 
 class Dial(NamedTuple):
-    """One board-settable dial: what shape its value takes, and which way it may
-    move.
+    """One board-settable dial: what shape its value takes, which way it may move,
+    and whether it is a path into a repo's rules at all.
 
     `kind` is checked against the value because an unreviewed channel that can
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
@@ -2329,6 +2329,34 @@ class Dial(NamedTuple):
     #: entry below carries one; a new dial that forgets is a picker row that says
     #: nothing, rather than a crash on the dashboard of whoever pulls it next.
     what: str = ""
+    #: WHAT THIS DIAL CONFIGURES, and it is the field that stopped this table being
+    #: the panel's (#563).
+    #:
+    #:   `rules`  a dotted path into a repo's resolved rules tree. `DEFAULTS` holds
+    #:            its built-in value, `apply_dials` overlays the board's on top, and
+    #:            `dial_layers` reports which layer answered. Every dial above.
+    #:   `fleet`  a setting nothing in the rules tree holds. It is validated, listed,
+    #:            offered by the picker and rendered by the dashboards exactly like
+    #:            the others, and it is read DIRECTLY by whichever tool it configures
+    #:            — never merged into a repo's config, because there is no repo in
+    #:            the question it answers.
+    #:
+    #: **The distinction is not a new namespace and this is deliberate.** #563 asked
+    #: whether `DIALS` is the panel's surface or the fleet's, and the answer was
+    #: already shipped rather than open: `app/api/dials.py` states that the board
+    #: does not know what a dial IS — the name is opaque text, the value opaque JSON,
+    #: and the vocabulary belongs to the client — and `tempo` (#474) has been drawn
+    #: as a dial by both dashboards for releases while this table has never held it.
+    #: The channel is the fleet's; the only thing that was the panel's is the two
+    #: lines of THIS module that assume a dial names a key in `DEFAULTS`. So a fleet
+    #: dial costs one field here rather than a second settings channel — which is
+    #: exactly what `BOARD_DIALS`' own no-second-source rule asks for.
+    #:
+    #: A fleet dial has no `DEFAULTS` entry, so `dial_specs` reports
+    #: `default_known: False` — and that is the honest answer rather than a hole in
+    #: this table: `spawn.max_sessions` falls back to a per-machine file that no
+    #: repo, and no board, can read.
+    applies: str = "rules"
 
 
 #: `reviewers.<seat>.enabled` is the interesting boundary and it gets the narrow
@@ -2350,6 +2378,13 @@ class Dial(NamedTuple):
 #: it needs it in exactly this direction, so the throttle inherits the rule rather
 #: than adding one.
 _NARROW_ONLY_ENABLED = "narrow"
+
+#: The two values `Dial.applies` takes, named rather than spelled at every site —
+#: `applies="fleet"` on a dial and `applies == _APPLIES_RULES` in the resolver are
+#: the same word, and a typo in one of them is a dial that silently stops being
+#: overlaid.
+_APPLIES_RULES = "rules"
+_APPLIES_FLEET = "fleet"
 
 #: The dials the board may set. **The dials whose value is a judgement about COST
 #: rather than about capability** — which is the line #305 draws and the reason
@@ -2460,6 +2495,39 @@ BOARD_DIALS: dict[str, Dial] = {
            "flag", False, _NARROW_ONLY_ENABLED,
            f"whether the {seat} seat is dispatched on a round")
        for seat in DEFAULTS[_LOCAL_BLOCK]},
+    # ---- and here the table stops being the panel's (#563) --------------------
+    #
+    # `spawn.json` carries three keys and one of them was never a permission.
+    # `enabled` and `commands` say what a box MAY do and stay in the nix-written,
+    # read-only file for `qb-start`'s own reason — *"a permission with a convenient
+    # bypass is not one"*, and a board a machine cannot reach must not be able to
+    # decide whether that machine may start agents at all. `max_sessions` says how
+    # HARD it may work, which is the `in_flight.max` side of the line that same file
+    # draws: a restriction, counting a resource rather than guarding a door. It was
+    # in the permission file only because that is where it was written, and it
+    # inherited the permission file's deployment path — a nix edit, a build, a PR, a
+    # merge, a `nixos-rebuild` and a human with the password, for a number.
+    #
+    # `0` IS A FREEZE, and it is the direction that matters. It is the only control
+    # that stops a box spawning without switching the mechanism off, and calming a
+    # fleet that is working too hard should not require a rebuild at exactly the
+    # moment nobody wants to be running one.
+    #
+    # SAFE TO PUT ON THE BOARD BECAUSE WRITES ARE HUMAN-ONLY. `set_dial` and
+    # `clear_dial` take `Depends(human)` and `app/api/dials.py` calls that the
+    # security argument, so an agent may read its own ceiling and cannot raise it —
+    # which is the whole of what makes this a throttle rather than an escalation.
+    "spawn.max_sessions": Dial("number", False, "either",
+        'agent sessions one machine may have spawned and running at once; 0 is a freeze',
+        applies=_APPLIES_FLEET),
+    # The half that has no local meaning, which is why it has no file to fall back
+    # to. A per-machine file cannot express a fleet-wide number, and five boxes each
+    # carrying a copy is how five boxes come to disagree about what the limit is.
+    # UNSET IS NO CEILING: the fleet ran without one until this existed, and the
+    # per-machine ceiling underneath is the real safety net.
+    "spawn.max_sessions_fleet": Dial("number", False, "either",
+        'agent sessions live across the whole board before a spawn is refused',
+        applies=_APPLIES_FLEET),
 }
 
 #: The severity bands a floor may name. `P0` is deliberately absent: the panel's
@@ -2799,6 +2867,13 @@ _KIND_HINTS = {
 #: meet and where the ignoring actually happens.
 _NARROW_NOTE = "narrow only — the board may switch this off, never back on"
 
+#: Said whenever a `fleet` dial is about to be typed into. Two things a person at
+#: that box cannot see otherwise: nothing in this repo's rules holds it, so the
+#: `default` line is blank rather than broken, and the value lands on every machine
+#: on the board rather than on the repo whose screen they are looking at.
+_FLEET_NOTE = ("fleet configuration — no repo's rules hold it, so it has no "
+               "built-in default here and it is read by the tool it names")
+
 
 def dial_choices(path: str) -> tuple[str, ...]:
     """The values this dial accepts, when there is a closed set of them.
@@ -2884,7 +2959,18 @@ def dial_specs() -> dict[str, dict]:
             "default_known": known,
             "choices": list(dial_choices(path)),
             "hint": dial_hint(path),
-            "note": _NARROW_NOTE if dial.rule == "narrow" else "",
+            #: WHICH TREE THIS DIAL LIVES IN — `rules` or `fleet` (#563). A client
+            #: needs it to read `default_known: False` correctly: on a rules dial
+            #: that is a hole in this table, and on a fleet dial it is the truth,
+            #: because the fallback is a per-machine file no board can read.
+            "applies": dial.applies,
+            #: Both notes when both apply, so neither is lost to the other. Joined
+            #: rather than listed because every consumer of this field draws it as
+            #: one line under the value box.
+            "note": "; ".join(
+                n for n in (_NARROW_NOTE if dial.rule == "narrow" else "",
+                            _FLEET_NOTE if dial.applies != _APPLIES_RULES else "")
+                if n),
         }
     return out
 
@@ -2910,6 +2996,34 @@ def dial_problem(path: str, value: Any) -> str:
                 f"list, not the board — a dial the board holds and nothing applies "
                 f"is worse than no dial at all")
     return _dial_problem(path, dial, value)
+
+
+def dial_scope_problem(path: str, repo: str | None) -> str:
+    """Why this dial may not be set at this SCOPE, or `""` — asked BEFORE the write.
+
+    The board takes either scope for any dial, on purpose: `dial` is opaque text
+    there and `repo` is just a column, so a repo-scoped `spawn.max_sessions` is
+    accepted, stored, and reported as in force for ever while nothing reads it. That
+    is the same shape as a misspelt name and it is answered in the same place — the
+    client, which is the only side that knows what a dial IS.
+
+    **A fleet dial has no repo answer, and that is not a limitation of the storage.**
+    `spawn.max_sessions` bounds panes on one tmux server, counted by `live_spawns()`,
+    which does not know which checkout each pane is in — so with `acme/widget` at 5
+    and `acme/gadget` at 2 there is no question the count has answered. A scope that
+    cannot mean anything must be refused where it is typed, not stored and ignored.
+
+    The other direction is deliberately NOT refused. A rules dial is legitimately
+    fleet-scoped — that is how one value covers every watched repo, and most of this
+    fleet's dials are set that way.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None or dial.applies == _APPLIES_RULES or not repo:
+        return ""
+    return (f"`{path}` is fleet configuration and cannot be set for one repo. It is "
+            f"read directly by the tool it names, which has no repo in the question "
+            f"it answers — a row scoped to {repo} would be stored, reported as in "
+            f"force, and applied by nothing. Set it with no repo")
 
 
 def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
@@ -3032,6 +3146,15 @@ def apply_dials(cfg: dict, dials: dict[str, dict]) -> tuple[dict[str, dict], lis
     problems: list[str] = []
     for path, entry in sorted(dials.items()):
         dial = BOARD_DIALS[path]
+        if dial.applies != _APPLIES_RULES:
+            # Not this config's business and NOT a problem (#563). A fleet dial is
+            # read directly by the tool it configures — `spawn.max_sessions` by
+            # `qb-start`, which has no repo to resolve and would not consult one —
+            # so there is nothing here to override and nothing to complain about.
+            # Reported as a problem it would put a line about the fleet's spawn
+            # ceiling into the provenance of every panel round on every repo, which
+            # is how a correct setting comes to read as a misconfiguration.
+            continue
         current, present = _get_dial(cfg, path)
         if not present:
             # The dial exists in DEFAULTS but not in this resolved config, which

@@ -760,3 +760,61 @@ def test_the_reason_the_table_is_unreadable_is_the_one_that_is_printed(tui):
         assert "not checked here" in text_of(screen, "#spec")
 
     drive(tui, modal(tui, {}, in_force={}, trouble=said), steps)
+
+
+# ------------------------------- #563: a fleet dial has no per-repo answer
+
+def test_a_fleet_dial_typed_on_a_repo_screen_is_refused_here(tui, vocabulary):
+    """The board takes it — `dial` is opaque text there and `repo` is just a column
+    — so a fleet dial written for one repo is accepted, stored, reported as in force
+    for ever, and read by nothing. That is a misspelt name's failure arriving through
+    the scope line, and it is answered in the same place for the same reason: this
+    side is the only one that knows what a dial IS."""
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = "spawn.max_sessions"
+        field(screen, "#f_value").value = "3"
+        field(screen, "#f_reason").value = "calming this box"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+        said = text_of(screen, "#err")
+        assert "cannot be set for one repo" in said, said
+        assert "Set it with no repo" in said, said
+
+    _, got = drive(tui, modal(tui, vocabulary), steps)
+    assert got == "not dismissed"
+
+
+def test_the_same_dial_at_the_fleet_scope_is_written(tui, vocabulary):
+    """The half that proves the refusal is about the SCOPE and not the dial. A
+    picker that would not set `spawn.max_sessions` at all would be a dial nobody can
+    turn, which is the state #563 is fixing."""
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = "spawn.max_sessions"
+        field(screen, "#f_value").value = "3"
+        field(screen, "#f_reason").value = "calming the fleet"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+
+    _, got = drive(tui, modal(tui, vocabulary, repo=None), steps)
+    assert got and got != "not dismissed", got
+    assert got["dial"] == "spawn.max_sessions" and got["repo"] is None
+
+
+def test_a_rules_dial_is_still_settable_for_one_repo(tui, vocabulary):
+    """The direction deliberately NOT refused, and most of this fleet's dials use
+    it: a rules dial is legitimately either scope, and one value covering every
+    watched repo is what the fleet scope is for."""
+    async def steps(screen, pilot):
+        field(screen, "#f_dial").value = "review_panel.max_rounds"
+        field(screen, "#f_value").value = "3"
+        field(screen, "#f_reason").value = "one more round here"
+        await pilot.pause()
+        screen.action_save()
+        await pilot.pause()
+
+    _, got = drive(tui, modal(tui, vocabulary), steps)
+    assert got and got != "not dismissed", got
+    assert got["repo"] == REPO
+
