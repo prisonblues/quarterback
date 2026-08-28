@@ -456,10 +456,36 @@ So, per finding:
 - **An unverifiable claim is exempt too, for the same reason** (#547) — see the next
   section, which is where the fourth road arrives.
 
-### 4c. The round's unverifiable claims — a fourth road, and the only one with a flag
+**If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
+the relay that you did and why. Below the gate the row is the *only* record, so a
+board that refused the write and a gate that suppressed the issue between them lose
+the finding outright — which is the one outcome this setting must never produce. The
+tracker is the fallback, not the default.
+
+**Do not mark your own findings `refuted` unattended.** That is a self-grading
+loop and #40's constraint applies for the same reason. The board cannot tell a
+fixer from a reviewer, so it does not refuse — it records `set_by` from your
+token, marks the row unattested, names it back in the response, and `/panel`
+shows the split. When a human has confirmed the refutation, send `attested_by`;
+when one has not, record it anyway (an unattested refutation on the board beats
+one in a comment nothing reads) and say so in the relay.
+
+**`attested_by` is a claim you are making, not a signature the board checked** —
+it is free text in your own request, stored beside your identity and rendered as
+"you claim signoff by X". Sending it for a human who did not actually confirm is
+the one way to corrupt the number this whole feature exists to produce.
+
+Re-reporting is safe and every edit is visible: a repeat FILLS an empty field,
+rewriting a stored one counts as a revision and comes back in `amended`, an
+explicit `null` clears a field (how you retract a mistaken attestation), and a
+changed answer keeps what it changed from. The status code says which happened —
+201 created, 200 updated, 422 when nothing was accepted — so `qb`'s exit status
+is worth reading rather than assuming.
+
+## 4c. The round's unverifiable claims — a fourth road, and the only one with a flag
 
 The report's **Unverifiable claims** block lists what this PR asserts that nothing in
-the review could check: the claim, a key (`uc-` and eight hex), and what instrument
+the review could check: the claim, a key (`uc-` and twelve hex), and what instrument
 *would* settle it. They are not findings. Nobody is asked to patch one, there is no
 severity, and the fixer never sees them — the judge ruled that no seat here could have
 settled them with what it was given, which is a fact about the instrument and not
@@ -492,32 +518,6 @@ holds because it looks like assurance. If a claim comes back next round under a 
 key, the judge reworded it — the key is derived from the claim's text and absorbs
 spelling but not rewording — and the run says so in `config_notes` rather than
 silently ignoring the stale one.
-
-**If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
-the relay that you did and why. Below the gate the row is the *only* record, so a
-board that refused the write and a gate that suppressed the issue between them lose
-the finding outright — which is the one outcome this setting must never produce. The
-tracker is the fallback, not the default.
-
-**Do not mark your own findings `refuted` unattended.** That is a self-grading
-loop and #40's constraint applies for the same reason. The board cannot tell a
-fixer from a reviewer, so it does not refuse — it records `set_by` from your
-token, marks the row unattested, names it back in the response, and `/panel`
-shows the split. When a human has confirmed the refutation, send `attested_by`;
-when one has not, record it anyway (an unattested refutation on the board beats
-one in a comment nothing reads) and say so in the relay.
-
-**`attested_by` is a claim you are making, not a signature the board checked** —
-it is free text in your own request, stored beside your identity and rendered as
-"you claim signoff by X". Sending it for a human who did not actually confirm is
-the one way to corrupt the number this whole feature exists to produce.
-
-Re-reporting is safe and every edit is visible: a repeat FILLS an empty field,
-rewriting a stored one counts as a revision and comes back in `amended`, an
-explicit `null` clears a field (how you retract a mistaken attestation), and a
-changed answer keeps what it changed from. The status code says which happened —
-201 created, 200 updated, 422 when nothing was accepted — so `qb`'s exit status
-is worth reading rather than assuming.
 
 ## 5. Re-review the fix commit — the round that used to be skipped
 
