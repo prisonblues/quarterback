@@ -2223,21 +2223,39 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
 #: is the fail-closed direction on purpose: a seventh CI state added to
 #: `CI_STATE_WORDS` next year vetoes until somebody argues it into this set, rather
 #: than passing silently the way `none` did before #546.
-CI_SETTLED = frozenset({"PASS", "FAIL"})
+#:
+#: #548's `local-pass` is the first state to be argued in, and the argument is the
+#: one this set is for: a suite that RAN on this exact commit and passed is execution
+#: evidence, which is the only thing the veto is asking about. It is weaker evidence
+#: than a green CI run and every renderer says so, but "weaker" is not the axis —
+#: nothing here grades evidence, it asks whether the round had any.
+#:
+#: **`local-fail` is deliberately NOT in here, and that is the one asymmetry with
+#: `FAIL` above.** The reason `FAIL` costs the round nothing is spelled out two
+#: sentences up and comes with its own precondition: `preland.check_ci` refuses the
+#: merge on red anyway, and "that division is only sound while both gates are
+#: applied". For a local failure the second gate does not exist — `preland.check_ci`
+#: reads GitHub and has never heard of the local run — so on the one repo that can
+#: reach this state with the merge gate satisfied (`preland.disabled_checks: ["ci"]`,
+#: which is also what exempts `none` below) a red suite would buy a confident stop
+#: and a merge together. It vetoes instead, which costs a repo with a genuinely red
+#: suite exactly one more round of the loop that is already trying to fix it.
+CI_SETTLED = frozenset({"PASS", "FAIL", panel_scope.LOCAL_PASS})
 
 #: One sentence per state, because each says a different thing — the discipline
-#: `_ci_line` and `ci_brief` already keep, and the reason #548 is a separate issue
-#: from this one. Every line names a cause somebody can discharge; none of them is
-#: discharged by a human acknowledging it.
+#: `_ci_line` and `ci_brief` already keep. Every line names a cause somebody can
+#: discharge; none of them is discharged by a human acknowledging it.
 #:
 #: "No settled result" and NOT "nothing executed", which is the stronger claim and
-#: is false of two of these four: `PENDING` can be a suite whose other checks have
-#: already passed, and `unknown` is a lookup that failed and says nothing either
-#: way about what ran. Only `none` and `blocked` are claims about execution. The
-#: veto is the same for all four — none of them gives the round a result to earn
-#: its confidence on — but the wording has to survive being read closely, because
-#: could-not-check is not nothing-to-report and this whole change is about not
-#: conflating those.
+#: is false of three of these six: `PENDING` can be a suite whose other checks have
+#: already passed, `unknown` is a lookup that failed and says nothing either way
+#: about what ran, and `local-unknown` is a command that was started and did not
+#: report. `none`, `blocked` and `local-fail` are the three that really are claims
+#: about execution, and the last of them is the only entry here where something ran
+#: and produced an answer. The veto is the same for all six — none of them gives the
+#: round a result it can earn its confidence on — but the wording has to survive
+#: being read closely, because could-not-check is not nothing-to-report and this
+#: whole change is about not conflating those.
 CI_UNSETTLED = {
     # #501 already gives a PENDING build a bounded wait before the seats are
     # dispatched. This is the residue AFTER that wait — the honest case its own
@@ -2246,16 +2264,33 @@ CI_UNSETTLED = {
     # have finished green.
     "PENDING": "CI had not settled when the seats were dispatched — no complete "
                "suite result exists for this commit yet",
-    # The case #546 is about, and one of the two here that really is a statement
+    # The case #546 is about, and one of the three here that really is a statement
     # about execution. #324 is what made this distinguishable from `blocked` at
-    # all, and #548 is the proposal to fill the empty channel at source rather
-    # than only pricing its emptiness here.
+    # all. Since #548 it also carries a second fact by implication: a round that
+    # reaches this state either declared no `review_panel.local_suite` or could not
+    # run the one it declared, because a suite that RAN would have replaced this
+    # status with one of the three below. The config note says which, and it is a
+    # note rather than a longer sentence here — this is the veto's vocabulary, and
+    # the reason a channel is empty belongs to whoever configures it.
     "none": "no CI run exists for this commit — nothing mechanical executed "
             "this code",
     # #324's state, and it must not borrow `none`'s sentence: a run EXISTS. It
     # simply will not execute until a person clicks, so it contributes nothing.
     "blocked": "a CI run exists for this commit and is gated on a human "
                "approval — it has executed nothing",
+    # #548's two vetoing states. `local-fail` is a claim about execution and the
+    # only one here that is not about a MISSING result: something ran and it was
+    # red. It vetoes for the reason `CI_SETTLED` gives — no merge gate reads it —
+    # and its sentence says which, so nobody reading a veto list mistakes it for a
+    # round that had nothing to go on.
+    panel_scope.LOCAL_FAIL:
+        "the repo's own suite was run locally on this commit and failed — and no "
+        "merge gate reads that result, so nothing else will stop it",
+    # Like `unknown` and not like `none`: a command was started and told us
+    # nothing. Whether it executed any of the code is exactly what is not known.
+    panel_scope.LOCAL_UNREAD:
+        "the repo's own suite was run locally on this commit and produced no "
+        "result — no settled suite result exists for it either way",
     # Not "nothing ran" — nobody knows whether anything ran. Could-not-check is
     # not nothing-to-report, and stating it as the former would be the same
     # conflation this veto exists to undo.

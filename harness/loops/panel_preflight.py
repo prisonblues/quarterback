@@ -83,6 +83,11 @@ from dataclasses import dataclass, field
 
 from panel_core import (ARGV_PROMPT_MAX_BYTES, CLI_BIN, seat_installed,
                         _diff_file_path)
+# `_ci_line` renders #548's states, so it names them rather than spelling the three
+# strings a second time — a state named in two places is a state the two places can
+# come to disagree about, and this one is compared for equality in four modules. The
+# import is one-way: panel_scope sits on panel_core and knows nothing of this module.
+from panel_scope import LOCAL_FAIL, LOCAL_PASS, LOCAL_UNREAD
 
 # ----------------------------------------------------------------------------- tunables
 
@@ -1447,10 +1452,10 @@ def move_manifest(diff: str, shape: DiffShape | None = None,
 
 def _ci_line(status: str, failing: tuple[str, ...] = (), skip: str = "") -> str:
     """One line of CI reading for a human, over :func:`panel_scope.review_ci`'s six
-    states plus "not read at all".
+    states, #548's three local ones, plus "not read at all".
 
-    Deliberately not :func:`panel_scope.ci_brief`, which covers the same six
-    states: that text is written AT a reviewer model ("do not spend a finding or a
+    Deliberately not :func:`panel_scope.ci_brief`, which covers the same states:
+    that text is written AT a reviewer model ("do not spend a finding or a
     `could_not_assess` entry on them") and is a paragraph, and both are wrong under
     a refusal notice whose whole point is that no model was involved. What the two
     must agree about is the discipline, not the words — `PENDING`, `none` and
@@ -1480,6 +1485,26 @@ def _ci_line(status: str, failing: tuple[str, ...] = (), skip: str = "") -> str:
     if status == "none":
         return ("NO RUN EXISTS for this commit, so there is no suite result either "
                 "way. This is not a pass.")
+    # #548's three. A refusal never runs a local suite — nothing is dispatched, so
+    # there is nobody to raise the floor under, and spending fifteen minutes of test
+    # run on a round that reviews nothing would contradict "a refusal must cost
+    # nothing". They are rendered anyway, because the alternative is the catch-all
+    # below telling a human that a suite which ran and passed "could NOT be read",
+    # and a renderer that lies about the one state it never sees today is a renderer
+    # that lies the first day something calls it with one.
+    if status == LOCAL_PASS:
+        return ("PASSED, but LOCALLY — no GitHub run exists for this commit, so the "
+                "repo's own suite was run on this box instead. Weaker evidence than a "
+                "green CI run and not a substitute for one: different machine, and "
+                "nothing says this is the commit that will merge.")
+    if status == LOCAL_FAIL:
+        return (f"FAILED LOCALLY — no GitHub run exists for this commit, so the repo's "
+                f"own suite was run on this box and it went red: "
+                f"{', '.join(failing) or 'names unavailable'}. This is not a pass.")
+    if status == LOCAL_UNREAD:
+        return ("was ATTEMPTED LOCALLY and produced no result"
+                + (f" ({skip})" if skip else "")
+                + " — no GitHub run exists for this commit either. This is not a pass.")
     return ("could NOT be read" + (f" ({skip})" if skip else "")
             + ". Its result is unknown. This is not a pass.")
 

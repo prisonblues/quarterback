@@ -1792,6 +1792,76 @@ def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     return fallback            # unreachable; `_refuse_value` always raises
 
 
+#: The most a repo may make a round wait before it dispatches a seat, whatever
+#: `review_panel.local_suite_timeout` says. An hour, and the number matters less than
+#: having one: a ceiling is what makes `inf` and `nan` refusals rather than special
+#: cases — both fail `0 < x <= LOCAL_SUITE_TIMEOUT_MAX` without a second branch, and
+#: `inf` is exactly the spelling of "no bound" that #548's whole timeout exists to
+#: refuse. A suite that genuinely needs longer than this wants CI, not a panel round
+#: sitting on it.
+LOCAL_SUITE_TIMEOUT_MAX = 3600
+
+
+def local_suite_commands(panel: dict) -> tuple[str, ...]:
+    """`review_panel.local_suite` (#548) — what to run when GitHub CI has nothing to
+    say about this commit, as a tuple of command strings, or ``()`` for off.
+
+    Off is the default and off is what every repo on the fleet gets until it writes
+    this key, which is the posture a setting that EXECUTES SOMETHING has to have.
+    One string is one command; a list is several, run in order, which is the shape
+    the issue asks for — `make test`, plus a DB-backed target on a box that has the
+    service. Each is split with `shlex` and run without a shell (see
+    :func:`panel_scope.review_local_suite`), so `make test` and `uv run pytest -q`
+    both work and `make test && make test-db` does not: the list is where "and then"
+    is spelled, and a shell would make the value a place to write a pipeline nobody
+    reviewed as one.
+
+    **Refused rather than defaulted**, like every other known key this harness reads:
+    a `local_suite` that is a number or a nested object is a typo, and quietly
+    running nothing would leave a repo believing its suite is being run every round.
+    An empty list and `null` are both legitimate spellings of off — that is a repo
+    saying "not here", not a repo getting it wrong.
+    """
+    raw = panel.get("local_suite")
+    if raw is None or raw is False or raw == "" or raw == []:
+        return ()
+    if isinstance(raw, str):
+        return (raw.strip(),) if raw.strip() else ()
+    if (isinstance(raw, (list, tuple)) and raw
+            and all(isinstance(c, str) and c.strip() for c in raw)):
+        return tuple(c.strip() for c in raw)
+    _refuse_value("local_suite", raw,
+                  "a command string, or a list of command strings (`null` or `[]` "
+                  "for off)")
+    return ()                  # unreachable; `_refuse_value` always raises
+
+
+def local_suite_timeout(panel: dict) -> float:
+    """`review_panel.local_suite_timeout` (#548) — the wall clock the whole declared
+    run may take, in seconds, before it is reported as not having finished.
+
+    Bounded at both ends and refused outside them. Zero or negative is not a budget
+    and would report every suite as timed out before it started, which is a veto
+    dressed as a measurement; above :data:`LOCAL_SUITE_TIMEOUT_MAX` is a round that
+    has stopped being a round. `true` is refused for `fix_injection_limit`'s reason —
+    ``isinstance(True, int)`` is True, so a bool that fell through would become a
+    one-second budget — and `false` is NOT honoured as an off switch here, unlike the
+    brakes: the off switch for this feature is `local_suite`, and a repo that wrote
+    `local_suite_timeout: false` while leaving a command in place has said something
+    this cannot act on.
+    """
+    raw = panel.get("local_suite_timeout")
+    if raw is None or raw == "":
+        return float(LOCAL_SUITE_TIMEOUT)
+    if (not isinstance(raw, bool) and isinstance(raw, (int, float))
+            and 0 < raw <= LOCAL_SUITE_TIMEOUT_MAX):
+        return float(raw)
+    _refuse_value("local_suite_timeout", raw,
+                  f"a number of seconds greater than 0 and at most "
+                  f"{LOCAL_SUITE_TIMEOUT_MAX} (omit it for {LOCAL_SUITE_TIMEOUT})")
+    return float(LOCAL_SUITE_TIMEOUT)   # unreachable; `_refuse_value` always raises
+
+
 def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
                        ceiling: int | None = None) -> int:
     """The round cap: the CLI's answer if it gave one, else the repo's
@@ -4188,6 +4258,7 @@ import panel_scope               # noqa: F401
 #: them silently. Generated from the module's own top level, so a helper added here
 #: is exported without anyone remembering to list it.
 __all__ = [
+    "LOCAL_SUITE_TIMEOUT_MAX", "local_suite_commands", "local_suite_timeout",
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",

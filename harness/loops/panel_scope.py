@@ -2176,9 +2176,14 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
 
     * **`PENDING`/`blocked`/`none`/`unknown` must never read as `PASS`.** "CI has
       not run yet" and "CI passed" are different facts, and a reviewer told the
-      wrong one is worse off than one told nothing. Each of the six states says
+      wrong one is worse off than one told nothing. Each of the nine states says
       which it is — `blocked` being #324's, for a run that exists, will not execute
       without a person, and so reports nothing at all.
+    * **A local run must never read as a CI run** (#548). The three `local-*` states
+      are the repo's own suite executed on this box when GitHub had nothing to say,
+      and each of them opens by saying so before it says anything else. They are
+      weaker evidence than the state they stand in for, and a seat that cannot tell
+      which it was handed would draw a conclusion the evidence does not carry.
     * **A pass is not a licence to stop looking.** It says every test we thought
       to write passed — not that the code is correct. A reviewer treating green as
       evidence of correctness has stopped reviewing, and this repo's whole
@@ -2186,6 +2191,12 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
     * **It never adds a fetch.** If `review_ci` was skipped or unreadable the
       brief says so, rather than retrying to make the prompt tidier.
     """
+    # One header for all nine states, and the WORDS that follow it are what say
+    # which channel answered. A header that varied ("CI:" / "Local suite:") would
+    # let a seat skim the label and miss the distinction the body spends a sentence
+    # making — and the two are the same question about the same commit, asked of
+    # two sources of differing strength, which is exactly what one heading with a
+    # careful body says and two headings do not.
     head = "CI (the repo's own test suite, run on this exact commit):"
     if status == "PASS":
         body = ("PASSED. Every test the project has thought to write is green on this commit. "
@@ -2216,6 +2227,36 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
         body = ("NO RUN EXISTS for this commit, so there is no suite result either way. "
                 "This is not a pass. It means nothing mechanical has looked at this "
                 "code, which is a fact about the commit rather than about the repo.")
+    elif status == LOCAL_PASS:
+        # #548. Everything `PASS` says, plus the sentence that keeps the two apart.
+        # A seat told "the suite passed" and left to assume it was CI's would draw a
+        # stronger conclusion than the evidence carries, which is the failure the
+        # first bullet above names — so the weakness is stated in the same breath as
+        # the refutation rather than in a footnote nothing reads.
+        body = ("NO GITHUB RUN EXISTS for this commit, so the repo's own suite was run "
+                "HERE instead, on a checkout at this exact commit, and it PASSED. That "
+                "REFUTES findings of the form \"this new test never runs\", \"this may "
+                "not even import\", or \"this migration looks syntactically incomplete\" "
+                "— do not spend a finding or a `could_not_assess` entry on them. Two "
+                "limits on it. It is NOT evidence the code is correct: it says nothing "
+                "about a case nobody wrote a test for, which is where the defects you "
+                "are looking for live. And it is WEAKER than a green CI run — a "
+                "different machine, possibly different service versions, and no "
+                "guarantee this is the commit that will merge.")
+    elif status == LOCAL_FAIL:
+        named = ", ".join(failing) if failing else "command names unavailable"
+        body = (f"NO GITHUB RUN EXISTS for this commit, so the repo's own suite was run "
+                f"HERE instead, on a checkout at this exact commit, and it FAILED: "
+                f"{named}. Something the project already tests is broken by this diff. "
+                "Treat that as a fact you may reason from, not as a finding to "
+                "re-report — it is already visible to everyone.")
+    elif status == LOCAL_UNREAD:
+        body = ("NO GITHUB RUN EXISTS for this commit. The repo's own suite was run HERE "
+                "instead and produced no result"
+                + (f" ({skip})" if skip else "")
+                + ". This is not a pass, and it is not a failure either: nothing was "
+                "established either way, so anything you would have checked against a "
+                "green suite is still unchecked.")
     else:
         body = ("could NOT be read"
                 + (f" ({skip})" if skip else "")
@@ -2372,6 +2413,317 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
     return status, failing, skip, round(now() - started, 1)
 
 
+# ------------------------------------------- #548: the empty channel, filled locally
+#
+# #501 built a channel and #546 priced its emptiness. `none` is the state neither of
+# them can help: there is nothing to wait for and nothing to read, so every seat is
+# told "no run exists for this commit" about a repo that may have a perfectly good
+# suite sitting in it. On the PR that prompted this the channel was empty for a
+# structural reason — a stacked PR whose CI branch filter never fired — and no
+# amount of waiting was ever going to fill it.
+#
+# So the repo's OWN suite is run once, before the seats are dispatched, and its
+# result travels down the same channel in the same vocabulary.
+#
+# **Evidence, not a seat.** `ALL_REVIEWERS` is a list of things that produce
+# FINDINGS — sonar is a member because it produces them, in a different shape,
+# through an API. A test run produces EVIDENCE, and evidence has a channel already:
+# it raises the floor under every seat at once instead of adding a fifth voice with
+# a coverage row whose meaning is not the question the other rows answer. It is also
+# not "give the seats a shell": three vendor CLIs each holding a live database is
+# expensive, nondeterministic, and costs the seats the independence that is the only
+# reason to seat four of them. One execution, attributable to one commit, shared by
+# all of them — the shape `review_ci` already has.
+#
+# **Three things it must never become**, each of them a way this would do more harm
+# than the gap it fills:
+#
+#   * *It must never read as CI.* A local run is weaker evidence — a different box,
+#     possibly different service versions, and nothing guaranteeing this is the
+#     commit that merges. So it gets three states of its OWN rather than borrowing
+#     PASS and FAIL, and every renderer says which one it is reading. That is
+#     `_ci_line`'s refusal to let a missing gate read as a green one, one step along.
+#   * *It must never loosen a merge gate.* `preland.check_ci` reads GitHub and has
+#     never heard of this; a repo whose CI reports nothing is refused there exactly
+#     as it was before. A local pass can buy a round its confident stop — which is
+#     the point — and it cannot buy a merge. The board agrees without being told:
+#     `app.ordering` compares `ci_status` against `PASS` and `FAIL` for EQUALITY and
+#     treats everything else as neither known-green nor known-red, so a `local-pass`
+#     reaching the plan orders it as conservatively as a `none` would. That is the
+#     fail-closed direction and it is left alone deliberately — the board is ordering
+#     work for people, and "a suite passed on somebody's laptop" is not the fact its
+#     green rule is about.
+#   * *It must never run code nobody chose to put on this box.* See
+#     :func:`_local_head_problem`, which is the security boundary of the feature.
+#
+# **The honest limit, recorded before anyone leans on it.** This answers a SUBSET.
+# On the PR that prompted the issue the open questions were a jsonb size ceiling,
+# whether a reader delivers a field to a browser, and whether stored rows are now a
+# mixed corpus — a test database holds no corpus, so a local `make test` would have
+# answered none of the three. This is the structural fix for a class, not a fix for
+# that round.
+
+#: The CI states a local run may answer FOR: the three where GitHub has nothing to
+#: say. `PASS` and `FAIL` are real results about this exact commit and a weaker
+#: reading must never displace either. `PENDING` is excluded because it belongs to
+#: #501's bounded wait, which is in the business of turning it into one of those
+#: two — running a local suite instead of waiting would spend minutes to arrive at
+#: a worse answer than the one already on its way.
+LOCAL_SUITE_WHEN = frozenset({"none", "blocked", "unknown"})
+
+#: The three states a local run can produce. Deliberately NOT members of
+#: `CI_STATE_WORDS`: that mapping is `qbdata.CI_STATES` in this module's vocabulary
+#: and every one of its names is something GitHub can report, which none of these
+#: is. They are lower-case for #324's reason — the three shouted names are #91's and
+#: are in prompts, payloads and a refusal notice — and hyphenated so that no reader
+#: skimming a payload can mistake one for `PASS`.
+LOCAL_PASS = "local-pass"
+LOCAL_FAIL = "local-fail"
+LOCAL_UNREAD = "local-unknown"
+LOCAL_STATES = (LOCAL_PASS, LOCAL_FAIL, LOCAL_UNREAD)
+
+#: Wall clock for the WHOLE declared run, not per command. A ceiling per command
+#: bounds nothing: a repo declaring four of them would get four times the number it
+#: read in the docs, and the thing being bounded is how long a round waits before it
+#: dispatches a seat.
+#:
+#: The bound fails in the honest direction, which is the same discipline
+#: `review_ci_settled`'s does: a run that does not finish is reported as not having
+#: finished (:data:`LOCAL_UNREAD`) and vetoes. It never becomes a pass, and it never
+#: silently becomes a failure either — "the suite is broken" and "the suite did not
+#: fit in the budget" are different facts about a diff, and only the first is one a
+#: reviewer should reason from.
+LOCAL_SUITE_TIMEOUT = 900
+
+#: How much of a failing command's own output is handed back to the caller, out of
+#: the :data:`LOCAL_SUITE_TAIL_BYTES` the run kept. Enough to recognise which
+#: assertion went red, on one line. It reaches the operator's terminal and the
+#: round's payload — never a prompt and never the `config_notes` `--post` publishes;
+#: see :func:`review_local_suite` for which reader is which.
+LOCAL_SUITE_GIST = 400
+
+
+def _local_head_problem(root: str, head_sha: str) -> str:
+    """Why the declared suite must NOT be run in `root`, or ``""`` when it may.
+
+    **This is the security boundary of the whole feature**, so it refuses by default
+    and every uncertain answer is a refusal too. What it forbids is the panel
+    executing a command out of a rules file against code somebody merely pointed it
+    at. `panel.py --repo x --pr N` reviews a PR without ever checking it out — the
+    diff and the seats' trees come from the forge (`fetch_increment`,
+    `fetch_pr_tree`) precisely so that nothing has to be — and a feature that read
+    `local_suite` from one branch and ran it over another would turn a review into an
+    execution channel for a PR nobody has read.
+
+    The rule is that the checkout must ALREADY be at the PR's head. Then whoever
+    checked that branch out has accepted this code on this box, and running its test
+    suite adds no capability that `git checkout` did not: the fix loop that calls the
+    panel is sitting in exactly that worktree, which is the case this exists to
+    serve. It also means the command, the rules file and the code under test are one
+    commit, so a :data:`LOCAL_PASS` is attributable to the sha the round reports.
+    Anything else and the panel keeps today's behaviour and the seats are told CI
+    reports nothing, which remains true.
+
+    Tracked edits are refused for the second half of that: a dirty tree runs a suite
+    against code that is in no commit, while `local-pass` claims one. UNTRACKED files
+    are tolerated, and the boundary is stated rather than left silent — a worktree
+    from `create-worktree` carries a `.env`, a virtualenv and scratch of its own, so
+    refusing those would mean this never runs anywhere real, and an untracked file
+    genuinely CAN change what a suite does. The answer for a repo that cannot accept
+    that is not to declare a `local_suite`.
+
+    Never raises, and every branch returns a sentence a human can act on: this runs
+    inside a round that must not die because a checkout was somewhere unexpected.
+    """
+    if not head_sha:
+        return "the PR's head sha is not known"
+    if not root:
+        return "no checkout path resolved for this repo"
+    at = (_git(root, "rev-parse", "HEAD") or "").strip()
+    if not at:
+        return f"{root} could not be read as a git checkout"
+    if at != head_sha:
+        return (f"the checkout is at {at[:8]}, not the PR head {head_sha[:8]} — a "
+                "run there would be a run of different code")
+    dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
+    if dirty is None:
+        return f"the working tree at {root} could not be read"
+    if dirty.strip():
+        n = len(dirty.strip().splitlines())
+        return (f"the checkout has {n} uncommitted change(s) to tracked files, so a "
+                f"run there would not be a run of {head_sha[:8]}")
+    return ""
+
+
+#: How much of a command's own output is kept, out of a file that may hold far more.
+#: Read from the END, because that is where a test runner puts its summary.
+LOCAL_SUITE_TAIL_BYTES = 4096
+
+
+def _kill_group(proc) -> None:
+    """SIGKILL the whole process group `proc` leads, then reap it.
+
+    `start_new_session=True` in :func:`_run_bounded` is what makes there BE a group,
+    and the two exist together: a suite that starts a database, a dev server or a
+    `docker compose` leaves descendants that `Popen.kill()` does not touch, and they
+    keep running on the box long after the round that started them has published its
+    report. Killing the leader alone is what makes a wall-clock bound a bound on THIS
+    process rather than on the machine.
+
+    Falls back to killing the leader if the group has already gone, and swallows a
+    reap that hangs: this is cleanup on the timeout path, and an exception raised
+    here would replace `TimeoutExpired` — turning "the suite did not finish", which
+    the caller has a state for, into a crash it has none for.
+    """
+    import signal                                            # noqa: PLC0415
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _run_bounded(argv: list[str], cwd: str, timeout: float) -> tuple[int, str]:
+    """Run `argv` in `cwd` under `timeout`, as ``(exit code, tail of its output)``.
+
+    **Not `subprocess.run`,** and each difference answers something `run` gets wrong
+    for a command whose length and volume nobody controls:
+
+    * **Output goes to a FILE, not a pipe into memory.** `capture_output=True`
+      buffers the lot, so a suite that prints for fifteen minutes is measured in the
+      panel's RSS — on a box already holding four reviewer prompts and a diff. Only
+      the last :data:`LOCAL_SUITE_TAIL_BYTES` are ever read back. The residual is
+      stated rather than hidden: this bounds MEMORY and not disk, and a repo whose
+      own declared command can fill a disk has a problem this function is not the
+      place to solve.
+    * **A file also removes the pipe deadlock**, which is the shape that would have
+      defeated the timeout: `subprocess.run` kills its child and then reads the pipes
+      to EOF, and a surviving grandchild holding the write end keeps that read open
+      for as long as it likes. The bound would have been advisory exactly when it
+      mattered.
+    * **`start_new_session=True`,** so there is a process group to kill. See
+      :func:`_kill_group`.
+
+    `errors="replace"` is the decode, and it is not a nicety: a test suite's output
+    is not guaranteed UTF-8 — a filename, a doctest, a library printing latin-1 —
+    and a strict decode would take a whole round down over a byte in somebody's
+    stack trace. That is `_git`'s lesson, arriving here for its reason.
+    """
+    with tempfile.TemporaryFile("w+b") as sink:
+        proc = subprocess.Popen(argv, cwd=cwd, stdout=sink,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        try:
+            code = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            raise
+        sink.seek(max(0, sink.tell() - LOCAL_SUITE_TAIL_BYTES))
+        return code, sink.read().decode("utf-8", "replace")
+
+
+def review_local_suite(commands, root: str, head_sha: str, *,
+                       timeout: float = LOCAL_SUITE_TIMEOUT,
+                       run=None, now=time.monotonic):
+    """The repo's own declared suite, run on this commit, in `review_ci`'s vocabulary.
+
+    Returns ``(status, failing, why, output, seconds)``.
+
+    **`why` and `output` are separate because their audiences are.** `why` is the
+    harness's own sentence — a command name and an exit code — and it goes in the
+    round's `config_notes`, which `--post` publishes as a **public PR comment**.
+    `output` is the tail of what the command printed, which is neither the harness's
+    words nor safe to publish: a failing test prints whatever it was holding, and on
+    this fleet that includes a `DATABASE_URL` with a password in it. It reaches the
+    round's payload and the operator's terminal, and it reaches no prompt and no
+    comment. One field carrying both would have made that distinction a matter of
+    who remembered it at each call site.
+
+    `status` is one of :data:`LOCAL_STATES` — or ``""``, which is **not a state**:
+    it means nothing was run, and the caller must leave its `ci_status` exactly as it
+    found it. That is why this returns an empty string rather than
+    :data:`LOCAL_UNREAD` when the run was never attempted. "The repo declared no
+    suite" and "a suite was run and told us nothing" are different facts, the second
+    vetoes a confident stop and the first cannot, and collapsing them would make
+    every repo on the fleet that has not opted in permanently unable to stop
+    confidently the day this landed.
+
+    `why` is a sentence in every case it is non-empty, including the ``""``-status
+    ones — a suite that was configured and skipped is something the round should say
+    out loud, or the setting looks live while doing nothing.
+
+    **The commands run in order and the first failure stops the run.** A suite that
+    is already red tells you what is wrong; spending the rest of the budget
+    collecting a second opinion from a DB-backed target delays the seats for
+    information the round will not use.
+
+    **A failing command's OUTPUT does not travel into the reviewer prompt**, only its
+    name. Two reasons, and the first is enough on its own: that output is text
+    produced by code from the PR under review, and pasting it into four reviewers and
+    a judge would hand a PR a direct channel into the prompts of everything judging
+    it — the exact door `member_sandbox` closes. It is also unbounded, on a budget
+    the diff is already competing for.
+
+    `run` is injected for the reason `review_ci_settled`'s `read` is: the suites must
+    be able to exercise this without a real suite, a real database and fifteen
+    minutes. Its contract is :func:`_run_bounded`'s — ``(argv, cwd, timeout)`` in,
+    ``(exit code, output tail)`` out, `TimeoutExpired` on the bound — and NOT
+    `subprocess.run`'s, because the three things that make the bound real (a file
+    instead of a pipe, a new session, a group kill) are not arguments to `run` and
+    would have had to be re-implemented by every caller that passed one.
+    """
+    import shlex                                            # noqa: PLC0415
+
+    run = run or _run_bounded
+    started = now()
+    cmds = tuple(commands or ())
+    if not cmds:
+        return "", [], "", "", 0.0
+    problem = _local_head_problem(root, head_sha)
+    if problem:
+        return "", [], f"the local suite was not run — {problem}", "", 0.0
+
+    for cmd in cmds:
+        spent = now() - started
+        left = timeout - spent
+        if left <= 0:
+            return (LOCAL_UNREAD, [cmd],
+                    f"the {timeout:.0f}s budget ran out before `{cmd}` started", "",
+                    round(spent, 1))
+        try:
+            argv = shlex.split(cmd)
+        except ValueError as e:
+            return (LOCAL_UNREAD, [cmd],
+                    f"`{cmd}` is not a command this can parse ({e})", "",
+                    round(spent, 1))
+        if not argv:
+            return (LOCAL_UNREAD, [cmd], f"`{cmd}` is empty", "", round(spent, 1))
+        try:
+            code, output = run(argv, root, left)
+        except subprocess.TimeoutExpired:
+            return (LOCAL_UNREAD, [cmd],
+                    f"`{cmd}` did not finish within the {timeout:.0f}s budget", "",
+                    round(now() - started, 1))
+        except (OSError, ValueError) as e:
+            # `ValueError` beside `OSError` so that "never raises" is true rather
+            # than intended: an injected `run` that decodes strictly raises it, and
+            # a round must not die because a byte in a stack trace was not UTF-8.
+            return (LOCAL_UNREAD, [cmd],
+                    f"`{cmd}` could not be run ({e.__class__.__name__})", "",
+                    round(now() - started, 1))
+        if code != 0:
+            return (LOCAL_FAIL, [cmd], f"`{cmd}` exited {code}",
+                    harness_rules.tail_gist(output, LOCAL_SUITE_GIST),
+                    round(now() - started, 1))
+    return LOCAL_PASS, [], "", "", round(now() - started, 1)
+
+
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
 #: them silently. Generated from the module's own top level, so a helper added here
@@ -2397,4 +2749,7 @@ __all__ = [
     "ReviewScope", "_cut_note", "_cut_note_reserve", "_SONAR_SEV",
     "_sonar_findings", "_try", "review_sonarqube", "ci_brief",
     "review_ci",
+    "LOCAL_SUITE_WHEN", "LOCAL_PASS", "LOCAL_FAIL", "LOCAL_UNREAD", "LOCAL_STATES",
+    "LOCAL_SUITE_TIMEOUT", "LOCAL_SUITE_GIST", "LOCAL_SUITE_TAIL_BYTES",
+    "_local_head_problem", "_kill_group", "_run_bounded", "review_local_suite",
 ]
