@@ -19,8 +19,9 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 # ----------------------------------------------------------------------------- reviewers
 
 # Reasoning levels each CLI accepts for the shared `effort` config key — codex
-# spells it `model_reasoning_effort`, pi spells it `--thinking`, and the two sets
-# genuinely differ (pi has off/minimal, codex has ultra), so they are listed per
+# spells it `model_reasoning_effort`, pi spells it `--thinking`, grok spells it
+# `--reasoning-effort`, and the sets genuinely differ (pi has off/minimal, codex
+# has ultra, grok stops at xhigh), so they are listed per
 # CLI rather than unioned. Per-MODEL support is narrower still and moves with the
 # fleet (gpt-5.6-luna takes `max` but not `ultra`), so this only catches typos —
 # the API rules on the model/effort pair and its sentence is surfaced verbatim.
@@ -33,7 +34,7 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 # vendor adds one. `run_seat` below is the other reader, and both now read the one
 # tuple. Import direction is fixed by panel_core already importing harness_rules.
 from harness_rules import (            # noqa: F401  — re-exported, see __all__
-    AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, PI_EFFORTS)
+    AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, GROK_EFFORTS, PI_EFFORTS)
 
 # How long a seat may ALREADY have spent and still be allowed to lower an
 # unsatisfiable pin and go again (#215). A count of attempts is not a bound on
@@ -58,7 +59,7 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #: Which seats may be handed the PR's own tree to read, when
 #: `review_panel.reviewer_code_access` is on (#113).
 #:
-#: An allowlist of ONE, and the other three are absences with reasons rather than
+#: An allowlist of ONE, and the other four are absences with reasons rather than
 #: omissions. The bar is a CLI that can express "read but do not execute", because
 #: #92 answered "may reviewers execute?" with no and this issue is reading. Each
 #: verdict below was checked by running the CLI, which is the standard
@@ -85,6 +86,16 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #:   tree is that headless print mode cannot prompt for a permission, so any tool
 #:   needing one is auto-denied; `antigravity_args` is explicit that `--mode plan`
 #:   is not the guarantee.
+#: * **grok** — the only absence here that is not about the mechanism. `--tools`
+#:   names an exact read-only set (`read_file,grep,list_dir`) and `--sandbox
+#:   strict` bounds READS to the cwd under Landlock — verified on 1.0.3, a read
+#:   outside the sandbox comes back "Permission denied" — which is the
+#:   working-directory boundary codex lacked and the property this bar asks for.
+#:   It is off the list because the SEAT is unproven, not the sandbox: #292
+#:   measured this CLI's argv, its tool injection and its refusals, and no live
+#:   review. A seat that has not yet returned findings should not also be the one
+#:   handed a checkout, so the tree is a separate change from the seat. Its
+#:   convention files are in the denylist above already, for when that happens.
 #:
 #: A seat NOT on this list keeps its empty sandbox even when the setting is on.
 #: That is deliberate and is not what #113 describes ("each seat's cwd is a
@@ -111,8 +122,14 @@ SEAT_READS_CODE = frozenset({"claude"})
 #: file it is looking at, so stripping only the top level leaves every nested one
 #: live — and a PR touching a subdirectory is exactly where a nested file would be
 #: added.
+#: CASE IS PART OF THE NAME on the filesystems this runs on, and one vendor makes
+#: that matter: grok's documented list is `Agents.md`, `Claude.md`, `CLAUDE.md`,
+#: `CLAUDE.local.md`, `AGENT.md`, `AGENTS.md` — six spellings of four files, and the
+#: two title-case ones are files nothing else here reads. A strip that matched only
+#: the shouted spellings would leave them live.
 CONVENTION_FILES = frozenset({
-    "CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENT.md", "GEMINI.md",
+    "CLAUDE.md", "CLAUDE.local.md", "Claude.md", "AGENTS.md", "Agents.md",
+    "AGENT.md", "GEMINI.md",
     "copilot-instructions.md", ".windsurfrules", ".clinerules", ".cursorrules",
     ".aider.conf.yml", ".goosehints", ".junie",
 })
@@ -122,7 +139,7 @@ CONVENTION_FILES = frozenset({
 #: Removed entire rather than filtered: the interesting failure is a hook, and a
 #: hook is whatever file the vendor decides to run next release.
 CONVENTION_DIRS = frozenset({
-    ".claude", ".codex", ".gemini", ".antigravity", ".cursor", ".windsurf",
+    ".claude", ".codex", ".gemini", ".antigravity", ".grok", ".cursor", ".windsurf",
     ".aider", ".github/copilot", ".continue", ".roo", ".kilocode",
 })
 
@@ -2399,6 +2416,112 @@ def pi_args(model: str, effort: str, session_id: str, session_dir: Path) -> list
     return args
 
 
+def grok_args(model: str, effort: str, prompt_file: Path) -> list[str]:
+    """grok argv — xAI's CLI, the panel's fifth vendor.
+
+    `--prompt-file` is its headless mode. grok's `-p/--single` wants the prompt as
+    a flag VALUE and reads nothing from stdin, so on the face of it this looked
+    like a second `antigravity` — the one member the kernel's argv limit binds. It
+    is not: `--prompt-file` takes a path, so the diff travels in a file and there
+    is no ceiling on it. That is why nothing in the argv-clamping path
+    (ARGV_PROMPT_MAX_BYTES, argv_clamp, the "truncated for antigravity" note) grew
+    a second member when this seat was added.
+
+    The file lives in the member's private temp dir, NOT in the sandbox repo it is
+    given as a cwd, and that is load-bearing rather than tidy — same rule as
+    codex's reply files, learned here the hard way. A trial run with the prompt
+    inside the cwd had grok `list_dir` the directory, find `prompt.txt`, and read
+    its own instructions back as if they were the code under review.
+
+    **This seat keeps read tools, unlike codex and pi, and that is a deliberate
+    reversal of this file's usual answer.** Every other member is driven toward
+    `--no-tools` because tools in an empty sandbox are wasted turns. grok is the
+    seat where taking them ALL away does not produce a quiet reviewer: measured
+    twice on grok-4.6, a toolless run never emits its findings at all. It streams
+    "I'll look at app/util.py and any tests or callers" over and over — 21 KB of
+    the same sentence in the one that was let run — until the CLI timeout takes
+    it, which costs the panel a whole vendor and a full turn of tokens for nothing.
+    Given `read_file`/`grep`/`list_dir` it calls them, finds the empty repo, and
+    gets on with reviewing the diff it was handed. So the toolset here is chosen
+    to keep the seat MOVING, and `--sandbox strict` is what makes that safe: reads
+    are bounded to the cwd, which `member_sandbox` has already made empty.
+
+    That is also why `strict` and not codex's `read-only` spelling. grok's
+    `read-only` profile restricts writes but leaves reads unrestricted at
+    filesystem root — the same hole codex's `-s read-only` had, where a seat
+    reaches past its sandbox and reviews the real checkout instead of the diff.
+    `strict` is the profile that bounds READS, which is the property this seat
+    needs. It is kernel-enforced (Landlock), applied to the whole process at
+    startup, and irreversible, so it holds even where the tool filtering below
+    does not.
+
+    **What IS taken away is every tool that is a network channel.** `--tools` is
+    an allowlist and is documented to disable default tool injection, but MCP's
+    `search_tool`/`use_tool` pair is injected regardless: measured, a run given
+    `--tools read_file` enumerated 31 quarterback MCP tools and offered to call
+    them. grok reads MCP servers from `~/.claude.json` (Claude Code compat) as
+    well as its own config, so this is not a hole a clean cwd closes — the servers
+    are the USER's, not the repo's. This is codex's `features.apps=false` lesson
+    arriving at a second vendor: an authenticated connector is a network channel
+    with credentials, and taking away the shell while leaving it buys nothing.
+    `Agent` goes with them (a subagent is a second brain the report does not
+    name), and `run_terminal_cmd` / `web_search` / `web_fetch` / the write tools
+    are simply not on the allowlist. Verified on grok 1.0.3: under these flags the
+    seat cannot read a file outside its sandbox and cannot reach the MCP servers a
+    control run enumerates.
+
+    **`--permission-mode default` is pinned, and the reason is sharper than the
+    usual "do not inherit an install's default": this fleet's `~/.grok/config.toml`
+    sets `permission_mode = "always-approve"`.** An unpinned seat inherits it and
+    runs yolo — every tool call auto-approved with no confirmation a headless run
+    could withhold. Read tools are auto-allowed under `default` too (that is the
+    point of keeping them), but anything that writes or executes is back to
+    needing a permission that headless print mode cannot give, which is the same
+    guarantee `agy`'s seat rests on.
+
+    `--verbatim` stops grok expanding the prompt before the model sees it — a
+    review prompt is a diff full of `@@`, `@paths` and leading `/`, which is
+    exactly the syntax an expanding CLI reaches for.
+
+    `--no-memory` and `--no-subagents` pin two more defaults that are off today
+    and are one config line from being on: cross-session memory would carry one
+    PR's review into the next, and subagents are already denied at the toolset.
+    `--disable-web-search` is belt to those braces — the seven codex runs that
+    went hunting for a private repo on github.com are what an open web tool costs.
+
+    Pin `model`. grok's own default is whatever `[models] default` in
+    `~/.grok/config.toml` says, which on this fleet is an OpenRouter route
+    (`or-grok` -> `x-ai/grok-4`) rather than the first-party `grok-4.6` — an
+    unpinned seat would review on a different model, through a different account,
+    than the report names. `grok models` lists what is servable.
+
+    Not instrumented, like `antigravity` and for a related reason: grok's session
+    transcript carries no token counts (only a `contextTokensUsed` gauge), so the
+    numbers exist only inside `--output-format json`, which moves the reply into a
+    `.text` string where `parse_reply`'s balanced-bracket scan cannot reach it.
+    That is the trade `run_seat`'s docstring declines — a bespoke unwrapper risks
+    the findings on every run to gain telemetry. Worth revisiting: unlike the
+    envelopes that argument was written about, grok's is flat, and it carries
+    `usage` AND `total_cost_usd`, which no other seat reports.
+
+    ONE THING THIS SEAT DOES THAT NO OTHER DOES, and it is not fixed here: grok
+    executes the user's Claude Code lifecycle hooks from `~/.claude/settings.json`
+    (Claude Code compat), so on this fleet every grok seat fires `qb-hook
+    SessionStart` and registers a phantom agent on the quarterback board. There is
+    no flag to turn that off. It is noise on the board, not a correctness problem
+    for the review, which is why this seat landed with it documented rather than
+    blocked on it. Tracked as #234.
+    """
+    return ["grok", "--prompt-file", str(prompt_file),
+            "--sandbox", "strict",
+            "--permission-mode", "default",
+            "--verbatim", "--no-memory", "--no-subagents", "--disable-web-search",
+            "--tools", "read_file,grep,list_dir",
+            "--disallowed-tools", "search_tool,use_tool,Agent"] + (
+        ["--model", model] if model else []) + (
+        ["--reasoning-effort", effort] if effort else [])
+
+
 def select_reviewers(rev: dict, spec: str | None) -> tuple[set[str], str | None]:
     """Which panel members run: the repo's `.harness-rules` by default, or exactly
     the ones named in `--reviewers`. Returns (selected, override_note).
@@ -2876,7 +2999,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: because either alone is wrong: the caller must have prepared a tree
         #: (`reviewer_code_access` on, the fetch and the strip both succeeded), AND
         #: this vendor must be able to express "read but do not execute" —
-        #: `SEAT_READS_CODE` records per vendor why three of the four cannot. A seat
+        #: `SEAT_READS_CODE` records per vendor why four of the five cannot. A seat
         #: that cannot read gains nothing from standing in the tree and still pays
         #: the instruction-file channel for it, so it keeps the empty sandbox.
         reads_code = code_tree is not None and cmd_name in SEAT_READS_CODE
@@ -2941,10 +3064,13 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             return sessions[-1]
 
         # The prompt goes on stdin wherever the CLI will take it there — which is
-        # everywhere but `agy`. That is not a style choice: a diff big enough to be
-        # worth a panel is big enough to exceed the kernel's per-argument limit, and
-        # in argv that failure lands at execve, before the reviewer exists, as an
-        # error with nothing in it. On stdin there is no such ceiling.
+        # everywhere but `agy` and `grok`. That is not a style choice: a diff big
+        # enough to be worth a panel is big enough to exceed the kernel's
+        # per-argument limit, and in argv that failure lands at execve, before the
+        # reviewer exists, as an error with nothing in it. On stdin there is no such
+        # ceiling — and neither is there in a FILE, which is how `grok` takes one
+        # and why it is not a second seat the argv clamp has to know about. `agy`
+        # remains the only member with nowhere but argv to put it.
         stdin_text: str | None = prompt
         #: What this seat actually asks for — the pins until a fallback lowers one.
         #: One-element lists because the argv thunk below closes over them and a
@@ -2957,7 +3083,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: Does this seat deliver its reply in a FILE rather than on stdout? Only
         #: codex does, and it is what makes the stdout-emptiness test the wrong
         #: question for it.
-        replies_used = cmd_name not in ("claude", "antigravity", "pi")
+        replies_used = cmd_name == "codex"
         if cmd_name == "claude":
             def args():
                 # `reads_code`, not `bool(code_tree)`: a tree that failed to stage
@@ -2972,6 +3098,14 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # exactly as before and reports no tokens, which the board renders as
             # "not recorded" rather than as zero.
             args, stdin_text = antigravity_args(model, effort, prompt), None
+        elif cmd_name == "grok":
+            # In the private temp dir and NOT in `sandbox`: a seat must not be
+            # able to find its own prompt as a file in the tree it is reviewing.
+            # Written once — the prompt does not change between attempts, so
+            # unlike codex's reply files this needs no thunk.
+            prompt_file = tmpdir / "prompt.txt"
+            prompt_file.write_text(prompt)
+            args, stdin_text = grok_args(model, effort, prompt_file), None
         elif cmd_name == "pi":
             def args():
                 return pi_args(model, effort, new_session(), tmpdir)
@@ -3463,7 +3597,7 @@ import panel_scope               # noqa: F401
 #: them silently. Generated from the module's own top level, so a helper added here
 #: is exported without anyone remembering to list it.
 __all__ = [
-    "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS",
+    "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
@@ -3483,7 +3617,7 @@ __all__ = [
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",
     "antigravity_args",
-    "pi_args", "select_reviewers", "_int", "_jsonl",
+    "pi_args", "grok_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
     "SeatParsed", "SeatTurn", "run_seat", "review_llm",
     "ask_llm", "_ask_gist", "_diff_added_lines", "_diff_files_cut",

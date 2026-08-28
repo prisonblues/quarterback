@@ -153,7 +153,12 @@ BOX_RULES_FILENAME = "harness-rules.json"
 CODEX_EFFORTS = ("low", "medium", "high", "xhigh", "max", "ultra")
 PI_EFFORTS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 AGY_EFFORTS = ("low", "medium", "high")
-EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS}
+# grok is the exception that proves the value of listing these per CLI: its own
+# CLI validates the level before the turn starts, so a typo costs a startup
+# rather than a whole reviewer's turn — but only for the levels it knows.
+GROK_EFFORTS = ("low", "medium", "high", "xhigh")
+EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS,
+           "grok": GROK_EFFORTS}
 
 # What the untracked overlay is allowed to say, and it is deliberately narrow.
 # An untracked file is reviewed by nobody — it never appears in a PR, so branch
@@ -304,6 +309,17 @@ DEFAULTS: dict = {
         # panel reaches a vendor none of the other three CLIs can. `effort` maps
         # to its `--thinking` (off|minimal|low|medium|high|xhigh|max).
         "pi": {"enabled": False, "model": "", "effort": ""},
+        # The fifth vendor, xAI's `grok`. Off by default like antigravity and pi,
+        # and for the same reason: a workstation package authenticated against a
+        # personal account, not on every box. PIN A MODEL — grok's own default is
+        # whatever `[models] default` says in the user's ~/.grok/config.toml,
+        # which on this fleet routes through OpenRouter rather than to the
+        # first-party model, so an unpinned seat reviews on a different model and
+        # a different account than the report names. `grok models` lists what is
+        # servable; `grok-4.6` is the current first-party one.
+        # effort: low|medium|high|xhigh — narrower than codex's or pi's, and the
+        # CLI validates it locally, so a typo costs a startup rather than a turn.
+        "grok": {"enabled": False, "model": "", "effort": ""},
         "sonarqube": {"enabled": False},
     },
     "review_panel": {

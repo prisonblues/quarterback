@@ -80,7 +80,7 @@ Usage:
     python3 ~/.claude/loops/panel.py --pr 734 --post
     python3 ~/.claude/loops/panel.py --pr 734 --json
     python3 ~/.claude/loops/panel.py --pr 734 --reviewers codex
-    python3 ~/.claude/loops/panel.py --pr 734 --reviewers claude,codex,antigravity
+    python3 ~/.claude/loops/panel.py --pr 734 --reviewers claude,codex,antigravity,grok
     python3 ~/.claude/loops/panel.py --pr 734 --post --json-file "$rundir/panel.json"
     python3 ~/.claude/loops/panel.py --pr 734 --post --round 2 --max-rounds 2 \
         --baseline "$rundir/r1.json" --json-file "$rundir/r2.json"
