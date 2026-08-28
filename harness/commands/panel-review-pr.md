@@ -504,11 +504,14 @@ So, per claim:
    Same footing as an escalation and for the identical reason: the issue *asks* the
    question rather than filing a task, and it is what carries it past the end of this
    session. Title it as the claim; body says what would settle it and links this PR.
-3. **Record it** on the board like any deferral — `outcome: deferred`, with the issue
-   in `deferred_to` and the claim in the `note`. There is no fifth `outcome` to
-   invent; the vocabulary is a database constraint, and "real, nobody checked it" is a
-   `deferred`.
-4. **Then pass the key back** to the next round: `--acknowledge uc-xxxxxxxx`,
+3. **Do not try to `qb record-outcome` it.** That call keys on a FINDING key and an
+   obligation is not a finding — it has no reporter, no severity and no chain — so
+   there is nothing on the board for the row to attach to, and inventing one would
+   need a schema change this deliberately does not take. Its durable record is the
+   round's payload (`unresolved_claims`, with the key, the claim, what would settle it
+   and whether it has been accepted) and the issue you opened in step 2. Say in the
+   relay which issues those are.
+4. **Then pass the key back** to the next round: `--acknowledge uc-0123456789ab`,
    repeatable, and the report prints the exact command. It is inherited by later
    rounds through `--baseline`, so you do it once per cycle and not once per round.
 
