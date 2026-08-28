@@ -147,6 +147,8 @@ async def app_lifespan(server: FastMCP):
         session=resolve_session(),
         elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
         elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
+        elevated_refresh_cmd=os.environ.get(
+            "QUARTERBACK_ELEVATED_TOKEN_REFRESH_CMD", "").strip() or None,
     )
     try:
         yield AppContext(client=client)

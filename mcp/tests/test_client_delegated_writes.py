@@ -336,3 +336,99 @@ def test_a_refresh_that_finds_nothing_new_is_not_retried(tmp_path):
     with pytest.raises(httpx.HTTPStatusError):
         c.plan_reorder({"order": ["a"]})
     assert len(seen) == 1, "an unchanged secret was replayed"
+
+
+# ---- the cache, and the way past it (prisonblues/nix-fleet#50) ---------------
+#
+# The fleet now hydrates this credential to /run/op-secrets at boot, so the
+# ordinary command stopped being `op read` and became `if [ -s <file> ]; then cat
+# <file>; else op read …; fi`. That is right for the hot path — `op read` against
+# a desktop integration blocks on a prompt when the vault session is cold, which
+# is always, because this credential is read about once a fortnight.
+#
+# It is wrong for the retry above, and silently so: re-running a file-backed
+# command returns the same bytes for ever, `fresh != secret` is never true, and
+# the one mechanism that existed to survive a rotation stops firing without
+# anything failing. The bearer has had QUARTERBACK_TOKEN_REFRESH_CMD for exactly
+# this reason since long before; this is that split, for this credential.
+
+
+def test_a_cached_command_alone_cannot_survive_a_rotation(tmp_path):
+    """The defect, pinned as the reason the refresh command exists. A command
+    that reads a file — which is what the fleet now generates — hands back the
+    same value on the re-read, so the retry is correctly suppressed and the
+    caller is left with the 403."""
+    cached = tmp_path / "cache"
+    cached.write_text("stale\n")
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get(ELEVATED_HEADER, ""))
+        return httpx.Response(403, json={
+            "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=f"cat '{cached}'")
+    with pytest.raises(httpx.HTTPStatusError):
+        c.plan_reorder({"order": ["a"]})
+    assert seen == ["stale"], "a file-backed command cannot refresh itself"
+
+
+def test_the_refresh_command_goes_past_the_cache_and_the_retry_fires(tmp_path):
+    """The fix. The ordinary command keeps reading the boot cache; the refresh
+    command reaches the store, and only after the board has refused the cached
+    value by name."""
+    cached = tmp_path / "cache"
+    cached.write_text("stale\n")
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        got = request.headers.get(ELEVATED_HEADER, "")
+        seen.append(got)
+        if got == "rotated":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(403, json={
+            "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=f"cat '{cached}'",
+                          elevated_refresh_cmd="echo rotated")
+    assert c.plan_reorder({"order": ["a"]}) == {"ok": True}
+    assert seen == ["stale", "rotated"], seen
+
+
+def test_the_cold_fetch_still_uses_the_cache(tmp_path):
+    """The refresh spelling is for a re-read after a refusal and nothing else. A
+    first fetch that reached the vault would spend the prompt this whole change
+    exists to avoid."""
+    cached = tmp_path / "cache"
+    cached.write_text("from-the-cache\n")
+    seen: list[str] = []
+
+    c = QuarterbackClient(BASE, "t",
+                          transport=httpx.MockTransport(
+                              lambda r: (seen.append(r.headers.get(ELEVATED_HEADER, "")),
+                                         httpx.Response(200, json={"ok": True}))[1]),
+                          elevated_cmd=f"cat '{cached}'",
+                          elevated_refresh_cmd="echo should-not-be-run")
+    c.plan_reorder({"order": ["a"]})
+    assert seen == ["from-the-cache"], seen
+
+
+def test_without_a_refresh_command_the_ordinary_one_is_still_re_read(tmp_path):
+    """A host whose ordinary command already reaches the store — no sidecar, or a
+    literal — must keep the behaviour it had. The fallback is the old path."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        got = request.headers.get(ELEVATED_HEADER, "")
+        seen.append(got)
+        if got == "v2":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(403, json={
+            "detail": f"the {ELEVATED_HEADER} secret presented does not match"})
+
+    c = QuarterbackClient(BASE, "t", transport=httpx.MockTransport(handler),
+                          elevated_cmd=_counting(tmp_path))
+    assert c.plan_reorder({"order": ["a"]}) == {"ok": True}
+    assert seen == ["v1", "v2"], seen

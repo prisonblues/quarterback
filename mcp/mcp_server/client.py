@@ -86,6 +86,7 @@ class QuarterbackClient:
         transport: httpx.BaseTransport | None = None,
         elevated: str | None = None,
         elevated_cmd: str | None = None,
+        elevated_refresh_cmd: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session = session
@@ -111,6 +112,20 @@ class QuarterbackClient:
         # session start — to serve two tools a session will probably never call.
         self._elevated = elevated or None
         self._elevated_cmd = elevated_cmd or None
+        #: How to get PAST a cache, when the ordinary command reads one.
+        #:
+        #: `_resolve_elevated` replays a 403 only when the value it re-read is
+        #: DIFFERENT, which silently stops being a refresh the moment the command
+        #: is served by a file. The fleet now hydrates this credential to
+        #: /run/op-secrets at boot, so `QUARTERBACK_ELEVATED_TOKEN_CMD` is
+        #: `if [ -s <file> ]; then cat <file>; else op read …; fi` — re-running it
+        #: returns the same bytes for ever and the retry never fires.
+        #:
+        #: The bearer solved this long ago with QUARTERBACK_TOKEN_REFRESH_CMD, on
+        #: the same reasoning: after a refusal, the cached copy is exactly what is
+        #: known to be wrong. Falls back to `_elevated_cmd` when unset, which is
+        #: right for a host whose ordinary command already reads the store.
+        self._elevated_refresh_cmd = elevated_refresh_cmd or None
         # Serialises credential RESOLUTION only — never a request. Two delegated
         # calls that both need a fetch would otherwise run the command twice, and
         # the command is `op read`, which can prompt. See `_resolve_elevated`.
@@ -177,8 +192,13 @@ class QuarterbackClient:
                 # credential-less until the process restarts, turning one bad
                 # request into every later one.
                 return current
+            # The REFRESH spelling whenever this is a re-read after a refusal
+            # (`stale` is set), and the ordinary one on a cold first fetch —
+            # which is the whole point of the cache and must keep using it.
+            command = (self._elevated_refresh_cmd or self._elevated_cmd) \
+                if stale else self._elevated_cmd
             try:
-                done = subprocess.run(self._elevated_cmd, shell=True, check=False,
+                done = subprocess.run(command, shell=True, check=False,
                                       capture_output=True, text=True, timeout=30)
             except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
                 # UnicodeDecodeError because `text=True` decodes the command's
