@@ -2848,6 +2848,145 @@ def test_a_refused_write_is_reported_and_does_not_take_the_dashboard_down():
     assert "edge refused" in said, said
 
 
+# ---- and how loudly it is reported (#577) ------------------------------------
+#
+# The write above could fail for a year without anybody noticing, and did: `/dials`
+# was empty fleet-wide when somebody finally went looking, because a credential
+# that cannot resolve reported itself in muted grey on a line the eye reads as
+# chrome — under a modal that had already dismissed as though it had worked. These
+# pin the three halves of being told: before, loudly, and not instead of.
+
+
+async def _writing(asked: dict, human=None, then=None, pause=0.4):
+    """`_written`, but handing back the app so the STYLE and the bell can be read.
+
+    Both matter here and neither is in the text: a sentence nobody's eye is drawn
+    to is the failure this issue is about, so asserting the words alone would pass
+    on the exact bug.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    rung = []
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.human = human or FakeHuman()
+        app.dials = {"asked": True, "now": None}
+        app.bell = lambda: rung.append(True)
+        app.dial_written(asked)
+        if then is not None:
+            then(app)
+        await pilot.pause(pause)
+        # Off the widget rather than off `detail_text`, because the STYLE is the
+        # half this issue is about and the text is identical either way.
+        style = repr(app.query_one("#detail").visual)
+        return app, app.detail_text, style, rung
+
+
+def test_a_credential_that_cannot_resolve_is_red_and_rings():
+    """The one error a person cannot otherwise tell apart from success, so it gets
+    the treatment `DialEdit._refuse` gives a refusal one screen up. They are the
+    same event — this side could not do what was asked."""
+    human = FakeHuman(fail="the human-key command failed: account is not signed in")
+    _, said, style, rung = asyncio.run(_writing(
+        {"dial": "review_panel.budget.tokens_per_day", "value": "400000",
+         "reason": "the window", "expiry": "", "repo": None}, human=human))
+    assert "not signed in" in said, said
+    assert "red" in style, f"a failed write drew in {style!r}"
+    assert rung, "a write that did not happen made no sound"
+
+
+def test_the_failure_leads_with_the_verb_and_not_with_the_dial_name():
+    """`{dial}: {exc}` spent 34 characters of
+    `review_panel.budget.tokens_per_day` before the only words that mattered — on
+    a line that has to survive a 78-column pane."""
+    human = FakeHuman(fail="account is not signed in")
+    _, said, _, _ = asyncio.run(_writing(
+        {"dial": "review_panel.budget.tokens_per_day", "value": "400000",
+         "reason": "the window", "expiry": "", "repo": None}, human=human))
+    assert said.startswith("could not set "), said
+
+
+def test_a_clear_that_failed_does_not_report_itself_as_a_set():
+    """The verb is the one the announcement used, so the two lines are visibly
+    about the same act."""
+    human = FakeHuman(fail="account is not signed in")
+    _, said, _, _ = asyncio.run(_writing(
+        {"dial": "tempo", "repo": None, "clear": True}, human=human))
+    assert said.startswith("could not clear tempo"), said
+
+
+def test_a_write_that_lands_is_not_dressed_as_an_alarm():
+    """The other half of the same rule: if everything is loud then nothing is."""
+    _, said, style, rung = asyncio.run(_writing(
+        {"dial": "review_panel.max_rounds", "value": "2", "reason": "window at 94%",
+         "expiry": "", "repo": None}))
+    assert "set review_panel.max_rounds" in said, said
+    assert "red" not in style, f"a write that worked drew in {style!r}"
+    assert not rung, "a successful write rang the bell"
+
+
+def test_the_wait_announces_itself_before_it_can_block():
+    """The hole #577 was actually reported as. Between the modal dismissing and the
+    worker returning this screen said nothing, and on a host whose key command
+    blocks that gap is the full 30s of the subprocess timeout — a dismissed modal
+    over an unchanged pane, indistinguishable from a write that landed."""
+    seen = []
+    _, _, _, _ = asyncio.run(_writing(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "",
+         "repo": None},
+        then=lambda app: seen.append(app.detail_text)))
+    assert seen and "setting tempo" in seen[0], seen
+    # NAMED, because the wait is almost always `op` and a person who reads the
+    # word has the answer before the timeout does.
+    assert "op" in seen[0] and "30s" in seen[0], seen
+
+
+def test_a_second_press_is_refused_rather_than_cancelling_the_first():
+    """`run_dial_write` is `exclusive=True`, so a second press cancelled the first
+    — and the first was the one holding the answer, thirty seconds into a key
+    command that had not returned. A person who sees nothing presses again, which
+    was the one input that guaranteed they went on seeing nothing."""
+    import threading
+    held = threading.Event()
+
+    class Slow(FakeHuman):
+        def set_dial(self, *a, **kw):
+            held.wait(timeout=5)
+            return super().set_dial(*a, **kw)
+
+    slow = Slow()
+    asked = {"dial": "tempo", "value": "eager", "reason": "draining",
+             "expiry": "", "repo": None}
+    refused = []
+
+    def press_again(app):
+        app.dial_written(dict(asked, dial="review_panel.max_rounds", value="2"))
+        refused.append(app.detail_text)
+        # RELEASED HERE, while the app is still running, so the first write
+        # actually completes inside `run_test` and this test proves what it says.
+        # Setting the event after `asyncio.run` returned proved nothing: the
+        # worker was finishing on its own timeout, after the app had gone.
+        held.set()
+
+    app, said, style, rung = asyncio.run(
+        _writing(asked, human=slow, then=press_again, pause=1.5))
+    # The refusal, seen at the moment of the second press rather than inferred
+    # from whatever the line said once everything had settled.
+    assert "still writing tempo" in refused[0], refused
+    assert "review_panel.max_rounds" not in [row[0] for row in slow.set], slow.set
+    # And the FIRST write was allowed to finish, which is the point of refusing
+    # the second rather than superseding it.
+    assert [row[0] for row in slow.set] == ["tempo"], slow.set
+    assert "set tempo" in said, said
+    # The flag is released, so the next press is not refused for ever.
+    assert app.dial_writing is None, app.dial_writing
+
+
 def test_ctrl_s_in_the_editor_is_what_sends_it():
     """The keystroke path, end to end: the ✎ opens the modal, the fields are
     typed, and ctrl+s is the only thing that spends a request.
