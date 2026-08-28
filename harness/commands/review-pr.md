@@ -500,8 +500,17 @@ if the script isn't there.
   bullet in its previous wording, fixed five findings, and **four of them were
   about the behaviour of the very flag the escalation questioned**. The pass was
   reverted the next day and everything it wrote had nothing left to attach to.
-  Exactly one finding was independent — and the line budget dropped that one.
-  The correct output was: escalate, fix nothing, stop.
+  Exactly one finding was independent — and the line budget dropped that one, so
+  on *that* round the partition left nothing to write and the right output was to
+  escalate and stop.
+
+  **Read that as the arithmetic of one round, not as the rule.** "Escalate and
+  stop" is what the partition happened to come to when four of five findings were
+  downstream; it is not what an escalation means. The rule is the two bullets
+  above — the downstream half gets no patch, the independent half gets fixed —
+  and a round with an independent half still writes it, tests it and pushes it.
+  Stopping outright is correct only when the independent half is empty, and that
+  is a thing you determine by partitioning, never by assuming.
 - **Open nothing yourself, and do not file the board row by hand.** The premise
   ISSUE is still the orchestrator's, after it has relayed your report — you were
   told to decide nothing and write no patch, and filing the premise yourself is

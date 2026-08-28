@@ -500,3 +500,62 @@ async def test_an_answered_forge_blocker_releases_the_item(client):
                              headers=HUMAN)
     assert done.status_code == 200, done.text
     assert (await plan(client, repo))["next"]["item_id"] == parked
+
+
+async def test_a_fleet_scope_blocker_reaches_a_fleet_scope_item(client):
+    """Both `repo` columns are nullable and NULL means FLEET SCOPE — a real value,
+    not a missing one. NULL never equals NULL in SQL, so an ordinary comparison
+    drops this pair silently; the COALESCE on both sides is what keeps it, and it
+    is `ix_plan_items_open_ref`'s own spelling. Untested, this is a path that reads
+    as working and parks nothing."""
+    r = await client.post("/plan/item", json={"title": "fleet-wide chore",
+                                              "ref_kind": "issue", "ref_value": "8801"},
+                          headers=LAPTOP)
+    assert r.status_code in (200, 201), r.text
+    item = r.json()["item_id"]
+    MINE.add(item)
+
+    raised = await client.post("/blockers", json={
+        "subject_kind": "issue", "subject_value": "8801", "kind": "decision",
+        "question": "fleet-wide: which?"}, headers=LAPTOP)
+    assert raised.status_code == 200, raised.text
+
+    plan_all = await client.get("/plan", headers=LAPTOP)
+    row = next(i for i in plan_all.json()["items"] if i["item_id"] == item)
+    assert row["waiting_on_a_human"], "a NULL-repo blocker must reach a NULL-repo item"
+
+
+async def test_a_scoped_blocker_does_not_reach_a_fleet_scope_item_of_the_same_number(
+        client):
+    """The other half of the same rule, and the direction that would park work
+    wrongly: `#8802` in one repo is not the fleet-wide `#8802`."""
+    r = await client.post("/plan/item", json={"title": "fleet-wide, unblocked",
+                                              "ref_kind": "issue", "ref_value": "8802"},
+                          headers=LAPTOP)
+    item = r.json()["item_id"]
+    MINE.add(item)
+    await client.post("/blockers", json={
+        "subject_kind": "issue", "subject_value": "8802", "kind": "decision",
+        "question": "about one repo's 8802", "repo": "acme/not-fleet"}, headers=LAPTOP)
+
+    plan_all = await client.get("/plan", headers=LAPTOP)
+    row = next(i for i in plan_all.json()["items"] if i["item_id"] == item)
+    assert not row["waiting_on_a_human"], "a repo's question must not park fleet work"
+
+
+async def test_an_item_carries_both_an_item_blocker_and_a_forge_one(client):
+    """The two paths are additive, not alternatives — an item named directly and by
+    its ref collects both questions, each answerable on its own."""
+    repo = "acme/both-paths"
+    item = await add_ref_item(client, "asked about twice", repo, "pr", "31")
+    await client.post("/blockers", json={
+        "subject_kind": "item", "subject_value": item, "kind": "taste",
+        "question": "the right shape?", "repo": repo}, headers=LAPTOP)
+    await client.post("/blockers", json={
+        "subject_kind": "pr", "subject_value": "31", "kind": "decision",
+        "question": "does the premise hold?", "repo": repo}, headers=LAPTOP)
+
+    after = await plan(client, repo)
+    row = next(i for i in after["items"] if i["item_id"] == item)
+    assert {w["class"] for w in row["waiting_on_a_human"]} == {"taste", "decision"}
+    assert after["counts"]["waiting_on_a_human"] == 1, "one item, however many questions"

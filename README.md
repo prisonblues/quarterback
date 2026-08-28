@@ -1007,7 +1007,9 @@ out of its own prose, and — **#555** — `panel.py --premise` when #84's brake
 is the sharpest question the fleet asks and was the last one still going into a pull-request
 comment. It arrives as `decision` with the premise as the question and the findings it explains in
 the detail, keyed on the premise rather than the sentence so two premises on one PR are two rows
-and a restatement re-raises the first. An announcement costs a reason, an unrecognised class goes to `other` with
+and a restatement re-raises the first — on a board and a harness that both carry #576's `condition`;
+against an older door the field is dropped and they collapse, which is the trade every producer
+here makes rather than lose the escalation. An announcement costs a reason, an unrecognised class goes to `other` with
 the spelling named, and the same question is asked once every twelve hours rather than once per
 tick. `QUARTERBACK_NEEDS_HUMAN=off` switches it off; `QUARTERBACK_NEEDS_HUMAN_TO` (or
 `needs_human.to` in `.harness-rules`) addresses it, and there is deliberately no default addressee.

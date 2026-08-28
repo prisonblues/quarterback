@@ -3651,11 +3651,19 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
         # named — so that half is described rather than enumerated, which is the
         # honest shape and not an omission to be filled in with a guess.
         if verdict["findings"]:
-            out += ["", "DOWNSTREAM OF THE PREMISE — write no patch for these:"]
+            rounds = ", ".join(str(r) for r in verdict["rounds"])
+            out += ["", "DOWNSTREAM OF THE PREMISE — write no patch for these. Every "
+                        f"key declared against it, across round(s) {rounds}:"]
             out += [f"    {k}" for k in verdict["findings"]]
-            out += ["", "INDEPENDENT — every other finding in this round. Fix those, "
-                        "exactly as step 3 says: an escalation partitions the pass, "
-                        "it does not end it.",
+            out += ["", "INDEPENDENT — every outstanding finding of THIS round that is "
+                        "not listed above. Fix those, exactly as step 3 says: an "
+                        "escalation partitions the pass, it does not end it.",
+                    "", "The list above is cumulative, so it can name a key from an "
+                        "earlier round that is already fixed or no longer outstanding. "
+                        "That costs nothing — it forbids a patch nobody was going to "
+                        "write. What it must NOT be read as is this round's finding "
+                        "list: subtract it from your own, and anything left over is "
+                        "the independent half.",
                     "", "The next round must not count the downstream half as work a "
                         "fix pass can clear:", f"    panel.py ... {keys}"]
         else:
@@ -3732,6 +3740,14 @@ def announce_escalation(verdict: dict, gh_repo: str, pr_number: int | None) -> s
     :func:`find_premise` maps restatements onto the same entry — so a premise
     restated in round 3 re-raises the row it opened in round 2 instead of opening
     a second one.
+
+    **That holds only where the door takes the field**, and the qualifier is not a
+    quibble: against a `needs_human` predating #576 the call goes without it (see
+    :func:`_door_takes_condition`) and two premises on one pull request DO collapse
+    into one row, exactly as they did before #576. That is the trade `qb-doctor`
+    and `qb-bump` already make — a stale harness loses the field, never the
+    escalation — but it means "two premises are two rows" is a statement about a
+    current board and a current harness, not an invariant of this function.
 
     **Best-effort, and it never raises.** `declare`'s contract is that it is cheap
     enough to run before every fix pass, and a fix pass must not fail because a
@@ -3860,6 +3876,15 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     # declaration counts as the first and the brake does not fire again. That is
     # precisely the run where the question most needs to be somewhere durable, and
     # the board row is the only durable thing left.
+    #
+    # THE COST OF THAT CHOICE, said out loud rather than left to be discovered: on
+    # a failed write the two states disagree. The board holds an open question that
+    # parks the work, while the register has no occurrence — so a later declaration
+    # counts as the first, the brake does not fire, and a fix pass is written
+    # against a premise a human has not answered. The alternative disagreement is
+    # strictly worse: the question would exist nowhere at all, and the exit code
+    # already tells the caller the declaration was not recorded. Resolving it is a
+    # person answering or withdrawing the blocker, which is what the row is for.
     board = (announce_escalation(verdict, cfg.get("github") or "", pr_number)
              if verdict["escalate"] else "")
     write_failed = write_payload(register_path, reg)

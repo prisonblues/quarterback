@@ -1155,3 +1155,36 @@ def test_a_door_too_old_for_the_condition_loses_the_field_and_not_the_question(
     assert len(door.blockers) == 1, "and still became a row"
     assert door.blockers[0].get("condition", "") == "", "the field is what was lost"
     assert "NOT announced" not in capsys.readouterr().out
+
+
+def test_a_lost_register_still_leaves_the_question_somewhere_durable(door, cycle,
+                                                                     monkeypatch, capsys):
+    """Announcing before the register write is checked is deliberate, and this pins
+    what it buys AND what it costs.
+
+    Buys: an unwritten register loses the occurrence, so the next declaration counts
+    as the first and the brake will not fire again — precisely the run where the
+    question most needs to be somewhere durable, and the row is the only durable
+    thing left.
+
+    Costs: the two states then disagree. The board holds an open question while the
+    register has no occurrence behind it. The exit code says the declaration was not
+    recorded, so a caller is told; resolving it is a person answering or withdrawing
+    the row, which is what the row is for. The alternative — the question existing
+    nowhere at all — is strictly worse.
+    """
+    # Fails on the ESCALATING declaration only. Failing on both would mean the
+    # register never persisted an occurrence, so the brake could not fire and there
+    # would be no escalation to test — the run would pass for the wrong reason.
+    real = panel_rounds.write_payload
+    calls: list[int] = []
+
+    def fail_the_second(path, payload):
+        calls.append(1)
+        return real(path, payload) if len(calls) == 1 else "disk full"
+
+    monkeypatch.setattr(panel_rounds, "write_payload", fail_the_second)
+    assert declare_twice(cycle) == panel_rounds.UNWRITTEN_PAYLOAD_EXIT
+    assert len(door.blockers) == 1, "the question survived the register that did not"
+    err = capsys.readouterr().err
+    assert "NOT recorded" in err, "and the caller is told the declaration was lost"

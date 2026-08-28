@@ -899,7 +899,39 @@ def test_the_orchestrators_brief_runs_the_brake_before_it_re_briefs_a_fix_pass()
     of it — the same reason "match it by premise, not by key" is. On #299 the fixers
     escalated zero times across five rounds and the human named the premise."""
     assert "--premise-file /tmp/tmp.AbC123/premises.json" in PANEL_REVIEW_PR
-    assert "Do not launch §4." in PANEL_REVIEW_PR
+    # The brake still runs BEFORE §4 — that is what this test is named for and it
+    # is unchanged. What follows a brake is what #555 changed; see below.
+    assert "Read the exit code." in PANEL_REVIEW_PR
+    assert "before you go back to §4" in PANEL_REVIEW_PR
+
+
+def test_a_brake_partitions_the_orchestrators_round_rather_than_dropping_it():
+    """#555, and a deliberate reversal of what this brief used to say.
+
+    It read **"Do not launch §4."** — a blanket stop — and this test pinned that
+    string. In the panel flow the orchestrator declares the premise (not the
+    fixer) and §4 IS "launch the fixer sub-agent", so a brake meant the fixer was
+    never launched and the findings the premise says nothing about were fixed by
+    nobody. That is the same defect #555 was filed about, one level up and in the
+    mirror direction: on lexray#1697 the fixer spent a whole pass on findings the
+    premise had voided, and a blanket stop here throws away the ones it had not.
+
+    The rule is that work downstream of an open question is speculative spend — it
+    is not that everything alongside such a question is. So the brake now
+    partitions: no fix pass for the escalated keys, a fix pass for the rest, and a
+    stop after it.
+    """
+    assert "Do not launch §4." not in PANEL_REVIEW_PR, \
+        "the blanket stop is what #555 replaced — see this test's docstring"
+    assert "The downstream findings do not get a fix pass." in PANEL_REVIEW_PR
+    assert "The independent findings still do." in PANEL_REVIEW_PR
+    assert "withheld from the brief" in PANEL_REVIEW_PR
+    # The empty case is a real outcome and has to be named, or a reader with
+    # nothing independent left invents a pass to justify launching one.
+    assert "Unless nothing is left." in PANEL_REVIEW_PR
+    # And it must still be a stop: partitioning the pass must not read as licence
+    # for another ROUND, which is the brake's whole purpose.
+    assert "stop the cycle after this pass" in PANEL_REVIEW_PR
 
 
 def test_the_fixers_brief_carries_the_fourth_test_and_says_it_stands_alone(
@@ -949,10 +981,11 @@ def test_the_escalation_names_both_halves_of_the_partition(repo, tmp_path, capsy
     declare(reg, LANDED, 1, KEY_A)
     declare(reg, LANDED, 2, KEY_A, KEY_B)
     out = capsys.readouterr().out
-    assert "DOWNSTREAM OF THE PREMISE — write no patch for these:" in out
+    assert "DOWNSTREAM OF THE PREMISE — write no patch for these." in out
     assert KEY_A in out and KEY_B in out
     assert "INDEPENDENT" in out
     assert "it does not end it" in out, "an escalation partitions the pass, not ends it"
+    assert "not listed above" in out, "the independent half is defined by subtraction"
 
 
 def test_a_declaration_that_named_no_findings_says_the_partition_is_missing(
@@ -992,3 +1025,39 @@ def test_a_recorded_declaration_reports_no_partition_because_there_is_none(
     declare(reg, LANDED, 1, KEY_A)
     out = capsys.readouterr().out
     assert "DOWNSTREAM OF THE PREMISE" not in out and "NO PARTITION" not in out
+
+
+def test_the_downstream_list_is_cumulative_and_says_so(repo, tmp_path, capsys):
+    """The register UNIONS finding keys across every declaration of a premise
+    (`declare_premise`: `entry["findings"] = sorted({*entry["findings"], *keys})`),
+    so the escalating verdict carries keys from earlier rounds as well as this
+    one. The report must not present that as this round's finding list.
+
+    A second opinion caught this and the first cut of these tests could not have:
+    they declared `KEY_A` in both rounds, so the accumulated set and the current
+    one were identical and no assertion could tell them apart. Here round 2
+    declares only `KEY_B`, and `KEY_A` still has to appear — labelled for what it
+    is."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1, KEY_A)
+    capsys.readouterr()
+    declare(reg, LANDED, 2, KEY_B)
+    out = capsys.readouterr().out
+
+    assert KEY_A in out and KEY_B in out, "the list is every key ever declared"
+    assert "across round(s) 1, 2" in out, "and it says which rounds it spans"
+    assert "cumulative" in out
+    assert "must NOT be read as is this round's finding list" in out
+    assert "subtract it from your own" in out, "the fixer is told how to use it"
+
+
+def test_the_independent_half_is_defined_against_this_round_not_the_list(
+        repo, tmp_path, capsys):
+    """The two halves are drawn from different populations — a cumulative
+    do-not-patch set and the current round's outstanding findings — and pairing
+    them without saying so is what made the earlier wording wrong."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1, KEY_A)
+    declare(reg, LANDED, 2, KEY_B)
+    out = capsys.readouterr().out
+    assert "every outstanding finding of THIS round that is not listed above" in out
