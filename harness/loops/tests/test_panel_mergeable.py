@@ -70,7 +70,7 @@ def _run(monkeypatch, tmp_path, *, mergeable="CONFLICTING", cfg_extra=None,
     monkeypatch.setattr(panel_core, "sh", fake_sh)
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r.json"
     assert panel.run("e2e", 77, post=False, json_file=str(out), record=False,
                      round_no=1, max_rounds=2, force=force) == 0

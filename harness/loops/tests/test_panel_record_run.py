@@ -183,7 +183,7 @@ def _round(monkeypatch, cfg=None, *, qb_present=False, stdout="", stderr=""):
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([], None, 5))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     _qb(monkeypatch, present=qb_present, stdout=stdout, stderr=stderr)
     # `_qb` pins `shutil.which` to answer for `qb` alone, and `seat_installed` is
     # a PATH read: pin it too, or which seats this round budgets depends on which

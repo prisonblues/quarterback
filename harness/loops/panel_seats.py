@@ -1896,7 +1896,8 @@ class Dials:
                     and severity_at_least(severity, self.fix_severity_floor)
                     and not severity_at_least(severity, self.round_trigger_floor))
 
-    def files_issue(self, severity: str, escalated: bool = False) -> bool:
+    def files_issue(self, severity: str, escalated: bool = False,
+                    unresolvable: bool = False) -> bool:
         """Does a deferral at this severity get a GitHub issue as well as its row?
 
         The board row is not in question and never is: every deferral gets one, at
@@ -1914,12 +1915,23 @@ class Dials:
         question — the same exemption a Sonar hard-gate issue gets from both severity
         floors, and for the same reason: it is not a severity judgement.
 
+        **An UNVERIFIABLE CLAIM is exempt too** (#547), and it is exempt for the
+        escalation's reason rather than for a new one. §4b's three roads to `deferred`
+        are joined by a fourth (§4c), and it is not a work item either: nothing here can
+        check the claim, so there is no task to file and no severity to weigh — what
+        the issue carries is the question, past the end of this session, to whoever
+        can answer it. Withholding it under a `never` gate would not save a ticket, it
+        would drop the question, and the claim's only remaining record would be a
+        payload nobody opens. The two exemptions stay separate arguments rather than
+        one `exempt` flag because they are two different reasons and the next person
+        to change one must not silently change the other.
+
         An unreadable or absent severity files the issue. That is the safe direction
         and the only one: the cost of an issue nobody needed is one line on a tracker,
         and the cost of silently withholding one is the finding living solely in a row
         whose severity nothing could read — which is the dumping ground this dial
         exists to avoid, arriving through the back door."""
-        if escalated:
+        if escalated or unresolvable:
             return True
         gate = self.file_deferral_issues
         if gate == DEFERRAL_ISSUES_ALWAYS:
@@ -1937,9 +1949,10 @@ class Dials:
             return "every deferral gets a GitHub issue"
         if self.file_deferral_issues == DEFERRAL_ISSUES_NEVER:
             return ("no deferral gets a GitHub issue — board rows only "
-                    "(an escalation still does)")
+                    "(an escalation and an unverifiable claim still do)")
         return (f"deferrals at/above {self.file_deferral_issues} get a GitHub issue, "
-                f"below it a board row only (an escalation always gets one)")
+                "below it a board row only (an escalation and an unverifiable claim "
+                "always get one)")
 
     def gist(self) -> str:
         """The one report line. Printed on EVERY round, at the default or not: the

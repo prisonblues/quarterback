@@ -453,6 +453,8 @@ So, per finding:
 - **An escalation is exempt at every setting, `never` included.** Its issue is not a
   work item, it is the question being put to a human, and it is what carries that
   question past the end of this session. Road 3 above is unchanged.
+- **An unverifiable claim is exempt too, for the same reason** (#547) — see the next
+  section, which is where the fourth road arrives.
 
 **If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
 the relay that you did and why. Below the gate the row is the *only* record, so a
@@ -480,6 +482,46 @@ changed answer keeps what it changed from. The status code says which happened �
 201 created, 200 updated, 422 when nothing was accepted — so `qb`'s exit status
 is worth reading rather than assuming.
 
+## 4c. The round's unverifiable claims — a fourth road, and the only one with a flag
+
+The report's **Unverifiable claims** block lists what this PR asserts that nothing in
+the review could check: the claim, a key (`uc-` and twelve hex), and what instrument
+*would* settle it. They are not findings. Nobody is asked to patch one, there is no
+severity, and the fixer never sees them — the judge ruled that no seat here could have
+settled them with what it was given, which is a fact about the instrument and not
+about this PR.
+
+Each one still costs the round its confidence until somebody accepts it, and that is
+deliberate: without it, a model could talk its own review into a confident stop by
+declaring everything unanswerable. What it buys is that the question can now be
+**discharged**, where before it could only be held.
+
+So, per claim:
+
+1. **Read it and decide** whether this PR may land with the claim unchecked. That is
+   a judgement about the change, and it is yours (or a human's) — never the panel's.
+2. **Open a GitHub issue for it, whatever `review_panel.file_deferral_issues` says.**
+   Same footing as an escalation and for the identical reason: the issue *asks* the
+   question rather than filing a task, and it is what carries it past the end of this
+   session. Title it as the claim; body says what would settle it and links this PR.
+3. **Do not try to `qb record-outcome` it.** That call keys on a FINDING key and an
+   obligation is not a finding — it has no reporter, no severity and no chain — so
+   there is nothing on the board for the row to attach to, and inventing one would
+   need a schema change this deliberately does not take. Its durable record is the
+   round's payload (`unresolved_claims`, with the key, the claim, what would settle it
+   and whether it has been accepted) and the issue you opened in step 2. Say in the
+   relay which issues those are.
+4. **Then pass the key back** to the next round: `--acknowledge uc-0123456789ab`,
+   repeatable, and the report prints the exact command. It is inherited by later
+   rounds through `--baseline`, so you do it once per cycle and not once per round.
+
+**Per claim, never in bulk, and there is no flag that accepts them all.** A blanket
+yes is the cheap gate, and a gate that always passes is worse than one that always
+holds because it looks like assurance. If a claim comes back next round under a new
+key, the judge reworded it — the key is derived from the claim's text and absorbs
+spelling but not rewording — and the run says so in `config_notes` rather than
+silently ignoring the stale one.
+
 ## 5. Re-review the fix commit — the round that used to be skipped
 
 Once the fixer has **pushed**, run the panel again over the new commit:
@@ -502,6 +544,11 @@ all is reported the same way, and costs the round its confidence.)
 
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
+
+Add `--acknowledge uc-xxxxxxxx` for each unverifiable claim you accepted in §4c —
+once, on the first round after you accepted it; the register is inherited through
+`--baseline` from there. Omit them and the round holds on a question you have already
+answered.
 
 ### Do not rewrite the branch between rounds, and know the cost if you must (#500)
 

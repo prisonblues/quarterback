@@ -18,6 +18,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -26,6 +27,7 @@ import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — run_cli lives here since #129
 import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
+import panel_rounds  # noqa: E402  — patched by name where a test forces a collision
 from conftest import gh_stub  # noqa: E402
 
 
@@ -241,7 +243,7 @@ def test_the_judges_own_schema_is_not_an_answer_either(monkeypatch):
         assert val["coverage_note"] == "the migration is unread", raw
     _judge_returning(monkeypatch, JUDGE_ECHO)
     out, skip, note = panel.adjudicate([], "diff", "", 34, coverage={"codex": ["the migration"]})
-    assert out == [] and note == ""
+    assert out == [] and note.note == ""
     assert skip and "unparseable" in skip
 
 
@@ -273,7 +275,7 @@ def test_the_schemas_example_verdict_rules_on_nothing_even_beside_a_real_note(mo
     out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
     assert [c.verdict for c in out] == ["unjudged"] and skip is None
     assert [c.synthesis for c in out] == ["leak"]
-    assert note == "the migration is unread"
+    assert note.note == "the migration is unread"
 
 
 def test_a_judge_reply_is_read_on_its_verdicts_not_on_a_findings_key():
@@ -1536,8 +1538,11 @@ def test_a_round_with_no_findings_still_gets_its_coverage_adjudicated(monkeypatc
     findings, skip, note = panel.adjudicate(
         [], "diff", "opus", 34, coverage={"codex": ["the migration"], "claude": []})
     assert findings == [] and skip is None
-    assert note.startswith("the migration is unread")
-    assert "could not assess the migration" in seen["prompt"]
+    assert note.note.startswith("the migration is unread")
+    # Numbered, one line per declaration: the number is what the judge's typed
+    # coverage ruling points at, so a listing that joined a seat's gaps onto one
+    # line would leave it nothing to point AT (#547).
+    assert "- [0] codex could not assess: the migration" in seen["prompt"]
 
 
 def test_an_ambiguous_judge_reply_is_not_a_ruling(monkeypatch):
@@ -1554,7 +1559,7 @@ def test_an_ambiguous_judge_reply_is_not_a_ruling(monkeypatch):
         '"synthesis": "the handle is closed by the context manager"}]}'))
     leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
     out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
-    assert [c.verdict for c in out] == ["unjudged"] and note == ""
+    assert [c.verdict for c in out] == ["unjudged"] and note.note == ""
     assert skip and "unparseable" in skip
     assert "not adjudicated" in " | ".join(panel.coverage_veto({}, skip, 0, 1_000, ci_status="PASS"))
 
@@ -1565,7 +1570,7 @@ def test_a_coverage_only_reply_is_not_a_judge_that_failed_to_rule(monkeypatch):
     _judge_returning(monkeypatch, json.dumps({"coverage_note": "nothing unread"}))
     _, skip, note = panel.adjudicate([], "diff", "", 34,
                                      coverage={"codex": ["the schema"]})
-    assert skip is None and note == "nothing unread"
+    assert skip is None and note.note == "nothing unread"
 
 
 def test_a_coverage_only_round_whose_judge_said_nothing_is_not_adjudicated(monkeypatch):
@@ -1588,7 +1593,7 @@ def test_a_coverage_only_round_whose_judge_said_nothing_is_not_adjudicated(monke
 def test_nothing_found_and_nothing_declared_needs_no_judge(monkeypatch):
     monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("the judge must not run with nothing to rule on")))
-    assert panel.adjudicate([], "diff", "", 34, coverage={"claude": []}) == ([], None, "")
+    assert panel.adjudicate([], "diff", "", 34, coverage={"claude": []}) == ([], None, panel.CoverageRuling())
 
 
 # ---- what the PR comment promises ------------------------------------------
@@ -1607,7 +1612,7 @@ def _fake_adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=
                              file=f.file, line=f.line, synthesis=f.title,
                              verdict="confirmed", detail=f.detail, reported_by=[f],
                              rationale="real")
-             for i, f in enumerate(flat)], None, "")
+             for i, f in enumerate(flat)], None, panel.CoverageRuling())
 
 
 def _stub_panel(monkeypatch, findings=None, title="feat: x", cfg=PANEL_CFG):
@@ -2397,3 +2402,578 @@ def test_a_malformed_disabled_checks_does_not_hand_out_the_exemption(
         cfg = {**PANEL_CFG, "preland": {"disabled_checks": junk}}
         got = _cycle_payload(monkeypatch, capsys, tmp_path, "none", cfg=cfg)
         assert got["round_stop"]["confident"] is False, junk
+
+
+# ------------------------------------------------------------------ #547's two cases
+#
+# A `could_not_assess` from a seat that did not open a file it could have opened, and
+# one from a seat that would need a running Postgres and a browser, produced the
+# identical artefact: a veto line, `confident: False`, a HOLD. The first impugns the
+# round. The second says what kind of instrument a panel of models reading a diff IS,
+# is true of every PR about runtime behaviour, and as a veto is exactly the standing
+# constant `coverage_veto`'s own docstring rules out.
+
+
+def _two_seats(claude=("the jsonb ceiling holds", "the html import"),
+               codex=("the jsonb ceiling under load",)) -> dict:
+    """Two running, sighted seats with declarations to rule on."""
+    return {"claude": {"ran": True, "code_blind": False,
+                       "could_not_assess": list(claude)},
+            "codex": {"ran": True, "code_blind": False,
+                      "could_not_assess": list(codex)}}
+
+
+def _numbered(meta: dict) -> list[tuple[str, str]]:
+    """The declaration list `adjudicate` hands the judge, in its order."""
+    return [(n, g) for n, m in sorted(meta.items())
+            for g in m.get("could_not_assess") or []]
+
+
+def _ruled(meta: dict, *entries):
+    """A judge reply's `coverage_rulings`, resolved against `meta`'s declarations —
+    the same path `adjudicate` takes, so these tests exercise the parser and not a
+    hand-built mapping."""
+    return panel._coverage_ruling(panel_core._rulings(list(entries)), _numbered(meta))
+
+
+#: One entry ruling declarations 0 and 2 — the same claim in two seats' words —
+#: structurally unanswerable, and declaration 1 answerable and unanswered.
+CEILING = {"declarations": [0, 2], "claim": "the jsonb ceiling holds at 8.16 MB",
+           "resolvable_in_harness": False, "reason": "needs a running Postgres"}
+IMPORT = {"declarations": [1], "claim": "the html import",
+          "resolvable_in_harness": True, "reason": "read the test file's imports"}
+
+
+def test_the_two_could_not_assess_cases_stop_producing_one_artefact():
+    """The issue, in one assertion. Before, three declarations meant three veto
+    lines and no way to tell which of them any round could ever answer. After, the
+    one that was trivially checkable and was not still costs the round its
+    confidence by name, and the two that no seat here could have settled are ONE
+    named obligation with a key somebody can act on."""
+    meta = _two_seats()
+    before = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS")
+    assert before == ["claude could not assess: the jsonb ceiling holds",
+                      "claude could not assess: the html import",
+                      "codex could not assess: the jsonb ceiling under load"]
+
+    after = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                                coverage=_ruled(meta, CEILING, IMPORT))
+    assert after == [
+        "claude could not assess: the html import",
+        "an unverifiable claim is unacknowledged [uc-61a3c6451332]: the jsonb ceiling "
+        "holds at 8.16 MB — needs a running Postgres"]
+
+
+def test_a_ruling_on_its_own_never_removes_a_veto_line():
+    """The property the whole design rests on, and the one to put to any change
+    here: a MODEL cannot author a confident stop.
+
+    The judge's ruling is a judgement about a judgement — not recorded state like
+    `absent` or `code_blind` — so it buys no exemption by itself. All it can do is
+    change what the veto SAYS. What ends the veto is a human passing the key back,
+    and that is an argument on a command line."""
+    meta = _two_seats()
+    ruling = _ruled(meta, CEILING, IMPORT)
+    assert ruling.unresolvable, "the judge did rule them unresolvable"
+    veto = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS", coverage=ruling)
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+
+def test_acknowledging_the_claim_by_key_is_what_discharges_it():
+    """And the other half: the act IS available, so the gate is satisfiable. That is
+    the whole of #547 — a veto nobody can ever discharge is a veto that gets dropped,
+    and then there is no gate at all."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta, {**CEILING, "declarations": [0]})
+    key = "uc-61a3c6451332"
+    veto = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling, acknowledged=[key])
+    assert veto == []
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is True
+
+
+def test_an_unruled_declaration_vetoes_exactly_as_it_did_before():
+    """The asymmetric default, stated as a test rather than as a paragraph. Silence
+    never buys the exemption: a reply that ruled on one declaration and forgot the
+    other leaves the other exactly where it was."""
+    meta = _two_seats(claude=("the jsonb ceiling holds", "the html import"), codex=())
+    ruling = _ruled(meta, {**CEILING, "declarations": [0]})
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling)[0] == \
+        "claude could not assess: the html import"
+
+
+@pytest.mark.parametrize("value", ["false", "False", 0, None, "no", [], "unresolvable"])
+def test_only_a_typed_false_buys_the_exemption(value):
+    """A typed enum is not prose, and this is where that stops being a claim. The
+    flag is read with `is False`, exactly as `_ruling` reads `real` and for the
+    mirror-image reason: there an unreadable flag must not dismiss a finding, here it
+    must not excuse a gap. A string spelling of the word is a spelling, not an act."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta, {**CEILING, "declarations": [0],
+                           "resolvable_in_harness": value})
+    assert not ruling.unresolvable
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == \
+        ["claude could not assess: the jsonb ceiling holds"]
+
+
+def test_a_missing_flag_buys_nothing_either():
+    """The commonest malformation, and the one a model reaches by writing prose
+    where a key was asked for."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta, {"declarations": [0], "claim": "the ceiling"})
+    assert not ruling.unresolvable
+
+
+def test_an_obligation_with_no_name_is_no_obligation():
+    """#547 asks for a NAMED obligation. An entry that rules a declaration
+    unresolvable and says nothing about what the claim IS would delete a veto line
+    and put nothing in its place, which is the model-authored bypass Part 2 exists to
+    prevent — so the declaration stays where it was."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta, {"declarations": [0], "claim": "",
+                           "resolvable_in_harness": False})
+    assert not ruling.unresolvable
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == \
+        ["claude could not assess: the jsonb ceiling holds"]
+
+
+def test_a_declaration_two_entries_both_claim_is_left_unruled():
+    """`JUDGE_PROMPT` asks for exactly one entry per declaration number. Two claims
+    on one number is a reply that did not answer the question, and resolving it by
+    taking the first would let the ORDER of a model's array decide whether a gap
+    vetoes — which is the failure `_agreed` was written to end."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta,
+                    {**CEILING, "declarations": [0]},
+                    {"declarations": [0], "claim": "the same gap, differently",
+                     "resolvable_in_harness": False})
+    assert not ruling.unresolvable
+
+
+def test_an_entry_that_names_no_declaration_exempts_nothing():
+    """It merges nothing, so it can exempt nothing — and keeping it would put a
+    claim on the round's ledger that no reviewer ever raised."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    assert not _ruled(meta, {**CEILING, "declarations": []}).unresolvable
+    assert not _ruled(meta, {**CEILING, "declarations": [9]}).unresolvable
+
+
+def test_the_ruling_is_read_off_numbers_and_never_off_the_wording():
+    """The rule every exemption in `coverage_veto` keeps, and the reason its
+    docstring gives for keeping it twice: a regex over free-form prose "would exempt
+    a genuine round-specific gap whose wording happened to match while missing the
+    structural one that did not".
+
+    So an entry whose `claim` quotes a declaration verbatim, while its
+    `declarations` list points somewhere else, exempts what it POINTED at and never
+    what it quoted."""
+    meta = _two_seats(claude=("the jsonb ceiling holds", "the html import"), codex=())
+    ruling = _ruled(meta, {"declarations": [1], "claim": "the jsonb ceiling holds",
+                           "resolvable_in_harness": False, "reason": "needs Postgres"})
+    assert [gap for _n, gap in ruling.unresolvable] == ["the html import"]
+
+
+def test_a_ruling_that_is_the_schema_quoted_back_rules_on_nothing(monkeypatch):
+    """The same guard `_is_answer` puts on a verdict, and it is needed more here: a
+    verdict echoed back files a fabricated finding, and a RULING echoed back removes
+    a veto line."""
+    # The schema as a MODEL resolves it: the two positions the prompt writes as
+    # tokens (`<...>`, `true|false`) filled in, and every literal string kept.
+    schema = panel_core.SCHEMA_RULING
+    example = {**schema, "declarations": [0, 2], "resolvable_in_harness": False}
+    assert all(v is not panel_core._TOKEN for v in example.values())
+    assert panel_core._rulings([example]) == ()
+
+    _judge_returning(monkeypatch, json.dumps(
+        {"verdicts": [], "coverage_note": "x",
+         panel_core.COVERAGE_RULINGS: [example]}))
+    _f, skip, ruled = panel.adjudicate(
+        [], "diff", "opus", 34, coverage={"claude": ["the migration"]})
+    assert skip is None and not ruled.unresolvable
+
+
+# ------------------------------------------------------- it can only get SHORTER
+
+
+def test_a_blind_seats_declaration_cannot_become_an_obligation():
+    """The property that makes this change safe to make at all: it can never add a
+    veto line anywhere.
+
+    A `code_blind` seat's declarations are reported and do not vote, because with the
+    diff as its whole evidence "I could not read a function this diff does not
+    change" is true of every round it sits. Letting one become an obligation would
+    hand that seat a standing veto it does not have today — #546's codex pass caught
+    the identical shape, a repo with no CI acquiring a veto every round — so
+    obligations are built only from declarations that WOULD have vetoed."""
+    meta = {"claude": {"ran": True, "code_blind": True,
+                       "could_not_assess": ["the jsonb ceiling holds"]}}
+    ruling = _ruled(meta, {**CEILING, "declarations": [0]})
+    assert ruling.unresolvable, "the judge ruled on it — it is in the listing"
+    assert panel.reached_obligations(meta, ruling) == ()
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == []
+
+
+def test_a_seat_that_never_ran_cannot_raise_an_obligation_either():
+    """Same rule, the other recorded state. Its declarations are not in the veto
+    list today (the seat's own `did not run` line is), so they cannot arrive as an
+    obligation and add a second."""
+    meta = {"claude": {"ran": False, "skip": "timed out",
+                       "could_not_assess": ["the jsonb ceiling holds"]},
+            "codex": {"ran": True, "code_blind": False, "could_not_assess": []}}
+    ruling = _ruled(meta, {**CEILING, "declarations": [0]})
+    assert panel.reached_obligations(meta, ruling) == ()
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == \
+        ["claude did not run (timed out)"]
+
+
+def test_adding_a_seat_that_restates_a_claim_costs_the_round_nothing():
+    """#547's second ordering constraint, and the test of whether the divergence is
+    actually fixed: **does adding a reviewer still make a confident stop strictly
+    less reachable?**
+
+    It did, by construction. Under `confident = not veto` each extra seat
+    contributed its own copy of the same capability limit and every copy was a veto,
+    so a fifth seat made a confident stop less reachable while adding findings rather
+    than evidence. Now the judge merges the copies into one claim and the ledger
+    carries one entry, so the fourth and fifth seats saying it too cost nothing."""
+    one = {"claude": {"ran": True, "code_blind": False,
+                      "could_not_assess": ["the jsonb ceiling holds"]}}
+    four = {**one,
+            "codex": {"ran": True, "code_blind": False,
+                      "could_not_assess": ["the jsonb ceiling under load"]},
+            "grok": {"ran": True, "code_blind": False,
+                     "could_not_assess": ["whether the ceiling holds at all"]},
+            "pi": {"ran": True, "code_blind": False,
+                   "could_not_assess": ["the 8.16 MB figure"]}}
+    merged = {**CEILING, "declarations": [0, 1, 2, 3]}
+    assert len(panel.coverage_veto(one, None, 0, 1_000, ci_status="PASS",
+                                   coverage=_ruled(one, {**CEILING, "declarations": [0]}))) == 1
+    assert len(panel.coverage_veto(four, None, 0, 1_000, ci_status="PASS",
+                                   coverage=_ruled(four, merged))) == 1
+    # And the old rule, for the contrast the issue measured: four seats, four vetoes.
+    assert len(panel.coverage_veto(four, None, 0, 1_000, ci_status="PASS")) == 4
+
+
+# --------------------------------------------------------------- #546 stays intact
+
+
+def test_a_round_where_nothing_executed_still_vetoes_though_every_claim_is_acknowledged():
+    """The sequencing constraint, checked from the other side. #546 made `ci_status`
+    reach this function precisely so that removing the seats' prose vetoes would not
+    turn a round with no execution behind it into a confident one — the prose vetoes
+    were holding that line by accident.
+
+    So: every declaration ruled unresolvable, every obligation acknowledged, and the
+    round still cannot stop confidently, because nothing ran."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    ruling = _ruled(meta, {**CEILING, "declarations": [0]})
+    veto = panel.coverage_veto(meta, None, 0, 1_000, ci_status="none",
+                               coverage=ruling,
+                               acknowledged=["uc-61a3c6451332"])
+    assert veto == ["no CI run exists for this commit — nothing mechanical "
+                    "executed this code"]
+    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
+
+
+def test_the_judge_cannot_exempt_itself():
+    """A judge that did not rule takes its own veto line, and no ruling it did not
+    make can remove it. Stated as a test because the exemption this issue adds is the
+    first one in this function that a MODEL grants, and the model granting it is the
+    same party the line is about."""
+    meta = _two_seats(claude=("the jsonb ceiling holds",), codex=())
+    veto = panel.coverage_veto(meta, "judge: claude CLI absent", 0, 1_000,
+                               ci_status="PASS",
+                               coverage=_ruled(meta, {**CEILING, "declarations": [0]}),
+                               acknowledged=["uc-61a3c6451332"])
+    assert veto == ["the round was not adjudicated (judge: claude CLI absent)"]
+
+
+# ------------------------------------------------------- #547's ledger, end to end
+#
+# Part 1 without Part 2 is a model-authored bypass of the confidence gate with no
+# ledger. These are Part 2: every unverifiable claim lands somewhere a human reads,
+# whether or not anybody has accepted it, and the acceptance is its own recorded act.
+
+
+def _ruling_judge(unresolvable=("the enactment drops to 8.16 MB",)):
+    """An `adjudicate` stub that rules every declaration it is given unresolvable
+    under one merged claim — the shape of the round #547 was filed off."""
+    def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
+        numbered = [(n, g) for n, items in sorted((coverage or {}).items())
+                    for g in items]
+        entries = [{"declarations": list(range(len(numbered))),
+                    "claim": c, "resolvable_in_harness": False,
+                    "reason": "needs the deployed system"} for c in unresolvable]
+        return [], None, panel._coverage_ruling(panel_core._rulings(entries), numbered)
+    return fake
+
+
+def _claiming_round(monkeypatch, capsys, tmp_path, *, acknowledge=(), baseline=(),
+                    round_no=1, gaps=("the enactment size",)):
+    """One whole cycle round whose single seat declares a gap the judge rules
+    structurally unanswerable. Returns (report, payload)."""
+    _stub_panel(monkeypatch, findings=[])
+    monkeypatch.setattr(panel, "review_llm", lambda *a, **k: panel.ReviewerRun(
+        [], None, 10, list(gaps)))
+    monkeypatch.setattr(panel, "adjudicate", _ruling_judge())
+    out = tmp_path / f"r{round_no}.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=round_no, max_rounds=3, baseline=list(baseline),
+                     acknowledge=list(acknowledge)) == 0
+    return capsys.readouterr().out, json.loads(out.read_text())
+
+
+#: The key `claim_key` mints for the claim the stub judge rules on. Written out
+#: rather than derived from the function under test — a key the tests compute the
+#: same way the code does would agree with any derivation, including a broken one,
+#: and this is the string a human types back off a PR comment.
+ENACTMENT = "uc-f1554b5ef264"
+
+
+def test_every_unverifiable_claim_reaches_the_payloads_ledger(monkeypatch, capsys,
+                                                              tmp_path):
+    """"Nobody checked whether stored rows are now a mixed corpus" is the BEST
+    output of the round that raised it. The problem was never that it was raised —
+    it is that raising it discharged nothing and cost the round its verdict forever.
+
+    So the claim is kept, under a key, with what would settle it beside it, and
+    whether it has been accepted is a separate field: a reader has to be able to tell
+    "this round raised none" from "all of them are signed off"."""
+    _report, got = _claiming_round(monkeypatch, capsys, tmp_path)
+    assert got["unresolved_claims"] == [
+        {"key": ENACTMENT, "claim": "the enactment drops to 8.16 MB",
+         "reason": "needs the deployed system", "acknowledged": False}]
+    assert got["round_stop"]["confident"] is False
+    assert got["round_stop"]["veto"] == [
+        f"an unverifiable claim is unacknowledged [{ENACTMENT}]: the enactment "
+        "drops to 8.16 MB — needs the deployed system"]
+
+
+def test_an_acknowledged_claim_stays_on_the_ledger_and_stops_costing_the_round(
+        monkeypatch, capsys, tmp_path):
+    """Acknowledging is not deleting. The claim, its key and what would settle it
+    all stay in the artefact; what changes is that the round may now stop
+    confidently, which is the one-time human act replacing a permanent HOLD."""
+    _report, got = _claiming_round(monkeypatch, capsys, tmp_path,
+                                   acknowledge=[ENACTMENT])
+    assert got["unresolved_claims"] == [
+        {"key": ENACTMENT, "claim": "the enactment drops to 8.16 MB",
+         "reason": "needs the deployed system", "acknowledged": True}]
+    assert got["acknowledged"] == {ENACTMENT: 1}
+    assert got["round_stop"]["veto"] == []
+    assert got["round_stop"]["confident"] is True
+
+
+def test_the_report_names_the_claim_its_key_and_the_command_that_discharges_it(
+        monkeypatch, capsys, tmp_path):
+    """The remedy has to be IN the artefact. A veto whose discharge lives in a brief
+    the reader does not have open is a veto they will resolve by dropping the gate,
+    which is the outcome this whole issue exists to avoid."""
+    report, _got = _claiming_round(monkeypatch, capsys, tmp_path)
+    assert "### Unverifiable claims" in report
+    assert f"`{ENACTMENT}` — the enactment drops to 8.16 MB" in report
+    assert f"--acknowledge {ENACTMENT}" in report
+    assert "unacknowledged" in report
+    # And the ledger's other half: an issue is opened whatever the deferral gate
+    # says, on the same footing as an escalation.
+    assert "whatever\n`review_panel.file_deferral_issues` says" in report \
+        or "whatever `review_panel.file_deferral_issues` says" in report
+
+
+def test_an_acknowledgement_is_inherited_by_the_next_round(monkeypatch, capsys,
+                                                           tmp_path):
+    """An unverifiable claim does not stop being unverifiable because a round ended.
+    A cycle that forgot the acknowledgement between rounds would put the identical
+    question to the same person every round — the permanent HOLD arriving one round
+    later, wearing a discharge — so the register travels in the payload exactly as
+    `escalated` does."""
+    _r1, first = _claiming_round(monkeypatch, capsys, tmp_path,
+                                 acknowledge=[ENACTMENT])
+    p1 = tmp_path / "r1.json"
+    assert first["acknowledged"] == {ENACTMENT: 1}
+    _r2, second = _claiming_round(monkeypatch, capsys, tmp_path, round_no=2,
+                                  baseline=[str(p1)])
+    # Nothing was passed on the command line this time.
+    assert second["acknowledged"] == {ENACTMENT: 1}
+    assert second["round_stop"]["veto"] == []
+
+
+def test_an_acknowledgement_naming_no_claim_this_round_raised_is_said_out_loud(
+        monkeypatch, capsys, tmp_path):
+    """`_claim_norm` absorbs spelling and not rewording, and says so. A judge that
+    words the claim differently next round mints a different key, so the caller's
+    acknowledgement matches nothing — and the one outcome ruled out is silence,
+    because the caller would read it as the acknowledgement having landed."""
+    _report, got = _claiming_round(monkeypatch, capsys, tmp_path,
+                                   acknowledge=["uc-deadbeefcafe"])
+    assert any("--acknowledge uc-deadbeefcafe names no unverifiable claim this "
+               "round raised" in n for n in got["config_notes"]), got["config_notes"]
+
+
+@pytest.mark.parametrize("junk", ["", "deadbeefdeadbeef", "uc-", "uc-nothexvalue1",
+                                  "uc-1234abcd", "uc-1234abcdef012"])
+def test_a_value_that_is_not_an_obligation_key_is_refused_and_says_what_that_costs(
+        monkeypatch, capsys, tmp_path, junk):
+    """The same door `--escalated` is checked at, and the refusal has to name the
+    cost for the same reason: an ignored acknowledgement is an obligation that goes
+    on vetoing while the caller believes it discharged.
+
+    A finding key is refused too, and deliberately — the two flags sit two lines
+    apart in the parser, and a key pasted into the wrong one must be told about
+    rather than silently matching nothing for the rest of the cycle."""
+    _report, got = _claiming_round(monkeypatch, capsys, tmp_path, acknowledge=[junk])
+    assert any("is not the shape of an obligation key" in n
+               for n in got["config_notes"]), got["config_notes"]
+    assert got["round_stop"]["confident"] is False
+
+
+def test_there_is_no_flag_that_accepts_every_claim_at_once(monkeypatch, capsys,
+                                                           tmp_path):
+    """The failure mode on the far side of this one. A gate that always passes is
+    worse than one that always holds, because it looks like assurance — so
+    acknowledging is per claim and the only way to accept two is to name two."""
+    def two(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
+        numbered = [(n, g) for n, items in sorted((coverage or {}).items())
+                    for g in items]
+        entries = [{"declarations": [i], "claim": c,
+                    "resolvable_in_harness": False, "reason": "needs the system"}
+                   for i, c in enumerate(("the enactment drops to 8.16 MB",
+                                          "no stored row is left mixed"))]
+        return [], None, panel._coverage_ruling(panel_core._rulings(entries), numbered)
+
+    _stub_panel(monkeypatch, findings=[])
+    monkeypatch.setattr(panel, "review_llm", lambda *a, **k: panel.ReviewerRun(
+        [], None, 10, ["the enactment size", "the stored corpus"]))
+    monkeypatch.setattr(panel, "adjudicate", two)
+    out = tmp_path / "two.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=1, max_rounds=3, acknowledge=[ENACTMENT]) == 0
+    capsys.readouterr()
+    got = json.loads(out.read_text())
+    assert [c["acknowledged"] for c in got["unresolved_claims"]] == [True, False]
+    assert len(got["round_stop"]["veto"]) == 1
+    assert got["round_stop"]["confident"] is False
+
+
+def test_the_judge_is_asked_for_the_ruling_in_the_shape_this_file_reads():
+    """The prompt and the parser have to agree, and the prompt is the artefact — a
+    schema this file reads out of `JUDGE_PROMPT` cannot drift from the text a model
+    is sent, but the INSTRUCTION beside it can."""
+    prompt = panel_core.JUDGE_PROMPT
+    assert '"coverage_rulings"' in prompt
+    assert '"resolvable_in_harness"' in prompt
+    # The declarations are pointed at by NUMBER, and the listing says so where the
+    # numbers are printed.
+    assert "the bracketed declaration NUMBERS this claim merges" in prompt
+    assert "the bracketed number is the declaration id" in prompt
+    # One entry per claim, not per declaration — the property that makes a fifth
+    # seat restating a claim cost the round nothing.
+    assert "One entry per CLAIM, not per declaration" in prompt
+    # And the tie-break is towards vetoing, said to the model in its own words.
+    assert "When you cannot tell, answer `true`" in prompt
+    # It is told what the `false` actually buys, so it is not writing one under the
+    # impression that it settles anything.
+    assert "somebody has to acknowledge by hand" in prompt
+
+
+def test_an_obligation_key_is_not_a_finding_key_and_the_two_cannot_be_swapped():
+    """They meet in the argument parser, two lines apart. A prefix nothing else uses
+    is what stops `--acknowledge <finding key>` matching nothing in silence — and
+    it keeps an 8-hex digest, which reads as an API key to every secret scanner, out
+    of a report that gets posted as a PR comment."""
+    key = panel.claim_key("the enactment drops to 8.16 MB")
+    assert panel.is_claim_key(key) and not panel._is_key(key)
+    assert not panel.is_claim_key("deadbeefdeadbeef")
+    assert panel._is_key("deadbeefdeadbeef")
+
+
+def test_one_claim_keeps_one_key_across_the_spellings_a_rewrite_changes():
+    """Content-addressed so two rounds raising the same claim raise it under the same
+    key, and one acknowledgement discharges it for the rest of the cycle. The limit
+    is stated rather than papered over: it absorbs spelling, not rewording."""
+    assert panel.claim_key("the enactment drops to 8.16 MB") == ENACTMENT
+    same = ["the enactment drops to 8.16 MB",
+            "The enactment drops to 8.16 MB.",
+            "the  enactment   drops to 8.16 MB"]
+    assert len({panel.claim_key(c) for c in same}) == 1
+    assert panel.claim_key("the enactment is smaller now") != panel.claim_key(same[0])
+
+
+# ------------------------------------------- the two ways a claim could have vanished
+#
+# Both found by the codex pass on this change, and both are the same failure: a
+# declaration suppressed from the veto list whose claim never reached the ledger. That
+# is precisely the disappearance Part 2 exists to make impossible, so both are refused
+# rather than resolved — the declarations go on vetoing under the line they always had.
+
+
+def test_a_seat_that_repeated_itself_leaves_both_declarations_unruled():
+    """The mapping is keyed by `(reviewer, declaration)`, because `coverage_veto` walks
+    seats and gap TEXT and has no numbers to look one up by. A seat that wrote the same
+    gap twice therefore gives two declaration numbers one key, and two rulings on them
+    would overwrite each other — suppressing both gaps from the veto while only the
+    surviving obligation reached the payload. One claim, gone from both."""
+    meta = {"claude": {"ran": True, "code_blind": False,
+                       "could_not_assess": ["the ceiling", "the ceiling"]}}
+    ruling = _ruled(meta,
+                    {"declarations": [0], "claim": "the jsonb ceiling holds at 8.16 MB",
+                     "resolvable_in_harness": False, "reason": "needs Postgres"},
+                    {"declarations": [1], "claim": "no stored row is left mixed",
+                     "resolvable_in_harness": False, "reason": "needs the corpus"})
+    assert not ruling.unresolvable
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == \
+        ["claude could not assess: the ceiling", "claude could not assess: the ceiling"]
+
+
+def test_two_claims_that_hash_alike_are_refused_rather_than_merged():
+    """A truncated digest can collide, and the two consequences are not symmetrical:
+    one claim would be absent from the ledger, and one `--acknowledge` would discharge
+    both. Twelve hex characters make it negligible; refusing it makes it fail-closed,
+    which is the direction every other branch in this resolver takes."""
+    meta = _two_seats(claude=("the ceiling", "the corpus"), codex=())
+    collide = [
+        {"declarations": [0], "claim": "the jsonb ceiling holds at 8.16 MB",
+         "resolvable_in_harness": False, "reason": "needs Postgres"},
+        {"declarations": [1], "claim": "no stored row is left mixed",
+         "resolvable_in_harness": False, "reason": "needs the corpus"},
+    ]
+    forced = panel_core._rulings(collide)
+    # Force the collision rather than searching for one: the resolver's rule is what
+    # is under test, not the hash's spread.
+    with mock.patch.object(panel_rounds, "claim_key", lambda _c: "uc-000000000000"):
+        ruling = panel_rounds._coverage_ruling(forced, _numbered(meta))
+    # The first claim keeps the key it minted; the second is refused, and its
+    # declaration goes back to the line it always produced. Two claims in, two veto
+    # lines out — neither is suppressed by an obligation that does not name it.
+    assert [ob.claim for ob in ruling.unresolvable.values()] == \
+        ["the jsonb ceiling holds at 8.16 MB"]
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                               coverage=ruling) == [
+        "claude could not assess: the corpus",
+        "an unverifiable claim is unacknowledged [uc-000000000000]: the jsonb "
+        "ceiling holds at 8.16 MB — needs Postgres"]
+
+
+def test_a_ruling_can_delete_lines_but_never_the_last_one():
+    """The invariant stated precisely, because the loose version is wrong in a way
+    that matters. Merging IS deletion — four seats stating one limit become one
+    obligation where they were four vetoes — and that is the whole of the seat-count
+    fix. What no ruling can do is leave the list empty where it was not empty before,
+    which is the only thing `confident` reads."""
+    meta = _two_seats()
+    for entries in ([CEILING, IMPORT],
+                    [{**CEILING, "declarations": [0, 1, 2],
+                      "claim": "everything about this PR"}],
+                    [{**CEILING, "declarations": [0]}]):
+        ruling = _ruled(meta, *entries)
+        after = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS",
+                                    coverage=ruling)
+        before = panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS")
+        assert 0 < len(after) <= len(before), entries
+        assert panel.round_stop(1, 2, [], [], after)["confident"] is False

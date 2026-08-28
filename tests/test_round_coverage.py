@@ -1160,7 +1160,8 @@ def _panel_round(monkeypatch, tmp_path, round_no, title, baseline=()):
                                  file="app/sync.py", line=12, synthesis=title,
                                  verdict="confirmed", detail="detail",
                                  reported_by=reports, rationale="real")],
-                None, "codex is right that the migration is unread")
+                None,
+                panel.CoverageRuling("codex is right that the migration is unread"))
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: PANEL_CFG)
     # Patched through `panel` rather than on a separately-imported panel_core:

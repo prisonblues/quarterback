@@ -1074,7 +1074,7 @@ def budget_for_partial_context() -> int:
 def _judge(seen):
     def fake(clusters, diff, model, pr, budget=None, coverage=None, ci="", **_kw):
         seen["diff"], seen["budget"] = diff, budget
-        return [], None, ""
+        return [], None, panel.CoverageRuling()
     return fake
 
 

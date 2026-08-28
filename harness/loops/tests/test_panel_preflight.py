@@ -1537,7 +1537,7 @@ def _run(monkeypatch, tmp_path, diff, panel_cfg, *, force=False, post=False,
     monkeypatch.setattr(panel_core, "sh", gh_stub(diff=diff))
     monkeypatch.setattr(panel, "review_llm", fake_review)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     monkeypatch.setattr(panel, "record_run",
                         lambda p: seen["recorded"].append(p))
     monkeypatch.setattr(panel, "post_summary",
@@ -1794,7 +1794,7 @@ def test_a_scoped_round_is_NOT_refused_for_the_size_of_its_CONTEXT(monkeypatch,
                         lambda n, m, prompt, effort="", **kw:
                         panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r2.json"
     assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
                      round_no=2, baseline=[_payload(tmp_path, "r1.json")],
@@ -1908,7 +1908,7 @@ def test_a_manifest_round_vetoes_a_confident_stop(monkeypatch, tmp_path):
     monkeypatch.setattr(panel, "review_llm",
                         lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "veto.json"
     # `--max-rounds` is what says this run is part of a cycle, which is what makes
     # `round_stop` a verdict rather than a field nobody reads.
@@ -1935,7 +1935,7 @@ def test_a_forced_round_vetoes_through_the_ORDINARY_truncation_path(monkeypatch,
     monkeypatch.setattr(panel, "review_llm",
                         lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "forced.json"
     assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
                      max_rounds=2, force=True) == 0
@@ -2049,7 +2049,7 @@ def test_a_scoped_round_is_weighed_on_its_INCREMENT_not_on_the_PR(monkeypatch,
 
     monkeypatch.setattr(panel, "review_llm", reviewer)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r2.json"
     assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
                      round_no=2, baseline=[_payload(tmp_path, "r1.json")],
@@ -2142,7 +2142,7 @@ def test_an_inherited_manifest_round_vetoes_a_later_SCOPED_round(monkeypatch,
     monkeypatch.setattr(panel, "review_llm",
                         lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     mani = _payload(tmp_path, "r1.json", round=1,
                     preflight={"verdict": "manifest", "reason": "move-shaped"})
     out = tmp_path / "r2.json"
@@ -2197,7 +2197,7 @@ def _scoped_manifest_run(monkeypatch, tmp_path, baselines, cap_divisor=4):
     monkeypatch.setattr(panel, "review_llm",
                         lambda n, m, p, effort="", **kw: panel.ReviewerRun([], None, 10, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r2.json"
     assert panel.run("e2e", 137, post=False, json_file=str(out), record=False,
                      round_no=2, baseline=list(baselines), max_rounds=3) == 0

@@ -94,7 +94,7 @@ def _adjudicate(clusters, diff, model, pr, budget=None, coverage=None, cwd=None,
                              file=f.file, line=f.line, synthesis=f.title,
                              verdict="confirmed", detail=f.detail, reported_by=[f],
                              rationale="real")
-             for i, f in enumerate(flat)], None, "")
+             for i, f in enumerate(flat)], None, panel.CoverageRuling())
 
 
 def stub(monkeypatch, findings, *, config=None, diff=None, prompts=None, sonar=(),
@@ -1626,7 +1626,26 @@ def test_never_files_nothing_and_says_the_escalation_still_does():
     and drops the one issue that is a question rather than a task."""
     d = gate("never")
     assert not any(d.files_issue(s) for s in ("P1", "P2", "P3", "P4"))
-    assert "an escalation still does" in d.deferral_gist()
+    assert "an escalation and an unverifiable claim still do" in d.deferral_gist()
+
+
+@pytest.mark.parametrize("value", ["never", "always", "P1", "P2", "P3", "P4"])
+def test_an_unverifiable_claim_is_exempt_at_every_setting(value):
+    """#547's fourth road to `deferred`, and it is exempt for the escalation's
+    reason rather than a new one: nothing here can check the claim, so there is no
+    task to file and no severity to weigh — the issue carries the QUESTION past the
+    end of this session. Withholding it under a `never` gate would not save a ticket,
+    it would drop the question and leave a payload nobody opens as the only record."""
+    assert gate(value).files_issue("", unresolvable=True) is True
+
+
+def test_the_two_exemptions_stay_two_arguments():
+    """Kept apart rather than folded into one `exempt` flag: they are two different
+    reasons, and the next person to change one must not silently change the other."""
+    d = gate("never")
+    assert not d.files_issue("P1")
+    assert d.files_issue("P1", escalated=True)
+    assert d.files_issue("P1", unresolvable=True)
 
 
 @pytest.mark.parametrize("value", ["never", "always", "P1", "P2", "P3", "P4"])
@@ -1794,7 +1813,8 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
             "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
             "cap 3x or +30,000 chars · fixer may defer yes · failing test "
             "required no · deferrals at/above P2 get a GitHub issue, below it a "
-            "board row only (an escalation always gets one)") in report
+            "board row only (an escalation and an unverifiable claim always get "
+            "one)") in report
 
 
 def _release_pr(monkeypatch, config):

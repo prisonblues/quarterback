@@ -748,7 +748,8 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
                                  file=f.file, line=f.line, synthesis=f.title,
                                  verdict="confirmed", detail="detail",
                                  reported_by=[f], rationale="real")
-                 for i, grp in enumerate(clusters) for f in grp], None, "")
+                 for i, grp in enumerate(clusters) for f in grp], None,
+                panel.CoverageRuling())
 
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg or CFG)
     monkeypatch.setattr(panel_core, "sh", fake_sh)
@@ -1109,7 +1110,7 @@ def test_an_explicit_since_anchors_the_attribution_too(monkeypatch, tmp_path):
                         lambda name, model, prompt, effort="", **_kw:
                         panel.ReviewerRun([], None, 800, None))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, panel.CoverageRuling()))
     out = tmp_path / "r2.json"
     panel.run("e2e", 77, post=False, json_file=str(out), record=False, round_no=2,
               baseline=[r1_path], max_rounds=2, since="ccc333")

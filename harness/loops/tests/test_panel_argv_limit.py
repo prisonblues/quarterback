@@ -277,7 +277,7 @@ def _agy_round(monkeypatch, tmp_path, capsys, diff, agy_budget=None):
                                                           code_blind=True))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate",
-                        lambda *a, **k: ([], "", None))
+                        lambda *a, **k: ([], "", panel.CoverageRuling()))
     out = tmp_path / f"agy-{agy_budget}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
     capsys.readouterr()

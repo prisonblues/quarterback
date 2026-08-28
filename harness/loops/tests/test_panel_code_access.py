@@ -379,7 +379,7 @@ def _round(monkeypatch, tmp_path, capsys, *, cfg_extra=None, tree=None,
 
     monkeypatch.setattr(panel, "review_llm", reviewer)
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", panel.CoverageRuling()))
     out = tmp_path / "p.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      no_code_access=no_code_access) == 0
@@ -501,7 +501,7 @@ def test_a_panel_of_only_blind_seats_does_not_download_a_tree(monkeypatch, tmp_p
                         lambda *a, **k: panel.ReviewerRun([], None, 10, [],
                                                           code_blind=True))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", panel.CoverageRuling()))
     out = tmp_path / "p.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
     report = capsys.readouterr().out
@@ -944,7 +944,7 @@ def test_the_tree_still_exists_when_the_judge_runs(monkeypatch, tmp_path, capsys
                         ci="", code_tree=None, budget_usd=None, recurrence=""):
         judged["tree"] = str(code_tree) if code_tree else None
         judged["alive"] = bool(code_tree) and (Path(code_tree) / "app/main.py").exists()
-        return [], None, ""
+        return [], None, panel.CoverageRuling()
 
     cfg = json.loads(json.dumps(CFG))
     monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
@@ -1043,7 +1043,7 @@ def test_the_diff_only_seats_are_told_they_have_no_tools(monkeypatch, tmp_path, 
                             prompts.append(prompt),
                             panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", panel.CoverageRuling()))
 
     assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
                      record=False) == 0
@@ -1120,7 +1120,7 @@ def test_the_brief_is_inside_what_the_argv_clamp_measured(monkeypatch, tmp_path,
                             prompts.setdefault(name, prompt),
                             panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", panel.CoverageRuling()))
 
     assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
                      record=False) == 0

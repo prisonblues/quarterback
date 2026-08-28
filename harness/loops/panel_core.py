@@ -781,6 +781,10 @@ covering every report id:
                   "synthesis": "the merged statement of the issue",
                   "related": ["F03"],
                   "reason": "why real or a false positive"}}],
+   "coverage_rulings": [{{"declarations": [<the bracketed declaration NUMBERS this claim merges, e.g. 0, 2>],
+                  "claim": "what nobody settled, in one line",
+                  "resolvable_in_harness": true|false,
+                  "reason": "what would settle it"}}],
    "coverage_note": "..."}}
 
 `coverage_note` adjudicates the reviewers' own coverage declarations below — one sentence, or ""
@@ -789,10 +793,37 @@ assess an area), that split is more informative than either verdict alone: say w
 believe and what is therefore still unread. Do not average it away, and do not turn it into a
 prediction about further rounds.
 
+`coverage_rulings` splits those same declarations into the two different things they are being
+made to say. A reviewer that did not open a file it could have opened, and a reviewer that would
+need a running database and a browser, both write one `could_not_assess` line; the first impugns
+this round and the second is a fact about what a panel of reviewers reading a diff IS.
+
+**One entry per CLAIM, not per declaration.** Where several reviewers say the same thing in
+different words, merge them and list every declaration number in `declarations`, exactly as
+`members` merges reports above. Every declaration number below belongs to exactly one entry, and
+a number you leave out is read as unruled — which costs the round its confidence, so leave none
+out.
+
+`resolvable_in_harness: true` — it was answerable from the diff and the tree in front of you, and
+was not answered. A file nobody opened, an import nobody checked, a caller nobody grepped for.
+`reason` names the file or the command that would have settled it.
+
+`resolvable_in_harness: false` — **no reviewer here could have settled it with what this review
+has.** It needs code to actually run, a live service, a browser, a populated database, data this
+checkout does not carry, or a measurement of the deployed system. `reason` names the instrument
+that could settle it.
+
+When you cannot tell, answer `true`. That is the answer that costs the round its confidence, and
+a reviewer's idleness recorded as a capability limit is a review that stopped confidently on a
+question nobody asked. This ruling never decides on its own that a claim is settled: a `false`
+converts an unanswerable veto into a named obligation somebody has to acknowledge by hand, and
+until they do it still costs the round its confidence.
+
 Reports:
 {findings}
 
-Coverage declared by the reviewers:
+Coverage declared by the reviewers (the bracketed number is the declaration id `coverage_rulings`
+takes):
 {coverage}
 {ci}
 <<<CODE_ACCESS_BRIEF>>>
@@ -1222,6 +1253,35 @@ def _example(key: str) -> dict | None:
 #: One findings entry / one verdicts entry, exactly as the prompt writes it.
 SCHEMA_ITEMS = {k: _example(k) for k in ENVELOPE_KEYS}
 
+#: The key the judge's coverage ruling arrives under (#547), and the one example
+#: entry :data:`JUDGE_PROMPT` ships inside it.
+#:
+#: Not in :data:`DECLARATION_KEYS`, and the distinction is the whole of #547: a
+#: DECLARATION says what went unassessed, and this RULES on the declarations
+#: somebody else made. Putting it there would make a judge that returned nothing
+#: but a coverage ruling read as a judge that declared its own coverage.
+COVERAGE_RULINGS = "coverage_rulings"
+
+
+def _ruling_example() -> dict | None:
+    """The one `coverage_rulings` entry the judge prompt illustrates."""
+    items = (SCHEMA_ECHOES.get("verdicts") or {}).get(COVERAGE_RULINGS)
+    return items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else None
+
+
+#: What a judge that quoted the ruling schema back returns, rather than ruling.
+SCHEMA_RULING = _ruling_example()
+
+
+def _is_ruling(item: object) -> bool:
+    """Whether one `coverage_rulings` entry is a ruling rather than the example.
+
+    The same test :func:`_is_answer` applies to a verdict, and it has to be applied
+    here for the same reason: a judge that echoes the schema beside a real reply
+    would otherwise contribute an entry claiming declaration numbers it never read,
+    and a ruling is the one thing in this reply that can REMOVE a veto line."""
+    return isinstance(item, dict) and not _quoted(item, SCHEMA_RULING)
+
 
 def _standins(key: str) -> frozenset[str]:
     """The phrase(s) a schema puts in its declaration field in place of an
@@ -1312,6 +1372,16 @@ class _Read(NamedTuple):
     #: The coverage declared, or None when the candidate never engaged with the
     #: question. The null-versus-`[]` distinction is load-bearing here too.
     declared: tuple[str, ...] | None
+    #: The judge's coverage RULING as the caller will read it (#547), normalised
+    #: the same way `declared` is, and `()` on every reply that carries none.
+    #:
+    #: Here rather than left out of the comparison, because this is the one field
+    #: of a judge reply that can DELETE a veto line. Two candidates identical in
+    #: their verdicts and contradicting each other about which declarations no seat
+    #: could have settled are not one answer, and leaving them out of the equality
+    #: would have position decide which contradiction survives — which is exactly
+    #: what :func:`_agreed` exists to stop doing.
+    rulings: tuple = ()
 
 
 def _read(val: list | dict, want: str | None = None) -> _Read:
@@ -1339,7 +1409,8 @@ def _read(val: list | dict, want: str | None = None) -> _Read:
     else:
         kept = tuple(_findings_of("", obj, items))
     read = _declaration(declared, kind)
-    return _Read(kept, None if read is None else tuple(read))
+    rulings = _rulings(obj.get(COVERAGE_RULINGS)) if kind == "verdicts" else ()
+    return _Read(kept, None if read is None else tuple(read), rulings)
 
 
 class _Ambiguous:
@@ -1804,6 +1875,63 @@ def _member_ids(raw) -> list[int]:
         elif isinstance(m, str) and m.strip().isdigit():
             out.append(int(m.strip()))
     return out
+
+
+class CoverageRule(NamedTuple):
+    """One entry of the judge's `coverage_rulings`, as the caller will read it.
+
+    The declarations are report NUMBERS the panel minted, never the seats' prose —
+    which is what makes this a typed ruling rather than the regex over free-form
+    wording :func:`coverage_veto`'s docstring rules out twice. The judge is handed a
+    numbered list and answers with numbers; nothing here reads a declaration's TEXT
+    to decide which entry it belongs to."""
+
+    #: Declaration ids this entry merges, deduplicated and in the order given.
+    declarations: tuple[int, ...]
+    #: The merged claim, in the judge's words. Empty when it wrote none.
+    claim: str
+    #: True only for a literal `resolvable_in_harness: false`. Every other value —
+    #: absent, null, a string, a number, a reply that never carried the key — leaves
+    #: this False, and a declaration nothing ruled `false` vetoes exactly as it did
+    #: before #547. The exemption takes an affirmative typed act; silence never
+    #: buys one, and this is the line where that is true rather than a paragraph.
+    unresolvable: bool
+    #: What would settle it, in the judge's words. Empty when it wrote none.
+    reason: str
+
+
+def _rulings(raw) -> tuple[CoverageRule, ...]:
+    """The judge's coverage ruling, normalised — `()` for a reply carrying none.
+
+    Defensive in one direction only, which is the same promise :func:`_parse_verdicts`
+    makes and the opposite of the direction it makes it in. There, a malformed reply
+    must never SUPPRESS a finding. Here, a malformed reply must never EXEMPT a
+    declaration: every branch that cannot read something drops the entry, and a
+    dropped entry means the declarations it would have covered stay unruled and go on
+    vetoing.
+
+    An entry naming no declaration is dropped. It merges nothing, so it can exempt
+    nothing, and keeping it would put a claim on the round's obligation ledger that no
+    reviewer ever raised — a model-authored obligation, which is a model authoring the
+    thing that discharges the gate."""
+    if not isinstance(raw, list):
+        return ()
+    out: list[CoverageRule] = []
+    for item in raw:
+        if not _is_ruling(item):
+            continue
+        ids = tuple(dict.fromkeys(_member_ids(item.get("declarations"))))
+        if not ids:
+            continue
+        out.append(CoverageRule(
+            declarations=ids,
+            claim=str(item.get("claim") or "").strip(),
+            # `is False`, exactly as :func:`_ruling` reads `real`, and for the
+            # mirror-image reason: there an unreadable flag must not dismiss a
+            # finding, here it must not excuse a gap.
+            unresolvable=item.get("resolvable_in_harness") is False,
+            reason=str(item.get("reason") or "").strip()))
+    return tuple(out)
 
 
 def _premise_verdict(raw) -> str:
@@ -2398,6 +2526,8 @@ __all__ = [
     "_TOKEN", "_TOKEN_MARK", "_tokenise", "_schema",
     "SCHEMA_ECHOES", "_example", "SCHEMA_ITEMS", "_standins",
     "SCHEMA_DECLARATIONS", "_quoted", "_is_answer", "_Read",
+    "COVERAGE_RULINGS", "_ruling_example", "SCHEMA_RULING", "_is_ruling",
+    "CoverageRule", "_rulings",
     "_read", "_Ambiguous", "_AMBIGUOUS", "_agreed",
     "extract_json_value", "_severity", "_TRUTHY", "_flag",
     "_to_findings", "_findings_of", "_verdict_reading", "_str_list",

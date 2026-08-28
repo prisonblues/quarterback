@@ -320,7 +320,7 @@ def _confirm_everything(clusters, diff, model, pr, budget=None, coverage=None, c
                              file=f.file, line=f.line, synthesis=f.title,
                              verdict="confirmed", detail=f.detail, reported_by=[f],
                              rationale="real")
-             for i, f in enumerate(flat)], None, "")
+             for i, f in enumerate(flat)], None, panel.CoverageRuling())
 
 
 def _report(monkeypatch, capsys, cfg=TWO_SEAT_CFG, runs=None, findings=None):

@@ -486,6 +486,13 @@ def _payload_defaults() -> dict:
         # the next round, through --baseline — must not have to tell "no
         # escalations" from "a payload that predates the field".
         "escalated": {},
+        # #547's two, on the same terms and for the same reason. `acknowledged` is
+        # the register the next round inherits; `unresolved_claims` is the ledger a
+        # human reads to decide what to acknowledge, and it is the artefact half of
+        # the answer — an unverifiable claim that vanished without landing here would
+        # be exactly the silence this issue exists to stop producing.
+        "acknowledged": {},
+        "unresolved_claims": [],
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
@@ -810,6 +817,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         no_code_access: bool = False,
         escalated: list[str] | None = None,
         escalated_from_board: bool = False,
+        acknowledge: list[str] | None = None,
         premise_file: str = "") -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
@@ -1120,6 +1128,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          "key (8-64 hex characters) — it was ignored, so the finding it "
                          "meant still counts as work a fix round can clear")
 
+    # `--acknowledge` (#547), checked at the same door and by the same rules, because
+    # it arrives the same way: a key a person read off a PR comment and typed back.
+    # Deduplicated on the spelling passed, refused loudly when it is not the shape
+    # this loop mints, and the refusal says what the silence would otherwise cost —
+    # an ignored acknowledgement is an obligation that goes on vetoing while the
+    # caller believes it discharged, which is the permanent HOLD wearing a fix.
+    accepted: list[str] = []
+    seen_ack: set[str] = set()
+    for raw in acknowledge or []:
+        if str(raw) in seen_ack:
+            continue
+        seen_ack.add(str(raw))
+        if is_claim_key(raw):
+            key = str(raw).strip().lower()
+            if key not in accepted:
+                accepted.append(key)
+        else:
+            notes.append(
+                f"--acknowledge `{_key_gist(raw)}` is not the shape of an obligation "
+                f"key ({CLAIM_KEY_PREFIX} and 12 hex characters, as the report prints "
+                "it) — it was ignored, so the claim it meant still costs the round its "
+                "confidence")
+
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
     # strip a two-line preamble before parsing is one preamble away from breaking.
@@ -1165,6 +1196,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # the finding was excluded while every later round counted it.
             for key in sorted(k for k in declared if k not in skip_prior.escalated):
                 notes.append(f"--escalated {key} was passed to a round that reviewed "
+                             "nothing, so it was NOT recorded — pass it again on the "
+                             "next round that runs")
+            # The same answer for the same reason: a round that reviewed nothing
+            # raised no obligations, so there is nothing here for an acknowledgement
+            # to attach to and dating it to this round would write it in unchecked.
+            for key in sorted(k for k in accepted if k not in skip_prior.acknowledged):
+                notes.append(f"--acknowledge {key} was passed to a round that reviewed "
                              "nothing, so it was NOT recorded — pass it again on the "
                              "next round that runs")
             skipped_payload = {
@@ -1220,6 +1258,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # branch (which needs this round's findings) never ran on this
                 # path. A key passed here is reported instead, above.
                 "escalated": dict(skip_prior.escalated),
+                # Carried forward and added to by nothing, exactly as `escalated` is
+                # and for the identical reason: the claims are still unverifiable and
+                # the person who accepted them has not un-accepted them because a
+                # title matched /^Merge /.
+                "acknowledged": dict(skip_prior.acknowledged),
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -2353,7 +2396,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # to a deleted directory: `seat_checkout` would fail its copy, fall back to an
     # empty sandbox, and the judge would silently review blind with the setting on
     # and nothing reporting it. Degrading correctly is exactly what made it silent.
-    findings, judge_skip, coverage_note = adjudicate(
+    findings, judge_skip, ruled = adjudicate(
         clusters, judge_text, panel.get("judge_model", ""), pr_number, None, coverage,
         ci=ci_text, code_tree=code_tree, budget_usd=budget_usd,
         # #67's question, asked of the judge because it is the only party in the
@@ -2361,6 +2404,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # commit that answered them. Empty on a round 1 and on any cycle whose
         # baseline named no findings, which leaves the prompt exactly as it was.
         recurrence=recurrence_brief(prior.fixed_findings, prior.head_round))
+    # The prose half, unchanged since it was added — it is printed and recorded and
+    # decides nothing. `ruled` carries the typed half beside it (#547), and the two
+    # travel together so a reader of either can find the other.
+    coverage_note = ruled.note
     # Now nothing reads the tree again: the reviewers copied out of it inside the
     # executor and the judge has just finished with it. Removed here rather than at
     # the end of `run` because a PR's checkout is the largest thing this process
@@ -2556,10 +2603,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # than a list would hand out the exemption by substring, which is the fail-OPEN
     # direction on the one setting here that can buy a confident stop.
     ci_declared_absent = isinstance(_off, list) and "ci" in _off
+    # Declared this round plus every key an earlier round of the cycle accepted.
+    # `prior` wins a collision for the same reason it does on `escalated`: the
+    # earliest round that recorded the act owns its date, and re-passing a key you
+    # inherited must not re-date the acknowledgement to now.
+    ack_held = dict(sorted({**{k: round_no for k in accepted},
+                            **prior.acknowledged}.items()))
+    obligations = reached_obligations(reviewer_meta, ruled)
     veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target),
                           ci_status=ci_status,
-                          ci_declared_absent=ci_declared_absent)
+                          ci_declared_absent=ci_declared_absent,
+                          coverage=ruled, acknowledged=ack_held)
             + manifest_veto + judge_gaps + inherited + prior.problems)
+    # An acknowledgement naming no obligation this round raised is almost always a
+    # re-worded claim under a new key, which `_claim_norm` says plainly it cannot
+    # absorb — so it is SAID rather than corrected. The alternative readings are a
+    # typo and a claim genuinely settled since, and this cannot tell the three apart;
+    # what it can do is stop the caller reading the cycle's silence as the
+    # acknowledgement having landed.
+    raised = {ob.key for ob in obligations}
+    for key in sorted(k for k in accepted if k not in raised):
+        notes.append(f"--acknowledge {key} names no unverifiable claim this round "
+                     "raised — check the key against the report's Unverifiable claims "
+                     "list, and expect a new one if the judge reworded the claim")
     # Declared this round, plus every key an earlier round declared. The earliest
     # round that said so owns the answer, so `prior` wins a collision — a caller
     # re-passing a key it inherited must not re-date the claim to now.
@@ -3556,6 +3622,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # never travels as one.
         "proposals": proposals,
         "coverage_note": coverage_note or None,
+        # #547's ledger. Every claim this round established that nothing in it could
+        # check, whether or not somebody has accepted it — the acceptance is a
+        # separate field, so a reader can tell "no unverifiable claims" from "all of
+        # them signed off" without holding two payloads side by side.
+        #
+        # It is the record that makes the exemption safe to grant. A judge ruling a
+        # declaration unresolvable does not delete it; it moves it here, under a key,
+        # with what would settle it beside it. A claim that vanished without landing
+        # on this list would be the model-authored bypass Part 2 of #547 exists to
+        # prevent, and the test that pins it asks exactly that question.
+        "unresolved_claims": [{"key": ob.key, "claim": ob.claim, "reason": ob.reason,
+                               "acknowledged": ob.key in ack_held}
+                              for ob in obligations],
+        # key -> the round it was first acknowledged in, inherited by the next round
+        # through --baseline exactly as `escalated` is.
+        "acknowledged": ack_held,
         # The REVIEW TARGET's size — the whole PR under "pr" scope, the increment
         # under "increment". Its meaning is scope-dependent and always has been
         # in spirit ("how big was the thing we reviewed"); what is new is that
@@ -4295,6 +4377,49 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if coverage_note:
             lines.append(f"- _master:_ {coverage_note}")
 
+    # #547. Under its own heading and not folded into the declarations above,
+    # because it answers a different question and is addressed to a different
+    # person. The list above is "what did the reviewers say they could not do";
+    # this is "what does this PR assert that nothing here can check", which is the
+    # best output of a round that raised it and is the one item on the report a
+    # human is being asked to act on rather than read.
+    if obligations:
+        lines.append("\n### Unverifiable claims")
+        lines.append(
+            "_The master ruled that no seat in this review could have settled these "
+            "with what it was given. They are not findings and nobody is asked to "
+            "patch them — but until one is acknowledged it costs the round its "
+            "confidence, which is what stops a capability limit being recorded as an "
+            "assurance._")
+        for ob in obligations:
+            mark = (f"✅ acknowledged in round {ack_held[ob.key]}"
+                    if ob.key in ack_held else "⏳ **unacknowledged**")
+            lines.append(f"- `{ob.key}` — {ob.claim}"
+                         + (f" _(what would settle it: {ob.reason})_" if ob.reason else "")
+                         + f" — {mark}")
+        open_now = [ob for ob in obligations if ob.key not in ack_held]
+        if open_now:
+            keys = " ".join(f"--acknowledge {ob.key}" for ob in open_now)
+            # The remedy in full, in the artefact, because the whole of Part 2 is
+            # that this question can be discharged and the old one could not. A
+            # veto whose remedy lives in a brief the reader does not have open is a
+            # veto they will resolve by dropping the gate.
+            lines.append(
+                f"\nRead each claim, decide whether the PR may land with it "
+                f"unchecked, and if so pass it back to the next round: `{keys}`. "
+                "Acknowledging is per claim on purpose — a blanket yes is the cheap "
+                "gate, and it is the failure on the other side of the one this "
+                "replaces."
+                # Read off the dial rather than asserted, so the sentence cannot come
+                # to disagree with the function the orchestrator's brief sends people
+                # to. `files_issue` is the one answer to "does this get an issue", and
+                # an unverifiable claim's exemption belongs there and not here.
+                + (" Each also gets a GitHub issue whatever "
+                   "`review_panel.file_deferral_issues` says, on the same footing as "
+                   "an escalation: it carries a question past the end of this session "
+                   "rather than filing a task."
+                   if dials.files_issue("", unresolvable=True) else ""))
+
     verdict = "**stop**" if stop["stop"] else "**go again**"
     unearned = stop["stop"] and not stop["confident"]
     # Only where a loop actually exists. `--max-rounds` is the CALLER's cap and
@@ -4433,6 +4558,16 @@ def main() -> int:
                          "Repeatable; needs a cycle (--round/--max-rounds/--baseline) "
                          "to mean anything, and is inherited by later rounds through "
                          "--baseline")
+    ap.add_argument("--acknowledge", action="append", default=[], metavar="KEY",
+                    help=f"an obligation key ({CLAIM_KEY_PREFIX} and 12 hex characters, "
+                         "as the report's Unverifiable claims list prints it) whose "
+                         "claim a human has read and accepted going unchecked (#547). "
+                         "The claim stays in the report and in the payload's ledger; "
+                         "what it stops doing is costing the round its confidence, "
+                         "which is what makes an unanswerable declaration a one-time "
+                         "act instead of a permanent HOLD. Per claim on purpose — "
+                         "there is no flag that accepts them all. Repeatable, and "
+                         "inherited by later rounds through --baseline")
     ap.add_argument("--escalated-from-board", action="store_true",
                     dest="escalated_from_board",
                     help="take the escalation list from the board instead of naming "
@@ -4517,6 +4652,7 @@ def main() -> int:
                                    ("--escalated", bool(args.escalated)),
                                    ("--escalated-from-board",
                                     args.escalated_from_board),
+                                   ("--acknowledge", bool(args.acknowledge)),
                                    # Refused rather than ordered, because the two are
                                    # different questions about one premise and the
                                    # answer to "which ran?" must not be a reading of
@@ -4565,7 +4701,8 @@ def main() -> int:
                                    ("--force", args.force),
                                    ("--escalated", bool(args.escalated)),
                                    ("--escalated-from-board",
-                                    args.escalated_from_board)) if used]
+                                    args.escalated_from_board),
+                                   ("--acknowledge", bool(args.acknowledge))) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -4654,7 +4791,7 @@ def main() -> int:
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
                args.no_code_access, args.escalated, args.escalated_from_board,
-               args.premise_file)
+               args.acknowledge, args.premise_file)
 
 
 if __name__ == "__main__":

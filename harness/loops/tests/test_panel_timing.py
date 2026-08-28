@@ -73,7 +73,7 @@ def _stub(monkeypatch, *, sleeps=None, judge_sleep=0.0, cfg=None, head=DEFAULT_H
 
     def judge(clusters, *a, **k):
         time.sleep(judge_sleep)
-        return ([], None, "")
+        return ([], None, panel.CoverageRuling())
 
     monkeypatch.setattr(panel, "adjudicate", judge)
 

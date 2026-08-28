@@ -24,10 +24,16 @@ import panel_scope               # noqa: F401
 # re-exports the name, and the last import wins. Placed above, the guarantee would
 # have been a claim about another module's current contents rather than a property
 # of this file.
-from collections.abc import Iterable          # noqa: E402
+from collections.abc import Iterable, Mapping # noqa: E402
 # Named here for the same reason, and used by exactly one check: a baseline's
 # recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
 import math                                   # noqa: E402
+# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
+# is what lets :class:`CoverageRuling` default to an empty mapping without the
+# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
+import hashlib                                # noqa: E402
+from types import MappingProxyType            # noqa: E402
+from typing import NamedTuple                 # noqa: E402
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -624,6 +630,220 @@ def recurrence_brief(fixed: list[tuple[str, str, str, int | None, str]],
         prior_findings="\n".join(lines))
 
 
+# ------------------------------------------------------------------ #547's two cases
+#
+# A `could_not_assess` line answers whichever of three questions the reader brings
+# to it, and until #547 they all produced the same artefact: a veto line.
+#
+#   DILIGENCE  — a seat did not open a file it could have opened.
+#   CAPABILITY — no seat here could have settled it: it needs a running database,
+#                a browser, a deployed system, data this checkout does not carry.
+#   EVIDENCE   — has anything actually CHECKED the claim? (#546 answers that one,
+#                off `ci_status`, and nothing here touches it.)
+#
+# The first impugns the round. The second is not a statement about the round at
+# all — it is a statement about what kind of instrument a panel of models reading a
+# diff IS, and it is true of every PR about runtime behaviour this repo will ever
+# open. Left as a veto it is `coverage_veto`'s own forbidden constant, one round in
+# every one, and an unsatisfiable gate is a gate that gets dropped.
+#
+# The split is the JUDGE's, because the judge is already asked to adjudicate exactly
+# these declarations (`JUDGE_PROMPT`'s `coverage_note`) and was already doing it well
+# in prose that decided nothing. What #547 changes is that it now answers in NUMBERS
+# against a list this file minted, so the ruling is typed rather than parsed out of
+# wording — the rule every exemption in `coverage_veto` keeps.
+#
+# **A ruling on its own exempts nothing, and that is the load-bearing property.** A
+# capability limit does not become "fine"; it becomes a NAMED OBLIGATION, which goes
+# on vetoing until a human acknowledges it by key. So the model half of this can
+# only ever change what a veto line SAYS. It cannot remove one, it cannot author a
+# confident stop, and the incentive gradient that would otherwise point at declaring
+# everything unresolvable arrives at a longer ledger rather than a shorter one.
+
+#: What an obligation's key looks like, and it deliberately does NOT look like a
+#: finding key (`_is_key`: 8-64 bare hex). An obligation is not a finding — it has
+#: no severity, no file, no reporter and no fix — and the two vocabularies meet in
+#: `panel.py`'s argument parser, where `--escalated` and `--acknowledge` sit two
+#: lines apart. A prefix nothing else uses is what stops one being passed to the
+#: other and silently matching nothing.
+CLAIM_KEY_PREFIX = "uc-"
+CLAIM_KEY_RE = re.compile(rf"^{CLAIM_KEY_PREFIX}[0-9a-f]{{12}}$")
+
+
+def _claim_norm(claim: str) -> str:
+    """A claim reduced past the ways one round's judge and the next round's spell
+    the same sentence: case, run-together whitespace, a trailing full stop.
+
+    Crude ON PURPOSE, and its limit is stated rather than papered over. It absorbs
+    spelling, not rewording: a judge that says the same thing in different words next
+    round mints a different key, and the acknowledgement the human already gave does
+    not carry. That is the same limit `--escalated` has lived with since #221 —
+    `panel-review-pr.md` §5 says a re-worded premise under a new key "happens very
+    often" — and it is handled the same way, by reporting the mismatch (an
+    acknowledged key no obligation this round carries is a NOTE, not silence) rather
+    than by matching prose, which is the thing this whole design refuses to do."""
+    return " ".join(claim.lower().split()).strip(" .;:,!?")
+
+
+def claim_key(claim: str) -> str:
+    """The stable id of an unverifiable claim, derived from the claim itself.
+
+    Content-addressed rather than positional, which is what makes it survive the
+    round: two rounds that raise the same claim raise it under the same key, so one
+    acknowledgement discharges it for the rest of the cycle instead of being re-asked
+    every round — the permanent HOLD this issue exists to remove, arriving by a
+    different door.
+
+    Twelve hex characters behind a word prefix, and every part of that is deliberate.
+    It is SHORT because a human types it back in an `--acknowledge` flag off a PR
+    comment, and it is not a bare 16-hex digest because those read as an API key to
+    every secret scanner — the reason `panel-review-pr.md` renders finding IDs into
+    the report and keeps keys out of it.
+
+    Twelve and not eight, which was the first cut. A truncated digest can collide, and
+    the two consequences are not symmetrical: within one round :func:`_coverage_ruling`
+    refuses a collision outright, but ACROSS a cycle an acknowledgement recorded in
+    round 1 for one claim would silently discharge a different claim in round 2 — the
+    one direction in this design that fails OPEN. Three more characters to type takes
+    that from unlikely to negligible, and the in-round refusal below makes it
+    fail-closed on top."""
+    return CLAIM_KEY_PREFIX + hashlib.sha256(
+        _claim_norm(claim).encode("utf-8")).hexdigest()[:12]
+
+
+def is_claim_key(raw: object) -> bool:
+    """Whether a string is the shape :func:`claim_key` mints."""
+    return isinstance(raw, str) and bool(CLAIM_KEY_RE.match(raw.strip().lower()))
+
+
+class Obligation(NamedTuple):
+    """A claim this review established that nothing in it could check.
+
+    Not a finding: there is no defect, nobody is asked to write a patch, and no
+    severity applies. What it records is that the PR asserts something, that the
+    panel read the assertion, and that no seat here had an instrument that could
+    settle it — so the honest artefact is a question with a name on it rather than
+    either a silence or a veto nobody can discharge."""
+
+    #: :func:`claim_key` of :attr:`claim`.
+    key: str
+    #: The claim, in the judge's words, merged across every seat that raised it.
+    claim: str
+    #: What WOULD settle it, in the judge's words. Empty when it said nothing.
+    reason: str
+
+
+class CoverageRuling(NamedTuple):
+    """What the judge said about the reviewers' declarations — both halves.
+
+    :attr:`note` is the prose ruling `coverage_note` has always carried and is
+    unchanged. :attr:`unresolvable` is #547's typed half, and it is keyed by the
+    `(reviewer, declaration)` pair the panel itself minted rather than by anything
+    read out of the declaration's text.
+
+    Both defaults are the STRICT answer: no note, and no declaration exempted. A
+    caller that constructs one of these without a judge behind it gets the round it
+    would have got before #547 existed."""
+
+    note: str = ""
+    #: `(reviewer, declaration)` -> the obligation the judge merged it into, for
+    #: every declaration it ruled unresolvable. A pair that is absent was NOT ruled
+    #: — the reply was malformed, the entry named no declarations, the judge skipped,
+    #: the judge is not installed — and an absent pair vetoes exactly as it did
+    #: before. Silence never buys the exemption.
+    unresolvable: Mapping[tuple[str, str], Obligation] = MappingProxyType({})
+
+
+def _coverage_ruling(rules: tuple, numbered: list[tuple[str, str]],
+                     note: str = "") -> CoverageRuling:
+    """Resolve the judge's numbered ruling against the declarations it was shown.
+
+    Every rejection here leaves a declaration UNRULED, which means vetoing. There is
+    no branch that fails towards the exemption, deliberately: this function reads a
+    model's answer, and the one thing a model must not be able to do on its own
+    authority is take a line out of the veto list.
+
+    A declaration claimed by more than one entry is dropped from all of them rather
+    than given to the first. `JUDGE_PROMPT` asks for exactly one entry per number, so
+    two claims on one number is a reply that did not answer the question asked — and
+    resolving it by position would let the ORDER of a model's array decide whether a
+    gap vetoes, which is the failure `_agreed` was written to end.
+
+    An entry with no `claim` text is dropped too. #547 asks for a NAMED obligation;
+    an unnamed one is a veto line deleted and nothing put in its place, which is the
+    model-authored bypass Part 2 exists to prevent.
+
+    **Two declarations that read identically are both left unruled**, and that is the
+    one rule here that is not obvious. The mapping this returns is keyed by
+    `(reviewer, declaration)` because that is what :func:`coverage_veto` has to look a
+    gap up by — it walks seats and gap TEXT, and has no numbers. A seat that repeated
+    itself (`could_not_assess: ["X", "X"]`) therefore produces one key for two
+    declaration numbers, and two rulings on them would overwrite each other: the
+    veto loop would suppress both gaps while only the surviving obligation reached the
+    ledger, so a claim would vanish from both the veto list and the payload. That is
+    exactly the disappearance Part 2 exists to make impossible, so an ambiguous pair
+    is refused rather than resolved.
+
+    **A key collision refuses the SECOND claim, for the same reason.** Two different
+    claims hashing to one key would share an obligation: one of them silently absent
+    from the ledger while its declarations were suppressed, and one `--acknowledge`
+    discharging both. So the first claim keeps the key it minted and the second is
+    left unruled, which puts its declarations back on the line they always produced.
+    It cannot happen at twelve hex characters in any round a person would read, and it
+    is checked anyway — the cost of checking is three lines, and the cost of not
+    checking is a claim nobody can see going unanswered."""
+    claimed: dict[int, int] = {}
+    for i, rule in enumerate(rules):
+        for d in rule.declarations:
+            claimed[d] = i if d not in claimed else -1
+    # A `(reviewer, gap)` pair the listing carries twice cannot be resolved to one
+    # ruling, so it is resolved to none. Fail-closed: both declarations go on vetoing
+    # under the line they have always produced.
+    ambiguous = {pair for pair in numbered if numbered.count(pair) > 1}
+    minted: dict[str, str] = {}
+    out: dict[tuple[str, str], Obligation] = {}
+    for i, rule in enumerate(rules):
+        if not rule.unresolvable or not rule.claim:
+            continue
+        key = claim_key(rule.claim)
+        held = minted.setdefault(key, _claim_norm(rule.claim))
+        if held != _claim_norm(rule.claim):
+            continue
+        ob = Obligation(key, rule.claim, rule.reason)
+        for d in rule.declarations:
+            if claimed.get(d) != i or not 0 <= d < len(numbered):
+                continue
+            if numbered[d] in ambiguous:
+                continue
+            out[numbered[d]] = ob
+    return CoverageRuling(note, MappingProxyType(out))
+
+
+def reached_obligations(reviewer_meta: dict[str, dict],
+                        ruling: CoverageRuling) -> tuple[Obligation, ...]:
+    """The obligations this round's VETOING declarations actually raised.
+
+    Read off the same seats and the same recorded state :func:`coverage_veto` walks,
+    because an obligation may only ever stand in for a veto line that would otherwise
+    have been emitted. That is what makes #547 unable to make the gate HARDER
+    anywhere: a declaration that costs the round nothing today — a blind seat's, an
+    absent seat's, one from a seat that never ran — cannot become an obligation, so
+    the veto list after this change is a merge of a subset of the veto list before
+    it, and never longer.
+
+    Deduplicated by key and in first-seen order, so several seats raising one claim
+    is one obligation and the report and payload do not depend on dict ordering."""
+    out: dict[str, Obligation] = {}
+    for name, meta in sorted(reviewer_meta.items()):
+        if not meta.get("ran") or meta.get("code_blind"):
+            continue
+        for gap in meta.get("could_not_assess") or []:
+            ob = ruling.unresolvable.get((name, gap))
+            if ob is not None:
+                out.setdefault(ob.key, ob)
+    return tuple(out.values())
+
+
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                budget: int | None = DEFAULT_DIFF_BUDGET,
                coverage: dict[str, list[str]] | None = None,
@@ -631,11 +851,11 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                code_tree: Path | None = None,
                budget_usd: float | None = None,
                recurrence: str = ""
-               ) -> tuple[list[Canonical], str | None, str]:
+               ) -> tuple[list[Canonical], str | None, CoverageRuling]:
     """The 'master' rules on every finding, merges the duplicates it finds, AND
     rules on the coverage the reviewers declared about themselves.
 
-    Returns (canonical findings, skip_reason, coverage_note). skip_reason is None
+    Returns (canonical findings, skip_reason, coverage ruling). skip_reason is None
     when the judge ran (even if it dismissed nothing); otherwise it explains WHY
     it could not rule — CLI absent, timeout, crash, a zero exit that produced no
     output, or output with no JSON verdict in it — so the caller can surface that
@@ -644,10 +864,18 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     (with its own stderr quoted) instead of blaming the shape of a reply it never
     made.
 
-    The coverage ruling is one extra key in the object the judge already returns,
+    The coverage ruling is two extra keys in the object the judge already returns,
     so it costs no additional model call — and its own reply may still be the
     bare verdict array an earlier judge returned, in which case there is simply
-    no coverage note.
+    no coverage note and no ruling.
+
+    ``coverage_note`` is the prose half and is unchanged. ``coverage_rulings`` is
+    #547's typed half: the declarations are handed over NUMBERED and the judge
+    answers in numbers, so which gap an entry covers is never read out of the gap's
+    wording. A number the reply leaves out, contradicts itself about, or attaches to
+    an entry that names no claim is left UNRULED, and an unruled declaration vetoes
+    exactly as every declaration did before. Nothing in this function's failure
+    modes points towards the exemption.
 
     ``recurrence`` is #67's question, rendered by :func:`recurrence_brief` and
     empty on every round with no earlier round to ask it about. It rides in on the
@@ -673,7 +901,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     """
     declared = {k: v for k, v in (coverage or {}).items() if v}
     if not any(clusters) and not declared:
-        return [], None, ""
+        return [], None, CoverageRuling()
     # The listing and the diff no longer share one ceiling. They did while the
     # prompt travelled in argv and the two genuinely competed for the kernel's
     # 128 KiB; on stdin they compete only for the model's context, and the diff
@@ -686,16 +914,28 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # listing MAX_LISTING_CHARS. A capped diff leaves the listing more room than
     # it asks for either way, so there is nothing left for the old arithmetic.
     diff_text = diff if budget is None else diff[:budget]
-    stated = "\n".join(f"- {name}: could not assess {'; '.join(items)}"
-                       for name, items in sorted(declared.items())) \
+    # Numbered, one line per DECLARATION rather than one per reviewer, because the
+    # number is the whole of #547's typed ruling: the judge answers with these ids and
+    # this file resolves them back through `numbered`, so no step anywhere matches a
+    # ruling to a gap by reading the gap's text. Joining a seat's gaps onto one line —
+    # which is what this did — left nothing for a ruling to point AT.
+    numbered = [(name, gap) for name, items in sorted(declared.items()) for gap in items]
+    stated = "\n".join(f"- [{i}] {name} could not assess: {gap}"
+                       for i, (name, gap) in enumerate(numbered)) \
         or "- (no reviewer declared a gap in its coverage)"
     listing, flat = _judge_listing(clusters, MAX_LISTING_CHARS)
     listing = listing or ("- (no findings this round — there is nothing to adjudicate "
                           "but the coverage below; return an empty `verdicts` array)")
 
-    def unruled(reason: str, note: str = "") -> tuple[list[Canonical], str, str]:
+    def unruled(reason: str, ruled: CoverageRuling | None = None
+                ) -> tuple[list[Canonical], str, CoverageRuling]:
+        # A judge that could not be read rules on nothing, so the ruling it carries
+        # out is the note it managed and NEVER an exemption. `judge_skip` is a veto
+        # line in its own right (`coverage_veto`), so a round that reaches here keeps
+        # both halves of the answer: the round was not adjudicated, and every
+        # declaration it was shown still costs it its confidence.
         return [_unmerged(f, pr, i + 1, "unjudged", "unjudged")
-                for i, f in enumerate(flat)], reason, note
+                for i, f in enumerate(flat)], reason, ruled or CoverageRuling()
 
     # Through the shared predicate (#222), not an inline `shutil.which`: `run()`
     # now withholds `judge_max_diff_chars` from a box with no `claude` for the same
@@ -778,7 +1018,7 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
                                  cwd=sandbox)
             if not err2:
                 parsed = panel_core.extract_json_value(out2, "verdicts")
-    note = ""
+    note, ruled = "", CoverageRuling()
     reply = parsed if isinstance(parsed, dict) else None
     if reply is not None:
         # `"coverage_note": "..."` is what JUDGE_PROMPT asks with, not an answer to
@@ -787,6 +1027,8 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         # candidates at all — but a real ruling can still carry the stand-in note.)
         note = str(reply.get("coverage_note") or "").strip()
         note = "" if note in SCHEMA_DECLARATIONS["verdicts"] else note
+        ruled = _coverage_ruling(
+            panel_core._rulings(reply.get(panel_core.COVERAGE_RULINGS)), numbered, note)
         parsed = reply.get("verdicts")
     if not isinstance(parsed, list):
         # With nothing to adjudicate, a reply that carries the coverage answer is
@@ -801,9 +1043,10 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
         # precisely the round where the coverage split most needed adjudicating.
         answered = reply is not None and (bool(note) or "verdicts" in reply)
         if not flat and answered:
-            return [], None, note
-        return unruled("judge: no JSON verdict in output (unparseable)", note)
-    return _parse_verdicts(parsed, flat, pr, asked=bool(recurrence)), None, note
+            return [], None, ruled
+        return unruled("judge: no JSON verdict in output (unparseable)",
+                       CoverageRuling(note))
+    return _parse_verdicts(parsed, flat, pr, asked=bool(recurrence)), None, ruled
 
 
 # ----------------------------------------------------------------------------- rounds
@@ -1268,6 +1511,15 @@ class Baseline:
     #: the loop is trusting a report by the same agent whose fix pass produced
     #: it. Earliest wins on a merge, for the same reason the cycle id does.
     escalated: dict[str, int] = field(default_factory=dict)
+    #: Obligation keys a human has ACKNOWLEDGED (`--acknowledge`, #547), mapped to
+    #: the round each was first accepted in.
+    #:
+    #: Inherited for the same reason `escalated` is, and the reason is sharper here.
+    #: An unverifiable claim does not stop being unverifiable because a round ended;
+    #: a cycle that forgot the acknowledgement between rounds would put the identical
+    #: question to the same person every round, which is the permanent HOLD this
+    #: register exists to end, arriving one round later and wearing a discharge.
+    acknowledged: dict[str, int] = field(default_factory=dict)
     #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
     #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
@@ -1411,6 +1663,68 @@ def _whole_pr_chars(payload: dict) -> int | None:
     return _positive_int(payload.get("pr_chars")) or (
         _positive_int(payload.get("diff_chars"))
         if str(payload.get("scope") or "pr") == "pr" else None)
+
+
+def _inherit(into: dict[str, int], raw: object, was: int, path, problems: list[str],
+             field_name: str, act: str, shaped, norm, shape_gist: str,
+             cost: str) -> None:
+    """Read one `{key: round}` register out of a baseline payload into `into`.
+
+    Two registers now travel this way — `escalated` (#221) and `acknowledged` (#547)
+    — and they are the same object doing the same job: a caller's record of an act
+    performed OUTSIDE the loop, by a human, which no later round makes stop being
+    true. One implementation rather than two, because the half of this that matters
+    is the failure handling, and two copies of failure handling is one copy that
+    silently stops matching the other.
+
+    Every branch is the same shape as the one it replaced. Both container shapes are
+    accepted: this run writes an object, and a payload from before the field (or a
+    hand-written one) may carry a bare list, which is attributed to the round that
+    wrote it — the only answer available and never later than the truth. Anything
+    else is REPORTED and not dropped silently, because an unreadable register reverts
+    the cycle to the exact behaviour the register exists to prevent, and it would
+    arrive with nothing said.
+
+    ``shaped`` and ``norm`` are what keep the two registers apart. A key of the wrong
+    shape is refused and named rather than stored: it would sit in the register
+    forever matching nothing, and the caller would read the cycle's silence as the
+    act being honoured."""
+    if isinstance(raw, dict):
+        declared = list(raw.items())
+    elif isinstance(raw, list):
+        declared = [(k, was) for k in raw]
+    else:
+        declared = []
+        if raw is not None:
+            problems.append(
+                f"baseline {path} has an `{field_name}` field that is neither an "
+                f"object nor a list ({type(raw).__name__}) — round {was}'s "
+                f"{field_name} entries were NOT inherited, so {cost}")
+    for k, when in declared:
+        if not shaped(k):
+            problems.append(
+                f"baseline {path} carries `{_key_gist(k)}` in its `{field_name}` "
+                f"register, which is not {shape_gist} — it was NOT inherited")
+            continue
+        # The NORMALISED key, which is what `shaped` judged and what the round's own
+        # key will equal — storing the raw one would put a padded or upper-case
+        # spelling in the register, matching nothing.
+        key = norm(k)
+        # The declaration round is the one auditable fact in a register the loop
+        # otherwise takes on trust, so it is range-checked rather than coerced.
+        # `bool` is excluded explicitly: it is an `int` subclass, so `True` would
+        # otherwise be read as "declared in round 1". Out of range falls back to the
+        # round of the payload carrying it — the same answer a bare list gets, and
+        # never later than the truth.
+        ok = isinstance(when, int) and not isinstance(when, bool) and 1 <= when <= was
+        if not ok:
+            problems.append(
+                f"baseline {path} dates {act} {key} to {when!r}, which is not "
+                f"a round of this cycle at or before {was} — read as round {was}, "
+                "so the round shown against it is this payload's, not the "
+                "declaration's")
+        first = when if ok else was
+        into[key] = min(first, into.get(key, first))
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -1706,48 +2020,26 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # register reverts the cycle to counting an escalated finding as work a
         # fix round can clear, which is the exact failure the register exists to
         # prevent — and it would arrive with nothing said.
-        esc = payload.get("escalated")
-        if isinstance(esc, dict):
-            declared = list(esc.items())
-        elif isinstance(esc, list):
-            declared = [(k, was) for k in esc]
-        else:
-            declared = []
-            if esc is not None:
-                b.problems.append(
-                    f"baseline {path} has an `escalated` field that is neither an "
-                    f"object nor a list ({type(esc).__name__}) — round {was}'s "
-                    "escalations were NOT inherited, so a finding only a human can "
-                    "close counts as work a fix round can clear again")
-        for k, when in declared:
-            if not _is_key(k):
-                # A key the payload carries but nothing can match: it would sit in
-                # the register forever, matching no finding, and the caller would
-                # read the cycle's silence as the escalation being honoured.
-                b.problems.append(
-                    f"baseline {path} carries `{_key_gist(k)}` in its `escalated` "
-                    "register, which is not the shape of a finding key — it was "
-                    "NOT inherited")
-                continue
-            # The NORMALISED key, which is what `_is_key` judged and what a
-            # finding's own key will equal — storing the raw one would put a
-            # padded or upper-case spelling in the register, matching nothing.
-            key = _key_norm(k)
-            # The declaration round is the one auditable fact in a register the
-            # loop otherwise takes on trust, so it is range-checked rather than
-            # coerced. `bool` is excluded explicitly: it is an `int` subclass, so
-            # `True` would otherwise be read as "declared in round 1". Out of
-            # range falls back to the round of the payload carrying it — the same
-            # answer a bare list gets, and never later than the truth.
-            ok = isinstance(when, int) and not isinstance(when, bool) and 1 <= when <= was
-            if not ok:
-                b.problems.append(
-                    f"baseline {path} dates escalation {key} to {when!r}, which is not "
-                    f"a round of this cycle at or before {was} — read as round {was}, "
-                    "so the round shown against it is this payload's, not the "
-                    "declaration's")
-            first = when if ok else was
-            b.escalated[key] = min(first, b.escalated.get(key, first))
+        _inherit(b.escalated, payload.get("escalated"), was, path, b.problems,
+                 "escalated", "escalation", _is_key, _key_norm,
+                 "the shape of a finding key",
+                 "a finding only a human can close counts as work a fix round can "
+                 "clear again")
+        # #547's register, on exactly the same terms and through the same function:
+        # both are a caller's word about an act performed outside the loop, both are
+        # answered by a human on their own clock, and both silently revert the thing
+        # they exist for if a round drops them.
+        #
+        # The KEY SHAPES differ and are checked apart — an obligation key is `uc-`
+        # plus eight hex, a finding key is bare hex — so a key pasted into the wrong
+        # flag is reported here rather than inherited into a register where it would
+        # match nothing for the rest of the cycle while the caller read the silence
+        # as the acknowledgement being honoured.
+        _inherit(b.acknowledged, payload.get("acknowledged"), was, path, b.problems,
+                 "acknowledged", "acknowledgement", is_claim_key,
+                 lambda k: k.strip().lower(), "the shape of an obligation key",
+                 "an unverifiable claim a human already accepted goes back to costing "
+                 "the round its confidence and is put to them again next round")
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -1991,7 +2283,9 @@ CI_NOT_APPLICABLE = "none"
 
 def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                   flagged: int, diff_chars: int, *, ci_status: str,
-                  ci_declared_absent: bool = False) -> list[str]:
+                  ci_declared_absent: bool = False,
+                  coverage: CoverageRuling = CoverageRuling(),
+                  acknowledged: Iterable[str] = ()) -> list[str]:
     """Reasons a quiet round is not evidence of a quiet PR.
 
     A counter cannot tell a genuinely dry round from a broken one — a reviewer
@@ -2059,7 +2353,54 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     failure mode this whole function exists to make impossible. `ci_declared_absent`
     does default, because its default is the STRICT answer — a caller that knows
     nothing about the repo's rules has not been told CI is inapplicable, and must
-    not assume it."""
+    not assume it.
+
+    **The fourth constant, and the one this function was itself producing** (#547).
+    A declaration that no seat here could have settled — the claim needs a running
+    database, a browser, a deployed system — is true of every round of every PR
+    about runtime behaviour, so as a veto it distinguishes nothing and makes a
+    confident stop unreachable on exactly the changes that most need one. It is the
+    same shape as `absent`, `code_blind` and `argv_capped`, arriving through the one
+    branch that read a seat's own prose.
+
+    So it is exempted on the same terms as those three: off RECORDED STATE. The
+    record is `coverage`, and the state is the judge's typed ruling against a list of
+    declarations THIS FILE numbered — not a regex over the declaration's wording,
+    which the paragraph above rules out and which would exempt a genuine
+    round-specific gap whose phrasing happened to match while missing the structural
+    one that did not.
+
+    **Unlike those three it is not free, because a judgement is not a fact.** `absent`
+    and `code_blind` are things the host and the sandbox did; a ruling is a model's
+    opinion about a model's sentence, and an exemption resting on one alone would be
+    a confidence gate the panel could open by writing about itself. So the ruling
+    does not exempt. It CONVERTS: the declaration stops being "claude could not
+    assess X" and becomes a named obligation, which goes on vetoing until a human
+    passes its key to `--acknowledge`. `acknowledged` is that act, and it is recorded
+    state of the plainest kind — an argument on the command line, inherited across a
+    cycle's rounds through the payload exactly as `--escalated` is.
+
+    Two properties follow, and they are the ones to check any change to this against:
+
+    * **The veto list can only get shorter, and never empty where it was not empty
+      before.** Merging is the point, so a ruling DOES delete lines: four seats
+      stating one capability limit become one obligation where they were four vetoes.
+      What it cannot do is delete the last one. An obligation stands in only for lines
+      this function would have emitted anyway (:func:`reached_obligations` walks the
+      same seats under the same recorded state), and every obligation reached is
+      either acknowledged by a human or emitted — so a set of declarations that
+      vetoed before still vetoes after, and `confident` is unchanged by any ruling
+      alone. No round vetoes for a reason it did not veto for before, and #546's
+      separation is untouched: a round with no settled CI result still vetoes on
+      `ci_status`, whatever the seats did or did not say.
+    * **Adding a seat no longer costs a confident stop by construction.** Under the
+      old rule each new seat contributed its own copy of the same capability limit
+      and each copy was a veto, so a fifth seat made a confident stop strictly less
+      reachable while adding findings rather than evidence. Now a seat restating a
+      claim already on the ledger adds nothing to this list. What a new seat can
+      still cost is a gap it found that the others missed and that this panel COULD
+      have closed — which is diligence, is discharged by going and looking, and is
+      the behaviour worth keeping."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -2112,7 +2453,30 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
         # round and worth the round's confidence.
         if not meta.get("code_blind"):
             for gap in meta.get("could_not_assess") or []:
-                out.append(f"{name} could not assess: {gap}")
+                # An unresolvable one is not dropped here — it is deferred to the
+                # obligation block below, which emits one line for the CLAIM rather
+                # than one per seat that raised it. A gap the judge did not rule on
+                # falls through to the line it has always produced.
+                if (name, gap) not in coverage.unresolvable:
+                    out.append(f"{name} could not assess: {gap}")
+    # What the declarations above became. One line per CLAIM, not per seat, and only
+    # for the claims a VETOING declaration raised — a blind seat's or an absent
+    # seat's cost the round nothing today and must not start costing it something
+    # here, which is what keeps this change unable to lengthen the list anywhere.
+    #
+    # Still a veto, and that is the half that makes the other half safe. The judge
+    # can say "nothing here could have checked this" and all that buys is a better
+    # sentence; what ENDS the veto is a person reading the claim and passing its key
+    # back, which is a bounded one-time act instead of a question no round can ever
+    # answer. Acknowledging is deliberately per claim rather than per round: a blanket
+    # "yes, fine" is the cheap gate that looks like assurance, and it is the failure
+    # mode on the far side of this one.
+    ack = {k.strip().lower() for k in acknowledged if isinstance(k, str)}
+    for ob in reached_obligations(reviewer_meta, coverage):
+        if ob.key in ack:
+            continue
+        out.append(f"an unverifiable claim is unacknowledged [{ob.key}]: {ob.claim}"
+                   + (f" — {ob.reason}" if ob.reason else ""))
     # The floor under the absence exemption above. Exempting absent seats one by
     # one means a box carrying NONE of the reviewer CLIs produces an empty veto
     # list, and `confident` is `not veto` — a confident stop on a diff nobody
@@ -4256,8 +4620,11 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "_inherit", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
     "CI_NOT_APPLICABLE", "round_stop",
+    "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
+    "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",
+    "reached_obligations",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
