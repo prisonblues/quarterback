@@ -412,6 +412,12 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def lapsed_claims(self, params: dict) -> dict:
+        resp = self._http.get(self._url("/claims/lapsed"),
+                              params={k: v for k, v in params.items() if v is not None})
+        resp.raise_for_status()
+        return resp.json()
+
     def claim_held(self, params: dict) -> dict:
         resp = self._http.get(self._url("/claim/held"),
                               params={k: v for k, v in params.items() if v is not None})

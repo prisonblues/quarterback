@@ -68,6 +68,7 @@ from app.api.claims import (
     claim_view,
     clean_session,
     is_unique_violation,
+    lapse_hint,
     live_claim,
     may_mutate,
 )
@@ -2405,8 +2406,16 @@ async def claim_item(
     await session.commit()
     view = (await _view_items(session, [item], now, mine=holder,
                               session_id=body.session))[0]
-    return {**view, "claimed": True, "renewed": renewed, "claim_id": str(claim.id),
-            "forced": bool(blockers)}
+    out = {**view, "claimed": True, "renewed": renewed, "claim_id": str(claim.id),
+           "forced": bool(blockers)}
+    # The other pickup path (#568). `get-involved` comes through here rather than
+    # through `POST /claim`, and an item claim writes the same row on the same key
+    # — so the redirect has to hang off the claim both of them take, or the plan
+    # route silently loses it. See `previous_lapse` for why a fresh take only.
+    if not renewed:
+        out.update(await lapse_hint(session, CLAIM_KIND, claim_key(item),
+                                    exclude=claim.id, now=now))
+    return out
 
 
 async def _covering_claim(session: AsyncSession, item: PlanItem, holder: str,

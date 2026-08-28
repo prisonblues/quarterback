@@ -45,13 +45,14 @@ rows is not a deletion.
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -198,6 +199,189 @@ async def _sweep_lapsed(session: AsyncSession, kind: str, key: str,
                ResourceLease.released_at.is_(None), ResourceLease.expires_at <= now)
         .values(released_at=now, lapsed=True)
     )
+
+
+#: The grammar the one free-text field on a claim turned out to have.
+#: ``create-worktree`` writes ``worktree <branch> on <host>`` on every claim it
+#: takes (its ``claim_the_branch``), and that is the standard pickup path rather
+#: than a convention somebody follows — so a claim on issue N carries the tree
+#: that was made for issue N, on the box it was made on. Parsed here, on the
+#: board, and not in the harness and the MCP layer and the dashboard: three
+#: readers with their own idea of the note's shape is :mod:`app.claimkey`'s
+#: argument about keys, moved into a text column.
+_WORKTREE_NOTE = re.compile(r"^worktree\s+(?P<branch>\S+)\s+on\s+(?P<host>\S+)$")
+
+
+def worktree_of(note: str | None) -> dict | None:
+    """The branch and host a claim recorded, or None if its note named neither.
+
+    RECORDED, never observed. The board makes no outbound calls (#327) and cannot
+    see another machine's disk, so this is what was written down when the claim
+    was taken and never a statement that the tree is still there:
+    ``prune-worktrees`` and ``/drop-worktree`` delete them, and asserting a live
+    path that has been removed is worse than saying nothing, because a reader
+    acts on it. A caller standing on that host can look and say; a caller
+    anywhere else has a branch name and a machine to ask, which is exactly what
+    it knows. The same could-not-check-versus-nothing-to-report split
+    ``qb-doctor`` draws around its edge probe.
+    """
+    m = _WORKTREE_NOTE.match((note or "").strip())
+    return {"branch": m["branch"], "host": m["host"]} if m else None
+
+
+def lapsed_in_fact(now: datetime):
+    """Rows whose holder stopped answering — whether or not the sweep has run yet.
+
+    **The ``lapsed`` column alone is not the population, and reading it as if it
+    were is how this lookup would answer "nothing" about its own headline case.**
+    :func:`_sweep_lapsed` is passive by design — it runs only when somebody asks
+    for that exact key, so there is no reaper and a quiet key costs nothing — and
+    the consequence is that a claim nobody ever asked about again keeps
+    ``released_at IS NULL`` and ``lapsed = false`` for ever while sitting hours or
+    days past its expiry. Measured on this board the day this shipped: 8 rows
+    carried the flag and 73 more were past ``expires_at`` with ``released_at``
+    still NULL. One of the 73 is #196's claim, which is the case the feature was
+    built for. A row nobody happened to re-claim is not a row whose holder is
+    still there.
+
+    **``released_at`` alone is not it either**, and that is the distinction
+    :func:`_sweep_lapsed` exists to keep: a released claim means the holder said
+    they were done, so the work landed and pointing the next agent at it is noise.
+    Only the vanished half is worth a redirect.
+
+    One boundary this draws deliberately: a holder who comes back *after* their
+    TTL ran out and calls ``POST /claim/release`` leaves ``released_at`` set with
+    ``lapsed`` still false, and the row then drops out of here. That is the right
+    answer rather than a hole. The TTL only ever inferred that they had gone; an
+    explicit release is the holder saying what happened, later and better
+    informed, and a redirect exists to be read by somebody deciding whether to
+    start — "I am done with this" is exactly the answer that makes it noise.
+    """
+    return or_(
+        ResourceLease.lapsed.is_(True),
+        and_(ResourceLease.released_at.is_(None), ResourceLease.expires_at <= now),
+    )
+
+
+def lapsed_view(c: ResourceLease, now: datetime) -> dict:
+    """A decayed claim as something to act on: when it went quiet, and where to look."""
+    return {
+        **claim_view(c),
+        "released": c.released_at.isoformat() if c.released_at else None,
+        # Whether the flag has been written yet, which is a fact about this board
+        # and not about the holder: an unswept row is one nobody has asked about
+        # again, and `lapsed_in_fact` explains why that is not the same question.
+        "swept": bool(c.lapsed),
+        # `expires_at` is when the holder stopped answering. `released_at` on a
+        # swept row is when somebody next asked about the key, which can be days
+        # later and says nothing at all about the work.
+        "stopped_answering": c.expires_at.isoformat(),
+        "silent_hours": round((now - c.expires_at).total_seconds() / 3600, 1),
+        "worktree": worktree_of(c.note),
+    }
+
+
+def lapsed_row(c: ResourceLease, now: datetime) -> dict:
+    """A decayed claim with the sentence to print about it."""
+    v = lapsed_view(c, now)
+    v["redirect"] = _redirect_sentence(c, v["worktree"])
+    return v
+
+
+#: Said once on a response rather than on every row: the board reports what was
+#: written down and cannot tell anybody whether that tree is still on that disk.
+WORKTREE_IS_RECORDED = (
+    "`worktree` is what the claim RECORDED, not what is on that disk now — the "
+    "board makes no outbound calls and cannot see another machine. Read it as a "
+    "place to look: on that host `git worktree list` and `git log` answer, and "
+    "from anywhere else the branch name and the host are what is known."
+)
+
+
+def _redirect_sentence(c: ResourceLease, wt: dict | None) -> str:
+    """One line a person or an agent can act on, composed once for every client.
+
+    Deliberately a *redirect* and not a warning. "Possible duplicate" tells a
+    picker-up to feel uncertain; a branch, a host and a date tell them where to
+    look, and looking is the whole remedy. It also never says the work is done or
+    that this issue should not be started — the holder vanished, so nobody knows
+    which, and a refusal on that evidence would be worse than the duplication it
+    prevents.
+    """
+    who = c.holder
+    when = c.acquired_at.date().isoformat()
+    line = (f"{c.key} was claimed on {when} by {who}, and that claim lapsed — the "
+            f"holder stopped answering rather than saying it was finished.")
+    if wt:
+        line += (f" Its worktree was recorded as `{wt['branch']}` on {wt['host']}."
+                 f" Look there before you start.")
+    elif c.note:
+        line += f' The claim recorded no worktree; it said: "{c.note}".'
+    else:
+        line += " The claim recorded no worktree and said nothing else."
+    if not c.session:
+        # #156's territory, not this one's. A claim with no session belongs to the
+        # machine — `create-worktree` takes one before the agent that will use the
+        # tree exists — so "go and ask the holder" resolves to a whole box rather
+        # than to somebody who can answer.
+        line += (f" It named no session, so {who} is a machine and not an agent you"
+                 f" can address.")
+    return line + " This is advice, not a refusal: carry on if the work was"\
+                  " abandoned for a reason."
+
+
+async def lapse_hint(session: AsyncSession, kind: str, key: str, *,
+                     exclude: uuid.UUID, now: datetime) -> dict:
+    """:func:`previous_lapse`, with its failure kept away from the claim.
+
+    The claim is committed before this runs, so a read that raises would 500 a
+    request whose write already succeeded — and the caller would hold a claim
+    whose id it never learnt, which is worse than the advice it lost.
+    :func:`_plan_item_for` makes exactly this argument about the plan write, and
+    ``plan_done``'s ``claim_left`` is the same register: say what could not be
+    done rather than leaving it silent or letting it take the verb down with it.
+    """
+    try:
+        prior = await previous_lapse(session, kind, key, exclude=exclude, now=now)
+    except Exception as e:  # noqa: BLE001 — the claim is what must survive
+        await session.rollback()
+        _log.warning("claim %s/%s: lapse lookup failed: %s", kind, key, e,
+                     exc_info=True)
+        return {"previously": None, "previously_error": str(e)}
+    return {"previously": prior} if prior is not None else {}
+
+
+async def previous_lapse(session: AsyncSession, kind: str, key: str, *,
+                         exclude: uuid.UUID, now: datetime) -> dict | None:
+    """Did somebody take this exact key and then vanish? The pickup lookup.
+
+    An EXACT key lookup, which is what makes it worth firing on every pickup: it
+    can only speak when there genuinely was a prior claim on the very resource
+    being taken, so it is silent on a fresh issue and it has nothing to grow
+    fuzzy about. Title matching would be the opposite trade and is not wanted
+    here — the issue this belongs to says so, and a check that warns constantly
+    is a check nobody reads.
+
+    ``exclude`` is the claim the caller has just taken. Without it the answer is
+    sometimes the caller's own row, because :func:`_sweep_apart` runs first and a
+    renew of something that had already gone quiet would report itself.
+    """
+    mine = (ResourceLease.kind == kind, ResourceLease.key == key,
+            ResourceLease.id != exclude, lapsed_in_fact(now))
+    latest = await session.scalar(
+        select(ResourceLease).where(*mine)
+        .order_by(ResourceLease.acquired_at.desc()).limit(1))
+    if latest is None:
+        return None
+    # Counted rather than measured off a page of rows: a scan window that fetched
+    # 25 and reported `len - 1` would say "24 more" for ever once a key passed 25,
+    # which is a number that stops being a number.
+    total = await session.scalar(
+        select(func.count()).select_from(ResourceLease).where(*mine))
+    out = lapsed_row(latest, now)
+    out["also_lapsed"] = (total or 1) - 1
+    out["note_on_worktree"] = WORKTREE_IS_RECORDED
+    return out
 
 
 async def live_claim(session: AsyncSession, kind: str, key: str,
@@ -567,6 +751,28 @@ async def take_claim(
         out["note_on_key"] = (
             f"you asked for {body.kind}/{body.key!r}; the board keys that resource "
             f"as {kind}/{key!r}. Send `ref` instead and you never have to know.")
+    # Where the work already is, if somebody took this exact key and vanished
+    # (#568). The pickup moment is the only one at which a redirect is cheap:
+    # `create-worktree` and `get-involved` both arrive here having composed the
+    # key for the issue they are about to start, so nothing has to be searched
+    # for and no client has to remember to ask. It rides on the CLAIM rather
+    # than sitting in a skill, because there are two pickup paths and a third
+    # would otherwise miss it — the same argument `plan_item` makes above.
+    #
+    # **On a fresh take only.** A renew is the same worker carrying on and it
+    # already saw this on the way in; repeating it on every heartbeat is how an
+    # advisory becomes something people filter out.
+    #
+    # **Before the plan item, not after.** `_plan_item_for` rolls the session
+    # back when its write fails, which expires every ORM object on it — so a
+    # lookup that ran afterwards asked for `claim.id` on an expired instance
+    # and raised `MissingGreenlet` inside the one path that exists to keep a
+    # failed plan write from costing the claim. The redirect is a read and the
+    # item write is a write; the read goes first.
+    if not renewed:
+        out.update(await lapse_hint(session, kind, key, exclude=claim.id,
+                                    now=_utcnow()))
+
     # On a renew too, and that is a REPAIR rather than a second write. Gating this
     # on a fresh take left the one state this feature exists to abolish with no way
     # out of it: if the plan write failed once — a transient database fault, a
@@ -744,31 +950,19 @@ async def release_session_claims(
     return released, refused
 
 
-@router.get("/claims")
-async def list_claims(
-    kind: str | None = None,
-    key: str | None = None,
-    ref_kind: str | None = Query(default=None,
-                                 description=f"derive the key instead: {', '.join(REF_KINDS)}"),
-    ref_value: str | None = Query(default=None, description="issue/PR number, branch, or id"),
-    repo: str | None = Query(default=None, description="`owner/name`, for a ref that needs one"),
-    holder_q: str | None = Query(default=None, alias="holder"),
-    include_released: bool = False,
-    limit: int = Query(default=100, ge=1, le=1000),
-    _: str = Depends(reader),
-    session: AsyncSession = Depends(get_session),
-) -> dict:
-    """What is claimed, by whom, and why.
+def _read_filter(kind: str | None, key: str | None, ref_kind: str | None,
+                 ref_value: str | None,
+                 repo: str | None) -> tuple[str | None, str | None, dict]:
+    """What a read is actually filtering on, and what to say about the difference.
 
-    Expired-but-unswept rows are filtered out on the way past rather than swept:
-    a read must not mutate, and the sweep is the claim path's job. So this view
-    and the unique index can briefly disagree about one lapsed row — the index
-    still holds it, this says it is gone — and the reader that matters (an agent
-    deciding whether to wait) gets the truthful answer, which is that nobody is
-    actually there.
+    Shared by every read on this router that names a resource, so ``GET /claims``
+    and ``GET /claims/lapsed`` cannot disagree about which row a caller meant. A
+    second copy of it would be #172 in the read path: one endpoint answering about
+    ``issue/<repo>#163`` while the other answers about ``work/<repo>#163``, both
+    of them right, and a caller reading one as the other.
+
+    Returns ``(kind, key, notes)``, where ``notes`` is merged into the response.
     """
-    now = _utcnow()
-    stmt = select(ResourceLease)
     asked = {"kind": kind, "key": key}
     # Derived here rather than by the caller, for the reason the write path is:
     # the MCP layer is a separate package with no import of this one, so a client
@@ -815,6 +1009,49 @@ async def list_claims(
             kind = canonical_kind(kind)
         except BadRef as e:
             raise HTTPException(422, str(e)) from None
+    notes: dict = {}
+    if (asked["kind"], asked["key"]) not in ((None, None), (kind, key)):
+        # Said out loud, exactly as `POST /claim` says it: a caller that believes
+        # it asked about `issue/<repo>#163` while the filter read `work/…` is the
+        # #172 defect with the parties swapped.
+        notes["filtered_on"] = {"kind": kind, "key": key}
+        notes["asked_for"] = asked
+        note = (f"you asked about {asked['kind']}/{asked['key'] or '(any key)'}; the "
+                f"board keys that as {kind}/{key or '(any key)'}")
+        if asked["key"] is None:
+            note += (" — a kind alone can no longer tell an issue from a PR, because "
+                     "the key's shape carries that now. Send `ref_kind`/`ref_value` "
+                     "for one resource, or `kind` and `key` together.")
+        notes["note_on_kind"] = note
+    return kind, key, notes
+
+
+@router.get("/claims")
+async def list_claims(
+    kind: str | None = None,
+    key: str | None = None,
+    ref_kind: str | None = Query(default=None,
+                                 description=f"derive the key instead: {', '.join(REF_KINDS)}"),
+    ref_value: str | None = Query(default=None, description="issue/PR number, branch, or id"),
+    repo: str | None = Query(default=None, description="`owner/name`, for a ref that needs one"),
+    holder_q: str | None = Query(default=None, alias="holder"),
+    include_released: bool = False,
+    limit: int = Query(default=100, ge=1, le=1000),
+    _: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """What is claimed, by whom, and why.
+
+    Expired-but-unswept rows are filtered out on the way past rather than swept:
+    a read must not mutate, and the sweep is the claim path's job. So this view
+    and the unique index can briefly disagree about one lapsed row — the index
+    still holds it, this says it is gone — and the reader that matters (an agent
+    deciding whether to wait) gets the truthful answer, which is that nobody is
+    actually there.
+    """
+    now = _utcnow()
+    stmt = select(ResourceLease)
+    kind, key, notes = _read_filter(kind, key, ref_kind, ref_value, repo)
     if kind:
         stmt = stmt.where(ResourceLease.kind == kind)
     if key:
@@ -831,19 +1068,67 @@ async def list_claims(
          "released": c.released_at.isoformat() if c.released_at else None,
          "lapsed": c.lapsed}
         for c in rows]}
-    if (asked["kind"], asked["key"]) not in ((None, None), (kind, key)):
-        # Said out loud, exactly as `POST /claim` says it: a caller that believes
-        # it asked about `issue/<repo>#163` while the filter read `work/…` is the
-        # #172 defect with the parties swapped.
-        out["filtered_on"] = {"kind": kind, "key": key}
-        out["asked_for"] = asked
-        note = (f"you asked about {asked['kind']}/{asked['key'] or '(any key)'}; the "
-                f"board keys that as {kind}/{key or '(any key)'}")
-        if asked["key"] is None:
-            note += (" — a kind alone can no longer tell an issue from a PR, because "
-                     "the key's shape carries that now. Send `ref_kind`/`ref_value` "
-                     "for one resource, or `kind` and `key` together.")
-        out["note_on_kind"] = note
+    out.update(notes)
+    return out
+
+
+@router.get("/claims/lapsed")
+async def lapsed_claims(
+    kind: str | None = None,
+    key: str | None = None,
+    ref_kind: str | None = Query(default=None,
+                                 description=f"derive the key instead: {', '.join(REF_KINDS)}"),
+    ref_value: str | None = Query(default=None, description="issue/PR number, branch, or id"),
+    repo: str | None = Query(default=None, description="`owner/name`, for a ref that needs one"),
+    holder_q: str | None = Query(default=None, alias="holder"),
+    limit: int = Query(default=50, ge=1, le=1000),
+    _: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Claims whose holder vanished — and, where it was recorded, the tree they left.
+
+    **A sibling rather than a flag on ``GET /claims``, and the reason is the
+    default result set.** "What is claimed right now" is a question with a
+    correct existing answer and a lot of callers — the pickup gate, the
+    dashboard, ``qb-claimed``, the in-flight count — and every one of them is
+    right to be told about live claims only. Widening that listing to include
+    decayed rows would change what all of them see for the benefit of the one
+    caller that wants the residue; hiding the residue behind a boolean on the
+    same endpoint would still make the interesting population a *modifier* of the
+    live one, when it is a different question with a different predicate and a
+    different consequence. ``include_released=true`` is the existing flag and
+    stays exactly as it was: it says "history too", undifferentiated, and it
+    cannot tell an abandoned land from a completed one — which is the collapse
+    :func:`_sweep_lapsed` wrote the ``lapsed`` column to prevent.
+
+    **What comes back is the vanished half only.** A *released* claim means its
+    holder said they were done: the work landed, the branch merged, and pointing
+    a new agent at it is noise. A *lapsed* one means the holder stopped renewing
+    — died, machine went away, session killed — and their worktree is still on a
+    disk with nobody having said what state it is in. See :func:`lapsed_in_fact`
+    for why the ``lapsed`` column alone does not identify that population.
+
+    **Advisory in the strongest sense: this endpoint answers, it never refuses.**
+    Nothing here gates a pickup. "Yes, and it was abandoned for a reason, carry
+    on" is a legitimate response to every row it returns, which is why the pickup
+    paths print it and continue rather than stopping — ``create-worktree
+    --require-claim`` refuses for a reason that is always true, and this reason
+    never is.
+    """
+    now = _utcnow()
+    kind, key, notes = _read_filter(kind, key, ref_kind, ref_value, repo)
+    stmt = select(ResourceLease).where(lapsed_in_fact(now))
+    if kind:
+        stmt = stmt.where(ResourceLease.kind == kind)
+    if key:
+        stmt = stmt.where(ResourceLease.key == key)
+    if holder_q:
+        stmt = stmt.where(ResourceLease.holder == holder_q)
+    rows = list(await session.scalars(
+        stmt.order_by(ResourceLease.expires_at.desc()).limit(limit)))
+    out: dict = {"claims": [lapsed_row(c, now) for c in rows],
+                 "note_on_worktree": WORKTREE_IS_RECORDED}
+    out.update(notes)
     return out
 
 

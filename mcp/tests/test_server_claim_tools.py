@@ -177,3 +177,52 @@ def test_every_reason_the_tool_advertises_is_one_it_will_send(reason, monkeypatc
     monkeypatch.setattr(srv, "_get_client", lambda ctx: _Client())
     assert srv.end_session(None, session="sid-1", reason=reason)["ended"] is True
     assert sent == {"session": "sid-1", "reason": reason}
+
+
+# -- lapsed_claims (#568) -----------------------------------------------
+#
+# The read that answers "who picked this up and vanished". It shares
+# `_resource_params` with `claims`, which is the point: two tools asking about one
+# row must not differ in how they name it, or "nobody holds that" and "nothing was
+# abandoned there" become answers about two different keys.
+
+
+@pytest.mark.parametrize("extra", [{"kind": "work"}, {"key": "acme/widget#1"}])
+def test_asking_about_lapsed_work_two_ways_at_once_is_refused_too(extra):
+    """Inherited from the shared builder, and pinned here anyway: a tool that
+    stopped sharing it would fail this rather than silently answering about the
+    half it preferred."""
+    with pytest.raises(ToolError) as e:
+        srv.lapsed_claims(None, ref_kind="issue", ref_value="196", **extra)
+    assert "not both" in str(e.value)
+
+
+def test_lapsed_claims_sends_the_ref_for_the_board_to_derive(monkeypatch):
+    """The key is derived server-side, as everywhere else — deriving it in this
+    package would be a second implementation of the rule in a package that cannot
+    import the first (#172)."""
+    sent: dict = {}
+
+    class _Client:
+        @staticmethod
+        def lapsed_claims(params):
+            sent.update(params)
+            return {"claims": []}
+
+    monkeypatch.setattr(srv, "_get_client", lambda ctx: _Client())
+    monkeypatch.setattr(srv, "_derive_repo", lambda path: "acme/widget")
+    assert srv.lapsed_claims(None, ref_kind="issue", ref_value="196")["claims"] == []
+    assert sent["ref_kind"] == "issue" and sent["ref_value"] == "196"
+    assert sent["repo"] == "acme/widget"
+    assert "key" not in sent, "a composed key here would be the second spelling"
+
+
+def test_the_tool_tells_an_agent_lapsed_is_not_released_and_it_never_refuses():
+    """The docstring IS the interface — an agent has nothing else to read. Two
+    things it has to carry: which population this is (a released claim means the
+    work landed, and redirecting there is noise), and that a hit is advice rather
+    than a reason to stop."""
+    doc = srv.lapsed_claims.__doc__ or ""
+    assert "Released means" in doc and "lapsed" in doc.lower()
+    assert "advice" in doc.lower()
+    assert "RECORDED" in doc, "the board cannot see that disk and has to say so"
