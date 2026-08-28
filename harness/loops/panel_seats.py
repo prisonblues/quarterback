@@ -3661,17 +3661,98 @@ _LINE_COMMENTS: dict[str, tuple[str, ...]] = {
     **{s: ("#",) for s in (".py", ".pyi", ".sh", ".bash", ".zsh", ".rb", ".pl",
                            ".r", ".yml", ".yaml", ".toml", ".cfg", ".ini",
                            ".conf", ".tf", ".nix", ".ex", ".exs", ".jl")},
-    **{s: ("//", "/*", "*/", "*") for s in (".js", ".mjs", ".cjs", ".ts", ".tsx",
+    # NO `*` IN ANY FORM, and the two rounds it took to get here are the argument for
+    # :data:`_BLOCK_COMMENTS` below. A docblock continuation is written `* text`, so a
+    # bare `*` marker was tried first and ate `*dst = value;` — a pointer store in C,
+    # Go and Rust. Narrowing it to `* ` moved the collision rather than closing it:
+    # `* dst = value;` is the same store with a space in it, and `* generator() {` is
+    # a JavaScript method. Both were caught by successive Codex second opinions, and
+    # both ran in the one direction this table may never lean.
+    #
+    # A prefix cannot answer this, because the question is not what the line starts
+    # with — it is whether the line is INSIDE a `/* … */`. That is state, so it is
+    # tracked as state, and `*` stops being guessed about at all.
+    **{s: ("//", "/*") for s in (".js", ".mjs", ".cjs", ".ts", ".tsx",
                                             ".jsx", ".go", ".java", ".c", ".h",
                                             ".cc", ".cpp", ".hpp", ".cs", ".rs",
                                             ".swift", ".kt", ".kts", ".scala",
-                                            ".php", ".dart", ".zig", ".css",
-                                            ".scss", ".proto")},
+                                            ".php", ".dart", ".zig", ".proto")},
+    # Stylesheets are the same family one step further on: `*` there is the UNIVERSAL
+    # SELECTOR, so `* { margin: 0 }` is a rule and not a docblock line. `//` stays for
+    # SCSS and is harmless in plain CSS, where no statement begins with it.
+    **{s: ("//", "/*") for s in (".css", ".scss", ".less", ".sass")},
     **{s: ("--",) for s in (".sql", ".lua", ".hs", ".elm")},
     **{s: (";",) for s in (".el", ".clj", ".cljs", ".scm", ".lisp")},
     ".vim": ('"',), ".tex": ("%",),
     **{s: ("<!--", "-->") for s in (".html", ".htm", ".xml", ".svg", ".vue")},
 }
+
+#: `/* … */` delimiters by suffix — the C family and stylesheets, which is exactly the
+#: set whose comments span lines without a marker on each one.
+#:
+#: **State, because a prefix could not answer the question.** Two rounds of review went
+#: on narrowing a `*` line-comment marker (`*` then `* `) and both narrowings still ate
+#: production code, because "does this line start with a star" is not the question a
+#: docblock continuation answers — "is this line inside a block comment" is, and that
+#: is not knowable from the line. Tracked per hunk and per diff side exactly as
+#: :data:`_DOCSTRING_FENCES` is, and for the same reasons.
+_BLOCK_COMMENTS: dict[str, tuple[str, str]] = {
+    s: ("/*", "*/") for s in (
+        ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".java", ".c", ".h",
+        ".cc", ".cpp", ".hpp", ".cs", ".rs", ".swift", ".kt", ".kts", ".scala",
+        ".php", ".dart", ".zig", ".proto", ".css", ".scss", ".less", ".sass")}
+
+#: What a line must FOLLOW for a triple-quote at its head to be a docstring rather
+#: than a value. A docstring is the first statement of a module, class or function, so
+#: the line before it opens a suite and ends with a colon; a multiline literal passed
+#: as an argument or continued from an assignment follows a line ending in `(`, `,`,
+#: `=` or `[`.
+#:
+#: Raised by a Codex second opinion, which pointed out that
+#:
+#:     cur.execute(
+#:         <fence>SELECT 1
+#:         FROM t<fence>)
+#:
+#: is syntactically identical to a docstring opener and is production data. Nothing on
+#: the line itself separates the two; the line BEFORE it does.
+#:
+#: A trailing comment is stripped before the test, so `def f():  # noqa` still hosts
+#: one. An UNKNOWN predecessor — the first churned line of a hunk, where this reader
+#: has seen nothing — is not a host, which is the safe direction and the same lean
+#: `_referee_kind_lines` takes on a hunk that begins inside a docstring.
+_DOCSTRING_HOST_END = ":"
+
+
+def _hosts_docstring(prev: str) -> bool:
+    """Can a triple-quote opening the line after ``prev`` be a docstring?
+
+    ``prev`` is the last non-blank line seen on this side of this hunk, stripped, or
+    `""` where none has been seen. See :data:`_DOCSTRING_HOST_END` for the argument."""
+    head = prev.split("#", 1)[0].rstrip() if prev else ""
+    return head.endswith(_DOCSTRING_HOST_END)
+
+
+def _next_block(in_block: bool, text: str, delims: tuple[str, str] | None) -> bool:
+    """Is a `/* … */` block comment open after this line, given whether one was open
+    before it?
+
+    Scans the line rather than testing a prefix, so `x = 1; /* note */ y = 2;` neither
+    opens a block nor is mistaken for one, and `*/ y = 2;` closes the block it was in
+    and leaves the tail as code. Nesting is not modelled because C does not have it;
+    the languages here all terminate at the first `*/`."""
+    if not delims:
+        return False
+    opener, closer = delims
+    at, state = 0, in_block
+    while at < len(text):
+        want = closer if state else opener
+        found = text.find(want, at)
+        if found < 0:
+            return state
+        state, at = not state, found + len(want)
+    return state
+
 
 #: Suffixes whose prose is FENCED by a delimiter rather than prefixed by a marker —
 #: a Python docstring, which is where #554's tenth finding sat and which no
@@ -3710,6 +3791,36 @@ def _suffix_of(path: str) -> str:
 #: characters at most, which is every combination Python allows, and matched
 #: case-insensitively because `R"""` is the same literal as `r"""`.
 _STRING_PREFIXES = ("r", "b", "u", "f", "rb", "br", "fr", "rf")
+
+
+#: The path :func:`_next_fence` asks :func:`_comment_line` about when it needs to know
+#: whether the text trailing a fence is a comment. The fences are Python's — no other
+#: suffix is in :data:`_DOCSTRING_FENCES` — so a Python path is the right question, and
+#: naming it once here beats spelling a literal at the call site.
+_COMMENTED_LIKE_PY = "x.py"
+
+
+def _unescaped_find(text: str, fence: str, start: int = 0) -> int:
+    """Index of the first occurrence of ``fence`` in ``text`` at or after ``start``
+    that is not backslash-escaped, or ``-1``.
+
+    A Codex second opinion found the raw `in` test this replaces: a docstring whose
+    body quotes its own delimiter escaped does not end there, and closing on the
+    substring ends it a line early. Everything after that reads as prose, which is the
+    direction that FIRES the brake — so this is one of the two corrections that keep
+    the reader's approximations all leaning the same way.
+
+    A delimiter is escaped when an ODD number of backslashes precedes it, so that a
+    literal backslash at the end of a line does not smuggle a real closer past this."""
+    at = text.find(fence, start)
+    while at != -1:
+        back = 0
+        while at - back - 1 >= 0 and text[at - back - 1] == "\\":
+            back += 1
+        if back % 2 == 0:
+            return at
+        at = text.find(fence, at + 1)
+    return -1
 
 
 def _fence_at_start(text: str, fences: tuple[str, ...]) -> str:
@@ -3753,7 +3864,8 @@ def _comment_line(path: str, text: str) -> bool:
     return bool(markers and stripped.startswith(markers))
 
 
-def _next_fence(open_fence: str, text: str, fences: tuple[str, ...]) -> str:
+def _next_fence(open_fence: str, text: str, fences: tuple[str, ...],
+                host: bool = True) -> str:
     '''The docstring fence still open after this line, given the one open before it.
 
     Delimited with single-triples, like its two neighbours, so the examples can be
@@ -3783,19 +3895,37 @@ def _next_fence(open_fence: str, text: str, fences: tuple[str, ...]) -> str:
     if not fences:
         return ""
     if open_fence:
-        # Open: only the SAME fence closes it, and anything after the closer on that
-        # line is not examined. A docstring that closes and starts executable code on
-        # one line is rare enough that reading the tail would buy less than the extra
-        # state it needs.
-        return "" if open_fence in text else open_fence
+        # Open: only the SAME fence closes it, and only an UNESCAPED occurrence of it —
+        # a body that quotes its own delimiter escaped does not end the string, and
+        # closing there ends it a line early. Anything after the closer on that line is
+        # not examined; a docstring that closes and starts executable code on one line
+        # is rare enough that reading the tail would buy less than the state it needs.
+        return "" if _unescaped_find(text, open_fence) >= 0 else open_fence
     fence = _fence_at_start(text, fences)
-    if not fence:
+    if not fence or not host:
+        # `host` is :func:`_hosts_docstring`'s answer about the line BEFORE this one.
+        # Without it a multiline literal passed as an argument opens a docstring, and
+        # its body — production data — reads as prose (a Codex second opinion).
         return ""
-    after = text.strip().split(fence, 1)[1] if fence in text else ""
-    # Two or more occurrences means it closed on the same line; none after the opener
-    # means a bare delimiter, which is read as a CLOSE that had no open rather than as
-    # an opener (see the docstring — the safe direction).
-    return fence if (after.strip() and fence not in after) else ""
+    # The fence `_fence_at_start` matched is at the head of the stripped line, so it is
+    # unescaped by construction; what matters is whether the SAME fence occurs again,
+    # unescaped, later on — that is the one-line docstring, which opens nothing.
+    stripped = text.strip()
+    after = stripped[stripped.index(fence) + len(fence):]
+    if _unescaped_find(after, fence) >= 0:
+        return ""
+    tail = after.strip()
+    # Nothing after the opener is a bare delimiter, read as a CLOSE that had no open
+    # rather than as an opener (see the docstring — the safe direction).
+    #
+    # AND NEITHER IS A DELIMITER TRAILED BY A COMMENT, which a Codex second opinion
+    # caught: a real closing fence is very often written `<fence>  # end docs`, and to
+    # a reader whose state says CLOSED — a hunk that began inside the docstring, or a
+    # body that quoted the delimiter — that is indistinguishable from an opener with
+    # content after it. Reading it as one opens a string that never closes and turns
+    # every production line left in the hunk into prose. An opener's text is prose;
+    # nobody writes a docstring whose first characters are a comment marker.
+    return fence if (tail and not _comment_line(_COMMENTED_LIKE_PY, tail)) else ""
 
 
 def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
@@ -3840,35 +3970,55 @@ def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
     after it in the hunk reads as prose. Only the fence that opened a string can close
     it — :func:`_next_fence` is that machine.
 
-    Three approximations remain and every one of them leans the same way — toward the
-    pass looking MORE refereed, so the brake declines to fire rather than firing on a
-    pass this misread:
+    **THE PROPERTY THIS READER EXISTS TO HAVE**, and the one the gate above it rests
+    on: every way it can be wrong must count a line as PRODUCTION, so the brake
+    declines to fire on a pass it misread rather than ending a cycle over one. Three
+    successive review rounds found violations of it — each one production logic read
+    as prose — and the shape of the fixes is worth recording, because the next person
+    to add a marker or a suffix will be tempted by the same shortcut:
+
+    * a bare ``*`` line-comment marker ate ``*dst = value;``. Narrowing it to ``* ``
+      moved the collision to ``* dst = value;`` and ``* generator() {``. **No prefix
+      can answer this**, because the question is not what the line starts with but
+      whether it sits inside a ``/* … */`` — so :data:`_BLOCK_COMMENTS` tracks that as
+      state and ``*`` is not guessed about at all;
+    * a triple-quote at the head of a line opens a docstring OR a multiline value, and
+      the two are syntactically identical. The line BEFORE it is what separates them
+      (:func:`_hosts_docstring`): a docstring follows a suite header ending in a
+      colon, a value follows a call or an assignment;
+    * a one-line docstring with a statement after it (``<fence>doc<fence>; call()``)
+      is a line carrying code, and counting it prose hid the call.
+
+    Two approximations remain, and both lean the safe way:
 
     * a hunk that BEGINS inside a docstring, whose context lines carry no fence, is
       read as beginning outside one and its prose counts as production. Closing it
       needs the file's whole text, which this reader does not have and the round has
       no reason to fetch;
-    * a fence must START its line to open one (:func:`_fence_at_start`), so an
-      assigned multiline template — ``sql = """SELECT`` — is production and not prose.
-      A docstring written with a bare opening ``"""`` on its own line therefore has its
-      BODY counted as production too: that spelling is indistinguishable from a
-      template's closing delimiter from inside a hunk, and reading it as an opener
-      would make every line after a template read as prose, which is the unsafe
-      direction;
-    * a fence that opens and closes on one line leaves the state closed, so
-      a one-line docstring is prose and nothing after it is.'''
+    * an unknown predecessor is not a docstring host, so a fence on the first churned
+      line of a hunk is a value rather than a docstring.'''
     path: str | None = None
     fences: tuple[str, ...] = ()
+    blocks: tuple[str, str] | None = None
     in_hunk = False
-    # Old side and new side, each holding the fence that opened its current
-    # docstring or `""`. A context line is in BOTH files and moves both; a `-` line
-    # exists only in the old and a `+` only in the new.
-    opened = {"-": "", "+": ""}
+
+    def fresh() -> dict:
+        """The per-side state, reset at each file and each hunk.
+
+        `fence` is the triple-quote that opened the current docstring, `block` whether
+        a `/* … */` is open, and `prev` the last non-blank line seen — which is what
+        :func:`_hosts_docstring` reads. A context line is in BOTH files and moves both
+        sides; a `-` line exists only in the old and a `+` only in the new."""
+        return {"-": {"fence": "", "block": False, "prev": ""},
+                "+": {"fence": "", "block": False, "prev": ""}}
+
+    state = fresh()
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             path, in_hunk = _diff_file_path(line), False
-            opened = {"-": "", "+": ""}
+            state = fresh()
             fences = _DOCSTRING_FENCES.get(_suffix_of(path), ()) if path else ()
+            blocks = _BLOCK_COMMENTS.get(_suffix_of(path)) if path else None
         elif line.startswith("+++ ") and not in_hunk:
             # The authoritative spelling, once it arrives — and gated on `in_hunk` for
             # `_diff_added_lines`' reason, which a Codex second opinion caught missing
@@ -3879,7 +4029,9 @@ def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
             # to the churn branch below and is counted, which is what it is.
             got = _diff_file_path(line)
             if got:
-                path, fences = got, _DOCSTRING_FENCES.get(_suffix_of(got), ())
+                path = got
+                fences = _DOCSTRING_FENCES.get(_suffix_of(got), ())
+                blocks = _BLOCK_COMMENTS.get(_suffix_of(got))
         elif path is None or line.startswith(("---", "\\", "index ")):
             continue
         elif line.startswith("@@"):
@@ -3887,19 +4039,42 @@ def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
             # file are two separate windows into it, and a string opened in the first
             # says nothing about where the second begins.
             in_hunk = True
-            opened = {"-": "", "+": ""}
+            state = fresh()
         elif line and line[0] in "+- ":
             marker, text = line[0], line[1:]
             sides = ("-", "+") if marker == " " else (marker,)
-            # Read BEFORE the state moves, so the line CARRYING a fence is prose
+            was = [state[s] for s in sides]
+            # Read BEFORE the state moves, so the line CARRYING a delimiter is prose
             # whichever way it turns the state: an opener, a closer and a one-line
-            # docstring are all docstring lines and none of them is code. `_next_fence`
-            # only ever opens on a fence that STARTS the line, so this second clause
-            # covers the opener and the one-liner together and needs no third.
-            fenced = (any(opened[s] for s in sides)
-                      or bool(_fence_at_start(text, fences)))
+            # docstring are all docstring lines and none of them is code.
+            #
+            # A fence at the head of the line only counts when the line before it
+            # could HOST a docstring — otherwise it is a multiline value, and its head
+            # is as much production as its body.
+            starts_doc = (bool(_fence_at_start(text, fences))
+                          and any(_hosts_docstring(w["prev"]) for w in was))
+            fenced = any(w["fence"] for w in was) or starts_doc
+            blocked = any(w["block"] for w in was) or (
+                blocks is not None and _next_block(False, text, blocks)
+                and text.strip().startswith(blocks[0]))
             for side in sides:
-                opened[side] = _next_fence(opened[side], text, fences)
+                cur = state[side]
+                cur["fence"] = _next_fence(cur["fence"], text, fences,
+                                           host=_hosts_docstring(cur["prev"]))
+                cur["block"] = _next_block(cur["block"], text, blocks)
+                if text.strip():
+                    cur["prev"] = text.strip()
+            # A one-line docstring that is FOLLOWED BY CODE is not a prose line: the
+            # statement after the `;` is production and the line has to be counted as
+            # what it mostly is. Raised by a Codex second opinion against
+            # `<fence>doc<fence>; authorize()`, which read as prose entire.
+            if starts_doc and not any(w["fence"] for w in was):
+                closed_at = _unescaped_find(
+                    text, _fence_at_start(text, fences),
+                    text.index(_fence_at_start(text, fences)) + 3)
+                tail = text[closed_at + 3:].strip() if closed_at >= 0 else ""
+                if tail and not _comment_line(_COMMENTED_LIKE_PY, tail):
+                    fenced = False
             if marker == " ":
                 continue                 # context: moves the state, is not churn
             guard = _guard_kind(path)
@@ -3910,7 +4085,7 @@ def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
                 # separating it would make `test` mean "test lines that are not
                 # comments", which is not a quantity anybody wants.
                 yield path, "test"
-            elif guard == "doc" or fenced or _comment_line(path, text):
+            elif guard == "doc" or fenced or blocked or _comment_line(path, text):
                 yield path, "prose"
             else:
                 yield path, "production"
@@ -4028,7 +4203,9 @@ __all__ = [
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",
     "UNREFEREED_MIN_CHURN", "_suffix_of", "_comment_line",
-    "_STRING_PREFIXES", "_fence_at_start", "_next_fence",
+    "_BLOCK_COMMENTS", "_DOCSTRING_HOST_END", "_hosts_docstring",
+    "_next_block",
+    "_STRING_PREFIXES", "_COMMENTED_LIKE_PY", "_unescaped_find", "_fence_at_start", "_next_fence",
     "_referee_kind_lines", "referee_split", "unrefereed_line_weight",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",

@@ -814,10 +814,17 @@ DEFAULTS: dict = {
         #
         # **Not value-weighting**, which #297 refuses deliberately: that would hand
         # judgement back to the actor whose judgement the 63.7% measurement indicts.
-        # Being refereed is a property of the path and the line, computable from the
-        # same `git diff --numstat` the budget already runs, and never an opinion
-        # about whether the work is worth doing. The fixer is asked for a
-        # multiplication, not a forecast — the same discipline as the count itself.
+        # Being refereed is a property of the path and the line, read off the fix's
+        # OWN DIFF — the one the fixer already produces to measure the fix at all — and
+        # never an opinion about whether the work is worth doing. The fixer is asked
+        # for a multiplication, not a forecast: the same discipline as the count.
+        #
+        # Not `git diff --numstat`, which is what this said until a Codex second
+        # opinion pointed out that numstat reports per-file insertion and deletion
+        # TOTALS and can see neither a comment nor a blank nor a docstring. #554's own
+        # "classifying each PATH is free at that point" is true of numstat; extending
+        # it to LINES was not, and the line half is what makes the measurement mean
+        # what it says.
         #
         # **2 is the one number here that is a judgement rather than a fact.** For it:
         # an unrefereed line has no referee, not a weaker one, so the budget must buy
@@ -1182,12 +1189,23 @@ DEFAULTS: dict = {
         # threshold over a few dozen cycles or not at all, and it is why `guard_ratio`
         # ships report-only: nobody has measured what test-to-source ratio is too
         # much, so any number would be a ceiling with its argument written afterwards.
-        # THERE IS NO SUCH NUMBER HERE. The rule is a predicate on a fact — the pass
-        # contains zero refereed lines — and a predicate has nothing to calibrate. A
-        # fraction, by contrast, would need one and would be wrong: a 5-line
-        # production fix carrying a 40-line regression test is 89% unrefereed and is
-        # exactly the work the panel wants. The ABSENCE of a refereed component is a
-        # different claim from a high proportion of unrefereed ones.
+        # THERE IS NO SUCH NUMBER HERE. The rule is a predicate — the pass contains
+        # zero refereed lines — and a predicate has nothing to calibrate. A fraction,
+        # by contrast, would need one and would be wrong: a 5-line production fix
+        # carrying a 40-line regression test is 89% unrefereed and is exactly the work
+        # the panel wants. The ABSENCE of a refereed component is a different claim
+        # from a high proportion of unrefereed ones.
+        #
+        # **What the predicate rests on, said plainly because a Codex second opinion
+        # was right to press on it.** "Zero production lines" is not ground truth; it
+        # is what `panel_seats.referee_split` returned, and that reader is heuristics
+        # — a marker table, a fence tracker, a path classifier. The case for gating is
+        # therefore not that it cannot be wrong, but that EVERY WAY IT CAN BE WRONG
+        # LEANS THE SAME WAY: toward counting a line as production, so the brake
+        # declines to fire on a pass it misread. Two violations of that property were
+        # found on review and fixed; a third is a bug of the same class, and the
+        # answer to it is to fix the reader rather than to put a number in front of
+        # it.
         #
         # **On by default, and the honest case against it.** The false positive is
         # real and worth naming: a round whose only finding is "this branch has no

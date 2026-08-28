@@ -689,8 +689,12 @@ never whether that test also opens a socket or whether its assertion is sufficie
 production fix carrying a forty-line regression test is 89% unrefereed and is exactly
 the work this panel wants, so the rule is the ABSENCE of a refereed component and
 nothing else. It is also not a judgement about the fix pass's worth — the split is
-computed from the same `git diff --numstat` the budget already runs, and the fixer is
-never asked about it, which is #297's discipline.
+read off the fix range's own diff, which the round already fetched for provenance, so
+it costs no extra call and the fixer is never asked about it (#297's discipline).
+
+(Not `git diff --numstat`: that reports per-file insertion and deletion TOTALS and
+cannot see a comment, a blank or a docstring. Paths are free from numstat and lines are
+not, which is the half that makes this measurement mean what it says.)
 
 **What to do with it.** Read `round_stop.unrefereed_fix` for the counts, and relay
 it in §6 as what it is: the last pass answered its findings by writing more test, so

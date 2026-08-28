@@ -3366,10 +3366,29 @@ def unrefereed_fix_brake(panel: dict, notes: list[str]) -> bool:
     **And a flag rather than a FRACTION, which is what makes it shippable as a gate
     on one cycle's evidence.** #67's rule is that an instrument earns a threshold over
     a few dozen cycles or not at all — the reason `panel_seats.guard_ratio` ships
-    report-only. There is no threshold here to earn: the rule is a predicate on a
-    fact, and a predicate has nothing to calibrate. A fraction would need a number
-    nobody has measured AND would be wrong on the commonest healthy shape there is, a
-    small production fix carrying a large regression test.
+    report-only. There is no threshold here to earn: the rule is a predicate, and a
+    predicate has nothing to calibrate. A fraction would need a number nobody has
+    measured AND would be wrong on the commonest healthy shape there is, a small
+    production fix carrying a large regression test.
+
+    **The exact scope of that claim, which a Codex second opinion was right to press
+    on.** "Zero production lines" is not ground truth; it is what
+    :func:`panel_seats.referee_split` returned, and that reader is a set of
+    heuristics — a comment-marker table, a docstring fence tracker, a path
+    classifier. So the argument is not "the predicate cannot be wrong". It is that
+    **every way it can be wrong leans the same way**: toward counting a line as
+    production, which makes the pass look refereed and the brake decline to fire.
+    That property is what a threshold-free rule buys, and it is the whole of the case
+    for gating here — it is asserted by `referee_split`'s own docstring, tested
+    directly, and two violations of it (a bare `*` marker eating a pointer store, a
+    fence tracker ending a docstring a line early) were real and are fixed. A third
+    would be a bug of the same class and should be treated as one, not as a reason to
+    add a number.
+
+    (:data:`panel_seats.UNREFEREED_MIN_CHURN` is not that number. It is a minimum
+    SAMPLE — the same structural role :data:`FIX_INJECTION_MIN_NEW` plays for a rule
+    whose threshold is 0.5 — and it can only make this rung fire less often. A floor
+    under a predicate is not a threshold on it.)
 
     ``false`` is a second spelling of ``null`` and is honoured as one, exactly as its
     two siblings honour it. ``true`` is the only other value; anything else is a hard

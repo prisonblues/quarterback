@@ -241,6 +241,14 @@ Spend it like this, and do not improvise around it:
      (`.md`, `.rst`, `docs/`, `changelog.d/`), and **every comment or docstring line
      anywhere**, source files included.
 
+   **Read the split off `git diff` (the body), not off `git diff --numstat`.**
+   `--numstat` gives you the per-file insertion and deletion totals from step 2 and
+   nothing else — it cannot see a comment, a blank line or a docstring, so it can tell
+   you a file's churn but not which pile the lines belong in. The paths come from
+   numstat; the lines come from the diff you are already looking at. `git diff
+   --numstat` for the total, then the diff body for the two piles, and they must add
+   up.
+
    The rule is that **a production fix has an external referee and a test fix has
    none, because nothing tests a test.** Red/green either detects the bug or it does
    not; the suite and CI are behind that. Nothing checks whether a new test also opens

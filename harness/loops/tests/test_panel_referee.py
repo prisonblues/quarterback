@@ -162,8 +162,27 @@ def test_a_small_production_fix_with_a_large_test_is_NOT_unrefereed():
     ("app/x.py", '    marker = "# not a comment"', "production"),
     ("app/x.go", "\t// why", "prose"),
     ("app/x.go", "\tif err != nil {", "production"),
+    # The `*` family, in BOTH directions. A Codex second opinion pointed out that the
+    # parametrization used to carry only the docblock case, which verifies a broad
+    # heuristic in the one direction that cannot hurt — the collision it left
+    # untested read production as prose, which is the direction that FIRES the brake.
+    # The `*` family, and every one of them is PRODUCTION here — because none of
+    # these lines is inside a `/* … */`, and outside one a leading star is a pointer
+    # store, a generator method or a universal selector. A docblock continuation is
+    # prose by BLOCK STATE, which a per-line table cannot see; see
+    # `test_a_star_line_is_prose_only_INSIDE_a_block_comment`.
+    ("app/x.go", "\t * not inside a block, so not a continuation", "production"),
+    ("app/x.c", "    *dst = value;", "production"),
+    ("app/x.c", "    * dst = value;", "production"),
+    ("app/x.c", "    *cursor++;", "production"),
+    ("app/x.rs", "    *slot = transform(in);", "production"),
+    ("web/x.js", "  *generator() {", "production"),
+    ("web/x.js", "  * generator() {", "production"),
+    ("web/x.css", "* { margin: 0 }", "production"),
+    ("web/x.css", "/* a real comment */", "prose"),
+    ("app/x.c", "    // a line comment", "prose"),
     ("app/x.sql", "-- why", "prose"),
-    ("web/x.ts", " * jsdoc continuation", "prose"),
+    ("web/x.ts", " * jsdoc continuation", "production"),
     ("README.md", "# Heading", "prose"),
     ("docs/x.rst", "anything at all", "prose"),
     ("changelog.d/1.feature", "anything at all", "prose"),
@@ -191,6 +210,83 @@ def test_each_line_is_classified_by_its_path_and_then_by_itself(path, text, kind
     got = panel_seats.referee_split(diff)
     assert got[kind] == 1, got
     assert got["churn"] == 1
+
+
+def test_a_star_line_is_prose_only_INSIDE_a_block_comment():
+    """The replacement for two rounds of failed `*` guessing, and the reason it is
+    state rather than a marker.
+
+    A bare `*` marker ate `*dst = value;`. Narrowing it to `* ` moved the collision to
+    `* dst = value;` — the same pointer store with a space — and to
+    `* generator() {`. Both were caught by successive Codex second opinions, and the
+    second one is the proof that no prefix can answer this: the question is not what
+    the line starts with, it is whether the line is inside a `/* … */`.
+
+    So `*` is not guessed about at all. A continuation is prose because a block is
+    open, and the identical line outside one is code."""
+    inside = ("diff --git a/app/x.c b/app/x.c\n--- a/app/x.c\n+++ b/app/x.c\n"
+              "@@ -1,1 +1,5 @@\n x\n"
+              "+    /* what this does\n+     * and why\n+     */\n"
+              "+    * dst = value;\n")
+    got = panel_seats.referee_split(inside)
+    # Three lines of block comment, and the store after it is code.
+    assert (got["prose"], got["production"]) == (3, 1)
+    # The same star line with no block open is code, four times over, and cannot
+    # fire the rung.
+    outside = ("diff --git a/app/x.c b/app/x.c\n--- a/app/x.c\n+++ b/app/x.c\n"
+               "@@ -1,1 +1,5 @@\n x\n"
+               "+    * dst = value;\n+    * a = b;\n+    * c = d;\n+    * e = f;\n")
+    got = panel_seats.referee_split(outside)
+    assert got["production"] == 4
+    assert panel_rounds.referee_state(got, True)["over"] is False
+
+
+def test_a_block_comment_that_ENDS_and_leaves_code_on_the_line_is_not_prose():
+    """`_next_block` scans rather than testing a prefix, so a block opened and closed
+    inside one line neither opens a block nor makes that line a comment."""
+    diff = ("diff --git a/app/x.c b/app/x.c\n--- a/app/x.c\n+++ b/app/x.c\n"
+            "@@ -1,1 +1,3 @@\n x\n"
+            "+    int x = 1; /* note */ int y = 2;\n+    int z = 3;\n")
+    assert panel_seats.referee_split(diff)["production"] == 2
+
+
+def test_a_MULTILINE_VALUE_is_not_a_docstring_because_of_the_line_before_it():
+    """Codex's third finding on the second pass, and the deepest of the three: a
+    triple-quote at the head of a line is *syntactically identical* whether it opens a
+    docstring or a multiline argument. Nothing on the line separates them.
+
+    The line BEFORE it does. A docstring is the first statement of a suite, so its
+    predecessor ends with a colon; a value continues a call or an assignment, so its
+    predecessor ends with `(`, `,` or `=`. An unknown predecessor — the first line of
+    a hunk — is not a host, which is the safe direction."""
+    value = (DIFF_HEADER + "@@ -1,1 +1,5 @@\n x\n"
+             f"+    cur.execute(\n+        {DQ}SELECT 1\n+        FROM t\n"
+             f"+        WHERE id = 2{DQ})\n")
+    got = panel_seats.referee_split(value)
+    assert got["production"] == 4 and got["prose"] == 0
+    assert panel_rounds.referee_state(got, True)["over"] is False
+    # ...and the same fence directly under a `def` still reads as the docstring it is.
+    doc = (DIFF_HEADER + "@@ -1,1 +1,4 @@\n x\n"
+           f"+def f():\n+    {DQ}Send it.\n+    {DQ}\n")
+    got = panel_seats.referee_split(doc)
+    assert (got["production"], got["prose"]) == (1, 2)
+
+
+def test_a_one_line_docstring_FOLLOWED_BY_CODE_is_counted_as_code():
+    """Codex's second finding on that pass. `<fence>doc<fence>; authorize()` is a
+    valid line whose second half is a statement, and reading the whole line as prose
+    hides it. Rare, and rarity is not the standard — the property is that no
+    misreading may move a line OUT of production."""
+    with_code = (DIFF_HEADER + "@@ -1,1 +1,3 @@\n x\n+def f():\n"
+                 f"+    {DQ}doc{DQ}; authorize()\n")
+    got = panel_seats.referee_split(with_code)
+    assert got["production"] == 2 and got["prose"] == 0
+    # The control, one character apart: the same one-liner with nothing after it is
+    # the docstring it looks like.
+    alone = (DIFF_HEADER + "@@ -1,1 +1,3 @@\n x\n+def g():\n"
+             f"+    {DQ}doc{DQ}\n")
+    got = panel_seats.referee_split(alone)
+    assert got["production"] == 1 and got["prose"] == 1
 
 
 def test_a_python_docstring_is_prose_even_though_no_line_starts_with_a_marker():
@@ -279,9 +375,104 @@ def test_a_bare_fence_on_its_own_line_does_not_OPEN_one():
             f"+    tpl = render()\n+    {DQ}\n+    still_code()\n"
             "+    more_code()\n x\n")
     got = panel_seats.referee_split(diff)
-    # The bare fence line is prose in itself; the two lines after it are not.
-    assert got["production"] == 3
+    # All four lines are production. The two after the bare fence obviously, and the
+    # fence line itself because `tpl = render()` cannot HOST a docstring — the two
+    # rules compose, and they compose in the safe direction.
+    assert got["production"] == 4
     assert panel_rounds.referee_state(got, True)["over"] is False
+
+
+def test_a_docstring_QUOTING_ITS_OWN_DELIMITER_does_not_end_a_line_early():
+    """Codex's second-pass P1, and the more dangerous of the two it found.
+
+    A docstring body that quotes its own delimiter escaped does not end the string,
+    but a raw substring test says it does. The reader then meets the REAL closer —
+    very often written with a trailing comment — while its state says closed, reads
+    that as an opener, and opens a string that never closes. Every production line
+    left in the hunk becomes prose.
+
+    Measured on Codex's own example: four added calls came back
+    `production=0, prose=7` and the brake fired on a pass that was four-sevenths
+    production logic."""
+    body = f"    Example token: \\{DQ}"
+    diff = (DIFF_HEADER + "@@ -1,1 +1,9 @@\n def f():\n"
+            f"+    {DQ}Summary.\n+{body}\n+    {DQ}  # end docs\n"
+            "+    authorize()\n+    charge()\n+    commit()\n+    notify()\n")
+    got = panel_seats.referee_split(diff)
+    assert got["production"] == 4 and got["prose"] == 3
+    assert panel_rounds.referee_state(got, True)["over"] is False
+
+
+def test_a_CLOSING_fence_with_a_trailing_comment_is_not_read_as_an_OPENER():
+    """The half of that fix which stands on its own, and it is reachable without any
+    escaping at all: a hunk that BEGINS inside a docstring starts closed by design,
+    and the first thing it meets is the closing delimiter — which, written
+    `<fence>  # end docs`, is indistinguishable from an opener with content after it.
+
+    Reading it as an opener turns the documented safe lean (a hunk beginning inside a
+    docstring counts as production) into its opposite for the rest of the hunk. An
+    opener's text is prose; nobody writes a docstring whose first characters are a
+    comment marker."""
+    assert panel_seats._next_fence("", f"    {DQ}  # end docs", (DQ, SQ)) == ""
+    # ...while a real opener still opens, and a one-liner still opens nothing.
+    assert panel_seats._next_fence("", f"    {DQ}Summary.", (DQ, SQ)) == DQ
+    assert panel_seats._next_fence("", f"    {DQ}One.{DQ}", (DQ, SQ)) == ""
+    diff = (DIFF_HEADER + "@@ -40,2 +40,5 @@\n     trailing docstring prose\n"
+            f"+    {DQ}  # end docs\n+    authorize()\n+    charge()\n")
+    # Three, not two: the closer line is production as well, because the line before
+    # it cannot host a docstring either. Both rules refuse to open, independently.
+    assert panel_seats.referee_split(diff)["production"] == 3
+
+
+@pytest.mark.parametrize("name,diff,expect", [
+    # A deleted file: `+++ /dev/null` names no path, so the `diff --git` header's name
+    # has to survive it or three deletions are attributed to nothing.
+    ("deleted file",
+     "diff --git a/app/x.py b/app/x.py\n--- a/app/x.py\n+++ /dev/null\n"
+     "@@ -1,3 +0,0 @@\n-def f():\n-    return 1\n-x = 2\n",
+     {"production": 3, "churn": 3}),
+    # A rename or mode change carries no hunk at all.
+    ("rename only, no hunk",
+     "diff --git a/app/x.py b/app/y.py\nsimilarity index 100%\n"
+     "rename from app/x.py\nrename to app/y.py\n",
+     {"churn": 0}),
+    # `@@ -1,3 +1,4 @@ def outer():` — git puts the enclosing section after the ranges.
+    ("hunk header with section text",
+     "diff --git a/app/x.py b/app/x.py\n--- a/app/x.py\n+++ b/app/x.py\n"
+     "@@ -1,3 +1,4 @@ def outer():\n x\n+    return compute()\n",
+     {"production": 1, "churn": 1}),
+    ("no newline at end of file",
+     "diff --git a/app/x.py b/app/x.py\n--- a/app/x.py\n+++ b/app/x.py\n"
+     "@@ -1,1 +1,2 @@\n x\n+    return compute()\n\\ No newline at end of file\n",
+     {"production": 1, "churn": 1}),
+    ("CRLF line endings",
+     "diff --git a/app/x.py b/app/x.py\r\n--- a/app/x.py\r\n+++ b/app/x.py\r\n"
+     "@@ -1,1 +1,2 @@\r\n x\r\n+    return compute()\r\n",
+     {"production": 1, "churn": 1}),
+])
+def test_the_reader_survives_the_diff_shapes_that_are_not_plain_hunks(name, diff, expect):
+    """The state-machine shapes a real fix range throws at this, named by a Codex
+    second opinion as untested. None of them was broken; all of them were unasserted,
+    which is the same thing one refactor later — a diff parser is exactly where a
+    silent misread lives, and every misread here is a wrong verdict about a cycle."""
+    got = panel_seats.referee_split(diff)
+    for key, want in expect.items():
+        assert got[key] == want, (name, key, got)
+
+
+def test_fence_state_resets_between_HUNKS_and_between_FILES():
+    """Two hunks of a file are two windows into it, and a string opened in the first
+    says nothing about where the second begins; two files share nothing at all.
+    Carrying the state across either would turn one unclosed docstring into prose for
+    the remainder of a whole fix range."""
+    across_hunks = (DIFF_HEADER + f"@@ -1,2 +1,3 @@\n def f():\n+    {DQ}Docs.\n"
+                    "@@ -40,1 +41,2 @@\n y\n+    return compute()\n")
+    assert panel_seats.referee_split(across_hunks)["production"] == 1
+    across_files = ("diff --git a/docs/a.md b/docs/a.md\n--- a/docs/a.md\n"
+                    "+++ b/docs/a.md\n@@ -1 +1,2 @@\n x\n+prose\n"
+                    + DIFF_HEADER + "@@ -1 +1,2 @@\n x\n+    return compute()\n")
+    got = panel_seats.referee_split(across_files)
+    assert (got["prose"], got["production"]) == (1, 1)
 
 
 def test_an_added_line_that_LOOKS_LIKE_a_file_header_is_content():
@@ -359,6 +550,43 @@ def test_the_classifier_shares_ONE_path_reader_with_the_apparatus_ratio():
     diff = ('diff --git a/tests/x.py b/tests/x.py\n--- a/tests/x.py\n'
             '+++ b/tests/x.py\n@@ -1 +1,2 @@\n x\n+    assert 1\n')
     assert panel_seats.referee_split(diff)["test"] == 1
+
+
+def test_EVERY_misreading_this_classifier_can_make_leans_the_same_way():
+    """The property the whole gate rests on, asserted as a property rather than left
+    to the docstrings that claim it.
+
+    "Zero production lines" is not ground truth — it is this reader's output, and the
+    reader is heuristics. What makes it safe to END A CYCLE on is that every way it
+    can be wrong counts a line as PRODUCTION, which makes the pass look refereed and
+    the brake decline to fire. Two violations of that were real (a bare `*` marker
+    eating a pointer store; a fence tracker ending a docstring a line early) and both
+    are covered above.
+
+    Collected here so the next person to add a marker, a suffix or a fence style has
+    one test to run and one sentence to satisfy: your case must not be able to move a
+    line OUT of `production` unless it is genuinely not code."""
+    ambiguous = [
+        # (path, line) — every shape where a reasonable reader might go either way.
+        ("app/x.c", "    *dst = value;"),
+        ("app/x.c", "    * dst = value;"),          # the space that moved the bug
+        ("app/x.c", "    */ trailing = code;"),
+        ("web/x.css", "* { margin: 0 }"),
+        ("web/x.js", "  *generator() {"),
+        ("web/x.js", "  * generator() {"),
+        ("app/x.ts", " * not inside any block"),
+        ("app/x.py", '    marker = "# not a comment"'),
+        ("app/x.py", "    x = 1  # trailing comments are not comments"),
+        ("app/x.py", f"    sql = {DQ}SELECT 1"),
+        ("Makefile", "\tgo build"),
+        ("app/x", "    a file with no suffix at all"),
+    ]
+    for path, line in ambiguous:
+        diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                f"@@ -1 +1,2 @@\n x\n+{line}\n")
+        got = panel_seats.referee_split(diff)
+        assert got["production"] == 1, (path, line, got)
+        assert panel_rounds.referee_state(got, True)["over"] is False
 
 
 # --------------------------------------------------------------------------- the dial
@@ -789,8 +1017,13 @@ REFEREED_COMPARE = json.dumps({
          "patch": "@@ -1,0 +2,2 @@\n+    with mock.patch('app.sync.redis'):\n"
                   "+        assert sync() == 1"},
         {"filename": "app/sync.py",
-         "patch": "@@ -1,2 +1,4 @@\n def sync():\n+    mirror_once()\n"
-                  '+    """Mirror it.\n+    """'},
+         # The docstring sits where one goes — directly under the `def` — so it is
+         # read as prose, and the one production line is `mirror_once()`. Written this
+         # way deliberately: a triple-quote that does NOT follow a suite header is a
+         # multiline value and counts as production, which would make this control
+         # pass for the wrong reason.
+         "patch": '@@ -1,2 +1,4 @@\n def sync():\n+    """Mirror it.\n+    """\n'
+                  "+    mirror_once()"},
     ]})
 
 E2E_CFG = {

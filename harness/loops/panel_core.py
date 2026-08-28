@@ -234,9 +234,17 @@ DEFAULT_LOW_SEVERITY_FIX_LINES = 40
 #:
 #: **This is not value-weighting**, which #297 refuses deliberately because it hands
 #: judgement back to the actor whose judgement the 63.7% measurement indicts. Being
-#: refereed is a property of the PATH AND THE LINE — computable from the same `git
-#: diff --numstat` the budget already runs — never an opinion about whether the work
-#: is worth doing. The fixer is asked for a multiplication, not a forecast.
+#: refereed is a property of the PATH AND THE LINE, read off the fix's own diff — the
+#: one the fixer already produces to measure the fix at all — and never an opinion
+#: about whether the work is worth doing. The fixer is asked for a multiplication, not
+#: a forecast.
+#:
+#: **Not `git diff --numstat`**, which is what this said until a Codex second opinion
+#: pointed out that numstat reports per-file insertion and deletion TOTALS and cannot
+#: see a comment, a blank or a docstring. #554's own wording — "classifying each PATH
+#: is free at that point" — is true of numstat and was extended here to lines, where
+#: it is not. The line half needs the diff body, which costs nothing extra because the
+#: fixer is already looking at it.
 #:
 #: **2 is the one number in #554 that is a judgement rather than a fact**, and it is
 #: written down here so it can be argued with rather than discovered. For it: an
