@@ -170,6 +170,10 @@ second measurement on 2026-08-21, where PR #188's 185-line feature came out of t
 at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
 individually reasonable small fixes;
+`unrefereed_line_weight` (**2**) is what one churned line of test or prose costs that budget
+against a production line's 1, because a production fix has an external referee in red/green,
+the suite and CI while a test fix has none — nothing tests a test — so a budget that prices
+them alike spends most of itself where nothing can check it (#554);
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
 whichever is crossed first binds, because a pure multiple hands its rope out in proportion to

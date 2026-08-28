@@ -226,6 +226,13 @@ From its output collect:
   WHEN it arrives: it is available from round 1's diffstat, where `max_fix_growth`
   needs a second round before it has a ratio at all, and the cycle it was filed from
   produced 406 lines of test for a 66-line config change with nothing noticing.
+- **Refereed-ness of the last fix pass** — the line printed under that name
+  (`round_stop.unrefereed_fix` in the JSON): the CHURN of the pass that landed
+  between the last round and this one, split into production / test / prose. Unlike
+  Guard-to-guarded above it, this one GATES — see the section on #554 below — and it
+  says so on the line. Absent on round 1 and on a round with no readable fix range,
+  because there was then no pass to measure and a line of zeroes would claim one
+  wrote nothing.
 - **Rounds** — the `**Rounds:**` line (also `round_stop` in the JSON): whether
   the cycle should go again and whether stopping would be convergence.
 
@@ -305,7 +312,8 @@ with these overrides:
   ones (§4b's road 2).
 - **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
   itself in worktree mode and must not guess: state `fix_severity_floor`,
-  `low_severity_fix_lines`, `reviewer_scope` and `fixer_may_defer` from the panel
+  `low_severity_fix_lines`, `unrefereed_line_weight`, `reviewer_scope` and
+  `fixer_may_defer` from the panel
   report's **Panel dials** line, in the brief, as the values in force. The brief's own opening asks for them
   by name, and a fixer left to guess reverts to "fix everything you find, anywhere",
   which is the behaviour these settings exist to bound.
@@ -657,6 +665,44 @@ Three consequences worth knowing when you read the result:
   there. `scope: "pr"` on a round 2 is that, and it means the round cost what it
   always used to. The same list carries the caveats on a round that WAS scoped: a
   rebase between the rounds, or a merge commit inside the range.
+
+### When the cycle ends because NOTHING COULD CHECK the fix pass (#554)
+
+`escalate_on.unrefereed_fix` ends the cycle when the pass that landed between the
+last round and this one churned four or more lines and **not one of them was
+production code** — all test and prose. You will see it as a veto line, `confident:
+false`, and a `stop_reason` that names the dial rather than the cap.
+
+**The argument, in one sentence:** a production fix has an external referee — red/
+green either detects the bug or it does not, with the suite and CI behind it — and a
+test fix has none, because nothing tests a test. A docstring fix has none either. So
+a pass whose entire output is test and prose produced only artefacts that no
+mechanism in this loop can check, and the round it would buy is a review of them.
+
+Measured on lexray#1697 round 1, since reverted: a 93-line pass across three files
+whose entire production share was a docstring and a comment introduced ten findings,
+nine in the test files it wrote and the tenth in that docstring. Red/green ran and
+went red 4 of 4 — it asks whether a new test detects the thing it was written for,
+never whether that test also opens a socket or whether its assertion is sufficient.
+
+**What it is NOT.** It is not a ratio and there is no proportion to tune: a five-line
+production fix carrying a forty-line regression test is 89% unrefereed and is exactly
+the work this panel wants, so the rule is the ABSENCE of a refereed component and
+nothing else. It is also not a judgement about the fix pass's worth — the split is
+computed from the same `git diff --numstat` the budget already runs, and the fixer is
+never asked about it, which is #297's discipline.
+
+**What to do with it.** Read `round_stop.unrefereed_fix` for the counts, and relay
+it in §6 as what it is: the last pass answered its findings by writing more test, so
+the question for a human is whether the findings had a production answer that nobody
+found. #507's constructive pass follows this rung like the others, so where it is
+armed each seat has already been asked for the smallest change that satisfies its
+findings — that is the material to put in front of them.
+
+It shares one blindness with #489's rung below and it is worth knowing which: both
+read the fix range, so a rewrite between rounds that #504 cannot rebuild disarms
+both. `escalate_on.new_findings_not_falling` is the only rung computed from the
+rounds' own counts.
 
 ### When the cycle ends because the FIX PASS was generating the work (#489, #506)
 
