@@ -222,7 +222,7 @@ async def test_a_chore_is_a_class_and_carries_no_permission_with_it(client):
     autonomous pickup — is in `harness/loops/tests/test_appetite.py`."""
     r = await raise_one(client, kind="chore")
     assert r.status_code in (200, 201), r.text
-    listing = await client.get("/blockers?open=true")
+    listing = await client.get("/blockers", params={"repo": REPO}, headers=LAPTOP)
     assert listing.status_code == 200
     body = listing.json()
     assert body["by_class"].get("chore") == 1
