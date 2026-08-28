@@ -3641,6 +3641,104 @@ def test_the_board_is_not_asked_at_all_when_no_shared_row_is_failing(monkeypatch
     assert all("dedupe could not run" not in c["detail"] for c in door.calls)
 
 
+# ------------------------------------------------------- #576: the row's own key
+
+
+def test_the_condition_is_the_row_name_so_three_faults_are_three_rows(door,
+                                                                      landing_host):
+    """The whole of #576, measured on the live board before it was written: `landed`,
+    `harness` and `unpushed` on `prisonblues/quarterback` were ONE blocker row, and the
+    second and third were answered "an open blocker already asks this of this subject"
+    and dropped. The subject and the class are identical for all three — the row name is
+    the only thing that tells them apart, so it is what the condition carries.
+
+    `scope="repo"` spelled out because `Check` defaults to `host`, and that default is
+    the fail-safe one: a row built anywhere but the registry files per machine, which
+    costs a duplicate post and can never silence another box.
+    """
+    checks = [qd.Check("landed", "acme/repo", "4 ready", "fail", scope="repo"),
+              qd.Check("unpushed", "acme/repo", "25 commits", "fail", scope="repo")]
+
+    qd.announce_failures(checks, landing_host, str(BIN / "qb-doctor"))
+
+    assert [c["condition"] for c in door.calls] == ["landed", "unpushed"]
+
+
+def test_a_host_scoped_row_carries_the_machine_into_its_condition(door, landing_host,
+                                                                  monkeypatch):
+    """`SCOPES` already says *"8 harness scripts are not on zeus"* and *"7 are not on
+    hermes"* are two facts. Two facts owed to a person are two rows, so the host is part
+    of which question this is — and a repo-scoped row must NOT carry it, or every
+    machine files its own copy of one fleet-wide question."""
+    monkeypatch.setattr(qd.socket, "gethostname", lambda: "ZEUS.fo.ls")
+
+    qd.announce_failures([qd.Check("harness", "acme/repo", "8 differ", "fail",
+                                   scope="host"),
+                          qd.Check("landed", "acme/repo", "4 ready", "fail",
+                                   scope="repo")],
+                         landing_host, str(BIN / "qb-doctor"))
+
+    assert [c["condition"] for c in door.calls] == ["harness@zeus", "landed"]
+
+
+def test_the_condition_is_the_fault_and_the_key_is_the_reading(door, landing_host):
+    """The boundary, and the reason the row cannot just reuse the post's key. Two ready
+    pull requests becoming four is news — a second POST — and it is the same standing
+    question, so it must not be a second ROW. A condition that moved with the reading
+    would fill the table the unique index exists to keep small, which is #576's defect
+    arriving from the other direction."""
+    two = qd.Check("landed", "acme/repo", "2 ready", "fail",
+                   extra={"ready": [401, 403], "tip_age_minutes": 240})
+    four = qd.Check("landed", "acme/repo", "4 ready", "fail",
+                    extra={"ready": [401, 403, 418, 419], "tip_age_minutes": 300})
+
+    qd.announce_failures([two, four], landing_host, str(BIN / "qb-doctor"))
+
+    assert len({c["key"] for c in door.calls}) == 2, "the bell rings again — that is news"
+    assert len({c["condition"] for c in door.calls}) == 1, \
+        "and it is one standing question, so it is one row"
+
+
+def test_a_door_too_old_for_the_condition_still_gets_the_escalation(monkeypatch, door,
+                                                                    landing_host):
+    """The harness on PATH goes stale — there is a row about exactly that, and it is
+    failing on zeus as this is written — while this script may be a fresh checkout. An
+    unexpected keyword is a `TypeError`, the guard would report it as "NOT announced",
+    and the escalation would be lost for a field that only makes the row tidier. So the
+    door is ASKED what it takes, and an old one gets the call it understands."""
+    seen: list[dict] = []
+
+    def old_announce(*, cls, reason, summary, repo="", detail="", refs=None,
+                     key="", cfg=None, session=None):
+        seen.append({"summary": summary})
+        return "needs-human announced by a door that predates #576"
+
+    monkeypatch.setattr(door, "announce", old_announce)
+
+    said = qd.announce_failures(_rows(("harness", "fail")), landing_host,
+                                str(BIN / "qb-doctor"))
+
+    assert len(seen) == 1, "the escalation went out"
+    assert not any("NOT announced" in line for line in said)
+
+
+def test_the_key_and_the_condition_name_the_host_with_the_same_string(door,
+                                                                      landing_host,
+                                                                      monkeypatch):
+    """A reader comparing a post to the row behind it should not have to know that two
+    spellings mean one box. `qb-bump` truncated at the first dot and this file did not,
+    which is the drift Codex caught one layer up in #569 — where a machine that could
+    not recognise its own name suppressed itself against its own escalation."""
+    monkeypatch.setattr(qd.socket, "gethostname", lambda: "Hermes.fo.ls")
+
+    qd.announce_failures([qd.Check("harness", "acme/repo", "d", "fail", scope="host")],
+                         landing_host, str(BIN / "qb-doctor"))
+
+    (call,) = door.calls
+    assert call["condition"] == "harness@hermes"
+    assert call["key"].endswith("hermes"), "the post key spells it the same way"
+
+
 def test_every_registered_check_declares_whose_fault_it_describes():
     """No default, so a new row cannot be added without its author deciding. The two
     directions of the mistake are not symmetric — a shared row called `host` costs a

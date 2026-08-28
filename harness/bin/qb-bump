@@ -146,6 +146,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -892,7 +893,7 @@ def resolve_attr(flake: Path, attr_arg: str | None, cfg: dict[str, str]) -> tupl
     declared = os.environ.get(ATTR_KEY) or cfg.get(ATTR_KEY)
     if declared:
         return declared, ""
-    me = socket.gethostname().split(".", 1)[0]
+    me = machine_id()
     attrs = host_attrs(flake)
     if not attrs:
         return "", (f"{flake} declares no nixosConfigurations this can read — name the "
@@ -1199,8 +1200,21 @@ def loops_dir(script: str) -> Path | None:
     return None
 
 
+def machine_id() -> str:
+    """This box's name, spelled once in this file — `needs_human.machine_id`'s rule.
+
+    Not imported from the door: this is used in a summary composed before the door
+    has been located, and the door may be older than the function. Copied rather
+    than diverged, which is the state #576 found — this file truncated at the first
+    dot and `qb-doctor` did not, so one machine had two names across the two halves
+    of one escalation. The condition is durable and a row that outlives a rename is
+    a question nobody can answer.
+    """
+    return socket.gethostname().strip().split(".", 1)[0].lower()
+
+
 def escalate(script: str, *, summary: str, reason: str, detail: str, repo: str,
-             key_parts: list[str]) -> str:
+             key_parts: list[str], condition_parts: list[str] | None = None) -> str:
     """Tell the board a human has to finish this — through `needs_human.announce`.
 
     Not a `board_post` written here, and not a print. #274 landed one door for
@@ -1209,8 +1223,24 @@ def escalate(script: str, *, summary: str, reason: str, detail: str, repo: str,
     person watching neither. The class is `environment`: nothing about this needs
     taste or a design decision, it needs root on a particular machine.
 
+    `condition_parts` is #576, and this file had the defect that issue is about.
+    Both callers pass `refs=[issue 267]` with class `environment`, so *"the flake
+    bump does not build"* and *"N harness scripts are not on this box"* keyed to
+    one blocker row — and so did zeus and hermes, because the subject is a fixed
+    issue number that says nothing about which machine cannot be rebuilt. Measured:
+    hermes escalated on the 27th and has no row at all; zeus's later escalation is
+    the row. The parts name the FAULT and the machine and never the reading, so the
+    pin moving and the build log changing do not make a second row — see the
+    `Blocker` docstring for that boundary.
+
     Never raises and never blocks. An unannounced escalation is still an
-    escalation — it is printed either way, and the return value says which.
+    escalation — it is printed either way, and the return value says which. That
+    was a claim rather than a guarantee until #576: this returned
+    `needs_human.announce(...)` directly, so anything the door raised came straight
+    back out through a function whose contract is that it does not — and the live
+    way to provoke one is a `needs_human` older than the keyword being passed to
+    it, which is precisely what a stale harness is. Now the door is asked what it
+    takes, and called inside a guard either way.
     """
     where = loops_dir(script)
     if where is None:
@@ -1221,10 +1251,45 @@ def escalate(script: str, *, summary: str, reason: str, detail: str, repo: str,
         import needs_human  # noqa: PLC0415 — resolved at call time, by design
     except Exception as exc:  # noqa: BLE001 — an escalation must survive its own courier
         return f"needs-human NOT announced: {type(exc).__name__} importing needs_human"
-    return needs_human.announce(
-        cls=NEEDS_HUMAN_CLASS, reason=reason, summary=summary, detail=detail, repo=repo,
-        key=needs_human.digest(*key_parts),
-        refs=[{"kind": "issue", "value": "267", "repo": repo}])
+    extra: dict = {}
+    if condition_parts and _door_takes_condition(needs_human):
+        extra["condition"] = _condition_for(needs_human, condition_parts)
+    try:
+        return needs_human.announce(
+            cls=NEEDS_HUMAN_CLASS, reason=reason, summary=summary, detail=detail,
+            repo=repo, key=needs_human.digest(*key_parts),
+            refs=[{"kind": "issue", "value": "267", "repo": repo}], **extra)
+    except Exception as exc:  # noqa: BLE001 — the courier, not the news
+        return f"needs-human NOT announced: {type(exc).__name__} from needs_human.announce"
+
+
+def _door_takes_condition(door: object) -> bool:
+    """Does this box's `needs_human` know about #576's `condition`?
+
+    The same question `qb-doctor` asks, for the same reason and deliberately not
+    shared with it: `loops_dir` is duplicated between these two scripts already,
+    because they are installed as `bin/` entries beside a `loops/` directory that
+    may be older than either of them. A helper factored into that directory would
+    be the very thing whose age is in doubt.
+
+    A stale door gets the call it understands and yesterday's collapsing
+    behaviour — which is what it did yesterday. Losing the escalation to a field
+    that only makes the row tidier would be the worse trade by a long way.
+    """
+    try:
+        params = inspect.signature(door.announce).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return any(p.name == "condition" or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params)
+
+
+def _condition_for(door: object, parts: list[str]) -> str:
+    """`parts` as a canonical condition, spelled by the door where it can be."""
+    fn = getattr(door, "condition_for", None)
+    if callable(fn):
+        return fn(*parts)
+    return "@".join(p.strip().lower() for p in parts if p.strip())[:120]
 
 
 # --------------------------------------------------------------------------- #
@@ -1665,7 +1730,14 @@ def prepared_bump(args, cfg: dict[str, str],
                     "can decide what gives"),
             detail=f"{why}\n\n{tail(log)}", repo=slug,
             key_parts=["qb-bump", "build-failed", str(consumer.flake), attr,
-                       sha(tail(log, 5))])
+                       sha(tail(log, 5))],
+            # The key carries the log's hash because a build failing a NEW way is
+            # news; the condition must not, because it is the same standing
+            # question — this configuration cannot take today's harness — however
+            # today's error reads. Flake name and attr rather than the flake path:
+            # one box can hold several system configurations and each is its own
+            # question, but a path is not an identifier a person recognises.
+            condition_parts=["build-failed", machine_id(), consumer.flake.name, attr])
         text = "\n".join([why, "", tail(log)] + ([announced] if announced else []))
         return ({**out, "outcome": "refused", "detail": why, "log": tail(log),
                  "announced": announced}, 4, None, text)
@@ -1673,7 +1745,7 @@ def prepared_bump(args, cfg: dict[str, str],
     cmd, how, typed = switch_command(proposal, cfg, not args.no_wrapper)
     out["switch"] = {"command": cmd, "how": how, "typed": typed}
 
-    me = socket.gethostname().split(".", 1)[0]
+    me = machine_id()
     n = len(drift.missing) + len(drift.differ)
     # No "a human must do this" under --apply: the human is holding the keyboard.
     # An escalation raised at the moment it is being answered is noise on a board
@@ -1695,7 +1767,11 @@ def prepared_bump(args, cfg: dict[str, str],
             "",
             f"run: {proposal.prepared_by} --apply",
         ]), repo=slug,
-        key_parts=["qb-bump", "prepared", str(consumer.flake), attr, proposal.new_rev])
+        key_parts=["qb-bump", "prepared", str(consumer.flake), attr, proposal.new_rev],
+        # Not `proposal.new_rev`: the pin moving is the fault getting newer, not a
+        # different fault. "This machine has not been rebuilt" is one question
+        # until somebody rebuilds it.
+        condition_parts=["rebuild-waiting", machine_id(), consumer.flake.name, attr])
     out.update({"outcome": "prepared", "proposal": asdict(proposal), "announced": announced,
                 "detail": f"a bump to {proposal.new_rev[:12]} is built and waiting for "
                           f"`{proposal.prepared_by} --apply`"})

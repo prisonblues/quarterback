@@ -667,6 +667,77 @@ def test_an_escalation_that_cannot_be_announced_is_still_reported(monkeypatch, t
     assert "NOT announced" in said
 
 
+def test_two_escalations_from_one_box_are_two_conditions(monkeypatch, tmp_path):
+    """#576, and this file had the defect the issue is about. Both call sites pass
+    `refs=[issue 267]` with class `environment`, so *"the flake bump does not build"* and
+    *"N scripts are not on this box"* keyed to ONE blocker row — and so did zeus and
+    hermes, because a fixed issue number says nothing about which machine cannot be
+    rebuilt. Measured: hermes escalated on the 27th and has no row at all; zeus's later
+    escalation is the row."""
+    monkeypatch.setenv("QB_LOOPS_DIR", str(LOOPS))
+    sys.path.insert(0, str(LOOPS))
+    import needs_human  # noqa: PLC0415
+    monkeypatch.setattr(needs_human.socket, "gethostname", lambda: "ZEUS.fo.ls")
+    seen: list[dict] = []
+    monkeypatch.setattr(needs_human, "announce", lambda **kw: seen.append(kw) or "said")
+    for fault in ("build-failed", "rebuild-waiting"):
+        qb.escalate(str(BIN / "qb-bump"), summary="s", reason="r", detail="d",
+                    repo="prisonblues/quarterback", key_parts=[fault],
+                    condition_parts=[fault, qb.machine_id(), "nix-fleet", "zeus"])
+    assert [c["condition"] for c in seen] == ["build-failed@zeus@nix-fleet@zeus",
+                                              "rebuild-waiting@zeus@nix-fleet@zeus"]
+
+
+def test_this_file_and_the_door_spell_the_machine_the_same_way(monkeypatch):
+    """`qb-bump` truncated at the first dot and `qb-doctor` did not, which is one box
+    under two names across the two halves of one escalation. A `condition` is durable in
+    a way a cache key is not, so two spellings there is a standing fault arriving as two
+    rows — or, in the direction that loses news, two machines collapsing into one."""
+    monkeypatch.setattr(qb.socket, "gethostname", lambda: " HERMES.fo.ls ")
+    sys.path.insert(0, str(LOOPS))
+    import needs_human  # noqa: PLC0415
+    monkeypatch.setattr(needs_human.socket, "gethostname", lambda: " HERMES.fo.ls ")
+    assert qb.machine_id() == needs_human.machine_id() == "hermes"
+
+
+def test_a_door_too_old_for_the_condition_still_gets_the_escalation(monkeypatch):
+    """A `needs_human` predating #576 has no such keyword, and this file's contract is
+    that it never raises. Asking the door what it takes is what keeps a stale harness —
+    the live case, and the thing the `harness` row exists to report — costing the field
+    rather than the escalation."""
+    monkeypatch.setenv("QB_LOOPS_DIR", str(LOOPS))
+    sys.path.insert(0, str(LOOPS))
+    import needs_human  # noqa: PLC0415
+    seen: list[dict] = []
+
+    def old_announce(*, cls, reason, summary, repo="", detail="", refs=None,
+                     key="", cfg=None, session=None):
+        seen.append({"summary": summary})
+        return "announced by a door that predates #576"
+
+    monkeypatch.setattr(needs_human, "announce", old_announce)
+    said = qb.escalate(str(BIN / "qb-bump"), summary="s", reason="r", detail="d",
+                       repo="r/r", key_parts=["a"], condition_parts=["build-failed"])
+    assert len(seen) == 1 and "NOT announced" not in said
+
+
+def test_a_door_that_raises_does_not_escape_a_function_that_never_raises(monkeypatch):
+    """This returned `needs_human.announce(...)` directly until #576, so anything the
+    door threw came straight back out through a docstring that promises it does not —
+    and the caller is `main`, mid-run, on a machine somebody is waiting to rebuild."""
+    monkeypatch.setenv("QB_LOOPS_DIR", str(LOOPS))
+    sys.path.insert(0, str(LOOPS))
+    import needs_human  # noqa: PLC0415
+
+    def explode(**kw):
+        raise RuntimeError("the board's client is from another century")
+
+    monkeypatch.setattr(needs_human, "announce", explode)
+    said = qb.escalate(str(BIN / "qb-bump"), summary="s", reason="r", detail="d",
+                       repo="r/r", key_parts=["a"])
+    assert "NOT announced" in said and "RuntimeError" in said
+
+
 def test_the_command_it_tells_a_person_to_type_is_one_that_exists(monkeypatch, tmp_path):
     """The bootstrap, and it is the normal case rather than the corner: the harness
     carrying `qb-bump` is by definition the one NOT installed on the host it is

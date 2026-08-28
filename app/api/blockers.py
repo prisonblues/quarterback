@@ -40,6 +40,17 @@ never written down — so the friction belongs on *answering*, never on *asking*
 Re-raising an identical open question is a no-op returning the existing row, which
 is what the partial unique index is for: a loop that asks every run must not fill
 the table, and must not have to check first either.
+
+## `condition` is what makes "identical" mean the question and not the class
+
+#576: without it the key was (subject, class), so `qb-doctor` asking three
+different things about one repo under `environment` got one row and two answers
+saying an open blocker already covered it. `condition` names WHICH standing
+question. It is normalised here — trimmed and lowercased — and otherwise passed
+through untouched, which is `app.claimkey`'s rule for an open namespace: police
+the spelling a consumer keys on, and do not police a vocabulary nobody here owns.
+Refusing an unfamiliar condition would refuse an escalation, and that is the one
+outcome this whole path exists to prevent.
 """
 
 from __future__ import annotations
@@ -56,7 +67,13 @@ from app.api.claims import is_unique_violation
 from app.auth import author, reader
 from app.db import get_session
 from app.identity import is_human
-from app.models.blocker import MAX_DETAIL, MAX_QUESTION, SUBJECT_KINDS, Blocker
+from app.models.blocker import (
+    MAX_CONDITION,
+    MAX_DETAIL,
+    MAX_QUESTION,
+    SUBJECT_KINDS,
+    Blocker,
+)
 from app.needs_human import NEEDS_HUMAN_CLASSES
 
 router = APIRouter(tags=["blockers"])
@@ -66,6 +83,11 @@ class BlockIn(BaseModel):
     subject_kind: str = Field(description="item | issue | pr | repo")
     subject_value: str = Field(min_length=1, max_length=200)
     kind: str = Field(description="one of app.needs_human.NEEDS_HUMAN_CLASSES")
+    #: WHICH standing question, when a subject carries more than one of a class.
+    #: Omitted means the subject and the class are the whole question — right for
+    #: a producer that already keys on a real PR or issue. See
+    #: :class:`~app.models.blocker.Blocker` for the fault-not-reading boundary.
+    condition: str = Field(default="", max_length=MAX_CONDITION)
     question: str = Field(min_length=1, max_length=MAX_QUESTION)
     detail: str | None = Field(default=None, max_length=MAX_DETAIL)
     #: Who is being asked. Omitted means "any human" — which is a real answer and
@@ -88,6 +110,12 @@ def _view(b: Blocker) -> dict:
         "repo": b.repo,
         "subject": {"kind": b.subject_kind, "value": b.subject_value},
         "kind": b.kind,
+        # Returned rather than write-only, and that is the compatibility story:
+        # a board predating #576 ignores an unknown field (`BlockIn` does not
+        # forbid extras, deliberately — see the module docstring), so a producer
+        # that sent a condition and gets none back has been told, in the answer,
+        # that its rows will collapse. Silent degradation with a way to see it.
+        "condition": b.condition,
         "question": b.question,
         "detail": b.detail,
         "owner": b.owner,
@@ -112,6 +140,7 @@ async def raise_blocker(body: BlockIn, who: str = Depends(author),
     loops asking the same question in the same second would both pass a check and
     both insert, and the second row would say nothing the first did not.
     """
+    condition = body.condition.strip().lower()
     if body.kind not in NEEDS_HUMAN_CLASSES:
         raise HTTPException(422, detail={
             "error": f"{body.kind!r} is not a blocker class",
@@ -126,6 +155,7 @@ async def raise_blocker(body: BlockIn, who: str = Depends(author),
 
     row = Blocker(repo=body.repo, subject_kind=body.subject_kind,
                   subject_value=body.subject_value, kind=body.kind,
+                  condition=condition,
                   question=body.question.strip(), detail=body.detail,
                   owner=body.owner, raised_by=who)
     session.add(row)
@@ -142,11 +172,20 @@ async def raise_blocker(body: BlockIn, who: str = Depends(author),
                 Blocker.subject_kind == body.subject_kind,
                 Blocker.subject_value == body.subject_value,
                 Blocker.kind == body.kind,
+                # Every column of the index, or this recovery is not a recovery.
+                # It fetches "the row the collision names", and with several
+                # conditions open on one subject a four-part filter matches all
+                # of them — so `scalar_one_or_none` raises `MultipleResultsFound`
+                # and the documented no-op becomes a 500, in exactly the case
+                # #576 added the column for. The lookup has to key on what the
+                # index keys on.
+                Blocker.condition == condition,
                 Blocker.resolved_at.is_(None)))).scalar_one_or_none()
         if existing is None:  # pragma: no cover - lost a race with a resolve
             raise
         return {"blocker": _view(existing), "raised": False,
-                "note": "an open blocker already asks this of this subject"}
+                "note": "an open blocker already asks this of this subject"
+                        + (f" under {condition!r}" if condition else "")}
     await session.refresh(row)
     return {"blocker": _view(row), "raised": True}
 

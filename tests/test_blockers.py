@@ -76,6 +76,116 @@ async def test_the_same_subject_can_carry_a_second_question_of_another_class(cli
     assert r.json()["raised"] is True
 
 
+# ------------------------------------ #576: one row per QUESTION, not per class
+
+
+async def test_two_conditions_on_one_subject_and_class_are_two_rows(client):
+    """The defect #576 is filed about, measured on the live board before it was
+    fixed: `qb-doctor` raised `landed`, `harness` and `unpushed` against one repo,
+    all of them `environment`, and the table held ONE row. The second and third
+    were answered "an open blocker already asks this of this subject" and thrown
+    away, so the surface a person scans undercounted by two."""
+    first = await raise_one(client, subject_kind="repo", subject_value=REPO,
+                            kind="environment", condition="landed",
+                            question="4 PRs ready and main has not moved")
+    second = await raise_one(client, subject_kind="repo", subject_value=REPO,
+                             kind="environment", condition="unpushed",
+                             question="25 commits exist on no remote")
+    assert first.json()["raised"] is True
+    assert second.json()["raised"] is True, second.text
+    assert first.json()["blocker"]["id"] != second.json()["blocker"]["id"]
+
+
+async def test_the_same_condition_re_raised_is_still_a_no_op(client):
+    """The other half of the boundary, and the one that must not have been broken
+    to get the first. A loop asking the same question every run still gets the
+    existing row back — a condition that moved with the READING rather than the
+    fault would refill the table this index exists to keep small."""
+    first = await raise_one(client, subject_kind="repo", subject_value=f"{REPO}-same",
+                            kind="environment", condition="landed",
+                            question="2 pull requests ready to land")
+    again = await raise_one(client, subject_kind="repo", subject_value=f"{REPO}-same",
+                            kind="environment", condition="landed",
+                            question="4 pull requests ready to land")
+    assert again.json()["raised"] is False
+    assert again.json()["blocker"]["id"] == first.json()["blocker"]["id"]
+    assert "landed" in again.json()["note"]
+
+
+async def test_re_raising_one_of_several_conditions_returns_that_row_not_a_500(client):
+    """The recovery after a unique violation re-reads "the row the collision
+    names", and it has to key on what the INDEX keys on. Filtering on the old
+    four-part key matches every condition open on the subject, so
+    `scalar_one_or_none` raises `MultipleResultsFound` and the documented no-op
+    becomes a 500 — in exactly the case the column was added for."""
+    subject = f"{REPO}-many"
+    made = {}
+    for cond in ("landed", "harness@zeus", "unpushed"):
+        r = await raise_one(client, subject_kind="repo", subject_value=subject,
+                            kind="environment", condition=cond, question=f"{cond}?")
+        assert r.json()["raised"] is True, r.text
+        made[cond] = r.json()["blocker"]["id"]
+
+    again = await raise_one(client, subject_kind="repo", subject_value=subject,
+                            kind="environment", condition="harness@zeus",
+                            question="8 scripts differ")
+    assert again.status_code == 200, again.text
+    assert again.json()["raised"] is False
+    assert again.json()["blocker"]["id"] == made["harness@zeus"], \
+        "the collision must return the row it actually collided with"
+
+
+async def test_a_condition_is_trimmed_and_lowercased_before_it_keys_anything(client):
+    """Otherwise `landed`, `landed ` and `Landed` are three standing questions
+    about one fault. Normalised at the edge, the way every other value a consumer
+    keys on is — and passed through otherwise, because the namespace is open and
+    refusing an unfamiliar condition would refuse an escalation."""
+    first = await raise_one(client, subject_kind="repo", subject_value=f"{REPO}-norm",
+                            kind="environment", condition="landed")
+    assert first.json()["blocker"]["condition"] == "landed"
+    again = await raise_one(client, subject_kind="repo", subject_value=f"{REPO}-norm",
+                            kind="environment", condition="  LANDED ")
+    assert again.json()["raised"] is False
+    assert again.json()["blocker"]["id"] == first.json()["blocker"]["id"]
+
+
+async def test_no_condition_is_the_empty_string_and_dedupes_as_it_always_did(client):
+    """Most producers pass none — `preland`, `panel`, `epic` and `issue_watch` all
+    key on a real PR or issue and raise one question per class about it. Their
+    behaviour is unchanged, which is what `NOT NULL DEFAULT ''` buys: nullable
+    would have switched deduplication OFF for exactly them, because PostgreSQL
+    treats NULLs in a unique index as distinct."""
+    first = await raise_one(client, subject_value="i-plain")
+    again = await raise_one(client, subject_value="i-plain")
+    assert first.json()["blocker"]["condition"] == ""
+    assert again.json()["raised"] is False
+
+
+async def test_a_fleet_scope_question_is_deduplicated_too(client):
+    """`repo` is nullable and NULL means fleet scope — a real value, not a missing
+    one. Under PostgreSQL's default no NULL equals another, so this index never
+    deduplicated fleet-scope rows at all and the `repo IS NULL` branch of the
+    recovery could not run for want of a collision to recover from. An idempotency
+    promise that holds for some rows and quietly not for others is worse than
+    none, because the docstring is read as covering both."""
+    first = await raise_one(client, repo=None, subject_value="i-fleet",
+                            kind="decision")
+    again = await raise_one(client, repo=None, subject_value="i-fleet",
+                            kind="decision")
+    assert first.json()["raised"] is True, first.text
+    assert again.json()["raised"] is False, again.text
+    assert again.json()["blocker"]["id"] == first.json()["blocker"]["id"]
+
+
+async def test_a_condition_longer_than_the_table_takes_is_refused(client):
+    """A bound the table enforces as well, so this cannot be the only thing
+    standing between a producer and a CHECK violation. It is short because a
+    condition is an identifier and not a sentence — anything near it is almost
+    certainly a reading that has been mistaken for a fault."""
+    r = await raise_one(client, condition="x" * 200)
+    assert r.status_code == 422
+
+
 async def test_an_unknown_class_is_refused_and_names_the_vocabulary(client):
     r = await raise_one(client, kind="urgent")
     assert r.status_code == 422

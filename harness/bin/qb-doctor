@@ -97,6 +97,7 @@ import argparse
 import ast
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -5096,15 +5097,90 @@ def _escalation(check: Check, slug: str, base_url: str, raised_by: str = "") -> 
     return summary, "\n".join(lines)
 
 
-def _host_part(check: Check) -> tuple[str, ...]:
+def _machine_id(door: object) -> str:
+    """This box's name, spelled the way #274's door spells it.
+
+    Deferred to `needs_human.machine_id` rather than restated, because #576 put the
+    same string in a DURABLE place: a `host`-scoped row's `condition` is
+    `harness@zeus`, and a row outlives every cache this key was ever compared
+    against. Two spellings of one machine there is either one fault arriving as two
+    rows the day something starts handing back an FQDN, or — the direction that
+    loses news — two machines' faults collapsing into one row.
+
+    `qb-bump` already truncated at the first dot while this file did not, which is
+    that drift with the two halves written eighteen months apart. The fallback is a
+    copy of the door's rule and exists only for a `needs_human` older than #576;
+    the door is the definition.
+    """
+    fn = getattr(door, "machine_id", None)
+    if callable(fn):
+        return fn()
+    return socket.gethostname().strip().split(".", 1)[0].lower()
+
+
+def _host_part(check: Check, machine: str) -> tuple[str, ...]:
     """The host, folded into a `host`-scoped row's dedupe key — and nothing otherwise.
 
     `gethostname` and not the board's name for this box, deliberately: a key must be the
     same string on every tick, and the board's answer depends on the board being
     reachable. A key that changed when the network did would re-announce a fault that
     had not changed, which is the failure the key exists to prevent.
+
+    Normalised through :func:`_machine_id` since #576, so this key and the row's
+    `condition` name the host with the same string — a reader comparing a post to
+    the row behind it should not have to know that two spellings mean one box. The
+    change costs one re-announcement per host-scoped row on the tick after it
+    lands, because the key moves; that is a duplicate post and not a lost one,
+    which is the direction this file always chooses.
     """
-    return (socket.gethostname(),) if check.scope != "repo" else ()
+    return (machine,) if check.scope != "repo" else ()
+
+
+def _condition(check: Check, machine: str, door: object) -> str:
+    """WHICH standing question this row is — #576's third part of the blocker key.
+
+    The row NAME and nothing else, because the row name is what a doctor check IS:
+    `landed`, `harness`, `unpushed` are three faults and were one blocker row until
+    #576, the second and third answered "an open blocker already asks this of this
+    subject" and dropped on the floor.
+
+    **Not `_instance(check)`, and that is the whole distinction.** The instance is
+    what makes a second POST worth sending — two pull requests ready to land, then
+    three, then four, each of them news. A row is not news, it is a standing state,
+    and a state that re-keyed itself every time the fault got worse would fill the
+    table the unique index exists to keep small. So: the fault, never the reading.
+
+    The host rides along for a `host`-scoped row, for the reason :data:`SCOPES`
+    already gives about the posts — *"8 harness scripts are not on zeus"* and
+    *"7 are not on hermes"* are two facts, and two facts owed to a person are two
+    rows.
+    """
+    fn = getattr(door, "condition_for", None)
+    if callable(fn):
+        return fn(check.name, *_host_part(check, machine))
+    return "@".join((check.name, *_host_part(check, machine)))
+
+
+def _door_takes_condition(door: object) -> bool:
+    """Does this box's `needs_human` know about #576's `condition`?
+
+    Asked rather than assumed. The harness on PATH goes stale — that is what the
+    `harness` row is FOR, and it is failing on zeus as this is written — while this
+    script may be a fresh checkout, so a signature mismatch between the two is the
+    live case and not a hypothesis. An unexpected keyword is a `TypeError`, the
+    guard below would turn that into "NOT announced", and the escalation would be
+    lost for the sake of a field that only makes the row tidier. A stale door gets
+    the call it understands and yesterday's collapsing behaviour, which is strictly
+    what it would have done anyway.
+
+    A `**kwargs` door counts as taking it: that is what accepting a keyword means.
+    """
+    try:
+        params = inspect.signature(door.announce).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return any(p.name == "condition" or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params)
 
 
 def _peer_gate(host: Host, slug: str, failing: list[Check],
@@ -5218,6 +5294,8 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
     # something that looks like a session and joins to nothing.
     session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip() or None
     peers, peers_why = _peer_gate(host, slug, failing, needs_human)
+    machine = _machine_id(needs_human)
+    takes_condition = _door_takes_condition(needs_human)
     for check in failing:
         peer = _peer_that_said_it(check, slug, peers, needs_human)
         if peer:
@@ -5237,6 +5315,12 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
         pr = check.extra.get("head_pr")
         if slug and isinstance(pr, int):
             refs.append({"kind": "pr", "value": str(pr), "repo": slug})
+        # #576: the condition is what makes this row its own question rather than
+        # the repo's one `environment` slot. Only when the door takes it — see
+        # `_door_takes_condition`; a stale harness must lose the field, never the
+        # escalation.
+        extra = ({"condition": _condition(check, machine, needs_human)}
+                 if takes_condition else {})
         try:
             line = needs_human.announce(
                 cls=NEEDS_HUMAN_CLASS,
@@ -5250,9 +5334,10 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
                 # twelve hours, which is #274's dedupe protecting the fleet from
                 # noise by hiding the news.
                 key=needs_human.digest("qb-doctor", check.name, check.subject,
-                                       _instance(check), *_host_part(check)),
+                                       _instance(check), *_host_part(check, machine)),
                 session=session,
-                refs=refs or None)
+                refs=refs or None,
+                **extra)
         except Exception as exc:  # noqa: BLE001 — the courier, not the news
             # `announce` documents that it never raises, and this does not take its
             # word for it. The harness on PATH goes stale — that is what the
