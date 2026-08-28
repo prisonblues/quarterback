@@ -248,6 +248,84 @@ async def test_a_delegated_agent_may_also_clear_one(client, _no_dials_survive):
     assert "review_panel.max_rounds" not in [d["dial"] for d in got.json()["dials"]]
 
 
+async def test_an_agent_may_not_clear_a_dial_a_person_set(client, _no_dials_survive):
+    """THE BYPASS THE FIRST PASS LEFT OPEN, and the reason there is a rule here at
+    all rather than only in `qb-start`.
+
+    Guarding the WRITE guards the wrong half. `qb-start` refuses a
+    `spawn.max_sessions` row authored by an agent, which stops an agent writing
+    itself a bigger number — and does nothing about it deleting the smaller one a
+    person wrote. Person sets 2, policy file says 8, agent clears the dial,
+    `ceilings_from_board` reports no board ceiling, 8 applies. The ceiling has been
+    raised to 8 without one agent-authored value ever being accepted.
+
+    Absence is what the reader cannot interpret: "nobody set one" and "an agent
+    removed the one somebody set" arrive there as the same empty answer. So it has
+    to be refused where the difference is still visible.
+    """
+    r = await client.post("/dials", json={"dial": "spawn.max_sessions", "value": 2,
+                                          "reason": "a person's ceiling"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    r = await client.post("/dials/clear", json={"dial": "spawn.max_sessions"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+    assert "set by a person" in r.text
+
+    got = await client.get("/dials", headers=LAPTOP)
+    live = {d["dial"]: d for d in got.json()["dials"]}
+    assert live["spawn.max_sessions"]["value"] == 2, "the person's ceiling survived"
+
+
+async def test_an_agent_may_not_overwrite_a_dial_a_person_set(client, _no_dials_survive):
+    """Replacing destroys the person's row exactly as clearing does — `set_dial`
+    clears every live prior row before inserting — so the same rule has to cover it.
+    Guarding only `clear` would leave the identical bypass one verb away."""
+    await client.post("/dials", json={"dial": "review_panel.fix_severity_floor",
+                                      "value": "P2", "reason": "a person's floor"},
+                      headers=HUMAN)
+    r = await client.post("/dials", json={"dial": "review_panel.fix_severity_floor",
+                                          "value": "P4", "reason": "an agent's idea"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+
+    got = await client.get("/dials", headers=LAPTOP)
+    live = {d["dial"]: d for d in got.json()["dials"]}
+    assert live["review_panel.fix_severity_floor"]["value"] == "P2"
+
+
+async def test_an_agent_may_replace_and_clear_its_own_dial(client, _no_dials_survive):
+    """The rule is "not a person's", not "not anybody's". An agent that could set a
+    dial and never correct it would be the trap the clear path was opened to avoid,
+    one step along."""
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 3, "reason": "asked to"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 4, "reason": "asked again"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    r = await client.post("/dials/clear", json={"dial": "review_panel.max_rounds"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+
+
+async def test_a_person_may_still_overwrite_an_agents_dial(client, _no_dials_survive):
+    """The rule is one-directional and must be. A person who could not correct what
+    an agent set would be locked out by a control meant to protect them — #479's own
+    warning that "a gate nobody can satisfy is an outage"."""
+    await client.post("/dials", json={"dial": "review_panel.max_rounds", "value": 9,
+                                      "reason": "an agent's"},
+                      headers=LAPTOP_ELEVATED)
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds", "value": 2,
+                                          "reason": "a person overriding"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "edge"
+
+
 async def test_a_bare_machine_token_still_cannot_turn_a_dial(client, _no_dials_survive):
     """The half of the security argument that #591 did NOT reverse, and the one
     that actually protects a review from itself.

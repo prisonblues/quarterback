@@ -543,18 +543,18 @@ async def delegated(
     if person is not None:
         setattr(request.state, _METHOD_ATTR, method)
         return _as_person(person)
-    if human_key and not elevated:
-        # Presented, wrong, and nothing else offered to try. Fall through only
-        # when there IS a delegation to attempt — an agent that sends a stale key
-        # beside a good elevated secret is still an agent a person delegated to,
-        # and refusing it here would rank a bad person-credential above a good
-        # agent one. With no elevated header there is nothing left, so say what
-        # was actually wrong rather than the message about browsers below.
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            f"the {HUMAN_KEY_HEADER} presented does not match any configured "
-            "person. Check HUMAN_TOKENS on the board and the key this client "
-            "resolved; an unconfigured board has none and refuses every key.")
+    # A WRONG KEY DOES NOT SHORT-CIRCUIT, and an earlier draft of #591 had it
+    # raising right here, which was wrong in three ways an adversarial review
+    # caught. It made the function non-monotonic — adding a stale header turned a
+    # request that would have succeeded through the dev bypass into a 403. It
+    # answered a caller holding a good bearer and no elevated secret with a
+    # message about `HUMAN_TOKENS`, sending them to check the one credential that
+    # was not the problem. And it ranked a bad person-credential above a good
+    # agent one, which is the opposite of this function's own precedence.
+    #
+    # So it is remembered and spent at the END, on whichever refusal is actually
+    # reached, rather than pre-empting the two ways in that are still untried.
+    stale_key = bool(human_key)
     machine = _match_bearer(authorization)
     if machine is not None:
         if elevated:
@@ -614,7 +614,11 @@ async def delegated(
             "this endpoint takes a person, or an agent a person has delegated to. "
             f"An agent presents its machine's {ELEVATED_HEADER} secret alongside "
             "its bearer token; a person is proved by the edge, or by their own "
-            f"{HUMAN_KEY_HEADER}. None of those was here.")
+            f"{HUMAN_KEY_HEADER}. None of those was here."
+            + (f" The {HUMAN_KEY_HEADER} you did send does not match any configured "
+               "person: check HUMAN_TOKENS on the board and the key this client "
+               "resolved. If you meant to call as a machine rather than as a person, "
+               f"the credential is {ELEVATED_HEADER}." if stale_key else ""))
     # Only now — a caller with no bearer at all cannot be an agent being
     # relabelled, so the local-dev bypass is safe to honour at this point and
     # nowhere earlier.
@@ -624,6 +628,14 @@ async def delegated(
         return _as_person(dev)
     if remote_user:
         raise HTTPException(status.HTTP_403_FORBIDDEN, _NOT_FROM_THE_EDGE)
+    if stale_key:
+        # No bearer, no edge, no bypass — the key was the only credential offered,
+        # so now it IS the answer and the message can be the specific one.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            f"the {HUMAN_KEY_HEADER} presented does not match any configured "
+            "person. Check HUMAN_TOKENS on the board and the key this client "
+            "resolved; an unconfigured board has none and refuses every key.")
     raise HTTPException(
         status.HTTP_401_UNAUTHORIZED,
         "authentication required",

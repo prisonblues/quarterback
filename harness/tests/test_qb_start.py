@@ -1228,7 +1228,8 @@ def test_the_refused_agent_ceiling_says_who_set_it_and_what_to_do(tmp_path):
     got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
     problem = json.loads(got.stdout)["dials_problem"] or ""
     assert "hermes/mist-harbour" in problem, problem
-    assert "not by a person" in problem, problem
+    assert "is not a person" in problem, problem
+    assert "X-Human-Key" in problem, "the remedy has to name a door a person has"
 
 
 def test_a_ceiling_a_person_set_with_a_key_is_still_honoured(tmp_path):
@@ -1251,6 +1252,19 @@ def test_a_row_older_than_the_set_via_column_is_honoured(tmp_path):
                   dials=[dial("spawn.max_sessions", 5)])
     got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
     assert json.loads(got.stdout)["max_sessions"] == 5
+
+
+def test_an_unknown_provenance_is_not_trusted_by_failing_to_match_agent(tmp_path):
+    """An ALLOWLIST, not `!= "agent"`. A misspelling, a value from a newer board than
+    this box, or a malformed row must not become person-authored by failing to match
+    one string. The question is "do I know this was a person", not "is this the one
+    bad value I have heard of"."""
+    for via in ("agnt", "elevated", "", "something-new"):
+        box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                      dials=[dial("spawn.max_sessions", 40, set_via=via)])
+        got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+        answer = json.loads(got.stdout)
+        assert answer["max_sessions"] == 2, f"{via!r} was trusted as a person"
 
 
 def test_the_ceiling_is_asked_for_at_fleet_scope_and_bounded(tmp_path):

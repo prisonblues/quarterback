@@ -127,7 +127,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import is_unique_violation
-from app.auth import delegated, human_method, reader
+from app.auth import AUTH_AGENT, delegated, human_method, reader
 from app.claimkey import BadRef, canonical_repo
 from app.db import get_session
 from app.models.dial import MAX_DIAL, MAX_REASON, DialSetting
@@ -206,6 +206,54 @@ def _live(rows: list[DialSetting], now: datetime) -> list[DialSetting]:
     return [r for r in rows
             if r.cleared_at is None
             and (r.expires_at is None or _aware(r.expires_at) > now)]
+
+
+def _refuse_displacing_a_person(request: Request, rows: list[DialSetting]) -> None:
+    """An agent may not clear or overwrite a dial a PERSON set. #591's second pass.
+
+    The first pass guarded the wrong half. `qb-start` refuses a `spawn.max_sessions`
+    row whose `set_via` is `agent`, which stops an agent writing itself a bigger
+    number — and does nothing about an agent DELETING the smaller one somebody
+    else wrote. A person sets the ceiling to 2, the policy file says 8, an agent
+    clears the dial, and `ceilings_from_board` reports no board ceiling, so the
+    file's 8 applies. The agent has raised its own ceiling to 8 without ever
+    getting an agent-authored value accepted, and `spawn.max_sessions_fleet` is
+    worse because it has no file fallback at all: clearing it removes the fleet
+    runaway guard outright. Found by an adversarial review, not by these tests,
+    which only ever built an isolated agent row.
+
+    Closed HERE rather than in `qb-start`, because absence is exactly what the
+    reader cannot interpret: "nobody has set one" and "an agent removed the one
+    somebody set" are the same empty answer by the time it gets there.
+
+    **Stated without a vocabulary**, which is why it is this rule and not a list of
+    protected dial names. This module does not know what a dial IS — `dial` is
+    opaque text and the harness owns the meaning (see the module docstring), and a
+    table of special names here would be the second place a dial is written down
+    that #56 and #305 exist to prevent. "An agent may not overwrite a person's
+    decision" needs no such table and covers `reviewers.*.enabled` and the fix
+    floors on the same terms as the ceilings.
+
+    A person is anything that is not `agent`, NULL included: a row older than the
+    column was written when only `human()` could write one.
+    """
+    if human_method(request) != AUTH_AGENT:
+        return
+    theirs = [r for r in rows if r.set_via != AUTH_AGENT]
+    if not theirs:
+        return
+    raise HTTPException(403, detail={
+        "error": "this dial was set by a person, and a delegated agent may not "
+                 "replace or clear one",
+        "dial": theirs[0].dial,
+        "repo": theirs[0].repo,
+        "set_by": theirs[0].set_by,
+        "set_via": theirs[0].set_via,
+        "hint": "an agent may set a dial nobody has set, and may replace its own. "
+                "Overwriting a person's is a decision, not an application of one — "
+                "ask them to change it, or to clear it first. Clearing is refused "
+                "for the same reason it is allowed otherwise: removing a value is "
+                "how a ceiling gets raised without writing a bigger number."})
 
 
 def _view(row: DialSetting, now: datetime) -> dict:
@@ -354,6 +402,7 @@ async def set_dial(
         .where(DialSetting.dial == dial, DialSetting.cleared_at.is_(None))
         .where(DialSetting.repo.is_(None) if scope is None else DialSetting.repo == scope)
     )).scalars().all()
+    _refuse_displacing_a_person(request, list(prior))
     replaced = [_view(p, now) for p in prior]
     if prior:
         await session.execute(
@@ -407,6 +456,7 @@ async def clear_dial(
         .where(DialSetting.dial == dial, DialSetting.cleared_at.is_(None))
         .where(DialSetting.repo.is_(None) if scope is None else DialSetting.repo == scope)
     )).scalars().all()
+    _refuse_displacing_a_person(request, list(rows))
     cleared = [_view(r, now) for r in rows]
     if rows:
         await session.execute(

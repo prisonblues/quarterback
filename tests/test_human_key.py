@@ -183,6 +183,47 @@ async def test_the_key_reaches_the_delegated_endpoints_too_as_a_person(client,
                               headers=LAPTOP)
 
 
+async def test_a_stale_key_does_not_suppress_the_dev_bypass(client, human_key,
+                                                            monkeypatch):
+    """`delegated()` must not become non-monotonic: adding a header that proves
+    nothing must never turn a request that would have succeeded into a refusal.
+
+    An earlier draft of #591 raised on a wrong `X-Human-Key` before consulting
+    either the bearer or the bypass, so on a dev board the SAME request succeeded
+    without the header and failed with it. Caught by an adversarial review.
+    """
+    monkeypatch.setattr(settings, "browser_dev_human", True)
+    monkeypatch.setattr(settings, "browser_dev_user", "devuser")
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "local dev", "repo": REPO},
+        headers={**LAPTOP, KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "dev"
+
+
+async def test_a_stale_key_beside_a_bearer_names_the_credential_actually_missing(
+        client, human_key):
+    """An agent holding a good bearer and no elevated secret was being told to check
+    `HUMAN_TOKENS` — the one credential that was not its problem. The refusal now
+    names `X-Agent-Elevated` as the thing this call wants from a machine, and still
+    mentions that the key it sent matched nobody, because both are true."""
+    r = await client.post("/plan/reorder", json={"repo": REPO, "order": []},
+                          headers={**LAPTOP, KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 403, r.text
+    assert "X-Agent-Elevated" in r.json()["detail"]
+
+
+async def test_a_stale_key_alone_still_says_to_check_human_tokens(client, human_key):
+    """When the key IS the only credential offered, it is the answer, and the
+    specific message is the useful one. The fix for the two tests above must not
+    cost this."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "x", "repo": REPO},
+        headers={KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 403, r.text
+    assert "HUMAN_TOKENS" in r.json()["detail"]
+
+
 async def test_the_edge_still_comes_first_and_is_unchanged(client, human_key):
     """A real browser write is never adjudicated against a key. The edge path is
     tried first and returns the person it vouched for, exactly as before."""
