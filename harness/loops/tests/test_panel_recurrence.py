@@ -477,7 +477,7 @@ FIX_COMPARE = json.dumps({
 
 E2E_CFG = {
     "github": "acme/e2e",
-    "path": "/tmp/acme-e2e",
+    "path": "/nonexistent/acme-e2e",
     "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     "review_panel": {"refuse_over_cap_multiple": 0, "manifest_moves": False},

@@ -519,23 +519,66 @@ ones sit in the denominator, so it is depressed toward zero however badly the fi
 pass behaved. On the cycle #500 was filed from, that happened on round 3 of a
 three-round cycle that ended on the cap — the exact shape the gate exists to stop.
 
-The round now says so where the verdict is read: a **veto line, and `confident`
-false**, the same treatment a reviewer that could not read the whole diff gets.
-That is honesty, not repair — the instruments are still off.
+The round says so where the verdict is read: a **veto line, and `confident` false**,
+the same treatment a reviewer that could not read the whole diff gets.
+
+**And then it tries to repair it (#504).** The range is wrong, not the history: the
+fix pass's commits are still on the branch under new SHAs, and `git patch-id` names
+them by what they CHANGED rather than by where they sit. So a rewritten round rebuilds
+the pass out of the local object store, `payload.fix_range_source` reads
+`reconstructed`, provenance, recurrence and `escalate_on.fix_injection` come back, and
+the veto does not fire. Read `config_notes`: the round states what it rebuilt and what
+it cost.
+
+**It is exact or it refuses, and a refusal leaves the round exactly as blind as it
+was** — the veto fires and nothing is attributed, with `fix_range_rebuilt.why`
+naming which of these it hit:
+
+- **No local checkout.** `patch-id` is git rather than the compare API, so a repo
+  with no `path` in its rules cannot rebuild anything — and neither can a box that
+  never held the pre-rebase head, since a rewrite only orphans commits where
+  somebody still has them.
+- **A commit the last round reviewed changed content in the rewrite** — a conflict
+  resolved during the rebase, an amended tip. That commit is somewhere among the
+  ones this would call the fix pass and nothing can say which, so attributing them
+  would blame the fixer for work already reviewed.
+- **The pass is not the TAIL of the branch** (a reorder, an `--autosquash` that
+  landed a fixup low in the series). Then no single diff is the pass, and reading
+  its commits' patches separately would attribute lines the pass added and then
+  removed.
+- **An ambiguous patch-id** — the branch carries more copies of a patch than the
+  last round had, so which is the fixer's own cannot be told from which is the
+  replayed one.
+- **No correspondence at all** (a squash, a re-created branch), and **a branch reset
+  BACKWARDS**, where the pass was removed rather than rewritten. The round says the
+  second in those words, because a force-push that dropped work must not read as a
+  quiet cycle.
+
+Refusing rather than leaning is a deliberate trade, and worth knowing when you read a
+round that did not rebuild: `escalate_on.fix_injection` is calibrated on `introduced`
+being a FLOOR, so a reconstruction that over-counted would end cycles wrongly and no
+`config_notes` line prevents that — nothing reads a note before firing a brake.
+`--scope increment` is not repaired either way (scope is settled before the seats
+run), and neither is #506's proposal below, which reads the compare range.
 
 So:
 
 - **Prefer merging the base branch into the PR** over rebasing it. That leaves the
-  old head an ancestor (`status: ahead`), so the range still reads. It is not free —
-  the base branch's own commits then fall inside the range and their lines are
-  attributed to the fix pass, so `introduced` over-counts — but an over-counting
-  instrument is worth more than a dark one, and it fails toward stopping the cycle
-  rather than toward letting it run.
+  old head an ancestor (`status: ahead`), so the range still reads without a rebuild.
+  It is not free — the base branch's own commits then fall inside the range and their
+  lines are attributed to the fix pass, so `introduced` over-counts — but an
+  over-counting instrument is worth more than a dark one, and it fails toward stopping
+  the cycle rather than toward letting it run.
 - **If you must rewrite, do it between CYCLES rather than between rounds** — after a
-  stop, before the next `--round 1`.
-- **If you already have, do not read that round's quiet as convergence.** The veto
-  says as much. Re-running the round with `--scope pr` gets the review back but not
-  the attribution; only a round whose baseline anchor is reachable can attribute.
+  stop, before the next `--round 1`. The rebuild is a repair, not a licence: it costs
+  an accuracy you did not have to spend.
+- **Rewrite in the checkout the panel reads.** A rebase done somewhere the panel will
+  never see — another box, a worktree that is then thrown away — is the one that
+  cannot be rebuilt, and it looks identical to the one that can until the round runs.
+- **If you already have, and `fix_range_source` is not `reconstructed`, do not read
+  that round's quiet as convergence.** The veto says as much. Re-running the round
+  with `--scope pr` gets the review back but not the attribution; only a round whose
+  fix pass can be reached — by range or by patch — can attribute.
 
 One instrument this does *not* disarm, worth knowing so you do not over-correct:
 #84's premise register is keyed on declared text rather than on commits, so it
@@ -621,10 +664,13 @@ numbers still argue for is one they cannot have talked you into.
 
 **On a rebased branch there is no proposal, and the round says so rather than going
 quiet.** `revert.kind` carries the fix range's own verdict — `ok`, `no-fix`, `blind`,
-`not-asked` — and `blind` is the case the subsection above is about: the range that
-would name the offending pass is the range a rewrite removes, so the cycle can
-measure a change it cannot point at. `offered: false` with `kind: "blind"` means "we
-cannot see this", not "there was nothing wrong".
+`rewritten`, `not-asked` — and the last two are the case the subsection above is
+about: the range that would name the offending pass is the range a rewrite removes, so
+the cycle can measure a change it cannot point at. `offered: false` with a `kind` of
+`blind` or `rewritten` means "we cannot see this", not "there was nothing wrong". This
+is the one thing #504 does **not** give back: a round can be attributing from a
+rebuilt pass and still be unable to offer a revert, because the proposal reads the
+compare range rather than the reconstruction.
 
 Two things this deliberately does **not** do, so you are not waiting for them:
 revert-and-re-run as an automatic mode, and re-running the fixer with a narrower

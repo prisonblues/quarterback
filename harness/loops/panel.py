@@ -422,6 +422,7 @@ def _payload_defaults() -> dict:
         # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
         "fix_range_source": None,
+        "fix_range_rebuilt": None,
         # #490's cross-round rows. Empty on every path that reviewed nothing, and
         # that costs a later round nothing: the block is rebuilt from the raw
         # per-round fields of every baseline, so a skipped round leaves a row that
@@ -1188,6 +1189,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # nothing because it reviewed nothing, which a consumer must be
                 # able to tell from "not a cycle run".
                 "fix_range_source": None,
+                "fix_range_rebuilt": None,
                 "provenance_counts": ({b: 0 for b in PROVENANCE}
                                       if skip_prior.rounds else {}),
                 # #67's two tallies follow the same rule, for the same reason.
@@ -1751,6 +1753,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "prior_rounds": len(prior.rounds),
             "prior_findings": len(prior.keys),
             "fix_range_source": None,
+            "fix_range_rebuilt": None,
             "provenance_counts": ({b: 0 for b in PROVENANCE} if prior.rounds else {}),
             "recurrence_counts": ({b: 0 for b in RECURRENCE} if prior.rounds else {}),
             "premise_counts": ({b: 0 for b in (*PREMISE_VERDICTS, "not-said")}
@@ -2690,6 +2693,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             gh_repo, anchor, head_sha)
     else:
         _range_diff, no_range_why, range_kind = None, None, FIX_RANGE_OK
+    # ---- #504: a REWRITTEN range is a wrong range, not a lost fix pass.
+    #
+    # #509 made a rebased round honest and #512 gave it one range to be honest
+    # about; neither keeps the instruments ARMED, so a rebase between rounds still
+    # ends with every finding `unknown` and `escalate_on.fix_injection` unable to
+    # fire on the shape it is worth most on — the fixer working against a base that
+    # moved. #500's own observation is what makes the repair possible: the old SHAs
+    # still resolve, so the range is wrong and the history is not.
+    #
+    # Tried ONLY on `rewritten`, and only on an attributable round. Every other
+    # verdict already has a sound range in hand — `ok` has this reader's, `blind`
+    # usually has the round's own increment — and spending local git on those would
+    # buy a second answer to a question already answered, which is the duplication
+    # #512 has just finished removing.
+    rebuilt = (reconstruct_fix_range(cfg.get("path") or "", gh_repo, base,
+                                     anchor, head_sha)
+               if attributable and range_kind == FIX_RANGE_REWRITTEN else None)
     # The increment is usable whenever the range is not REWRITTEN — including when
     # this reader came back blind. `blind` means "I could not get the range" (too
     # large to hold, an API refusal), which says nothing about the copy the round
@@ -2698,7 +2718,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `rewritten` is the one that forbids it, because then no diff of that span is
     # the fix pass — the round's included.
     have_increment = review.scope == "increment" and bool(review.increment)
-    if attributable and range_kind != FIX_RANGE_REWRITTEN and have_increment:
+    # `reconstructed` is checked FIRST and it is the only source a rewritten round
+    # may use. The increment is barred there for the reason above it and stays
+    # barred — the reconstruction does not make the round's own diff trustworthy,
+    # it supplies a different one — and `_range_diff` is None on that road anyway.
+    if rebuilt and rebuilt["diff"]:
+        fix_diff, fix_range_source = rebuilt["diff"], "reconstructed"
+    elif attributable and range_kind != FIX_RANGE_REWRITTEN and have_increment:
         fix_diff, fix_range_source = review.increment, "increment"
     else:
         fix_diff = _range_diff
@@ -2712,6 +2738,31 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if attributable and not fix_diff:
         notes.append(f"provenance unavailable: {no_range_why} — new findings are recorded "
                      "as `unknown`, not attributed")
+    # SAID either way, because a reconstruction is a different measurement from the
+    # one every other round makes and a reader comparing `introduced` across a cycle
+    # has to be able to see where the denominator changed under them. The failure is
+    # worth a line for the opposite reason: `no_range_why` above says the branch was
+    # rewritten, which by itself now reads as "so it was rebuilt" — the note names
+    # which of the repair's own refusals it hit, and most of them (no local checkout,
+    # commits this box never held) are things an operator can act on.
+    if rebuilt and rebuilt["diff"]:
+        # No caveat clause, and that is the point of the rewrite this had under review
+        # rather than an omission: a reconstruction that would have needed one now
+        # DECLINES. Every commit the last round reviewed came through the rewrite
+        # intact, the pass is the tail of the branch, and what is attributed is one
+        # net diff of it — so `introduced` is a floor here exactly as it is on a
+        # linear round, which is what `escalate_on.fix_injection`'s threshold is
+        # calibrated against.
+        notes.append(
+            "the fix range was RECONSTRUCTED across the branch rewrite (#504): "
+            f"{len(rebuilt['commits'])} commit(s) on the branch have no patch-"
+            f"equivalent among the {rebuilt['prior']} the last round reviewed, so "
+            "provenance, recurrence and `escalate_on.fix_injection` read those. "
+            "Not repaired by it: `--scope increment` (scope was settled before the "
+            "seats ran) and #506's revert proposal (it reads the compare range)")
+    elif rebuilt:
+        notes.append("the fix range could not be reconstructed across the rewrite "
+                     f"(#504): {rebuilt['why']}")
     # ---- #500: an instrument that could not run is a COVERAGE GAP, and takes a veto.
     #
     # Three of this cycle's convergence instruments read the same fix range —
@@ -2746,10 +2797,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # #512 narrows this: a `blind` range whose increment answered is not a blind
     # round — the attribution happened, from the diff the seats actually read — so
     # vetoing there would be the alert fatigue this veto was written to avoid. A
-    # REWRITTEN range always vetoes: nothing attributed, whatever was in hand.
-    if attributable and (range_kind == FIX_RANGE_REWRITTEN
-                         or (range_kind == FIX_RANGE_BLIND
-                             and fix_range_source is None)):
+    # REWRITTEN range vetoes unless it was REBUILT, which is the next paragraph:
+    # nothing already in hand may attribute after a rewrite, and #504 does not put
+    # anything in hand, it goes and fetches a different thing.
+    # #504 narrows it once more, and on the same rule #512 used: what the veto is
+    # about is whether the round ATTRIBUTED, never which reader answered. A rewritten
+    # range whose pass was rebuilt from the object store has its instruments back —
+    # vetoing there would be the alert fatigue this veto was written to avoid, and it
+    # would fire on the one round that had just repaired itself. What is left of the
+    # rewrite is a lean, and the note above carries it. Written as one condition over
+    # `fix_range_source` rather than two over `range_kind`, because the two spellings
+    # had already drifted apart once: `rewritten` could only ever reach here with no
+    # source, so this is today's behaviour with the new road exempted and nothing else
+    # moved.
+    if attributable and fix_range_source is None and range_kind in (
+            FIX_RANGE_REWRITTEN, FIX_RANGE_BLIND):
         veto = [*veto, (
             f"provenance, recurrence and increment scoping all read the fix range and "
             f"this round had none — {no_range_why}. Every new finding is recorded "
@@ -3636,6 +3698,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # not, so a reader comparing `introduced` across rounds has to be able to
         # see that the denominator's provenance changed under them.
         "fix_range_source": fix_range_source,
+        # #504's working, published rather than left in a sentence. `null` on every
+        # round that did not have to rebuild — which is nearly all of them — and
+        # otherwise the commits it named, how many the last round had reviewed, how
+        # many of those came through the rewrite intact, and `why` when it declined.
+        # `prior`/`carried`/`unmatched` are the correspondence it found. On a round
+        # that ATTRIBUTED they are always `n`/`n`/`0` — an inexact reconstruction
+        # declines rather than leaning — so what they are worth is on the declines,
+        # where they say how far off the two histories were and whether a rebase or a
+        # force-push is what an operator should go and look at.
+        #
+        # WITHOUT the diff, which is the one key here that is not a fact about the
+        # round but a copy of the fix pass — up to `FIX_RANGE_MAX_CHARS` of it. This
+        # payload is written to a file, passed as the next round's `--baseline` and
+        # recorded on the board, and none of those wants a megabyte of patch riding
+        # along; nothing downstream reads it, because everything that needed it read
+        # `fix_added` above. `why` still tells a decline from a success.
+        "fix_range_rebuilt": ({k: v for k, v in rebuilt.items() if k != "diff"}
+                              if rebuilt else None),
         # #490's block as data, so a board or an orchestrator reading the payload
         # gets the trend without re-deriving it from every earlier round's file.
         # One row per round INCLUDING this one, and rebuilt from the raw per-round
