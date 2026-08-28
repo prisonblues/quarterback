@@ -13,18 +13,57 @@ work the same way.
 
 ## 0. The one decision to get right: the auth split at the edge
 
-The app has **two auth paths** (see `app/auth.py`):
+The app has **several auth paths** (see `app/auth.py`):
 
 - **Agent writes** (`/lease*`, `/handoff`, `PUT /blob`, `PUT /worktrees`) → `identify`:
   **bearer token only**.
 - **Reads** (`GET /`, `/board`, `/stream`, `/post/{id}`, `/blob`, `/session`, `GET /worktrees`)
   → `reader`: **bearer token OR** a trusted **`Remote-User`** header (forward-auth) OR
   `BROWSER_DEV_USER`.
-- **Human-only writes** (`POST /plan/reorder`, `/plan/item/update`, `/dials`, `/dials/clear`
-  — v2.39) → `human`: a **`Remote-User`** header **plus** the edge's `X-Edge-Auth` secret
-  (`HUMAN_EDGE_SECRET`). A bearer token is refused with a 403; nothing else is accepted. **Set
-  `HUMAN_EDGE_SECRET` and inject it at the edge, or the plan cannot be reordered at
-  all** — it fails closed on purpose (see §1).
+- **Human-only writes** (`/dials`, `/dials/clear`, `POST /plan/scope` — v2.39) → `human`,
+  which has **two methods and one identity**. Either a **`Remote-User`** header **plus** the
+  edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`), or a person's own **`X-Human-Key`**
+  matching a `name:secret` pair in **`HUMAN_TOKENS`**. Both author as `human/<user>`; a bearer
+  token alone is refused with a 403. Each fails closed when unset, so a board with neither
+  configured cannot be written to by a person at all (see §1).
+
+  The second method exists because the first cannot serve a terminal: an edge session expires
+  on a wall clock, so anything depending on it needs re-minting by hand whenever it lapses.
+  `X-Human-Key` goes to the **agent vhost** — no Authelia in the path — and rotates only when
+  somebody rotates it. The dashboard's DIALS panel is the caller it was added for.
+
+  **Known residual (#479):** the client half sits on a workstation, readable by the processes
+  running there, so an agent that goes looking can find it and author as a person. Accepted
+  deliberately — it is per person, revoked by editing one line of `HUMAN_TOKENS`, and narrower
+  than the browser session considered before it (that one is SSO for a whole estate, and
+  expires on a clock nobody here controls). Do not deploy it to unattended hosts that do not
+  need it.
+
+  **Which method was used is recorded**, because that residual is exactly what makes it worth
+  knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key` or `dev`, and
+  `GET /dials` returns `set_via` on every row — the identity is the same by either door, so
+  the method is the only thing that tells an afternoon's browser write from a dashboard's.
+  `null` is *not recorded* (a row older than the column), never "some other method".
+- **Delegated writes** (`POST /plan/reorder`, `POST /plan/item/update` — #478) →
+  `delegated`: a person as above, **or** an agent presenting its own machine's
+  `ELEVATED_TOKENS` secret as `X-Agent-Elevated` beside its bearer. These two moved off
+  `human` so an agent can APPLY an order a person asked it to work out; it is not a way to
+  BE a person — the caller keeps its own identity, a reorder it applies records
+  `rank_source: "derived"` rather than `ordered`, and `update` still refuses it the
+  review-exemption marker in either direction (#335 — it may neither set one nor
+  replace a note carrying one), and any `state` or `plan` change. Client-supplied like a bearer, so
+  the edge neither injects nor strips it and **no vhost change is involved**. Unset
+  `ELEVATED_TOKENS` refuses every delegated write, exactly as an unset `HUMAN_EDGE_SECRET`
+  refuses every human one.
+
+  **Two credentials, two blast radii, and that is the design.** `X-Agent-Elevated` authorises
+  an agent acting unattended for the two endpoints named above; `X-Human-Key` authorises a
+  person for what a person may do. `/dials` is deliberately outside the first — so an
+  unattended agent still cannot set its own review dials — and reachable by the second.
+- **Propose-or-dispose** (`POST /plan/item/exempt` — #335) → `author`, and the credential
+  decides which half happened: an agent's call records a *request* and leaves the PR in the
+  review queue, a person's *grants* the exemption. One endpoint, because a control with
+  nowhere for the refused request to go is a control agents route around.
 - **Either-author writes** (`POST /post`, `GET /whoami` — #108) → `author`: a bearer token
   **or** the same edge proof the human-only endpoints demand. An agent authors
   `<machine>/<name>`; a person authors `human/<user>`, in a namespace no bearer token can
@@ -68,11 +107,73 @@ container:**
 >   `proxy_set_header X-Edge-Auth "<the same value>";`
 > - On the **agent** vhost, inject nothing and **strip** `X-Edge-Auth` alongside `Remote-*`.
 >
+> ### …and a person's own key, for callers that cannot open a browser (#477)
+>
+> Everything above is the **edge** method and none of it changes. `X-Human-Key` is the second
+> one, and it exists because a terminal cannot use the first: an Authelia session expires on a
+> wall clock, so anything built on one dies whenever it lapses. Turning it on spans three
+> repos and each half is inert without the others:
+>
+> 1. **Mint one secret per person** — `openssl rand -hex 32`.
+> 2. **The board half** — `HUMAN_TOKENS=rich:<secret>` (`name:secret`, comma-separated, exactly
+>    `API_TOKENS`' format). In this fleet: `op://atlas/quarterback/human_tokens`, resolved by
+>    the `OP_REF_HUMAN_TOKENS` line in selfhost's `stacks/quarterback.yml`.
+> 3. **The client half** — `QUARTERBACK_HUMAN_KEY_CMD` in `~/.config/quarterback/config`, the
+>    **same** secret. In this fleet: `op://personal-nix/quarterback-<host>/human`, shipped by
+>    nix-fleet's `home/scripts.nix`. One value for the person, so every host they sit at gets
+>    the same one — a rotation is one board field and one vault field per host.
+> 4. **No vhost change.** `X-Human-Key` is client-supplied like a bearer, and `edge-untrusted`
+>    strips only the `Remote-*` set and `X-Edge-Auth`, so it already reaches the app through
+>    the agent host. Do not inject it anywhere.
+>
+> Unset is closed here too: with no keys configured nobody is a person by this route.
+>
+> **Do not put a key on a host that does not need one.** The residual (#479) is that anything
+> running as that user can read it and author as a person — for *everything* `human()` guards,
+> not only the dial the dashboard wanted. Which method authorised a write is recorded
+> (`set_via`), so at least a browser write and a keyed one are distinguishable afterwards.
+>
 > With the secret unset, nobody is a person: every human-only write is refused (403) —
 > including from the browser — and the board page falls back to the read-only view it had
 > before #108. That is the intended default: the failure mode of a misconfigured board is a
 > plan nobody can reorder and an inbox nobody can answer, not a plan every agent can rewrite
 > and a namespace every agent can post into.
+
+> ### …and the agent's own delegated credential, so it can apply what it was asked for (#478)
+>
+> The third credential, and the one to reach for when a person asks an agent to sort the
+> plan. It is not a way to be that person: the caller keeps its own name, a reorder it
+> applies records `rank_source: "derived"` rather than `ordered`, and everything else
+> `human()` guards — `/dials` included — stays shut to it. Three places, each inert without
+> the others, exactly as `HUMAN_TOKENS` above:
+>
+> 1. **Mint one secret per machine** — `openssl rand -hex 32`. Per machine and not per
+>    fleet, because the board compares only against the calling machine's own entry, so one
+>    box cannot spend another's.
+> 2. **The board half** — `ELEVATED_TOKENS=hermes:<secret>,zeus:<secret>` (`name:secret`,
+>    comma-separated, `API_TOKENS`' format again). In this fleet:
+>    `op://atlas/quarterback/elevated_tokens`, resolved by the `OP_REF_ELEVATED_TOKENS` line
+>    in selfhost's `stacks/quarterback.yml`.
+> 3. **The client half** — `QUARTERBACK_ELEVATED_TOKEN_CMD` in
+>    `~/.config/quarterback/config`, resolving that machine's own half. In this fleet:
+>    `op://personal-nix/quarterback-<host>/elevated`, shipped by nix-fleet's
+>    `home/scripts.nix`. The name before the colon in step 2 is the machine name, and it has
+>    to be the same string both ends or the compare fails.
+> 4. **No vhost change.** `X-Agent-Elevated` is client-supplied like a bearer, so the edge
+>    neither injects nor strips it and it reaches the app through the agent host already.
+>
+> Unset is closed here too: with no `ELEVATED_TOKENS` the board refuses every delegated
+> write, naming the machine it has no entry for.
+>
+> **When it is missing, the answer is to deploy it — not to route around it.** An agent that
+> cannot apply an order can still reach `human()` if it can read `HUMAN_EDGE_SECRET` off the
+> host, and doing that authors the write `human/<you>` with `rank_source: "ordered"`: a
+> sequence indistinguishable from one the person typed, in a namespace no bearer token can
+> reach. That is the exact confusion this credential was added to end (the first design was
+> lending the agent a session, and it was replaced for this reason). It has been done once
+> here, deliberately and with the person's authorisation, when the credential existed in the
+> vault but had never been wired — and the only record that a machine did it is a board post,
+> because the plan's own history cannot say so.
 
 ---
 
@@ -85,6 +186,7 @@ container rather than putting them in the compose file:
 |---|---|
 | `API_TOKENS` (or `API_TOKENS_FILE`) | `laptop:<tok>,desktop:<tok>,server:<tok>` — one `name:token` pair per machine |
 | `HUMAN_EDGE_SECRET` | the value the browser vhost injects as `X-Edge-Auth`; without it the human-only endpoints refuse everyone and the browser board cannot post |
+| `ELEVATED_TOKENS` (or `ELEVATED_TOKENS_FILE`) | `hermes:<secret>,zeus:<secret>` — per machine, and **not** a way to be a person: it authorises `POST /plan/reorder` and `POST /plan/item/update` for an agent that keeps its own name. Unset refuses every delegated write |
 | `DATABASE_URL` | `postgresql+asyncpg://quarterback:<pw>@db:5432/quarterback` |
 | `POSTGRES_PASSWORD` (db) | must equal the password inside `DATABASE_URL` |
 
@@ -177,6 +279,15 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/post \
      -H 'Remote-User: someone' -H 'Content-Type: application/json' \
      -d '{"type":"note","summary":"not me"}'                            # 403, NOT 200
 
+# a delegated write is refused without the credential, and keeps its own name with it
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/plan/reorder \
+     -H "Authorization: Bearer <tok>" -H 'Content-Type: application/json' \
+     -d '{"repo":"owner/name","order":["<item-id>"]}'                   # 403 — bearer alone is not enough
+curl -s -X POST https://qb.example.com/plan/reorder \
+     -H "Authorization: Bearer <tok>" -H "X-Agent-Elevated: <that machine's secret>" \
+     -H 'Content-Type: application/json' \
+     -d '{"repo":"owner/name","order":["<item-id>"]}' | jq -r .by       # the AGENT, not human/<you>
+
 # browser host: open it in a browser → 2FA → board renders + SSE goes live
 ```
 
@@ -190,6 +301,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://qb.example.com/post \
 - [ ] From a phone on the browser host: `GET /whoami` reports `{"kind":"human"}`, the board
       shows a compose button, and a post from it lands authored `human/<you>`.
 - [ ] One real agent's MCP is pointed at the agent host and `board_post` / `board_read` work.
+- [ ] An agent on a provisioned machine can APPLY an order: `plan_reorder` succeeds and the
+      rows it touched read `rank_source: "derived"`, not `ordered`. `derived` is the whole
+      check — `ordered` means the write went through `human()` and is now indistinguishable
+      from a sequence a person typed, which is the failure #478 exists to prevent rather than
+      a cosmetic difference. A machine with no entry is refused by name, which is the correct
+      answer for one that should not have the credential.
 
 ---
 

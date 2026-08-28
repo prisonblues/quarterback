@@ -257,6 +257,34 @@ def _remember(key: str, now: float) -> None:
         pass
 
 
+def _board_json(path: str, body: dict) -> tuple[dict | None, str]:
+    """``POST <path>`` to this host's board, returning the decoded answer.
+
+    Factored out of :func:`_post` when #523 added a second write. The error
+    shapes are unchanged and stay in one place, which is the point: two writes
+    that disagreed about what "the board was unreachable" looks like would give
+    an operator two vocabularies for one outage.
+    """
+    url, token, why = board_config()
+    if why:
+        return None, why
+    req = urllib.request.Request(
+        f"{url}{path}", data=json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=ANNOUNCE_TIMEOUT,
+                                    context=ssl_context()) as r:
+            return json.loads(r.read().decode()), ""
+    except urllib.error.HTTPError as e:
+        hint = " — the token this host resolved was refused" if e.code == 401 else ""
+        return None, f"the board answered HTTP {e.code}{hint}"
+    except OSError as e:
+        return None, f"the board was unreachable ({e.__class__.__name__})"
+    except ValueError:
+        return None, "the board answered with something that is not JSON"
+
+
 def _post(body: dict) -> tuple[int | None, str]:
     """``POST /post`` to this host's board. ``(post id, why-there-is-none)``.
 
@@ -266,33 +294,84 @@ def _post(body: dict) -> tuple[int | None, str]:
     :func:`harness_rules.board_config`, which is the same site-config contract
     ``qb-env`` states, so an escalation cannot land on another island's board.
 
-    Never raises. The error shapes are ``_dial_body``'s, for the same reasons it
-    gives: ``HTTPError`` before ``URLError`` because a status says more than
-    "unreachable", ``OSError`` rather than ``URLError`` because a reset partway
-    through the read is not wrapped.
+    Never raises; see :func:`_board_json` for the error shapes and why they are
+    stated once.
     """
-    url, token, why = board_config()
+    answer, why = _board_json("/post", body)
     if why:
         return None, why
-    req = urllib.request.Request(
-        f"{url}/post", data=json.dumps(body).encode(),
-        headers={"Authorization": f"Bearer {token}",
-                 "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=ANNOUNCE_TIMEOUT,
-                                    context=ssl_context()) as r:
-            answer = json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        hint = " — the token this host resolved was refused" if e.code == 401 else ""
-        return None, f"the board answered HTTP {e.code}{hint}"
-    except OSError as e:
-        return None, f"the board was unreachable ({e.__class__.__name__})"
-    except ValueError:
-        return None, "the board answered with something that is not JSON"
     got = answer.get("id") if isinstance(answer, dict) else None
     if not isinstance(got, int):
         return None, "the board accepted the post without saying which one it is"
     return got, ""
+
+
+#: Which post ref becomes the blocker's subject, and in what order of preference.
+#: A PR is more specific than the issue it closes, and an issue more specific
+#: than the repo — so a `stuck` carrying both is about the PR. `item` is here
+#: because a producer that already knows the plan row should say so; nothing
+#: emits one today.
+_SUBJECT_PREFERENCE = ("item", "pr", "issue", "repo")
+
+
+def _subject_from(refs: list[dict] | None) -> tuple[str, str, str] | None:
+    """``(kind, value, repo)`` for the blocker row, or None if nothing names one.
+
+    Read off the refs the caller already supplies rather than adding a parameter,
+    because every producer already passes them — that is what keeps this change
+    inside one function, which is the property `announce`'s docstring promises.
+
+    None means the escalation is announced and NOT stored, which is honest rather
+    than lossy: a blocker's whole value is that somebody can ask "what is waiting
+    on me" and get rows back, and a row whose subject is "something, somewhere"
+    answers that question with noise. The post still carries it.
+    """
+    if not refs:
+        return None
+    by_kind = {}
+    for r in refs:
+        kind, value = str(r.get("kind") or ""), str(r.get("value") or "")
+        if kind and value:
+            by_kind.setdefault(kind, (value, str(r.get("repo") or "")))
+    for kind in _SUBJECT_PREFERENCE:
+        if kind in by_kind:
+            value, repo = by_kind[kind]
+            return kind, value, repo
+    return None
+
+
+def _raise_blocker(*, cls: str, question: str, detail: str, repo: str,
+                   refs: list[dict] | None) -> str:
+    """Record the question as a row as well as announcing it (#328, #523).
+
+    **The post announces; the row persists.** #274 built the door every producer
+    already calls, and #328 built the queue behind it — this is the join, and it
+    is deliberately here rather than in the six callers: `announce`'s own
+    docstring says it is "the only place that knows the post type, the addressee
+    and the wire format, so #328's `blockers` row can become the store by
+    changing this function and nothing else."
+
+    Best-effort and never raises, for the same reason `_post` is: an escalation
+    that cannot be stored must still be an escalation. A failure returns a phrase
+    the caller's note carries, so a board that is refusing writes says so on the
+    line an operator is already reading rather than in a log nobody opens.
+
+    Re-raising an identical open question is a no-op at the board — the partial
+    unique index on (subject, class) is what makes this safe to call every run
+    without the caller checking first.
+    """
+    subject = _subject_from(refs)
+    if subject is None:
+        return ""
+    kind, value, ref_repo = subject
+    body = {"subject_kind": kind, "subject_value": value, "kind": cls,
+            "question": question[:500], "detail": detail or None,
+            "repo": ref_repo or repo or None}
+    answer, why = _board_json("/blockers", body)
+    if why:
+        return f", not recorded as a blocker ({why})"
+    raised = isinstance(answer, dict) and answer.get("raised")
+    return ", recorded as a blocker" if raised else ", already an open blocker"
 
 
 def announce(*, cls: str, reason: str, summary: str, repo: str = "",
@@ -371,5 +450,11 @@ def announce(*, cls: str, reason: str, summary: str, repo: str = "",
         return f"needs-human NOT announced ({known}): {why}"
     if key:
         _remember(key, now)
+    # The row, after the post. In that order deliberately: the post is what a
+    # person sees now and the row is what they can find later, so a board that
+    # accepts one and refuses the other should still have rung the doorbell.
+    stored = _raise_blocker(cls=known, question=summary, detail=detail,
+                            repo=repo, refs=refs)
     addressed = f" to {to}" if to else ""
-    return f"needs-human announced on the board{addressed} as post {post_id} ({known})"
+    return (f"needs-human announced on the board{addressed} as post "
+            f"{post_id} ({known}){stored}")

@@ -1,6 +1,7 @@
 from app.models.agent_name import AgentName
 from app.models.base import Base
 from app.models.blob import Blob
+from app.models.blocker import Blocker
 from app.models.dial import DialSetting
 from app.models.landing import LandingEdge, LandingWatch
 from app.models.lease import Lease
@@ -28,6 +29,7 @@ __all__ = [
     "AgentName",
     "Base",
     "Blob",
+    "Blocker",
     "DialSetting",
     "LandingEdge",
     "LandingWatch",

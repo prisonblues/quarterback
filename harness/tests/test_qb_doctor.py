@@ -20,6 +20,7 @@ Run: pytest harness/tests/test_qb_doctor.py
 
 from __future__ import annotations
 
+import ast
 import importlib.machinery
 import importlib.util
 import json
@@ -28,6 +29,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -511,7 +513,7 @@ def test_forward_auth_with_no_session_is_unknown_and_names_the_runbook(monkeypat
     check = qd.check_edge(host_for(repo, base_url="https://agent", human_url="https://browser"))
     assert check.verdict == "unknown"
     assert "no session" in check.detail
-    assert qd.EDGE_RUNBOOK in check.manual
+    assert qd.edge_runbook() in check.manual
 
 
 #: What `app/auth.py` actually answers a `Remote-User` the edge did not vouch for.
@@ -533,7 +535,7 @@ def test_a_refused_human_write_fails_and_says_it_needs_a_person(monkeypatch, rep
     assert check.verdict == "fail"
     assert "HUMAN_EDGE_SECRET" in check.detail
     assert check.fix is None, "a secret in 1Password and a redeploy is not qb-doctor's to run"
-    assert qd.EDGE_RUNBOOK in check.manual
+    assert qd.edge_runbook() in check.manual
 
 
 @pytest.mark.parametrize("body", [
@@ -1919,6 +1921,292 @@ def test_a_queue_entry_that_arrived_in_the_future_is_not_evidence_of_health(
     assert "no usable arrival time" in check.detail
 
 
+# ------------------------------------------------------------ escalations
+
+
+def _ago(minutes: float) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+def _board_paths(monkeypatch, answers: dict[str, tuple[int, str]]) -> None:
+    """Answer several DIFFERENT board GETs, chosen by a marker in the path.
+
+    `check_escalations` makes two — `/board?type=stuck` and `/blockers` — and a stub
+    that answered both with one body would have the row counting posts as rows and
+    still passing, which is a test asserting its own fixture. Same reasoning as
+    `_gh_answers`, and the same failure it was written to prevent.
+    """
+    def fake(url, headers=None):
+        # The PATH, not the url: `https://board.example/blockers` contains "/board"
+        # — because "https://" ends in a slash — so a substring match answered the
+        # blockers call with the posts body and the row read posts as rows.
+        path = urlsplit(url).path
+        for marker, (status, body) in answers.items():
+            if path.startswith(marker):
+                return status, body if isinstance(body, str) else json.dumps(body), None
+        raise AssertionError(f"no stub for board GET: {url}")
+
+    monkeypatch.setattr(qd, "http_get", fake)
+
+
+def _stuck(n: int, minutes: float = 5) -> tuple[int, list]:
+    """`n` stuck posts, `minutes` old, as a bare ARRAY — which is what `GET /board` answers.
+
+    It used to return `{"posts": [...]}` — the shape the MCP `board_read` wrapper
+    assembles, not the shape the API has — and so did the code under test, so five tests
+    agreed with the bug and passed while the row could not read a single post on any
+    host (#531). `test_the_board_stub_answers_the_shape_the_api_declares` is what now
+    holds this to the real endpoint.
+
+    They carry a `ts` because the row dates them itself: `window_min` is a request the
+    board is free to over-answer, so a post with no readable timestamp is not evidence
+    about any window. See `_aged_stuck`.
+    """
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes)} for i in range(n)]
+
+
+def _aged_stuck(*minutes: float) -> tuple[int, list]:
+    """Stuck posts at named ages — for the floor, which serves them regardless of age."""
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(m)}
+                 for i, m in enumerate(minutes)]
+
+
+def _stored(*ages: float) -> tuple[int, dict]:
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a)}
+                              for i, a in enumerate(ages)]}
+
+
+def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
+    """The whole point of the row. #328 landed a table and no producer, twice-over the
+    same shape as the `stuck` type that measured zero across thirty days — and neither
+    was visible, because an empty table and a working table with nothing in it are the
+    same table. Only the second source makes it a finding."""
+    _board_paths(monkeypatch, {"/board": _stuck(4), "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert "4 stuck post(s)" in check.detail
+    assert check.extra["posts"] == 4 and check.extra["rows"] == 0
+
+
+def test_a_quiet_day_is_not_a_severed_producer(monkeypatch, landing_host):
+    """"Do not fail on irrelevance." No escalations and no rows is the correct state of
+    a day nobody got stuck, and a row that called that a fault would be ignored on every
+    good day until it was ignored on the bad one."""
+    _board_paths(monkeypatch, {"/board": _stuck(0), "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "quiet day" in check.detail
+
+
+def test_fewer_rows_than_posts_is_the_designed_behaviour_and_not_a_finding(
+        monkeypatch, landing_host):
+    """An escalation whose refs name no subject is announced and deliberately NOT
+    stored (#523), so posts > rows is by design. A proportional test here would fail on
+    correct data, which is why the predicate is any-versus-none."""
+    _board_paths(monkeypatch, {"/board": _stuck(5), "/blockers": _stored(10)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra == {"posts": 5, "rows": 1, "window_minutes": 1440}
+
+
+def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
+    """A person can raise one by hand, and an unanswered blocker outlives the window
+    the posts are counted over."""
+    _board_paths(monkeypatch, {"/board": _stuck(0), "/blockers": _stored(30, 200)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+
+
+def test_rows_older_than_the_window_do_not_answer_for_todays_stuck(
+        monkeypatch, landing_host):
+    """The two counts have to describe the same span. A table full of last month's
+    blockers would otherwise vouch for a producer that has been severed since."""
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": _stored(4000, 9000)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["rows"] == 0
+
+
+def test_a_row_raised_in_the_future_is_not_evidence_of_health(monkeypatch, landing_host):
+    """Clock skew or bad data. `_age_minutes` returns it negative rather than clamping,
+    and this row discards it — the same rule the queue row applies to arrivals."""
+    _board_paths(monkeypatch, {"/board": _stuck(2), "/blockers": _stored(-90)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+
+
+def test_posts_the_floor_served_from_outside_the_window_are_not_todays_escalations(
+        monkeypatch, landing_host):
+    """`/board` does not honour `window_min` for a `type=` read.
+
+    It floors a quiet slice at the ten most recent posts whatever their age
+    (`_ORIENT_FLOOR`), and `type=` is deliberately not one of the lookups that skip the
+    floor — so a day on which nothing escalated is answered with last week's stuck
+    posts. Counting the page would make `raised` non-empty against an empty blockers
+    table and report the producer severed, which is this row crying wolf on evidence
+    that predates its own question. Observed on the live board: ten posts returned, five
+    older than the cutoff.
+    """
+    _board_paths(monkeypatch, {"/board": _aged_stuck(4000, 5000, 6000),
+                               "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "quiet day" in check.detail
+    assert check.extra["posts"] == 0
+
+
+def test_a_full_oldest_first_page_of_blockers_is_unknown_and_never_fail(
+        monkeypatch, landing_host):
+    """`/blockers` orders by `raised_at` ascending and then truncates, so a full page is
+    the OLDEST rows and today's can lie entirely beyond it. Counting that page as the
+    table would report a severed producer on a board whose only fault is a long
+    history — the false alarm that would teach a person to ignore this row."""
+    full = 200, {"blockers": [{"id": str(i), "raised_at": _ago(9000)}
+                              for i in range(qd._BOARD_PAGE)]}
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": full})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "oldest-first" in check.detail
+    assert "raised-after" in check.manual
+
+
+def test_a_board_answering_nonsense_elements_is_reported_not_raised(
+        monkeypatch, landing_host):
+    """A list whose elements are not objects is a board answering nonsense. A row that
+    raises AttributeError while diagnosing is worth less than one that says what it
+    found, so both halves type-check an element before dereferencing it."""
+    _board_paths(monkeypatch, {"/board": (200, ["nope", 7, None]),
+                               "/blockers": (200, {"blockers": ["nope", 7, None]})})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra == {"posts": 0, "rows": 0, "window_minutes": 1440}
+
+
+def test_a_board_without_blockers_deployed_has_not_severed_anything(
+        monkeypatch, landing_host):
+    """An image predating #328 is a deploy that has not happened, not a producer that
+    has broken, and the two want different sentences. Never `fail`."""
+    _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": (404, "")})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "before #328" in check.detail
+    assert "redeploy" in check.manual
+
+
+@pytest.mark.parametrize("answers, phrase", [
+    ({"/board": (500, "")}, "answered 500"),
+    ({"/board": (200, "not json")}, "did not answer JSON"),
+    # The MCP wrapper's object, which is exactly what #531 shipped reading for.
+    ({"/board": (200, {"posts": [], "cursor": 0})}, "did not answer a list to /board"),
+    ({"/board": _stuck(1), "/blockers": (200, {"blockers": 7})}, "no list of blockers"),
+])
+def test_a_board_that_will_not_state_it_is_unknown_and_never_ok(
+        monkeypatch, landing_host, answers, phrase):
+    """Every way the board can answer uselessly reaches `unknown`. A row that could
+    reach `ok` without having been answered is worse than no row."""
+    _board_paths(monkeypatch, answers)
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "unknown"
+    assert phrase in check.detail
+
+
+@pytest.mark.parametrize("path,getter", [
+    ("/blockers", "board_get"),
+    ("/board", "board_get_list"),
+])
+def test_a_null_body_is_refused_with_a_sentence_and_not_with_a_blank(
+        monkeypatch, landing_host, path, getter):
+    """`null` decodes to None, and None is what these helpers return for failure too.
+
+    Splitting the shape check off `_board_json` (#531) put a `payload is None` test
+    between the two, which conflated them: a board answering the four bytes `null` is
+    answering the wrong SHAPE, but it came back as (None, "") — the empty reason a
+    caller then prints as its whole detail, giving a blank cell in the table where the
+    row is supposed to say what went wrong. The failure is carried by `why` alone.
+    """
+    monkeypatch.setattr(qd, "http_get", lambda _u, _h=None: (200, "null", None))
+
+    payload, why = getattr(qd, getter)(landing_host, path)
+
+    assert payload is None
+    assert why.startswith("the board did not answer")
+    assert path in why
+
+
+def test_the_board_stub_answers_the_shape_the_api_declares():
+    """The stub above is only evidence if it answers what the real endpoint answers.
+
+    #531 is what happens when it does not: `check_escalations` read `/board` as an
+    object, `_stuck` handed it an object, and the row shipped unable to see a post while
+    its tests stayed green. This ties the fixture back to the API.
+
+    Parsed rather than string-sliced, because a guard against drift that is itself
+    defeated by reformatting a decorator is not a guard. And it reads the source instead
+    of importing `app.api.posts`, which needs a venv and a database this file
+    deliberately does not have — the constraint `declared_version` already documents.
+
+    It can only see the ANNOTATION, which is why it is not the whole guard:
+    `test_board_answers_a_bare_list_not_a_wrapper_object` in tests/test_board.py asserts
+    what a client actually receives, over a real app and a real database.
+    """
+    # The harness is packaged and tested WITHOUT the app tree — `nix flake check`'s
+    # worktree-tests build has only harness sources under /build, which is the same
+    # constraint that makes every other test here synthesize a repo instead of reading
+    # the real one. A fake `posts.py` would prove nothing about drift, so this skips
+    # where the API is genuinely absent rather than asserting against something it
+    # wrote itself. Nothing is lost: it runs in the repo suite and in CI's harness job,
+    # and `test_board_answers_a_bare_list_not_a_wrapper_object` carries the runtime half
+    # where a real app and database exist.
+    api = BIN.parent.parent / "app" / "api" / "posts.py"
+    if not api.is_file():
+        pytest.skip("no app tree here — the harness is packaged without one")
+    tree = ast.parse(api.read_text())
+    routes = [n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef | ast.FunctionDef)
+              and any(isinstance(d, ast.Call)
+                      and isinstance(d.func, ast.Attribute) and d.func.attr == "get"
+                      and any(isinstance(a, ast.Constant) and a.value == "/board"
+                              for a in d.args)
+                      for d in n.decorator_list)]
+
+    assert len(routes) == 1, [r.name for r in routes]
+    assert ast.unparse(routes[0].returns) == "list[dict]"
+    assert isinstance(_stuck(1)[1], list)
+
+
+def test_the_finding_names_no_command_that_backfills_the_table(landing_host):
+    """The row measures whether the producer works. Writing rows by hand clears the
+    verdict, leaves every future escalation just as unrecorded, and destroys the only
+    evidence — the same argument the `landed` row makes against merging to go green."""
+    spec = next(s for s in qd.CHECKS if s.name == "escalations")
+    brief = spec.briefs["fail"]
+
+    assert "Do not write rows by hand" in brief.constraints[0]
+    assert brief.audience == "agent"
+
+
 # ----------------------------------------------------------------- landed
 
 _COMMIT = "repos/acme/thing/commits/main"
@@ -2507,7 +2795,8 @@ def test_the_real_tagger_answers_the_argv_this_row_sends_it(landing_repo):
 def test_the_landing_group_holds_every_row_that_answers_can_work_land():
     names = {spec.name for spec in qd.CHECKS if spec.group == "landing"}
 
-    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper", "briefs"}
+    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper",
+                     "briefs", "escalations"}
 
 
 def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, tmp_path,
@@ -3600,3 +3889,58 @@ def test_the_two_readings_are_independent_of_each_other(tmp_path, no_cache):
     ev = qd.gather_evidence([_write(tmp_path, "a.md", "prose")])
 
     assert qd._cache_key("row", "q?", ev, 1) != qd._cache_key("row", "q?", ev, 2)
+
+
+# ---------------------------------------- the runbook path resolves, not asserts
+
+
+def _runbook(tmp_path, where: str):
+    """A selfhost checkout with the runbook in `where`."""
+    d = tmp_path / where
+    d.mkdir(parents=True)
+    (d / qd.EDGE_RUNBOOK_FILE).write_text("# the runbook\n")
+    return tmp_path
+
+
+@pytest.mark.parametrize("where", ["issues/closed", "issues/open"])
+def test_the_runbook_is_found_in_either_state_of_the_issue(monkeypatch, tmp_path, where):
+    """The bug this replaced: the path hardcoded `issues/open`, the issue closed on
+    2026-08-22, the file moved, and the row whose whole point is that its remedy is
+    a path printed a path to nothing. Both states resolve, because which one the
+    file is in is a fact about somebody else's repo on somebody else's schedule."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, where)))
+    assert qd.edge_runbook().endswith(f"{where}/{qd.EDGE_RUNBOOK_FILE}")
+
+
+def test_a_resolved_runbook_names_a_file_that_exists(monkeypatch, tmp_path):
+    """The property worth pinning, since the failure it replaces was a plausible
+    path to nothing: whatever comes back, if it looks like a path it IS one."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, "issues/closed")))
+    answer = qd.edge_runbook()
+    assert Path(answer.replace("~", str(Path.home()), 1)).is_file()
+
+
+def test_no_checkout_says_so_instead_of_naming_a_path(monkeypatch, tmp_path):
+    """A box without the selfhost repo gets a sentence, never a path — #408's rule
+    is that a row carries the fix, and a path that is not there is not a fix."""
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(tmp_path / "nothing-here"))
+    answer = qd.edge_runbook()
+    assert "not on this box" in answer
+    assert qd.EDGE_RUNBOOK_FILE in answer, "it must still name what to look for"
+    assert not answer.startswith("~/"), "a sentence, not a path"
+
+
+def test_the_env_override_is_what_lets_a_checkout_live_elsewhere(monkeypatch, tmp_path):
+    """This is a path into ANOTHER repository — the one thing this script cannot
+    derive from its own checkout — so the override is the mechanism, not a bypass.
+
+    Compared after expanding `~`, because the answer is deliberately abbreviated
+    when it sits under `$HOME` — which it does inside the nix sandbox, where
+    `tmp_path` is under a synthetic home. Asserting the raw absolute string passed
+    on a developer box and failed in the build for a reason that had nothing to do
+    with the override.
+    """
+    monkeypatch.setenv(qd.SELFHOST_REPO_ENV, str(_runbook(tmp_path, "issues/closed")))
+    answer = qd.edge_runbook()
+    expanded = answer.replace("~", str(Path.home()), 1) if answer.startswith("~") else answer
+    assert str(tmp_path) in expanded, answer

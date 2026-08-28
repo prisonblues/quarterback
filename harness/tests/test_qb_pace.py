@@ -1,7 +1,7 @@
 """`qb-pace` — the verdict a caller can act on, and the exit status that carries it.
 
 `qbdata.pace()` decides; this file is about the half that makes the decision
-reachable from a shell script and from `qb-seat`. Three properties, in the order
+reachable from a shell script and from `qb-seats`. Three properties, in the order
 they matter:
 
   1. **A ceiling that could not be read is never reported as clear.** `--gate`
@@ -108,9 +108,9 @@ def test_a_gate_does_not_stop_work_merely_because_the_window_is_warm(monkeypatch
 
 
 def test_a_gate_says_nothing_at_all_when_there_is_nothing_to_act_on(monkeypatch, capsys):
-    """A line printed on every seat start is how an operator learns to skip the one
-    that means something — qb-seat's own rule, and the reason it can relay this
-    output verbatim without deciding what to suppress."""
+    """A line printed on every screen build is how an operator learns to skip the
+    one that means something — `qb-seats`' own rule, and the reason it can relay
+    this output verbatim without deciding what to suppress."""
     _at(monkeypatch, "go")
     assert qp.main(["--gate"]) == 0
     assert capsys.readouterr().out == ""

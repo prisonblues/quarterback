@@ -22,8 +22,11 @@ issues, a human repeating the sequence to whoever asked, and an untracked
 3. *Only a human reorders it — and PLACING a new item is not reordering (#183).*
    Permuting items already in the plan is contested: two agents disagreeing about
    whether #80 outranks #83 and rewriting each other is how the plan stops being
-   the shared intent it exists to be, so ``POST /plan/reorder`` is human-only and
-   stays that way. Choosing where a NEW item *enters* alters the relative order of
+   the shared intent it exists to be, so ``POST /plan/reorder`` never takes an
+   order an agent *decided*. What it does take, since #478, is one a person asked
+   for: :func:`app.auth.delegated` accepts a person, or an agent presenting its own
+   machine's credential — and the row then records ``derived`` rather than
+   ``ordered``, so the two are never confused. Deciding stays a person's. Choosing where a NEW item *enters* alters the relative order of
    nothing already there — every existing pair keeps its existing relationship —
    so it cannot thrash, and ``after`` / ``before`` on ``POST /plan/item`` let an
    agent do it. What a placement competes with is not another agent's judgement;
@@ -45,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Literal, NamedTuple
 
@@ -67,10 +71,11 @@ from app.api.claims import (
     live_claim,
     may_mutate,
 )
-from app.auth import author, human, identify, reader
+from app.auth import author, delegated, human, identify, reader
 from app.claimkey import WORK, BadRef, canonical_repo, derive, work_ref
 from app.db import get_session
 from app.identity import HUMAN, is_human, same_machine
+from app.models.blocker import Blocker
 from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
@@ -377,10 +382,14 @@ def _refuse_agent_exemption(ref_kind: str | None, note: str | None,
     transfers unaltered: **the label that authorises work has to come from
     someone who is not the worker.**
 
-    So the marker is a human write, on the same footing as ``POST /plan/reorder``
-    and for the reasoning :func:`app.auth.human` already gives. Only two paths can
-    put it on an open item now, and both take :func:`app.auth.human`:
-    ``POST /plan/item/update`` and :func:`exempt_item`'s grant half.
+    So the marker is a human write, for the reasoning :func:`app.auth.human`
+    already gives. Two paths can put it on an open item and **neither will take it
+    from an agent**: :func:`exempt_item`'s grant half, which downgrades an agent's
+    ``grant`` to a request; and ``POST /plan/item/update``, which since #478 runs
+    on :func:`app.auth.delegated` and calls this function for any caller that is
+    not a person. That second path is why this guard is not merely belt-and-braces
+    — widening that endpoint's gate without it reopened #335 through one of the two
+    doors this argument depends on, and a delegated agent exempted its own PR.
 
     **The refusal is not a dead end**, which is the other half of #335 and the
     reason this is not a bare 403: an agent may still *propose* an exemption at
@@ -826,7 +835,8 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
                blockers: list[PlanItem], now: datetime,
                plan: Plan | None = None, plan_claim: ResourceLease | None = None,
                mine: str | None = None, session_id: str | None = None,
-               reconciled: PlanReconcile | None = None) -> dict:
+               reconciled: PlanReconcile | None = None,
+               waiting_on_a_human: Sequence[Blocker] = ()) -> dict:
     idle = (now - item.updated_at).total_seconds() / 86400
     return {
         "item_id": str(item.id),
@@ -856,8 +866,20 @@ def _item_view(item: PlanItem, claim: ResourceLease | None,
         "depends_on": list(item.depends_on or []),
         # Only OPEN dependencies block: a dropped one will never be done, and
         # waiting on it forever would be the plan quietly lying about "next".
+        # TWO kinds, reported apart because the remedy is different: one waits on
+        # work, the other waits on a person. `blocked_by` keeps its shape and its
+        # meaning for the item-to-item edges — a reader that only knows about
+        # those is not broken by this — and the human kind gets a field of its
+        # own rather than being folded in as a fake item (#328).
         "blocked_by": [{"item_id": str(b.id), "title": b.title,
                         "ref": b.ref_value, "repo": b.repo} for b in blockers],
+        "waiting_on_a_human": [
+            {"blocker_id": str(w.id), "class": w.kind, "question": w.question,
+             "owner": w.owner, "raised_by": w.raised_by,
+             "raised": w.raised_at.isoformat() if w.raised_at else None,
+             "idle_days": round((now - w.raised_at).total_seconds() / 86400, 1)
+             if w.raised_at else None}
+            for w in (waiting_on_a_human or ())],
         "claim": claim_view(claim) if claim is not None else None,
         "added_by": item.added_by,
         "created": item.created_at.isoformat(),
@@ -907,10 +929,25 @@ def _order_trust(open_views: list[dict]) -> dict:
     # In the read's own order, so `first_unchosen` is the first one a reader
     # walking this list actually meets.
     unchosen = [v for v in open_views if v["rank_source"] == "appended"]
+    # `derived` rows are counted beside `unchosen`, never inside it, and they do
+    # NOT flip `trusted` (#478). A delegated reorder was asked for by a person and
+    # computed from facts, so it is not a position nobody chose — and the
+    # `picked-up` migration already settled the general case: counting a new
+    # source as untrusted makes the plan read as less trustworthy "for the sole
+    # reason that agents were working", swamping the signal that the human's
+    # ordering has gaps with the signal that the fleet is busy. Weaker than
+    # `ordered` and much stronger than `appended` is a count, not a boolean.
+    derived = [v for v in open_views if v["rank_source"] == "derived"]
     return {
         "trusted": not unchosen,
         "by_source": by_source,
         "unchosen": len(unchosen),
+        "derived": len(derived),
+        "derived_hint": None if not derived else
+                        "an agent applied that order on somebody's instruction, "
+                        "computed from `GET /plan/order`'s rules. It is a real "
+                        "decision and it is not a person's own sequence — read "
+                        "the board for who asked and when.",
         # One row, named exactly: the first item in this read whose position
         # nobody chose. Null when there is none, rather than a sentinel a client
         # has to know about.
@@ -1123,6 +1160,7 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
     known = {str(i.id): i for i in items}
     wanted = {d for i in items for d in (i.depends_on or [])} - set(known)
     known |= await _load(session, wanted)
+    human_blockers = await _human_blockers_for(session, items)
 
     def plan_of(item: PlanItem) -> Plan | None:
         return plans.get(str(item.plan_id)) if item.plan_id is not None else None
@@ -1140,11 +1178,40 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
             now,
             plan=plan_of(item),
             plan_claim=plan_claim_of(plan_of(item)) if item.state == "open" else None,
+            waiting_on_a_human=human_blockers.get(str(item.id), ()),
             mine=mine, session_id=session_id,
             reconciled=reconciled.get((item.repo, item.ref_kind, item.ref_value)),
         )
         for item in items
     ]
+
+
+async def _human_blockers_for(session: AsyncSession,
+                              items: list[PlanItem]) -> dict[str, list[Blocker]]:
+    """Open blockers keyed by the plan item they are about (#328).
+
+    A SECOND source feeding ``blocked_by``; the item-to-item edges are unchanged
+    and this does not touch them. The two kinds are reported apart because the
+    REMEDY is different — one waits on work, the other waits on a person — which
+    is the argument `_next_caveat` already makes about the kinds it can see.
+
+    Matched on ``subject_value`` against the item's id. A blocker may also name an
+    issue or a PR that no plan item points at, and that is the case
+    ``depends_on`` structurally cannot express — those live in the queue and are
+    simply not attached to a row here.
+    """
+    open_ids = [str(i.id) for i in items if i.state == "open"]
+    if not open_ids:
+        return {}
+    rows = (await session.execute(
+        select(Blocker).where(Blocker.subject_kind == "item",
+                              Blocker.subject_value.in_(open_ids),
+                              Blocker.resolved_at.is_(None))
+        .order_by(Blocker.raised_at))).scalars().all()
+    out: dict[str, list[Blocker]] = {}
+    for b in rows:
+        out.setdefault(b.subject_value, []).append(b)
+    return out
 
 
 async def _scope_items(session: AsyncSession, repo: str | None, exact: bool,
@@ -1612,7 +1679,7 @@ class ItemIn(BaseModel):
     #: inserting between ranks 2 and 3 leaves every existing pair's relative order
     #: untouched, so there is no prior decision to overwrite and nothing to thrash
     #: (#183). Permuting what is already there is still :func:`reorder`, and still
-    #: human-only.
+    #: not an agent's own decision to make (#478).
     after: str | None = Field(default=None, max_length=128)
     before: str | None = Field(default=None, max_length=128)
     #: Whose stated priority this placement transcribes — ``"Rich, 23:00"``.
@@ -1858,7 +1925,8 @@ async def report_reconcile(
     decision; it was that the observation and the plan were two facts on one board
     that never met. `plan_read` carries this now, and says it in `next.caveat`.
 
-    Agent-authenticated, unlike the plan's ORDER, which is human-only. Ordering is
+    Agent-authenticated, unlike the plan's ORDER, which needs a person or a
+    delegated credential (#478). Ordering is
     the fleet's shared intent and an agent rewriting it makes the plan thrash;
     reporting what GitHub says about a ref is not intent, and the only agent that
     can report it is one somebody already trusted with a machine token.
@@ -2066,8 +2134,14 @@ async def read_plan(
             now, mine=caller, session_id=session_q)
     else:
         views = open_views[:limit]
+    # `waiting_on_a_human` joins the reasons `next` passes an item over, and it
+    # has to: the whole failure #328 measured is an item parked on a decision
+    # reading as ordinary open work and being handed to the next agent that asks.
+    # A drain at `eager` (#474) would pick up the item whose own note says "RANK
+    # IS WRONG AND A HUMAN MUST FIX IT" for exactly this reason.
     unclaimed = [v for v in open_views
-                 if not v["claim"] and not v["blocked_by"] and not v["covered_by"]]
+                 if not v["claim"] and not v["blocked_by"] and not v["covered_by"]
+                 and not v["waiting_on_a_human"]]
     trust = _order_trust(open_views)
     nxt = unclaimed[0] if unclaimed else None
     by_state = await _counts_by_state(session, repo, plan_id, exact)
@@ -2115,7 +2189,14 @@ async def read_plan(
         "counts": {
             "open": len(open_views),
             "claimed": sum(1 for v in open_views if v["claim"]),
+            # Two kinds, counted apart, because the remedy is different and
+            # `plan_counts` consumers render them differently: one waits on work
+            # finishing, the other on somebody answering. `blocked` keeps its old
+            # meaning exactly — item-to-item edges — so a reader that predates
+            # #328 is not silently told a new number.
             "blocked": sum(1 for v in open_views if v["blocked_by"]),
+            "waiting_on_a_human": sum(1 for v in open_views
+                                      if v["waiting_on_a_human"]),
             # Held via a plan claim rather than item by item. Counted separately
             # because the remedy is different: a blocked item needs work
             # finishing, a covered one needs a word with its holder.
@@ -2149,7 +2230,8 @@ async def add_item(
     ranks 2 and 3 and every existing pair keeps its existing relationship, so
     there is no prior decision to overwrite and nothing for two agents to thrash.
     Permuting existing items is the contested operation, and that is
-    :func:`reorder`, which is human-only and unchanged.
+    :func:`reorder`, which is unchanged in what it MEANS: an agent may apply an
+    order a person asked for (#478) and may never decide one.
 
     Absent a position it appends, exactly as before — and says so, in
     ``rank_source``, rather than leaving a reader of 28 ranked rows to work out
@@ -2490,9 +2572,10 @@ async def complete_item(
 def _completion_note(existing: str | None, said: str | None) -> str | None:
     """Add the completion note to the item's note without destroying it.
 
-    `note` is the human's reasoning for the item's position — "the sentence a
-    human would otherwise repeat to each agent that asks", and human-only to
-    edit for exactly that reason. Replacing it with a completing agent's receipt
+    `note` is the reasoning for the item's position — "the sentence a human would
+    otherwise repeat to each agent that asks". Editing it is deliberate and takes
+    its own call: a person, or a delegated agent correcting reasoning that has gone
+    stale (#478). What it is not is a side effect of finishing something. Replacing it with a completing agent's receipt
     ("landed in PR #143") deleted the intent and left the receipt in a field the
     agent was not allowed to write, unrecoverably.
     """
@@ -2536,10 +2619,11 @@ async def set_depends(
 @router.post("/plan/item/update")
 async def update_item(
     body: UpdateIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Retitle, move, re-reason, or drop an item. Human-only, like reordering.
+    """Retitle, move, re-reason, or drop an item — a person; retitle and re-reason
+    — a delegated agent.
 
     ``dropped`` is not ``done``: one says the work happened, the other says a
     person decided it should not. Reopening a dropped item is allowed here too,
@@ -2548,9 +2632,69 @@ async def update_item(
     A ``done`` item cannot be dropped. Dropping clears ``done_at``/``done_by``,
     so the drop control on a history row was one click from destroying the record
     that the issue ever closed — and the page offered it on every row.
+
+    **A delegated agent may re-reason, and may not decide (#478).** #478's whole
+    argument for a second credential is that it authorises a NAMED, narrow act
+    rather than an identity, and the narrow act here is the one the changelog
+    names: correcting reasoning an agent itself wrote and that has gone stale.
+    Two of this endpoint's other powers are decisions and stay a person's:
+
+    * **The review-exemption marker.** :func:`_refuse_agent_exemption`'s docstring
+      says *"Only two paths can put it on an open item now, and both take
+      app.auth.human: POST /plan/item/update and exempt_item's grant half"* — so
+      widening this endpoint's gate without this guard reopened #335 through one
+      of the two doors that #335's own fix depends on. Measured, not reasoned
+      about: before this guard, a delegated agent writing a `review: exempt` note
+      here got `exempt: True` on its own PR, which is precisely the authority
+      ``exempt_item`` refuses it by downgrading a grant to a request.
+    * **Dropping, and moving between plans.** *"a person decided it should not"*
+      is the endpoint's own description of the first, and an agent deciding that
+      about work it may be the one avoiding is the same self-approval shape one
+      field over; it also reaches ``live_claim`` and clears somebody's hold.
+      ``plan`` is the same kind of act — detaching an item from a plan somebody is
+      holding changes what is grouped with what, and ``""`` detaches entirely.
+
+    Both refuse the ACT and not the caller, so nothing an agent legitimately does
+    here changes: a delegated note update is still one call.
     """
     _refuse_phase(body.phase)
     item = await _get(session, body.item_id)
+    if not is_human(editor):
+        # Ordered before every other check so a refusal is about the authority
+        # and not about the item's state — an agent told "that item is done"
+        # would reasonably conclude the write was otherwise allowed.
+        # `state` and `plan` both DECIDE something; `title` and `note` describe.
+        # `plan` joined this guard after a panel round escalated the gap: the
+        # docstring above claimed title and note were the whole surface while
+        # `plan` was applied for a delegated caller with no check at all, so an
+        # agent could move an item between plans — or detach it from one a person
+        # is holding, which reaches `covered_by` and is nearer to dropping than to
+        # re-reasoning. Narrowed rather than documented, because widening later is
+        # one line and discovering the reverse is not.
+        refused = [f for f, v in (("state", body.state), ("plan", body.plan))
+                   if v is not None]
+        if refused:
+            raise HTTPException(403, detail={
+                "error": f"{' and '.join(refused)} on a plan item is a person's decision",
+                "hint": "a delegated credential may retitle and re-reason an item "
+                        "(`title`, `note`); it may not decide whether the work "
+                        "should happen or which plan it belongs to. See #478.",
+                "refused": refused,
+                "item_id": str(item.id)})
+        _refuse_agent_exemption(item.ref_kind, body.note)
+        # And the other direction, which the guard above cannot see: `note` is a
+        # WHOLE-FIELD replacement, so an agent writing an innocuous note over one
+        # that carries the marker REVOKES a person's exemption — the PR silently
+        # rejoins the review queue. Round 1 closed "an agent may not set it" and
+        # left "an agent may not clear it" wide open; same field, same endpoint,
+        # opposite direction. Measured: exempt True -> agent writes a note -> False.
+        if body.note is not None and exempting(item.note):
+            raise HTTPException(403, detail={
+                "error": "that item carries a review exemption a person granted",
+                "hint": "replacing the note would revoke it. Ask a person to change "
+                        "or withdraw the exemption first (POST /plan/item/exempt "
+                        "with grant: false), then re-reason the item.",
+                "item_id": str(item.id)})
     if body.state is not None and item.state == "done" and body.state != "done":
         raise HTTPException(409, detail={
             "error": "that item is done: finished work is a record, not a plan item",
@@ -2926,10 +3070,10 @@ async def _ref_taken(session: AsyncSession, repo: str | None, ref_kind: str | No
 @router.post("/plan/reorder")
 async def reorder(
     body: ReorderIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Set the order. **Human-only** — this is the endpoint decision 1 is about.
+    """Set the order. A person's decision — which a delegated agent may APPLY.
 
     Items in scope that the caller did not list keep their relative order and
     follow the listed ones, and are named in ``appended``. A stale page must not
@@ -2958,6 +3102,13 @@ async def reorder(
     ordered = [by_id[str(i)] for i in dict.fromkeys(str(i) for i in body.order)]
     rest = [i for i in by_id.values() if i not in ordered]
     listed = {i.id for i in ordered}
+    # WHO asked decides what the rank claims about itself (#478). A person's
+    # sequence is `ordered`; a delegated agent's is `derived` — a rule and an
+    # instruction produced it together, which is weaker evidence than a person
+    # typing it and much stronger than an append. Writing `ordered` for both
+    # would make an agent-applied order indistinguishable from a human's in the
+    # one field a client can read, which is #183's substitution exactly.
+    chosen = "ordered" if is_human(editor) else "derived"
     now = _utcnow()
     for rank, item in enumerate([*ordered, *rest], start=1):
         # `ordered` is the human's sequence and `rest` is what the page did not
@@ -2965,7 +3116,7 @@ async def reorder(
         # arrived after the page loaded was carried along, not decided on, and
         # marking it would make `GET /plan` claim a human had chosen a position
         # they never saw (#183).
-        source = "ordered" if item.id in listed else item.rank_source
+        source = chosen if item.id in listed else item.rank_source
         if item.rank != rank or item.rank_source != source:
             item.rank, item.rank_source, item.updated_at = rank, source, now
     await session.commit()
@@ -3386,7 +3537,11 @@ def _order_view(repo: str | None, now: datetime, c: Computed) -> dict:
         # board reads `suggested_order` back. #232's non-privileged-writer rule.
         "apply": {
             "endpoint": "POST /plan/reorder",
-            "human_only": True,
+            # False since #478: `POST /plan/reorder` takes a person OR an agent
+            # holding its machine's delegated credential. Clients BRANCH on this
+            # field — it is not prose — so leaving it True told every reader that
+            # applying the suggestion was impossible for them.
+            "human_only": False,
             "body": {"repo": repo, "order": list(c.result.suggested_order)},
         },
     }
@@ -3620,7 +3775,7 @@ def _recorded(row: OrderProposal, c: Computed, repo: str | None, now: datetime, 
         "generated": now.isoformat(),
         "apply": {
             "endpoint": "POST /plan/reorder",
-            "human_only": True,
+            "human_only": False,
             "body": {"repo": repo, "order": list(row.suggested_order or [])},
         },
     }

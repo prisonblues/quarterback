@@ -87,6 +87,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -619,6 +620,80 @@ DEFAULTS: dict = {
         # ORCHESTRATOR opens the issue — #223 and #237 are what a good deferral
         # record looks like. False restores today's two exits.
         "fixer_may_defer": True,
+        # WHERE THE DEFERRAL GOES — a board row always, a GitHub issue only at or
+        # above this severity (#482).
+        #
+        # `panel-review-pr.md` §4b used to open an issue for every finding that
+        # lands on `deferred`, and its reason was sound as far as it went:
+        # `deferred_to` names an issue ref, and "a `deferred` with nowhere to go is
+        # the markdown list this replaced". But it conflates two records that are
+        # only sometimes the same one. The **board row** is the durable one — it
+        # chains by finding key across rounds, it feeds `/panel`, and it is what
+        # stops the leaderboard rewarding a reviewer for being confident rather than
+        # right. The **GitHub issue** is a work item on a human's tracker. For a P1
+        # or P2 deferral those coincide. For the P3/P4 tail they do not, and the tail
+        # is where the volume is.
+        #
+        # THE MEASUREMENT, taken on this repo on 2026-08-26. Roughly twenty open
+        # issues are the panel's own deferred-finding exhaust and nothing else —
+        # #66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237
+        # #285 #286 #288 #300 — every one of them a capped or below-floor round with
+        # nowhere to put what was left. #283 is a rescue FROM one of them: three live
+        # defects that had been sitting inside a deferred-findings dump nobody read.
+        # That is the failure mode: at that volume the tracker stops being a queue
+        # and starts being a place findings go to not be found, and every one of
+        # those issues dilutes the ranking #435's queue and the drainer are for. The
+        # same complaint arrived independently from another repo in the fleet — "i
+        # don't want this issue creation spam like i had in quarterback" — which is
+        # the floor working (a P4 kept out of the fix pass) and the bookkeeping one
+        # step downstream filing it as a ticket anyway.
+        #
+        # P2, NOT `"always"`, and the issue that proposed this suggested `"always"`
+        # on the usual preserve-today's-behaviour grounds. Taken at P2 instead
+        # because "anyone not opting in" is the wrong side of this particular
+        # default: the behaviour being preserved is a bookkeeping step that produces
+        # tracker spam at a measured rate of about one issue per capped round, on
+        # every repo the harness reaches, and a repo only discovers it needs the dial
+        # after twenty issues have accumulated. A P1/P2 deferral still gets its issue
+        # — those are the ones where the row and the work item genuinely coincide.
+        #
+        # NOTHING IS DROPPED, and that is the whole difference between this and a
+        # backlog. Below this floor the finding still gets its `deferred` row, still
+        # carries a one-line `note` saying what it is and why it was not fixed —
+        # required by the brief precisely so the row is READABLE later rather than
+        # merely present — and is still relayed to the human in the summary. What it
+        # does not get is a second copy on the tracker. `deferred_to` is nullable
+        # (`app/models/review.py`), the API accepts a `deferred` outcome without one,
+        # and `/panel` renders such a row with no target rather than as broken — the
+        # open question this issue could not settle from outside, settled here and
+        # guarded by a test.
+        #
+        # DESIGNED TO BE READ, not just written. A row nothing queries is the
+        # markdown list again under a new name, so the read side is named at the same
+        # time as the write: `GET /review/findings?repo=&pr=` returns each chain with
+        # its outcome, which is how a fiddly finding on a PR is found again, and it is
+        # what #500's repeat-finding chain and the cross-PR signal both want to read
+        # from. No cross-PR query is built here (that is its own issue) — what this key
+        # must not do is foreclose one, which is why the record is a row with a note
+        # and not a bullet in a closed issue's body.
+        #
+        # AN ESCALATION IS EXEMPT at every setting, including `"never"`. §4b has
+        # three roads to `deferred` and only two of them are work items: a fixer
+        # deferral and a below-floor or unpaid finding, which is what the twenty
+        # issues above were. The third — the fixer escalating the change's premise —
+        # produces an issue that ASKS a question rather than filing a task, it is what
+        # carries that question past the end of the session, and the cycle is not
+        # finished until a human answers it. Suppressing it would drop the question,
+        # not save a ticket. Same exemption a Sonar hard-gate issue gets from both
+        # severity floors, for the same reason: it is not a severity judgement.
+        #
+        # `"always"` restores the pre-#482 behaviour exactly — an issue for every
+        # deferral, whatever its severity. `"never"` files none at all, which is the
+        # right answer for a repo whose tracker is not where its work is queued
+        # (`mode: jungle`), and is NOT the same as discarding them: the rows are
+        # still there and still relayed. Severities are case-insensitive, like every
+        # other floor here.
+        "file_deferral_issues": "P2",
         # What a fix round is asked to CLEAR. At or above this severity a finding
         # gets fixed; below it, it is reported and recorded and not fixed. The
         # panel already computes a calibrated severity and the prompts then throw
@@ -736,6 +811,64 @@ DEFAULTS: dict = {
         # whole grown PR, so the same number means "the fix is 3x the change" in one
         # and "the PR tripled" in the other. Both are the thing worth stopping for.
         "max_fix_growth": 3.0,
+        # The ABSOLUTE half of that same ceiling, and the two bind at whichever is
+        # crossed FIRST (#492). Chars the PR may GROW past the size the cycle's first
+        # round read it at.
+        #
+        # **A pure multiple hands its rope out in proportion to the starting size**,
+        # so the absolute growth it permits is largest exactly where a ceiling is most
+        # wanted. At 3.0x a 113-line PR may grow ~226 lines before the check fires and
+        # a 2,000-line one may grow 4,000 — four thousand lines of fix-pass output on
+        # a change that was already large, waved through by the same dial that stops
+        # the small one at 226. "A fix pass that MULTIPLIES the diff has written a
+        # second change" is a claim about ABSOLUTE second-change-ness, and one
+        # multiple cannot express it at both ends of the range.
+        #
+        # **Chars, and the unit is in the name.** The field report asked for lines;
+        # this counts chars because the ceiling beside it already does — `max_fix_growth`
+        # divides `pr_chars` by the first round's `pr_chars` — and two halves of one
+        # ceiling read off two different measurements is #298's defect one level up: a
+        # numerator taken from a different string than the denominator, reading as
+        # configured and stopping nothing. A churned-line count also does not EXIST on
+        # any baseline written before this key did, so a `_lines` dial would decline to
+        # run on every cycle already in flight and on every payload behind it, which is
+        # #169's failure — a mechanism that ships unwired. Chars is the unit
+        # `max_diff_chars`, `judge_max_diff_chars` and `ask_max_context_chars` are
+        # already in, so a reader of this block is not being asked to hold two.
+        #
+        # **30,000, and the conversion is measured rather than assumed.** PR #188's own
+        # diff is 34,717 chars over 521 churned lines — 66 chars a line — and this
+        # repo's last 25 commits run 52-94 with a median near 78, larger diffs running
+        # leaner. So 30,000 is roughly 380-450 churned lines of GROWTH. Against the two
+        # runaways this repo has actually measured: #188 went 185 -> 721 churned lines,
+        # a growth of 536 (~35,000 chars at its own 66), and #236 went 359 -> 2,313, a
+        # growth of 1,954 (~129,000). Both stop, with margin. The 113-line cycle in
+        # #492 grew ~122 lines and does NOT stop here, correctly — that is the "binds a
+        # round late" half of the report, which no absolute floor can reach, and
+        # `guard_ratio` is the earlier signal filed for it.
+        #
+        # **It can only ever TIGHTEN — and that is the narrow claim, not a wider one.**
+        # Crossed-first means both numbers are ceilings, so no value of this key lets
+        # through a cycle 3.0x would have caught. It does NOT follow that the multiple
+        # would eventually have caught what this stops: a 2,000,000-char PR that grows
+        # by 30,001 chars sits at 1.02x and may never approach 3.0x at all, and
+        # catching exactly that is the point — a proportional ceiling can permit that
+        # growth permanently. So this stops cycles the multiple never would, and lets
+        # through none that it would. That is also what makes it cheap to reverse:
+        # `null` switches this half off and restores the pre-#492 behaviour exactly,
+        # and `null` on both is no growth check at all, as it was before either
+        # existed.
+        #
+        # **A second key rather than a two-part `max_fix_growth` value**, which is the
+        # open question #492 left. A pair would avoid a fifth growth-adjacent name in a
+        # block already near 25 keys, and it would cost more than that saves:
+        # `BOARD_DIALS` types this dial as a scalar `number` and the board's column
+        # stores one JSON value per dial, so a pair needs a new shape at both ends; and
+        # `null` is already the documented off switch for `max_fix_growth`, so a pair
+        # would have to answer which half a bare `null` switches off. Two keys, two
+        # nulls, two independent answers, and either one settable from the board on its
+        # own.
+        "max_fix_growth_chars": 30_000,
         # What a reviewer is asked to look FOR. `diff` asks for defects in the
         # change under review, and surfaces anything outside it as an observation
         # rather than as a finding a fix round must clear. `repo` is today's
@@ -834,7 +967,216 @@ DEFAULTS: dict = {
         # (`require_failing_test`'s precedent): a governance switch believed to be on
         # and quietly off is the loudest possible way to make a process look
         # governed.
-        "escalate_on": {"premise_repeated": 2},
+        #
+        # `premise_undecidable` (#491) is the second one built, and it brakes on the
+        # FIRST declaration rather than the second — which is not the inconsistency it
+        # looks like. `premise_repeated` counts occurrences because one declaration
+        # says nothing: a fix written against a premise is ordinary, and only the
+        # repeat is evidence. `premise_undecidable` is not counting anything. It fires
+        # on a fixer's own answer to a specific question — *can the runtime this
+        # assertion runs in observe the property you are asserting?* — and a `no`
+        # there is already the whole finding. Every fix for such a property is an
+        # approximation of it, the next round finds the gap between the approximation
+        # and the property, and the round count is unbounded by construction. Waiting
+        # for a second one buys a fix pass and a panel to confirm what the first
+        # answer said.
+        #
+        # **This is what `premise_repeated` cannot see, and #491 is the measurement.**
+        # A fixer that replaces one proxy with a better one declares a genuinely
+        # different premise every round, honestly — four were declared on one cycle
+        # and no two matched, so the occurrence counter never reached 2 while three
+        # fix passes circled one undecidable property. Comparing declaration TEXT
+        # cannot close that (`same_premise` says so, and #84 rules out building a
+        # similarity heuristic); asking one more question of each declaration can.
+        #
+        # `false`/`null` switches it off, for a repo that would rather a fixer
+        # approximate than stop. Unlike `premise_repeated` there is no number: the
+        # answer it reads is a fixer's `yes`/`no`, and an occurrence count over it
+        # would be counting how many times somebody said the same `no`.
+        # #489's second brake, and the FIRST gate this codebase has put on a
+        # provenance number. `fix_injection` is the fraction of a round's new
+        # outstanding findings that `panel_scope._provenance` attributed to the
+        # previous fix pass; a round above it ends the cycle, with a veto line and
+        # `confident` false. More than half a round's news being the fix pass's own
+        # damage means `round_stop`'s rule 1 — new findings buy another round — is
+        # being fed by the loop's own output, and a termination test fed by its own
+        # output can only end on the cap.
+        #
+        # **The instrument came before the gate, deliberately, and this is the
+        # calibration arriving.** `panel.py`'s comment beside the #67 tallies states
+        # the withholding in as many words: nothing reads these tallies to stop a
+        # run, #67 asks for the instrument before the gate, "two pull requests in one
+        # day is an observation, not a calibrated rule", and "a few dozen cycles of
+        # it are what would justify wiring it to anything". The cycles are in. 128 of
+        # 201 new findings across the seven PRs in `round_stop`'s docstring were
+        # created by the fix pass immediately before them; 39 of 53 after round 1 on
+        # PR #299, and 17 of 17 in its round 2; 64% then 87% on the cycle #489 was
+        # filed from, over a PR whose actual change was 113 lines. Every one of those
+        # is far above 0.5 and every one of those cycles ran to its cap.
+        #
+        # What is still NOT calibrated is where a HEALTHY cycle sits, which is the
+        # number that decides the false-positive rate. So the rule is built so that
+        # a false positive costs as little as it can — see the three properties under
+        # "on by default" — and `null` switches it off in one line.
+        #
+        # **0.5, read strictly: MORE than half.** Not a percentile off a curve nobody
+        # has; the defence of the number is that it is the point where the fix pass is
+        # generating more of the round's work than the pull request is, which is a
+        # threshold with a meaning. It is also the safe end of a measurement
+        # documented as a FLOOR: `_provenance` under-counts `introduced` in both
+        # directions — a defect a fix introduced by DELETING a guard has no added line
+        # to sit on, and `introduced` needs exact membership in the added lines while
+        # LLM reviewers and Sonar routinely report a line or two off — so a measured
+        # 0.64 is at least 0.64, and a threshold crossed is genuinely crossed.
+        #
+        # **ONE round, not two consecutive.** The field report proposed "two
+        # consecutive rounds over the threshold" and it cannot work: provenance is
+        # only attributable from round 2 (round 1 has no preceding fix), so a
+        # two-round rule cannot fire before round 3, and `max_rounds` above defaults
+        # to 2. Two-consecutive would ship switched off for every repo on the shipped
+        # defaults and fire only for the ones running `--loop`. A brake that is off
+        # wherever it was not configured is the `require_failing_test` failure with
+        # the honesty removed.
+        #
+        # **On by default, like `premise_repeated` and unlike #78's other switches**,
+        # and three properties earn it:
+        #   - it can only ever turn a `go again` into a STOP, never the reverse, so
+        #     no value of it can make a review look cleaner than it is;
+        #   - under the shipped `max_rounds: 2` the only round it can fire on is the
+        #     one the cap would have ended anyway. What a default-on costs a repo on
+        #     the defaults is therefore a better `reason` and one more veto line, not
+        #     an earlier finish — and it bites where the loop actually runs away, in
+        #     a repo that raised the cap or drives `--loop`;
+        #   - a false positive costs one printed question, which is #67's own
+        #     required output and the cheap failure; a false negative is #299's
+        #     five-round cycle, which nothing stopped.
+        #
+        # `panel_rounds.FIX_INJECTION_MIN_NEW` is the other half of the rule and is a
+        # constant rather than a dial: a rate over two findings is not a rate, and a
+        # second number nobody can calibrate is worse than one documented floor.
+        #
+        # #505's rung, BESIDE the one above and emphatically not a second stopping
+        # system. `fix_injection` asks *did the fix cause this?*; this one asks *is
+        # the new-finding count still falling?*, which is a different question with a
+        # different answer, and the value is the number of CONSECUTIVE rounds whose
+        # new-finding count did not decrease before the cycle ends.
+        #
+        # **The rule is Rich's, stated on #480 over a cycle this codebase ran**: three
+        # rounds produced 44 findings, then 15 new, then 18 new — stop the cycle and
+        # triage the remainder rather than running a fourth. Read as attribution that
+        # cycle says nothing: the 18 need not have been created by the fix at all. A
+        # reviewer reading deeper, a seat that woke up, a scope that widened and a
+        # vendor added mid-cycle all produce news no fix pass wrote, and `_provenance`
+        # UNDER-counts by design on top of that (a defect introduced by DELETING a
+        # guard has no added line to sit on). So a genuinely diverging cycle can sit
+        # under `fix_injection`'s 0.5 for its whole life and be stopped only by the
+        # cap — which is a cap, and a cap fires in the same place whether the round
+        # found two findings or twenty.
+        #
+        # **1, for `fix_injection`'s own "ONE round, not two consecutive" reason, and
+        # the structure of the argument is identical.** A new-finding count can only
+        # be compared against a predecessor, so round 1 can never be a not-falling
+        # round and a value of 2 could not fire before round 3 — while `max_rounds`
+        # above defaults to 2. Shipped at 2 this rung would be OFF for every repo that
+        # did not configure it and armed only for the ones driving `--loop`, which is
+        # the `require_failing_test` failure with the honesty removed. At 1 the
+        # earliest round it can fire on is round 2, and on the shipped cap that is the
+        # round the cycle was ending on anyway.
+        #
+        # 1 is also exactly the rule as it was stated: 44 -> 15 falls and buys round
+        # 3; 15 -> 18 does not fall and ends the cycle there, which is where the human
+        # ended it.
+        #
+        # **The same three properties earn it the same default-on**, and they are the
+        # test a rung has to pass rather than a form of words:
+        #   - it can only ever turn a `go again` into a STOP, never the reverse, and
+        #     `round_stop` checks that condition rather than merely obeying it — so no
+        #     value of it can make a review look cleaner than it is;
+        #   - under the shipped `max_rounds: 2` the only round it can fire on is round
+        #     2, which is the round the cap would have ended anyway. What a default-on
+        #     costs a repo on the defaults is a better `reason` and one more veto line,
+        #     not an earlier finish;
+        #   - a false positive costs one printed question — the stop is vetoed and
+        #     `confident` is false, so the answer a human gives is "go again", not a
+        #     merge nobody looked at.
+        #
+        # **And one property `fix_injection` cannot claim.** This is computed from the
+        # ROUNDS' OWN COUNTS and never from provenance, so #500 — rebasing between
+        # rounds silently disarms provenance, and therefore silently disarms
+        # `fix_injection` — cannot disarm it. On a busy queue most PRs are rebased
+        # mid-cycle, which is precisely where the one shipped convergence brake stops
+        # being computable, and that is the argument for a second rung existing rather
+        # than for tightening the threshold on the first.
+        #
+        # **What it does NOT do, said out loud because the issue asks for both
+        # clauses.** #505's second gap is that a stopping rule has nowhere to put the
+        # findings it leaves outstanding — Rich's instruction was "stop the cycle AND
+        # triage the remainder into an issue", and the second half is #42, which is
+        # open. This rung ends the round; the remainder is handed to nobody, exactly
+        # as `fix_injection`'s and the cap's are. It trades a round for a stop that a
+        # human has to act on, and until #42 lands that is what it is.
+        #
+        # `null` (or `false`) switches it off in one line, like its sibling. `0` is
+        # REFUSED: zero consecutive not-falling rounds is every round, which is a
+        # brake with no discrimination in it. `panel_rounds.NOT_FALLING_MIN_NEW` is
+        # the noise floor and is a constant rather than a dial, for the reason
+        # `FIX_INJECTION_MIN_NEW` is: 1 -> 2 is arithmetic, not divergence, and a
+        # second number nobody can calibrate is worse than one documented floor.
+        "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
+                         "fix_injection": 0.5, "new_findings_not_falling": 1},
+        # #507, and it is NOT a fifth rung — which is why it is here and not inside
+        # the block above. Every key in `escalate_on` answers one question: does this
+        # end the cycle? This one ends nothing, extends nothing and cannot move a
+        # verdict. It decides what an escalation ARRIVES WITH.
+        #
+        # **The hole it fills.** Every seat returns findings — a defect, a severity,
+        # a location — and on an ordinary round that is the right contract. On a
+        # cycle that will not converge the fixer is doing something else: inferring
+        # the reviewer's INTENT from a criticism and guessing at a change that
+        # satisfies it, and that guess is what the next round reads. #489's numbers
+        # are what the guessing costs — 128 of 201 new findings across seven PRs were
+        # created by the fix immediately before them — and nothing anywhere asked a
+        # seat the obvious question. So when a rung above fires, each seat that still
+        # has outstanding findings on the PR is asked one thing: *given these
+        # findings of yours, what is the smallest change that resolves them?* The
+        # answers go in the escalation output, in front of whoever the escalation
+        # goes to.
+        #
+        # **On escalation and not every round**, which is the whole of the cost
+        # argument. It buys a fan-out on a PR whose cycle was already ending badly,
+        # and nothing at all on a healthy round — where the fixer has the findings
+        # and the findings are working. #507 is explicit that this is where it is
+        # cheap and worth it.
+        #
+        # **`--ask` (#129) is the machinery and the wrong question.** That path fans
+        # a PREMISE out to the same seats and tallies holds/fails/unresolved; it
+        # adjudicates a claim somebody already wrote. Here nobody has written one,
+        # because the whole problem is that the fixer does not know what the claim
+        # should be. `panel_propose` reuses the fan-out and reuses neither the
+        # question nor — deliberately — the TALLY: four seats proposing four
+        # incompatible changes is the most useful answer a stuck cycle can get, and a
+        # verdict struck over them would average away the one thing worth collecting.
+        #
+        # **On by default, and the properties that earn it are not the brakes'.**
+        # Those two had to argue that they could not end a cycle early; this one
+        # cannot end a cycle at all:
+        #   - a proposal is NOT a finding. It enters no leaderboard, no cross-round
+        #     defect chain and no severity floor, it reaches `round_stop` through
+        #     nothing,
+        #     and the board's `extra="ignore"` ingest drops the key outright. A
+        #     reviewer that proposes is not thereby right (#79's precedent);
+        #   - it runs AFTER `stop`, `reason`, `veto` and `confident` are final and
+        #     writes to none of them, so it cannot make a review look cleaner than it
+        #     is — the property `fix_injection` and #505's rung each claim, and the
+        #     easiest of the three to hold here;
+        #   - a false positive costs one extra fan-out on a cycle that already spent
+        #     several rounds of them, and the failure it prevents is a human at a veto
+        #     line with a list of complaints and no proposal.
+        #
+        # `false` switches it off in one line, and the round then SAYS so in
+        # `config_notes` when it escalates — a repo that declined this must not be
+        # indistinguishable from one where the pass silently did not run.
+        "propose_on_escalation": True,
         # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
         # than a placeholder: `None` means "no ceiling", the panel makes no board
         # call at all when every one of them is `None`, and a fleet that installs
@@ -1959,16 +2301,19 @@ DIALS_ENV = "QUARTERBACK_DIALS"
 
 
 class Dial(NamedTuple):
-    """One board-settable dial: what shape its value takes, and which way it may
-    move.
+    """One board-settable dial: what shape its value takes, which way it may move,
+    and whether it is a path into a repo's rules at all.
 
     `kind` is checked against the value because an unreviewed channel that can
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
-    for `max_fix_growth`, `distant_merge_lines`, `escalate_on.premise_repeated` and
+    for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
+    `escalate_on.premise_repeated`, `escalate_on.fix_injection`,
+    `escalate_on.new_findings_not_falling` and
     `max_diff_chars`, and means "inherit the default" for everything else — so a
-    dial that took `null` generally would have one written value with two meanings.
+    dial that took `null` generally would have one written value with two
+    meanings.
 
     `rule` is the direction, and it is the one place this layer and #276's throttle
     genuinely differ:
@@ -1986,6 +2331,48 @@ class Dial(NamedTuple):
     kind: str
     nullable: bool
     rule: str
+    #: ONE LINE on what this dial decides, for the screen that offers it (#539).
+    #:
+    #: A summary, and the argument stays where it was — beside the key in
+    #: `DEFAULTS`, at whatever length it needed. That prose is Python comments and
+    #: nothing can read it, which is why a person opening `set a dial` was handed 29
+    #: dotted paths and no way to tell which one they meant. This is the shortest
+    #: thing that answers that question, and it is not the place to re-argue a
+    #: number: a reader who wants the reasoning is one `grep` from the comment that
+    #: carries it.
+    #:
+    #: Defaulted, so a `Dial(...)` written with three fields still constructs. Every
+    #: entry below carries one; a new dial that forgets is a picker row that says
+    #: nothing, rather than a crash on the dashboard of whoever pulls it next.
+    what: str = ""
+    #: WHAT THIS DIAL CONFIGURES, and it is the field that stopped this table being
+    #: the panel's (#563).
+    #:
+    #:   `rules`  a dotted path into a repo's resolved rules tree. `DEFAULTS` holds
+    #:            its built-in value, `apply_dials` overlays the board's on top, and
+    #:            `dial_layers` reports which layer answered. Every dial above.
+    #:   `fleet`  a setting nothing in the rules tree holds. It is validated, listed,
+    #:            offered by the picker and rendered by the dashboards exactly like
+    #:            the others, and it is read DIRECTLY by whichever tool it configures
+    #:            — never merged into a repo's config, because there is no repo in
+    #:            the question it answers.
+    #:
+    #: **The distinction is not a new namespace and this is deliberate.** #563 asked
+    #: whether `DIALS` is the panel's surface or the fleet's, and the answer was
+    #: already shipped rather than open: `app/api/dials.py` states that the board
+    #: does not know what a dial IS — the name is opaque text, the value opaque JSON,
+    #: and the vocabulary belongs to the client — and `tempo` (#474) has been drawn
+    #: as a dial by both dashboards for releases while this table has never held it.
+    #: The channel is the fleet's; the only thing that was the panel's is the two
+    #: lines of THIS module that assume a dial names a key in `DEFAULTS`. So a fleet
+    #: dial costs one field here rather than a second settings channel — which is
+    #: exactly what `BOARD_DIALS`' own no-second-source rule asks for.
+    #:
+    #: A fleet dial has no `DEFAULTS` entry, so `dial_specs` reports
+    #: `default_known: False` — and that is the honest answer rather than a hole in
+    #: this table: `spawn.max_sessions` falls back to a per-machine file that no
+    #: repo, and no board, can read.
+    applies: str = "rules"
 
 
 #: `reviewers.<seat>.enabled` is the interesting boundary and it gets the narrow
@@ -2008,6 +2395,13 @@ class Dial(NamedTuple):
 #: than adding one.
 _NARROW_ONLY_ENABLED = "narrow"
 
+#: The two values `Dial.applies` takes, named rather than spelled at every site —
+#: `applies="fleet"` on a dial and `applies == _APPLIES_RULES` in the resolver are
+#: the same word, and a typo in one of them is a dial that silently stops being
+#: overlaid.
+_APPLIES_RULES = "rules"
+_APPLIES_FLEET = "fleet"
+
 #: The dials the board may set. **The dials whose value is a judgement about COST
 #: rather than about capability** — which is the line #305 draws and the reason
 #: `auto_merge`, the epic and preland blocks, `skip_title_patterns` and the loop
@@ -2022,21 +2416,66 @@ _NARROW_ONLY_ENABLED = "narrow"
 BOARD_DIALS: dict[str, Dial] = {
     # The two floors #305 is named for: which findings a fix pass may touch, and
     # which ones buy another round.
-    "review_panel.fix_severity_floor": Dial("severity", False, "either"),
-    "review_panel.round_trigger_floor": Dial("severity", False, "either"),
+    "review_panel.fix_severity_floor": Dial("severity", False, "either",
+        'the lowest severity a fix pass may act on; under it is deferred, not fixed'),
+    "review_panel.round_trigger_floor": Dial("severity", False, "either",
+        'the lowest severity that buys another round; under it never extends the cycle'),
+    # #482's third floor: which deferrals get a GitHub issue as well as their board
+    # row. A `deferral_gate` and not a `severity` because its two ends are words —
+    # `always` and `never` — which no severity band can spell: "below P4" has no band
+    # and `P0` is deliberately not a severity this panel has.
+    "review_panel.file_deferral_issues": Dial("deferral_gate", False, "either",
+        'how severe a deferral must be to open a GitHub issue as well as its board row'),
     # #297's budget for the band between them, and #298's growth ceiling.
-    "review_panel.low_severity_fix_lines": Dial("number", False, "either"),
-    "review_panel.max_fix_growth": Dial("number", True, "either"),
+    "review_panel.low_severity_fix_lines": Dial("number", False, "either",
+        'churned lines a round may spend on findings over the fix floor and under the round floor'),
+    "review_panel.max_fix_growth": Dial("number", True, "either",
+        'how many times its round-1 size the change may grow before the cycle stops'),
+    # #492's absolute half of that ceiling. Settable on its own and nullable on its
+    # own, which is the whole reason it is a second key rather than a pair inside the
+    # one above.
+    "review_panel.max_fix_growth_chars": Dial("number", True, "either",
+        'how many chars past its round-1 size it may grow; whichever ceiling binds first'),
     # What a cycle costs: how many rounds, how much of the change each seat reads,
     # how much diff it is handed, and whether a second model adjudicates.
-    "review_panel.max_rounds": Dial("number", False, "either"),
-    "review_panel.reviewer_scope": Dial("scope", False, "either"),
-    "review_panel.max_diff_chars": Dial("number", True, "either"),
-    "review_panel.judge_max_diff_chars": Dial("number", True, "either"),
-    "review_panel.judge_model": Dial("text", False, "either"),
+    "review_panel.max_rounds": Dial("number", False, "either",
+        'how many rounds one review cycle may run before it stops and hands over'),
+    "review_panel.reviewer_scope": Dial("scope", False, "either",
+        'whether a finding must be in the change, or may be anywhere it touches'),
+    "review_panel.max_diff_chars": Dial("number", True, "either",
+        'chars of diff each reviewer is handed; null hands over the whole thing'),
+    "review_panel.judge_max_diff_chars": Dial("number", True, "either",
+        'chars of diff the judge is handed; inherits max_diff_chars when unset'),
+    "review_panel.judge_model": Dial("text", False, "either",
+        'which model adjudicates the seats, and it must not be one of their own'),
     # #278's dial, and #84's futility brake.
-    "review_panel.distant_merge_lines": Dial("number", True, "either"),
-    "review_panel.escalate_on.premise_repeated": Dial("number", True, "either"),
+    "review_panel.distant_merge_lines": Dial("number", True, "either",
+        "lines a base merge may change in this PR's own files before the round is redone"),
+    "review_panel.escalate_on.premise_repeated": Dial("number", True, "either",
+        'how many times one rejected premise may be declared before the cycle escalates'),
+    "review_panel.escalate_on.premise_undecidable": Dial("flag", True, "either",
+        'escalate as soon as a fixer says the runtime cannot observe what is asserted'),
+    # #489's injection gate, `nullable` for its sibling's reason: `null` is how a
+    # repo switches a futility brake off, and a board that could move the number but
+    # not turn it off would be a channel with half a policy in it.
+    "review_panel.escalate_on.fix_injection": Dial("number", True, "either",
+        "share of a round's new findings that its own previous fix pass may have created"),
+    # #505's volume rung, on the same terms. A fleet mid-drain wants a shorter
+    # window than a fleet reviewing one careful pull request, which is exactly the
+    # decision the dial layer exists for — and `nullable` for its sibling's reason:
+    # a board that could move the number but not turn the brake off would be a
+    # channel carrying half a policy.
+    "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either",
+        'consecutive rounds whose new-finding count may fail to fall before escalating'),
+    # #507's constructive pass. `either`, because it is the one dial here whose two
+    # directions cost different things and neither is a merge policy: switching it ON
+    # spends a fan-out on cycles that escalate, switching it OFF sends a human to a
+    # veto line with a list of complaints and no proposal. A fleet mid-drain may well
+    # want the first answer and a fleet reviewing one careful pull request the second,
+    # which is exactly the decision a settings channel exists for — and it can move no
+    # verdict either way, so there is nothing here a board could loosen.
+    "review_panel.propose_on_escalation": Dial("flag", False, "either",
+        'whether an escalation arrives with a proposed change or only with complaints'),
     # #55's ceiling, and it is the reason this table's `narrow`/`either` split is
     # not the whole story. These five are `either` — a person may raise a ceiling
     # as well as lower one, which is the point of a settings channel — but they are
@@ -2044,12 +2483,18 @@ BOARD_DIALS: dict[str, Dial] = {
     # applied to a run, and `panel_caps` treats the layer that answered as part of
     # the answer: a ceiling the board stated cannot be exceeded by the repo's own
     # file, by `--max-rounds`, or by `--force`. See `panel_caps.ceiling_of`.
-    "review_panel.budget.tokens_per_day": Dial("number", True, "either"),
-    "review_panel.budget.runs_per_day": Dial("number", True, "either"),
-    "review_panel.budget.tokens_per_pr": Dial("number", True, "either"),
-    "review_panel.budget.runs_per_pr": Dial("number", True, "either"),
-    "review_panel.budget.fleet_tokens_per_day": Dial("number", True, "either"),
-    "review_panel.budget_window_hours": Dial("number", False, "either"),
+    "review_panel.budget.tokens_per_day": Dial("number", True, "either",
+        'tokens this repo may spend on panels in the rolling window'),
+    "review_panel.budget.runs_per_day": Dial("number", True, "either",
+        'panel runs this repo may spend in the rolling window'),
+    "review_panel.budget.tokens_per_pr": Dial("number", True, "either",
+        'tokens one PR may spend across every cycle and every head it has had'),
+    "review_panel.budget.runs_per_pr": Dial("number", True, "either",
+        'panel runs one PR may spend across every cycle and every head it has had'),
+    "review_panel.budget.fleet_tokens_per_day": Dial("number", True, "either",
+        'tokens every watched repo combined may spend in the rolling window'),
+    "review_panel.budget_window_hours": Dial("number", False, "either",
+        'how long the rolling window is that the per-day ceilings are counted over'),
     # #55's fourth acceptance criterion: turning the watcher off for a repo takes
     # ONE setting and takes effect on the next resolution rather than the next
     # restart — which is what a dial is, since `resolve_repo` reads them on every
@@ -2057,12 +2502,48 @@ BOARD_DIALS: dict[str, Dial] = {
     # a repo that has switched its own reviews off knows something the board does
     # not, so the board may turn a repo OFF and may not turn one back ON over the
     # top of a file that said no.
-    "enabled": Dial("flag", False, _NARROW_ONLY_ENABLED),
+    "enabled": Dial("flag", False, _NARROW_ONLY_ENABLED,
+        'whether this repo is reviewed at all'),
     # The boundary case, narrow-only. Filled in below from DEFAULTS' seat list so
     # that a seat added there is settable without a second edit here — a seat named
     # in two places is a seat the two places can disagree about.
-    **{f"{_LOCAL_BLOCK}.{seat}.enabled": Dial("flag", False, _NARROW_ONLY_ENABLED)
+    **{f"{_LOCAL_BLOCK}.{seat}.enabled": Dial(
+           "flag", False, _NARROW_ONLY_ENABLED,
+           f"whether the {seat} seat is dispatched on a round")
        for seat in DEFAULTS[_LOCAL_BLOCK]},
+    # ---- and here the table stops being the panel's (#563) --------------------
+    #
+    # `spawn.json` carries three keys and one of them was never a permission.
+    # `enabled` and `commands` say what a box MAY do and stay in the nix-written,
+    # read-only file for `qb-start`'s own reason — *"a permission with a convenient
+    # bypass is not one"*, and a board a machine cannot reach must not be able to
+    # decide whether that machine may start agents at all. `max_sessions` says how
+    # HARD it may work, which is the `in_flight.max` side of the line that same file
+    # draws: a restriction, counting a resource rather than guarding a door. It was
+    # in the permission file only because that is where it was written, and it
+    # inherited the permission file's deployment path — a nix edit, a build, a PR, a
+    # merge, a `nixos-rebuild` and a human with the password, for a number.
+    #
+    # `0` IS A FREEZE, and it is the direction that matters. It is the only control
+    # that stops a box spawning without switching the mechanism off, and calming a
+    # fleet that is working too hard should not require a rebuild at exactly the
+    # moment nobody wants to be running one.
+    #
+    # SAFE TO PUT ON THE BOARD BECAUSE WRITES ARE HUMAN-ONLY. `set_dial` and
+    # `clear_dial` take `Depends(human)` and `app/api/dials.py` calls that the
+    # security argument, so an agent may read its own ceiling and cannot raise it —
+    # which is the whole of what makes this a throttle rather than an escalation.
+    "spawn.max_sessions": Dial("number", False, "either",
+        'agent sessions one machine may have spawned and running at once; 0 is a freeze',
+        applies=_APPLIES_FLEET),
+    # The half that has no local meaning, which is why it has no file to fall back
+    # to. A per-machine file cannot express a fleet-wide number, and five boxes each
+    # carrying a copy is how five boxes come to disagree about what the limit is.
+    # UNSET IS NO CEILING: the fleet ran without one until this existed, and the
+    # per-machine ceiling underneath is the real safety net.
+    "spawn.max_sessions_fleet": Dial("number", False, "either",
+        'agent sessions live across the whole board before a spawn is refused',
+        applies=_APPLIES_FLEET),
 }
 
 #: The severity bands a floor may name. `P0` is deliberately absent: the panel's
@@ -2073,11 +2554,34 @@ BOARD_DIALS: dict[str, Dial] = {
 #: is: every severity entering the panel is stripped and upper-cased, so a layer
 #: that refused `"p2"` while the sample beside it accepted it would make one written
 #: value mean two things depending on which layer carried it.
-_SEVERITY_RE = re.compile(r"^[Pp][1-4]$")
+#:
+#: SPELLED OUT AS A TUPLE, with the pattern built from it, because #539 needs the
+#: bands as words — a form that offers a floor's four legal values cannot read them
+#: out of a regex, and a screen that listed `P1..P4` in its own prose would be a
+#: second copy of the ladder that goes stale the day a band is added.
+_SEVERITY_BANDS = ("P1", "P2", "P3", "P4")
+_SEVERITY_RE = re.compile(f"^[Pp][{''.join(b[1] for b in _SEVERITY_BANDS)}]$")
 
-#: What `reviewer_scope` accepts. Two words, and a third would silently review the
-#: whole PR every round.
-_SCOPES = ("diff", "increment")
+#: The two ends of `file_deferral_issues`, beside the P1..P4 bands (#482). Lower-cased
+#: on the way in for `_SEVERITY_RE`'s reason: one written value must not mean two
+#: things depending on which layer carried it.
+_DEFERRAL_GATE_ENDS = ("always", "never")
+
+#: What `reviewer_scope` accepts: defects in the change (`diff`), or in the change
+#: and everything it touches (`repo`, the pre-#165 posture). Two words, and a third
+#: would silently review the whole PR every round.
+#:
+#: **`increment` USED TO BE HERE AND IS `round_scope`'S WORD** (`panel_core.
+#: ROUND_SCOPES`), which made this layer wrong in both directions at once and
+#: neither was visible from the board: the documented value `repo` was REFUSED here
+#: and never applied, while `increment` passed this check, was written into the
+#: resolved config, and then met `panel_seats.reviewer_scope` — which refuses a word
+#: it does not know with `SystemExit`. A board dial that validates and then kills
+#: the run is the worst of the three outcomes, and it is the one this spelling
+#: produced. `test_harness_dials` now holds the tuple against `REVIEWER_SCOPES`
+#: itself, which is the only thing that can stop it drifting again: `panel_core`
+#: imports THIS module, so the constant cannot simply be imported from there.
+_SCOPES = ("diff", "repo")
 
 
 def _config_file(path: Path) -> dict[str, str]:
@@ -2289,6 +2793,19 @@ def _dial_default(path: str) -> tuple[Any, bool]:
     return node, True
 
 
+def _is_band(value: Any) -> bool:
+    """Is this a severity band a floor may name, written any way a hand writes one?
+
+    STRIPPED BEFORE MATCHING, which is the half `_SEVERITY_RE`'s own comment claims
+    and the check did not do: `panel_seats._severity` strips and upper-cases every
+    severity that enters the panel, and `severity_floor` therefore accepts `" p2 "`
+    out of a rules file. A board dial that refused the same value would make one
+    written value mean two things depending on which layer carried it — and the layer
+    is exactly what a person writing into a settings endpoint cannot see.
+    """
+    return isinstance(value, str) and bool(_SEVERITY_RE.match(value.strip()))
+
+
 def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     """Why this value may not be applied, or `""`.
 
@@ -2308,8 +2825,14 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
             f"`{path}` must be true or false, not {value!r} — a quoted 'false' is "
             f"a non-empty string and would read as ON")
     if dial.kind == "severity":
-        return "" if isinstance(value, str) and _SEVERITY_RE.match(value) else (
+        return "" if _is_band(value) else (
             f"`{path}` must be a severity band P1-P4, not {value!r}")
+    if dial.kind == "deferral_gate":
+        ok = _is_band(value) or (isinstance(value, str)
+                                 and value.strip().lower() in _DEFERRAL_GATE_ENDS)
+        return "" if ok else (
+            f"`{path}` must be a severity band P1-P4 or one of "
+            f"{', '.join(_DEFERRAL_GATE_ENDS)}, not {value!r}")
     if dial.kind == "scope":
         return "" if isinstance(value, str) and value.strip().lower() in _SCOPES else (
             f"`{path}` must be one of {', '.join(_SCOPES)}, not {value!r}")
@@ -2320,9 +2843,203 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     # an int in Python and `max_rounds: true` would otherwise resolve to one round.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return f"`{path}` must be a number, not {value!r}"
+    # NaN AND THE INFINITIES, before the sign test and not after it. `json.loads`
+    # accepts all three as bare literals, and `NaN` compares false against every
+    # bound there is — so `NaN < 0` is false and a floor, a round cap or a budget
+    # would take it. `-Infinity` only fails below by luck, and `Infinity` does not
+    # fail at all. `app/api/dials.py` refuses them at the board with `allow_nan=
+    # False`; this is the same refusal made where the value is typed, which is the
+    # whole point of a client that owns the vocabulary.
+    if isinstance(value, float) and not math.isfinite(value):
+        return (f"`{path}` must be a finite number, and is {value!r} — JSON's "
+                f"`NaN` and `Infinity` are values Postgres will not store and "
+                f"nothing here can compare against")
     if value < 0:
         return f"`{path}` must not be negative, and is {value!r}"
     return ""
+
+
+#: One line per `kind`, in the words a person types into a box — the answer to
+#: "what does THIS dial take", which no single placeholder over 29 dials and six
+#: kinds can give. Built from the same constants `_dial_problem` judges by, so the
+#: hint and the refusal cannot drift apart: a form that offered `always` for a
+#: `severity` would be a second, wrong statement of the vocabulary, which is the
+#: failure #56's rule and #305 both exist to end.
+_KIND_HINTS = {
+    "severity": f"a severity band — {', '.join(_SEVERITY_BANDS)}",
+    "deferral_gate": (f"a severity band ({', '.join(_SEVERITY_BANDS)}) "
+                      f"or {' / '.join(_DEFERRAL_GATE_ENDS)}"),
+    "scope": " or ".join(_SCOPES),
+    "flag": "true or false, unquoted",
+    "number": "a number",
+    "text": "a string",
+}
+
+#: Said whenever a `narrow` dial is about to be typed into, because the direction
+#: rule is invisible in the value and only discoverable by having a write ignored.
+#: A WARNING AND NOT A REFUSAL: whether `true` is a widening depends on what this
+#: box's overlay and the repo's own sample already say, and neither is knowable
+#: from a screen that has not resolved the repo — `apply_dials` is where the two
+#: meet and where the ignoring actually happens.
+_NARROW_NOTE = "narrow only — the board may switch this off, never back on"
+
+#: Said whenever a `fleet` dial is about to be typed into. Two things a person at
+#: that box cannot see otherwise: nothing in this repo's rules holds it, so the
+#: `default` line is blank rather than broken, and the value lands on every machine
+#: on the board rather than on the repo whose screen they are looking at.
+_FLEET_NOTE = ("fleet configuration — no repo's rules hold it, so it has no "
+               "built-in default here and it is read by the tool it names")
+
+
+def dial_choices(path: str) -> tuple[str, ...]:
+    """The values this dial accepts, when there is a closed set of them.
+
+    **AS TYPED, not as judged.** These are the words that go in a value box, and a
+    box holds text: `true` here is the four characters, and it reaches
+    `dial_problem` as the boolean only once the client has taken it through its own
+    `parse_dial_value` — JSON where it parses, the string it looks like otherwise.
+    Every entry below survives that round trip, and `harness/tests` asserts it from
+    the side that has both halves; returning real booleans instead would make the
+    two closed sets that are words (`P1`, `always`) and the one that is not disagree
+    about what a choice is.
+
+    Empty for `number` and `text`, which are not lists and must not be offered as
+    though a form could enumerate them.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return ()
+    if dial.kind == "severity":
+        return _SEVERITY_BANDS
+    if dial.kind == "deferral_gate":
+        return _SEVERITY_BANDS + _DEFERRAL_GATE_ENDS
+    if dial.kind == "scope":
+        return _SCOPES
+    if dial.kind == "flag":
+        return ("true", "false")
+    return ()
+
+
+def dial_hint(path: str) -> str:
+    """What to type into this dial's value box, in one line.
+
+    The nullable half is appended rather than written per dial: `null` is the
+    documented OFF SWITCH wherever `Dial.nullable` is true and means "inherit the
+    default" everywhere else, and a person cannot tell which from the value box.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return ""
+    hint = _KIND_HINTS.get(dial.kind, dial.kind)
+    return hint + (" — or `null`, which switches it off" if dial.nullable else "")
+
+
+def dial_specs() -> dict[str, dict]:
+    """Every board-settable dial as plain data, for a client drawing a form — #539.
+
+    Setting a dial used to be four empty boxes and one placeholder covering all of
+    them at once (`P3, 2, true, null`), so the question a person actually has —
+    what does THIS one take, what is it now, which way may it move — had no answer
+    on the screen where it is asked. The names, kinds, directions and defaults were
+    all here the whole time, two directories from the dashboard that draws the box.
+
+    NOT A NEW STATEMENT OF ANY OF IT. `BOARD_DIALS` still settles the list and the
+    shapes, `DEFAULTS` still holds every default, and this reads both back — the
+    same thing `_dial_default` does and for the same reason. A client rendering
+    this is reading the one copy, which is what #56's rule asks for; a client that
+    hard-coded the same table would be the second place a dial is written down.
+
+    **IN THE TABLE'S ORDER, and that is part of the answer.** `BOARD_DIALS` is
+    written grouped — the two floors first, then what a cycle costs, then the
+    futility brakes, then the budgets, then the switches — and a client that sorted
+    the names would open on `enabled`, which is alphabetically first, is the one
+    dial that turns this repo's reviews off entirely, and is nobody's answer to
+    "what did I come here to change".
+    """
+    out: dict[str, dict] = {}
+    for path, dial in BOARD_DIALS.items():
+        default, known = _dial_default(path)
+        out[path] = {
+            "dial": path,
+            #: What it decides, in one line. First in the entry because it is first
+            #: in the question a person is asking: which of these did I want.
+            "what": dial.what,
+            "kind": dial.kind,
+            "nullable": dial.nullable,
+            "rule": dial.rule,
+            #: The built-in default, and whether `DEFAULTS` actually had one. A
+            #: dial with no default is a bug in this table rather than a dial that
+            #: defaults to null, and the flag is how a form can say so instead of
+            #: drawing `null` as if it were the shipped answer.
+            "default": default,
+            "default_known": known,
+            "choices": list(dial_choices(path)),
+            "hint": dial_hint(path),
+            #: WHICH TREE THIS DIAL LIVES IN — `rules` or `fleet` (#563). A client
+            #: needs it to read `default_known: False` correctly: on a rules dial
+            #: that is a hole in this table, and on a fleet dial it is the truth,
+            #: because the fallback is a per-machine file no board can read.
+            "applies": dial.applies,
+            #: Both notes when both apply, so neither is lost to the other. Joined
+            #: rather than listed because every consumer of this field draws it as
+            #: one line under the value box.
+            "note": "; ".join(
+                n for n in (_NARROW_NOTE if dial.rule == "narrow" else "",
+                            _FLEET_NOTE if dial.applies != _APPLIES_RULES else "")
+                if n),
+        }
+    return out
+
+
+def dial_problem(path: str, value: Any) -> str:
+    """Why this dial cannot carry this value, or `""` — asked BEFORE the write.
+
+    The same judgement `board_dials` makes on the way in, made one step earlier so
+    that a person typing gets the sentence instead of a round three hours later
+    getting the default. `POST /dials` cannot make it: the board stores `dial` as
+    opaque text and `value` as opaque JSON on purpose, so a misspelt name or a
+    quoted `"2"` is accepted, stored, returned and then ignored by every harness
+    that reads it (#305, #539).
+
+    The unknown-name sentence is not `board_dials`' and should not be: that one is
+    about a row already on the board that this run is dropping, and this one is
+    about a write that has not happened yet, where the fix is to type a different
+    name rather than to go and clear something.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None:
+        return (f"`{path}` is not a board-settable dial. This harness settles that "
+                f"list, not the board — a dial the board holds and nothing applies "
+                f"is worse than no dial at all")
+    return _dial_problem(path, dial, value)
+
+
+def dial_scope_problem(path: str, repo: str | None) -> str:
+    """Why this dial may not be set at this SCOPE, or `""` — asked BEFORE the write.
+
+    The board takes either scope for any dial, on purpose: `dial` is opaque text
+    there and `repo` is just a column, so a repo-scoped `spawn.max_sessions` is
+    accepted, stored, and reported as in force for ever while nothing reads it. That
+    is the same shape as a misspelt name and it is answered in the same place — the
+    client, which is the only side that knows what a dial IS.
+
+    **A fleet dial has no repo answer, and that is not a limitation of the storage.**
+    `spawn.max_sessions` bounds panes on one tmux server, counted by `live_spawns()`,
+    which does not know which checkout each pane is in — so with `acme/widget` at 5
+    and `acme/gadget` at 2 there is no question the count has answered. A scope that
+    cannot mean anything must be refused where it is typed, not stored and ignored.
+
+    The other direction is deliberately NOT refused. A rules dial is legitimately
+    fleet-scoped — that is how one value covers every watched repo, and most of this
+    fleet's dials are set that way.
+    """
+    dial = BOARD_DIALS.get(path)
+    if dial is None or dial.applies == _APPLIES_RULES or not repo:
+        return ""
+    return (f"`{path}` is fleet configuration and cannot be set for one repo. It is "
+            f"read directly by the tool it names, which has no repo in the question "
+            f"it answers — a row scoped to {repo} would be stored, reported as in "
+            f"force, and applied by nothing. Set it with no repo")
 
 
 def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
@@ -2379,7 +3096,12 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
         # lower-cases a scope on its way in, and a provenance table showing `"p3"`
         # beside a round that ran `P3` is a table a reader would have to second-guess.
         if dial.kind == "severity":
-            value = value.upper()
+            value = value.strip().upper()
+        elif dial.kind == "deferral_gate":
+            # Each half normalised the way its own vocabulary is: a band upper-cased
+            # like every other severity, an end lower-cased like every other word.
+            value = (value.strip().upper() if _is_band(value)
+                     else value.strip().lower())
         elif dial.kind == "scope":
             value = value.strip().lower()
         scope = "repo" if row.get("scope") == "repo" else "fleet"
@@ -2440,6 +3162,15 @@ def apply_dials(cfg: dict, dials: dict[str, dict]) -> tuple[dict[str, dict], lis
     problems: list[str] = []
     for path, entry in sorted(dials.items()):
         dial = BOARD_DIALS[path]
+        if dial.applies != _APPLIES_RULES:
+            # Not this config's business and NOT a problem (#563). A fleet dial is
+            # read directly by the tool it configures — `spawn.max_sessions` by
+            # `qb-start`, which has no repo to resolve and would not consult one —
+            # so there is nothing here to override and nothing to complain about.
+            # Reported as a problem it would put a line about the fleet's spawn
+            # ceiling into the provenance of every panel round on every repo, which
+            # is how a correct setting comes to read as a misconfiguration.
+            continue
         current, present = _get_dial(cfg, path)
         if not present:
             # The dial exists in DEFAULTS but not in this resolved config, which

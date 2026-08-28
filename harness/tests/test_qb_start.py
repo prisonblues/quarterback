@@ -37,7 +37,6 @@ Run: pytest harness/tests/test_qb_start.py
 """
 
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -48,6 +47,10 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 START = BIN / "qb-start"
 HM_MODULE = Path(__file__).resolve().parents[1] / "hm-module.nix"
@@ -56,6 +59,22 @@ STARTED, MISUSE = 0, 2
 NOT_ENABLED, NOT_ALLOWED, AT_CAP = 3, 4, 5
 PACED, FULL, HELD = 6, 7, 8
 COULD_NOT_START = 9
+AT_FLEET_CAP = 10
+
+
+def dial(name: str, value: object, repo: str | None = None) -> dict:
+    """One row as `GET /dials` returns it. Fleet scope by default, which is the only
+    scope either spawn dial can mean — `repo` is for the row that should not exist."""
+    return {"dial": name, "value": value,
+            "scope": "repo" if repo else "fleet", "repo": repo,
+            "reason": "a test", "set_by": "human/rich", "expires_at": None}
+
+
+def agents(n: int, subagents: int = 0) -> dict:
+    """`GET /active`'s shape with `n` live top-level agents beside `subagents` of
+    their fan-out, which is deliberately not counted."""
+    return {"agents": [{"session": f"s{i}"} for i in range(n)],
+            "subagents": [{"agent_id": f"a{i}"} for i in range(subagents)]}
 
 TMUX = shutil.which("tmux")
 
@@ -79,6 +98,7 @@ def stub_tool(path: Path, exit_code: int = 0, log: Path | None = None) -> None:
 
 
 def sandbox(tmp_path: Path, *, policy: object = "absent", explode: bool = True,
+            plan_next: object = "unset", dials: object = None, active: object = None,
             pace: int = 0, admit: int = 0, claim: int = 0, release: int = 0,
             tmux_exit: int | None = 0, new_window_exit: int | None = None,
             set_option_exit: int | None = None,
@@ -94,6 +114,7 @@ def sandbox(tmp_path: Path, *, policy: object = "absent", explode: bool = True,
     copied = stub / START.name
     copied.write_bytes(START.read_bytes())
     posts = tmp_path / "posts.jsonl"
+    reads = tmp_path / "reads.jsonl"
     (stub / "qbdata.py").write_text(f"""
 import json
 
@@ -107,9 +128,46 @@ class _Client:
             fh.write(json.dumps({{"path": path, "body": body}}) + "\\n")
         return {{}}
 
+    def get(self, path, params=None, timeout=None):
+        # Recorded, so a test can assert what was asked and with what bound — the
+        # dial read is on the hot path and the point of its short timeout is that
+        # it is short.
+        with open({str(reads)!r}, "a") as fh:
+            fh.write(json.dumps({{"path": path, "params": params,
+                                  "timeout": timeout}}) + "\\n")
+        if path == "/dials":
+            # `None` is a board with no dial layer at all — the pre-#563 board, and
+            # the ordinary state of a fleet that has set none. qb-start's ceiling
+            # then comes off the policy file, which is the fail-open property.
+            if {dials!r} is None:
+                raise AttributeError("this stub board holds no dials")
+            # A STRING is how a test asks for a body that is not the shape the
+            # caller expects: `"list"` answers a JSON array, which is truthy and has
+            # no `.get`, and `"dials-not-a-list"` answers an object whose one key is
+            # the wrong type. Both are readable answers that mean nothing.
+            if {dials!r} == "list":
+                return [1, 2]
+            if {dials!r} == "dials-not-a-list":
+                return {{"dials": "several"}}
+            return {{"dials": {dials!r}}}
+        if path == "/active":
+            if {active!r} is None:
+                raise AttributeError("this stub board answers no /active")
+            if {active!r} == "list":
+                return [1, 2]
+            return {active!r}
+        # `unset` means this stub has no `get` worth speaking of, which is the
+        # pre-#541 board: qb-start's plan question then fails OPEN and says so.
+        if {plan_next!r} == "unset":
+            raise AttributeError("this stub board answers no reads")
+        return {{"next": {plan_next!r} or None}}
+
 
 def repo_slug(path="."):
-    return "acme/widget"
+    # None for a path that is not a checkout, which is what the real one answers and
+    # what `read_ceilings` degrades on: the repo buys the diagnostic, not the number.
+    import os.path
+    return "acme/widget" if os.path.isdir(os.path.join(path, ".git")) else None
 
 
 def board_client():
@@ -148,8 +206,8 @@ def board_client():
         (tools / "tmux").chmod(0o755)
 
     # $XDG_CONFIG_HOME, because there is no override to point at a file: the
-    # resolution under test is the real one, and it is the same one `qb-env`,
-    # `qb-seat` and `qbdata` use. A `$QUARTERBACK_SPAWN` existed here until the
+    # resolution under test is the real one, and it is the same one `qb-env` and
+    # `qbdata` use. A `$QUARTERBACK_SPAWN` existed here until the
     # codex review pointed out that a bypass a repository could set falsifies the
     # only claim this gate makes.
     config = tmp_path / "config"
@@ -163,20 +221,36 @@ def board_client():
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
 
     return {"script": copied, "policy": policy_path, "config": config, "repo": repo,
-            "tools": tools, "log": log, "posts": posts}
+            "tools": tools, "log": log, "posts": posts, "reads": reads,
+            "root": tmp_path}
 
 
 def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
         env: dict | None = None, cwd: Path | None = None):
     """`qb-start` inside the sandbox. `tmux` is what $TMUX is set to — empty means
     there is no multiplexer, which is a different answer from a broken one."""
-    where = {**os.environ,
-             "XDG_CONFIG_HOME": str(box["config"]),
-             "PATH": f"{box['tools']}{os.pathsep}{os.environ['PATH']}",
-             **(env or {})}
-    where.pop("TMUX", None)
+    over = {"XDG_CONFIG_HOME": str(box["config"]), **(env or {})}
     if tmux:
-        where["TMUX"] = tmux
+        over["TMUX"] = tmux
+    # `box["tools"]` and a toolbox of named binaries, not the developer's PATH
+    # (#528). `qb-start` resolves its neighbours with `shutil.which`, so the
+    # inherited PATH found the INSTALLED `qb-claim` the moment a test deleted the
+    # stub — `test_a_qb_claim_that_is_not_installed_refuses_the_spawn` ran a real
+    # `qb-claim issue 277` against a throwaway repo, measured once per run, and
+    # got its verdict from that tool failing for an unrelated reason rather than
+    # from the tool being missing. `sibling()`'s `${script dir}/qb-claim` fallback
+    # cannot restore it either: the copy under test sits in `stub/`, which holds
+    # only what this fixture wrote.
+    #
+    # `sleep` is on the list because tmux hands the pane it opens THIS PATH, and
+    # the real-tmux tests below use `sleep 60` as their still-running agent —
+    # measured: without it the pane's command dies at once and `@qb_spawn_ended`
+    # is set before the test can read it.
+    where = _path_sandbox.sandbox_env(
+        box["root"], box["tools"], tools=("git", "sh", "bash", "sleep"), **over)
+    if not tmux:
+        where.pop("TMUX", None)
+    where.pop("TMUX_PANE", None)
     got = subprocess.run(
         [sys.executable, str(box["script"]),
          "--repo-path", repo_path or str(box["repo"]), *args],
@@ -184,6 +258,8 @@ def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
     got.ran = (box["log"].read_text().splitlines() if box["log"].exists() else [])
     got.posts = [json.loads(ln) for ln in
                  (box["posts"].read_text().splitlines() if box["posts"].exists() else [])]
+    got.reads = [json.loads(ln) for ln in
+                 (box["reads"].read_text().splitlines() if box["reads"].exists() else [])]
     return got
 
 
@@ -487,8 +563,9 @@ def test_a_dry_run_prints_the_argv_it_would_run(tmp_path):
 def test_a_caller_can_ask_what_this_machine_will_start_without_asking_for_one(tmp_path):
     """`--policy` is the question a trigger with a button on it has to ask BEFORE
     the click. It starts nothing, claims nothing, posts nothing — and `explode` is
-    left ON here, so "consults nothing but the policy file" is a board client that
-    could not have been imported rather than a sentence about one."""
+    left ON here, so the board client could not have been imported at all, which
+    makes this the FAIL-OPEN case as well: the ceiling is the policy file's, named
+    as the policy file's, and nothing about the answer degrades (#563)."""
     box = sandbox(tmp_path, policy=ENABLED)
     got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
     assert got.returncode == STARTED, got.stderr
@@ -496,6 +573,8 @@ def test_a_caller_can_ask_what_this_machine_will_start_without_asking_for_one(tm
     assert answer["enabled"] is True
     assert answer["commands"] == ["/fix-issue", "/panel-review-pr"]
     assert answer["max_sessions"] == 2
+    assert answer["max_sessions_source"] == "policy"
+    assert answer["max_sessions_fleet"] is None
     assert got.ran == [], f"asking the question consulted {got.ran}"
     assert got.posts == []
 
@@ -862,14 +941,26 @@ def test_the_nix_module_and_the_script_agree_on_what_can_be_spawned():
     assert set(re.findall(r'"(/[a-z-]+)"', nix)) == read_spawnable()
 
 
-def test_every_spawnable_command_claims_something():
+def test_every_spawnable_command_says_what_it_claims_even_when_that_is_nothing():
     """A command whose unit of work nobody has worked out is a command that cannot
-    be started — not one that is started uncounted."""
+    be started — not one that is started uncounted.
+
+    Restated for #541 rather than relaxed. The old form read the ref kind out of
+    the table and required one for every entry, which WAS the arity check as long
+    as every command took a number. `/get-involved` takes none, so the invariant
+    is now: every entry names a kind, or names `None` deliberately — and `None`
+    means the session claims its own item once it has read the plan, never that
+    nobody thought about it. An entry the pattern below cannot match at all still
+    fails, which is the half that matters."""
     body = START.read_text()
-    block = body.split("SPAWNABLE = {", 1)[1].split("}", 1)[0]
-    kinds = dict(re.findall(r'"(/[a-z-]+)"\s*:\s*"([a-z]+)"', block))
-    assert set(kinds) == read_spawnable()
-    assert set(kinds.values()) <= {"issue", "pr"}
+    block = body.split("SPAWNABLE = {", 1)[1].split("\n}", 1)[0]
+    kinds = dict(re.findall(r'"(/[a-z-]+)":\s*Spawnable\(\s*(None|"[a-z]+")', block))
+    assert set(kinds) == read_spawnable(), "an entry nobody declared an arity for"
+    assert set(kinds.values()) <= {'"issue"', '"pr"', "None"}
+    claimless = {c for c, k in kinds.items() if k == "None"}
+    assert claimless == {"/get-involved"}, (
+        "a new claimless command needs the claim-skip path and its own test, not "
+        "just a table entry")
 
 
 def test_the_module_and_the_script_agree_on_the_policys_key_names():
@@ -895,3 +986,464 @@ def test_the_module_writes_the_policy_only_when_spawning_is_enabled():
     assert re.search(r"commands = lib\.mkOption \{\s*\n\s*type = lib\.types\.listOf "
                      r"lib\.types\.str;\s*\n\s*default = \[ \];", nix), \
         "spawn.commands must ship empty — that is the second lock"
+
+
+# ------------------------------------------------- #541: a command with no number
+
+#: A policy that admits `/get-involved` honestly — it and everything it dispatches
+#: into. Written out rather than computed, so a test cannot pass because the
+#: production table and the fixture drifted the same way.
+INVOLVED_OK = {"enabled": True, "max_sessions": 2, "commands": [
+    "/get-involved", "/fix-issue", "/fix-and-land", "/review-pr", "/panel-review-pr"]}
+
+
+def test_a_numberless_command_is_accepted_and_briefs_without_one(tmp_path):
+    """`/get-involved` reads the plan and self-selects, so there is no number to
+    pass. The brief must be the command ALONE — not `"/get-involved "` and not
+    `"/get-involved None"`, both of which a slash-command parser matching on
+    equality would miss."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next={"item_id": "x"})
+    got = run(box, "--dry-run", "/get-involved")
+    assert got.returncode == STARTED, got.stderr
+    assert "-- /get-involved" in got.stderr
+    assert "/get-involved None" not in got.stderr
+
+
+def test_a_numbered_command_still_refuses_a_missing_number(tmp_path):
+    """The arity moved into the table; it did not go away."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False)
+    got = run(box, "--dry-run", "/fix-issue")
+    assert got.returncode == MISUSE, got.stderr
+    assert "takes an issue or PR number" in got.stderr
+
+
+def test_a_number_handed_to_a_numberless_command_is_a_misuse(tmp_path):
+    """The other direction, and it is not pedantry: a caller passing a number
+    believes it has aimed this at something specific. Silently dropping it would
+    start a session that picks its own work while the caller's records say
+    otherwise."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False)
+    got = run(box, "--dry-run", "/get-involved", "7")
+    assert got.returncode == MISUSE, got.stderr
+    assert "takes no number" in got.stderr
+
+
+def test_the_claimless_path_takes_no_claim_and_releases_none(tmp_path):
+    """The work interlock moves inside the session (`plan_claim`), because which
+    item it takes is not known until it has read the plan. What must NOT happen is
+    a claim on the wrong thing — or a release of one that was never taken, on a
+    spawn that fails."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False,
+                  plan_next={"item_id": "x"}, new_window_exit=1)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START, got.stderr
+    assert not [c for c in got.ran if c[0] in ("qb-claim", "qb-release")], got.ran
+    assert "no claim was taken" in got.stderr
+
+
+def test_a_policy_allowing_get_involved_but_not_what_it_dispatches_is_refused(tmp_path):
+    """The second lock, kept true in fact rather than in form. `/get-involved`
+    runs `/fix-issue` one hop along, so a machine that allows the first and
+    withholds the second gets the second anyway — and its operator has no way to
+    see it, because `--policy` reports the allowlist."""
+    policy = {"enabled": True, "commands": ["/get-involved", "/review-pr",
+                                            "/panel-review-pr", "/fix-and-land"]}
+    box = sandbox(tmp_path, policy=policy, explode=False)
+    got = run(box, "--dry-run", "/get-involved")
+    assert got.returncode == NOT_ALLOWED, got.stderr
+    assert "/fix-issue" in got.stderr and "one hop along" in got.stderr
+
+
+def test_policy_reports_a_command_it_lists_but_refuses(tmp_path):
+    """A file that disagrees with itself is the one thing an operator cannot read
+    off the file."""
+    policy = {"enabled": True, "commands": ["/get-involved", "/review-pr",
+                                            "/panel-review-pr", "/fix-and-land"]}
+    got = run(sandbox(tmp_path, policy=policy, explode=False), "--policy")
+    assert got.returncode == STARTED, got.stderr
+    assert "listed but refused" in got.stderr
+    assert "/get-involved" in got.stderr
+
+
+def test_dry_run_prints_a_claim_line_for_a_numbered_command_and_not_otherwise(tmp_path):
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next={"item_id": "x"})
+    numbered = run(box, "--dry-run", "/fix-issue", "277")
+    assert "claim:    issue 277" in numbered.stderr, numbered.stderr
+    involved = run(box, "--dry-run", "/get-involved")
+    assert "claim:    none" in involved.stderr, involved.stderr
+
+
+def test_a_plan_with_nothing_free_refuses_before_a_session_exists(tmp_path):
+    """The refusal that costs nothing. Without it the session starts, reads the
+    plan, finds the same nothing and stops — correct, and a whole session spent to
+    reach it. At the tail of a drain that is the common case."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next=None)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == HELD, got.stderr
+    assert "nothing on the plan is free" in got.stderr
+    assert not [c for c in got.ran if c[0] == "qb-claim"], got.ran
+
+
+def test_a_board_that_cannot_answer_the_plan_question_fails_OPEN(tmp_path):
+    """The one gate here that does not fail closed, and the asymmetry is the point:
+    the gates above it are counting a resource, and this one is only avoiding a
+    wasted session. A board that did not answer has said nothing about the plan,
+    and refusing on silence would make an unreachable board look like a finished
+    one."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False,  # `unset`: no reads
+                  new_window_exit=1)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START, got.stderr
+    assert "could not ask whether the plan has anything free" in got.stderr
+
+
+def test_via_drain_is_not_accepted_yet(tmp_path):
+    """#476 adds it, with a line here and a line in harness/README.md. Until then
+    an unknown trigger is a caller nobody wrote."""
+    got = run(sandbox(tmp_path, policy=INVOLVED_OK, explode=False),
+              "--dry-run", "--via", "drain", "/get-involved")
+    assert got.returncode != STARTED
+
+
+# ------------------------------------- #563: the ceiling is a dial, the gate is not
+
+#: A policy whose own ceiling is 2, so a dial that says something else is visibly
+#: the layer that answered rather than a coincidence.
+DIALLED = {"enabled": True, "commands": ["/fix-issue", "/panel-review-pr"],
+           "max_sessions": 2}
+
+
+def test_the_board_ceiling_answers_over_the_policy_file(tmp_path):
+    """The whole of #563 in one assertion: raising 2 to 3 cost a nix edit, a build,
+    a PR, a merge, a `nixos-rebuild` and a human with the password. Now it is a dial,
+    and the file is what applies when nobody has set one."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 5)])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 5
+    assert answer["max_sessions_policy"] == 2, (
+        "the file's number is still reported — a caller has to be able to tell a "
+        "box configured at 2 from a fleet dialled to 2")
+    assert answer["max_sessions_source"] == "board"
+
+
+def test_a_freeze_can_come_from_the_board_and_names_the_layer_that_froze_it(tmp_path):
+    """`0` is the direction the issue says matters more: the only control that stops
+    a box spawning without switching the mechanism off. The remedy has to name the
+    DIAL — "raise max_sessions in spawn.json" sends somebody to edit a file whose
+    number is being overridden, and on this fleet that edit is a build, a PR and a
+    rebuild before they find out it changed nothing."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 0)])
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_CAP, got.stderr
+    assert "0 of 0" in got.stderr and "0 is a freeze" in got.stderr
+    assert "spawn.max_sessions` on the board" in got.stderr
+    assert "spawn.json" not in got.stderr, (
+        "the file is not the remedy while a dial is overriding it")
+    assert not any("qb-claim" in line for line in got.ran)
+
+
+def test_the_file_is_the_remedy_when_the_file_is_what_answered(tmp_path):
+    """The other half of the same sentence, so the message cannot simply always name
+    the dial."""
+    box = sandbox(tmp_path, policy={**DIALLED, "max_sessions": 0}, explode=False,
+                  dials=[])
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_CAP, got.stderr
+    assert "spawn.json" in got.stderr and "on the board" not in got.stderr
+
+
+def test_a_board_that_cannot_be_read_leaves_the_file_in_force_and_says_so(tmp_path):
+    """FAILS OPEN, unlike its neighbours in that file and for `qb-admit`'s reason: it
+    counts a resource rather than guarding a door. A ceiling that failed closed would
+    stop a box over a board hiccup, which is worse than the thing it guards."""
+    box = sandbox(tmp_path, policy={**DIALLED, "max_sessions": 0}, explode=False,
+                  dials=None)
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_CAP, got.stderr
+    assert "the board's ceiling was not used" in got.stderr
+    assert "the ceiling is" in got.stderr and "spawn.json's 0" in got.stderr
+
+
+@pytest.mark.parametrize("value", [-1, True, "lots", None, 2.5])
+def test_a_dial_that_is_not_a_number_of_sessions_is_refused_and_not_substituted(
+        value, tmp_path):
+    """`POST /dials` stores an opaque JSON value on purpose and
+    `harness_rules.dial_problem` only checks it is a number, so `-1` and `true`
+    arrive here having passed everything in front of them. A refused value leaves the
+    ceiling where it was — on the file — rather than falling to a compiled-in number
+    neither layer asked for."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", value)])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 2, (value, got.stderr)
+    assert answer["max_sessions_source"] == "policy", value
+    assert "not a non-negative whole number" in (answer["dials_problem"] or ""), \
+        (value, answer)
+
+
+def test_the_ceiling_is_asked_for_at_fleet_scope_and_bounded(tmp_path):
+    """Two properties of the read itself. **No repo**, because a machine's
+    concurrency is not a property of a repository — `live_spawns()` counts panes on
+    this tmux server without knowing which checkout each is in, so there is no
+    question a repo-scoped ceiling would have answered. And **bounded short**, for
+    `harness_rules.DIALS_TIMEOUT`'s reason: a dashboard asks `--policy` on every
+    click, so a board that is down must cost a moment rather than half a minute."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False, dials=[])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    reads = [r for r in got.reads if r["path"] == "/dials"]
+    assert len(reads) == 1, f"the ceiling was read {len(reads)} times: {got.reads}"
+    assert reads[0]["timeout"] == 5, reads[0]
+    # The repo IS sent, and it buys the REPORT rather than the ceiling: `GET /dials`
+    # answers a repo read with that repo's rows AND the fleet's, and only the fleet
+    # rows can answer a ceiling counted on a tmux server.
+    assert (reads[0]["params"] or {}).get("repo") == "acme/widget", reads[0]
+
+
+def test_a_machine_that_never_opted_in_asks_the_board_nothing(tmp_path):
+    """The property to break last, held against the new layer. A box with no policy
+    file must reach no board, no token and no network — so the dial read sits AFTER
+    the enabled check on both paths, and `explode` is left on to prove it."""
+    box = sandbox(tmp_path)
+    for argv in (("--policy", "--json"), ("/fix-issue", "277")):
+        got = run(box, *argv, tmux="/tmp/fake,1,0")
+        assert got.returncode == NOT_ENABLED, (argv, got.stderr)
+        assert got.reads == [], f"{argv} asked the board {got.reads}"
+
+
+def test_a_misuse_costs_no_board_call(tmp_path):
+    """Every refusal above the ceiling is answerable from the file, and the dial is
+    read at the first point the NUMBER is actually needed. A spawner that phoned home
+    to tell somebody they had typed an unknown command would pay for the board on the
+    one path that never needed it."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False, dials=[])
+    assert run(box, "/rm-rf", "277").reads == []
+    assert run(box, "/fix-issue", "not-a-number").reads == []
+    assert run(box, "/fix-issue", "277", repo_path=str(tmp_path)).reads == []
+
+
+# ---------------------------------------------- and the ceiling across the board
+
+def test_the_fleet_ceiling_refuses_when_the_board_is_at_it(tmp_path):
+    """The half that did not exist: `qb-pace` bounds the subscription's SPEND and
+    `qb-admit` bounds ONE REPO's work, so five boxes each set to 3 had a ceiling of
+    fifteen and nothing that knew it."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 4)], active=agents(4))
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_FLEET_CAP, got.stderr
+    assert "4 of 4 agent(s) are live across the whole board" in got.stderr
+    assert "spawn.max_sessions_fleet" in got.stderr
+    assert not any("qb-claim" in line for line in got.ran), (
+        "the fleet gate is applied before the claim, like every other ceiling")
+
+
+def test_its_own_exit_code_because_nothing_on_this_box_is_the_remedy(tmp_path):
+    """Not a second flavour of `AT_CAP`. The codes exist so a caller can tell
+    refusals apart by remedy, and these two share none: `AT_CAP` is answered here by
+    closing a pane, and this one cannot be answered here at all."""
+    assert AT_FLEET_CAP != AT_CAP
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 1)], active=agents(9))
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_FLEET_CAP
+    assert "nothing on this box moves that" in got.stderr
+
+
+def test_room_across_the_board_starts_the_session(tmp_path):
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 10)], active=agents(3))
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+
+
+def test_a_fan_out_is_not_a_session(tmp_path):
+    """`GET /active` returns `subagents` beside the agents and they are deliberately
+    not counted: a fan-out holds no pane and no seat, and counting it would make a
+    ceiling expressed in sessions bite on something that is not one."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 3)],
+                  active=agents(2, subagents=40))
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+
+
+def test_with_no_fleet_dial_the_board_is_never_asked_to_count(tmp_path):
+    """UNSET IS NO CEILING — how this fleet ran before the dial existed — and it
+    costs no call, which is what keeps the ordinary spawn as cheap as it was."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False, dials=[])
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    assert not [r for r in got.reads if r["path"] == "/active"], got.reads
+
+
+def test_the_fleet_gate_fails_OPEN_and_is_the_only_one_that_does(tmp_path):
+    """The gates that fail closed are counting a resource with the board as the only
+    source of truth. This one has a local ceiling underneath it: a board outage
+    degrades five boxes from "ten across the board" to "five each", which is bounded
+    and nowhere near a runaway, while refusing on silence would stop every box on the
+    fleet whenever the board hiccups."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 1)], active=None)
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    assert "could not count the fleet's live agents" in got.stderr
+    assert "this machine's own ceiling of 2" in got.stderr
+
+
+def test_the_local_ceiling_is_applied_before_the_board_is_asked_to_count(tmp_path):
+    """Order, and it is not cosmetic: the cheap local refusal must not pay for a
+    board call it cannot be talked out of by."""
+    box = sandbox(tmp_path, policy={**DIALLED, "max_sessions": 0}, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 10)], active=agents(0))
+    got = run(box, "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == AT_CAP, got.stderr
+    assert not [r for r in got.reads if r["path"] == "/active"], got.reads
+
+
+def test_policy_reports_the_fleet_ceiling_so_a_button_can_see_a_freeze(tmp_path):
+    """`--policy` is asked before a button is offered, and #371's rule is that a
+    button which appears to work and does not is worse than one that is absent."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 7)])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert json.loads(got.stdout)["max_sessions_fleet"] == 7
+    assert "7 live across the whole board" in got.stderr
+    assert not [r for r in got.reads if r["path"] == "/active"], (
+        "--policy reports the ceiling; counting against it is the spawn path's job")
+
+
+def test_the_script_and_the_dial_registry_name_the_same_two_dials():
+    """The no-second-source rule applied to this pair. A dial `qb-start` reads and
+    `BOARD_DIALS` does not hold is `tempo`'s state — set, stored, reported as in
+    force, and refused as unrecognised by every resolution on the fleet — which is
+    the thing #563 exists to stop, not to reproduce."""
+    sys.path.insert(0, str(BIN.parent / "loops"))
+    import harness_rules as hr
+
+    read = set(re.findall(r'^DIAL_[A-Z]+ = "([\w.]+)"', START.read_text(), re.M))
+    assert read == {"spawn.max_sessions", "spawn.max_sessions_fleet"}
+    for name in read:
+        assert name in hr.BOARD_DIALS, f"{name} is read here and settable nowhere"
+        assert hr.BOARD_DIALS[name].applies == "fleet", (
+            f"{name} is not a path into any repo's rules")
+
+
+def test_a_caller_on_a_ui_thread_can_ask_without_leaving_the_box(tmp_path):
+    """`--policy`'s own promise is that a caller may ask it on every click without
+    paying for it, and the dashboard asks it from the UI thread — where a board that
+    is down would freeze the screen for `DIALS_TIMEOUT` on every keystroke. It gives
+    up nothing by opting out: it reads only `enabled` and `commands`, both of which
+    are the file's, and the ceiling it never consulted is still applied by the spawn
+    one step later."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 5)])
+    got = run(box, "--policy", "--no-board", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    assert got.reads == [], f"--no-board asked the board {got.reads}"
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 2 and answer["max_sessions_source"] == "policy"
+
+
+def test_the_spawn_path_cannot_opt_out_of_the_board_ceiling(tmp_path):
+    """Refused rather than ignored. The ceiling is what decides whether this box may
+    start anything at all, so a flag that appeared to switch it off would be a caller
+    believing it had opted out of something it is still subject to — and a gate must
+    never look like it took an instruction it did not."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 0)])
+    got = run(box, "--no-board", "/fix-issue", "277", tmux="/tmp/fake,1,0")
+    assert got.returncode == MISUSE, got.stderr
+    assert "answers --policy and nothing else" in got.stderr
+    assert got.reads == [] and got.ran == []
+
+
+def test_the_dashboard_is_the_caller_that_takes_that_flag():
+    """The coupling only this file can hold: `--no-board` exists for one caller, and
+    a `--policy` on the UI thread that lost the flag is a five-second freeze per
+    keystroke that nothing else would notice."""
+    tui = BIN / "qb-dash-tui.py"
+    assert '"--policy", "--no-board", "--json"' in tui.read_text(), (
+        "the dashboard asks --policy from the UI thread and must not pay for a "
+        "board call it does not read")
+
+
+def test_a_ceiling_scoped_to_one_repo_is_named_rather_than_quietly_dropped(tmp_path):
+    """The dashboard's picker refuses this write (`dial_scope_problem`), and the
+    board takes it from anything else holding a human key — a `curl`, the web page —
+    because `dial` is opaque text there and `repo` is just a column. A setting
+    stored, reported as in force and read by nothing is the exact failure this layer
+    exists to end, so the reader is the last place it can be said out loud."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 9, repo="acme/widget")])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 2, "a repo-scoped ceiling must not apply"
+    assert answer["max_sessions_source"] == "policy"
+    assert "set on the board for acme/widget" in (answer["dials_problem"] or "")
+    assert "Set it with no repo" in answer["dials_problem"]
+
+
+def test_a_wrong_scoped_row_beside_a_good_one_does_not_name_the_file_as_in_force(
+        tmp_path):
+    """The half that is easy to get wrong: a refused row is reported AND the fleet
+    row still answers, so the message must not go on to say the file's number is the
+    ceiling. Naming the wrong layer as the one in force is the failure the whole
+    provenance idea exists to prevent."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 9, repo="acme/widget"),
+                         dial("spawn.max_sessions", 5)])
+    got = run(box, "/fix-issue", "277", "--dry-run", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 5 and answer["max_sessions_source"] == "board"
+    assert "set on the board for acme/widget" in got.stderr
+    assert "the ceiling is" not in got.stderr, (
+        "the file is not what answered, so it must not be named as the ceiling")
+
+
+def test_a_checkout_that_cannot_name_itself_still_gets_a_ceiling(tmp_path):
+    """The repo buys the report, not the number. A path with no slug asks for the
+    fleet rows alone, which is the answer either way — it loses a diagnostic rather
+    than a ceiling."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 5)])
+    got = run(box, "--policy", "--json", "--repo-path", str(tmp_path),
+              tmux="/tmp/fake,1,0")
+    assert json.loads(got.stdout)["max_sessions"] == 5, got.stderr
+
+
+@pytest.mark.parametrize("body,why", [
+    ("list", "a JSON array — truthy, and with no `.get` on it"),
+    ("dials-not-a-list", "an object whose `dials` is not a list"),
+])
+def test_a_board_answering_the_wrong_shape_is_a_ceiling_not_a_crash(body, why,
+                                                                    tmp_path):
+    """The shape this layer exists to survive. `body or {}` guards only the FALSY
+    answers, and a JSON array is truthy — so `.get` on it is an AttributeError
+    raised outside the fail-open try, which would crash the spawner over exactly the
+    board trouble the fallback is for."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False, dials=body)
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, (why, got.stderr)
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 2 and answer["max_sessions_source"] == "policy"
+    assert "Traceback" not in got.stderr, (why, got.stderr)
+
+
+def test_a_fleet_count_of_the_wrong_shape_fails_open_rather_than_raising(tmp_path):
+    """Same guard on the other read, and here the crash would be worse: this gate's
+    whole promise is that a board it cannot read leaves the local ceiling in charge
+    rather than stopping the spawn."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions_fleet", 1)], active="list")
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    assert "could not count the fleet's live agents" in got.stderr
+    assert "not an object" in got.stderr
+    assert "Traceback" not in got.stderr
+

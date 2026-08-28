@@ -40,6 +40,12 @@ one-project screen that column is the same word on every row and the pane is
 78 columns wide (#261). `s` widens it to the whole fleet and brings the column
 back; QB_DASH_SCOPE=all opens that way.
 
+It also opens in ONE COLUMN, and lays the panels out in two above 157 of them —
+which is two of the 78 a table wants before it wraps, plus the gutter. What the
+second column buys is height: seven panels dividing one column's rows is why
+CLAIMED and REVIEW QUEUE are two rows tall on a screen nobody would call short.
+`QB_DASH_WIDE` moves the threshold; below it nothing about the layout changes.
+
 Textual requests mouse tracking from the terminal, and tmux forwards events to
 a pane that asks for them — so this needs no tmux configuration beyond the
 `mouse on` that makes borders draggable. Hold Shift to reach tmux's own mouse
@@ -61,9 +67,9 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import Vertical
 from textual.coordinate import Coordinate
-from textual.events import Click
+from textual.events import Click, Resize
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Static
+from textual.widgets import DataTable, Footer, Input, OptionList, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import qbdata as qd                                             # noqa: E402
@@ -82,6 +88,20 @@ def sibling(name: str) -> str:
     """
     from shutil import which
     return which(name) or os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
+
+
+def env_columns(name: str, fallback: int) -> int:
+    """A column count from the environment, or the fallback — never an exception.
+
+    The one knob here is a layout threshold, and a dashboard that refused to
+    start over `QB_DASH_WIDE=wide` would be trading the panel somebody is trying
+    to read for a typo in a tuning variable. A value that is not a positive
+    number of columns is not honoured and is not fatal; it is simply not there.
+    """
+    raw = (os.environ.get(name) or "").strip()
+    if not raw.isdigit() or int(raw) < 1:
+        return fallback
+    return int(raw)
 
 
 def spawn_answer(name: str, done: "subprocess.CompletedProcess") -> str:
@@ -151,6 +171,536 @@ class Confirm(ModalScreen[bool]):
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+
+class DialEdit(ModalScreen[dict | None]):
+    """Set or clear one dial, from the pane — the write half of #477.
+
+    The dashboard could always READ what was in force; turning one was a browser
+    action, because `POST /dials` takes `app.auth.human` and this program
+    authenticates with the machine bearer token every agent on the box holds.
+    What changed is the credential, not the gate: :class:`qbdata.HumanClient`
+    presents a person's own key to the agent host, so the person at this keyboard
+    writes as themselves and the board records `human/<user>` as it always has.
+
+    **What that costs is written down rather than implied** — prisonblues/quarterback#479
+    is the record. The key is readable by everything running as this user, so
+    "the dash can set a dial" and "anything on this box can set a dial" are one
+    fact, and the second is the one to design against.
+
+    ## The vocabulary is on screen, because it has to be somewhere (#539)
+
+    The first cut of this modal had four empty boxes and one placeholder each, and
+    the value placeholder read `P3, 2, true, null` — four value kinds in one line,
+    because it had to cover all 29 dials at once and therefore could not answer the
+    only question a person actually has, which is what THIS one takes. Nothing said
+    which dials exist, what this one is set to now, or which way it may move. A
+    misspelt name saved clean: the board stores `dial` as opaque text on purpose,
+    so the refusal arrives from a round three hours later, on the old value.
+
+    Everything needed was two directories away the whole time. `harness_rules`
+    owns the dial table, `qbdata.dial_vocabulary` reads it at call time rather than
+    copying it, and this screen renders what it gets:
+
+      * **dial** — the dotted path, with the names filtered under it as you type
+        (`↓` to walk them, enter or a click to take one). **Scrolling them says what
+        each one does**: the line under the value box describes the name under the
+        CURSOR, not the name in the box, because reading down 29 dotted paths is the
+        moment "which of these did I mean" is being asked and answering it after the
+        choice is made answers it too late. Fixed when editing a row that exists; a
+        dial is identified by its name, so letting this be edited would silently
+        create a second dial rather than change the one on screen.
+      * **value** — JSON where it parses, the string it looks like otherwise
+        (`qbdata.parse_dial_value`, and `dials.html` does the same). Once a name is
+        chosen the list retires and the line under this box grows the rest of the
+        answer: what the dial accepts, what it defaults to, what is in force and at
+        which scope. The two states are the two questions, and they do not both fit
+        a 78x24 pane. `ctrl+s` refuses a value the harness would not apply — in the
+        box, naming the field, instead of storing it and finding out later.
+      * **reason** — required, by the board and here. A dial whose argument was
+        never written down is one nobody can decide to remove.
+      * **for** — `30m`, `4h`, `7d`, or empty for a dial with no end. Empty is a
+        real answer and not a missing one, and it is parsed here now rather than
+        after the modal closes, so a mistyped duration costs a keystroke instead
+        of the other three fields.
+
+    **A bad VALUE is a refusal; an unknown NAME is a warning and then a write.**
+    The table is the harness beside THIS dashboard and the two are installed
+    separately, so a hard refusal would make a box one release behind a box that
+    cannot set a dial the rest of the fleet already applies — `tempo` (#474) is the
+    standing case, drawn by both dashboards and absent from `BOARD_DIALS`. A value
+    for a name this box DOES know gets no such benefit of the doubt: the kind came
+    from the same table as the name, so there is no version of the harness in which
+    `max_rounds: "2"` is a value somebody applies.
+
+    **A box that cannot find the table still writes.** `dial_vocabulary` answers
+    `{}` on a host with no `harness/loops` beside the dashboard, and then this is
+    the form it always was: free text, no picker, no refusal, the board taking
+    both. Refusing to open would make the dashboard less useful than it was, and
+    an empty vocabulary is "cannot tell", never "nothing is settable" — so it is
+    said on the line under the value rather than shown as a dial list of length 0.
+    """
+
+    BINDINGS = [("escape", "cancel", "cancel"), ("ctrl+s", "save", "save"),
+                ("ctrl+x", "clear", "clear"), ("down", "to_names", "names")]
+
+    #: A 78x24 pane is the size this has to fit, and the picker cost it four rows
+    #: it did not have. What paid for them: the per-field margins (the spec line
+    #: reads as the value box's caption without one), the scope, which moved into
+    #: the title where it is always visible rather than last where it was first to
+    #: be clipped, and the refusal line, which takes no room until there is one.
+    #: The list and the spec line then take turns — four rows of names while a name
+    #: is being chosen, three of description once one has been — so the tall state
+    #: is the only one either of them is in.
+    #: `overflow-y` is the backstop for a pane shorter still — a modal that clips
+    #: silently loses whichever control is last, and here that was the scope.
+    CSS = """
+    DialEdit { align: center middle; }
+    #box { width: 90%; max-width: 76; height: auto; max-height: 100%;
+           overflow-y: auto; padding: 1 2;
+           background: $panel; border: thick $accent; }
+    #hint { color: $text-muted; }
+    /* ALIGNED WITH THE TEXT IN THE BOXES, not with the box edge. An `Input` draws
+       a border and pads inside it, so its text starts three columns in; a bare
+       `Static` starts at the panel's own padding, and the description sat three
+       columns to the left of every field it describes. The title and the key line
+       keep the edge — they frame the form rather than belonging to a field. */
+    #spec { color: $text-muted; padding-left: 3; }
+    #err { color: $error; padding-left: 3; }
+    /* Four NAMES and no more: the names are an aid to the field above them, not
+       the form. `border: none` because the default one costs two rows of the four
+       — a frame around a list that sits directly under the box it belongs to, paid
+       for in half the names it can show. */
+    #names { height: auto; max-height: 4; border: none; padding-left: 3; }
+    """
+
+    def __init__(self, row: dict | None = None, repo: str | None = None,
+                 scope_label: str = "", vocabulary: dict | None = None,
+                 in_force: dict | None = None, now: str | None = None,
+                 trouble: str = "") -> None:
+        super().__init__()
+        self.row = row or {}
+        self.repo = repo
+        self.scope_label = scope_label
+        #: `{}` is "this box cannot read the harness's table", not "no dial is
+        #: settable" — see the class docstring.
+        self.vocabulary = vocabulary or {}
+        #: WHY it is empty, in the caller's words (`qbdata.dial_trouble`). Handed
+        #: in beside the vocabulary rather than fetched here, so the sentence and
+        #: the table it explains come from one read: a screen that asked the loader
+        #: a second question could answer with a state the first one never saw.
+        self.trouble = trouble
+        #: `GET /dials`' own answer, so the spec line can say what is in force
+        #: beside what the built-in default is. Moving a floor without being told
+        #: it was already moved is how one gets nudged twice.
+        self.in_force = in_force or {}
+        #: The BOARD's clock, for the expiry. A box an hour slow otherwise writes
+        #: "in one hour" as a time already past.
+        self.now = now
+        #: The names currently offered, in the order they are drawn — what an
+        #: option index means. Set before the list can be clicked, because an
+        #: empty one is the honest state of a modal that has not mounted yet.
+        self.matches: list[str] = []
+        #: The unknown name this screen has already objected to once. See
+        #: `action_save`: an unrecognised dial is warned about and then allowed,
+        #: because the table it is being judged against is THIS BOX'S harness.
+        self._insisted = ""
+        #: The name under the cursor in the list, which is NOT the name in the box.
+        #: Scrolling the picker describes what it lands on — a person reading down a
+        #: list of 29 dotted paths is asking which one they want, and answering that
+        #: only after the choice is made is answering it too late.
+        self._preview = ""
+
+    def compose(self) -> ComposeResult:
+        existing = bool(self.row.get("dial"))
+        with Vertical(id="box"):
+            # WHICH LAYER this will be written to, on the title line and not at the
+            # bottom. `fleet` and `this repo` are different settings with the same
+            # name and it is the one mistake a person cannot see afterwards, so it
+            # is the line that must never be the one a short pane clips.
+            title = Text("set a dial" if not existing else
+                         f"dial · {self.row.get('dial')}", style="bold")
+            title.append(f"  ·  {self.scope_label or 'fleet (every repo)'}",
+                         style="bold yellow")
+            yield Static(title)
+            if not existing:
+                yield Input(placeholder="review_panel.fix_severity_floor", id="f_dial")
+                # Populated in `on_mount` rather than here: the whole list is the
+                # right first answer to "which dials are there", and it is the
+                # same call every keystroke makes afterwards.
+                yield OptionList(id="names")
+            yield Input(value=self._value_text(), placeholder=self._value_hint(),
+                        id="f_value")
+            yield Static(self._spec(self._dial_name()), id="spec")
+            yield Input(placeholder="why is this value in force?", id="f_reason")
+            yield Input(placeholder="30m · 4h · 7d — empty for no end", id="f_expiry")
+            # Not drawn at all until something is actually wrong: a refusal line
+            # that is always there is one a person stops reading, and an empty one
+            # would spend a row of a modal that has none to spare.
+            err = Static("", id="err")
+            err.display = False
+            yield err
+            # The keys, and only the ones that do something here. `ctrl+x` clears a
+            # dial that is ON the board, so on a new one it is a key that can only
+            # bell — and `↓` is where the list of names went when the line under the
+            # value box started describing them instead of counting them.
+            keys = ("ctrl+s save · ctrl+x clear this dial · esc cancel" if existing
+                    else "↓ names · ctrl+s save · esc cancel")
+            yield Static(Text(keys, style="bold $accent"), id="hint")
+
+    # -- what the chosen dial is, and what it takes ----------------------------
+
+    def _dial_name(self) -> str:
+        """The dial this modal is about — the fixed one, or whatever is typed."""
+        return (self.row.get("dial") or self._field("f_dial")).strip()
+
+    def _spec_of(self, dial: str) -> dict:
+        return self.vocabulary.get(dial) or {}
+
+    #: The value box's placeholder before any dial is named — four spellings from
+    #: four different dials, which is what a form can say when it does not know
+    #: which one it is on. Everywhere else it is replaced by that dial's own.
+    GENERIC_HINT = "P3, 2, true, null"
+
+    def _value_hint(self) -> str:
+        """The value box's placeholder, for THIS dial where one is known.
+
+        The old placeholder listed four spellings from four different dials, which
+        is what a form says when it cannot tell which dial it is on. With a name
+        already chosen it can, and the generic line is kept only for the case
+        where it is still true — a new dial with nothing typed yet.
+        """
+        spec = self._spec_of(self._dial_name())
+        return spec.get("hint") or self.GENERIC_HINT
+
+    def _browsing(self) -> bool:
+        """Is the list up? Then the line below it is describing a row, not a choice."""
+        names = self._names()
+        return names is not None and names.display
+
+    def _spec(self, dial: str, brief: bool = False) -> Text:
+        """The line under the value box: what this dial takes, and where it stands.
+
+        Four facts answering four different questions. WHAT IT DECIDES answers "is
+        this the one I meant". The kind answers "what do I type". The DEFAULT
+        answers "what happens if I clear it", which is the other half of every
+        decision to set one. And what is IN FORCE answers "am I the second person to
+        move this today" — the board returns the row it replaced for the same
+        reason, and a person who reads it here does not have to undo anything to
+        find out.
+
+        `brief` is the first of those on its own, and it is what the list is drawn
+        with: scrolling 29 names is the moment the first question is being asked and
+        none of the other three are. It is also what makes room — the names and the
+        full block cannot both be on a 78x24 pane, and the choice between them is
+        settled by which question the person is currently asking.
+        """
+        if not self.vocabulary:
+            # Said once, plainly, and NOT as an empty dial list: a form that drew
+            # "0 dials settable" would state as fact the one thing it failed to
+            # find out. The write still goes through; the board is the judge.
+            #
+            # AND IT SAYS WHICH FAILURE. An absent harness, one that will not
+            # import and one older than the dial table all end here, and telling
+            # all three as the first sends somebody to look for a directory that is
+            # sitting right there. `qbdata.dial_trouble` carries the distinction.
+            return Text(f"{self.trouble or 'the dial table cannot be read here'}, "
+                        f"so the names and values are not checked here",
+                        style="italic")
+        spec = self._spec_of(dial)
+        if not spec:
+            # A name that is not in the table is a person who has probably mistyped
+            # it, and it has to LOOK different before ctrl+s says so — yellow rather
+            # than red, because `action_save` warns about this and then writes it:
+            # the table is this box's harness, and being ahead of it is not an error.
+            #
+            # The empty case is the FIRST PAINT and only that: `compose` draws this
+            # line before `on_mount` has filled the list, so for one frame there is
+            # no name anywhere to describe. It says what the list under the box is
+            # rather than nothing, because a person whose eye lands there first
+            # should not have to infer it.
+            if not dial:
+                return Text(f"{len(self.vocabulary)} dials are settable — "
+                            f"type to filter, ↓ to pick one", style="italic")
+            return Text(f"nothing this box knows applies this"
+                        f"{self._did_you_mean(dial)}", style="bold yellow")
+        # WHAT IT DECIDES, first. The kind, the default and the layer below it are
+        # all answers to "how do I set this one"; this is the answer to "is this the
+        # one I meant", which is the question actually being asked at the moment a
+        # name is picked out of a list of 29.
+        out = Text(spec["what"] or dial, style="bold")
+        if brief:
+            return out
+        # The HINT and not the kind beside it: `number · a number` is the kind said
+        # twice, and the hint is the half written in the words that go in the box.
+        out.append(f"\n{spec['hint']}", style="none")
+        # `default_known` and not a bare `default`: a dial absent from DEFAULTS is a
+        # bug in the harness's table, and drawing its `null` as the shipped answer
+        # would hide that behind a plausible value.
+        out.append(f"\ndefault {json.dumps(spec['default'])}"
+                   if spec.get("default_known") else "\nno built-in default")
+        row = qd.dial_of(self.in_force, dial, self.repo)
+        out.append(f" · in force {qd.dial_value(row, 24)} "
+                   f"({'this repo' if row.get('repo') else 'fleet'})" if row
+                   else " · no board dial — this repo's own value stands")
+        if spec.get("note"):
+            out.append("\n" + spec["note"], style="yellow")
+        return out
+
+    def _did_you_mean(self, dial: str) -> str:
+        """` — ↓ takes review_panel.max_rounds`, where that is unambiguous.
+
+        The commonest way to arrive at an unknown name is to type the half of it a
+        person actually remembers: `max_rounds` for `review_panel.max_rounds`,
+        `pi.enabled` for `reviewers.pi.enabled`. A refusal that only said "not a
+        dial" would be technically right and leave the answer sitting one row
+        below, unmentioned — so where the filter has narrowed to exactly one, the
+        refusal names it. Several matches name none: picking the first would be
+        this screen guessing which dial somebody meant to move.
+        """
+        hit = qd.dial_matches(self.vocabulary, dial, limit=2)
+        return f" — ↓ takes {hit[0]}" if len(hit) == 1 else ""
+
+    def _value_text(self) -> str:
+        """The current value, spelled the way this box would accept it back."""
+        if "value" not in self.row:
+            return ""
+        value = self.row.get("value")
+        return value if isinstance(value, str) else json.dumps(value)
+
+    # -- the picker ------------------------------------------------------------
+
+    def _names(self) -> OptionList | None:
+        found = self.query("#names")
+        return found.first(OptionList) if found else None
+
+    def _refill(self, typed: str) -> None:
+        """The names worth offering for what has been typed, redrawn."""
+        names = self._names()
+        if names is None:
+            return
+        self.matches = qd.dial_matches(self.vocabulary, typed)
+        names.clear_options()
+        names.add_options(self.matches)
+        # HIDDEN ONCE THE NAME IS ONE OF THEM, and not only to buy back the rows the
+        # spec line then spends. A list of names is help with choosing, and it has
+        # stopped helping the moment a choice is made — leaving it up would keep four
+        # rows of alternatives under a field that is already answered, on a form
+        # whose next question is one line further down. Typing again brings it back.
+        names.display = bool(self.matches) and not self._spec_of(typed.strip())
+        # Highlight the first one, because `clear_options` leaves nothing
+        # highlighted and an OptionList with no highlight answers `enter` by doing
+        # nothing at all — which reads as a picker that does not work.
+        names.highlighted = 0 if self.matches else None
+        # And the line below describes it straight away. Waiting for a key would
+        # leave the first row — the one a person's eye is already on — as the only
+        # one in the list with nothing said about it.
+        self._preview = self.matches[0] if self.matches and names.display else ""
+
+    def on_mount(self) -> None:
+        # The field a person came here to change. Editing an existing dial that is
+        # its value; creating one, it is the name.
+        self._refill("")
+        self.query_one("#f_dial" if not self.row.get("dial") else "#f_value",
+                       Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Filter as the name is typed, and re-state what the named dial takes."""
+        if event.input.id in ("f_dial", "f_value") and not self._armed():
+            # The two fields a refusal is ever about. Editing either is a person
+            # acting on it, and a refusal left standing beside the field it has
+            # stopped describing is read as a second, still-live objection.
+            #
+            # UNLESS THE UNKNOWN-NAME WARNING IS ARMED. That one is not a complaint
+            # about the value — it says the NAME is one nothing here applies, and it
+            # stays true while the name does. Clearing it on a value edit hid the
+            # sentence while `_insisted` went on holding the next ctrl+s open, which
+            # is a confirmation nobody can see they have given.
+            self.query_one("#err", Static).display = False
+        if event.input.id != "f_dial":
+            return
+        self._refill(event.value)
+        self._redraw_spec()
+
+    def _redraw_spec(self) -> None:
+        """The line under the value box, for whatever is being looked at right now.
+
+        The PREVIEW wins over the typed name while the list is up, and that is the
+        whole of this feature: the name in the box is what will be written, and the
+        name under the cursor is what is being read about. The value's placeholder
+        follows the box rather than the cursor — it belongs to the field it sits in,
+        and flickering it through 29 dials as somebody scrolls would be describing
+        one thing in the widget for another.
+        """
+        browsing = self._browsing()
+        dial = (self._preview if browsing and self._preview else self._dial_name())
+        self.query_one("#spec", Static).update(self._spec(dial, brief=browsing))
+        # AND THE VALUE BOX FOLLOWS IT TOO. An earlier cut kept the placeholder on
+        # the typed name, on the reasoning that a widget should describe its own
+        # field — which is the wrong way round here, because the placeholder IS the
+        # guide to what may be typed, and the dial being read about is the one the
+        # question is about. Scrolling the list now says what each dial decides AND
+        # what it will take, which is the pair a person needs before choosing.
+        spec = self._spec_of(dial)
+        self.query_one("#f_value", Input).placeholder = (
+            spec["hint"] if spec else self.GENERIC_HINT)
+
+    def on_option_list_option_highlighted(
+            self, event: OptionList.OptionHighlighted) -> None:
+        """Scrolling the list describes what it lands on."""
+        if 0 <= event.option_index < len(self.matches):
+            self._preview = self.matches[event.option_index]
+            self._redraw_spec()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        """A name taken from the list: fill the box and move on to the value.
+
+        Indexed into the list this screen filtered rather than read off the
+        widget's own option, so what is written into the box is the string that
+        went in — a prompt is a renderable, and rendering one back to text is a
+        round trip through Rich that a dotted path does not need to take.
+        """
+        if not (0 <= event.option_index < len(self.matches)):
+            return
+        field = self.query_one("#f_dial", Input)
+        field.value = self.matches[event.option_index]
+        # `on_input_changed` refills and redraws off the back of that assignment;
+        # the focus move is what is left, and it goes to the box a person picking
+        # a name is on their way to.
+        self.query_one("#f_value", Input).focus()
+
+    def action_to_names(self) -> None:
+        """`↓` from the NAME box walks into the list under it.
+
+        `Input` binds neither arrow, so this key would otherwise do nothing at all
+        in the one field it is the obvious gesture for. From any other field it
+        still does nothing, deliberately: a `↓` typed in the reason box is somebody
+        reaching for the next line, and throwing the focus three fields backwards
+        is a worse answer than ignoring it.
+        """
+        names = self._names()
+        if names is not None and names.display and self.focused is self.query_one(
+                "#f_dial", Input):
+            names.focus()
+
+    # -- saving ----------------------------------------------------------------
+
+    def _armed(self) -> bool:
+        """Is the unknown-name warning outstanding for the name in the box?"""
+        return bool(self._insisted) and self._insisted == self._dial_name()
+
+    def _refuse(self, message: str) -> None:
+        """Say why, and stay open.
+
+        The alternative is what this modal did before #539: dismiss, and let the app
+        say it afterwards. That spends the other three fields to report a mistake in
+        one of them, and the person retypes a reason they already wrote.
+        """
+        err = self.query_one("#err", Static)
+        err.update(Text(message, style="bold red"))
+        err.display = True
+        self.app.bell()
+
+    def _field(self, name: str) -> str:
+        found = self.query(f"#{name}")
+        return found.first(Input).value if found else ""
+
+    def action_save(self) -> None:
+        """Everything the board would refuse, and everything the harness would
+        ignore, judged here — then dismissed with what the caller asked for.
+
+        The two are not the same list and both matter. A blank reason is refused by
+        `POST /dials` and a 422 would say so; a dial name the harness does not know
+        is ACCEPTED by the board, stored, and reported as in force for ever while
+        nothing applies it. Only this side can catch the second, because only this
+        side has the table.
+
+        The raw strings go back to `Dash.dial_written` unparsed, so the app's own
+        checks still run on the path where this screen had no vocabulary to check
+        against. Parsing twice is cheaper than one of the two forgetting.
+        """
+        dial = self._dial_name()
+        if not dial:
+            self._refuse("which dial? Type a name, or press ↓ to pick one")
+            return
+        reason = self._field("f_reason")
+        if not reason.strip():
+            self._refuse("a dial needs a reason — why is this value in force? "
+                         "The board refuses one without, and so does this")
+            return
+        try:
+            value = qd.parse_dial_value(self._field("f_value"))
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            self._refuse(str(exc))
+            return
+        # GATED ON THE TABLE THIS SCREEN WAS GIVEN, not on whether `qbdata` can
+        # find one of its own. They are the same answer in the app — the modal is
+        # handed `dial_vocabulary()` — and keeping the judgement on the screen's
+        # own copy is what stops a form that says "not checked here" from refusing
+        # a write anyway, which is the one behaviour a person cannot argue with.
+        if self.vocabulary and not self._spec_of(dial):
+            # **AN UNKNOWN NAME IS A WARNING AND THEN A WRITE**, and the asymmetry
+            # with the value check below is the whole argument.
+            #
+            # The table this is judged against is the harness beside THIS DASHBOARD,
+            # and the two are installed separately: a box a release behind would
+            # otherwise be a box that cannot set a dial the rest of the fleet
+            # already applies. `tempo` (#474) is the standing case — both dashboards
+            # draw it, `BOARD_DIALS` does not hold it, and a hard refusal here would
+            # take a dial the fleet uses away from the one screen that sets it.
+            #
+            # A value for a name this box DOES know gets no such benefit of the
+            # doubt: the kind came from the same table as the name, so there is no
+            # version story in which `max_rounds: "2"` is a value somebody's harness
+            # applies. That one stays a refusal.
+            if self._insisted != dial:
+                self._insisted = dial
+                self._refuse(f"nothing this box knows applies `{dial}`"
+                             f"{self._did_you_mean(dial)} — ctrl+s again to set it "
+                             f"anyway")
+                return
+        elif self.vocabulary:
+            problem = qd.dial_refusal(dial, value)
+            if problem:
+                self._refuse(problem)
+                return
+            # And WHERE the row goes, which is a second question about a different
+            # field and gets its own answer (#563). The board takes either scope for
+            # any dial — `dial` is opaque text there and `repo` is just a column — so
+            # a fleet dial written for one repo is accepted, stored, reported as in
+            # force, and read by nothing. That is a misspelt name's failure arriving
+            # through the scope line, and it is caught in the same place for the same
+            # reason: this side is the only one that knows what a dial IS.
+            problem = qd.dial_scope_refusal(dial, self.repo)
+            if problem:
+                self._refuse(problem)
+                return
+        try:
+            # Parsed for its refusal only — the app parses it again against the
+            # same board clock when it writes.
+            qd.parse_dial_expiry(self._field("f_expiry"), self.now)
+        except (ValueError, OverflowError) as exc:
+            self._refuse(str(exc))
+            return
+        self.dismiss({
+            "dial": dial,
+            "value": self._field("f_value"),
+            "reason": reason,
+            "expiry": self._field("f_expiry"),
+            "repo": self.repo,
+        })
+
+    def action_clear(self) -> None:
+        """Take it off the board. Only for a dial that IS on the board — clearing
+        one that was never set is a no-op the board accepts, and offering it while
+        creating one would be a button that cannot mean anything."""
+        if not self.row.get("dial"):
+            self.app.bell()
+            return
+        self.dismiss({"dial": self.row["dial"], "repo": self.repo, "clear": True})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class ClickTable(DataTable):
@@ -248,11 +798,21 @@ class Dash(App):
               color: $text-muted; }
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
 
+    /* THE SHARE IS ON THE PANEL, NOT ON THE TABLE. Each title and its table are
+       one `.panel` so that the wide layout has something to place: a grid puts
+       CELLS in columns, and a title in one column with its table in the other is
+       what happens if the seven pairs are left loose in the container. The table
+       then takes `1fr` of its own panel — everything the title left — so the
+       shares below still read as shares of the pane. */
+    #body { layout: vertical; }
+    .panel { layout: vertical; }
+    .panel > DataTable { height: 1fr; }
+
     /* A share of the pane each, and each scrolls inside its share. With
        `height: auto` the four tables simply stack past the bottom of a 42-row
        pane: the PRs then cannot be clicked, because they are not on screen —
        which is how the click test caught it. */
-    /* SEATS sizes to its CONTENT, and it is the only table here that may.
+    /* SEATS sizes to its CONTENT, and it is the only panel here that may.
        Every other one is unbounded — the fleet, the plan and the issue list are
        as long as the board is — so `height: auto` on those is what put the PR
        table off the bottom of the pane and made its rows unclickable. This one
@@ -266,16 +826,62 @@ class Dash(App):
        ＋ out of view on a full screen and reintroduce the bug above four seats
        below the ceiling the script already enforces — a cap and a maximum have to
        be quoted from the same place or one of them silently wins. */
-    #seats  { height: auto; max-height: 12; }
-    #fleet  { height: 2fr; }
-    #claims { height: 1fr; }
-    #plan   { height: 2fr; }
-    #prs    { height: 2fr; }
+    #p_seats  { height: auto; }
+    #seats    { height: auto; max-height: 12; }
+    /* Sized to its CONTENT like SEATS, and for SEATS' reason: a fleet with nothing
+       set is two rows, and an fr share would spend the rest on blank space that
+       comes straight off ISSUES — already the panel that falls below the fold
+       (#269). The cap is where it stops growing and starts scrolling, which is the
+       right way round here: the printed renderer has to stop listing and count the
+       rest (DIAL_ROWS), and this one does not, so nothing is hidden by it. 7 is
+       four dials and the row that says where to turn one; a fleet with more than
+       that in force has a configuration question rather than a layout one. */
+    #p_dials  { height: auto; }
+    #dials    { height: auto; max-height: 7; }
+    #p_fleet  { height: 2fr; }
+    #p_claims { height: 1fr; }
+    #p_plan   { height: 2fr; }
+    #p_prs    { height: 2fr; }
     /* 1fr, not 2: the queue is at most as deep as OPEN PRs above it and is
        usually shorter, and every row it takes here comes off ISSUES — which is
        already the panel that falls below the fold (#269). */
-    #queue  { height: 1fr; }
-    #issues { height: 2fr; }
+    #p_queue  { height: 1fr; }
+    #p_issues { height: 2fr; }
+
+    /* ---- and the same panels in two columns, when there are columns to spare.
+       Textual has no media query, so the class is set from `on_resize` and the
+       whole of the wide layout is this block. `layout` is a property like any
+       other, which is why the narrow layout above says `vertical` explicitly
+       rather than leaning on the default: the two rules have to be able to
+       disagree.
+
+       WHAT TWO COLUMNS BUY IS HEIGHT, not width. Seven panels sharing one
+       column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a pane
+       nobody would call short; the same seven over four grid rows are three to
+       five times that, and no panel's share had to be taken from another's.
+
+       DIALS AND SEATS SPAN BOTH, and for one reason said twice: they are the two
+       panels whose height is their CONTENT, so a column of their own would buy
+       them nothing and cost the panel beside them half its width. DIALS keeps
+       its place at the top for the reason it was put there — it is the
+       configuration every panel below is running under — and SEATS keeps the ＋
+       findable, which is the one thing that panel has to do (see the cap above).
+       They are also the only `auto` rows: the three under them divide what is
+       left.
+
+       THE WEIGHTS ARE THE NARROW ONES, PAIRED. A row is as tall as the taller of
+       the two panels in it wants to be, and narrow that is 2fr for all three
+       pairs — (FLEET, CLAIMED), (OPEN PRs, REVIEW QUEUE), (PLANS, ISSUES) — so
+       equal thirds is the faithful translation. PLANS and ISSUES get the extra
+       because they are the two panels that are always long: the plan is every
+       repo's list and the issue list is every open issue, while OPEN PRs is
+       usually under ten and is often zero. Both short panels ride with a long
+       one rather than with each other, so no row is dead space on a quiet day. */
+    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto auto 2fr 2fr 3fr;
+                  grid-gutter: 0 1; }
+    #body.-wide .panel { height: 100%; }
+    #body.-wide #p_dials { column-span: 2; height: auto; }
+    #body.-wide #p_seats { column-span: 2; height: auto; }
     """
 
     BINDINGS = [
@@ -285,8 +891,22 @@ class Dash(App):
         ("p", "panel_pr", "panel"),
         ("f", "fix_issue", "fix"),
         ("s", "toggle_scope", "scope"),
+        # The board's dials PAGE, which is still worth a key now that the panel
+        # can write: the page shows every repo's dials at once and this panel
+        # shows the screen's own, and a person who wants to compare two projects
+        # wants the page. The ✎ on a row is the control; this is the map.
+        ("d", "open_dials", "dials"),
+        ("z", "expand", "expand"),
         ("question_mark", "help", "keys"),
     ]
+
+    # WHEN THE PANELS GO TWO ACROSS, in columns of the pane. Not a taste: 78 is
+    # what one of these tables wants before it wraps — it is `QB_SEATS_DASH_SIZE`'s
+    # default, and quoted from there — so two of them side by side plus the gutter
+    # between is the narrowest screen on which the second column is not paid for
+    # out of the first. `QB_DASH_WIDE` moves it, which is how a terminal whose
+    # font makes 157 columns comfortable can have the wide layout sooner.
+    WIDE_COLUMNS = 157
 
     # The ⚖ lives in its own column so that clicking it means something
     # different from clicking the row. Column 1 of the PR table.
@@ -300,6 +920,12 @@ class Dash(App):
     # the same meaning — a plan item that points at an issue is an issue you can
     # take, and having it in one place means one thing to learn.
     FIX_COLUMN = 1
+    # And column 1 of the DIALS table is the ✎ that opens the page where a dial
+    # can actually be turned. Same column as the other three, because "the action
+    # icon is always the second cell" is one habit rather than four — and the same
+    # meaning as the ⚒ next door: this is the verb, the rest of the row is the
+    # explanation.
+    EDIT_COLUMN = 1
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
                  plan_interval: float = 15.0, scope: "qd.Scope | None" = None,
@@ -331,13 +957,12 @@ class Dash(App):
         # client had already made.
         self.board: dict = {}
         self.seats: list[dict] = []           # the seat PANES, off tmux
-        # (machine, scope, seat number) -> the board's live agent. All three,
-        # because neither of the first two is enough on its own: `list-panes -a` is
-        # the whole tmux server and since #208 two screens can each hold a seat 1,
-        # and the BOARD is the whole fleet, where two machines can each hold a
-        # `seat-lexray-1`. Keyed on the number alone, one of those overwrites the
-        # other and a pane is shown a state that belongs to something else.
-        self.seat_states: dict[tuple[str | None, str | None, int], dict] = {}
+        # session id -> the board's live agent, which is the id the pane carries
+        # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
+        # number) while a pane could only be identified through the agent's name,
+        # and all three were needed because none of them was unique on its own
+        # (#540).
+        self.seat_states: dict[str, dict] = {}
         self.prs: list[dict] = []
         # The derived review queue, kept for the same reason as `board`: `s`
         # redraws from it, and it rides the gh clock so a re-fetch on a toggle
@@ -349,6 +974,15 @@ class Dash(App):
         # know. `render_issues` paints when BOTH answers are in and not before.
         self.issues: list[dict] | None = None
         self.issue_err: str | None = None
+        # What the board says is in force. `{}` UNTIL IT HAS ANSWERED, and
+        # `fetch_dials` sets `asked` when it has — the header cell renders nothing
+        # at all until then, because "no dial is set" and "nobody has asked" are
+        # different facts and the first is the one a person acts on (#244).
+        self.dials: dict = {}
+        #: The credential the writes go out on, or None until `on_mount` has a
+        #: config to build it from. See `qd.HumanClient` — and #479 for what it
+        #: costs, which is not this file's to re-argue but is this file's to say.
+        self.human: "qd.HumanClient | None" = None
         self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None
@@ -375,7 +1009,17 @@ class Dash(App):
         # and resolves the repository from the checkout it runs in. The panels
         # list several repos now, so "issue #12" is not an address on its own.
         self.repo_slug = qd.repo_slug(self.repo)
-        self.agent_bin = os.environ.get("QB_SEAT_AGENT", "claude")
+        # WHICH AGENT THE ⚖ RUNS, and it is the dash's own knob rather than a
+        # seat's. It read `QB_SEAT_AGENT` until #540 retired that family, which
+        # would have left this the last reader of a variable nothing else sets and
+        # no documentation mentions — a knob that looks live and is not.
+        #
+        # NOT `QB_SEAT_INITIAL_CMD`, which is the nearest surviving thing and is
+        # the wrong shape: that is a whole command LINE and may carry a prompt of
+        # its own, so composing it with the one below would produce
+        # `claude-yolo -- /get-involved -- /panel-review-pr 42`. A binary is what
+        # this needs and a binary is what it asks for.
+        self.agent_bin = os.environ.get("QB_DASH_AGENT", "claude")
         # The ⚒ runs this rather than the agent directly (#371). Resolved once
         # and kept, so that a test can point it somewhere and so that the two
         # calls the button makes — `--policy` before the click and the spawn
@@ -383,6 +1027,13 @@ class Dash(App):
         self.start_bin = sibling("qb-start")
         self.confirm = os.environ.get("QB_DASH_CONFIRM", "1") != "0"
         self.pr_err: str | None = None
+        # WHICH LAYOUT IS UP, and it starts narrow because that is what the pane
+        # `qb-seats` splits off is. `relayout` compares against this rather than
+        # against the class, so a resize that does not cross the threshold — which
+        # is most of them, since attaching a client resizes every pane on the
+        # screen — costs a comparison and no reflow.
+        self.wide = False
+        self.wide_at = env_columns("QB_DASH_WIDE", self.WIDE_COLUMNS)
 
     # ---- layout ---------------------------------------------------------
 
@@ -392,36 +1043,74 @@ class Dash(App):
         # towards is the one number none of the tables can show.
         yield Static("", id="limits")
         yield Static("quarterback — connecting…", id="head")
-        with Vertical():
-            yield Static("SEATS", classes="title", id="t_seats")
-            yield ClickTable(id="seats", cursor_type="row")
-            yield Static("FLEET", classes="title", id="t_fleet")
-            yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
-            yield Static("CLAIMED", classes="title", id="t_claims")
-            yield ClickTable(id="claims", cursor_type="row")
-            yield Static("PLANS", classes="title", id="t_plan")
-            yield ClickTable(id="plan", cursor_type="row")
-            yield Static("OPEN PRs", classes="title", id="t_prs")
-            yield ClickTable(id="prs", cursor_type="row")
+        # A PANEL PER TABLE, and the pairing is structural rather than visual: a
+        # grid places cells, so a title loose in the container is a cell of its
+        # own and lands in a different column from the table it names. Wrapping
+        # them changes nothing about the narrow screen — one `Vertical` inside
+        # another lays out identically — and is the whole of what the wide one
+        # needed from the tree.
+        with Vertical(id="body"):
+            # Above the seats, and above everything the seats then do: this is the
+            # configuration every panel below is running under, which is the caps
+            # line's own argument for being at the top. It is two rows when nothing
+            # is set — the printed renderer makes the same choice in the same place
+            # (qb-dash.panel_dials).
+            with Vertical(classes="panel", id="p_dials"):
+                yield Static("DIALS", classes="title", id="t_dials")
+                yield ClickTable(id="dials", cursor_type="row")
+            with Vertical(classes="panel", id="p_seats"):
+                yield Static("SEATS", classes="title", id="t_seats")
+                yield ClickTable(id="seats", cursor_type="row")
+            with Vertical(classes="panel", id="p_fleet"):
+                yield Static("FLEET", classes="title", id="t_fleet")
+                yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
+            with Vertical(classes="panel", id="p_claims"):
+                yield Static("CLAIMED", classes="title", id="t_claims")
+                yield ClickTable(id="claims", cursor_type="row")
+            with Vertical(classes="panel", id="p_plan"):
+                yield Static("PLANS", classes="title", id="t_plan")
+                yield ClickTable(id="plan", cursor_type="row")
+            with Vertical(classes="panel", id="p_prs"):
+                yield Static("OPEN PRs", classes="title", id="t_prs")
+                yield ClickTable(id="prs", cursor_type="row")
             # Directly under OPEN PRs, which is where it answers the question that
             # panel raises and cannot: that one says a PR exists and CI is green,
             # this one says whether anybody has reviewed it (#273).
-            yield Static("REVIEW QUEUE", classes="title", id="t_queue")
-            yield ClickTable(id="queue", cursor_type="row")
-            yield Static("ISSUES", classes="title", id="t_issues")
-            yield ClickTable(id="issues", cursor_type="row")
+            with Vertical(classes="panel", id="p_queue"):
+                yield Static("REVIEW QUEUE", classes="title", id="t_queue")
+                yield ClickTable(id="queue", cursor_type="row")
+            with Vertical(classes="panel", id="p_issues"):
+                yield Static("ISSUES", classes="title", id="t_issues")
+                yield ClickTable(id="issues", cursor_type="row")
         yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
-                     "plan row→why, queue row→what it waits on, "
-                     "⚖→panel review, ⚒→fix issue   ? for keys",
+                     "plan row→why, queue row→what it waits on, dial row→why it is "
+                     "set, ⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
+                     "   ? for keys",
                      id="detail")
         yield Footer()
 
     def on_mount(self) -> None:
+        # BEFORE the board client, which is allowed to fail: a machine with no
+        # board configured still gets a laid-out dashboard saying so, and a
+        # `return` above this would leave a wide pane in the narrow layout for as
+        # long as it stayed exactly that wide.
+        self.relayout()
         self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
         self.query_one("#claims", DataTable).add_columns("who", "key", "left")
+        # NOT in build_columns, and that is the one table here for which that is
+        # right: its scope cell names the LAYER a value came from — fleet or this
+        # repo — rather than a project, and that is half of what a dial's answer
+        # is. See qbdata.dial_where.
+        self.query_one("#dials", DataTable).add_columns(
+            "", "✎", "dial", "value", "in force", "left", "why")
         self.build_columns()
         try:
             self.client, self.cfg = qd.board_client()
+            # Built unconditionally and asked later whether it can do anything.
+            # `why_not()` is configuration rather than a live check, so a box with
+            # no session still gets an object that explains itself — which is what
+            # lets the ✎ say why instead of going missing.
+            self.human = qd.HumanClient(self.cfg)
         except Exception as exc:                  # noqa: BLE001
             self.query_one("#head", Static).update(
                 Text(f"no board configured: {type(exc).__name__}", style="bold red"))
@@ -502,8 +1191,17 @@ class Dash(App):
 
     @work(thread=True, exclusive=True, group="plan")
     def refresh_plan(self) -> None:
+        """The plan and the dials, on one clock and in one worker.
+
+        Both are board calls answering a question a PERSON changed — a reorder, a
+        floor moved, a tempo turned down — rather than something the fleet does to
+        itself every few seconds, so neither wants the four-second clock and both
+        want the same one. `refresh_prs` pairs the review queue with the PR list
+        for the same kind of reason.
+        """
         plan, err = qd.fetch_plan(self.client)
         self.call_from_thread(self.render_plan, plan, err)
+        self.call_from_thread(self.render_dials, qd.fetch_dials(self.client))
 
     @work(thread=True, exclusive=True, group="prs")
     def refresh_prs(self) -> None:
@@ -563,8 +1261,20 @@ class Dash(App):
             # is tmux's answer (is a process there); `state` is the agent's own.
             agent = self.seat_state(s)
             word, style = qd.agent_state(agent)
-            scope = qd.pane_scope(s)
-            label = f"{scope} {s['seat']}" if len(screens) > 1 and scope \
+            # WHICH SCREEN, when there is more than one — off the tmux session
+            # name, which is what tmux calls that screen and what `qb-seats
+            # resume` takes. It was the seat's board SCOPE, which had to be
+            # derived from two pane options that existed to carry it; the screen
+            # itself has always known its own name (#540).
+            #
+            # Minus the `seats-` that `qb-seats` puts on the front of its default
+            # name, which every screen on a box shares and so distinguishes none
+            # of them — dropping it is what keeps this cell reading `quarterback 1`
+            # rather than `seats-qu…` in the thirteen columns it has.
+            screen_name = s["session"]
+            if screen_name.startswith("seats-") and len(screen_name) > 6:
+                screen_name = screen_name[6:]
+            label = f"{screen_name} {s['seat']}" if len(screens) > 1 \
                 else f"seat {s['seat']}"
             key = table.add_row(
                 Text("●" if live else "·", style="green" if live else "grey50"),
@@ -593,7 +1303,8 @@ class Dash(App):
         title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
         self.query_one("#t_seats", Static).update(title)
 
-    def render_limits(self, limits: list[dict], err: str | None) -> None:
+    def render_limits(self, limits: list[dict], err: str | None,
+                      width: int | None = None) -> None:
         """Claude Code's own caps, as bars — `5h ████░░ 64% 3h57m  7d ██░ 41% 5d8h`.
 
         A failed call keeps the last figures rather than blanking the line: they
@@ -614,9 +1325,14 @@ class Dash(App):
             bar = self.query_one("#limits", Static)
         except Exception:                         # noqa: BLE001 — a resize before mount
             return
-        cells = qd.limit_cells(self.limits, max(20, self.size.width - 2))
-        bar.display = bool(cells or self.queue)
-        if not (cells or self.queue):
+        # `width` when a resize handed one over — see on_resize for why the app's
+        # own size is a resize behind in there. Everywhere else it is unset and
+        # the app's size is the current one.
+        pane = self.size.width if width is None else width
+        cells = qd.limit_cells(self.limits, max(20, pane - 2))
+        tempo = qd.tempo_cell(self.dials)
+        bar.display = bool(cells or self.queue or tempo)
+        if not (cells or self.queue or tempo):
             return
         text = Text()
         for i, (label, glyphs, pct, reset, colour) in enumerate(cells):
@@ -647,12 +1363,73 @@ class Dash(App):
             text.append(f" {depth}", style=f"bold {colour}")
             if age:
                 text.append(f" {age}", style="grey50")
+        # And the throttle beside the budget it protects (#477). The caps say what
+        # the seats MAY spend; this says whether they are supposed to be spending
+        # it at all, and a reader glancing at one is asking about the other. Every
+        # state draws once the board has answered, `unset` included — a cell that
+        # vanished when nothing was set could not be told from a dashboard that
+        # never asked, and "nothing is throttling the fleet" is exactly the answer
+        # somebody is looking for at 94% of a window.
+        if tempo:
+            label, value, life, colour = tempo
+            if text.plain:
+                text.append("   ")
+            text.append(label, style="bold grey70")
+            text.append(f" {value}", style=f"bold {colour}")
+            if life:
+                text.append(f" {life}", style="grey50")
         bar.update(text)
 
-    def on_resize(self) -> None:
-        """Re-lay the bars to the new width — they are sized to the pane, and the
-        dash pane is resized every time the screen is."""
-        self.render_limits(self.limits, self.limits_err)
+    def on_resize(self, event: Resize) -> None:
+        """Re-lay to the new width — the bars are sized to the pane, the panels
+        are one column or two by it, and the dash pane is resized every time the
+        screen is.
+
+        THE WIDTH COMES OFF THE EVENT, NEVER OFF `self.size`, and that is not
+        style. Measured on textual 8.2: the handler runs BEFORE the app's own
+        size is updated, so a `self.size.width` read here is the width the pane
+        had before the resize being handled. The caps bar has been laying itself
+        out one resize behind ever since it was sized to the pane — invisible,
+        because dragging a border emits a stream of them and the last-but-one is
+        near enough — and a layout threshold read the same way is not invisible
+        at all: it would take two crossings to go two-across, and a pane that
+        crossed once and stopped would sit in the wrong layout indefinitely.
+        """
+        self.relayout(event.size.width)
+        self.render_limits(self.limits, self.limits_err, width=event.size.width)
+
+    def relayout(self, width: int | None = None) -> None:
+        """One column or two, decided by the width the pane actually has.
+
+        Textual has no media query, so this is the media query: `on_resize` fires
+        on every width the pane is given — a client attaching, a seat closing, a
+        `C-q >`, a zoom — and the class it sets is the whole of what `#body.-wide`
+        keys off.
+
+        THE ORDER IS NOT THE SAME IN BOTH LAYOUTS, and that is the only part of
+        this that is not CSS. A grid fills row by row in DOM order, so the narrow
+        order lays OPEN PRs and REVIEW QUEUE into different rows — and "the queue
+        sits directly under the PRs" is the arrangement #273 asked for, not a
+        coincidence of the order they were added in. Wide, `directly under`
+        becomes `directly beside`: PLANS moves down one, which pairs PRs with the
+        queue that reviews them and PLANS with the issues its items point at.
+
+        `move_child` and not a remount, because the panels hold DataTables with a
+        cursor, a scroll offset and the row keys every click resolves through —
+        all of which a remove-and-mount would throw away, and the width crossing
+        the threshold is not news the panel should lose its place over.
+        """
+        wide = (self.size.width if width is None else width) >= self.wide_at
+        if wide == self.wide:
+            return
+        self.wide = wide
+        body = self.query_one("#body", Vertical)
+        body.set_class(wide, "-wide")
+        plan = self.query_one("#p_plan", Vertical)
+        if wide:
+            body.move_child(plan, after=self.query_one("#p_queue", Vertical))
+        else:
+            body.move_child(plan, before=self.query_one("#p_prs", Vertical))
 
     def render_board(self, data: dict) -> None:
         self.board = data
@@ -660,6 +1437,20 @@ class Dash(App):
                        key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
         agents, elsewhere = qd.in_scope(every, self.scope)
 
+        # WHICH OF THESE ARE IN A PANE IN FRONT OF YOU. It marks the rows a click
+        # can jump to and counts them beside the fleet's total, and it is the same
+        # `@qb_session` join the SEATS panel makes — an agent is a seat here if its
+        # conversation is in one of this box's seat panes.
+        #
+        # That reads slightly differently from the seat NAME it replaces, and more
+        # honestly: `seat-lexray-1` on another machine used to count towards this
+        # box's "3 seats" and highlight a row no click could reach (#540).
+        #
+        # `self.seats` is filled by the SEATS worker on its own clock, so on the
+        # first board tick of a fresh dashboard this is empty and nothing is marked.
+        # It fills within seconds, and it is the same trade `seat_states` makes below
+        # for the same reason: two panels, two workers, one join between them.
+        here = {s.get("agent") for s in getattr(self, "seats", []) if s.get("agent")}
         head = self.query_one("#head", Static)
         if data.get("error"):
             head.update(Text(f"● board unreachable — {qd.clip(data['error'], 60)}",
@@ -670,7 +1461,7 @@ class Dash(App):
             # "7 live · quarterback" next to a table holding two would be the one
             # place on this pane where the scope makes something read falsely — and
             # what is hidden is on FLEET's own title, which is where it belongs.
-            seats = sum(1 for a in agents if qd.seat_number(a.get("holder")))
+            seats = sum(1 for a in agents if a.get("session") in here)
             head.update(Text(f"● {self.cfg.base_url}   {len(agents)} live · {seats} seats"
                              f"   {self.scope.label()}", style="green"))
 
@@ -678,11 +1469,14 @@ class Dash(App):
         table.clear()
         for i, a in enumerate(agents):
             key = f"agent:{i}"
-            seat = qd.seat_number(a.get("holder"))
+            # Not "is this agent a seat" — that is not a property of an agent any
+            # more. It is "is this row in a pane in front of you", which is what
+            # the styling is actually for: these are the rows a click can jump to.
+            in_pane = a.get("session") in here
             who = (a.get("holder") or "?").split("/", 1)[-1]
             word, style = qd.agent_state(a)
             key = table.add_row(
-                Text(qd.clip(who, 13), style="bold green" if seat else "bold"),
+                Text(qd.clip(who, 13), style="bold green" if in_pane else "bold"),
                 Text(word or "—", style=style),
                 # What `state` cannot say: `working` reads the same writing the
                 # first cut and coming out of the third review round, and so do
@@ -696,7 +1490,7 @@ class Dash(App):
                 Text(qd.scope_mark(self.scope, a.get("repo"))
                      + qd.clip(a.get("title") or a.get("branch") or "—",
                                40 if self.scope.column else 50),
-                     style="white" if seat else "grey70"),
+                     style="white" if in_pane else "grey70"),
                 Text(qd.until(a.get("expires")), style="grey50"),
                 key=key,
             ).value
@@ -717,9 +1511,11 @@ class Dash(App):
         # pane belonging to another project's screen is on that panel either way, and
         # narrowing here would leave its `state` cell reading `—` — which is how a
         # reader sees which seat is waiting on them.
+        # Keyed on the SESSION id, which is what the pane carries. An agent with no
+        # session is dropped rather than filed under "": a pane with no agent looks
+        # up the empty string, and a bucket there would answer it with somebody.
         self.seat_states = {
-            (qd.seat_machine(a.get("holder")), qd.seat_scope(a.get("holder")), n): a
-            for a in every if (n := qd.seat_number(a.get("holder"))) is not None}
+            s: a for a in every if (s := a.get("session"))}
 
         claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
         ctable = self.query_one("#claims", DataTable)
@@ -874,6 +1670,106 @@ class Dash(App):
         if err:
             title += f" · board: {qd.clip(err, 24)}"
         self.query_one("#t_plan", Static).update(title)
+
+    def render_dials(self, dials: dict) -> None:
+        """Which dials are in force, which layer answered, why, and for how long — #477.
+
+        A dial is a setting: the repo supplies a default, the board states the
+        value IN FORCE, and the layer that answered is part of the answer (#305).
+        Nothing a person or an agent looks at showed one until this panel — the
+        value governing every round on the fleet was set from a browser endpoint,
+        read back by one function in `panel_seats.py`, and invisible everywhere
+        else.
+
+        **The last row is always the door.** `POST /dials` takes `app.auth.human`
+        and this dashboard holds a machine bearer token, which is precisely the
+        credential that gate exists to refuse — every agent on a box holds it, and
+        nothing inside a request distinguishes one from a person. So the row that
+        opens the board's dials page is drawn whether or not there is a dial above
+        it, because the reader who most needs it is the one who has just found out
+        that nothing is set.
+        """
+        self.dials = dials
+        table = self.query_one("#dials", DataTable)
+        table.clear()
+        self.rows = {k: v for k, v in self.rows.items() if not k.startswith("dial:")}
+        rows = dials.get("dials") or []
+        # ASKED ONCE PER PAINT, not per row: it is the same answer for every one
+        # of them, and it decides whether the ✎ is a control or an explanation.
+        # A verb that looks available and fails on the click is the shape that
+        # reads as a broken button — and this one would fail against a board that
+        # is perfectly healthy, because what is missing is on this host.
+        cannot = self.human.why_not() if self.human else "no board configured"
+        pencil = "grey30" if cannot else "bold cyan"
+        for row in rows:
+            where, where_style = qd.dial_where(row)
+            life, life_style = qd.dial_life(row)
+            by = " · ".join(x for x in (row.get("set_by"), qd.ago(row.get("set_at"))) if x)
+            key = f"dial:{row.get('repo') or 'fleet'}:{row.get('dial')}"
+            key = table.add_row(
+                Text("●", style="cyan"),
+                Text("✎", style=pencil),
+                Text(qd.clip(row.get("dial"), 34), style="bold white"),
+                Text(qd.dial_value(row, 14), style="cyan"),
+                Text(where, style=where_style),
+                Text(life, style=life_style),
+                # The argument for the value, which the board requires and which is
+                # the difference between a dial somebody can decide to remove and
+                # one nobody dares touch. Clipped here, in full on a click.
+                Text(qd.clip((row.get("reason") or "") + (f"  ({by})" if by else ""), 40),
+                     style="grey50"),
+                key=key,
+            ).value
+            self.rows[str(key)] = row
+
+        err = dials.get("error")
+        if err:
+            # A ROW and not a suffix on the title, for the same reason the review
+            # queue puts its errors in one: the title is bounded by the pane and
+            # would clip the one message that says why the panel is empty.
+            table.add_row(Text("!", style="red"), Text(""), Text(""), Text(""),
+                          Text(""), Text(""), Text(qd.clip(err, 40), style="red"),
+                          key="dial:error")
+        if not rows and not err:
+            table.add_row(Text(""), Text(""),
+                          Text("every dial at its repo default" if dials.get("asked")
+                               else "asking the board…", style="grey50"),
+                          Text(""), Text(""), Text(""), Text(""), key="dial:none")
+        # The door, always. Registered in `self.rows` so a click reaches
+        # `dispatch_row` — an unregistered key is dropped, which is right for a
+        # row with no verb and wrong for the only row here that has one.
+        # THE LAST ROW IS THE VERB THIS PANEL DID NOT USED TO HAVE, and it says
+        # which one it is: a live ✎ sets a dial from here, a dead one still opens
+        # the page that can. Drawn whether or not there is a dial above it,
+        # because the reader who most needs it is the one who has just found out
+        # that nothing is set.
+        page = table.add_row(
+            Text(""), Text("✎", style=pencil),
+            Text(qd.clip(f"set a dial — {cannot}" if cannot else "set a dial",
+                         92), style="grey50" if cannot else "cyan"),
+            Text(""), Text(""), Text(""), Text(""), key="dial:page").value
+        self.rows[str(page)] = {"page": True}
+
+        # A COUNT IS A CLAIM: "0 in force" over a board that would not answer says
+        # the fleet is running on its defaults, which is the one thing an
+        # unanswered read cannot establish.
+        if err:
+            title = "DIALS · unreadable"
+        elif not dials.get("asked"):
+            title = "DIALS · asking"
+        else:
+            title = f"DIALS · {len(rows)} in force"
+        shadowed = len(dials.get("shadowed") or [])
+        if shadowed:
+            # A fleet dial every repo on this screen overrides. Counted rather than
+            # drawn, because it is NOT in force here — and silence would leave the
+            # person who set it fleet-wide unable to see what became of it.
+            title += f" · {shadowed} overridden"
+        self.query_one("#t_dials", Static).update(title)
+        # The header cell carries the tempo off this same answer, and it is drawn
+        # on the limits clock — an hour long. Without this it would keep last
+        # hour's value while the panel below showed this minute's.
+        self.render_limits(self.limits, self.limits_err)
 
     def render_prs(self, prs: list[dict], err: str | None) -> None:
         self.prs, self.pr_err = prs, err
@@ -1149,6 +2045,15 @@ class Dash(App):
                     self.say(qd.queue_detail(record))
             else:
                 self.say(qd.queue_detail(record))
+        elif kind == "dial":
+            # The ✎ edits; anything else on the row says what the board said, in
+            # full. With no credential on this host the ✎ is the door it always
+            # was — the browser — and says so rather than opening a modal whose
+            # save could only fail.
+            if column == self.EDIT_COLUMN or record.get("page"):
+                self.edit_dial(None if record.get("page") else record)
+            else:
+                self.say(qd.dial_detail(record))
         elif kind == "issue":
             if column == self.FIX_COLUMN:
                 self.fix_issue(record)
@@ -1195,35 +2100,25 @@ class Dash(App):
     def seat_state(self, seat: dict) -> dict:
         """What the board says about the agent in this pane, or {}.
 
-        NARROW, THEN NARROW AGAIN, AND NEVER GUESS. Start from every agent with
-        this seat number; keep the ones in this pane's project, then the ones on
-        this machine; take the survivor only if there is exactly one. Each step is
-        skipped when it would leave nothing, which is what lets a pane that cannot
-        say which project it is in — a screen built before `@qb_repo` — still match
-        the only agent answering to its number.
+        ONE LOOKUP, ON THE SESSION ID. The pane carries `@qb_session` — the
+        conversation `qb-hook` stamped on it — and every agent `/active` returns
+        carries the same id, so the two sides join exactly.
 
-        Both narrowings earn their place, and one of them is why this is not just a
-        dict lookup. `list-panes -a` is the whole tmux server, so since #208 one box
-        holds `zeus/seat-lexray-1` and `zeus/seat-nix-fleet-1` at once; and the
-        BOARD is the whole fleet, so `zeus/seat-lexray-1` and `laptop/seat-lexray-1`
-        are both on it. Either collision, resolved by taking the first, is a wrong
-        answer that looks exactly like a right one.
+        This used to narrow three times and could still answer nothing. It started
+        from every agent whose NAME parsed to this pane's seat number, kept the
+        ones whose project matched, then the ones on this machine, and took the
+        survivor only if exactly one was left. Both narrowings were needed and
+        neither was sound: `list-panes -a` is the whole tmux server, so two screens
+        could each hold a seat 1 (#208); the board is the whole fleet, so two
+        machines could each hold a `seat-lexray-1`; and the machine half was a
+        GUESS at this host's board name, which comes from the token map and need
+        not be the hostname. A session id has none of those problems, and a pane
+        running an agent nobody named a seat resolves too (#540).
 
-        The machine is this host's name as the harness reads it, which is a GUESS —
-        the board's machine name comes from the token map and need not be the
-        hostname. It can only ever narrow a set that was already ambiguous, so a
-        wrong guess costs the state cell and never fills it in with the wrong agent.
+        Empty `agent` — a pane with no agent in it — matches nothing, which is the
+        answer: the state cell stays blank because there is no state.
         """
-        try:
-            number = int(seat["seat"])
-        except (KeyError, TypeError, ValueError):
-            return {}
-        here = getattr(self.cfg, "agent", None)
-        found = [(k, a) for k, a in self.seat_states.items() if k[2] == number]
-        scope = qd.pane_scope(seat)
-        found = [c for c in found if c[0][1] == scope] or found
-        found = [c for c in found if c[0][0] == here] or found
-        return found[0][1] if len(found) == 1 else {}
+        return self.seat_states.get(seat.get("agent") or "", {})
 
     def seat_session(self) -> str | None:
         """Which screen to act on: the one the seats are in, not the cursor's.
@@ -1252,12 +2147,30 @@ class Dash(App):
             return
         self.seat_click("add", session, f"add a seat to {session}?")
 
+    def action_expand(self) -> None:
+        """`z` — this pane to a window of its own, and back.
+
+        THROUGH `qb-seat-click`, exactly as the ＋ and the ✕ do, and for their
+        reason: the ⛶ on the top line, `C-q z` and this key are three front ends
+        onto ONE definition of what expanding means, which is `qb-seat-key
+        expand`. Two copies of the break-and-rejoin would be two places for the
+        geometry lore to drift.
+
+        NOT CONFIRMED, unlike the ✕. Nothing is killed, no process is touched —
+        the dash keeps polling across the move — and the same key puts it back.
+        """
+        session = self.seat_session()
+        if not session:
+            self.say("no seat screen on this server — nothing to expand into")
+            return
+        self.run_seat_click("expand", session)
+
     def jump_pane(self, seat: dict) -> None:
         """Move the tmux cursor to a seat's pane, by pane id.
 
-        By ID and not by seat number, because this row already knows the pane —
-        jump_to_seat's search over `list-panes -a` is for the FLEET table, whose
-        rows come off the board and only carry a holder name.
+        By ID, because this row already knows the pane — jump_to_agent's search
+        over `list-panes -a` is for the FLEET table, whose rows come off the board
+        and know a session id rather than a pane.
         """
         pane = seat.get("pane")
         if not pane or not os.environ.get("TMUX"):
@@ -1317,8 +2230,9 @@ class Dash(App):
         conclusion was still wrong: a review in a window is a review you go and
         find later, and the reason to click a PR here rather than open it on
         GitHub is to watch the thing happen. run_in_pane keeps it out of the
-        seat machinery — see @qb_label there. It runs the agent the same way
-        qb-seat does: the brief positionally, after `--`.
+        seat machinery — see @qb_label there. It runs the agent with its brief
+        positionally, after `--`, so a prompt beginning with `-` is read as a
+        prompt rather than as a flag.
         """
         number = pr.get("number")
         # The same refusal the ⚒ on an issue row makes, for the same reason and
@@ -1476,6 +2390,16 @@ class Dash(App):
         every click rather than cached at mount, so opting a machine in takes
         effect on the next click instead of on the next dashboard.
 
+        **`--no-board` is what keeps that true, and it is deliberate (#563).**
+        `--policy` now reads the board's `spawn.max_sessions` by default, because
+        the callers that read a ceiling before acting want the one in force. This
+        one is not such a caller — it asks two questions, *is this machine on* and
+        *is this command allowed*, and both are answered by the file — and it runs
+        on the UI thread, where a board that is down would freeze the screen for
+        five seconds on every keystroke. So it opts out of the read it does not
+        use, and gives up nothing: a ceiling this button never consulted is still
+        applied by the spawn itself, one step later, in `qb-start`'s own words.
+
         **AND IT DOES NOT FALL BACK TO THE OLD SPAWN.** The tempting shape is
         obvious — refuse through `qb-start`, and when the machine has not opted
         in start the session the way this button did last week — and it is wrong
@@ -1489,7 +2413,7 @@ class Dash(App):
         somebody wants this on.
         """
         try:
-            got = subprocess.run([self.start_bin, "--policy", "--json"],
+            got = subprocess.run([self.start_bin, "--policy", "--no-board", "--json"],
                                  capture_output=True, text=True, timeout=15)
         except Exception as exc:                       # noqa: BLE001
             # Fails CLOSED, and says which failure it was. `qb-start` missing is
@@ -1627,9 +2551,8 @@ class Dash(App):
         self.say(f"'{name}' is in the seat row — Ctrl-b x closes it")
 
     def click_agent(self, agent: dict) -> None:
-        seat = qd.seat_number(agent.get("holder"))
-        if seat is not None and self.jump_to_seat(seat, qd.seat_scope(agent.get("holder"))):
-            self.say(f"jumped to seat {seat} — {agent.get('holder')}")
+        if self.jump_to_agent(agent.get("session")):
+            self.say(f"jumped to {agent.get('holder')}")
             return
         self.say(
             f"{agent.get('holder')} · {agent.get('model') or '?'} · "
@@ -1637,37 +2560,30 @@ class Dash(App):
             f"{agent.get('cwd') or '?'}"
         )
 
-    def jump_to_seat(self, seat: int, scope: str | None = None) -> bool:
-        """Move the tmux cursor to the pane wearing @qb_seat = seat.
+    def jump_to_agent(self, session: str | None) -> bool:
+        """Move the tmux cursor to the pane this agent's conversation is in.
 
-        `scope` says which screen, and it has to: a FLEET row carries a board
-        identity, two screens can each have a seat 1 (#208), and jumping to
-        whichever tmux listed first is a jump to the wrong project half the time.
-        Narrowed and never guessed, exactly as seat_state does it — a screen too
-        old to carry `@qb_repo` still gets a working click when it is the only
-        candidate, and two panes that cannot be told apart get none.
+        ON THE SESSION ID, which the pane carries as `@qb_session` — so a click on
+        a FLEET row lands on the right pane or on none, with nothing to narrow and
+        nothing to guess. It used to jump by seat NUMBER parsed out of the holder's
+        name, which meant a screen had to be picked between: two screens can each
+        have a seat 1 (#208), so the click went to the wrong project about half the
+        time until a scope was threaded through to break the tie (#540).
 
-        No machine to narrow on here, and none wanted: every pane tmux lists is on
-        this box by definition.
-
-        Tab-separated, not space: `@qb_repo` is a filesystem path and a directory
-        with a space in it made the previous split return four fields, which matched
-        no seat at all.
+        A FLEET row for an agent on another machine simply matches no pane here,
+        which is the honest answer and the same one it gave before.
         """
-        if not os.environ.get("TMUX"):
+        if not session or not os.environ.get("TMUX"):
             return False
         try:
             out = subprocess.run(
-                ["tmux", "list-panes", "-a", "-F",
-                 "#{pane_id}\t#{@qb_seat}\t#{@qb_repo}\t#{@qb_scope}"],
+                ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{@qb_session}"],
                 capture_output=True, text=True, timeout=5,
             ).stdout
         except Exception:                          # noqa: BLE001
             return False
         found = [p for p in (line.split("\t") for line in out.splitlines())
-                 if len(p) == 4 and p[1] == str(seat)]
-        found = [p for p in found
-                 if qd.pane_scope({"repo": p[2], "scope": p[3]}) == scope] or found
+                 if len(p) == 2 and p[1] == session]
         pane = found[0][0] if len(found) == 1 else None
         if pane is None:
             return False
@@ -1684,6 +2600,142 @@ class Dash(App):
         self.open_url(f"https://github.com/{issue.get('repo') or qd.REPO}"
                       f"/issues/{issue.get('number')}")
 
+    def edit_dial(self, row: dict | None) -> None:
+        """Open the editor on one dial — or on a new one, when `row` is None.
+
+        **Falls back to the browser rather than to a dead modal.** With no session
+        on this host the write cannot succeed, and a form that took four fields
+        and then said so would have spent the person's typing to tell them
+        something it knew before they started. The page is still there and still
+        works, which is the whole reason the read-only version shipped first.
+        """
+        cannot = self.human.why_not() if self.human else "no board configured"
+        if cannot:
+            self.say(f"{cannot} — opening the board's dials page instead")
+            self.open_url(qd.dials_url(self.cfg))
+            return
+        # WHICH SCOPE a new dial lands in, decided here rather than in the modal:
+        # this screen already knows which project it is about, and a scope picker
+        # in a 78-column modal is a control that would be got wrong in a hurry.
+        # Editing an existing row keeps that row's own scope, which is the only
+        # answer that can mean "change what I am looking at".
+        repo = (row or {}).get("repo") if row else self.new_dial_scope()
+        label = repo or "fleet (every repo)"
+        # The harness's own dial table, the board's answer, and the board's clock —
+        # the three things the modal cannot work out for itself. `dial_vocabulary`
+        # resolves once per process and answers `{}` on a box with no harness/loops
+        # beside this script, which is the form as it shipped: free text and no
+        # refusal (#539).
+        self.push_screen(DialEdit(row, repo, label,
+                                  vocabulary=qd.dial_vocabulary(),
+                                  trouble=qd.dial_trouble(),
+                                  in_force=self.dials,
+                                  now=(self.dials or {}).get("now")),
+                         self.dial_written)
+
+    def new_dial_scope(self) -> str | None:
+        """Which repo a NEW dial belongs to — off the SCOPE, never off the cwd.
+
+        The rows on this pane are `Scope`'s (`QB_DASH_REPOS`, or `--repo`, or the
+        launch directory's origin, in that order). `self.repo_slug` is only the
+        last of those, and it is where work is LAUNCHED rather than what is being
+        shown: a pane started in one checkout with `QB_DASH_REPOS=owner/other`
+        displays `other`'s dials and would have written the dial to the checkout's
+        repo instead. Same name, different setting, and nothing on screen
+        afterwards says which one took it — the one mistake this panel must not
+        let a person make.
+
+        None means the fleet, and it is the honest answer twice over: a wide pane
+        is about several projects and cannot choose between them, and a sole repo
+        this process knows only by a bare name is not one the board would accept
+        (`owner/name` is its shape). The modal states whichever answer this gives
+        in bold before anything is written.
+        """
+        if self.scope.column:
+            return None                      # several projects, or the wide view
+        named = [r for r in self.scope.repos if "/" in r]
+        return named[0] if len(named) == 1 else None
+
+    def dial_written(self, asked: dict | None) -> None:
+        """What the modal came back with, turned into one board write.
+
+        Runs on the UI thread and hands the HTTP off to a worker: `op read` can
+        prompt and the board can be slow, and a dashboard that froze mid-write
+        would look like the thing it is trying to avoid being.
+        """
+        if not asked or not asked.get("dial"):
+            return
+        if asked.get("clear"):
+            self.run_dial_write(asked, None, None)
+            return
+        try:
+            value = qd.parse_dial_value(asked.get("value", ""))
+            expires = qd.parse_dial_expiry(asked.get("expiry", ""),
+                                           (self.dials or {}).get("now"))
+        except (ValueError, OverflowError) as exc:
+            # Refused HERE, where the sentence can name the box that was wrong,
+            # rather than at a 422 that names a field nobody typed.
+            #
+            # OverflowError as well as ValueError, and it is not defensive
+            # padding: `timedelta` raises it rather than ValueError for a duration
+            # past its range, so the bounded regex and this clause are two halves
+            # of one fix. Escaping here is a crash inside a Textual callback,
+            # which takes the dashboard down and every other panel with it.
+            self.say(str(exc))
+            return
+        if not (asked.get("reason") or "").strip():
+            self.say("a dial needs a reason — why is this value in force? "
+                     "The board refuses one without, and so does this")
+            return
+        self.run_dial_write(asked, value, expires)
+
+    @work(thread=True, exclusive=True, group="dialwrite")
+    def run_dial_write(self, asked: dict, value, expires: str | None) -> None:
+        """The write itself, off the UI thread. Never raises into Textual."""
+        dial, repo = asked["dial"], asked.get("repo")
+        try:
+            if asked.get("clear"):
+                got = self.human.clear_dial(dial, repo)
+                cleared = got.get("cleared") or []
+                said = (f"cleared {dial} — the repo's own default takes over"
+                        if cleared else f"{dial} was already gone")
+            else:
+                got = self.human.set_dial(dial, value, asked["reason"], repo, expires)
+                # WHAT IT REPLACED, said out loud: moving a dial without being told
+                # what it was is how one gets nudged twice by two people who each
+                # believed they were starting from the default. The endpoint
+                # returns the old row for exactly this sentence.
+                was = [f"{qd.dial_value(d, 40)} ({d.get('reason')})"
+                       for d in (got.get("replaced") or [])]
+                said = f"set {dial}" + (f" — it was {', '.join(was)}" if was else "")
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            said = f"{dial}: {exc}"
+        self.call_from_thread(self.say, qd.clip(said, 400))
+        # Straight back to the board rather than waiting out the plan clock: the
+        # person is looking at the row they just changed, and a panel that showed
+        # the old value for fifteen seconds would be read as a write that failed.
+        self.call_from_thread(self.refresh_plan)
+
+    def open_dials(self) -> None:
+        """The board's dials page — the only surface that can actually turn one.
+
+        Said out loud in the detail line rather than left to be inferred from a
+        browser opening. #443 is the record of what the silent version costs: a
+        person told the reorder was theirs to do, in a terminal, whose reply was
+        "i don't know how to re-order". A door nobody can find is the same as no
+        door.
+
+        **Still worth a key now that the panel can write.** The page shows every
+        repo's dials at once where this panel shows the screen's own, so a person
+        comparing two projects wants it. The `✎` on a row is the control; this is
+        the map. It is also the fallback when this host has no key.
+        """
+        self.open_url(qd.dials_url(self.cfg))
+        self.say("the board's dials page — every repo's dials at once, where this "
+                 "panel shows the screen's own. Setting one from here needs a "
+                 "person's key (QUARTERBACK_HUMAN_KEY_CMD); the page needs a "
+                 "browser the edge has vouched for.")
+
     def open_url(self, url: str) -> None:
         try:
             subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
@@ -1694,9 +2746,13 @@ class Dash(App):
 
     # ---- key actions -----------------------------------------------------
 
+    def action_open_dials(self) -> None:
+        """`d` — from any table, because a dial governs all of them."""
+        self.open_dials()
+
     def action_refresh_now(self) -> None:
         self.refresh_board()
-        self.refresh_plan()
+        self.refresh_plan()          # …which fetches the dials with it
         self.refresh_prs()
         self.refresh_issues()
         self.say("refreshing…")
@@ -1741,9 +2797,11 @@ class Dash(App):
 
     def action_help(self) -> None:
         self.say("o open on GitHub · p panel-review · f fix the selected issue or "
-                 "plan item · s this project's rows or the whole fleet's · r refresh · "
-                 "q quit · click ⚖ to review, ⚒ to fix, a plan row for why it is "
-                 "there, a seat to jump to its pane")
+                 "plan item · d the board's dials page · z this pane full screen "
+                 "and back · s this project's rows or the "
+                 "whole fleet's · r refresh · q quit · click ⚖ to review, ⚒ to fix, "
+                 "✎ to set or clear a dial (ctrl+s saves, ctrl+x clears), a plan row "
+                 "for why it is there, a seat to jump to its pane")
 
     def selected_row(self, table_id: str) -> dict | None:
         table = self.query_one(table_id, DataTable)

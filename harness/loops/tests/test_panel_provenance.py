@@ -291,8 +291,8 @@ def test_a_readable_range_comes_back_as_a_diff(monkeypatch):
     """The happy path, reconstructed from the compare API's per-file patches into
     something `_diff_added_lines` reads — which is the only consumer."""
     monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare()))
-    diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
-    assert why is None
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    assert why is None and kind == panel.FIX_RANGE_OK
     assert panel._diff_added_lines(diff) == {"app/sync.py": {11, 12}}
 
 
@@ -319,8 +319,31 @@ def test_a_branch_REWRITTEN_between_rounds_is_refused(monkeypatch):
     ever added — so every finding on a PR-added line reads `introduced` and the
     fixer is confidently blamed for all of it. GitHub calls it `diverged`."""
     monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare(status="diverged")))
-    diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "diverged" in why and "rewritten" in why
+    # REWRITTEN, split out of BLIND by #512, and the distinction is load-bearing:
+    # blind is "this reader could not get the range" and leaves the round's own
+    # increment usable; rewritten is "no diff of this span IS the fix pass", because
+    # the three-dot merge base has moved back. Nothing may attribute here — not this
+    # reader, not `Review.increment`, however readable the latter looks.
+    assert kind == panel.FIX_RANGE_REWRITTEN
+
+
+def test_a_branch_RESET_BACKWARDS_is_rewritten_and_not_an_empty_round(monkeypatch):
+    """The second rewrite, and it arrives disguised as the innocent case — which is
+    why it is named rather than inferred (found by Codex on #500).
+
+    GitHub answers `behind` when the head is an ANCESTOR of the commit the last round
+    reviewed: a reset backwards, a force-push that dropped commits. The three-dot
+    merge base is then the head itself, so the compare carries no files, and the
+    empty-compare road would report "no commit landed between rounds". The opposite
+    happened — commits were removed, and the fix pass this round exists to attribute
+    is gone from the branch."""
+    monkeypatch.setattr(panel_core, "sh",
+                        _sh_returning(_compare(status="behind", files=())))
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    assert diff is None and kind == panel.FIX_RANGE_REWRITTEN
+    assert "BEHIND" in why and "reset to an ancestor" in why
 
 
 def test_an_empty_compare_is_no_range(monkeypatch):
@@ -328,8 +351,52 @@ def test_an_empty_compare_is_no_range(monkeypatch):
     range with zero added lines, every new finding comes back `missed` —
     confidently, and with no note to say the range was empty."""
     monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare(files=())))
-    diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "changed no line" in why
+    # NO-FIX beside the unmoved head, and for its reason: commits landed and netted
+    # to nothing, so there is no fix pass the instruments failed to see.
+    assert kind == panel.FIX_RANGE_NO_FIX
+
+
+def test_a_MIXED_range_stays_readable_and_takes_no_veto(monkeypatch):
+    """The other half of the binary question, raised on review and declined on
+    purpose — recorded as a test so the next reader sees a decision rather than a
+    gap.
+
+    Partial attribution is a documented bias of this signal, not a blind instrument.
+    A binary file loses nothing — a finding has a line, and a binary file has none —
+    and a patch the API omitted for SIZE loses real lines, which is accepted because
+    `_fix_range_diff`'s docstring already accepts the identical loss from the same API
+    via the 300-file cap, and `_provenance` documents `introduced` as a floor rather
+    than a measurement.
+
+    Both roads are exercised here, because the second is the one a reason covering
+    only binaries would leave unjustified. Vetoing either would fire on any PR
+    touching a lockfile or an image — most of them — and that is the alert fatigue
+    this change exists to avoid, not to create."""
+    monkeypatch.setattr(panel_core, "sh", _sh_returning(
+        _compare(files=(("app/sync.py", COMPARE_PATCH),
+                        ("logo.png", None),          # binary: nothing to attribute
+                        ("huge.sql", None)))))       # omitted for size: lines lost
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    assert kind == panel.FIX_RANGE_OK and why is None
+    assert panel._diff_added_lines(diff) == {"app/sync.py": {11, 12}}
+
+
+def test_a_compare_of_only_BINARY_files_is_blind_not_empty(monkeypatch):
+    """Found by Codex on #500's first cut, and it is the difference the whole veto
+    turns on. Files changed — a fix pass really landed — and not one of them carried
+    a readable patch, so the attribution is gone. That is blind in exactly the sense
+    a rewritten branch is, and reading it as an empty compare would suppress the veto
+    on a round that genuinely lost its instruments.
+
+    The empty-compare road above stays `no-fix`: there, nothing changed at all."""
+    monkeypatch.setattr(panel_core, "sh",
+                        _sh_returning(_compare(files=(("logo.png", None),
+                                                      ("data.bin", None)))))
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    assert diff is None and kind == panel.FIX_RANGE_BLIND
+    assert "changed 2 file(s)" in why and "readable patch" in why
 
 
 def test_a_range_too_large_to_hold_is_not_held(monkeypatch):
@@ -339,7 +406,7 @@ def test_a_range_too_large_to_hold_is_not_held(monkeypatch):
     of somebody's vendored tree."""
     monkeypatch.setattr(panel_scope, "FIX_RANGE_MAX_CHARS", 40)
     monkeypatch.setattr(panel_core, "sh", _sh_returning(_compare()))
-    diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "larger than" in why
 
 
@@ -363,6 +430,7 @@ def test_a_missing_end_of_the_range_is_named_before_any_call_is_made(monkeypatch
     is a one-off that fixes itself next round, an unmoved head means no fix pass
     ran at all."""
     monkeypatch.setattr(panel_core, "sh", _sh_raising(AssertionError("must not call gh")))
+    assert panel._fix_range_diff("acme/board", None, "bbbb2222")[2] == panel.FIX_RANGE_BLIND
     assert panel._fix_range_diff("acme/board", None, "bbbb2222")[1].startswith(
         "the baseline does not record")
     assert "did not record" in panel._fix_range_diff("acme/board", "aaaa1111", None)[1]
@@ -374,8 +442,12 @@ def test_an_unmoved_head_is_not_a_github_failure(monkeypatch):
     whole of it, and asking GitHub to compare a commit with itself buys an API
     call to be told so."""
     monkeypatch.setattr(panel_core, "sh", _sh_raising(AssertionError("must not call gh")))
-    diff, why = panel._fix_range_diff("acme/board", "aaa111", "aaa111")
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaa111", "aaa111")
     assert diff is None and why == "no commit landed between rounds (head unchanged at aaa111)"
+    # NO-FIX, not blind (#500): there is no fix pass the instruments failed to see,
+    # so this must not take a veto. A veto here would fire on every honest empty
+    # round, and a veto that fires on nearly every round is one readers learn to skip.
+    assert kind == panel.FIX_RANGE_NO_FIX
 
 
 def test_a_range_that_github_cannot_serve_is_a_reason_not_a_crash(monkeypatch):
@@ -384,8 +456,9 @@ def test_a_range_that_github_cannot_serve_is_a_reason_not_a_crash(monkeypatch):
     version of this test reached none of this, because every call it made exited
     through a guard clause before `gh` was ever invoked."""
     monkeypatch.setattr(panel_core, "sh", _sh_raising(subprocess.CalledProcessError(1, "gh")))
-    diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+    diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
     assert diff is None and "could not read the range aaaa1111..bbbb2222" in why
+    assert kind == panel.FIX_RANGE_BLIND
 
 
 def test_no_gh_on_path_is_a_reason_too(monkeypatch):
@@ -584,7 +657,12 @@ FIX_COMPARE = _compare()
 
 CFG = {
     "github": "acme/e2e",
-    "path": "/tmp/acme-e2e",
+    # A path that CANNOT exist, not merely one that does not. #504 reconstructs a
+    # rewritten fix range out of the local object store at `path`, so a round in this
+    # file now runs local git against whatever is there — and `/tmp/acme-e2e` is a
+    # name somebody could plausibly create, which would make these rounds behave
+    # differently on one developer's box than on CI.
+    "path": "/nonexistent/acme-e2e",
     "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     "review_panel": {},
@@ -638,7 +716,7 @@ def _cfg(**budgets) -> dict:
 
 
 def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
-                 cfg=None, compare=None, moves_to=None):
+                 cfg=None, compare=None, moves_to=None, compare_diff=""):
     """One panel run with every subprocess replaced, so what is under test is the
     payload the panel builds rather than any CLI."""
     # One shared double (conftest.gh_stub) rather than a bespoke one: it knows
@@ -649,6 +727,12 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
               "headRefOid": head},
         head_moves_to=moves_to,
         compare=FIX_COMPARE if compare is None else compare,
+        # The RAW-diff media type, which is `fetch_increment`'s call and therefore
+        # what `--scope increment` reviews. Empty by default, which makes the
+        # increment fall back and the round read the whole PR — the state every
+        # test in this file was written against, kept so they keep meaning what
+        # they meant.
+        compare_diff=compare_diff,
         diff=PR_DIFF)
 
     def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
@@ -853,7 +937,7 @@ def test_a_compare_body_that_is_valid_json_but_not_an_OBJECT_is_a_reason(monkeyp
     parses cleanly and then has no `.get`, which is the case that guard is for."""
     for body in ("null", "[]"):
         monkeypatch.setattr(panel_core, "sh", _sh_returning(body))
-        diff, why = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
+        diff, why, kind = panel._fix_range_diff("acme/board", "aaaa1111", "bbbb2222")
         assert diff is None and "not an object" in why
 
 
@@ -904,3 +988,415 @@ def test_a_round_that_could_attribute_NOTHING_says_nothing_rather_than_zeroes(
     assert r2["provenance_counts"] == {"introduced": 0, "missed": 0,
                                        "missed-unread": 0, "unknown": 1}
     assert "of those:" not in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# What the number now DOES (#489)
+#
+# The tally above was measured, recorded and printed for six releases and read by
+# nothing — deliberately, and `panel.py` says so in as many words: #67 asks for the
+# instrument before the gate, and "a few dozen cycles of it are what would justify
+# wiring it to anything". `escalate_on.fix_injection` is that gate arriving, and
+# these two tests are the seam it arrived on. Everything either side of it is
+# covered in `test_panel_injection.py` — the dial, the arithmetic and the stop rule —
+# and what is only coverable HERE is that `run()` computes the tally BEFORE the
+# verdict that consumes it. The block used to sit below `round_stop`, and could,
+# because nothing read it.
+# --------------------------------------------------------------------------
+
+def test_a_round_whose_findings_are_mostly_its_own_damage_ends_the_cycle(
+        monkeypatch, tmp_path):
+    """Four findings new to round 2, three of them on lines the round-1 fix wrote.
+    Under rule 1 alone that is four reasons to go again; under the gate it is the
+    fix pass generating the work, and the cycle ends saying so.
+
+    The `reason` is the load-bearing assertion. Every one of these findings is a P2,
+    so without the gate this round goes again and hits the cap — and "round cap (2)
+    reached" sends a reader looking for a bigger cap, which is the one remedy that
+    makes this failure worse."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                         head="bbb222", baseline=[r1_path])
+
+    assert r2["provenance_counts"] == {"introduced": 3, "missed": 1,
+                                       "missed-unread": 0, "unknown": 0}
+    # The `stop_reason` first, because it is what the defect looked like: before the
+    # gate this round said "round cap (2) reached — 4 finding(s) no earlier round
+    # raised, unreviewed", three of those four findings having been written by the
+    # round-1 fix pass.
+    assert "round cap" not in r2["stop_reason"]
+    assert "introduced by the fix pass before this round" in r2["stop_reason"]
+    assert r2["round_stop"]["stop"] is True
+    assert r2["round_stop"]["confident"] is False
+    assert any("escalate_on.fix_injection" in v for v in r2["round_stop"]["veto"])
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["introduced"], got["new"]) == (3, 4)
+    assert (got["rate"], got["over"]) == (0.75, True)
+    # The human half. `jq .round_stop` is what an orchestrator reads; this is what a
+    # person reads off the PR comment, and the printed "N introduced" line above it
+    # cannot say that a threshold was crossed.
+    assert any("fix_injection" in n and "the cycle ends here" in n
+               for n in r2["config_notes"])
+
+
+# ------------------------------ #512: one range, and it is the one that was read
+
+#: An increment that touches app/sync.py:11 — the same line COMPARE_PATCH does, so
+#: the two sources agree about the finding and differ only in what ELSE they carry.
+INCREMENT_DIFF = (
+    "diff --git a/app/sync.py b/app/sync.py\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/app/sync.py\n"
+    "+++ b/app/sync.py\n"
+    "@@ -10,0 +11,2 @@\n"
+    "+introduced_by_the_fix()\n"
+    "+and_this_one_too()\n")
+
+
+def test_provenance_reads_the_range_the_round_actually_REVIEWED(monkeypatch, tmp_path):
+    """The consolidation, asserted where it is visible: the two sources are pointed
+    at DIFFERENT content and provenance follows the increment.
+
+    The compare path is told the fix pass touched app/far.py; the increment — the
+    diff this round put in front of the seats — says it touched app/sync.py:11. A
+    finding at sync.py:11 is `introduced` only if attribution read the increment.
+    Before #512 it read the compare call and came back `missed`, confidently, about
+    a range nobody looked at."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle")],
+                         head="bbb222", baseline=[r1_path],
+                         compare_diff=INCREMENT_DIFF,
+                         compare=_compare(files=(("app/far.py", COMPARE_PATCH),)))
+    # The BEHAVIOUR first and the label second, deliberately: against the pre-#512
+    # code this must fail on the attribution being wrong, not on a payload key that
+    # does not exist yet. A test that goes red on a KeyError has demonstrated
+    # nothing about the defect it is named for.
+    assert r2["provenance_counts"]["introduced"] == 1
+    assert r2["provenance_counts"]["missed"] == 0
+    assert r2["fix_range_source"] == "increment"
+
+
+def test_an_explicit_since_anchors_the_attribution_too(monkeypatch, tmp_path):
+    """The anchor mismatch, asserted on the road that survives a scope fallback.
+
+    `--since` is documented and legitimate. Scope resolves it into `anchor` before it
+    decides anything; attribution used to take `prior.head_sha` outright, so the two
+    described different spans with nothing reporting it. Reading `review.since`
+    instead would fix only half of it — that field is EMPTY on a round whose scope
+    fell back to `pr`, which is precisely a round with no increment to cross-check
+    the answer against.
+
+    Asserted through the argv the compare call was made with, because the anchor is
+    not otherwise visible in the payload."""
+    # Round 1 FIRST: `_panel_round` installs its own `panel_core.sh`, so an
+    # instrumented stub put in before it is overwritten and records nothing.
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    calls: list = []
+    fake_sh = gh_stub(meta={"title": "feat: mirror", "additions": 20, "deletions": 2,
+                            "headRefOid": "bbb222"},
+                      compare=FIX_COMPARE, diff=PR_DIFF, calls=calls)
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: CFG)
+    monkeypatch.setattr(panel_core, "sh", fake_sh)
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda name, model, prompt, effort="", **_kw:
+                        panel.ReviewerRun([], None, 800, None))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], None, ""))
+    out = tmp_path / "r2.json"
+    panel.run("e2e", 77, post=False, json_file=str(out), record=False, round_no=2,
+              baseline=[r1_path], max_rounds=2, since="ccc333")
+    compares = [" ".join(a) for a in calls if any("/compare/" in x for x in a)]
+    assert compares, "no compare call was made at all"
+    assert all("aaa111" not in c for c in compares), (
+        "attribution anchored on the baseline's head, not on --since")
+    assert any("ccc333" in c for c in compares)
+
+
+def test_a_REBASED_round_does_not_attribute_the_widened_increment(monkeypatch,
+                                                                  tmp_path):
+    """The regression this change nearly introduced, caught by Codex on review, and
+    it would have been worse than the bug #509 fixed.
+
+    `fetch_increment` uses the three-dot form, so after a rewrite the merge base
+    moves back and the increment WIDENS toward the whole PR. Its own docstring calls
+    that "the safe failure: the round re-reads more than it needed to" — safe for a
+    REVIEW, catastrophic for an ATTRIBUTION, because every line the PR ever added is
+    then inside the supposed fix range and every finding on one reads `introduced`.
+    `panel_scope` only falls back at `len(increment) >= len(diff)`, so a rebase that
+    widens the increment to most of the PR sails through and becomes the target.
+
+    Where #500 was the injection gate failing to FIRE, this would be the gate firing
+    WRONGLY — ending a cycle with the fixer blamed for the whole PR. `_fix_range_diff`
+    is the only reader that sees `status`, so it keeps running and its refusal still
+    wins over the increment's lines."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a finding on a PR-added line")],
+                         head="bbb222", baseline=[r1_path],
+                         # The round reviewed a (widened) increment happily...
+                         compare_diff=INCREMENT_DIFF,
+                         # ...and the compare API says the branch was rewritten.
+                         compare=_compare(status="diverged"))
+    assert r2["provenance_counts"]["introduced"] == 0, (
+        "a rewritten branch must attribute NOTHING — the increment is not the fix "
+        "pass after a rebase, however readable it looks")
+    assert r2["provenance_counts"]["unknown"] == 1
+    assert r2["fix_range_source"] is None
+    # #509's veto is downstream of the same call and must still fire.
+    assert any("#500" in v for v in r2["round_stop"]["veto"])
+
+
+def test_a_range_too_LARGE_to_hold_still_attributes_from_the_increment(monkeypatch,
+                                                                       tmp_path):
+    """Found by Codex, and it fires on the case this feature is most for.
+
+    `_fix_range_diff` refuses a range past `FIX_RANGE_MAX_CHARS` rather than holding
+    it in memory — which a big base-branch merge reaches easily. That is BLIND: this
+    reader could not get the range. It says nothing about the round's own increment,
+    which is in memory already, was what the seats read, and is narrowed to the PR's
+    own files so the merge's commits are not even in it.
+
+    Gating on "did the compare call return a diff" discarded it and marked the round
+    unattributable — a false blindness, plus #509's veto, on a round that read the
+    fix pass perfectly well. The gate is `rewritten`, not `blind`."""
+    monkeypatch.setattr(panel_scope, "FIX_RANGE_MAX_CHARS", 10)
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle")],
+                         head="bbb222", baseline=[r1_path],
+                         compare_diff=INCREMENT_DIFF)
+    # Behaviour first: pre-fix this round attributed NOTHING, so the red is the
+    # defect and not a payload key that does not exist yet.
+    assert r2["provenance_counts"]["introduced"] == 1
+    # And no veto: the attribution HAPPENED, so calling the round blind would be the
+    # alert fatigue #509's veto was written to avoid.
+    assert not any("#500" in v for v in r2["round_stop"]["veto"])
+    assert r2["fix_range_source"] == "increment"
+
+
+def test_a_blind_range_with_NO_increment_still_vetoes(monkeypatch, tmp_path):
+    """The other half, so the narrowing above cannot quietly switch #509 off. Nothing
+    in hand and nothing fetchable is still a blind round."""
+    monkeypatch.setattr(panel_scope, "FIX_RANGE_MAX_CHARS", 10)
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a second defect")],
+                         head="bbb222", baseline=[r1_path])  # no increment either
+    assert r2["fix_range_source"] is None
+    assert any("#500" in v for v in r2["round_stop"]["veto"])
+
+
+def test_a_pr_scope_round_still_uses_the_compare_call(monkeypatch, tmp_path):
+    """The narrowing, from the other side. A repo on `round_scope: pr` has no
+    increment at all, so #41's "introduced by construction" never covered it and the
+    old path is still the only answer available."""
+    cfg = {**CFG, "review_panel": {**CFG["review_panel"], "round_scope": "pr"}}
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111",
+                              cfg=cfg)
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a second defect")],
+                         head="bbb222", baseline=[r1_path], cfg=cfg,
+                         compare_diff=INCREMENT_DIFF)
+    assert r2["fix_range_source"] == "compare"
+
+
+def test_a_round_whose_increment_fell_back_uses_the_compare_call(monkeypatch,
+                                                                 tmp_path):
+    """The other road to `compare`, and the commonest one: the increment could not
+    be fetched, so the round read the whole PR. There is no increment to attribute
+    against, and inventing one from a range the seats never saw is the mismatch this
+    change removes."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a second defect")],
+                         head="bbb222", baseline=[r1_path])  # compare_diff="" -> falls back
+    assert r2["fix_range_source"] == "compare"
+
+
+def test_round_one_has_no_range_source_because_it_has_nothing_to_attribute(
+        monkeypatch, tmp_path):
+    """`null` rather than a source name, on this file's standing rule: a round with
+    no earlier round is not "unattributable", the question does not arise."""
+    _, r1 = _panel_round(monkeypatch, tmp_path, 1,
+                         [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    assert r1["fix_range_source"] is None
+
+
+# ------------------------------------------- #500: a blind instrument is a gap
+
+
+def test_a_REBASE_between_rounds_vetoes_the_round_it_blinded(monkeypatch, tmp_path):
+    """#500's measured case. `main` moves, somebody rebases between rounds — ordinary
+    and correct — and three convergence instruments go dark at once, because
+    provenance, recurrence and `--scope increment` all read the same fix range.
+
+    The panel always DETECTED this and said so in `config_notes`, read afterwards by
+    whoever thought to look, while the round went on to report a stop whose `reason`
+    never mentioned that its main convergence test was off. It is a coverage gap of
+    exactly the kind a truncated reviewer is, and it now takes what one takes: a veto
+    line, and `confident` false.
+
+    #497 is what makes it cost something. `fix_injection` is computed from
+    provenance, so with the range gone every new finding is `unknown`, `unknown` sits
+    in the denominator, and the gate cannot fire on the very cycle it was built for.
+    """
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket")],
+                         head="bbb222", baseline=[r1_path],
+                         compare=_compare(status="diverged"))
+
+    # Every finding unattributable, which is what disarms the gate.
+    assert r2["provenance_counts"]["unknown"] == 3
+    assert r2["round_stop"]["fix_injection"]["over"] is False
+    # ...and the round says so where the verdict is read, not only in config_notes.
+    assert any("rewritten between rounds" in v for v in r2["round_stop"]["veto"])
+    assert any("fix_injection" in v and "#500" in v for v in r2["round_stop"]["veto"])
+    assert r2["round_stop"]["confident"] is False
+
+
+def test_the_veto_names_all_three_instruments_not_just_provenance(monkeypatch, tmp_path):
+    """They share one cause and one fix range, so a veto naming only provenance
+    under-reports what the round lost — and `--scope increment` is the one an
+    operator can act on immediately by re-running the round whole."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "a second defect")],
+                         head="bbb222", baseline=[r1_path],
+                         compare=_compare(status="diverged"))
+    lines = [v for v in r2["round_stop"]["veto"] if "#500" in v]
+    assert lines, "no #500 veto line at all"
+    assert all(w in lines[0] for w in ("provenance", "recurrence", "increment"))
+
+
+def test_an_unmoved_head_takes_NO_veto(monkeypatch, tmp_path):
+    """The alert-fatigue guard, and the reason the fix range reports a KIND rather
+    than a sentence to grep. A head that never moved means no fix pass happened, so
+    the instruments are vacuous rather than blind — there is nothing they failed to
+    see.
+
+    A veto here would fire on every honest empty round, and #501 is the standing
+    evidence for what that costs: a veto on nearly every round teaches the reader to
+    skip the veto list, which is exactly where the real coverage gaps are reported.
+    """
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 90, "an unrelated defect")],
+                         head="aaa111", baseline=[r1_path])
+    assert not any("#500" in v for v in r2["round_stop"]["veto"])
+
+
+def test_an_empty_fix_pass_takes_no_veto_either(monkeypatch, tmp_path):
+    """The other `no-fix` road: commits landed and netted to nothing — a revert, an
+    empty commit. Same argument as the unmoved head, and it is a separate road
+    through `_fix_range_diff`, so it is asserted separately."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 90, "an unrelated defect")],
+                         head="bbb222", baseline=[r1_path],
+                         compare=_compare(files=()))
+    assert not any("#500" in v for v in r2["round_stop"]["veto"])
+
+
+def test_round_one_takes_no_veto_because_it_has_nothing_to_attribute_against(
+        monkeypatch, tmp_path):
+    """`attributable` is false in round 1 — there is no earlier round — so the whole
+    question does not arise. Guarded because the veto is appended near code that runs
+    on every round, and a round-1 veto would fire on every first round in the fleet.
+    """
+    _, r1 = _panel_round(monkeypatch, tmp_path, 1,
+                         [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    assert not any("#500" in v for v in r1["round_stop"]["veto"])
+
+
+def test_the_ORCHESTRATOR_is_told_before_the_rebase_not_only_after(monkeypatch,
+                                                                    tmp_path):
+    """#500's second remedy, and the cheaper of the two. The veto is honest about a
+    round already blinded; only the brief can stop the rebase happening. §5 tells the
+    caller to pass every earlier payload as `--baseline` and said nothing about
+    rewriting the branch between rounds.
+
+    A prose test, on this repo's precedent for the ones that guard a mechanism's
+    other half: a veto nobody was warned about is a veto read as bad luck."""
+    brief = (Path(__file__).resolve().parents[3]
+             / "harness/commands/panel-review-pr.md").read_text()
+    assert "Do not rewrite the branch between rounds" in brief
+    # The three instruments, the gate it disarms, and the remedy that keeps the
+    # range readable — the four things a caller needs before choosing.
+    for owed in ("provenance", "recurrence", "increment",
+                 "escalate_on.fix_injection", "merging the base branch"):
+        assert owed in brief, owed
+
+
+def test_a_round_that_mostly_found_what_the_last_one_MISSED_is_not_diverging(
+        monkeypatch, tmp_path):
+    """The other side of the same seam, and the one that keeps the gate honest. Four
+    new findings, one of them on the fix pass's own lines: the earlier round
+    under-read, which argues for more coverage and not for stopping. The cycle ends
+    on the cap, as it always did, and the rate rides in the payload saying why it did
+    not fire."""
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111")
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw"),
+                          ("app/sync.py", 91, "and another one beside it"),
+                          ("app/sync.py", 92, "and a third")],
+                         head="bbb222", baseline=[r1_path])
+
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["introduced"], got["new"]) == (1, 4)
+    assert (got["rate"], got["over"]) == (0.25, False)
+    assert "round cap (2) reached" in r2["stop_reason"]
+    assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+
+
+def test_a_round_that_stops_UNDER_A_FLOOR_is_not_told_it_stopped_on_divergence(
+        monkeypatch, tmp_path):
+    """The integration half of `over` vs `fired`, and the one a unit test cannot
+    reach: `run()` writes the human-readable note, and gating it on the MEASUREMENT
+    rather than on the VERDICT puts "the cycle ends here" in `config_notes` under a
+    `reason` that names a policy floor and a `confident: true` beside it.
+
+    Both floors are raised to P1 so this round's P2s buy nothing and clear nothing:
+    the cycle stops under #165's trigger floor, which is a policy stop that is
+    deliberately NOT vetoed. Three of its four new findings were still written by the
+    fix pass, so the rate is over the threshold and has to say so in the payload —
+    and say nothing anywhere else."""
+    cfg = {**CFG, "review_panel": {"fix_severity_floor": "P1",
+                                   "round_trigger_floor": "P1"}}
+    r1_path, _ = _panel_round(monkeypatch, tmp_path, 1,
+                              [("app/sync.py", 11, "a stale mirror")], head="aaa111",
+                              cfg=cfg)
+    _, r2 = _panel_round(monkeypatch, tmp_path, 2,
+                         [("app/sync.py", 11, "the fix left a dangling handle"),
+                          ("app/sync.py", 12, "and dropped the lock with it"),
+                          ("app/sync.py", 11, "and never closed the socket"),
+                          ("app/sync.py", 90, "an unrelated defect nobody saw")],
+                         head="bbb222", baseline=[r1_path], cfg=cfg)
+
+    got = r2["round_stop"]["fix_injection"]
+    assert (got["over"], got["fired"]) == (True, False)
+    assert "round trigger floor" in r2["stop_reason"]
+    assert r2["round_stop"]["confident"] is True
+    assert not any("fix_injection" in v for v in r2["round_stop"]["veto"])
+    assert not any("fix_injection" in n for n in r2["config_notes"])

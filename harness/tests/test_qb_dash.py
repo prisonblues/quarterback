@@ -203,7 +203,7 @@ async def _drive() -> list[str]:
     # the click is already in flight. Off for every test here: none of them is
     # about the caps, and a test that reached the network would be its own bug.
     app.refresh_limits = lambda: None
-    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # THE THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, all off.
     # (`#detail` is a third and is left alone: the drivers move that one
     # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
@@ -215,17 +215,22 @@ async def _drive() -> list[str]:
     # covering it. None of these tests is about the caps, the queue or the seats.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     opened: list[int] = []
-    jumped: list[int] = []
+    jumped: list[str | None] = []
     app.open_pr = lambda pr: (opened.append(pr.get("number")),
                               app.say(f"opened #{pr.get('number')}"))[1]
-    # `scope` too, and not as decoration: `jump_to_seat` grew a second parameter
-    # when seat identity became per-project (#208), and this stub did not — so
-    # every run of this test died on a TypeError from inside the lambda rather
-    # than on anything it asserts. A stub of a real method has to keep that
-    # method's signature or it stops standing in for it.
-    app.jump_to_seat = lambda seat, scope=None: (jumped.append(seat), True)[1]
+    # THE STUB HAS TO KEEP THE REAL METHOD'S SIGNATURE. It did not when
+    # `jump_to_seat` grew a scope parameter (#208), and every run of this test then
+    # died on a TypeError from inside the lambda rather than on anything it
+    # asserts. It takes a session id now (#540) and takes only that.
+    app.jump_to_agent = lambda session: (jumped.append(session), True)[1]
 
     failures: list[str] = []
     async with app.run_test(size=(80, 44)) as pilot:
@@ -273,6 +278,12 @@ async def _drive_issues() -> list[str]:
     # The caps line and SEATS both move everything under them — see _drive.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     opened: list[int] = []
@@ -358,6 +369,12 @@ async def _drive_plan() -> list[str]:
     # The caps line and SEATS both move everything under them — see _drive.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, list]] = []
     app.spawn_refusal = lambda command: None
@@ -430,7 +447,7 @@ async def _drive_panel() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
-    # THE TWO THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, both off.
+    # THE THINGS THAT MOVE THIS PANE WITHOUT BEING ASKED TO, all off.
     # (`#detail` is a third and is left alone: the drivers move that one
     # themselves, by clicking, and several of them assert on what it says.)
     # The caps line APPEARS — `display: none` until the first answer — and SEATS
@@ -442,6 +459,12 @@ async def _drive_panel() -> list[str]:
     # covering it. None of these tests is about the caps, the queue or the seats.
     app.refresh_seats = lambda: None
     app.render_queue = lambda *a, **k: None
+    # …and DIALS, which is a fourth (#477). It is `height: auto` like SEATS, so it
+    # grows from nothing to two rows the moment the board answers — and it rides
+    # `refresh_plan`, which these drivers deliberately leave running because they
+    # need the plan table live. Every panel below it reflows on that growth, which
+    # is a click landing a row high on whatever was in flight at the time.
+    app.render_dials = lambda *a, **k: None
 
     started: list[tuple[str, str]] = []
     windowed: list[tuple[str, str]] = []
@@ -560,6 +583,12 @@ async def _drive_seats() -> list[str]:
     # on mount AND on a timer, so a fixture that only re-rendered would race it
     # and the panel under the pointer would be the developer's own seats.
     app.refresh_seats = lambda: None
+    # And DIALS, which sits DIRECTLY ABOVE this panel and is `height: auto` (#477).
+    # It grows from nothing to two rows when the board answers, on `refresh_plan`'s
+    # clock, and every row of SEATS moves down with it — mid-click, since this
+    # driver clicks three of them. Not hypothetical: it is what failed
+    # `test_the_seats_panel_jumps_closes_and_adds` on the run that added this line.
+    app.render_dials = lambda *a, **k: None
 
     failures: list[str] = []
     async with app.run_test(size=(90, 50)) as pilot:
@@ -667,6 +696,169 @@ def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
 
     assert asyncio.run(drive()) == [("add", "seats-demo")], \
         "the ＋ row was not what a click at its offset reached"
+
+
+# ---- one column or two ------------------------------------------------------
+#
+# The complaint the wide layout answers is HEIGHT: seven panels sharing one
+# column's rows leave CLAIMED and REVIEW QUEUE two rows tall on a pane nobody
+# would call short. So these measure heights and positions rather than reading
+# the class back off the widget — a class that is set while the grid does
+# nothing is exactly the bug worth catching, and it would pass an assertion
+# about the class.
+
+
+def _panels(app) -> dict:
+    """Every panel's region, by id. Position and size, which is the whole claim."""
+    return {pid: app.query_one("#" + pid).region
+            for pid in ("p_dials", "p_seats", "p_fleet", "p_claims", "p_plan",
+                        "p_prs", "p_queue", "p_issues")}
+
+
+def _stub_fetches(app) -> None:
+    """Nothing is fetched because nothing here depends on the rows: an empty
+    table still occupies its share of the pane, and a layout test that waited on
+    `gh` would be a layout test that skips in CI."""
+    for stub in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, stub, lambda: None)
+
+
+async def _laid_out(width: int, height: int = 50) -> dict:
+    """Drive the app at one size with every fetch stubbed out, and measure."""
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    _stub_fetches(app)
+    async with app.run_test(size=(width, height)) as pilot:
+        await pilot.pause(0.2)
+        return {"wide": app.wide, "panels": _panels(app)}
+
+
+def test_a_narrow_pane_is_one_column_and_a_wide_one_is_two():
+    """The threshold is a width, and below it nothing changes at all.
+
+    78 columns is what one of these tables wants before it wraps, so the pane
+    `qb-seats` splits off must come out EXACTLY as it did before this existed —
+    a dash that went two-across at 78 would be two columns of 39, which is worse
+    than the problem being solved.
+    """
+    narrow = asyncio.run(_laid_out(90))
+    assert narrow["wide"] is False
+    assert {r.x for r in narrow["panels"].values()} == {0}, \
+        "a 90-column pane put panels in more than one column"
+
+    wide = asyncio.run(_laid_out(200))
+    assert wide["wide"] is True
+    lefts = {r.x for r in wide["panels"].values()}
+    assert len(lefts) == 2, f"a 200-column pane did not use two columns: {lefts}"
+
+
+def test_two_columns_is_bought_for_height_not_for_width():
+    """The point of the second column, asserted as the thing it is for.
+
+    Every panel but SEATS — which is its content in both layouts, and spans both
+    columns for that reason — has to come out TALLER wide than narrow. If it
+    does not, the grid is drawing two columns and the rows are still being cut
+    into sevenths, which looks like a success and fixes nothing.
+    """
+    narrow = asyncio.run(_laid_out(90))["panels"]
+    wide = asyncio.run(_laid_out(200))["panels"]
+    shorter = {pid: (narrow[pid].height, wide[pid].height)
+               for pid in narrow if pid not in ("p_seats", "p_dials")
+               and wide[pid].height <= narrow[pid].height}
+    assert not shorter, f"no taller in two columns (narrow, wide): {shorter}"
+    assert wide["p_seats"].width > narrow["p_seats"].width, \
+        "SEATS did not span both columns — the ＋ is in half a pane"
+    # DIALS spans for the same reason and is asserted the same way: it is the
+    # other content-sized panel, so a column of its own would buy it nothing and
+    # cost the panel beside it half its width.
+    assert wide["p_dials"].width > narrow["p_dials"].width, \
+        "DIALS did not span both columns"
+
+
+def test_the_review_queue_stays_with_the_prs_it_reviews():
+    """#273's arrangement survives the second column, by moving with it.
+
+    Narrow, the queue is directly UNDER OPEN PRs: that one says a PR exists and
+    CI is green, this one says whether anybody has reviewed it, and they are
+    read together. A grid fills row by row in DOM order, so leaving the order
+    alone would have put the queue in the row below PLANS and a column away from
+    the panel it exists to answer. Wide, `under` becomes `beside` — same row,
+    next column — which is `relayout`'s one job that CSS could not do.
+    """
+    narrow = asyncio.run(_laid_out(90))["panels"]
+    assert narrow["p_queue"].y == narrow["p_prs"].y + narrow["p_prs"].height, \
+        "narrow: REVIEW QUEUE is not directly under OPEN PRs"
+
+    wide = asyncio.run(_laid_out(200))["panels"]
+    assert wide["p_queue"].y == wide["p_prs"].y, \
+        "wide: REVIEW QUEUE is not in OPEN PRs' row"
+    assert wide["p_queue"].x > wide["p_prs"].x, \
+        "wide: REVIEW QUEUE is not beside OPEN PRs"
+
+
+def test_crossing_the_threshold_and_coming_back_restores_the_narrow_order():
+    """A resize is not a one-way door, and the reorder has to undo exactly.
+
+    `>` and `<` nudge the pane by 8 columns at a time, so a dash crossing the
+    threshold twice in ten seconds is an ordinary afternoon rather than an edge
+    case — and `move_child` mutates the tree, so an undo that is not exact
+    leaves a screen whose panels are in an order nobody chose. Measured by the
+    positions, which is where a wrong order shows up.
+    """
+    async def drive() -> tuple:
+        app_module = _load_app()
+        app = app_module.Dash(interval=3600, gh_interval=3600)
+        _stub_fetches(app)
+        async with app.run_test(size=(90, 50)) as pilot:
+            await pilot.pause(0.2)
+            first = _panels(app)
+            await pilot.resize_terminal(200, 50)
+            await pilot.pause(0.2)
+            wide = app.wide
+            await pilot.resize_terminal(90, 50)
+            await pilot.pause(0.2)
+            return first, wide, app.wide, _panels(app)
+
+    first, went_wide, came_back, again = asyncio.run(drive())
+    assert went_wide is True and came_back is False
+    assert again == first, "the narrow layout did not come back the way it went"
+
+
+def test_the_add_row_is_still_clickable_in_two_columns():
+    """The ＋ again, at the width that rearranges everything around it.
+
+    The last two defects in this panel were both a click reaching the wrong row
+    or no row, and both came from a layout change that read fine. A grid that
+    spans SEATS across two columns and reorders the panels under it is the same
+    class of change, so it is checked the same way: by clicking, not by
+    measuring.
+    """
+    async def drive() -> list:
+        app_module = _load_app()
+        app = app_module.Dash(interval=3600, gh_interval=3600)
+        app.refresh_limits = lambda: None
+        app.refresh_seats = lambda: None
+        clicked: list = []
+        app.run_seat_click = lambda tag, session: clicked.append((tag, session))
+        app.jump_pane = lambda seat: clicked.append(("jump", seat["pane"]))
+        full = [{"pane": f"%{n}", "seat": str(n), "session": "seats-demo",
+                 "window": "0", "command": "claude", "path": "/tmp/demo"}
+                for n in range(1, 11)]
+        async with app.run_test(size=(200, 50)) as pilot:
+            assert app.wide is True, "200 columns did not reach the wide layout"
+            app.render_seats(full)
+            await pilot.pause(0.2)
+            seats = app.query_one("#seats")
+            await pilot.click(seats, offset=(4, len(full) + 1))
+            await pilot.pause(0.3)
+            if isinstance(app.screen, app_module.Confirm):
+                await pilot.press("enter")
+                await pilot.pause(0.3)
+            return clicked
+
+    assert asyncio.run(drive()) == [("add", "seats-demo")], \
+        "the ＋ row was not what a click at its offset reached in two columns"
 
 
 # ---- the scope (#261) -------------------------------------------------------
@@ -1469,6 +1661,10 @@ async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[s
     app = app_module.Dash(interval=3600, gh_interval=3600)
     app.refresh_limits = lambda: None
     app.refresh_seats = lambda: None
+    # DIALS too — same reason as `_drive_seats`: it grows above the seat row this
+    # asserts on, and a row that moved between the render and the read is a row
+    # this reads at the wrong index.
+    app.render_dials = lambda *a, **k: None
 
     calls: list[list[str]] = []
     windowed: list[str] = []
@@ -1530,11 +1726,14 @@ def test_with_no_seat_row_to_join_a_review_still_gets_somewhere():
     assert not any("split-window" in c for c in calls), calls
 
 
-# ---- two screens on one machine (#208) ---------------------------------------
+# ---- joining a pane to the board, on the session id (#540) -------------------
 #
-# `list-panes -a` is the whole tmux server, so since seats became per-project the
-# dashboard sees two seat 1s and has to tell them apart. Everything below is
-# synchronous: it exercises the joins, not the widgets, and does not need a pilot.
+# `list-panes -a` is the whole tmux server and the board is the whole fleet, so a
+# seat NUMBER identified a pane in neither: two screens can each hold a seat 1
+# (#208) and two machines can each hold a `seat-lexray-1`. The pane carries the
+# conversation in it instead, and the board returns the same id, so this is one
+# lookup. Everything below is synchronous: it exercises the join, not the widgets,
+# and does not need a pilot.
 
 
 def _dash():
@@ -1542,93 +1741,170 @@ def _dash():
 
 
 def _agents(*holders):
-    return {"agents": [{"holder": h, "state": "working", "reported": None}
+    """A board answer. The session is derived from the holder so a test can name
+    the one it means without a second table to keep in step."""
+    return {"agents": [{"holder": h, "session": f"sess-{h}",
+                        "state": "working", "reported": None}
                        for h in holders], "claims": []}
 
 
 def _stated(app, **seat):
     """A pane record as tmux_seats returns one, filled in only where it matters."""
-    return app.seat_state({"pane": "%0", "repo": "", "scope": "", **seat})
+    return app.seat_state({"pane": "%0", "agent": "", **seat})
 
 
-def test_a_seat_pane_is_matched_to_its_own_screens_agent():
-    """The number alone is no longer a name. Matching on it shows one screen's
-    agent against the other screen's pane — a wrong answer that looks exactly
-    like a right one."""
+def _seat_labels(app, seats):
+    """The label cell SEATS draws for each pane, without a pilot.
+
+    `render_seats` writes into a DataTable, so the labels are read back off the
+    stub's calls rather than off a widget — this is about which words it chooses,
+    which the panel's own driver above does not assert on.
+    """
+    written: list = []
+
+    class Table:
+        def clear(self, *a, **k): pass
+
+        def add_row(self, *cells, key=None, **k):
+            written.append([str(getattr(c, "plain", c)) for c in cells])
+            return SimpleNamespace(value=key)
+
+    app.query_one = lambda sel, *a, **k: Table() if sel == "#seats" else _Sink()
+    app.render_seats(seats)
+    # Minus the ＋, which render_seats appends as a row of its own so the panel can
+    # be driven by the mouse alone. It is not a seat and has no label to assert on.
+    return [row[2] for row in written[:len(seats)]]
+
+
+def test_one_screen_calls_a_pane_what_the_bar_and_the_border_call_it():
+    """`seat 1`, in the three places a human reads it. Renaming it here when there
+    is nothing to disambiguate would be a third spelling for one thing."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
-                       ("zeus", "nix-fleet", 1): {"holder": "zeus/seat-nix-fleet-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
-        == "zeus/seat-lexray-1"
-    assert _stated(app, seat="1", repo="/home/rich/nix-fleet")["holder"] \
-        == "zeus/seat-nix-fleet-1"
+    labels = _seat_labels(app, [{"pane": "%0", "seat": "1", "session": "seats-lexray",
+                                 "agent": "", "command": "bash", "path": "/x"}])
+    assert labels[0] == "seat 1"
 
 
-def test_two_screens_on_one_repository_are_told_apart_by_the_scope_they_were_given():
-    """The case QB_SEAT_SCOPE exists for, and the one @qb_repo cannot answer."""
+def test_two_screens_are_told_apart_by_the_screen_they_are_in():
+    """More than one screen on the server means more than one seat 1, so the number
+    stops being a name.
+
+    It was the seat's board SCOPE, carried on two pane options that existed to
+    derive it. The screen has always known its own tmux name, and `qb-seats resume`
+    takes that same name — minus the `seats-` prefix its own default naming puts on
+    every screen, which distinguishes none of them and costs six of the thirteen
+    columns this cell has (#540).
+    """
     app = _dash()
-    app.seat_states = {("zeus", "review", 1): {"holder": "zeus/seat-review-1"},
-                       ("zeus", "build", 1): {"holder": "zeus/seat-build-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="review")["holder"] \
-        == "zeus/seat-review-1"
-    assert _stated(app, seat="1", repo="/home/rich/lexray", scope="build")["holder"] \
-        == "zeus/seat-build-1"
+    labels = _seat_labels(app, [
+        {"pane": "%0", "seat": "1", "session": "seats-lexray", "agent": "",
+         "command": "bash", "path": "/x"},
+        {"pane": "%1", "seat": "1", "session": "qbseats", "agent": "",
+         "command": "bash", "path": "/y"},
+    ])
+    assert labels == ["lexray 1", "qbseats 1"]
 
 
-def test_another_machines_seat_is_not_shown_against_a_local_pane():
-    """The board is the whole FLEET, so `zeus/seat-lexray-1` and
-    `laptop/seat-lexray-1` are both on it and the scope cannot separate them."""
+def test_a_seat_pane_is_matched_to_the_agent_whose_session_it_holds():
+    """The join that replaced three narrowings and a guess.
+
+    Two panes, both seat 1, on two screens of one box — the #208 collision that
+    made a number useless as a name. Their sessions differ, so nothing has to be
+    told apart.
+    """
     app = _dash()
-    app.cfg = SimpleNamespace(agent="zeus")
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"},
-                       ("laptop", "lexray", 1): {"holder": "laptop/seat-lexray-1"}}
-    assert _stated(app, seat="1", repo="/home/rich/lexray")["holder"] \
-        == "zeus/seat-lexray-1"
-
-    # The machine is the harness's guess at this host's board name, and it may be
-    # wrong. Then the set stays ambiguous and the cell stays empty — a wrong guess
-    # costs the state, it never fills it in with somebody else's agent.
-    app.cfg = SimpleNamespace(agent="not-this-host")
-    assert _stated(app, seat="1", repo="/home/rich/lexray") == {}
+    app.seat_states = {"sess-lex": {"holder": "zeus/thorn-sumac"},
+                       "sess-nix": {"holder": "zeus/amber-otter"}}
+    assert _stated(app, seat="1", agent="sess-lex")["holder"] == "zeus/thorn-sumac"
+    assert _stated(app, seat="1", agent="sess-nix")["holder"] == "zeus/amber-otter"
 
 
-def test_a_screen_too_old_to_say_its_repo_still_matches_when_it_can():
-    """@qb_repo is newer than @qb_seat. One agent with that number is not a
-    guess; two is, and a coin toss is the bug this join exists to avoid."""
+def test_another_machines_agent_is_not_shown_against_a_local_pane():
+    """The board is the whole FLEET. Two machines could each hold a seat of the
+    same name, and the old join broke that tie on a GUESS at this host's board
+    name — narrowing that cost the state cell whenever the guess was wrong. A
+    session id is unique across the fleet, so there is no tie and no guess."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
-    assert _stated(app, seat="1")["holder"] == "zeus/seat-lexray-1"
-
-    app.seat_states[("zeus", "nix-fleet", 1)] = {"holder": "zeus/seat-nix-fleet-1"}
-    assert _stated(app, seat="1") == {}
+    app.seat_states = {"sess-here": {"holder": "zeus/thorn-sumac"},
+                       "sess-there": {"holder": "laptop/cedar-flint"}}
+    assert _stated(app, seat="1", agent="sess-here")["holder"] == "zeus/thorn-sumac"
 
 
-def test_a_pane_with_no_agent_on_the_board_is_not_given_someone_elses():
+def test_a_pane_with_no_agent_in_it_gets_no_state_rather_than_someone_elses():
+    """A seat holding a bare shell — closed agent, or a screen built with an empty
+    initial command — carries an empty @qb_session. It must not collide with an
+    agent the board could not attribute either."""
     app = _dash()
-    app.seat_states = {("zeus", "lexray", 1): {"holder": "zeus/seat-lexray-1"}}
-    assert _stated(app, seat="2", repo="/home/rich/lexray") == {}
-    assert _stated(app, seat="", repo="/home/rich/lexray") == {}
+    app.seat_states = {"sess-lex": {"holder": "zeus/thorn-sumac"}}
+    assert _stated(app, seat="2", agent="") == {}
+    assert _stated(app, seat="2") == {}
 
 
-def test_the_fleet_table_stashes_a_seat_under_its_machine_and_project():
-    """render_board is what fills seat_states, and the key it uses is the join."""
+def test_an_agent_the_board_lists_without_a_session_is_not_filed_at_all():
+    """`""` is what a pane with no agent looks up, so a bucket under it would
+    answer that pane with somebody else's agent."""
+    app = _dash()
+    app.query_one = lambda *a, **k: _Sink()
+    app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
+    app.render_board({"agents": [{"holder": "zeus/thorn-sumac", "session": None,
+                                  "state": "working", "reported": None}],
+                      "claims": []})
+    assert app.seat_states == {}
+    assert _stated(app, seat="1", agent="") == {}
+
+
+def test_the_fleet_table_stashes_every_agent_under_its_session():
+    """render_board is what fills seat_states, and the key it uses is the join.
+
+    Every agent, not only the ones that named themselves a seat: a pane running a
+    session this screen did not start resolves now, where a name-derived seat
+    number could never have seen it.
+    """
     app = _dash()
     app.query_one = lambda *a, **k: _Sink()
     # The header line names the board, and there is not one configured in CI.
     app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
-    app.render_board(_agents("zeus/seat-lexray-1", "laptop/seat-lexray-1",
-                             "zeus/seat-3", "zeus/amber-otter"))
-    assert set(app.seat_states) == {("zeus", "lexray", 1), ("laptop", "lexray", 1),
-                                    ("zeus", None, 3)}
+    app.render_board(_agents("zeus/thorn-sumac", "laptop/cedar-flint",
+                             "zeus/amber-otter"))
+    assert set(app.seat_states) == {"sess-zeus/thorn-sumac",
+                                    "sess-laptop/cedar-flint",
+                                    "sess-zeus/amber-otter"}
+
+
+def test_the_seat_count_is_the_agents_sitting_in_a_pane_on_this_box():
+    """"3 live · 1 seats" is about panes a click can reach.
+
+    It counted holders whose NAME parsed as a seat, so an agent called
+    `seat-lexray-1` on another machine counted towards this box's total and
+    highlighted a row no click could land on.
+    """
+    app = _dash()
+    said: list[str] = []
+    app.query_one = lambda *a, **k: _Sink(said)
+    app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
+    app.seats = [{"pane": "%0", "seat": "1", "agent": "sess-zeus/thorn-sumac"},
+                 {"pane": "%1", "seat": "2", "agent": ""}]
+    app.render_board(_agents("zeus/thorn-sumac", "laptop/cedar-flint"))
+    assert any("2 live · 1 seats" in t for t in said), said
 
 
 class _Sink:
     """Every widget render_board reaches for, doing nothing. The join is what is
-    under test here; the widgets have their own pilot-driven tests above."""
+    under test here; the widgets have their own pilot-driven tests above.
+
+    `said` collects what was written to it, for the one test whose subject is the
+    header text rather than a join. Optional, so every other call site stays the
+    bare `_Sink()` it was."""
 
     row_count = 0
 
-    def update(self, *a, **k): pass
+    def __init__(self, said: list | None = None) -> None:
+        self.said = said
+
+    def update(self, *a, **k):
+        if self.said is not None and a:
+            self.said.append(str(getattr(a[0], "plain", a[0])))
+
     def clear(self, *a, **k): pass
 
     def add_row(self, *a, key=None, **k):
@@ -1641,16 +1917,16 @@ class _Sink:
         return SimpleNamespace(value=key)
 
 
-def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
-    """A FLEET row carries a board identity. Jumping to whichever pane tmux
-    listed first is a jump to the wrong project half the time."""
+def test_a_fleet_click_jumps_to_the_pane_holding_that_conversation(monkeypatch):
+    """A FLEET row carries a board identity and a session id, and the pane carries
+    the same session id. Two panes both called seat 1 need no telling apart."""
     module = _load_app()
     # Built BEFORE the stub goes in: Dash.__init__ shells out to git for the repo
     # slug, and `module.subprocess` is the stdlib module itself, so patching .run
     # on it patches it for every caller in the process.
     app = module.Dash(interval=3600, gh_interval=3600)
     monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
-    panes = ["%0\t1\t/home/rich/lexray\t", "%9\t1\t/home/rich/nix-fleet\t"]
+    panes = ["%0\tsess-lex", "%9\tsess-nix"]
     selected: list[str] = []
 
     class Done:
@@ -1664,30 +1940,32 @@ def test_a_fleet_click_jumps_to_the_pane_in_the_same_project(monkeypatch):
         return Done()
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert app.jump_to_seat(1, "nix-fleet") is True
+    assert app.jump_to_agent("sess-nix") is True
     assert selected == ["%9"]
 
-    # No scope to match and more than one candidate: no jump rather than a guess.
+    # An agent on another machine, or one whose pane has gone: no jump, and the
+    # caller falls through to printing what it knows about the row.
     selected.clear()
-    assert app.jump_to_seat(1, None) is False
+    assert app.jump_to_agent("sess-elsewhere") is False
     assert selected == []
 
-    # One candidate and nothing to match it on: the click still works.
-    panes[:] = ["%0\t1\t\t"]
-    assert app.jump_to_seat(1, "lexray") is True
-    assert selected == ["%0"]
+    # A row the board could not attribute a session to asks tmux nothing at all.
+    assert app.jump_to_agent(None) is False
+    assert app.jump_to_agent("") is False
+    assert selected == []
 
 
-def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
-    """The pane list is tab-separated because @qb_repo is a filesystem path — a
-    space-split returned three fields and matched no seat at all."""
+def test_a_pane_holding_no_agent_is_never_jumped_to(monkeypatch):
+    """Every bare shell on the box answers `@qb_session` with the empty string, so
+    a lookup that did not guard the empty case would match all of them, find more
+    than one candidate, and — with exactly one seat open — jump to it."""
     module = _load_app()
     app = module.Dash(interval=3600, gh_interval=3600)      # before the stub; see above
     monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
     selected: list[str] = []
 
     class Done:
-        stdout = "%4\t2\t/home/rich/my repos/lexray\t\n"
+        stdout = "%4\t\n"
 
     def fake_run(argv, **kw):
         if "select-pane" in argv:
@@ -1695,8 +1973,8 @@ def test_a_repository_path_with_a_space_in_it_still_finds_its_pane(monkeypatch):
         return Done()
 
     monkeypatch.setattr(module.subprocess, "run", fake_run)
-    assert app.jump_to_seat(2, "lexray") is True
-    assert selected == ["%4"]
+    assert app.jump_to_agent("") is False
+    assert selected == []
 
 
 # ---- one number, two repos (#209) --------------------------------------------
@@ -2268,3 +2546,407 @@ def test_a_refusal_is_reported_in_qb_starts_own_words():
 def test_an_answer_with_no_words_at_all_still_names_the_exit():
     module = _load_app()
     assert "9" in module.spawn_answer("fix-issue-7", _done(9, "not json", ""))
+
+
+# ---- the dials, in the clickable renderer (#477) ------------------------------
+#
+# The panel this dashboard did not have, and the one nothing anywhere had: a dial
+# was set from an endpoint and read back by one function in `panel_seats.py`, so
+# the values governing every round on the fleet were invisible on every screen a
+# person or an agent actually looks at.
+#
+# What these pin is the half the panel CANNOT do. `POST /dials` takes
+# `app.auth.human` and this program holds the machine bearer token every agent on
+# the box holds, so the ✎ is a door and not a control — and a door nobody can find
+# is the same as no door (#443).
+
+DIALS = {
+    "asked": True,
+    "error": None,
+    "shadowed": [{"dial": "tempo", "value": "eager", "repo": None, "scope": "fleet",
+                  "reason": "fleet default", "set_by": "human/rich",
+                  "set_at": "2026-08-25T10:00:00+00:00", "expires_at": None}],
+    "dials": [
+        {"dial": "tempo", "value": "held", "repo": "prisonblues/quarterback",
+         "scope": "repo", "reason": "this repo is mid-release", "set_by": "human/rich",
+         "set_at": "2026-08-25T10:00:00+00:00", "expires_at": None},
+        {"dial": "review_panel.max_rounds", "value": 2, "repo": None, "scope": "fleet",
+         "reason": "the window is at 94%", "set_by": "human/rich",
+         "set_at": "2026-08-25T10:00:00+00:00",
+         "expires_at": "2099-01-01T00:00:00+00:00"},
+    ],
+}
+
+
+class FakeHuman:
+    """A human credential that records instead of writing (#479's, stubbed).
+
+    `why_not` is the one method the panel asks on every paint, and returning None
+    is what makes the ✎ a control — so a driver that wants the read-only shape
+    passes `why=<a sentence>` and gets the fallback back.
+    """
+
+    def __init__(self, why: str | None = None, fail: str | None = None):
+        self.why, self.fail = why, fail
+        self.set: list = []
+        self.cleared: list = []
+
+    def why_not(self):
+        return self.why
+
+    def set_dial(self, dial, value, reason, repo=None, expires_at=None):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.set.append((dial, value, reason, repo, expires_at))
+        return {"replaced": [{"value": "P4", "reason": "the old argument"}]}
+
+    def clear_dial(self, dial, repo=None):
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.cleared.append((dial, repo))
+        return {"cleared": [{"dial": dial}]}
+
+
+async def _drive_dials(offset=None, key=None, human=None, keys=(), pause=0.3):
+    """Render the dials, then click at `offset` / press `key` / type `keys`."""
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    opened: list = []
+    app.open_url = lambda url: opened.append(url)
+
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        # AFTER the app has mounted, and that is not a detail: `on_mount` builds
+        # the real `HumanClient` from the resolved config, so a stub installed
+        # before `run_test` is replaced by whatever credential the box running
+        # the suite happens to have — which is how a test comes to pass on a
+        # laptop and fail in CI, or worse, write to a real board.
+        #
+        # NO CREDENTIAL by default, which is every box on the fleet today: the
+        # panel reads and the ✎ is the door to the page. A driver that wants the
+        # write path asks for it, so "what happens with nothing configured" stays
+        # the case nobody has to remember to cover.
+        app.human = human if human is not None else FakeHuman(why="no session here")
+        app.render_dials(DIALS)
+        await pilot.pause()
+        table = app.query_one("#dials")
+        rows = [_cells(table, i) for i in range(table.row_count)]
+        title = str(app.query_one("#t_dials").content)
+        bar = str(app.query_one("#limits").content)
+        if offset is not None:
+            await _click_row(pilot, table, offset)
+            await pilot.pause(0.3)
+        if key is not None:
+            await pilot.press(key)
+            await pilot.pause(0.3)
+        for press in keys:
+            await pilot.press(press)
+            await pilot.pause(0.05)
+        if keys:
+            await pilot.pause(pause)
+        return rows, title, opened, app.detail_text, bar
+
+
+def test_the_dials_panel_says_which_layer_answered_and_for_how_long():
+    """Three cells and each is a distinct fact: the value, the layer it came from,
+    and whether anything will ever take it off. A repo dial beats a fleet dial, so
+    the overridden one is counted in the title rather than drawn as in force."""
+    rows, title, _, _, _ = asyncio.run(_drive_dials())
+    assert rows[0][2] == "tempo" and rows[0][3] == "held", rows[0]
+    assert rows[0][4] == "quarterback", rows[0]
+    # The two expiry states, side by side, not rendering alike (#244's rule).
+    assert rows[0][5] == "no end", rows[0]
+    assert rows[1][5] not in ("no end", ""), rows[1]
+    assert "2 in force" in title and "1 overridden" in title, title
+
+
+def test_the_dials_panel_always_offers_the_verb():
+    """The last row is how a dial gets set, whether or not there is one above it —
+    the reader who most needs it is the one who has just found out that nothing is
+    in force. What that row DOES depends on the credential; that it is there does
+    not."""
+    rows, _, _, _, _ = asyncio.run(_drive_dials())
+    assert any("set a dial" in "".join(r) for r in rows), rows
+
+
+def test_with_no_session_the_pencil_is_the_door_it_always_was():
+    """The read-only shape, which is every box with no cookie — and it must not be
+    a modal whose save could only fail. A form that took four fields and then said
+    so would have spent the person's typing to tell them something it knew before
+    they started."""
+    module = _load_app()
+    _, _, opened, detail, _ = asyncio.run(
+        _drive_dials(offset=(module.Dash.EDIT_COLUMN + 2, 1)))
+    assert opened and "/dials/view" in opened[0], opened
+    assert "no session here" in detail, detail
+
+
+def test_the_row_says_why_the_pencil_is_dead_before_it_is_pressed():
+    """Asked once per paint and drawn into the row, so the refusal arrives before
+    the click rather than after it."""
+    rows, _, _, _, _ = asyncio.run(_drive_dials())
+    assert any("no session here" in "".join(r) for r in rows), rows
+
+
+def test_with_a_session_the_pencil_opens_the_editor_on_that_dial():
+    """The verb this panel did not used to have. Prefilled from the row, and with
+    the dial's NAME fixed: a dial is identified by its name, so an editable one
+    would create a second dial rather than change the one on screen."""
+    module = _load_app()
+
+    async def go():
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = FakeHuman()          # after mount — see `_drive_dials`
+            app.render_dials(DIALS)
+            await pilot.pause()
+            await _click_row(pilot, app.query_one("#dials"),
+                             (module.Dash.EDIT_COLUMN + 2, 1))
+            await pilot.pause(0.3)
+            screen = app.screen
+            return (type(screen).__name__,
+                    screen.row.get("dial") if hasattr(screen, "row") else None,
+                    [w.value for w in screen.query("Input")] if hasattr(screen, "row") else [])
+
+    name, dial, values = asyncio.run(go())
+    assert name == "DialEdit", name
+    assert dial == "tempo", dial
+    # The value comes back spelled the way the box would accept it again, and
+    # there is no name field on an existing dial.
+    assert "held" in values, values
+
+
+def test_a_dial_row_explains_itself_rather_than_opening_anything():
+    """The row is six narrow cells and the argument does not fit in one of them —
+    the board requires a reason on every write precisely so there is one."""
+    _, _, opened, detail, _ = asyncio.run(_drive_dials(offset=(60, 1)))
+    assert not opened, "clicking the row itself is a read, not a door"
+    assert "this repo is mid-release" in detail, detail
+    assert "set indefinitely" in detail, detail
+
+
+def test_d_opens_the_dials_page_from_wherever_you_are():
+    """A dial governs every table on the screen, so the key is not tied to one."""
+    _, _, opened, _, _ = asyncio.run(_drive_dials(key="d"))
+    assert opened and "/dials/view" in opened[0], opened
+
+
+def test_the_tempo_rides_the_caps_line_in_the_clickable_renderer():
+    """Drawn on the limits clock, which is an hour long — so a new dials answer
+    has to redraw it, or the cell up there keeps last hour's tempo while the panel
+    below shows this minute's."""
+    _, _, _, _, bar = asyncio.run(_drive_dials())
+    assert "TEMPO" in bar and "held" in bar, bar
+
+
+# ---- and the write itself (#479's credential, stubbed) ------------------------
+
+async def _written(asked: dict, human=None, dials=None):
+    """Hand `dial_written` what a modal would have returned, and see what went out.
+
+    Driven at that seam rather than through four Input widgets because that is
+    where the decisions are: parse the value, parse the expiry, refuse a blank
+    reason, and only then spend a request. The keystroke path has its own test.
+    """
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                          scope=qd.Scope([qd.REPO]))
+    for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                 "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
+    async with app.run_test(size=(100, 50)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
+        app.human = human or FakeHuman()
+        app.dials = dials if dials is not None else {"asked": True, "now": None}
+        app.dial_written(asked)
+        await pilot.pause(0.3)
+        return app.human, app.detail_text
+
+
+def test_a_saved_dial_goes_out_as_a_value_and_not_as_its_spelling():
+    """`2` is a number, `P3` is a string, and `null` is the documented off switch
+    for three dials — `qbdata.parse_dial_value`, the same table `dials.html`
+    implements in the browser."""
+    human, said = asyncio.run(_written(
+        {"dial": "review_panel.max_rounds", "value": "2", "reason": "window at 94%",
+         "expiry": "", "repo": None}))
+    assert human.set == [("review_panel.max_rounds", 2, "window at 94%", None, None)]
+    # WHAT IT REPLACED, said out loud: moving a dial without being told what it
+    # was is how one gets nudged twice by two people who each believed they were
+    # starting from the default.
+    assert "it was P4" in said and "the old argument" in said, said
+
+
+def test_an_empty_expiry_is_a_dial_with_no_end_rather_than_a_missing_field():
+    human, _ = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "",
+         "repo": "prisonblues/quarterback"}))
+    assert human.set[0][4] is None, human.set
+
+
+def test_an_expiry_is_measured_from_the_boards_clock():
+    """A box whose clock is an hour slow otherwise writes "in one hour" as a time
+    already past, which `POST /dials` refuses at the door — in words about a field
+    the person never filled in."""
+    human, _ = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "4h",
+         "repo": None},
+        dials={"asked": True, "now": "2026-08-26T00:00:00+00:00"}))
+    assert human.set[0][4].startswith("2026-08-26T04:00:00"), human.set
+
+
+def test_a_duration_nobody_can_parse_is_refused_before_anything_is_spent():
+    """Named where the sentence can point at the box that was wrong, rather than
+    at a 422 about a field nobody typed."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "soon",
+         "repo": None}))
+    assert human.set == [], "a request went out on an expiry that would be refused"
+    assert "30m" in said and "4h" in said, said
+
+
+def test_a_dial_with_no_argument_is_refused_here_too():
+    """The board refuses one without a reason — "a dial nobody can read an argument
+    for is a dial nobody can decide to remove" — and so does this, in the same
+    words and without spending the request."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "   ", "expiry": "", "repo": None}))
+    assert human.set == []
+    assert "reason" in said, said
+
+
+def test_clearing_returns_the_repo_to_its_own_default():
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "repo": "prisonblues/quarterback", "clear": True}))
+    assert human.cleared == [("tempo", "prisonblues/quarterback")]
+    assert human.set == []
+    assert "default takes over" in said, said
+
+
+def test_a_refused_write_is_reported_and_does_not_take_the_dashboard_down():
+    """The interesting refusals come from an auth proxy in front of the board, and
+    a dashboard is the one program whose crash costs the reader every other panel
+    on the screen as well."""
+    human = FakeHuman(fail="the edge refused this session before the board saw it")
+    _, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining", "expiry": "",
+         "repo": None}, human=human))
+    assert "edge refused" in said, said
+
+
+def test_ctrl_s_in_the_editor_is_what_sends_it():
+    """The keystroke path, end to end: the ✎ opens the modal, the fields are
+    typed, and ctrl+s is the only thing that spends a request.
+
+    TWICE, because the dial on this screen is `tempo` — which both dashboards draw
+    and `harness_rules.BOARD_DIALS` does not hold, so nothing this box knows applies
+    it. #539 warns on the first ctrl+s and writes on the second: the vocabulary is
+    the harness beside THIS dashboard, and the two are installed separately, so a
+    hard refusal would make a box one release behind a box that cannot set a dial
+    the rest of the fleet already applies. The first press spending nothing is the
+    half this test used to assert on its own, and it still holds."""
+    module = _load_app()
+
+    async def go():
+        app_module = _load_app()
+        qd = app_module.qd
+        app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
+                              scope=qd.Scope([qd.REPO]))
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        human = FakeHuman()
+        async with app.run_test(size=(100, 50)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = human
+            app.dials = {"asked": True, "now": None}
+            app.render_dials(DIALS)
+            await pilot.pause()
+            await _click_row(pilot, app.query_one("#dials"),
+                             (module.Dash.EDIT_COLUMN + 2, 1))
+            await pilot.pause(0.3)
+            # The value box holds the focus on an existing dial, so what is typed
+            # replaces it only after it is cleared — `ctrl+a` is not a Textual
+            # binding, so this deletes what is there the way a person would.
+            for _ in range(8):
+                await pilot.press("backspace")
+            for ch in "eager":
+                await pilot.press(ch)
+            await pilot.press("tab")
+            for ch in "draining":
+                await pilot.press(ch)
+            assert not human.set, "a keystroke wrote before ctrl+s did"
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.4)
+            assert not human.set, (
+                "an unrecognised dial was written without being confirmed")
+            await pilot.press("ctrl+s")
+            await pilot.pause(0.4)
+            return human.set
+
+    written = asyncio.run(go())
+    assert written, "ctrl+s sent nothing"
+    dial, value, reason, repo, _ = written[0]
+    assert (dial, value, reason) == ("tempo", "eager", "draining"), written
+    # The row's own scope, kept: editing an existing dial is changing the one on
+    # screen, and a write that silently moved it to the fleet would be a different
+    # setting with the same name.
+    assert repo == "prisonblues/quarterback", written
+
+
+def test_a_new_dial_takes_its_scope_from_the_rows_on_screen_not_the_cwd():
+    """The mistake a person cannot see afterwards, and the one a second opinion
+    found: `repo_slug` is where work is LAUNCHED, `Scope` is what is being SHOWN.
+    A pane started in one checkout with `QB_DASH_REPOS=owner/other` draws `other`'s
+    dials — and used to offer to write the dial to the checkout's repo instead.
+    Same dial name, different setting, and nothing on screen says which took it.
+    """
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/other"]))
+    app.repo_slug = "prisonblues/quarterback"          # the checkout it launched in
+    assert app.new_dial_scope() == "prisonblues/other"
+
+
+def test_a_wide_pane_writes_to_the_fleet_because_it_cannot_choose():
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["prisonblues/one", "prisonblues/two"]))
+    app.repo_slug = "prisonblues/one"
+    assert app.new_dial_scope() is None
+
+
+def test_a_repo_known_only_by_a_bare_name_is_not_offered_as_a_scope():
+    """`owner/name` is the board's shape for a repo scope; a bare `quarterback` is
+    refused there. Fleet is the honest answer, and the modal says so in bold."""
+    module = _load_app()
+    qd = module.qd
+    app = module.Dash(scope=qd.Scope(["quarterback"]))
+    app.repo_slug = None
+    assert app.new_dial_scope() is None
+
+
+def test_a_duration_that_would_overflow_is_answered_not_raised():
+    """`timedelta` raises OverflowError rather than ValueError past its range, and
+    an escape here is a crash inside a Textual callback — which takes the whole
+    dashboard, not just this panel."""
+    human, said = asyncio.run(_written(
+        {"dial": "tempo", "value": "eager", "reason": "draining",
+         "expiry": "99999999999999999999d", "repo": None}))
+    assert human.set == []
+    assert "not a duration" in said, said

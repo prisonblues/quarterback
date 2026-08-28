@@ -28,12 +28,19 @@ code nobody runs — the rule `test_create_worktree_claim.py` follows.
 Run: pytest harness/tests
 """
 
-import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+
+# A sibling module, imported by bare name — see `_path_sandbox`'s own docstring
+# for why a suite that asserts a tool is absent cannot build its PATH from the
+# host's.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _path_sandbox  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "create-worktree"
 
@@ -74,9 +81,17 @@ def run_stanza(*, bound="true", claim="true", require="false",
     Run as a script FILE rather than `bash -c`, deliberately. The stanza falls
     back to `${0%/*}/qb-admit` when the tool is not on PATH, and under `-c` that
     `$0` is the interpreter's own path — so on a machine where the harness is
-    installed beside bash, the "absent" case would find the real one and this
-    suite would assert the opposite of what it says (the trap
-    `test_create_worktree_claim.py` is caught in on exactly this host).
+    installed beside bash, the "absent" case would find the real one.
+
+    That guard was only half of it, and the missing half is what made
+    `test_a_missing_qb_admit_does_not_abort_the_run_under_set_e` pass for four
+    months without ever taking the branch it names (#472). PATH was `bindir` plus
+    `dirname(bash)`, and on a home-manager install that second directory is the
+    profile directory holding the real `qb-admit`: `command -v` found it before
+    the `$0` fallback was ever reached, it ran against a throwaway repo, and it
+    happened to satisfy `stderr == ""`. A test green for the wrong reason is
+    worse than a red one, because nothing will ever tell you. `_path_sandbox`
+    builds a PATH out of directories this test filled, so absent is absent.
     """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
@@ -86,7 +101,7 @@ def run_stanza(*, bound="true", claim="true", require="false",
         # inside a nix build sandbox (#177).
         fake.write_text(f"#!{BASH}\n" + stub + "\n")
         fake.chmod(0o755)
-    script = tmp_path / "stanza.sh"
+    script = _path_sandbox.sibling_dir(tmp_path) / "stanza.sh"
     script.write_text(PRELUDE
                       + f'BOUND={bound}\nCLAIM={claim}\nREQUIRE_CLAIM={require}\n'
                       + f'MAIN_REPO={tmp_path}\n'
@@ -94,7 +109,8 @@ def run_stanza(*, bound="true", claim="true", require="false",
                       + '\nadmit_the_branch\necho REACHED-THE-CHECKOUT\n')
     return subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
-        env={"PATH": f"{bindir}:{os.path.dirname(BASH)}", "HOME": str(tmp_path)})
+        env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir),
+             "HOME": str(tmp_path)})
 
 
 def reached(got) -> bool:

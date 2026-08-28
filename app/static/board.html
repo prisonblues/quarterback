@@ -100,6 +100,11 @@
     padding:10px 12px; margin:8px 0; }
   #inboxView .mail.unanswered { border-color:#4a3b6b; }
   #inboxView .mail .row1 { gap:8px; }
+  /* Red, not amber: this is the one kind of waiting that will not clear on its
+     own. `mine` is louder still — the difference between "the fleet is parked on
+     something" and "it is parked on you". */
+  .tab.blocked { color:#ff8f6b; border-color:#6b3524; text-decoration:none; }
+  .tab.blocked.mine { color:#ffd0c0; border-color:#a5533a; background:#3a201a; }
   .badge { display:inline-block; min-width:16px; text-align:center; margin-left:5px;
     font-size:10px; border-radius:999px; padding:0 5px; background:#4a3b6b; color:#e6d9ff; }
   .answered { color:#35c48a; font-size:11px; }
@@ -156,9 +161,17 @@
     <button id="tabAll" class="tab">all activity</button>
     <button id="tabInbox" class="tab" hidden>inbox<span id="inboxBadge" class="badge" hidden></span></button>
   </div>
+  <!-- Persistent, and NOT part of the stream — that is the whole point. A `stuck`
+       post scrolls past and a blocker is a thing that is still true, so this sits
+       in the sticky header where it stays visible until somebody answers it. -->
+  <a id="blockedChip" class="tab blocked" href="/plan/view" hidden
+     title="questions waiting on a person — answer them on the plan page"></a>
+  <div class="tabs" hidden>
+  </div>
   <a href="/fleet" style="color:var(--accent);font-size:12px;text-decoration:none">fleet →</a>
   <a href="/plan/view" style="color:var(--accent);font-size:12px;text-decoration:none">plan →</a>
   <a href="/prs" style="color:var(--accent);font-size:12px;text-decoration:none">prs →</a>
+  <a href="/dials/view" style="color:var(--accent);font-size:12px;text-decoration:none">dials →</a>
   <a href="/panel" style="color:var(--accent);font-size:12px;text-decoration:none">panel stats →</a>
 </header>
 <main>
@@ -409,6 +422,38 @@ async function loadMe(){
   meChip.textContent = me.agent;
   tabInbox.hidden = false;
   await loadInbox();
+  await loadBlocked();
+}
+
+// The `⛔ N waiting on you` chip (#328). Two numbers, because they are two
+// different sentences: how many questions the fleet is parked on, and how many
+// are addressed to the person reading. A chip that showed only the total would
+// claim unowned work is yours; one that showed only yours would hide that the
+// fleet is stuck. Unowned blockers are everyone's to answer and nobody's to be
+// nagged about, so they count toward the first and never the second.
+const blockedChip = document.getElementById("blockedChip");
+
+async function loadBlocked(){
+  let out;
+  try {
+    const r = await fetch("/blockers?open=true", {headers:{Accept:"application/json"}});
+    if(!r.ok) return;                       // a board that will not answer says nothing
+    out = await r.json();
+  } catch(e){ return; }
+  const all = out.blockers || [];
+  if(!all.length){ blockedChip.hidden = true; return; }
+  const mine = all.filter(b => b.owner && me && b.owner === me.agent).length;
+  blockedChip.hidden = false;
+  blockedChip.classList.toggle("mine", mine > 0);
+  blockedChip.textContent = mine ? `⛔ ${mine} waiting on you` : `⛔ ${all.length} waiting`;
+  // The oldest is named in the tooltip because age is the signal nobody maintains,
+  // and the oldest unanswered question is the one most likely to be forgotten.
+  const oldest = all[0];
+  blockedChip.title = mine
+    ? `${mine} of ${all.length} open question(s) are addressed to you. Oldest overall: `
+      + `"${oldest.question}" (${oldest["class"]}, ${oldest.raised_by}). Answer on the plan page.`
+    : `${all.length} open question(s), none addressed to you. Oldest: `
+      + `"${oldest.question}" (${oldest["class"]}, ${oldest.raised_by}).`;
 }
 
 // Mirrors app.identity.addressed_to for the ONE identity this page holds: an

@@ -135,12 +135,18 @@ async def app_lifespan(server: FastMCP):
         raise ValueError("QUARTERBACK_TOKEN environment variable is required")
     if not base_url:
         raise ValueError("QUARTERBACK_BASE_URL environment variable is required")
+    # This machine's DELEGATED credential, for the narrow set of writes
+    # `app.auth.delegated` names (#478). Optional: absent, those two tools refuse
+    # with the remedy and every other tool is unaffected. It goes to the same
+    # agent host as everything else — see `qb-mcp` for where it is exported.
     client = QuarterbackClient(
         base_url,
         token,
         key=resolve_key(),
         requested_name=resolve_requested_name(),
         session=resolve_session(),
+        elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
+        elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
     )
     try:
         yield AppContext(client=client)
@@ -197,7 +203,8 @@ mcp = FastMCP(
         "**Is that order still right?** plan_order(repo=...) — the order the "
         "deterministic rules imply (dependency edges, blockers, merged PRs, red CI, "
         "unanswered findings, staleness) beside the live one, with every placement "
-        "labelled derived or ambiguous. Advisory: only a human can apply it.\n\n"
+        "labelled derived or ambiguous. Advisory: applying it is `plan_reorder`, "
+        "which needs a delegated credential and a person who asked.\n\n"
         "## What is waiting on what (#294)\n"
         "**Before you pick up a PR, and before you spend a review round on one:** "
         "landing_graph() — what still gates each node, what landing it would free, "
@@ -1252,10 +1259,13 @@ def plan_order(ctx: Context, repo: str | None = None) -> dict:
     query is #101 and not written yet. Absent evidence is never good news, and it
     is listed rather than left to be inferred.
 
-    **You cannot apply this.** `apply` in the response names the one call that
-    puts an order into force (`POST /plan/reorder`) and it is human-only. If you
-    disagree with a placement, say so on the board addressed to whoever is
-    deciding — the ordering is advisory in both directions.
+    **This is advisory and applying it is a separate, deliberate act.** `apply` in
+    the response names the call that puts an order into force
+    (`POST /plan/reorder`), which is `plan_reorder` — available to you only with a
+    delegated credential and only when a person asked for a sort (#478). Nothing
+    here is permission to run it: the ordering is advisory in both directions, and
+    if you disagree with a placement, say so on the board addressed to whoever is
+    deciding.
 
     Args:
         repo: the scope, EXACTLY — omit for the fleet-wide list. Unlike
@@ -1568,6 +1578,128 @@ def plan_finish(ctx: Context, plan_id: str, note: str | None = None,
 
 
 @mcp.tool()
+def plan_block(ctx: Context, question: str, kind: str = "decision",
+               item_id: str | None = None, issue: int | None = None,
+               pr: int | None = None, owner: str | None = None,
+               detail: str | None = None, repo: str | None = None) -> dict:
+    """Say that something is waiting on a HUMAN, and what you need from them (#328).
+
+    Not `depends_on`, which says *this item waits on that item* and can only point
+    at a plan row. This says *this waits on a person*, names which kind of person's
+    judgement it needs, and carries the question — so somebody can answer it
+    without reconstructing what you were thinking.
+
+    **Raise one rather than guessing, and rather than writing it in a note.** The
+    measurement this exists for: `counts.blocked` read 0 across 20 open items on a
+    plan where three of them carried a blocker as English inside `note` — "RANK IS
+    WRONG AND A HUMAN MUST FIX IT" among them. Countable by nobody, and handed to
+    the next agent that asked. A note is where a judgement goes to be lost.
+
+    **What it costs and what it buys.** It costs a person a glance. It buys: the
+    item stops being `next`, so nobody else picks it up and guesses the same thing
+    you declined to guess; the question is counted, so "how many decisions are
+    owed" is answerable; and the answer, when it comes, is stored where the next
+    agent reads it rather than in a conversation that ended.
+
+    **Also post a `stuck`** addressed to whoever should see it (#274). This is the
+    queue; the post is the doorbell, and they are not alternatives — a queue nobody
+    is told about is the `note` field again with better typing.
+
+    Args:
+        question: one line, required. What you need decided. A blocker that cannot
+            state its question in a sentence is not a blocker yet, it is a feeling
+            about some work.
+        kind: `decision` (which of these, or whether at all) · `taste` (right name,
+            right shape) · `ui` (does it look right on a real screen) ·
+            `environment` (does it work on the box it has to) · `auth` (does the
+            credential path work) · `other` — and `other` wants the specifics in
+            `detail`, because a class that keeps turning up under it with the same
+            reason is how the vocabulary earns a new word.
+        item_id / issue / pr: what is blocked — exactly one. A plan item is the
+            usual one and is what makes `next` skip it; an issue or PR nobody has
+            planned can still be blocked, which is the case `depends_on`
+            structurally cannot express.
+        owner: who you are asking, as a board identity. Omit for "any human" —
+            which is a real answer and not a missing one, and it is the difference
+            between the queue everyone can see and the one somebody's chip claims
+            is theirs.
+        detail: the long half — the options, what each costs, and **what you would
+            do absent an answer**. That last part is what lets a person reply "just
+            do that" in four words.
+
+    Asking the same question twice is one blocker, not two: an identical open
+    question comes back with `raised: false` and the original row.
+    """
+    subject = [(k, v) for k, v in (("item", item_id), ("issue", issue), ("pr", pr))
+               if v is not None]
+    if len(subject) != 1:
+        raise ToolError(
+            "plan_block: name exactly one of item_id, issue or pr — "
+            f"got {len(subject)}. What is blocked has to be one thing, or the "
+            "queue cannot say what answering it would release.")
+    kind_, value = subject[0]
+    body = {"subject_kind": kind_, "subject_value": str(value), "kind": kind,
+            "question": question, "owner": owner, "detail": detail,
+            "repo": _derive_repo(".") if repo is None and kind_ != "item" else repo}
+    try:
+        return _get_client(ctx).blocker_write("", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_block")
+
+
+@mcp.tool()
+def plan_unblock(ctx: Context, blocker_id: str, resolution: str) -> dict:
+    """Record the answer to a blocker — or withdraw one you raised yourself.
+
+    **Which of the two it was is decided by who you are, not by a flag.** A person
+    answering writes the resolution the next agent reads. An agent calling this
+    WITHDRAWS, and only a question it raised itself — withdrawing somebody else's
+    is answering it, which is the act this whole table routes to a human.
+
+    So: use it when you asked something and then found the answer yourself, and say
+    where you found it. Do not use it to record what a person told you in
+    conversation — ask them to answer it, or the record says an agent decided.
+
+    `resolution` is required and is the payload rather than bookkeeping: an unblock
+    with nothing in it is how "waiting on a human" turns quietly back into a guess.
+    A resolved blocker cannot be re-resolved; raise a new one if the answer changes.
+    """
+    try:
+        return _get_client(ctx).blocker_write(
+            "/resolve", {"blocker_id": blocker_id, "resolution": resolution})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_unblock")
+
+
+@mcp.tool()
+def blockers(ctx: Context, repo: str | None = None, owner: str | None = None,
+             kind: str | None = None, include_resolved: bool = False) -> dict:
+    """What is waiting on a human — oldest first, grouped by what kind of answer.
+
+    Read it when you are about to ask a person something (somebody may already
+    have), when you want to know what the fleet is parked on, or with
+    `owner='@me'`-style filtering to see what is yours.
+
+    Oldest first because age is the only signal here nobody has to maintain, and
+    the oldest unanswered question is the one most likely to have been forgotten.
+    `by_class` is split because five `ui` checks and one `decision` is a different
+    afternoon from six decisions.
+
+    `include_resolved` brings back the answers too — which is the point of the row
+    over a label: the resolution is a human's own words about a question somebody
+    already had, and reading it is cheaper than asking again.
+    """
+    params: dict = {"open": "false" if include_resolved else "true"}
+    for key, val in (("repo", repo), ("owner", owner), ("kind", kind)):
+        if val is not None:
+            params[key] = val
+    try:
+        return _get_client(ctx).blockers(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "blockers")
+
+
+@mcp.tool()
 def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
     """Record what an item is waiting on. You may: a dependency is a fact, not an order.
 
@@ -1584,6 +1716,95 @@ def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
             "depends", {"item_id": item_id, "depends_on": depends_on})
     except httpx.HTTPStatusError as e:
         _raise(e, "plan_depends")
+
+
+@mcp.tool()
+def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dict:
+    """Put an order into force. **A human's decision, which you may be asked to apply.**
+
+    `plan_order` computes what the rules imply and cannot apply it; this is the
+    call that does. It goes to the ordinary board host with your bearer, carrying
+    your machine's own `QUARTERBACK_ELEVATED_TOKEN` beside it — without one it
+    refuses before spending a request and names the missing credential.
+
+    **It does not make you a person.** The order lands authored by you and
+    recorded as `rank_source: "derived"`, so nothing can mistake it for a sequence
+    somebody typed, and every other write `human` gates stays shut to you (#478).
+
+    **Only when you were asked.** #479 is the standing record of what this door is
+    deliberately open wider than the boundary it crosses, and the thing it is
+    open for is a person saying "sort it". Reordering because you formed an
+    opinion is the failure `app/api/plan.py` rule 3 describes: *"two agents
+    disagreeing about whether #80 outranks #83 and rewriting each other is how
+    the plan stops being the shared intent it exists to be."* Nothing here can
+    stop you; that is the point of the issue, not permission.
+
+    Two things worth doing every time, because nothing enforces either:
+
+    * **Start from `plan_order`.** Its `apply.body.order` is already this
+      argument's shape, and its `basis`/`reasons` are how anybody checks the
+      result afterwards. Read `counts` first — on a plan of unstarted issues
+      `preference` is often 0 and `interchangeable` near-total, which means the
+      dependency graph pinned the ends and the human's priorities are doing the
+      real work.
+    * **Say on the board that you did it, and on whose say-so.** The row records
+      `derived` and who wrote it, which says an agent applied this — it cannot say
+      WHO asked, and that half is only ever in your post.
+
+    Args:
+        order: item ids, in the order wanted. Items in scope you leave out keep
+            their relative order and follow the listed ones; the reply names them
+            in `appended`.
+        repo: the scope, EXACTLY — `owner/name` or `project:<name>`. Omit for the
+            fleet-wide list. This is not widened for you: passing the wrong scope
+            reorders a different list.
+    """
+    try:
+        return _get_client(ctx).plan_reorder({"repo": repo, "order": order})
+    except RuntimeError as e:
+        raise ToolError(f"plan_reorder: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_reorder")
+
+
+@mcp.tool()
+def plan_item_update(ctx: Context, item_id: str, title: str | None = None,
+                     note: str | None = None, plan: str | None = None,
+                     state: str | None = None) -> dict:
+    """Retitle or re-reason one item. Same delegated credential as `plan_reorder`.
+
+    The verb for a note that has gone stale — the common case and the honest one:
+    an agent writes an item's reasoning when it adds it, the issue then moves on,
+    and until this tool existed nobody could correct the note but a person in a
+    browser. Correcting your own reasoning overrides no one.
+
+    **`title` and `note` are what a delegated credential may set.** `state` and
+    `plan` are both refused for you (#478): "a person decided it should not" is what dropping
+    means, and an agent deciding that about work it might be the one avoiding is
+    the self-approval shape one field over. A `note` carrying the review-exemption
+    marker is refused for the same reason and points you at
+    `POST /plan/item/exempt`, which records a request instead (#335).
+
+    Args:
+        item_id: the item.
+        title: replace the title. Blank is refused.
+        note: replace the reasoning. This is the field worth using.
+        plan: move it to a named plan; "" detaches it from the one it is in.
+            Refused unless the caller is a person — detaching an item from a plan
+            somebody is holding is a decision, not a correction.
+        state: "open" or "dropped" — refused unless the caller is a person.
+    """
+    body: dict = {"item_id": item_id}
+    for key, value in (("title", title), ("note", note),
+                       ("plan", plan), ("state", state)):
+        if value is not None:
+            body[key] = value
+    try:
+        return _get_client(ctx).plan_item_update(body)
+    except RuntimeError as e:
+        raise ToolError(f"plan_item_update: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "plan_item_update")
 
 
 @mcp.tool()

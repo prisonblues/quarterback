@@ -1,7 +1,7 @@
 """Tests for qb-seats, the layout.
 
-`qb-seat`, the per-seat wrapper each pane runs, ships and is tested separately;
-the fixture here stubs it, so nothing below depends on the real one.
+A pane holds a shell and one line is typed into it — `QB_SEAT_INITIAL_CMD`, which the
+fixture points at a stub, so nothing below starts a real agent.
 
 These drive a REAL tmux server against a stub agent, because the things worth
 testing here are not string manipulation — they are what the panes actually end
@@ -49,31 +49,34 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def screen(tmp_path):
-    """A throwaway repo, a stub qb-seat on PATH, and an isolated tmux server."""
+    """A throwaway repo, a stub agent on PATH, and an isolated tmux server."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
 
-    # The stub stands in for the agent: it records what the seat was given and
-    # then holds the pane open, the way a real session would.
+    # The stub stands in for the agent. It is what QB_SEAT_INITIAL_CMD names, so
+    # it is exactly what a seat is told — it records what it was given and then
+    # holds the pane open, the way a real session would.
+    #
+    # NAMED FOR WHAT IT IS, not `qb-seat`. It stood in for that script until #540,
+    # which was a per-pane wrapper this suite deliberately did not test; there is
+    # no wrapper now, so the stub stands directly in the agent's place.
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
-    stub = stub_dir / "qb-seat"
+    stub = stub_dir / "seat-stub"
     # /bin/sh, not `#!/usr/bin/env bash`: there is no /usr/bin/env inside the nix
     # build sandbox, and a stub that cannot exec makes every test here fail for a
     # reason that has nothing to do with the code under test. The shipped scripts
     # dodge this via patchShebangs; a stub written at runtime cannot.
     #
-    # The brief is recorded with `${VAR+set}`/`${VAR-unset}`, the same distinction
-    # qb-seat itself draws: set-and-empty means "no brief, wait" and unset means
-    # "use the built-in one", and a test that cannot tell them apart cannot pin the
-    # bug that forwarded the wrong one. It has to be logged rather than read back
-    # off tmux, because --add passes it with `split-window -e`, which sets the
-    # environment of the PANE — and there is no tmux command that shows that.
+    # `args` is logged because the initial command is a COMMAND LINE now and not a
+    # program name: `--cmd 'seat-stub -- /get-involved'` has to arrive as a stub
+    # with two arguments, and a test that only saw the program could not tell that
+    # from the prompt having been dropped.
     stub.write_text(
         "#!/bin/sh\n"
-        'printf "seat=%s instance=%s cwd=%s brief=%s\\n" "$1"'
-        ' "${QUARTERBACK_INSTANCE:-unset}" "$PWD" "${QB_SEAT_BRIEF+set:}${QB_SEAT_BRIEF-unset}"'
+        'printf "instance=%s cwd=%s args=%s\\n"'
+        ' "${QUARTERBACK_INSTANCE:-unset}" "$PWD" "$*"'
         f' >> {tmp_path / "seats.log"}\n'
         "exec sleep 300\n"
     )
@@ -99,12 +102,12 @@ def screen(tmp_path):
     env = {
         # EVERY QB_SEAT* KNOB IS STRIPPED, not merely overridden below. These tests
         # assert what a seat was told, so a value in the developer's own environment
-        # decides their result: `QB_SEAT_BRIEF=` exported fleet-wide — which is the
-        # documented way to ask for waiting seats — is forwarded correctly by the
-        # code under test and makes `test_an_empty_brief_reaches_a_seat_added_later`
-        # fail on its FIRST assertion, the one that wants a plain screen to leave the
-        # knob unset. Green on CI, red on the box that configured it, and the diff
-        # under test innocent in both.
+        # decides their result: `QB_SEAT_INITIAL_CMD=` exported fleet-wide — which
+        # is the documented way to ask for a screen of bare shells — makes every
+        # test that asserts on what a seat was told fail, against code that handled
+        # it exactly right. Green on CI, red on the box that configured it, and the
+        # diff under test innocent in both. (It was QB_SEAT_BRIEF that proved this;
+        # the prefix test catches the whole family either way.)
         #
         # Same rule the tmux.conf above is an input for, and the same rule that put
         # QB_SEATS_DASH and QB_SEATS_BOARD below: what the machine happens to carry
@@ -136,6 +139,14 @@ def screen(tmp_path):
         # A stray value in the launching environment is exactly the leak the
         # script has to defend against, so the fixture always supplies one.
         "QUARTERBACK_INSTANCE": "leaked-host-wide",
+        # AND NO REAL AGENT. The shipped default is `claude-yolo`, so every screen
+        # these tests build would otherwise try to start one — or, more likely,
+        # type a command the pane's shell cannot resolve and leave a `command not
+        # found` where the assertions expect a seat. Same rule as the dash, the
+        # tape and the pace note below: a test supplies what it is about to assert
+        # on. The tests that are ABOUT the default unset this and check what
+        # qb-seats types rather than running it.
+        "QB_SEAT_INITIAL_CMD": "seat-stub",
         # NO DASH unless a test asks for one. Left alone, dash_cmd() resolves
         # whatever qb-dash happens to be installed on the machine running the
         # suite, so a third of these tests would depend on that — and would start
@@ -209,7 +220,7 @@ def screen(tmp_path):
     _run.tmux_conf = tmux_conf     # write to this BEFORE the first call: tmux
                                    # reads its config when the server starts
     _run.repo = repo
-    _run.stub_dir = stub_dir       # the stub qb-seat, for tests that rebuild PATH
+    _run.stub_dir = stub_dir       # the stub agent, for tests that rebuild PATH
     _run.log = tmp_path / "seats.log"
     _run.env = env
     yield _run
@@ -439,8 +450,9 @@ def path_with_no_dash_on_it(tmp_path, run):
         found = shutil.which(tool)
         if found and not (d / tool).exists():
             (d / tool).symlink_to(found)
-    # The stub qb-seat still has to be findable, or require_qb_seat falls back to
-    # the real one beside the script under test and starts a real agent.
+    # The stub agent still has to be findable: QB_SEAT_INITIAL_CMD names it by the
+    # bare name, and a pane that cannot resolve it types a `command not found`
+    # where the assertions expect a seat.
     return f"{run.stub_dir}:{d}"
 
 
@@ -452,6 +464,39 @@ def wait_for_log(path, count, timeout=20):
             return path.read_text().splitlines()
         time.sleep(0.2)
     return path.read_text().splitlines() if path.exists() else []
+
+
+def typing_shell(run):
+    """Give the screen's panes a shell that records what is typed into them.
+
+    For the tests whose subject is WHAT qb-seats types rather than what the
+    command then does. The shipped default is `claude-yolo`, so those tests cannot
+    let the line run — and they cannot substitute a stub either, because the value
+    they are asserting on is the default itself.
+
+    A shell that reads its stdin is exactly the hazard `QB_SEATS` exists to warn
+    rc files off (keys sent to a pane wait in the pty until something reads them),
+    which is what makes it the right instrument here: it consumes the keystrokes
+    the way a prompt would and writes down what it got.
+
+    Returns the path it appends to. Call it BEFORE the screen is built — tmux
+    reads its config when the server starts.
+    """
+    typed = run.repo.parent / "typed.log"
+    sh = run.stub_dir / "recording-shell"
+    sh.write_text(
+        "#!/bin/sh\n"
+        "while IFS= read -r line; do\n"
+        f"  printf '%s\\n' \"$line\" >> {typed}\n"
+        "done\n"
+        "exec sleep 300\n"
+    )
+    sh.chmod(0o755)
+    # Appended, because a test may have set something here already, and the fixture
+    # documents this file as an input rather than as fixture-owned.
+    with open(run.tmux_conf, "a") as conf:
+        conf.write(f'set -g default-shell "{sh}"\n')
+    return typed
 
 
 def test_the_screen_is_n_seats_plus_one_board(screen):
@@ -477,9 +522,11 @@ def test_a_pane_base_index_of_one_still_builds_the_screen(screen):
 def test_no_inherited_instance_reaches_a_seat(screen):
     """The failure this guards against looks like nothing at all from the screen.
 
-    Naming a seat is qb-seat's job and is tested with it; the LAYOUT's job is to
-    guarantee that whatever was in the launching environment does not arrive
-    here. So the stub seeing no value at all is the pass condition.
+    Nothing names a seat since #540 — with no value the hook falls back to the
+    session id, which is unique per conversation. The LAYOUT's job is to guarantee
+    that whatever was in the launching environment does not arrive here, because
+    one value shared across panes makes them one agent on the board. So the stub
+    seeing no value at all is the pass condition.
     """
     screen("-n", "2")
     lines = wait_for_log(screen.log, 2)
@@ -488,90 +535,190 @@ def test_no_inherited_instance_reaches_a_seat(screen):
     assert "leaked-host-wide" not in "\n".join(lines)
 
 
-def test_qb_seat_knobs_reach_the_panes(screen):
-    """A pane's environment comes from the tmux SERVER, usually one that was
-    already running for something else. Without explicit forwarding,
-    `QB_SEAT_AGENT=... qb-seats` sets a variable no seat ever sees — and starts
-    the REAL agent while reporting nothing wrong. That is how this was found.
+def test_the_default_initial_command_is_the_one_a_seat_is_given(screen):
+    """`claude-yolo` and not `claude --dangerously-skip-permissions`.
+
+    The value is TYPED INTO A SHELL rather than exec'd, so naming the alias is
+    what lets a consumer put their own wrapper in front of it — and on the box
+    this was written for `claude-yolo` is an alias in ~/.bashrc that is not on
+    PATH at all, which an exec'd default could not have run.
+
+    Asserted on what the screen TYPES, with the pane's shell replaced by one that
+    records its input: running the real default would start an agent.
     """
-    screen.env["QB_SEAT_AGENT"] = "some-stand-in"
+    del screen.env["QB_SEAT_INITIAL_CMD"]
+    typed = typing_shell(screen)
     screen("-n", "1")
-    env = screen.tmux("show-environment", "-t", "t").stdout
-    assert "QB_SEAT_AGENT=some-stand-in" in env
+    assert wait_for_log(typed, 1) == ["claude-yolo"]
 
 
-def test_the_scope_reaches_the_panes(screen):
-    """The knob for the one case the per-project default cannot read: two screens
-    on ONE repository, whose seats would otherwise both be numbered from 1 in the
-    same namespace and collide exactly as two projects used to (#208)."""
-    screen.env["QB_SEAT_SCOPE"] = "review"
+def test_an_empty_initial_command_leaves_a_bare_shell(screen):
+    """Set-and-empty is a request, not a missing answer, and it is the one value a
+    `${VAR:-}` test cannot express — it reads as unset and hands the pane the
+    default instead. That exact bug had a name in the knob this replaced."""
+    screen.env["QB_SEAT_INITIAL_CMD"] = ""
+    typed = typing_shell(screen)
+    screen("-n", "2")
+    assert panes(screen), "the panes are still built"
+    time.sleep(1.0)
+    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+
+
+def test_the_initial_command_may_carry_a_prompt(screen):
+    """`claude-yolo -- /get-involved` is a screen that comes up claiming work, and
+    it is the whole of what an eager fleet needs from this script — so the line has
+    to arrive as a command LINE and not as a program name."""
+    screen.env["QB_SEAT_INITIAL_CMD"] = "seat-stub -- /get-involved"
     screen("-n", "1")
-    assert "QB_SEAT_SCOPE=review" in screen.tmux("show-environment", "-t", "t").stdout
+    lines = wait_for_log(screen.log, 1)
+    assert "args=-- /get-involved" in lines[0], lines
 
 
-def test_an_empty_scope_reaches_the_panes(screen):
-    """Set-and-empty is the request for the machine-wide seat numbering this had
-    before #208, and it is the one value a `-n` forwarding predicate drops — which
-    would hand the screen the per-project default it was told not to use.
+def test_cmd_beats_the_environment(screen):
+    """One invocation's answer, over an exported one. The precedence matters
+    because the export is how a box says what its screens are made of."""
+    screen.env["QB_SEAT_INITIAL_CMD"] = "seat-stub exported"
+    screen("-n", "1", "--cmd", "seat-stub flagged")
+    assert "args=flagged" in wait_for_log(screen.log, 1)[0]
 
-    Line-wise, not as a substring, for QB_SEAT_BRIEF's reason: `"QB_SEAT_SCOPE=" in
-    env` also matches `QB_SEAT_SCOPE=review`.
+
+def test_cmd_with_an_empty_string_is_a_screen_of_shells(screen):
+    """`--cmd ''` has to survive the argument parser, which is why the guard there
+    counts arguments rather than testing the value for emptiness."""
+    typed = typing_shell(screen)
+    screen("-n", "1", "--cmd", "")
+    assert panes(screen)
+    time.sleep(1.0)
+    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+
+
+def test_an_initial_command_with_a_newline_in_it_is_refused(screen):
+    """RED/GREEN. `send-keys -l` writes bytes into a pty, and a newline in a pty is
+    Enter — so a value carrying one is not a line that gets typed, it is several
+    commands, and the first runs whatever --staged was asked for.
+
+    Measured before this guard existed: `--staged --cmd $'echo FIRST\necho SECOND'`
+    left `echo FIRST` already executed in the pane with no C-m sent at all. A safety
+    control that silently does not hold is worse than no control.
     """
-    screen.env["QB_SEAT_SCOPE"] = ""
-    screen("-n", "1")
-    env = screen.tmux("show-environment", "-t", "t").stdout.splitlines()
-    assert "QB_SEAT_SCOPE=" in env, f"set-and-empty must arrive as itself: {env}"
-    assert "-QB_SEAT_SCOPE" not in env, "must not be marked for removal"
+    done = screen("-n", "1", "--staged", "--cmd", "echo FIRST\necho SECOND")
+    assert done.returncode != 0, done.stdout
+    assert "single line" in done.stderr, done.stderr
+    # And nothing was built: the check runs before a session exists.
+    assert screen.tmux("has-session", "-t", "t").returncode != 0
 
 
-def test_a_plain_screen_forwards_no_scope(screen):
-    """The default lives in qb-seat and is derived from the pane's own cwd, which
-    the layout already sets to the repo. Writing it out here as well would be a
-    second place for it to live and to drift from."""
-    screen("-n", "1")
-    assert "QB_SEAT_SCOPE" not in screen.tmux("show-environment", "-t", "t").stdout
-    assert screen.tmux("show-options", "-v", "-t", "t:", "@qb_scope").returncode != 0
+def test_a_tab_in_the_initial_command_is_refused_too(screen):
+    """The other control bytes are terminal editing rather than text — a tab is
+    completion in an interactive shell, which is not what the caller typed."""
+    done = screen("-n", "1", "--cmd", "seat-stub\targ")
+    assert done.returncode != 0
+    assert "single line" in done.stderr, done.stderr
 
 
-def test_the_scope_is_recorded_on_the_screen_as_well_as_forwarded(screen):
-    """Two readers, two mechanisms. The variable tells the SEAT what to call
-    itself; the option tells whatever reads the screen from outside — the
-    dashboard joins `zeus/seat-review-1` to a pane, and @qb_repo answers for the
-    default scope only."""
-    screen.env["QB_SEAT_SCOPE"] = "review"
-    screen("-n", "1")
-    assert screen.tmux("show-options", "-v", "-t", "t:", "@qb_scope").stdout.strip() \
-        == "review"
+def test_an_ordinary_initial_command_with_a_prompt_is_not_caught(screen):
+    """The guard must not fire on the shape the setting exists for."""
+    screen("-n", "1", "--cmd", "seat-stub -- /get-involved")
+    assert "args=-- /get-involved" in wait_for_log(screen.log, 1)[0]
 
 
-def test_a_seat_added_later_carries_the_scope_it_was_added_with(screen):
-    """--add scopes its -e list to the one pane it creates rather than rewriting
-    the session under seats already working in it, and the option goes the same
-    way for the same reason."""
-    screen("-n", "1")
-    screen.env["QB_SEAT_SCOPE"] = "review"
-    screen("--add")
-    panes = dict(line.split("\t", 1) for line in
-                 screen.tmux("list-panes", "-t", "t:", "-F",
-                             "#{@qb_seat}\t#{@qb_scope}").stdout.splitlines())
-    assert panes.get("2") == "review", panes
-    # And NOT on the seat that was already working, whose own scope is the default.
-    assert panes.get("1") == "", panes
+def test_add_refuses_past_the_seat_ceiling(screen):
+    """The ceiling is a property of the SCREEN, and the check by the argument parser
+    validates what this call was asked to BUILD — for `--add` that is the untouched
+    default and says nothing about the screen being grown. So a screen could be
+    added to indefinitely, past the point where the layout note stops applying."""
+    screen("-n", str(10))                      # MAX_SEATS
+    assert len([n for _, n in panes(screen) if n]) == 10
+    done = screen("--add")
+    assert done.returncode != 0, done.stdout
+    assert "ceiling" in done.stderr, done.stderr
+    assert len([n for _, n in panes(screen) if n]) == 10, "and nothing was added"
 
 
-def test_no_yolo_reaches_the_panes(screen):
-    """The flag is the env knob with the value supplied by the layout, so there
-    is one mechanism to test and nothing that can drift between the two."""
+def test_add_fills_a_hole_even_on_a_full_screen(screen):
+    """The ceiling tests `next` rather than a count, so a screen with a hole in it
+    has room by construction — which is the case that would be wrong if the check
+    counted panes instead."""
+    screen("-n", str(10))
+    victim = next(pid for pid, n in panes(screen) if n == "4")
+    screen.tmux("kill-pane", "-t", victim)
+    assert screen("--add").returncode == 0
+    assert sorted(int(n) for _, n in panes(screen) if n) == list(range(1, 11))
+
+
+def test_cmd_without_a_value_is_refused_rather_than_read_as_empty(screen):
+    """A caller bug, and it says so: silently reading a missing value as "bare
+    shells" would build a screen that starts nothing and look deliberate."""
+    done = screen("-n", "1", "--cmd")
+    assert done.returncode != 0
+    assert "--cmd needs a command line" in done.stderr, done.stderr
+
+
+def test_no_yolo_asks_for_the_agent_that_stops_to_ask(screen):
+    """The flag is sugar for --cmd, so there is one mechanism and nothing that can
+    drift between the two."""
+    del screen.env["QB_SEAT_INITIAL_CMD"]
+    typed = typing_shell(screen)
     screen("--no-yolo", "-n", "1")
-    assert "QB_SEAT_YOLO=0" in screen.tmux("show-environment", "-t", "t").stdout
+    assert wait_for_log(typed, 1) == ["claude"]
 
 
-def test_a_plain_screen_leaves_the_knob_unset(screen):
-    """Not "sets it to on" — an unset variable is how qb-seat is told the question
-    was not answered, and answering it here would be a second place for the
-    default to live and to drift from."""
-    screen("-n", "1")
-    assert "QB_SEAT_YOLO" not in screen.tmux("show-environment", "-t", "t").stdout
+def test_yolo_overrides_an_exported_initial_command(screen):
+    """The only thing --yolo is for: saying the default out loud over the top of
+    an export that said something else."""
+    screen.env["QB_SEAT_INITIAL_CMD"] = "seat-stub exported"
+    typed = typing_shell(screen)
+    screen("--yolo", "-n", "1")
+    assert wait_for_log(typed, 1) == ["claude-yolo"]
+
+
+def test_the_screen_records_what_it_was_built_with(screen):
+    """--add and the bar's ＋ cannot read the environment the screen was BUILT in:
+    the ＋ arrives through `run-shell`, whose environment is the tmux server's. So
+    the answer is recorded on the session, where the screen's own tooling reads
+    it."""
+    screen("-n", "1", "--cmd", "seat-stub recorded")
+    assert screen.tmux("show-options", "-v", "-t", "t:",
+                       "@qb_initial_cmd").stdout.strip() == "seat-stub recorded"
+
+
+def test_a_seat_added_later_is_the_seat_the_screen_is_made_of(screen):
+    """--add with nothing said takes the screen's own answer, not the default.
+
+    And not an exported one either — the fixture always exports one, which is the
+    ambient case this ordering is about: an export in an rc file would otherwise
+    have every ＋ quietly add a seat unlike the ones beside it, where the screen
+    was built deliberately and in front of somebody.
+    """
+    screen("-n", "1", "--cmd", "seat-stub original")
+    assert screen.env["QB_SEAT_INITIAL_CMD"] == "seat-stub", "the ambient export"
+    screen("--add")
+    lines = wait_for_log(screen.log, 2)
+    assert all("args=original" in line for line in lines), lines
+
+
+def test_a_screen_of_bare_shells_stays_that_way_when_a_seat_is_added(screen):
+    """The reason the recording distinguishes unset from empty. tmux answers an
+    option that was never set with exit 1 and one set to "" with exit 0, so a
+    screen built with `--cmd ''` says so — and an `--add` that read the two the
+    same way would start an agent on a screen deliberately built without one."""
+    typed = typing_shell(screen)
+    screen("-n", "1", "--cmd", "")
+    screen("--add")
+    assert len([n for _, n in panes(screen) if n]) == 2
+    time.sleep(1.0)
+    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+
+
+def test_an_added_seat_can_be_told_something_else(screen):
+    """One pane, told once. It does not rewrite what the screen is made of, so the
+    NEXT --add is back to the screen's own answer."""
+    screen("-n", "1", "--cmd", "seat-stub original")
+    screen("--add", "--cmd", "seat-stub added")
+    lines = wait_for_log(screen.log, 2)
+    assert any("args=added" in line for line in lines), lines
+    assert screen.tmux("show-options", "-v", "-t", "t:",
+                       "@qb_initial_cmd").stdout.strip() == "seat-stub original"
 
 
 def test_the_inherited_instance_is_stripped_from_the_session(screen):
@@ -640,13 +787,52 @@ def test_add_grows_a_running_screen_without_restarting_it(screen):
     assert before <= {pid for pid, n in after if n}, "existing seats keep their panes"
 
 
-def test_add_numbers_from_the_highest_seat_not_the_count(screen):
-    """A closed pane must not hand its number to the next seat and collide."""
+def test_add_fills_the_hole_a_closed_seat_left(screen):
+    """Close seat 2 of 3, add one, get seat 2 back.
+
+    It was max+1 until #540, so that this could never hand a new agent the number
+    of one that had just exited — the number was half of the seat's board NAME, and
+    the board's returning-key rule would have given the new pane the old agent's
+    identity. The number is a pane option now and the board keys on the session id,
+    so the collision cannot happen and the row can stay dense, which is what
+    somebody opening and closing panes actually wants.
+    """
     screen("-n", "3")
     victim = next(pid for pid, n in panes(screen) if n == "2")
     screen.tmux("kill-pane", "-t", victim)
     screen("--add")
-    assert sorted(n for _, n in panes(screen) if n) == ["1", "3", "4"]
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2", "3"]
+
+
+def test_a_seat_parked_outside_the_row_keeps_its_number(screen):
+    """A number is unique per SCREEN, not per window.
+
+    `break-pane -d` into a holding window is how the qb key hides the tape and the
+    dash, and #517 is about doing it to a seat — the pane leaves the row without
+    giving its number up. The lowest-free rule reads the whole session for exactly
+    that reason: reading the row alone would hand the parked seat's number to a new
+    pane, and then the ✕, the jump and the restore all take whichever match tmux
+    lists first.
+
+    The old max+1 rule was accidentally immune to this, so the guard arrives with
+    the rule that needs it rather than with the feature that will.
+    """
+    screen("-n", "3")
+    parked = next(pid for pid, n in panes(screen) if n == "2")
+    screen.tmux("break-pane", "-d", "-s", parked, "-t", "t:", "-n", "qb-hidden")
+    # Gone from the row, still on the screen, still wearing its number.
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3"]
+    screen("--add")
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "3", "4"], \
+        "seat 2 is parked, not free"
+
+
+def test_add_still_appends_when_the_row_has_no_hole(screen):
+    """The dense case is the ordinary one, and it is unchanged: the lowest free
+    number on a screen nobody has closed a seat in IS the next one up."""
+    screen("-n", "2")
+    screen("--add")
+    assert sorted(n for _, n in panes(screen) if n) == ["1", "2", "3"]
 
 
 def test_rerunning_reattaches_rather_than_rebuilding(screen):
@@ -1074,18 +1260,17 @@ def test_a_board_that_refuses_or_is_down_does_not_keep_the_pane_open(screen, tmp
     assert sorted(n for _, n in panes(screen) if n) == ["2"]
 
 
-def test_the_plus_adds_a_seat_and_does_not_reuse_a_closed_number(screen):
-    """A recycled seat number is a board bug, not a cosmetic one.
-
-    The board keys an agent by its identity, so a new agent wearing the number
-    of one that just exited reads as the old one coming back.
-    """
+def test_the_plus_puts_a_seat_back_where_the_cross_left_a_hole(screen):
+    """✕ then ＋ is the pair a human actually presses, and it should leave the row
+    as it found it. A recycled number was a board bug while the number was part of
+    a seat's identity; since #540 it is a label on a pane (see
+    test_add_fills_the_hole_a_closed_seat_left)."""
     screen("-n", "2")
     wait_for_log(screen.log, 2)
     assert click(screen, "kill1", "t").returncode == 0
     assert click(screen, "add", "t").returncode == 0
     got = sorted(int(n) for _, n in panes(screen) if n)
-    assert got == [2, 3], f"expected the new seat to be 3, got {got}"
+    assert got == [1, 2], f"expected the hole at 1 to be filled, got {got}"
 
 
 def test_the_seat_name_jumps_to_that_pane(screen):
@@ -1129,7 +1314,9 @@ def test_the_bar_works_on_a_screen_whose_name_tmux_keeps_verbatim(screen):
 
     done = click(screen, "add", real, name=real)
     assert done.returncode == 0, done.stderr
-    assert sorted(int(n) for _, n in panes(screen, real) if n) == [1, 3, 4], done.stderr
+    # 2, because the ✕ above left a hole there — see
+    # test_add_fills_the_hole_a_closed_seat_left.
+    assert sorted(int(n) for _, n in panes(screen, real) if n) == [1, 2, 3], done.stderr
 
 
 def test_the_cross_works_on_a_screen_that_is_not_the_last_one_on_the_server(screen):
@@ -1883,6 +2070,268 @@ def test_the_dash_comes_back_above_the_tape_and_not_beside_it(screen):
     assert geometry(screen) == before, "the dash came back to a different screen"
 
 
+def test_expanding_the_dash_gives_it_a_window_and_puts_the_screen_back_exactly(screen):
+    """`z` — out of the row into a window of its own, and back with the geometry.
+
+    The same break-and-rejoin `d` uses, so it inherits the thing that was hard
+    about that one: the widths are recorded BEFORE the break, because afterwards
+    the dash's columns have already gone to a neighbour and recording then puts
+    the screen back the way the break left it. Asserted on the whole screen and
+    not on the dash alone — a rejoined dash at the right width with the seats
+    beside it wrong is the failure that looks like success.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+    dash = pane_id(screen, "dash")
+    assert dash, "this screen was supposed to have a dash"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") is None, "the dash is still in the seats window"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == dash
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") == dash, "a different pane came back"
+    assert geometry(screen) == before, "the screen came back a different shape"
+    for option in ("@qb_dash_expanded", "@qb_hidden_dash"):
+        left = screen.tmux("show-options", "-t", "t:", "-qv", option).stdout.strip()
+        assert left == "", f"{option} outlived the collapse: {left!r}"
+
+
+def test_an_expanded_dash_is_visible_rather_than_parked(screen):
+    """The whole difference between this and `d`, and it is one flag.
+
+    `break-pane -d` leaves the pane in a window nobody is looking at, which is
+    what hiding means; without it the client follows the pane to its new window,
+    which is what expanding means. Same recording, same way back — so the only
+    thing worth asserting is that the window is the current one and is named for
+    reading rather than for parking.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert seat_key(screen, "expand", "t").returncode == 0
+
+    name = screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_name}").stdout.strip()
+    assert name == "qb-dash", f"the expanded dash landed in {name!r}"
+    assert screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_panes}").stdout.strip() == "1", \
+        "the expanded dash is sharing its window"
+
+
+def test_expanding_keeps_the_process_that_was_in_the_pane(screen):
+    """Which is the whole argument for `break-pane` over a popup running a second
+    dashboard: the expanded pane is the SAME process, so it has everything it had
+    already polled and there is no "waiting for gh" caption on the way in."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    was = screen.tmux("display-message", "-p", "-t", dash, "#{pane_pid}").stdout.strip()
+    assert was.isdigit(), f"the dash has no process at all: {was!r}"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") == dash, "the pane was replaced rather than moved"
+    assert screen.tmux("display-message", "-p", "-t", dash,
+                       "#{pane_pid}").stdout.strip() == was, \
+        "the dash came back with a different process in it"
+
+
+def test_expanding_a_hidden_dash_shows_it_rather_than_putting_it_in_the_row(screen):
+    """The one crossing between the two toggles that had to be decided.
+
+    `d` means "in the row or not" and `z` means "full screen or not", so a hidden
+    dash asked to expand is asked for the thing it is one step from — not brought
+    back to its 78-column column, which is `d`'s answer to a different question,
+    and not refused, which answers nothing. It is also the cheap direction: the
+    pane is already alone in a window, so this is a rename and a select and no
+    geometry moves. A `break-pane` here would fail outright.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+    dash = pane_id(screen, "dash")
+
+    assert seat_key(screen, "dash", "t").returncode == 0            # hide it
+    assert seat_key(screen, "expand", "t").returncode == 0          # now show it big
+    assert pane_id(screen, "dash") is None, "the dash went back into the row"
+    assert screen.tmux("display-message", "-p", "-t", "t:",
+                       "#{window_name}").stdout.strip() == "qb-dash"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == dash
+
+    # And the way back is still one route, with the geometry hide_pane recorded
+    # before any of this — which is the thing a rename could quietly have lost.
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert geometry(screen) == before, "the round trip through both states lost the row"
+
+
+def test_a_nudge_says_which_of_the_two_states_the_dash_is_in(screen):
+    """"Hidden" about a dash filling the screen in front of you is the kind of
+    wrong answer that makes somebody doubt the tool rather than the state."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    nudged = seat_key(screen, "wider", "t")
+    assert nudged.returncode != 0
+    assert "expanded" in nudged.stderr, nudged.stderr
+    assert "hidden" not in nudged.stderr, \
+        f"an expanded dash was reported as hidden: {nudged.stderr}"
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    hidden = seat_key(screen, "wider", "t")
+    assert hidden.returncode != 0
+    assert "hidden" in hidden.stderr, hidden.stderr
+
+
+def test_the_dash_toggle_also_brings_back_an_expanded_dash(screen):
+    """One route into the row, whichever route left it.
+
+    Expanded and hidden are both "the dash is not in the seats window", and they
+    come back the same way — so `d` on an expanded dash must put it back rather
+    than refusing or, worse, breaking it out a second time.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    before = geometry(screen)
+
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert geometry(screen) == before, "`d` brought an expanded dash back wrong"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == "", \
+        "the expanded marker outlived a collapse made with `d`"
+
+
+def test_killing_the_expanded_dash_takes_both_markers_with_it(screen):
+    """A dead pane must not leave a screen describing one.
+
+    Two options describe the expanded dash — `@qb_hidden_dash` is where it is
+    parked, `@qb_dash_expanded` is which of the two ways it got there — and the
+    pane-is-gone branch used to clear only the first. What was left was a screen
+    marked expanded with nothing recorded, so every later `z` took the expanded
+    branch and reported "nothing recorded to put back": the wrong problem named,
+    on a screen whose real one is that the dash process died. Neither key could
+    put it right, because the marker is the only thing either of them reads.
+
+    Closing the window the dash was expanded into is not a contrived way to reach
+    that — it is `C-q z` followed by the reflex of closing a window you are done
+    with, and the dash is the only pane in it.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    assert seat_key(screen, "expand", "t").returncode == 0
+    dash = screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip()
+    assert dash, "the dash did not record itself as expanded"
+
+    screen.tmux("kill-pane", "-t", dash)
+    # It refuses, and that is right — there is no dash to bring back. What it
+    # must not do is refuse the same way for ever.
+    assert seat_key(screen, "expand", "t").returncode != 0
+    for option in ("@qb_dash_expanded", "@qb_hidden_dash"):
+        left = screen.tmux("show-options", "-t", "t:", "-qv", option).stdout.strip()
+        assert left == "", f"{option} outlived the pane it describes: {left!r}"
+
+    # And the message now names the screen's actual state rather than the marker's.
+    again = seat_key(screen, "expand", "t")
+    assert "marked expanded" not in again.stderr, \
+        f"still answering from a marker that was cleared: {again.stderr!r}"
+
+
+def test_a_marker_left_without_a_record_clears_itself(screen):
+    """The other order the same contradiction can arrive in, and its only exit.
+
+    `expand_dash` asks `@qb_dash_expanded` first and hands off to `restore_dash`,
+    which answers from `@qb_hidden_dash`. A marker with no record is a state that
+    describes no pane, and leaving it set made this refusal the answer to every
+    later `z` — so `restore_dash` returning 1 is taken as the proof the marker is
+    wrong, and it does not survive being disproved.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    dash = pane_id(screen, "dash")
+    screen.tmux("set-option", "-t", "t:", "@qb_dash_expanded", dash)
+
+    first = seat_key(screen, "expand", "t")
+    assert first.returncode != 0, "a marker with no record was acted on"
+    assert screen.tmux("show-options", "-t", "t:", "-qv",
+                       "@qb_dash_expanded").stdout.strip() == "", \
+        "the disproved marker survived being disproved"
+    # With it gone, `z` reads the screen as it is — a dash in the row, to expand.
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert pane_id(screen, "dash") is None, "the second z did not expand the dash"
+
+
+def test_the_top_line_carries_a_clickable_expand(screen):
+    """`#[range=…]` is honoured in status-format and nowhere else, which is the
+    whole reason a control can live on a status line — and the top line is where
+    this one belongs, since every cell on the seat bar names a seat and a control
+    for the pane down the right would be the exception a reader has to learn."""
+    screen("-n", "2")
+    fmt = top_format(screen)
+    assert "#[range=user|expand]" in fmt, f"no expand widget on the top line: {fmt}"
+    assert "⛶" in fmt, "the range is there and has nothing in it"
+    # `norange` and not `default`: the note in seat_bar applies here too — a
+    # `#[default]` jumps back to status-style, which is the theme's green.
+    after = fmt.split("#[range=user|expand]", 1)[1]
+    assert "#[norange]" in after.split("#{@qb_top}", 1)[0], \
+        "the range is never closed, so the whole line is one click target"
+
+
+def test_the_expand_widget_reaches_qb_seat_key(screen):
+    """The ⛶, `C-q z` and the dash's own `z` are three front ends onto ONE
+    definition of expanding, and this is the join for the first of them.
+
+    Driven through qb-seat-click by the range name the status line would send,
+    which is the part that can be tested without synthesising a mouse event —
+    the same split the seat bar's own widgets are tested along.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    before = geometry(screen)
+
+    done = click(screen, "expand", "t")
+    assert done.returncode == 0, done.stderr
+    assert pane_id(screen, "dash") is None, "the click did not expand the dash"
+
+    assert click(screen, "expand", "t").returncode == 0
+    assert geometry(screen) == before, "the click did not put the screen back"
+
+
+def test_a_click_on_the_top_line_reaches_the_dispatcher_too(screen):
+    """The join the test above deliberately skips, and the one that was broken.
+
+    `qb-seat-click expand` worked from the moment it was written; the ⛶ still did
+    nothing, because the mouse binding gated on
+    `#{==:#{mouse_status_line},#{@qb_bar}}` — true of the seat bar, line 1, and
+    of nothing else. The widget drew, registered its range, and every click on it
+    fell through to `switch-client -t =`. Both halves of the feature passed their
+    own tests; what nobody owned was the line between them.
+
+    A status-line click cannot be synthesised — tmux routes it to the client, not
+    to a pane, so there is no `send-keys` that produces one — so this asserts the
+    property that made the click unreachable rather than the click. The binding
+    must decide on the SCREEN and not on the line: both status lines are ours,
+    every range on either is one this script put there, and which widget was hit
+    is the range's job to say.
+    """
+    screen("-n", "2")
+    lines = [ln for ln in screen.tmux("list-keys", "-T", "root").stdout.splitlines()
+             if re.search(r"-T\s+root\s+MouseDown1Status\s", ln)]
+    assert len(lines) == 1, lines
+    assert "mouse_status_line" not in lines[0], (
+        "the binding gates on which status line was clicked, so a widget on the "
+        "top line registers its range and is then dropped — which is exactly how "
+        "the ⛶ shipped inert")
+    # And the widget it could not reach is on the line that was being excluded.
+    assert "#[range=user|expand]" in top_format(screen), \
+        "the ⛶ is no longer on the top line, so this test is measuring nothing"
+
+
 def test_a_hidden_pane_keeps_the_process_that_was_in_it(screen):
     """Which is the whole reason this is `break-pane` and not "kill it and split a
     new one": a tape that restarted would lose everything it had followed, and a
@@ -1943,6 +2392,42 @@ def test_two_screens_disagree_about_whether_their_tape_is_showing(screen):
     assert len(aux_panes(screen, "two")) == 1, "hiding one screen's tape hid the other's"
     assert screen.tmux("show-options", "-v", "-t", "=two:",
                        "@qb_hidden_tape").stdout.strip() == ""
+
+
+@pytest.mark.parametrize("action", ["dash", "expand", "tape"])
+def test_a_pane_taken_out_of_the_row_stays_in_its_own_session(screen, action):
+    """`break-pane` with no `-t` uses the CLIENT'S CURRENT session, not the source
+    pane's — so on a server running two screens, taking a pane out of the one you
+    are not looking at parks it in the other one's window list.
+
+    Everything downstream then fails to find it: `pane_exists` and the whole
+    restore path search `list-panes -s -t "$SID"`, which is scoped to the session,
+    so the pane is at once alive, stranded, and reported as gone. There is no way
+    back for it through this script.
+
+    IT CANNOT BE SEEN WITH ONE SESSION ON THE SERVER, which is why it survived the
+    hide/show tests entirely and only turned up when a screen was built beside a
+    real one on a developer's box: the dash landed in `seats-quarterback:qb-dash`
+    while its own screen reported it missing. Two screens, and the second is the
+    current one — which is what makes the wrong answer available.
+    """
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2", name="one")
+    screen("-n", "2", name="two")          # built last, so it is the current session
+
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+
+    stranded = [line for line in screen.tmux(
+        "list-panes", "-a", "-F", "#{pane_id} #{session_name}:#{window_name}"
+    ).stdout.splitlines() if line.startswith(("%",)) and " two:" in line
+        and not line.endswith(":seats")]
+    assert stranded == [], f"`{action}` on screen one put a pane in screen two: {stranded}"
+
+    # And the round trip still works, which is the thing the stranding broke: the
+    # pane was findable enough to break out and not findable enough to bring back.
+    assert seat_key(screen, action, "one", name="one").returncode == 0
+    assert len(aux_panes(screen, "one")) == 2, \
+        f"`{action}` could not put the pane back on its own screen"
 
 
 def test_a_nudge_records_the_width_it_landed_at(screen):
@@ -2615,7 +3100,7 @@ def test_a_dash_command_that_collides_with_a_key_name_is_still_typed(screen):
 
 
 def test_no_dash_command_means_no_dash_pane(screen):
-    """Set-and-empty is the off switch, matching QB_SEAT_BRIEF's spelling."""
+    """Set-and-empty is the off switch, matching QB_SEAT_INITIAL_CMD's spelling."""
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "2")
     got = aux_panes(screen)
@@ -3087,40 +3572,14 @@ def test_dash_fit_tolerates_a_screen_that_has_moved_on(screen):
     assert screen("--dash-fit", name="no-such-screen").returncode == 0
 
 
-def test_an_empty_brief_reaches_the_panes(screen):
-    """The one value QB_SEAT_BRIEF exists to express, and a `-n` forwarding test
-    silently dropped it: nothing arrived in the pane, qb-seat saw unset, and the
-    seat started on the full built-in brief — a screen asked for waiting seats
-    that went and claimed work instead, reporting nothing wrong.
-
-    Asserted line-wise and not as a substring. `"QB_SEAT_BRIEF=" in env` also
-    matches `QB_SEAT_BRIEF=go and claim something`, so a regression that forwarded
-    the built-in default instead of the empty string — the precise failure above —
-    would have kept it green.
-    """
-    screen.env["QB_SEAT_BRIEF"] = ""
-    screen("-n", "1")
-    env = screen.tmux("show-environment", "-t", "t").stdout.splitlines()
-    assert "QB_SEAT_BRIEF=" in env, f"set-and-empty must arrive as itself: {env}"
-    assert "-QB_SEAT_BRIEF" not in env, "must not be marked for removal"
-    # And the seat that received it agrees, which is the half tmux cannot be asked.
-    assert wait_for_log(screen.log, 1)[0].endswith("brief=set:")
-
-
-def test_an_empty_brief_reaches_a_seat_added_later(screen):
-    """--add builds its own -e list, and for a while that list was written out by
-    hand rather than being the forwarder's: `QB_SEAT_BRIEF= qb-seats --add` onto a
-    screen built without the variable forwarded nothing at all, qb-seat saw unset,
-    and the added seat went off on the full built-in brief — the same silent failure
-    the `up` path had, in the half of the code that had no test.
-    """
-    screen("-n", "1")
-    assert wait_for_log(screen.log, 1)[0].endswith("brief=unset")
-    screen.env["QB_SEAT_BRIEF"] = ""
-    screen("--add")
-    lines = wait_for_log(screen.log, 2)
-    assert len(lines) == 2, lines
-    assert lines[1].endswith("brief=set:"), lines
+# The two tests that were here pinned QB_SEAT_BRIEF's forwarding — that an empty
+# value arrived as itself on the build path and on --add, because a `-n` predicate
+# dropped it and the seat then started on the full built-in brief. There is no
+# brief and nothing is forwarded through the session environment any more (#540);
+# what replaced both is `test_an_empty_initial_command_leaves_a_bare_shell` and
+# `test_a_screen_of_bare_shells_stays_that_way_when_a_seat_is_added`, which make
+# the same distinction — set-and-empty is an answer — against the mechanism that
+# carries it now.
 
 
 # ---- list and resume --------------------------------------------------------
@@ -3388,9 +3847,9 @@ def test_a_new_screen_says_what_its_seats_are_about_to_spend(screen):
 
 
 def test_the_screen_is_built_whatever_the_window_says(screen):
-    """It warns and proceeds, always. A human bringing up a screen has decided to
-    spend; the refusal lives one layer down in qb-seat, off by default, for the
-    panes with nobody in front of them."""
+    """It warns and proceeds under the default mode. A human bringing up a screen
+    has decided to spend; withholding the agents is `QB_SEATS_PACE=obey`, which is
+    opt-in and tested above."""
     # Exiting non-zero as well, because that is the shape of the case worth
     # pinning: a verdict that says stop must still be RELAYED by the thing that
     # has decided not to stop.
@@ -3399,6 +3858,111 @@ def test_the_screen_is_built_whatever_the_window_says(screen):
     assert result.returncode == 0
     assert "qb-seats: pace: HOLD — 5h at 99%; resets in 12m" in result.stderr
     assert len([p for p in panes(screen) if p[1]]) == 2, "the screen was not built"
+
+
+def test_obey_brings_the_seats_up_as_shells_rather_than_refusing_the_screen(screen):
+    """What a spent window costs: the agents, not the panes.
+
+    The refusal this replaces lived in the per-pane wrapper and refused to create
+    the PANE at all (exit 4). A pane costs nothing, and refusing somebody a
+    terminal because a subscription window is spent is a refusal they can only
+    work around by not using this script — so `obey` withholds the thing that
+    actually spends the window and leaves a shell you can type into (#540).
+    """
+    _pace_stub(screen, "echo 'pace: HOLD — 5h spent; resets in 12m'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "obey"
+    typed = typing_shell(screen)
+    done = screen("-n", "2")
+    assert done.returncode == 0, done.stderr
+    assert len([p for p in panes(screen) if p[1]]) == 2, "the panes are still built"
+    # Phrase-wise and not as one string: `warn` prints this refusal as the
+    # multi-line block it is written as, so the sentence carries the wrap.
+    assert "these seats come up as" in done.stderr, done.stderr
+    assert "bare shells" in done.stderr, done.stderr
+    assert "resets in 12m" in done.stderr, "and it says when it comes back"
+    time.sleep(1.0)
+    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+
+
+def test_a_pace_hold_does_not_become_what_the_screen_is(screen):
+    """A held window is a fact about right now, not about the screen.
+
+    The recording is what `--add` reads back, so writing the WITHHELD value into it
+    would make a transient hold permanent: the screen would go on adding bare shells
+    for the rest of its life, long after the window came back, and the gate would
+    have nothing left to re-check because there would be no command to withhold.
+    """
+    _pace_stub(screen, "echo 'pace: HOLD'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "obey"
+    screen("-n", "1", "--cmd", "seat-stub original")
+    # Nothing was started — the gate did its job for this invocation …
+    assert len(wait_for_log(screen.log, 1, timeout=2)) == 0
+    # … and the screen still knows what it is made of.
+    assert screen.tmux("show-options", "-v", "-t", "t:",
+                       "@qb_initial_cmd").stdout.strip() == "seat-stub original"
+
+    # So when the window comes back, an --add is a seat again.
+    _pace_stub(screen, "echo 'pace: go'\nexit 0\n")
+    screen("--add")
+    assert "args=original" in wait_for_log(screen.log, 1)[0]
+
+
+def test_warn_says_the_window_is_spent_and_starts_the_seats_anyway(screen):
+    """The default, and the direction this deliberately points: a human standing in
+    front of a screen, told the window is spent, is a human who can decide."""
+    _pace_stub(screen, "echo 'pace: HOLD — 5h spent'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "warn"
+    screen("-n", "1")
+    assert wait_for_log(screen.log, 1), "the seat started"
+
+
+def test_a_screen_of_bare_shells_does_not_consult_the_pace_at_all(screen):
+    """With no initial command there is no agent to withhold, so the gate has
+    nothing to act on — and a suite that left the mode at its default would
+    otherwise read the developer's own subscription to decide nothing."""
+    log = _pace_stub(screen, f'echo "gate $*" >> {screen.log.parent / "pace.log"}\nexit 3\n')
+    screen.env["QB_SEATS_PACE"] = "obey"
+    screen("-n", "1", "--cmd", "")
+    assert "--gate" not in (log.read_text() if log.exists() else "")
+
+
+def test_obey_withholds_a_seat_added_to_a_spent_screen_too(screen):
+    """--add is the other way a seat starts, and the window does not care which."""
+    screen("-n", "1")
+    wait_for_log(screen.log, 1)
+    _pace_stub(screen, "echo 'pace: HOLD'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "obey"
+    done = screen("--add")
+    assert done.returncode == 0, done.stderr
+    assert len([p for p in panes(screen) if p[1]]) == 2, "the pane is still added"
+    time.sleep(1.0)
+    assert len(wait_for_log(screen.log, 2, timeout=1)) == 1, "and no second agent"
+
+
+def test_a_pace_that_cannot_answer_does_not_withhold_anything(screen):
+    """3 is `hold` and only 3. A timeout, a broken install or an `unknown` all mean
+    the gate did not RUN rather than that it passed — and none of them is a reason
+    to leave a screen somebody asked for standing empty."""
+    _pace_stub(screen, "exit 127\n")
+    screen.env["QB_SEATS_PACE"] = "obey"
+    screen("-n", "1")
+    assert wait_for_log(screen.log, 1), "the seat started"
+
+
+def test_a_pace_mode_that_is_not_a_mode_is_named_and_read_as_warn(screen):
+    """A typo in the one variable that decides whether a screen starts anything.
+    Read as the strict answer it would be a screen that mysteriously starts
+    nothing; read silently as warn, a `QB_SEATS_PACE=obay` never obeys."""
+    _pace_stub(screen, "echo 'pace: HOLD'\nexit 3\n")
+    screen.env["QB_SEATS_PACE"] = "obay"
+    done = screen("-n", "1")
+    assert "not off, warn or obey" in done.stderr, done.stderr
+    # ONCE, for one typo. Three callers ask what the mode is — the estimate, the
+    # gate, and the top line's flag — and a complaint repeated per caller is how a
+    # message worth reading becomes one to skip. It is also why the answer is a
+    # global rather than something a `$(…)` subshell computes and throws away.
+    assert done.stderr.count("not off, warn or obey") == 1, done.stderr
+    assert wait_for_log(screen.log, 1), "and it starts, because warn starts"
 
 
 def test_a_broken_pace_command_costs_the_note_and_not_the_screen(screen):

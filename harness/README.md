@@ -17,8 +17,7 @@ board reconnects them.**
   `prune-worktrees`, `worktree-holder`), plus `qb-stage`, which records the workflow
   stage a session is in for the statusline, `qb-mode`, which says which of the two
   ways of working a repo uses — `⌂ CLEANROOM` or `~ JUNGLE` — and exits 3 when the
-  tree you are standing in contradicts it, `qb-seat`, which turns one pane of a
-  multiplexer into a fleet seat with its own board identity, `qb-board`, which
+  tree you are standing in contradicts it, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
   on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
   that asks whether the board's plan still describes the present, `qb-pace`, which
@@ -156,7 +155,7 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 4.1% / P2 28.6% / P3 36.1% / P4 31.3%, says the signal is calibrated at about 1.2 P1s per
 PR and the 67.3% tail beside it is not.
 
-So `.harness-rules.sample` now carries eight `review_panel` dials (#165, #297), and what they
+So `.harness-rules.sample` now carries ten `review_panel` dials (#165, #297, #492, #482), and what they
 bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
 is asked to clear, and below it a finding is reported, marked and recorded rather than
 fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
@@ -172,9 +171,16 @@ at 721 lines, 74% of the PR being review-response code, off a round-2 fix list t
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
 individually reasonable small fixes;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
-fixing it; `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
+whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
+the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
+stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
-not have; `max_rounds` (**2**) surfaces the existing cap; and `require_failing_test`
+not have; `max_rounds` (**2**) surfaces the existing cap; `file_deferral_issues` (**P2**) decides which
+deferrals get a GitHub issue as well as the board row every deferral gets anyway, which is the
+tail arriving one step downstream of the floor — the floor keeps a P4 out of the fix pass and
+the bookkeeping then filed it as a ticket, twenty times over on this repo alone (#482); and
+`require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
 because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
 
@@ -197,8 +203,10 @@ fixes on one unexamined premise, and PR #88 had a fixer circle its own previous 
 single commit. So `review-pr.md`'s brief (step 3a) lets a fixer report that a finding says the
 **approach** is wrong rather than the code, and write no patch for it: stated, with the premise
 in one sentence and what removing it would cost, rather than answered with a special case. It is
-narrow on purpose — three conditions that must all hold — and it never authorises a redesign,
-because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
+narrow on purpose — three conditions that must all hold, **or** a fourth that fails on its own
+(#491: the property the fix asserts is not decidable in the runtime the assertion runs in, so
+every fix for it is an approximation and the rounds cannot converge) — and it never authorises a
+redesign, because the output is "stop and ask" and the evidence behind it is still two PRs (#67). The
 premise can be put to the seats first with `panel.py --ask`, which is exactly the shape of
 question that path exists for. An escalated finding is recorded as `deferred` by the
 orchestrator, which relays it, opens an issue that **asks** the premise, and names that issue in
@@ -206,6 +214,22 @@ orchestrator, which relays it, opens an issue that **asks** the premise, and nam
 itself — "the defect is real, and it is not what this change is for" — which is a different
 judgement from an escalation ("the defect is real and the FIX is in dispute") arriving at the
 same row; the fixer owes two justifying lines and the orchestrator still owns the filing.
+
+**A deferral always gets a board row; `review_panel.file_deferral_issues` decides which ones
+also get a GitHub issue** (#482). The two were being treated as one record and they are not: the
+row chains by finding key across rounds, feeds `/panel` and keeps the leaderboard honest, while
+the issue is a work item on somebody's tracker. Those coincide for a P1 or P2 deferral and do not
+for the P3/P4 tail, which is where the volume is — measured on this repo on 2026-08-26, roughly
+twenty open issues were panel deferred-finding exhaust and nothing else, and #283 is a rescue
+*from* one of them. At or above the gate the orchestrator opens the issue and names it in
+`deferred_to` as before; below it the row carries no `deferred_to` (the column is nullable, the
+API accepts it, and `/panel` renders a targetless row rather than breaking) and a one-line `note`
+instead, which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read
+that write exists for. The default is `P2`; `always` is the pre-#482 behaviour and `never` files
+none. **An escalation is exempt at every setting**, because its issue asks a question rather than
+filing a task, and if the board write fails the orchestrator files the issue anyway — below the
+gate the row is the only record, so losing both would lose the finding.
+
 `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to
 step 3a resolve, and that `deferred` is a value the database accepts.
@@ -433,7 +457,7 @@ Four decisions in it are worth stating, because each is a way this could have go
   failure it exists to prevent.
 - **One item per invocation, and it stops.** A loop over items is an agent deciding how much
   work the fleet takes on, and nothing bounds that yet (#80 measures integration cost as
-  quadratic in open PRs). `qb-seat`'s brief stops after one item for the same reason. The
+  quadratic in open PRs). The
   loops that do loop — `/fix-and-land` — loop over review *rounds* inside one issue, under
   a round cap and a spend ceiling that already exist.
 
@@ -1147,14 +1171,14 @@ fleet view can *act* on rather than only describe. Best effort throughout: no st
 board, or a refusal all fall through to closing the pane, because the pane is what the
 human clicked to close.
 
-The line `qb-seat` draws — *"the board coordinates work, it does not operate the machine"* —
+The line `qb-seats` draws — *"the board coordinates work, it does not operate the machine"* —
 is about **dispatch**, and none of this moves it. What an agent works on is still its own
 choice, self-selected and claimed atomically.
 
 ### `qb-start` — the verb that begins a session, and it ships off
 
 The other half of #277. There were three ways to start a session on this fleet and every one
-of them ended at a human hand: `qb-seat` in a pane somebody typed into, the dashboard's ⚒ on
+of them ended at a human hand: a seat screen somebody built, the dashboard's ⚒ on
 a mouse click, and `run_agent`'s headless `claude -p` inside a loop a person launched. So a
 plan could say what was next, the board could show who was on what, and nothing could act on
 either.
@@ -1162,6 +1186,7 @@ either.
 ```bash
 qb-start /fix-issue 277               # a session working issue 277
 qb-start /panel-review-pr 352         # …reviewing PR 352
+qb-start /get-involved                # …taking its own next item off the plan (#541)
 qb-start --dry-run /fix-issue 277     # every refusal, nothing started
 qb-start --policy --json              # what will this machine start? (starts nothing)
 qb-start --via dash /fix-issue 277    # …and record what pulled it
@@ -1174,6 +1199,7 @@ qb-start --via dash /fix-issue 277    # …and record what pulled it
 #   exit 7  this repo's window is full, or qb-admit could not read it
 #   exit 8  somebody holds that work, or the claim could not be taken at all
 #   exit 9  could not start it — the claim goes back, and it says if that failed
+#   exit 10 the FLEET's ceiling is spent — nothing on this box moves that
 ```
 
 **Off by default, and the default costs nothing — not even a file.** With no
@@ -1187,9 +1213,94 @@ and neither can an agent:
 programs.quarterback-harness.spawn = {
   enable      = true;
   commands    = [ "/fix-issue" ];   # empty by default: the second lock
-  maxSessions = 1;                  # 0 is a freeze
+  maxSessions = 1;                  # 0 is a freeze — and the FALLBACK, see below
 };
 ```
+
+**The ceiling is a dial; the two permissions beside it are not
+([#563](https://github.com/prisonblues/quarterback/issues/563)).** `spawn.json` carries three
+keys and only two of them say what this box MAY do. `enabled` and `commands` are permissions
+and stay in the nix-written file for the reason above. `max_sessions` says how HARD it may
+work — the `in_flight.max` side of the very line the paragraph below draws, counting a
+resource rather than guarding a door — and it was in the permission file only because that is
+where it was written, inheriting a deployment path that costs a nix edit, a build, a PR, a
+merge, a `nixos-rebuild` and a human with the password. For a number. The direction that
+matters more is the other one: **`0` is a freeze**, the only control that stops a box spawning
+without switching the mechanism off, and calming a fleet that is working too hard should not
+require a rebuild at the moment nobody wants to be running one.
+
+So there are two dials, and `maxSessions` above is the fallback under the first:
+
+| dial | scope | counts | when unset |
+|---|---|---|---|
+| `spawn.max_sessions` | this machine | spawned panes whose agent has not exited | `maxSessions` from the policy file |
+| `spawn.max_sessions_fleet` | the whole board | every live agent, spawned or not | no fleet ceiling at all |
+
+Both are **fleet-scoped** dials — set them with no repo. A machine's concurrency is not a
+property of a repository: `live_spawns()` counts panes on a tmux server without knowing which
+checkout each is in, so with one repo at 5 and another at 2 there is no question the count
+has answered. The board takes either scope for any dial (`dial` is opaque text there and
+`repo` is just a column), so the refusal is the client's: the dashboard's dial picker
+**refuses** the write (`harness_rules.dial_scope_problem`), and `qb-start` **names** a
+repo-scoped row it is ignoring — because a `curl` and the web page have no dial vocabulary
+and by design cannot have one, and a setting stored, reported as in force and read by nothing
+is the failure this whole layer exists to end. The other direction stays legitimate: a rules
+dial is set at either scope, and a fleet-scoped one is how a single value covers every
+watched repo.
+
+Both **fail open**, alone among `qb-start`'s gates and for `qb-admit`'s reason: they count a
+resource rather than guarding a door, so an unreadable dial leaves the file's number in force
+and an unreachable board leaves the fleet gate silent. A permission that failed open would
+start sessions nobody authorised; a ceiling that failed closed would stop every box on the
+fleet over a board hiccup, which is worse than the thing it guards. Safe to put on the board
+because dial **writes are human-only** (`POST /dials` takes `app.auth.human`) — an agent may
+read its own ceiling and cannot raise it, which is the whole of what makes this a throttle
+rather than an escalation.
+
+**The fleet number is a runaway guard, not an allocator.** It exists to stop a hundred agents
+opening at once against a long queue — [#476](https://github.com/prisonblues/quarterback/issues/476),
+the drainer, is the thing that would do that — and every property follows: advisory and
+non-atomic (two boxes spawning in the same second can both see room, exactly as `qb-admit`
+documents), failing open, and worth setting **well above the busiest legitimate day**, because
+a ceiling that bites in normal use gets raised until it does not and then it is not a guard.
+It counts **every live agent** off `GET /active`, not only spawned ones — a hundred agents is
+a hundred agents, and the board cannot tell a spawn from a seat somebody typed into without
+new plumbing at both ends — so a busy human day consumes it too. That is the other argument
+for a generous number.
+
+`qb-start --policy` reads both, bounded at five seconds and failing open to the file, and
+reports the effective ceiling with the layer that gave it — `max_sessions` is what will
+actually apply, `max_sessions_policy` is the file's number underneath it, and
+`max_sessions_source` says which answered. That is the one thing `--policy` leaves the box
+for, and it earns it for a caller that reads a ceiling before acting. A machine that never
+opted in still reaches nothing but its own config directory.
+
+**`--policy --no-board` opts out**, and the dashboard's ⚒ takes it. `--policy` promises a
+caller may ask on every click without paying for it, and the ⚒ asks from the UI thread, where
+a board that is down would freeze the screen for five seconds per keystroke. It reads only
+`enabled` and `commands` — both the file's — so it gives up nothing: the ceiling it never
+consulted is still applied by the spawn itself, one step later, in `qb-start`'s own words.
+The flag answers `--policy` and nothing else; on a spawn it is **refused** rather than
+ignored, because a gate must never look like it took an instruction it did not.
+
+**`/get-involved` takes no number, and allowing it implies allowing what it runs (#541).**
+Every other spawnable command is aimed at an issue or a PR; this one reads the plan and
+selects its own item, so the brief is the command alone and no claim is taken up front —
+the interlock moves inside the session, where `plan_claim` is atomic and is what makes
+three seats take three different items.
+
+Two consequences worth reading before switching it on:
+
+* **It dispatches**, into `/fix-issue`, `/fix-and-land`, `/review-pr` and
+  `/panel-review-pr`. A policy naming `/get-involved` without those is **refused**, rather
+  than granting them silently one hop along — otherwise the allowlist would say one thing
+  and permit another, on the one gate whose whole job is meaning exactly what it says.
+  `qb-start --policy` reports any command it lists but refuses, and why.
+* **It asks the board whether anything is free** before spawning, and refuses at exit 8 if
+  not. That is not dispatch — nothing is passed to the agent, and the item it eventually
+  claims may not be the one that was free — it is the refusal that costs nothing, because
+  the alternative is a session that starts, reads the plan, finds nothing and stops. This
+  one gate fails **open**: a board that did not answer has said nothing about the plan.
 
 **A malformed policy fails CLOSED, which is the opposite of `qb-admit` and is the same
 principle.** `in_flight.max` is a restriction, so failing open on a typo admits one agent too
@@ -1276,7 +1387,7 @@ than from whenever the agent's SessionStart hook gets round to it — `qb-end <i
 immediately, the seat bar's ✕ can reach it, and the ordinary SessionEnd hook ends it with a
 reason like any other session.
 
-**It is not a dispatcher, and that line is not being moved.** `qb-seat`'s *"the board
+**It is not a dispatcher, and that line is not being moved.** `qb-seats`' *"the board
 coordinates work, it does not operate the machine"* is about **dispatch**: nothing here reads
 the plan, picks an item, or tells an agent what to work on. It is told a command and a number
 by whatever pulled it, exactly as the dashboard's ⚒ is told one by a click. Which work an
@@ -1496,172 +1607,26 @@ directly, and it is the true positive this must never drop.
 [#80]: https://github.com/prisonblues/quarterback/issues/80
 [#422]: https://github.com/prisonblues/quarterback/issues/422
 
-### `qb-seat` — one pane, one seat, one identity
+### `qb-seat` — retired (#540)
 
-Starting a fleet is the part that never scaled: open a terminal, `cd`, run the agent, read
-the plan out loud to it, repeat. The human doing the reading is a dispatcher, and a
-dispatcher is exactly what the board exists to remove.
+There was a per-pane wrapper here. Each seat ran `qb-seat <n>`, which gave the agent a board
+name (`seat-<project>-<n>`), passed it a brief telling it to read the board and run
+`/get-involved`, held a pid marker so two panes could not be the same seat, and registered the
+name with the board before exec'ing the agent.
 
-```bash
-qb-seat 3                  # seat 3, in this directory
-qb-seat 3 --dry-run        # print the environment, cwd and brief; start nothing
-qb-seat 3 --model opus     # anything else is passed through to the agent
-qb-seat 3 -- --dry-run     # …and everything after -- is passed through untouched
-```
+All of it is gone, and the reason is that five of its six jobs existed only to defend the name
+it gave a seat. A seat is a pane with a shell in it; a pane holds an agent when something
+types a command into it; and the board already keys an agent by its conversation, which is
+unique across panes and machines by construction. So there is nothing left to name, nothing to
+collide, and no marker to hold. What is left — the one line a pane is given — is
+`QB_SEAT_INITIAL_CMD`, below, which belongs to the screen that makes the panes.
 
-`--dry-run` and `--help` are taken from anywhere in the arguments, not only from the
-position above: everything after the seat number goes to the agent verbatim, and a
-misplaced `--dry-run` that started five agents would be the one mistake this flag exists
-to prevent. `--` is the way to hand either word on to the agent anyway.
-
-A multiplexer supplies the panes and its layout says `qb-seat 1` … `qb-seat n`; this
-supplies what goes in one. It is deliberately thin, because everything that would make it
-thick already exists somewhere better — identity, presence, lease renewal, publish-on-push
-and transcript push all arrive from the lifecycle hooks, and the worktree with its isolated
-database arrives from `/fix-issue`. What is left is: name the seat, enter the repo, start
-the agent on a brief.
-
-The brief is **identical for every seat** — *read the board, run `/get-involved`, stop* —
-and that is the design rather than an omission. Since #424 the pickup is that command rather
-than four paragraphs of this brief: a brief is prose a model may skim, and the one step that
-must not be skimmed is the claim, so it lives in `qb-next` where it is code. (The brief it
-replaced composed its own claim key, `kind='work'`, `key='<owner>/<repo>#<number>'` — #172,
-in the one text every seat on the box reads.)
-
-**A repo with no plan now means stop, and that is a deliberate narrowing.** The old brief's
-fallback was: no plan, so scan the open issues, judge which are unclaimed and undiscussed,
-and pick one. That is work discovery outside the human-ordered plan — #63, hand-rolled, in
-the default text of every seat on the box, and with none of the appetite gates #85/#86 put
-around the real thing. A repo where nobody has ordered anything is a repo where nobody has
-decided what is worth doing. Give the seat a plan, or attach to the pane and tell it. A
-spawner that reads the plan and hands seat 1 the first item is hub-and-spoke with a hub
-that runs once, at t=0, and then stops existing. Override it wholesale with
-`QB_SEAT_BRIEF` if a fleet wants a different one — or set it to the empty string for a
-pane that should come up waiting rather than working, which starts the agent with no
-prompt at all. The seat number is the only thing that differs between panes. It also
-tells a seat to **stop after one item**, because a seat that re-claims when it finishes
-turns the fleet into a drain, and nothing yet bounds how much work a fleet may take on.
-
-**Why the instance is per seat and never host-wide.** The lifecycle hook keys its ask-poll
-cursor on `QUARTERBACK_INSTANCE` (`qb-asks-<agent>-<instance>`), so one value exported for
-the whole box gives n seats *one* cursor between them: whichever seat polls first advances
-it past everyone else's mail and the other n−1 never see an ask addressed to them. Set per
-seat it is the opposite — a stable, typeable `zeus/seat-lexray-3` instead of
-`zeus/a4f81c2e`, which survives the seat restarting in the same pane because the board
-hands a returning key its old name back.
-
-**Why the name carries the project as well as the number.** `seat-3` on its own makes the
-*namespace* the machine while the *numbering* is per screen — and `qb-seats` numbers from 1
-every time it builds one. So the second screen on a box asked for seat 1, found the first
-screen's seat 1 holding the pane marker, and refused: not an edge case reached by an unlucky
-choice of number but the guaranteed outcome of starting a second screen, which made one
-screen per project the one thing this could not do (#208).
-
-The guard was right and its key was too coarse, so the key grew a scope. A seat is
-`seat-<project>-<n>`, so `seat-lexray-1` and `seat-nix-fleet-1` are two seats while
-`seat-lexray-1` started twice is still one — every property the refusal names survives.
-The scope defaults to the basename of the seat's own repository, because a screen is per
-repository; `QB_SEAT_SCOPE` overrides it for the two cases that default cannot read, which
-are two screens on *one* repository and anyone who wants the old machine-wide numbering
-back (`QB_SEAT_SCOPE=`, empty and meaning it).
-
-The scope is **slugged**, and that is not cosmetic: an `X-Agent-Name` that does not match
-`^[a-z0-9]+(?:-[a-z0-9]+)*$` within 40 characters is refused with a 400, so a repository
-called `Foo.Bar_2` would otherwise make every seat in it fail registration. The basename is
-folded to lower case, every run of anything else becomes one hyphen, the ends are trimmed
-and the middle is capped at 32. A scope that slugs away to nothing — a directory named
-`___` — leaves the bare `seat-3` and says so on stderr, rather than inventing a project
-name nobody could type.
-
-**Why it registers that name itself, before starting anything.** Since v2.12 the board
-*designates* the name half of an identity, and `QUARTERBACK_INSTANCE=seat-lexray-3` is only a
-**request** (`X-Agent-Name`). Allocation is first-contact-wins. Measured against a live board:
-
-| First contact | Later request | Board says |
-|---|---|---|
-| key only, no name | — | `zeus/meadow-russet` |
-| key only, no name | `seat-lexray-9` | `zeus/meadow-russet` — **the request is ignored** |
-| key **and** `seat-lexray-9` together | — | `zeus/seat-lexray-9` |
-
-When this was written the MCP server was the only client that made the request and the
-lifecycle hook was not, so the hook's `SessionStart` usually got there first and a seat came
-up as two random words about as often as not — losing the one property the numbering was for.
-**Every client asks now (#156)**, so the row is settled correctly whichever one reaches the
-board first.
-
-`qb-seat` still makes a single `GET /whoami` carrying both headers before it execs, and the
-reason is the read-back rather than the request: a name is granted only when it is *free*, so
-a second pane started as the same seat is quietly given something else, and it is worth being
-told that at the one moment a human is looking. It warns when the board's answer is not the
-name it asked for — which also happens when the key was bound to a designated name on some
-earlier run, since allocation hands a returning key the name it already had and a request
-cannot displace one that exists.
-
-*Addressing was never at risk either way*, and that is worth knowing before someone
-re-derives the worry: the board resolves `machine/key` as a permanent alias, so an ask sent
-to `zeus/meadow-russet` is returned by a poll that asks for `to=zeus/seat-lexray-3`. This is
-about the name a human types and reads on a status bar.
-
-**Two panes on one seat is refused, and the board cannot be the one to refuse it.**
-They export the same instance, so they send the same key, so the board hands them *one*
-identity — from its side they are indistinguishable by construction. They then share the
-ask-poll cursor, and whichever polls first swallows the other's mail: the exact bug the
-per-seat instance exists to prevent, one level down, and invisible because both seats
-otherwise work. So the check is local, where the panes actually are. `qb-seat` records its
-pid in `$XDG_RUNTIME_DIR/qb-<seat name>.pid` — or, on a machine with no `XDG_RUNTIME_DIR`
-(macOS, most containers, ssh onto a box with no systemd user session), in
-`${TMPDIR:-/tmp}/qb-<uid>-<seat name>.pid`, where the uid is in the name because `/tmp` is
-shared and a marker there is not. The marker is keyed on the **whole name** and not on the
-bare number, because the two have to agree or the guard is protecting something other than
-the identity it describes — a marker on the number alone refused the second screen's seat 1
-while the board would happily have given it its own identity. It exits **3** if a live
-process already holds that seat. A marker left by a seat that died is taken over rather than honoured, and
-`QB_SEAT_FORCE=1` overrides the refusal for a pid that has since been reused by something
-unrelated — noisily, on stderr, because being wrong about that is the shared-inbox bug
-with nothing on screen.
-
-The marker is **claimed atomically**, by hard-linking a fully written temp file into
-place, and it is claimed *before* the board call rather than after it. That is not
-fastidiousness: the case the guard exists for is a layout, a layout starts all n panes in
-the same instant, and look-then-write loses that race by construction — every pane sees a
-free seat while the one that got there first is still several seconds deep in registering
-its name. Measured on the check-then-write version: twelve panes started as seat 1 left
-between six and twelve agents running, all sharing one identity. Hard-linking leaves one.
-
-**Best-effort by construction.** No board configured, no token, no `curl`, no network: the
-registration is skipped and the seat starts anyway. A seat that refused to run because a
-cosmetic name could not be reserved would cost more than the name is worth — the same
-bargain `qb-stage` strikes, and the panel's board recording before that. Two things it is
-*not* silent about, because both are worth a line before the rest of the session goes
-wrong the same way: a board that answered **401** (a revoked token, or the other island's
-token — the lifecycle hooks are about to be refused identically) and a board that did not
-answer at all (fine on a laptop, and said differently). The token itself goes to `curl` on
-stdin, never in argv, where any local process could read it out of `/proc` for the life of
-the call.
-
-What it deliberately does **not** do: create a worktree (under self-selection a seat does
-not know its branch until it has claimed something, and `/fix-issue` owns that path and its
-per-branch database), assign work, or drive the agent past starting it.
-
-| Variable | Default | What it does |
-|---|---|---|
-| `QB_SEAT_REPO` | the pane's cwd | Where the seat works; the layout normally sets the cwd instead |
-| `QB_SEAT_BRIEF` | the built-in brief | Replaces it wholesale; empty means no brief at all |
-| `QB_SEAT_AGENT` | `claude` | The agent to start |
-| `QB_SEAT_SCOPE` | the repository directory's name | The project half of `seat-<scope>-<n>`, which is what lets two screens each hold a seat 1. Slugged to what the board will take as a name; set it when two screens share one repository, or set it **empty** for the machine-wide numbering this had before #208 |
-| `QB_SEAT_FORCE` | unset | Start anyway when this seat number looks already taken. Truthy values only (`1`, `yes`, `true`, `on`) — `QB_SEAT_FORCE=0` leaves the guard on |
-| `QB_SEAT_PACE` | `warn` | What to do about the shared subscription's window before starting. `warn` says it and starts anyway; `obey` refuses to start at `hold` and names when the window comes back (exit 4); `off` does not consult at all. See `qb-pace` below |
-| `QB_SEAT_YOLO` | **on** | Permission prompts. A seat starts with them off (`--dangerously-skip-permissions`) because nobody is watching the pane to answer one; `QB_SEAT_YOLO=0` (or any of `no`, `false`, `off`) gives them back. The flag is claude's spelling: point `QB_SEAT_AGENT` at a wrapper for anything else |
-| `QUARTERBACK_BASE_URL`, `QUARTERBACK_TOKEN` / `QUARTERBACK_TOKEN_CMD` | from the config file | The board to register the name with |
-| `QUARTERBACK_CONFIG` | `$XDG_CONFIG_HOME/quarterback/config`, else `~/.config/quarterback/config` | Where those three are read from when the environment does not supply them. Sourced in a subshell, and only those three are read back out of it, so nothing else the file sets can reach the seat or the agent |
-
-The environment beats the file variable by variable — except the *credential*, which is
-taken as a set: a `QUARTERBACK_TOKEN_CMD` in the environment means the file's static
-`QUARTERBACK_TOKEN` is not used at all. Best-of-each would authenticate one island's board
-with the other island's credential, which is the exact failure the per-host config exists
-to prevent. A config file that *errors* is reported and then ignored entirely, rather than
-half-applied and passed over in silence.
-
+The knobs that went with it: `QB_SEAT_AGENT`, `QB_SEAT_BRIEF`, `QB_SEAT_SCOPE`,
+`QB_SEAT_YOLO`, `QB_SEAT_FORCE` and `QB_SEAT_REPO`. `QB_SEAT_PACE` was folded into
+`QB_SEATS_PACE`, which is the same question and now has one spelling. The dashboard's ⚖
+had been reading `QB_SEAT_AGENT` for the binary it starts a review with, which would have
+left it the last reader of a retired variable, so that one is `QB_DASH_AGENT` now — the
+dash's own knob, beside `QB_DASH_REPO` and `QB_DASH_CONFIRM`.
 
 ### `qb-seats` — the agent screen
 
@@ -1675,6 +1640,7 @@ qb-seats              # the same, three by default
 qb-seats 10           # ten: five across, two down
 qb-seats --staged     # built, each seat waiting on Enter
 qb-seats --no-yolo    # seats that stop and ask, as agents normally do
+qb-seats --cmd ''     # a screen of bare shells: panes, and nothing started in them
 qb-seats --add        # add a seat to a running screen
 ssh box -t qb-seats   # reattach from anywhere
 qb-b list             # the screens that are up, numbered
@@ -1701,19 +1667,32 @@ against a screen that plainly existed. `qb-seat-click` — the bar's ✕ and ＋
 Names are for the messages a human reads; ids do the addressing, and
 `test_every_session_target_is_an_id_and_not_a_name` reads both scripts to keep it that way.
 
-A screen also records **what its seats are called**: `@qb_repo` is the repository it was
-built in, and `@qb_scope` is the explicit `QB_SEAT_SCOPE` if it was given one. Both are set
-on the session — `--add` puts `@qb_scope` on the pane it creates instead, so it does not
-rewrite the session under seats already working in it — and together they are how anything
-reading the screen from outside turns a pane into a board identity. `list-panes -a` is the
-whole tmux server, so since #208 the seat number alone no longer says which seat a pane is;
-the dashboard's SEATS panel and its FLEET-row jump both go through this.
+A screen records **what it is made of**: `@qb_repo` is the repository it was built in, and
+`@qb_initial_cmd` is the line its seats were given. `--add` and the bar's ＋ read the second
+one back, because neither can see the environment the screen was built in — the ＋ arrives
+through `run-shell`, whose environment is the tmux server's. It is always set, the empty
+string included, so a screen of bare shells stays that way when a seat is added to it.
 
-One tmux session: N panes each running `qb-seat <n>`, and one full-width pane along the
-bottom running `qb-board --follow`. Every seat gets the **same** brief — read the board, run
-`/get-involved`, stop — and self-selects. Nothing reads the plan on the agents' behalf and
-nothing assigns: each seat reads it for itself and the claim is what keeps them off each
-other, which is why three seats given one brief take three different items.
+**How anything outside turns a pane into a board identity: `@qb_session`.** The lifecycle
+hook stamps the agent's session id on its pane at `SessionStart`, and `GET /active` returns
+that same id for every live agent, so the join is an equality. It used to be a seat NUMBER
+parsed out of the agent's name, which identified a pane in neither direction — `list-panes
+-a` is the whole tmux server, so two screens could each hold a seat 1 (#208), and the board
+is the whole fleet, so two machines could each hold a `seat-lexray-1`. The dashboard's SEATS
+panel and its FLEET-row jump both go through the session id now (#540), which also means a
+pane running an agent this screen did not start resolves correctly.
+
+One tmux session: N panes each holding a shell with `QB_SEAT_INITIAL_CMD` typed into it, and
+one full-width pane along the bottom running `qb-board --follow`. Every seat gets the **same**
+line — that is the design and not an omission, because the moment one seat is told something
+another is not, there is a dispatcher again.
+
+The default line starts an agent and says nothing else to it. Give it a prompt and the screen
+comes up working: `QB_SEAT_INITIAL_CMD='claude-yolo -- /get-involved'` is a screen that claims,
+and it is still self-selection rather than dispatch — the same line to every pane, with the
+board's atomic `plan_claim` deciding who gets what, which is why three seats given one line
+take three different items. Whether the fleet should be taking work at all is `tempo`'s
+question (#474), not this script's.
 
 **Why real sessions and not sub-agents.** Sub-agents are a star: one orchestrator holds the
 plan, fans out, and every result funnels back through one context window. Children are
@@ -1733,11 +1712,14 @@ Two things to know before you run it:
   swallow it. `QB_SEATS=1` is exported into every pane precisely so an rc can detect a seat
   and skip that. This is not theoretical — it cost five minutes per seat on the machine
   this was written for, where the greeter was an animation that ran until a keypress.
-- **`QUARTERBACK_INSTANCE` must be per seat, never host-wide.** `qb-seat` sets its own —
-  see its section above for why sharing one is worse than it sounds — and the layout's
-  half of that guarantee is to strip any inherited value, from the session as well as the
-  panes, so nothing split off later picks one up. Nothing in your shell profile should set
-  it.
+- **`QUARTERBACK_INSTANCE` must never be host-wide.** The board takes it as the agent KEY,
+  so two seats sharing one are not two agents with muddled inboxes — they are a single agent
+  with one history, one presence and one lease, holding each other's claims perfectly
+  legitimately. Nothing sets one per seat any more (#540): with no value, `qb-hook` falls
+  back to the session id, which is one per *conversation* and so unique across panes by
+  construction. The layout still strips any inherited value, from the session as well as the
+  panes, because one arriving from your profile would put every pane on the screen back to
+  being one agent. Nothing in your shell profile should set it.
 
 **Seats start with permission prompts off, and that is the default on purpose.** A seat is
 a pane nobody is watching. The first tool call wanting a permission the agent does not
@@ -1751,8 +1733,9 @@ It is a real trade and it is made deliberately: it hands a full shell to N agent
 a repo whose tests, hooks and scripts all run as you. What decides it is the blast radius
 either way — a seat that cannot act is useless to everybody, while a seat that can act is
 dangerous in a repo you already trusted enough to point a fleet at. Say `--no-yolo` for one
-screen, or export `QB_SEAT_YOLO=0` to have prompts back everywhere. The flag and the
-variable are the same mechanism, so they cannot drift.
+screen, or export `QB_SEAT_INITIAL_CMD=claude` to have prompts back everywhere: the flag is
+sugar for the setting, so the permission question is *which command you type* and not a
+second knob that could disagree with it.
 
 `qb-seats` deliberately does not create worktrees (a self-selecting seat does not know its
 branch until it has claimed), does not assign work, and does not drive the agents past
@@ -2034,8 +2017,9 @@ along the bottom (the **tape**) is the event stream. Who is alive and on what, w
 which claim and for how long, what the fleet agreed to do next, every open PR with its CI
 verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
 the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub, and a review-queue row says every
-reason it is still waiting. `qb-dash` is the same views rendered without
+where it is, a PR or an issue opens on GitHub, a review-queue row says every
+reason it is still waiting, and a dial row says why it is set (its `✎` opens the one surface
+that can change it). `qb-dash` is the same views rendered without
 interaction, for a box that cannot import `textual` — which is the whole of what
 it is for since #426. It is not a lesser default any more; it is the fallback.
 
@@ -2099,6 +2083,108 @@ An age prefixed `~` is the longest the wait could have been rather than the leng
 nothing records when a head moved or when a branch started conflicting, so those are
 measured from the round or from the PR's opening. Nothing here starts a review — the panel
 is a reader, and the thing that would act on it is #53.
+
+**Above 157 columns the panels go TWO ACROSS, and what that buys is height.** Seven
+panels dividing one column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a
+50-row screen while four others get five each; the same seven over four grid rows are
+between two and five times that, and no panel's share was taken from another's. The
+threshold is quoted rather than chosen: 78 columns is what one of these tables wants
+before it wraps — `QB_SEATS_DASH_SIZE`'s default, from `qb-seats` — so two side by side
+plus the gutter is the narrowest pane on which the second column is not paid for out of
+the first. Below it nothing changes at all, which is the point: the pane `qb-seats`
+splits off is 78 columns and must come out exactly as it did before this existed.
+`QB_DASH_WIDE` moves it, and a value that is not a positive number of columns is ignored
+rather than fatal.
+
+SEATS spans both columns — it is its content in either layout, and a second column would
+only move the ＋, which is the one widget here that has already fallen off a screen once.
+The other placement is the part CSS could not do. **A grid fills row by row in DOM
+order**, so the order that puts REVIEW QUEUE directly under OPEN PRs above lays them into
+different rows the moment there are two of them, and the pairing #273 asked for is gone.
+So `Dash.relayout` moves PLANS down one when it goes wide: `under` becomes `beside`, and
+PLANS pairs with the ISSUES its items point at. It moves back on the way down, exactly —
+`>` and `<` nudge by eight columns, so crossing the threshold twice in a minute is
+ordinary. The reorder is `move_child` and never a remount: a DataTable carries a cursor, a
+scroll offset and the row keys every click resolves through, and a pane getting wider is
+not news worth losing your place over.
+
+**Take the width off the resize EVENT, never off `self.size`.** Measured on textual 8.2:
+`on_resize` runs before the app's own size is updated, so a `self.size.width` read in
+there is the width the pane had *before* the resize being handled. The caps bar had been
+laying itself out one resize behind since it was first sized to the pane, and nobody
+noticed because dragging a border emits a stream of resizes and the last-but-one is near
+enough. A layout threshold is not forgiving in the same way — a pane that crossed once and
+stopped would sit in the wrong layout until the next resize — which is how the older bug
+came to light.
+
+#### The dash full screen — `z`, `C-q z`, and the ⛶
+
+The wide layout is only worth having if the pane can be made wide, and 78 columns down the
+right of a seat screen never will be. `z` inside the dash, `C-q z` from anywhere on the
+screen, and the ⛶ on the top line all reach one verb — `qb-seat-key expand` — which
+**breaks the dash out into a window of its own**, and puts it back on the next press.
+
+**It is `break-pane`, and deliberately not `resize-pane -Z`.** Zoom was the obvious answer
+and is the wrong one: zoom is a property of the window and tmux drops it on any layout
+change, which this screen makes constantly — `select-layout -E` when a seat is closed, and
+the `window-resized` hook reasserting `@qb_dash_width` on every client attach. A dash zoomed
+to read would pop back to 78 columns the moment somebody attached a phone, with nothing on
+screen to say why. It is also not a `display-popup` running a second dashboard: that is a
+second board poll, a second `gh` poll, and a cold start whose ISSUES panel says "waiting for
+gh" for up to a minute. `break-pane` moves the pane the process is already in.
+
+It is the same move `d` makes, minus the `-d` that leaves the pane parked where nobody is
+looking — so it inherits everything that was hard about that one, including the rule that
+the widths are recorded **before** the break. That rule bites differently here and it cost a
+test to find: `hide_pane` is handed its size by a caller that read it first, while
+`expand_dash` does its own break, so reading afterwards is one line away and looks
+identical. It is not — after the break the pane fills its new window, so the recorded size
+is the whole terminal, and the join back asks for a 240-column pane inside a 240-column
+window and fails with `create pane failed: pane too small`.
+
+**Two toggles over three states**, and the crossings are decided rather than accidental. `d`
+means "in the row or not"; `z` means "full screen or not".
+
+| | `d` | `z` |
+|---|---|---|
+| in the row | → hidden | → expanded |
+| hidden | → in the row | → **expanded** |
+| expanded | → in the row | → in the row |
+
+The middle row is the one worth stating. Somebody pressing `z` on a hidden dash is asking
+for a dash they can read, and a hidden one is one step from that rather than in the wrong
+state for it — so it is shown rather than restored to its column, and rather than refused.
+It is also the cheap direction: the pane is already alone in a window, so that crossing is a
+rename and a `select-window` and no geometry moves at all. A `break-pane` there would fail
+outright, having nothing to break.
+
+Both routes out of the row record the same state and come back through the same
+`restore_dash`, so there is one way back however it left — which is why `@qb_dash_expanded`
+is cleared there rather than in `expand_dash`. `>` and `<` refuse while it is out, and say
+which of the two states they are refusing for: "hidden" about a dash filling the screen in
+front of you is the kind of wrong answer that makes somebody doubt the tool rather than the
+state.
+
+**`break-pane` must name the session, and until now none of these did.** With no `-t`,
+`break-pane` puts the new window in the **client's current** session rather than the source
+pane's — so on a server running two screens, taking a pane out of the one you are not
+looking at parks it in the other one's window list. Everything downstream then fails to find
+it: `pane_exists` and the restore path both search `list-panes -s -t "$SID"`, which is scoped
+to the session, so the pane is at once alive, stranded, and reported as gone, with no way
+back through this script. It is not reachable with one session on the server, which is why
+`d` and `t` carried it from the day they shipped and the hide/show tests never saw it — it
+turned up the first time a test screen was built beside a real one, with the dash landing in
+`seats-quarterback:qb-dash` while its own screen said it was missing. All three breaks name
+`-t "$SID:"` now, and the regression test builds two screens because one cannot show it.
+
+**Nothing had to be taught about this mode for the resize hook to leave it alone.**
+`qb-seats`' own `dash_pane` looks in `$SESSION_ID:seats` and nowhere else, so an expanded
+dash is outside its reach and cannot be shrunk back to 78 columns by an attaching client.
+That is a property of where the pane went, not a special case anybody wrote.
+
+What the dash does with the room is its own business and is not arranged here: it is a
+Textual app that lays out to the width it is given, so a window-wide pane simply crosses the
+threshold above and goes two columns across. This verb moves a pane.
 
 **It opens on ONE project, and that is the interesting default.** Every panel here is
 fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
@@ -2182,12 +2268,230 @@ of panes nobody is watching; `qbdata.pace()` turns the cached figures into `go` 
 same cache and the same three-minute floor, so a verdict never costs a call and the word and
 the bar cannot come to disagree.
 
+**DIALS says what the fleet is running under, and where to change it.** A dial is a
+setting: the repo supplies a default, the board states the value in force, and the layer
+that answered is part of the answer ([#305](https://github.com/prisonblues/quarterback/issues/305)).
+Until [#477](https://github.com/prisonblues/quarterback/issues/477) **no screen showed one**
+— a dial was set from an endpoint and read back by one function in `panel_seats.py`, so the
+value governing every round on the fleet was invisible on `qb-dash`, `qb-dash-tui`,
+`qb-board` and the web board alike. That was tolerable while a dial only configured what a
+review round costs; it stops being tolerable with `tempo` (#474), which is the answer to
+*"is this fleet working right now, and how hard"*.
+
+**DIALS IS THE FLEET'S SURFACE, NOT THE PANEL'S**
+([#563](https://github.com/prisonblues/quarterback/issues/563)). Every dial in the registry
+was `review_panel.*` until `spawn.max_sessions` arrived, which made the question urgent rather
+than academic — and the answer turned out to be already shipped rather than open. The board
+does not know what a dial IS: `app/api/dials.py` stores the name as opaque text and the value
+as opaque JSON on purpose, and says in as many words that the client owns the vocabulary.
+`tempo` (#474) has been drawn as a dial by both dashboards for releases while `BOARD_DIALS`
+has never held it. So the channel was never the panel's; the only thing that was is two lines
+of `harness_rules` which assume a dial names a key in `DEFAULTS`.
+
+`Dial.applies` is that distinction, and it is deliberately one field rather than a second
+settings channel — a fleet dial is validated, listed, offered by the picker and rendered by
+the dashboards exactly like every other one, and it is simply never merged into a repo's
+resolved rules, because there is no repo in the question it answers. It has no `DEFAULTS`
+entry either, so the picker's `default` line is blank and says why: `spawn.max_sessions` falls
+back to a per-machine file that no repo and no board can read. `tempo` (#474) and the plumbing
+in #475 are the same shape, and they inherit this rather than each inventing one.
+
+The panel sits at the top, above the seats, for the caps line's own reason: it is the
+configuration every panel below it is running under. Each row is the dial, its value, the
+layer it came from (`fleet`, or the repo), and what is left of it; the argument for it — the
+board requires one on every write — is on the line underneath with who set it and when.
+**A repo dial beats a fleet dial** of the same name, so the beaten one is counted in the
+title as `overridden` rather than drawn as if it were in force. And `tempo` gets a cell of
+its own on the caps line, beside the budget it is there to protect: the caps say what the
+seats may spend, this says whether they are supposed to be spending it at all.
+
+**An indefinite dial and an expiring one do not render alike**, which is the half of this
+that is easiest to drop. A `tempo: eager` with forty minutes on it and one set indefinitely
+are different situations; the countdown is the quiet cell and `no end` is the loud one,
+because a dial that expires takes itself off the board with nobody remembering it while one
+with no end stays until a person comes and clears it. That is
+[#244](https://github.com/prisonblues/quarterback/issues/244)'s rule — being idle and being
+broken must not look alike — applied to a switch instead of a queue. `—` is not used here:
+on every other panel it means "nobody reported this", and an expiry that was never set is a
+decision somebody made.
+
+**Turning one is a `✎` on the row, and what makes that possible is a credential rather
+than a looser gate.** `GET /dials` takes `app.auth.reader`, which the machine bearer token
+passes, so reading was always free from a terminal. `POST /dials` takes `app.auth.human` and
+still does — every agent on a box holds the same machine token, so nothing inside a request
+from one distinguishes it from a person, and a tempo an agent could raise for itself is the
+self-approval shape #85, #86, #78, #232 and #335 each settled separately.
+
+What `human()` gained is a second **method**: `HUMAN_TOKENS`, `name:secret` pairs in
+`API_TOKENS`' format, presented as **`X-Human-Key`** to the **agent host** beside the ordinary
+bearer. `rich:<secret>` authors as `human/rich` — the same identity the edge produces, by a
+different door.
+
+**What separates this from the browser session considered before it is NOT provenance**, and
+that correction is worth having because #479 is the record: a cookie would have authenticated
+the same person to the same `human()` and recorded the same `human/rich`. Two things separate
+them. **Scope** — an Authelia session is SSO for everything behind that edge, where a key is
+this board only, which is most of the answer to what a rogue agent gains by finding one. And
+**expiry** — a session rotates on a clock nobody here controls, so the capability breaks on a
+schedule rather than when somebody decides; "nothing to babysit" is a correctness property,
+not a convenience. (Both corrections are hermes/seat-quarterback-1's.)
+
+**Authelia is not in that path, and that is the requirement rather than a detail.** The other
+way to be a person here is an edge session, which expires on a wall clock: a dashboard built
+on one goes dead whenever it lapses and stays dead until somebody re-mints it by hand. A key
+rotates when somebody decides to rotate it and never otherwise. `edge-untrusted.conf` clears
+the four `Remote-*` headers and `X-Edge-Auth` and nothing else, so the new header passes
+through the agent vhost with no nginx change at all.
+
+The `✎` opens an editor on that row: **value**, **reason** and **for** (`30m`, `4h`, `7d`, or
+empty for a dial with no end), with the dial's name fixed — a dial is identified by its name,
+so an editable one would create a second dial rather than change the one on screen. `ctrl+s`
+saves, `ctrl+x` clears the dial and hands the repo back its own default, `esc` cancels. The
+scope is stated in the modal before anything is written, because `fleet` and `this repo` are
+two different settings with one name and it is the mistake you cannot see afterwards. A value
+is **JSON where it parses** (`2`, `true`, `null`, a list) and the string it looks like
+otherwise (`P3`, `eager`); an expiry is measured from the **board's** clock, so a box whose
+own clock is slow does not have its "in four hours" refused as being in the past.
+
+**The vocabulary is on the screen where it is asked for**
+([#539](https://github.com/prisonblues/quarterback/issues/539)). Setting a NEW dial was four
+empty boxes and one placeholder covering all 29 of them at once — `P3, 2, true, null`, four
+value kinds in one line, which is what a form says when it cannot tell which dial it is on.
+The name field now filters the settable dials as you type (`↓` walks them, enter or a click
+takes one), matching on the half of a name a person actually remembers: `budget` finds the
+five `review_panel.budget.*`, `enabled` finds the seats. The list is in `BOARD_DIALS`' own
+order — the two floors, then what a cycle costs, then the futility brakes, the budgets and
+the switches — because sorted alphabetically it opened on `enabled`, which switches this
+repo's reviews off entirely and is nobody's answer to *what did I come here to change*.
+
+**Scrolling the list says what each one does, and what it will take.** The line under the
+value box describes the name under the cursor, not the name in the box — *the lowest severity
+a fix pass may act on; under it is deferred, not fixed* — and the value box's own placeholder
+becomes that dial's accepted values, `a severity band — P1, P2, P3, P4`. Both halves of "is
+this the one I meant" move together as you read down the list, and the second half costs no
+rows, which is the only reason they both fit a pane this size. The name box is untouched while
+you browse: what is highlighted is being read, what is typed is what will be written.
+
+That description had no home a program could read. Every dial's argument is a Python comment
+beside its key in `DEFAULTS`, at whatever length it needed, so a screen could show a dial's
+shape and never its point. `Dial.what` is a one-line summary of it — capped at two wrapped
+lines at 66 columns, asserted by a test — and the argument stays where it was.
+
+Once a name IS one of the 29 the list retires and the description grows into the rest of the
+block: what the dial takes (`a severity band — P1, P2, P3, P4`), its default, what is in force
+now and at which scope, and — for `enabled` and the per-seat switches — that it is **narrow
+only**, which is invisible in the value and otherwise discoverable just by having a write
+ignored. The two states are the two questions: *which one did I mean*, then *what do I type,
+what is it now, what happens if I clear it*. They cannot both be on a 78×24 pane, and typing
+again brings the list back.
+
+The description, the names and the refusal line sit at the column the fields' own text starts
+at, rather than at the panel's padding. An `Input` draws a border and pads inside it, so its
+text begins three columns in while a bare `Static` begins at the edge — which put every line
+describing a field three columns to the left of the field, down the middle of a form that is
+otherwise one column. The title and the key line keep the edge: they frame the form rather
+than belonging to a field.
+
+Writing those descriptions turned up a dial that validated and then killed the run.
+`reviewer_scope` takes `diff` or `repo` (`panel_core.REVIEWER_SCOPES`), and the board layer's
+validator had `("diff", "increment")` — `increment` is `round_scope`'s word. So `repo`, the
+documented value, was refused here and never applied, while `increment` passed, reached the
+resolved config, and met `panel_seats.reviewer_scope`, which refuses an unknown scope with
+`SystemExit`. `_SCOPES` is `("diff", "repo")` now and a test pins it against
+`REVIEWER_SCOPES`; the constant cannot simply be imported, because `panel_core` imports
+`harness_rules`.
+
+`ctrl+s` refuses in the box rather than after it. `POST /dials` cannot do this: the board
+stores `dial` as opaque text and `value` as opaque JSON deliberately, so a misspelt name or a
+quoted `"2"` is accepted, stored, reported as in force, and then ignored by every harness
+that reads it — the refusal used to arrive from a round hours later, on the old value. The
+sentence is the harness's own (`harness_rules.dial_problem`) and the other three fields keep
+what was typed into them.
+
+**A bad VALUE is a refusal; an unknown NAME is a warning and then a write**, and the
+asymmetry is the point. The table being consulted is the harness beside *this dashboard*, and
+the two are installed separately — so a hard refusal would make a box one release behind a
+box that cannot set a dial the rest of the fleet already applies. `tempo` (#474) is the
+standing case: both dashboards draw it and `BOARD_DIALS` does not hold it. So an unrecognised
+name says *nothing this box knows applies `tempo`* and the next `ctrl+s` sets it anyway;
+confirming one name does not wave the next one through. A value for a name this box *does*
+know gets no such benefit of the doubt — the kind came from the same table as the name, so
+there is no version of the harness in which `max_rounds: "2"` is a value somebody applies.
+Where the filter has narrowed to exactly one name, both messages say which: *— ↓ takes
+`review_panel.max_rounds`*.
+
+The scope moved onto the title line in the same pass, and not for tidiness: the picker cost
+four rows a 78×24 pane did not have, and what a Textual modal does when it outgrows its
+screen is clip whatever was composed last — which was the scope. `fleet` and `this repo` are
+two settings with one name and it is the mistake you cannot see afterwards, so it is now the
+line that cannot be the one to go. A test drives the modal at 78×24 and asserts every control
+is drawn.
+
+None of this is a second copy of the dial table. `qbdata.dial_vocabulary()` reads
+`harness_rules.dial_specs()` at call time — names, kinds, defaults, directions, all still
+settled by `BOARD_DIALS` and `DEFAULTS` — and a box that cannot read it gets `{}`, which is
+*cannot tell* and never *nothing is settable*: the picker is hidden, the line under the value
+says so, and the write goes through exactly as it did before, with the board as the only
+judge. A form that refused there would leave the person at that keyboard with no door at all.
+
+**And it says WHICH cannot-tell.** Three states end in an empty vocabulary — no
+`harness/loops` beside the dashboard, a `harness_rules.py` that will not import, and a
+harness older than the dial table — and `qbdata.dial_trouble()` tells them apart, because a
+partial upgrade reported as an install that never happened sends somebody to look for a
+directory that is sitting right there. It is the distinction the board layer already draws one
+level up: `_dials_unreadable` is *we could not find out*, never *there is no dial*. The
+failure is not cached either, so a harness installed while the dashboard is open is picked up
+the next time the modal opens rather than at the next restart.
+
+**What that credential costs is [#479](https://github.com/prisonblues/quarterback/issues/479),
+and it is stated rather than implied**: the key sits on this workstation, readable by the
+processes running here, so an agent that goes looking can find it and author as a person. That
+is the trade — open it wide now, tighten later — and #479 carries the menu for narrowing it.
+It is narrower than the design considered before it, a signed-in Authelia session, which is
+SSO for an entire estate. It is also why the delegated **agent** credential
+(`X-Agent-Elevated`, #480) is a *different* thing and stays narrow: that one is for an agent
+acting unattended and names the two endpoints it may reach, `/dials` deliberately not among
+them. Two credentials, two blast radii; an unattended agent still cannot set a dial.
+
+**Which door a dial came through is recorded**, and shown. `human/rich` is `human/rich`
+either way — a person is one author however they arrived — so the identity alone cannot tell
+a browser write from a key on a workstation, and the second is the one carrying the residual
+above. `GET /dials` returns `set_via` (`edge`, `key` or `dev`); the page draws it as a chip
+beside the author and a dial row's detail line says *"set by human/rich with a key"*. A row
+older than the column says nothing rather than guessing, because a default there would be the
+one value a reader must be able to distrust sitting in the field they consult to decide.
+
+**With no key on the host, the panel is exactly what it was** — and that is every box until
+one is deployed. `HumanClient.why_not()` is asked once per paint, the `✎` goes grey, the last
+row says why in place of the verb, and a click opens `<board>/dials/view` instead. `d` opens
+that page from anywhere either way, because the page shows every repo's dials at once where
+the panel shows this screen's. This is
+[#443](https://github.com/prisonblues/quarterback/issues/443)'s three shapes settled: the
+dashboard has option (2), a credential distinct from the machine token, and degrades to option
+(3), read-only plus a printed URL. #443 is why the fallback names the URL rather than implying
+it — the record of a person told the reorder was theirs to do whose reply was *"i don't know
+how to re-order"*.
+
+Two variables configure it, in `~/.config/quarterback/config` beside the bearer:
+`QUARTERBACK_HUMAN_KEY_CMD` — a **command**, for the reason `QUARTERBACK_TOKEN_CMD` is one, so
+the secret is resolved at the first write rather than at startup and lives in that process and
+nowhere else — and `QUARTERBACK_HUMAN_KEY` for a literal value in a test or on a box with no
+`op`. The board half is `HUMAN_TOKENS` (or `HUMAN_TOKENS_FILE`, rendered by the op-resolver),
+and with neither side configured nothing changes: unset fails closed, exactly as an unset
+`HUMAN_EDGE_SECRET` does.
+
+**None of these surfaces knows what a dial MEANS.** The harness owns the vocabulary
+(`harness/loops/harness_rules.py`), the server image carries no `harness/` directory at all,
+and a copy in a dashboard would be a second place a dial is written down — the confusion
+#56's rule and #305 exist to end. So a `tempo` with no board dial reads `unset` rather than
+naming a default, and a dial no harness recognises is stored, returned and ignored, loudly.
+
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming starts a
 real session you can attach to, read and interrupt. Clicking anywhere else on the row still
 opens the thing on GitHub. The keys are `o` open, `p` panel-review, `f` fix the selected
-issue or plan item, `s` this project's rows or the whole fleet's, `r` refresh, `?` the list,
-`q` quit.
+issue or plan item, `d` the board's dials page, `s` this project's rows or the whole
+fleet's, `r` refresh, `?` the list, `q` quit.
 
 **The `⚒` goes through `qb-start` (#371), and therefore inherits its gate.** It used to
 compose `claude -- /fix-issue <n>` and hand it to tmux, and what that started was a session
@@ -2344,11 +2648,18 @@ subscription is the largest single spending decision this fleet makes, and it is
 at a prompt, by a human who is not looking at the dash the caps are drawn on — so
 `qb-seats` asks `qb-pace`
 for an estimate of *this* screen's seat count and prints it before the first pane exists.
-It warns and proceeds, always: the refusal lives one layer down in `qb-seat`, off by
-default, for panes with nobody in front of them. Printed here rather than in the panes
-because a seat execs its agent moments later and the agent paints over anything printed
-before it. `QB_SEATS_PACE=off` silences it, and a `qb-pace` that is missing, broken or slow
-costs the note and never the screen.
+It warns and proceeds by default. Printed here rather than in the panes because a seat's
+agent paints over anything printed before it.
+
+`QB_SEATS_PACE` is the whole knob: `off` consults nothing, `warn` (the default) says it and
+starts anyway, `obey` brings the seats up as **bare shells** and starts nothing. What a spent
+window costs is the agents, not the panes — the refusal this replaced lived in the per-pane
+wrapper and refused to create the *pane* (#540), which is refusing somebody a terminal over a
+subscription. `obey` therefore means "this screen does not start agents right now", which is
+what it was always trying to say, and a screen already built with no initial command does not
+consult `qb-pace` at all because there is nothing to withhold. A `qb-pace` that is missing,
+broken or slow costs the note and never the screen: 3 is `hold` and only 3, and everything
+else means the gate did not run rather than that it passed.
 
 The width is per-screen state, read from the environment once when the screen is built and
 recorded on the pane. So `--add` and the seat bar's ✕ put the dash back to the width *that
@@ -2447,10 +2758,10 @@ sentence as two real numbers and be believed.
 
 **Who reads it.** `qb-seats` prints the estimate when it builds a screen — N agents on one
 subscription is the largest single spending decision the fleet makes, and it is made at a
-prompt by a human who is not looking at the dash. It warns and proceeds, always. `qb-seat`
-carries the refusal, and it is **off by default**: `QB_SEAT_PACE=obey` is for panes with
-nobody in front of them, and at `hold` such a seat does not start, says when the window
-comes back, and exits 4. `unknown` never stops a seat under either mode — refusing every
+prompt by a human who is not looking at the dash. It warns and proceeds by default.
+`QB_SEATS_PACE=obey` carries the refusal, and it is **off by default**: at `hold` the seats
+come up as bare shells, the screen says when the window comes back, and nothing is started.
+`unknown` never withholds anything under either mode — refusing every
 seat on the fleet because a laptop dropped its network is a far larger claim than this is
 making — but it is always said.
 
@@ -2592,6 +2903,68 @@ lander's. There is no `--execute` to graduate to, because there is nothing for i
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
+
+### `qb-line` — how much of the backlog could be ordered at all (#435)
+
+`GET /merge-queue` computes an order and names its own blind spots. It has never
+described a drain, because **nothing enumerates a repo's open PRs** — the queue holds
+only the PRs whose agent happened to run `/fix-and-land` step 4a, so the ranking is over
+four rows when the backlog is thirty-six, and one unenrolled straggler nulls
+`suggested_order` for everyone.
+
+```
+qb-line                  this checkout's repo, every open PR
+qb-line --base test      only PRs targeting one base
+qb-line --json           the same answer as data
+```
+
+There is deliberately **no `--preland`**. An earlier cut had one and it could not keep the
+tool's one promise: `preland.py` fetches the base branch's remote-tracking ref — its own
+docstring says "the one write is `git fetch`" — and `announce_hold` POSTs to the board for
+a HOLD, so a sweep would write once per holding PR. Run `preland.py --pr N` on the one PR
+you are about to land, where its writes are somebody's deliberate act.
+
+It walks the OPEN PRs and asks the same question of each, sorting them into five tiers
+with the repair for each:
+
+| tier | what it means | the fix |
+|---|---|---|
+| `never-panelled` | the board has no run for this PR at all, so it is in no class of anybody's collisions | run a panel round |
+| `no-file-list` | the PR's **newest** run recorded no changed-file list — a 404 from `/review/collisions`, or a reach-back past it | run a panel round (#94 was the title-skip path) |
+| `inconsistent-counts` | the run stored more paths than its own changed-file count admits to | re-record the run |
+| `stale-evidence` | the list belongs to a commit the branch has left, or to a base the PR no longer targets | re-review at the head |
+| `head-unknown` | a file list exists and which commit it describes could not be established | re-review at the head |
+| `prefix-list` | GitHub caps a file list at 3,000 and this PR is over it | nothing — the collision count is a floor, not a gap |
+| `orderable` | a complete list at the current head | — |
+
+The headline is the number #435 says nobody has ever seen: **how much of a real backlog
+the ranker could be computed over**, not how good the order is.
+
+**IT FORMS NO QUEUE, ENQUEUES NOTHING AND MERGES NOTHING.** #435 asked for a driver that
+enqueues; [#476](https://github.com/prisonblues/quarterback/issues/476) supersedes that
+half, on the grounds that a central drainer is the shape this codebase has refused four
+separate times in its own docstrings — `qb-seats`' "no orchestrator to lose", `qb-start`'s
+"a spawner that read the plan and handed seat 1 the first item would be hub-and-spoke with
+a hub that runs once", `app/review_queue.py`'s "a drainer that also ordered would be the
+hub-and-spoke shape `qb-seats` was written to refuse", and `app/api/landing.py`'s "not an
+orchestrator… not a ranker… not a trigger". Self-selection is the design, and the engine
+#476 wants is a dial on the agent that already claimed the work. What survives is the
+sensor, and this is it. `test_qb_line.py` asserts the refusal from the board's side —
+every request it makes is a `GET`.
+
+Three limits it states rather than hides. It enumerates at most 200 open PRs and **says
+so when that binds** — the headline is a fraction, and a silently truncated denominator
+makes it read better than the truth. `/review/collisions` answers over the PRs this
+board has panelled, so a rival it has never seen is in no class at all — which is why
+`never-panelled` is a tier here rather than a missing row. And every tier is judged on the PR's
+**newest** run, because that is the run the ranker uses: `merge_queue` takes one
+unconditional `DISTINCT ON (pr) ORDER BY ts DESC` with no file-list predicate, while
+`/review/collisions` reaches back past its window for the newest run *bearing a list*. On a
+PR whose newest run recorded nothing the two disagree, and following collisions would call
+it `orderable` while the queue counts it blind. The collisions response carries no
+`head_sha` either, so the run's commit comes from `/reviews` — and where it cannot be
+established the PR is `head-unknown`, never `orderable`, because `orderable` is the one
+tier here that is a safety claim.
 
 ### `qb-backfill` — the collision datum, recovered from the forge (#449)
 
@@ -3352,18 +3725,50 @@ including the `qb-reconcile` whose systemd units had therefore never been instal
 bumped at 10:19, and was stale again by 14:00.
 
 ```bash
-qb-bump                     # stale? prepare the bump, BUILD it, propose it
+qb-bump                     # pull; if stale, prepare the bump, BUILD it, propose it
 qb-bump --json              # the same answer as a document
-qb-bump --apply             # what a PERSON runs: install the prepared lock and switch
-qb-bump --apply --dry-run   # print that command rather than running it
+qb-bump --apply             # the WHOLE job, by a PERSON: pull, bump, build, switch
+qb-bump --apply --dry-run   # all of that except the switch, whose command is printed
+qb-bump --apply --cached    # switch onto the cached proposal; prepare nothing
+qb-bump --no-pull           # compare and build the two trees exactly as they stand
+qb-bump --no-wrapper        # switch with `sudo nixos-rebuild`, not this host's `rebuild`
 
 #   exit 0  nothing to carry — the harness on PATH is this checkout's
 #   exit 1  cannot tell — not in a quarterback checkout, a harness row that is
-#           neither ok nor fail, no qb-doctor, no nix, no consuming flake, or
-#           more than one
-#   exit 2  a bump is prepared and BUILT; one command by a person finishes it
+#           neither ok nor fail, no qb-doctor, no nix, no consuming flake, more
+#           than one, or a checkout that could not be brought level with origin
+#   exit 2  a bump is prepared and BUILT; --apply switches onto it
 #   exit 4  the bump does not build — refused to propose it
 ```
+
+**It says what it is doing.** Two `git fetch`es, a `qb-doctor`, a scan, a `nix flake
+update` and a whole NixOS build used to run without printing one word until the last of
+them finished — which on a box that has to compile is forty minutes of a cursor and no
+output, indistinguishable from a hang. Each slow step now narrates to stderr before it
+starts and reports what it found after, and nix's build output is written to
+`~/.cache/quarterback/harness-bump/build.log` **as it happens**, so `tail -f` on it works
+while the build is running. `--json` turns the narration off: stdout is the report, and a
+caller redirecting both streams into a parser is a normal thing to do.
+
+**It pulls before it compares, because a comparison against a stale checkout is worth
+nothing.** The drift verdict answers *"is the harness on PATH the one **this checkout**
+has"*, so a checkout twenty commits behind origin agrees with an installed harness twenty
+commits behind and the answer comes back "nothing to carry" about a box that is nothing of
+the sort. #414 closed this for a checkout that was the wrong *directory*; #533 closes it for
+the right directory at the wrong *commit*. Both trees are brought up to date first — the
+quarterback checkout because it is what the comparison is against, and the consuming flake
+because its HEAD is what gets built.
+
+**The pull is `fetch` plus `merge --ff-only`, and the refusals are the feature.** A tree with
+a local commit or a conflicting edit is *reported*, with the tree exactly as it was found;
+nothing here merges, rebases, resets or stashes, for the same reason the harness refuses
+those outright in a shared tree. A tree with no upstream is not a failure — there is nothing
+to pull it up to, and saying so and stepping over it is what stops every worktree on this
+fleet answering "cannot tell" forever. A fetch that **fails** or a fast-forward that is
+**refused** is the other case: there is a remote and this could not get level with it, so a
+`current` verdict downgrades to `unknown`/1. Having pulled the consuming flake, it also
+*acts* on it: a commit that landed there from another box is a rebuild this machine owes even
+when the harness pin has not moved.
 
 **It does not detect anything.** The drift verdict is `qb-doctor --json --only harness`,
 read and not re-derived. A second comparison here would be a second opinion about a fact
@@ -3375,9 +3780,44 @@ would say.
 
 **The ceiling is `sudo`, and it is designed around rather than fought.** A
 `nixos-rebuild switch` needs root. An agent has no root and should not go looking for it, so
-this stops one step short of it — prepare, build, prove, and hand a person one command. That
-is the ten minutes; the `sudo` is the ten seconds. `--apply` refuses without a terminal, so
-a timer, a CI job or an agent that invokes it changes nothing and prints the command instead.
+the agent path stops one step short of it — pull, prepare, build, prove. That is the ten
+minutes; the `sudo` is the ten seconds. `--apply` refuses without a terminal, so a timer, a
+CI job or an agent that invokes it changes nothing and prints the command instead. What
+`--apply` no longer does is *refuse a stale proposal*: it runs the whole preparation itself
+and switches onto what it has just proven, rather than onto what somebody proved an hour and
+three merges ago. `--apply --cached` is the door back, for a host that lost its network
+between the preparation and the person. It also raises no needs-human escalation — the human
+is holding the keyboard, and #274's door is not a logbook.
+
+**The switch goes through this host's `rebuild` wrapper, because `nixos-rebuild switch`
+lies.** It prints *"Done. The new configuration is …"* even when
+`home-manager-<user>.service` has failed, so `home.file` links, user units and dotfiles do
+not apply and the switch says nothing about it. For `qb-bump` that is not a neighbouring
+subsystem's bug: the harness scripts it exists to deliver arrive through exactly that
+activation, so a bypassed wrapper reports #267's own failure as a success. The wrapper is
+**called, not reimplemented** — the same argument that makes the drift verdict `qb-doctor`'s.
+
+It is **read** to decide that, never run: there is no `--print-target` to ask, and finding
+out by executing an arbitrary script on an arbitrary host is a worse trade than a read whose
+worst outcome is falling back to a command that was already correct. Whole-line comments are
+dropped — a commented-out `flake=` naming the right directory, above a live
+`--flake "path:$other#rescue"`, is the decoy that made that necessary — and the answer is
+used only when exactly one flake directory is named and it is this one. None, two, or
+somebody else's all mean *cannot tell*, which means the explicit
+`sudo nixos-rebuild switch --flake` this file resolved itself; `--no-wrapper` asks for that
+outright.
+
+**This is a heuristic, and it is worth being precise about what it does not establish.** A
+regex is not a shell parser, so a target assembled out of variables can hide from it. And
+the *attribute* is not checked at all — it cannot be, because it never appears in a
+wrapper's text: a wrapper derives it from the live hostname. That is precisely why the
+wrapper is used only when the attribute was **matched** rather than named. `resolve_attr`
+matches this machine's `hostName` too, so wrapper and bump agree by construction; `--host
+laptop` run on a desktop agrees only by luck, and would switch this machine onto a
+configuration the run never built — so `--host` refuses the wrapper outright.
+`QUARTERBACK_REBUILD_CMD` (environment or site config, or `consumer.rebuild` in the module)
+is the door for a fleet whose wrapper is spelled differently — a declaration is consent and
+skips the check.
 
 **A proposal that has not been built is a proposal to break somebody's machine.** The first
 bump on 2026-08-22 failed: quarterback's module had started installing
@@ -3392,6 +3832,17 @@ tree — a half-edited secrets module — can neither be built here nor swept in
 only file this ever writes into a consumer's checkout is `flake.lock`, only under `--apply`,
 and only when a person typed the command. It is left *modified*, never committed: what that
 lock means for a fleet's history is the consumer's business.
+
+**And it knows its own handwriting (#537).** Leaving the lock modified meant a successful
+`--apply` created the exact state the *next* run refused — "flake.lock has uncommitted
+changes … commit or revert that file first" — which since #533 fires on the second command
+rather than in some corner. The refusal's reasoning is untouched: an uncommitted lock is
+normally a nixpkgs bump somebody was part-way through, and preparing against HEAD would
+discard it. But the cache records precisely what was last written (`Proposal.new_lock_sha`),
+so "somebody's in-flight bump" and "the lock I installed ten minutes ago" are
+distinguishable rather than both being "not HEAD". A working-tree lock that hashes to the
+cached proposal's, for that same flake, is this tool's own output and is prepared over. A
+lock edited since, a proposal for another flake, a cleared cache — all still refuse.
 
 #### Finding the quarterback checkout it compares against
 
@@ -3471,7 +3922,7 @@ is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
 The proposal is a claim that *one particular system* was built. Every refusal below is the
 same sentence in a different place: what would be switched onto is not what was proven.
 
-- **Nothing prepared** — run `qb-bump` first.
+- **Nothing prepared** — only reachable under `--cached`; drop it and `--apply` prepares one.
 - **No terminal** — the next thing it does is ask for a password, so a timer, a CI job or an
   agent gets the command printed and nothing else.
 - **The consumer's `flake.lock` moved** since the build. Re-preparing costs minutes.
@@ -3506,6 +3957,8 @@ still an escalation.
 stale: behind this checkout: 5 absent (check-db-isolation, qb-admit, qb-release, qb-start,
        +1 more), 5 differ (create-worktree, prune-worktrees, qb-doctor, qb-hooks, +1 more)
 
+pulled     checkout: 83fe1e7db2c8 -> f03644fd5787 (origin/main)
+pulled     consumer: already level with origin/master
 harness    /nix/store/…-quarterback-harness-0.1.0/bin
 checkout   /home/rich/source/quarterback (the working directory)
 consumer   /home/rich/source/nix-fleet (found by scanning /home/rich/source)
@@ -3516,8 +3969,8 @@ built      desktop: /nix/store/…-nixos-system-zeus-26.05.20260707.0ad6f47
 10 scripts arrive on PATH when a person runs:
   /home/rich/source/quarterback/harness/bin/qb-bump --apply
 
-That writes the prepared flake.lock into the consumer and runs `nixos-rebuild switch`, which
-needs a password; nothing above it did.
+That writes the prepared flake.lock into the consumer and then switches this machine with
+`rebuild switch`, which needs a password; nothing above it did.
 ```
 
 That path rather than the bare name is deliberate and is the normal case: the harness
@@ -3987,8 +4440,9 @@ because `installScripts = false` is a supported way to take the loops alone. Poi
 your board to light up `GET /review/stats` and the board's `/panel` page.
 
 One site config, read by everything: `QUARTERBACK_BASE_URL` and `QUARTERBACK_TOKEN_CMD` (plus
-the optional `QUARTERBACK_TOKEN_REFRESH_CMD`, `QUARTERBACK_AGENT` and `QUARTERBACK_REPO`) from
-`${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, each overridable from the environment.
+the optional `QUARTERBACK_TOKEN_REFRESH_CMD`, `QUARTERBACK_AGENT`, `QUARTERBACK_REPO`, and —
+for the dashboard's own writes — `QUARTERBACK_HUMAN_KEY_CMD`)
+from `${XDG_CONFIG_HOME:-~/.config}/quarterback/config`, each overridable from the environment.
 `bin/qb-env` is the contract and the loader; `qb`, `qb-hook` and `qb-mcp` source it, while
 `worktree-holder` and `qb-board` read the same two variables directly, so the occupancy check
 and the board client work whether or not the CLI is installed. Under home-manager,

@@ -233,10 +233,38 @@ case "$range" in
     tmux kill-pane -t "$pane"
     reflow
     ;;
+  expand)
+    # THE ⛶ ON THE TOP LINE, and it does not implement anything: the dash's verbs
+    # live in qb-seat-key and this hands over to it, which is the same delegation
+    # the `a`, `x` and digit keys make in the other direction. Two copies of
+    # "break the dash out and record the widths to put it back with" is two places
+    # for the geometry lore to drift, and the drift shows up as a screen nobody
+    # chose the shape of.
+    #
+    # WHICH COPY of qb-seat-key is read off the session, for dash_hooks' reason
+    # one surface along: a binding fires with the tmux SERVER's PATH, and the
+    # server usually predates whatever put this harness on one. @qb_key_bin is
+    # what the screen was built with, so a rollout where PATH's harness and a
+    # checkout disagree still reaches the copy this screen belongs to.
+    need_sid
+    key=$(tmux show-options -v -t "$sid:" @qb_key_bin 2>/dev/null || true)
+    [ -n "$key" ] || key=$(command -v qb-seat-key 2>/dev/null || true)
+    [ -n "$key" ] || die "qb-seat-key is not on PATH and the session did not record it"
+    # Its stderr is captured and re-reported rather than left in the hole
+    # `run-shell -b` discards both streams into: an expand that refused for a good
+    # reason — a hidden dash, a screen with no dash at all — would otherwise look
+    # exactly like a button that is not wired up.
+    if ! why=$("$key" expand "$session" 2>&1 >/dev/null); then
+      die "${why:-qb-seat-key expand failed}"
+    fi
+    ;;
   add)
-    # --add works out the next seat number itself, and deliberately does not
-    # reuse the number of a seat that was closed: the board would read the new
-    # agent as the old one coming back.
+    # --add works out the next seat number itself, and since #540 that is the
+    # lowest FREE one, which may be a number a closed seat used to have. It was
+    # max+1 while the number was half of a seat's board name and reusing one made
+    # the board hand back the old agent's identity; the number is a pane option
+    # now and the board keys on the session id, so a ＋ after a ✕ puts the seat
+    # back where the row had a hole.
     #
     # The path is read off the session because a tmux server usually predates
     # the screen running in it, and its PATH is whatever started it — which is

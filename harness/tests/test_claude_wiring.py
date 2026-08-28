@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -993,3 +994,125 @@ def test_an_unwired_event_is_MISSING_even_though_a_field_after_it_is_set(tmp_pat
                          env={**os.environ, "HOME": str(home)}, timeout=60)
     assert "MISSING  PreToolUse" in got.stdout, got.stdout
     assert got.returncode == 1, got.stdout
+
+
+def test_qb_mcp_exports_the_agent_name_the_server_interpolates(tmp_path):
+    """`QUARTERBACK_AGENT` must reach the MCP server's ENVIRONMENT, not just qb-mcp's shell.
+
+    The server resolves one credential for itself: `client._resolve_elevated` runs
+    `QUARTERBACK_ELEVATED_TOKEN_CMD` through `subprocess.run(..., shell=True)` with no
+    `env=`, so that child sees `os.environ` and nothing else. The fleet writes that
+    command as `op read "op://…/quarterback-$QUARTERBACK_AGENT/elevated"`, and
+    `qb_load_config` sets the variable as a plain shell variable. Unexported, it expands
+    to empty in the child and the ref becomes `quarterback-/elevated` — an item name no
+    vault has.
+
+    What made it cost an evening is the shape of the failure: the board answered "this
+    host has no delegated credential", which reads as an unprovisioned machine, and the
+    variable this script dropped is nowhere in that sentence.
+
+    Asserted through the exec rather than by reading the source, because `export` is the
+    one thing a static check of the assignment cannot see. The stub stands in for the
+    server and resolves the command exactly as `client.py` does.
+    """
+    repo = tmp_path / "repo"
+    (repo / "mcp" / ".venv" / "bin").mkdir(parents=True)
+    py = repo / "mcp" / ".venv" / "bin" / "python"
+    # The interpreter by absolute path, never `/usr/bin/env` (#177): there is no
+    # `/usr/bin/env` inside a nix build sandbox, so an env-shebang stub cannot exec
+    # and the suite fails for a reason unrelated to the code under test.
+    py.write_text(
+        f"#!{sys.executable}\n"
+        "import os, subprocess, sys\n"
+        "cmd = os.environ.get('QUARTERBACK_ELEVATED_TOKEN_CMD', '')\n"
+        "out = subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout\n"
+        "sys.stdout.write('AGENT=%s\\nRESOLVED=%s\\n'\n"
+        "                 % (os.environ.get('QUARTERBACK_AGENT', ''), out.strip()))\n",
+        encoding="utf-8")
+    py.chmod(0o755)
+
+    config = tmp_path / "config"
+    config.write_text(
+        # Unroutable on purpose: the self-heal probe must fail fast and fail open.
+        "QUARTERBACK_BASE_URL='http://127.0.0.1:1'\n"
+        "QUARTERBACK_TOKEN='stub-bearer'\n"
+        # The fleet's real shape, with `op read` swapped for `echo` so the test needs no
+        # vault. The interpolation is the part under test.
+        "QUARTERBACK_ELEVATED_TOKEN_CMD='echo \"quarterback-$QUARTERBACK_AGENT/elevated\"'\n",
+        encoding="utf-8")
+
+    env = {**os.environ, "QUARTERBACK_CONFIG": str(config), "QUARTERBACK_REPO": str(repo)}
+    for stray in ("QUARTERBACK_AGENT", "QUARTERBACK_TOKEN", "QUARTERBACK_BASE_URL",
+                  "QUARTERBACK_ELEVATED_TOKEN", "QUARTERBACK_ELEVATED_TOKEN_CMD"):
+        env.pop(stray, None)
+
+    done = subprocess.run([str(BIN / "qb-mcp")], capture_output=True, text=True,
+                          env=env, timeout=60)
+    assert done.returncode == 0, f"qb-mcp exited {done.returncode}: {done.stderr}"
+
+    # `platform.node()`, never a `hostname` subprocess: the nix check sandbox has no
+    # such binary, and a test that shells out to one fails on its environment rather
+    # than on its assertion — which is what this test exists to stop happening to the
+    # SCRIPT. Split on the dot for the same reason qb-env does.
+    host = platform.node().split(".")[0]
+    assert f"AGENT={host}" in done.stdout, (
+        "qb-mcp did not export QUARTERBACK_AGENT into the server's environment; "
+        f"got: {done.stdout!r}")
+    assert f"RESOLVED=quarterback-{host}/elevated" in done.stdout, (
+        "the credential reference resolved with an empty agent name — this is the "
+        f"`quarterback-/elevated` failure. Got: {done.stdout!r}")
+
+
+def test_qb_env_resolves_an_agent_name_without_a_hostname_binary(tmp_path):
+    """`qb_load_config` must name this machine on a box with no `hostname` on PATH.
+
+    The old fallback could not do what it looked like it did — `hostname -s 2>/dev/null
+    || hostname` calls the SAME binary twice, so the `||` covered a failing `hostname`
+    and never an absent one. Absent, it expanded to empty, and an empty agent name is
+    refused by nothing: it becomes `quarterback-` in every `op://` reference built from
+    it (#556), and the failure surfaces a layer away as "this host has no delegated
+    credential".
+
+    A nix check sandbox is exactly that box, which is how this was found — a test that
+    shelled out to `hostname` failed on its environment rather than its assertion.
+    """
+    # A PATH holding only what the fallbacks legitimately need. `hostname` is excluded by
+    # construction rather than by hiding it: a stub that exits non-zero would exercise the
+    # arm the old code already had, not the one that was missing.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for tool in ("uname", "cat", "sh", "hostname"):
+        found = shutil.which(tool)
+        if found and tool != "hostname":
+            (bin_dir / tool).symlink_to(found)
+    assert (bin_dir / "uname").exists(), "no uname to fall back to — the test proves nothing"
+    assert not (bin_dir / "hostname").exists()
+
+    probe = (
+        f'. "{BIN / "qb-env"}"; qb_load_config; printf "%s" "$QUARTERBACK_AGENT"'
+    )
+    # bash by absolute path: PATH below is the SCRIPT's world, deliberately thin, and
+    # resolving the interpreter through it would fail for a reason unrelated to the test.
+    bash = shutil.which("bash")
+    assert bash, "no bash to run qb-env with"
+    done = subprocess.run([bash, "-c", probe], capture_output=True, text=True,
+                          env={"PATH": str(bin_dir), "HOME": str(tmp_path),
+                               "QUARTERBACK_CONFIG": str(tmp_path / "no-such-config")},
+                          timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip(), (
+        "qb_load_config produced an EMPTY agent name with no `hostname` on PATH — every "
+        f"op:// reference built from it becomes `quarterback-`. stderr: {done.stderr!r}")
+    assert done.stdout.strip() == platform.node().split(".")[0]
+
+
+def test_qb_env_leaves_an_explicitly_set_agent_name_alone():
+    """The dot-stripping is for a `uname -n` that carried a domain, not for a name somebody
+    typed. An operator naming a machine is making a decision; this function guessing one is
+    not, and only the guess should be normalised."""
+    probe = f'. "{BIN / "qb-env"}"; qb_load_config; printf "%s" "$QUARTERBACK_AGENT"'
+    done = subprocess.run(["bash", "-c", probe], capture_output=True, text=True,
+                          env={**os.environ, "QUARTERBACK_AGENT": "box.example.com",
+                               "QUARTERBACK_CONFIG": "/nonexistent"}, timeout=30)
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "box.example.com"

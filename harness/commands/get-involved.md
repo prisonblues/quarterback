@@ -136,7 +136,7 @@ the next agent to take it starts from where you got to rather than from the begi
 and a spend ceiling that already exist. A loop over *items* is a different thing: it is an agent
 deciding how much work the fleet takes on, and nothing bounds that yet. #80 measures integration
 cost as quadratic in open PRs, so an agent that quietly takes four items has not been four times as
-useful. `qb-seat`'s brief stops after one item for the same reason and in those words.
+useful. A seat screen tells its panes nothing about looping, for the same reason.
 
 So when the item closes, stop and say what you did. A human who wants another says so, and
 `/get-involved` again is one line. When the appetite gates (#85/#86) and the board's round and

@@ -18,6 +18,7 @@ _REVIEWS_HTML = (_STATIC / "reviews.html").read_text(encoding="utf-8")
 _PLAN_HTML = (_STATIC / "plan.html").read_text(encoding="utf-8")
 _FLEET_HTML = (_STATIC / "fleet.html").read_text(encoding="utf-8")
 _PRS_HTML = (_STATIC / "prs.html").read_text(encoding="utf-8")
+_DIALS_HTML = (_STATIC / "dials.html").read_text(encoding="utf-8")
 # Read here for the same reason the pages are: an asset the build failed to ship
 # becomes a startup crash instead of a silent 404 on a page that would then just
 # quietly have no drag. See app/static/vendor/README.md for the pin.
@@ -104,6 +105,34 @@ async def sortable_js(_reader: str = Depends(reader)) -> Response:
     # matters here is the phone's own.
     return Response(_SORTABLE_JS, media_type="application/javascript",
                     headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get("/dials/view", response_class=HTMLResponse)
+async def dials_view(_reader: str = Depends(reader)) -> HTMLResponse:
+    """The dials in force, and the one surface a person can turn one from (#477).
+
+    Under ``/dials/`` rather than beside ``/fleet`` for ``/plan/view``'s reason:
+    ``/dials`` itself is the JSON this page fetches, and one path cannot be both
+    without content negotiation nobody would remember was there.
+
+    **It exists because the terminal cannot do this half.** A dial was set from an
+    endpoint and read back by one function in ``harness/loops/panel_seats.py``, so
+    the values governing every round on the fleet were invisible on ``qb-dash``,
+    ``qb-dash-tui``, ``qb-board`` and the web board alike. The two dashboards now
+    render what is in force and print this page's URL — which is the honest whole
+    of #443's option (3), and would be a dead end without a page at the end of it.
+
+    They cannot do more than that on purpose. :func:`app.api.dials.set_dial` takes
+    :func:`app.auth.human`; a dashboard authenticates with the machine bearer token
+    every agent on the box holds, which is exactly the credential that gate is built
+    to refuse. So the edge identity this page carries is what makes a dial a
+    person's decision, the same way it is what makes the plan's order one.
+
+    Reading is not deciding: the page itself is behind :func:`app.auth.reader`, so
+    an agent may look at it, and it says plainly whose answer ``/whoami`` gave when
+    that answer means the writes will be refused.
+    """
+    return HTMLResponse(_DIALS_HTML)
 
 
 @router.get("/fleet", response_class=HTMLResponse)

@@ -99,10 +99,13 @@ skip quietly: each costs you a write-up in step 6 and nothing else on the list.
 
 **A deferral is not "not now" as a way out of work.** It costs you two lines — why
 the defect is real, and what this change is for such that the defect sits outside
-it — and it has to go somewhere: the ORCHESTRATOR opens the issue and records the
-finding against it once you have relayed, which is what makes a deferral a record
-rather than a shrug. You open nothing and record nothing, exactly as for an
-escalation. #223 and #237 are what a good one looks like. A finding you are simply
+it — and it has to go somewhere: once you have relayed, the ORCHESTRATOR records
+the finding `deferred` on the board, and opens a GitHub issue for it where the
+repo's `review_panel.file_deferral_issues` calls for one (#482 — the row is the
+durable record and the issue is a work item on a human's tracker, and for the P3/P4
+tail those are not the same thing). Either way it lands somewhere with your two
+lines attached, which is what makes a deferral a record rather than a shrug. You
+open nothing and record nothing, exactly as for an escalation. #223 and #237 are what a good one looks like. A finding you are simply
 tired of, or one whose fix you have not worked out, is not a deferral. With
 `fixer_may_defer` off, the first two are the whole list and "not now" is not
 available to you.
@@ -318,8 +321,8 @@ Everything above tells you to fix everything and never note-and-move-on. That is
 right, and it is also exactly why every fixer so far has patched a broken premise
 rather than saying so. This is the one permitted exception, and it is narrow.
 
-**It is an escalation only if all three hold.** Otherwise it is a defect, and you
-fix it:
+**It is an escalation if tests 1-3 all hold, or if test 4 fails.** Otherwise it is
+a defect, and you fix it:
 
 1. **The defect is downstream of a decision, not of the line.** The named code
    does what it was written to do; the finding is what that intent costs.
@@ -331,6 +334,30 @@ fix it:
    whose regression test can only be written against a single example moves the
    boundary rather than removing it. (#114 is this same check, reached from the
    other side.)
+4. **Is the property your fix asserts decidable in the runtime the assertion runs
+   in?** If it is not, escalate — whatever tests 1-3 said.
+
+**Test 4 stands alone, and the other three are why it has to.** Tests 1-3 are a
+conjunction that describes one shape: *the code is right, your patch would be a
+special case, and you cannot write a general test for it.* Test 4 describes a
+different one, and a stronger one. Ask what your fix really needs to know, then ask
+whether anything where the assertion runs can actually observe it. If the answer is
+no, every possible fix is an **approximation** of that property, the next round's
+findings are the gap between your approximation and the property, and the round
+count is unbounded by construction — no fix can close it, because no fix can check
+it.
+
+Requiring test 4 to hold *alongside* the other three would guarantee it never fired.
+A better approximation is generally testable, so test 3 passes precisely when test 4
+is failing — which is how this pattern survived four fix passes on one cycle with all
+three tests applied honestly and answered correctly every time.
+
+**The tell is that you can describe what you are really checking for, and then
+notice the runtime cannot see it.** "The panel actually reviewed the PR" is not
+observable from inside the process that ran it; exit codes, payload files and head
+SHAs are all proxies for it, each one checkable, none of them the property. If your
+next sentence is *"well, a better signal would be…"*, you are choosing the next
+proxy, and that is the loop this test exists to stop.
 
 **Check the premise before writing the patch, and check your own last round
 hardest.** The strongest case on record is a fixer circling its own fix: on
@@ -355,16 +382,35 @@ PREMISE
 )
 python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
     --premise-file <the register path from the brief> \
+    --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
 
-Read the exit code, not the prose. **0** means this premise has not been patched
-before in this cycle: carry on and decide patch-or-escalate on the three tests
-above. **4** means it has, and `review_panel.escalate_on.premise_repeated` says
-stop — **do not write the patch**. It is an escalation now whether or not it
-passes the three tests, because a premise a fix pass has already been written
-against once is #67's circling by definition, and the second patch is what
-produces the third round. Report it under `Escalated` with the command's output,
+`--premise-decidable` is **test 4, answered where it can brake something**. Pass
+`no` when the runtime the assertion runs in cannot observe the property the fix
+asserts, `yes` when it can. Omit it and the declaration is recorded as *not
+answered*: nothing brakes on it, the report says so, and #491's whole mechanism is
+off for that pass. It is one word and it is the only part of step 3a that a later
+round can act on.
+
+Read the exit code, not the prose. **0** means the fix may be written: carry on and
+decide patch-or-escalate on the four tests above. **4** means it may not — **do not
+write the patch** — and the report says which brake fired:
+
+- `escalate_on.premise_repeated`: this premise has been patched before in this
+  cycle. It is an escalation now whether or not it passes tests 1-3, because a
+  premise a fix pass has already been written against once is #67's circling by
+  definition, and the second patch is what produces the third round.
+- `escalate_on.premise_undecidable`: you answered `no` to test 4. This fires on the
+  **first** declaration, not the second, and that is deliberate — an unobservable
+  property does not become observable on the next attempt, so waiting for a repeat
+  buys a fix pass and a panel to confirm what your own answer already said.
+
+A `no` **sticks to the premise**. Re-declaring it later with `yes`, or with the flag
+omitted, does not clear it and does not get you past the brake — the answer is about
+the property, not about one pass's opinion of it, and the one agent whose fix is being
+refused is not the one who gets to lift the refusal. If you believe the `no` was
+wrong, that is the escalation talking to a human, which is where it was going anyway. Report it under `Escalated` with the command's output,
 including the `--escalated` keys it prints, and fix everything else in the pass
 as usual.
 
@@ -375,12 +421,21 @@ double-quoted argument bash *executes* them. `--premise-for` takes finding
 titles — they are what the orchestrator hands the next round as `--escalated`,
 and an ID there names no finding at all.
 
-**State the premise, never the proxy.** The brake compares declarations, not code:
-"the panel exiting 0 means it reviewed" and "the payload existing means it
+**State the premise, never the proxy.** The repeat brake compares declarations, not
+code: "the panel exiting 0 means it reviewed" and "the payload existing means it
 reviewed" are one premise wearing two proxies, they share almost no words, and
 declared that way they count as two. Declare what the fix *assumes about the
 world* — "a local check can prove a review happened" — and the second one is
 caught.
+
+**And when you cannot — answer test 4, which does not depend on your wording.**
+Declaring at the right altitude is a discipline, and a discipline is not a
+mechanism: replacing a proxy produces a genuinely different premise, honestly
+declared, so the counter stays at 1 while the cycle circles. That is measured, not
+theoretical — one cycle declared four premises, no two of them matched, and three
+fix passes went by. `--premise-decidable no` is what brakes that cycle at the
+first pass, because the answer is a fact about the runtime rather than a fact about
+the sentence you chose.
 
 If the brief gave you no register path, say so in your write-up rather than
 inventing one: an undeclared fix pass is **unescalatable** — nothing can brake it
@@ -576,7 +631,8 @@ Deferred — real, and not this change's job
   Why it is real: <one line — this is not a refutation>
   Why not here: <one line — what this change is for, and why the defect sits
        outside it>
-  Goes to: the orchestrator files it — you open nothing
+  Goes to: the orchestrator records it — a board row always, an issue where
+       `file_deferral_issues` calls for one. You open nothing
 
 Escalated — the approach, not the code
 - Premise: <one sentence>
@@ -638,16 +694,37 @@ a deferral you infer (the fixer wrote no patch because the approach is in disput
 for, and its two justifying lines are in the summary's `Deferred` block; and a finding
 the panel reported below the fix floor is the third, described in the next paragraph.
 Your job is the same on all three and it is the half the fixer is forbidden to do:
-open the issue, then record the finding `deferred` with that issue in `deferred_to`. #223 and #237
+**record the finding `deferred`, and open an issue for it only if
+`review_panel.file_deferral_issues` says so.** #223 and #237
 are what that record looks like — a human applying exactly this judgement by hand,
 at the round cap, which is the thing the setting exists to let a fixer reach on
 round 1 instead.
 
+**The row is the record; the issue is a work item, and they are not the same thing
+(#482).** `review_panel.file_deferral_issues` is a severity gate — at or above it a
+deferral gets a GitHub issue named in `deferred_to` as it always did; below it the
+deferral is a board row with **no `deferred_to`** and **a one-line `note`** saying
+what the defect is and why it was not fixed. `deferred_to` is nullable, the API takes
+a `deferred` outcome without one, and `/panel` renders such a row with no target
+rather than as broken. The note is what makes that row worth having: it is the thing
+somebody reads later, and `GET /review/findings?repo=<owner/name>&pr=<n>` is where
+they read it. A row with neither an issue nor a note is the markdown list this
+replaced, wearing a database.
+
+Measured on this repo on 2026-08-26, roughly twenty open issues were panel
+deferred-finding exhaust and nothing else. The default is `P2`; `always` restores the
+pre-#482 "an issue for every deferral" and `never` files none. **An escalation is
+exempt at every setting** — its issue asks a question rather than filing a task, and
+it is what carries that question past the end of the session. And if the board write
+fails, file the issue whatever the gate says and say so in the relay: below the gate
+the row is the only record, so losing both loses the finding.
+
 A finding the panel reported **below the round's `fix_severity_floor`** is the one
 that needs no judgement from anybody: the floor already decided. Those arrive marked 🔽 under *Reported, not this round's work*, they were
-never in the fixer's brief, and they are recorded `deferred` against whatever issue
-you open for the batch — one issue for the batch is fine and is usually right, since
-filing nine issues for nine P3s is the overflow this floor exists to stop (#165).
+never in the fixer's brief, and they are recorded `deferred` — as board rows alone at
+the default gate, which is precisely the tier it exists for. Where the gate does call
+for an issue, one issue for the batch is fine and is usually right, since filing nine
+issues for nine P3s is the overflow this floor exists to stop (#165).
 
 The one that matters is `refuted`. A judge-confirmed finding that turns out to be
 wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
@@ -672,9 +749,11 @@ when a human answers. And a `deferred` row that later moves is designed for:
 an expected lifecycle (`app/models/review.py`), which is exactly what the human's
 answer will make of this row.
 
-**You open the premise issue, not the fixer, and only after you have relayed.**
-`deferred_to` names an issue ref, so the row wants one — a `deferred` with nowhere
-to go is the markdown list this replaced — but the fixer is a sub-agent told to
+**You open the premise issue, not the fixer, and only after you have relayed.** This
+one is filed at every setting of `file_deferral_issues`, `never` included: an
+escalation's issue is not a work item on somebody's backlog, it is the question being
+put to a human, and a `deferred` row with nowhere to go and nothing carrying the
+question is the markdown list this replaced. The fixer is a sub-agent told to
 decide nothing and write no patch, so the filing is yours (§3 below). Relay the
 escalation first, then open an issue that **asks**: the premise, the findings it
 explains, what removing it would cost, the patch that was not written, and the
@@ -697,8 +776,11 @@ and why — don't paper over it.
 its `Deferred` block, or the panel reported anything below the fix floor, say so
 plainly with the count and the one-line reason for each: those are defects this pass
 knowingly did not fix, and a relay that omits them tells the user a PR is finished
-when the record says otherwise. Then follow §2b in order — open the issue, record
-the row.
+when the record says otherwise. Then follow §2b in order — record the row, and open
+an issue only where `file_deferral_issues` calls for one. Below the gate the relay is
+where a human hears about it at all, so the count and the reasons are not optional
+there; that is the half of the deal that keeps a board row from being a place things
+go to be forgotten.
 
 **An escalation is the headline, not a footnote.** If the sub-agent escalated
 anything (the brief's step 3a), lead with it: the premise, what it explains,

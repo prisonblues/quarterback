@@ -196,8 +196,36 @@ case "${1:-sessions}" in
     # and both are printed rather than counted. A silent rejection here would
     # undo the whole point of naming it back: the caller believes an outcome
     # landed, and the coverage marker on /panel says it never did.
+    #
+    # `amended` is counted AND itemised, and it is the bucket this render once
+    # left out entirely (#553). It is the one a note rewrite lands in, and the
+    # endpoint separates it from `changed` and `unchanged` on the grounds that it
+    # is the one that matters — a rewritten refutation is a rewritten piece of
+    # evidence. Omitted, it does not read as silence: `amended` alone takes the
+    # 200 branch, so curl succeeds and every counter this knew about was
+    # legitimately zero, and five stored note rewrites printed as
+    # "recorded 0, changed 0, unchanged 0" — a positive report that nothing
+    # happened, indistinguishable from the genuine no-op. The agent that read it
+    # put its evidence in a commit message instead. Same failure as a silent
+    # rejection with the sign flipped, in the render whose own comment above
+    # argues against it.
+    #
+    # The order follows the response's own: recorded, changed, amended,
+    # unchanged, rejected, unattested. `// []` on `amended` for the same reason
+    # `rejected` carries one — a board that has not got the bucket renders a
+    # zero rather than a null.
     printf '%s\n' "$out" | jq -r '
-        "recorded \(.recorded|length), changed \(.changed|length), unchanged \(.unchanged|length)"
+        def amend_fields:
+          [ (if ((.rewrote // []) | length) > 0
+             then "rewrote " + (.rewrote | join(", ")) else empty end),
+            (if ((.filled // []) | length) > 0
+             then "filled " + (.filled | join(", ")) else empty end) ];
+        "recorded \(.recorded|length), changed \(.changed|length), amended \((.amended // [])|length), unchanged \(.unchanged|length)"
+        + (if ((.amended // []) | length) > 0
+           then "\n" + ((.amended | map("  AMENDED \(.key)"
+                + (amend_fields | if length > 0 then ": " + join("; ") else "" end)))
+                | join("\n"))
+           else "" end)
         + (if ((.rejected // []) | length) > 0
            then "\n" + ((.rejected | map("  REJECTED \(.key): \(.reason)")) | join("\n"))
            else "" end)

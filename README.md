@@ -369,7 +369,8 @@ POST  /plan/item         { title, repo?, ref_kind?, ref_value?, plan?, note?, de
                           SAME scope and say where the new item enters — agent-permitted,
                           because PLACING changes the relative order of nothing already
                           in the plan, while REORDERING permutes what is there and stays
-                          human-only (#183). Absent, it appends and says so. `placed_for`
+                          not an agent's own decision (#183, #478). Absent, it appends
+                          and says so. `placed_for`
                           records whose priority a placement transcribes and is refused
                           without one
 POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
@@ -380,7 +381,8 @@ POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
 POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
-POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← human-only
+POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← delegated
+                                          (plan/state person-only)
 POST  /plan/item/exempt  { item_id | (repo, pr), reason, grant=true }
                           take a PR out of the review queue — or, from an agent, ASK to.
                           One endpoint, and the credential decides which it was: a person
@@ -391,7 +393,7 @@ POST  /plan/item/exempt  { item_id | (repo, pr), reason, grant=true }
                           through /plan/item, /plan/submit or /plan/item/done is refused:
                           the authorisation to skip a check cannot come from the party the
                           check is on (#335). Idempotent both ways
-POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← human-only
+POST  /plan/reorder      { repo?, order:[item_id, …] }                  ← delegated
 GET   /plan/scopes       -> {scopes:[{scope, label, note, added_by, created}], sigil}
                           the declared PROJECT scopes only. Repo scopes are not listed
                           and should not be: a repo scope exists because a repository
@@ -476,7 +478,11 @@ GET   /plan/order-proposal/{id}  -> one proposal with its per-item evidence
 GET   /health            (no auth)
 ```
 
-The human-only endpoints authorise on the **edge identity** (Authelia's `Remote-User`),
+`← delegated` means a person **or** an agent presenting its machine's `ELEVATED_TOKENS`
+secret as `X-Agent-Elevated` (#478) — it applies an order a person asked for and records
+`rank_source: "derived"`; it never becomes a person, and `plan`/`state` stay person-only
+on `update`. The human-only endpoints authorise on the **edge identity** (Authelia's
+`Remote-User`),
 not a bearer token, and refuse one with a 403. That is not belt-and-braces: every agent on a
 box authenticates with the same machine token, so nothing inside a request distinguishes a
 person from a process, and the plan's order is only shared intent while agents cannot rewrite
@@ -536,7 +542,10 @@ priority into free text — a `phase` reading `TOP PRIORITY — Rich, 2026-08-17
 `note` opening `RANK IS WRONG AND A HUMAN MUST FIX IT`.
 
 So the two operations are separated. **Reordering** permutes items already in the plan: two
-agents can overwrite each other's decision, it is contested, and it stays human-only.
+agents can overwrite each other's decision, so it is contested, and deciding an order stays
+a person's. Since #478 an agent may APPLY one it was asked for, with a credential of its
+own and a `rank_source` that says which happened — that separates applying from deciding
+rather than relaxing the rule.
 **Placing** chooses where a new item enters, and alters the relative order of nothing already
 there — insert between ranks 2 and 3 and every existing pair keeps the relationship it had,
 so there is no prior decision to overwrite and nothing to thrash. `after` / `before` take an
@@ -776,7 +785,7 @@ stopped; whatever stopped it is what calls it. On a machine that is `qb-hook`'s
 SessionEnd (which maps Claude Code's own `reason`, so a `/clear` lands as
 `context_reset` while its claims are still keyed to the session id that took them),
 or `qb-seat-click` reading the session id `qb-hook` stamped on the pane before its ✕
-kills it, or `qb-end` by hand. The line `qb-seat` draws — *"the board coordinates
+kills it, or `qb-end` by hand. The line `qb-seats` draws — *"the board coordinates
 work, it does not operate the machine"* — is about **dispatch**, and nothing here
 moves it: what an agent works on is still its own choice, self-selected and claimed
 atomically.
@@ -863,9 +872,14 @@ claimed on the way out) / `plan_hold` / `plan_unhold` / `plan_finish`; and claim
 `claim` / `claims` / `renew_claim` / `release_claim` / `claim_held` (am I holding
 anything here — the check to make before substantive work). **No claim tool takes a repo
 string and none composes a key**: they take a `repo_path` and the board derives both, which
-is #148's rule and #172's. There is
-no `plan_reorder` tool, and that is the feature: reordering is human-only, so a tool for
-it could only ever return a 403. Placing a new item is the other half of that distinction
+is #148's rule and #172's. `plan_reorder`
+and `plan_item_update` exist and are the narrow exception: reordering is still not
+something an agent may *decide*, and #478 separates deciding from **applying an order a
+person asked for**. They take a per-machine `ELEVATED_TOKENS` credential presented as
+`X-Agent-Elevated`, never a person's identity — so the caller keeps its own name and the
+row records `rank_source: "derived"`, which no reader can mistake for a sequence somebody
+typed. Everything else `human` gates stays shut to them, `granting` a review exemption
+included (#335). Placing a new item is the other half of that distinction
 and is `plan_add(after=…/before=…)`: it alters no existing pair's relative order, so it
 cannot thrash and needs no gate. Panel stats are
 deliberately *not* an MCP tool: they are recorded by the panel process itself
@@ -1755,6 +1769,7 @@ full — including what was broken before it, which is the part no diff recovers
 - **v3.19** — a claim writes its own plan item, and the collision datum stops being blind where it
   matters most.
 - **v3.20** — an existing backlog can be ordered, and an actionable issue can be picked up.
+- **v3.21** — the fleet hands out its own work, and what stops it becomes a row.
 - **Not yet numbered** — a bare git remote on the server so cross-*device* cherry-pick has a
   shared object store; wire `landed` refs to a cherry-pick helper. Deliberately unnumbered: a
   roadmap bullet that named `v3` would sit here as a second `v3` the day `apply --major` stamps
@@ -2276,8 +2291,8 @@ harness/      step 2 of the install — the workflow the board coordinates
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
-                   anything destroys one), qb-stage, qb-seat (one pane of a
-                   multiplexer, started as a seat with its own board identity),
+                   anything destroys one), qb-stage, qb-seats (a screen of
+                   agent panes in a multiplexer, plus the board),
                    qb-board (launcher for the terminal client in mcp/mcp_server/board/)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points, dbtarget.py (the DB

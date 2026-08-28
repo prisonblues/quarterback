@@ -60,6 +60,31 @@ async def test_board_since_and_type_filter(client):
     assert findings[0]["from"] == "server"
 
 
+async def test_board_answers_a_bare_list_not_a_wrapper_object(client):
+    """The shape `qb-doctor` reads, asserted where it is actually served.
+
+    #531: the `escalations` row parsed this endpoint as `{"posts": [...], "cursor": N}` —
+    the object the MCP `board_read` wrapper assembles on the way out — and so could not
+    read a single post on any host. Its own stub answered an object too, so five unit
+    tests passed while the row was dead.
+
+    A unit test over the harness can only pin the annotation, and an annotation is not
+    the contract: `-> list[dict]` would keep passing while the body started returning an
+    object. This asserts what a client receives, and it belongs here because this is the
+    file with a real app and a real database behind it.
+    """
+    await client.post("/post", json={"type": "note", "summary": "shape"}, headers=LAPTOP)
+
+    body = (await client.get("/board", headers=LAPTOP)).json()
+
+    assert isinstance(body, list), type(body)
+    assert body and all(isinstance(p, dict) and "ts" in p for p in body)
+    # The `type=` slice too — that is the call the escalations row makes, and the one
+    # whose elements it dates itself.
+    sliced = (await client.get("/board", params={"type": "note"}, headers=LAPTOP)).json()
+    assert isinstance(sliced, list), type(sliced)
+
+
 async def test_board_omits_presence_by_default(client):
     base = await client.get("/board", headers=LAPTOP)
     start = base.json()[-1]["id"] if base.json() else 0

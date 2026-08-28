@@ -163,11 +163,50 @@ CMD_TIMEOUT = 30
 #: which is this file's subject happening to this file.
 MAX_BODY = 8 * 1024 * 1024
 
-#: Where the runbook for the edge secret lives. Named in full because the whole
-#: point of the edge row is that its remedy belongs to a person, and "ask Rich"
-#: is not a remedy — a path is.
-EDGE_RUNBOOK = ("~/source/selfhost/issues/open/"
-                "160-bug-quarterback-human-writes-refused-at-the-edge.md")
+#: The runbook's file name. Only the name is a constant, because only the name is
+#: stable: the file moves between `issues/open` and `issues/closed` as the issue's
+#: state changes, and this used to hardcode `issues/open`.
+#:
+#: It moved to `closed` on 2026-08-22, when the secret was actually deployed — so
+#: from that day the one row whose entire purpose is *"the remedy belongs to a
+#: person, and a path is the remedy"* printed a path to nothing. A stale pointer is
+#: worse here than no pointer: it sends somebody looking in a directory the file is
+#: not in, for a document that does exist.
+EDGE_RUNBOOK_FILE = "160-bug-quarterback-human-writes-refused-at-the-edge.md"
+
+#: Both states the issue can be in, newest-first by likelihood: a runbook worth
+#: naming is usually one whose problem has been solved at least once.
+EDGE_RUNBOOK_DIRS = ("issues/closed", "issues/open")
+
+#: The checkout it lives in. An env override because this is a path into ANOTHER
+#: repository, which is the one thing this script cannot derive from its own.
+SELFHOST_REPO_ENV = "SELFHOST_REPO"
+
+
+def edge_runbook() -> str:
+    """Where the runbook is on THIS box, or how to find it when it is not here.
+
+    Resolved rather than asserted. The alternative — a constant naming one of the
+    two directories — is what shipped, and it was wrong within a fortnight for a
+    reason no reader could have predicted from the constant: the issue was closed,
+    so the file moved, so the remedy pointed at nothing.
+
+    Never returns a path that does not exist. A box without the selfhost checkout
+    gets a sentence saying which repository to look in, which is a worse remedy
+    than a path and a much better one than a path that is a lie.
+    """
+    root = Path(os.environ.get(SELFHOST_REPO_ENV) or Path.home() / "source" / "selfhost")
+    for where in EDGE_RUNBOOK_DIRS:
+        found = root / where / EDGE_RUNBOOK_FILE
+        if found.is_file():
+            # `~` rather than the absolute path, to match every other path this
+            # tool prints and because the reader is the person whose home it is.
+            try:
+                return f"~/{found.relative_to(Path.home())}"
+            except ValueError:
+                return str(found)
+    return (f"{EDGE_RUNBOOK_FILE} in the selfhost repo — not on this box "
+            f"(set {SELFHOST_REPO_ENV} if it is checked out elsewhere)")
 
 
 @dataclass
@@ -1156,12 +1195,19 @@ def check_edge(host: Host) -> Check:
       ever stopped stripping, any agent on any box could post as Rich. That half
       is checkable from here and it is checked first, because a false pass on it
       is worse than a fail on the other.
-    * the browser vhost must ACCEPT the person it authenticated. That is the half
-      that has been broken since v2.39 — `HUMAN_EDGE_SECRET` was never generated,
-      never given to the app and never injected by nginx — and it is the half a
-      machine with no forward-auth session cannot see. Hence `unknown` there and
-      not `ok`: the honest answer is "nothing on this host can tell", and the
-      remedy is a runbook rather than a command.
+    * the browser vhost must ACCEPT the person it authenticated. This was broken
+      from v2.39 until 2026-08-22 — `HUMAN_EDGE_SECRET` had never been generated,
+      given to the app or injected by nginx — and selfhost #160 fixed it, verified
+      live. **Stated in the past tense deliberately.** This paragraph asserted the
+      present one for four days after it stopped being true, next to a runbook path
+      that had gone stale for the same reason: the issue closing is what moved the
+      file, and the same event is what made the sentence wrong.
+
+      It is still `unknown` rather than `ok`, and that is not a leftover. This half
+      needs a forward-auth session and an agent host has none, so "nothing on this
+      host can tell" remains the honest answer whatever the deployment does — see
+      `_edge_human_writes`, and `QUARTERBACK_EDGE_COOKIE` for the one way a box can
+      answer it.
 
     Deliberately NOT done by asking the app whether the secret is configured.
     That would need a new endpoint, and a new endpoint would be absent from the
@@ -1179,7 +1225,7 @@ def check_edge(host: Host) -> Check:
                      "agent vhost refuses a self-supplied Remote-User; the browser vhost is "
                      "not known to this host, so human writes could not be tested", "unknown",
                      manual="set QUARTERBACK_HUMAN_URL in ~/.config/quarterback/config, then "
-                            f"re-run. If human writes are refused, the runbook is {EDGE_RUNBOOK}")
+                            f"re-run. If human writes are refused, the runbook is {edge_runbook()}")
     return _edge_human_writes(host)
 
 
@@ -1250,13 +1296,13 @@ def _edge_human_writes(host: Host) -> Check:
     status, body, err = http_get(f"{host.human_url}/whoami", headers)
     if err:
         return Check("edge", host.human_url, f"could not reach the browser vhost: {err}",
-                     "unknown", manual=f"runbook: {EDGE_RUNBOOK}")
+                     "unknown", manual=f"runbook: {edge_runbook()}")
     if status in (301, 302, 303, 307, 308):
         return Check(
             "edge", host.human_url,
             f"the browser vhost answered {status} — forward-auth, and this host has no "
             "session, so nothing here can see whether HUMAN_EDGE_SECRET is set", "unknown",
-            manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to a "
+            manual=f"runbook: {edge_runbook()} (or set QUARTERBACK_EDGE_COOKIE to a "
                    "signed-in session and re-run)")
     if status in (401, 403):
         # WHICH hop refused matters, and the status code cannot say. The auth proxy
@@ -1273,17 +1319,17 @@ def _edge_human_writes(host: Host) -> Check:
                          "board's — the auth proxy refused this host before the app saw the "
                          "request, so nothing here can see whether HUMAN_EDGE_SECRET is set",
                          "unknown",
-                         manual=f"runbook: {EDGE_RUNBOOK} (or set QUARTERBACK_EDGE_COOKIE to "
+                         manual=f"runbook: {edge_runbook()} (or set QUARTERBACK_EDGE_COOKIE to "
                                 "a signed-in session and re-run)")
         return Check("edge", host.human_url,
                      f"human writes are REFUSED ({status}) — the edge authenticated a person "
                      "and the app would not take them, which is HUMAN_EDGE_SECRET unset or "
                      "disagreeing between 1Password and sops", "fail",
-                     manual=f"runbook: {EDGE_RUNBOOK} — needs a generated secret in TWO "
+                     manual=f"runbook: {edge_runbook()} — needs a generated secret in TWO "
                             "stores and two deploys; that is a person's job, not this tool's")
     if status != 200:
         return Check("edge", host.human_url, f"/whoami answered {status}", "unknown",
-                     manual=f"runbook: {EDGE_RUNBOOK}")
+                     manual=f"runbook: {edge_runbook()}")
     try:
         kind = json.loads(body).get("kind")
     except ValueError:
@@ -1292,7 +1338,7 @@ def _edge_human_writes(host: Host) -> Check:
         return Check("edge", host.human_url,
                      f"the browser vhost answered as {kind!r}, not a person — Remote-User is "
                      "not reaching the app", "fail",
-                     manual=f"runbook: {EDGE_RUNBOOK}")
+                     manual=f"runbook: {edge_runbook()}")
     return Check("edge", host.human_url, "human writes accepted", "ok")
 
 
@@ -1972,12 +2018,14 @@ def fragments_in_use(host: Host) -> bool:
     return (host.repo / "changelog.d").is_dir()
 
 
-def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+def _board_json(host: Host, path: str) -> tuple[object | None, str]:
     """One authenticated GET against the board, decoded — or a sentence saying why not.
 
-    Returns ``(payload, "")`` or ``(None, why)``. Every caller turns the `why` into an
-    `unknown`, so there is one place where "the board could not be asked" is phrased and
-    no way for a row to reach a verdict without having been answered.
+    Returns ``(payload, "")`` or ``(None, why)``, with the payload exactly as the board
+    shaped it. Nothing here judges that shape, because the board does not answer one:
+    `/blockers` returns an object and `/board` returns a bare array, and a single helper
+    that insisted on either turned every caller of the other into "could not be asked"
+    without ever reaching the question it was asked to settle (#531).
     """
     if not host.base_url:
         return None, "no board is configured (QUARTERBACK_BASE_URL unset), so nothing here " \
@@ -1992,11 +2040,49 @@ def board_get(host: Host, path: str) -> tuple[dict | None, str]:
     if status != 200:
         return None, f"the board answered {status} to {path}"
     try:
-        payload = json.loads(body)
+        return json.loads(body), ""
     except ValueError:
         return None, f"the board did not answer JSON to {path}"
+
+
+def board_get(host: Host, path: str) -> tuple[dict | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON object.
+
+    Every caller turns the `why` into an `unknown`, so there is one place where "the
+    board could not be asked" is phrased and no way for a row to reach a verdict without
+    having been answered.
+    """
+    # `if why`, not `if payload is None`: a body of `null` decodes to None with nothing
+    # wrong with the request, and testing the payload would hand back an EMPTY reason
+    # for it — a blank cell in the table where a sentence belongs. The failure is
+    # carried by `why` alone, so `null` falls through to the shape check below and gets
+    # the same sentence as any other answer of the wrong shape.
+    payload, why = _board_json(host, path)
+    if why:
+        return None, why
     if not isinstance(payload, dict):
         return None, f"the board did not answer an object to {path}"
+    return payload, ""
+
+
+def board_get_list(host: Host, path: str) -> tuple[list | None, str]:
+    """`_board_json`, for the board endpoints that answer a JSON array.
+
+    `GET /board` is one — `read_board` is annotated `-> list[dict]` and returns the posts
+    bare. The `{"posts": [...], "cursor": N}` object is assembled by the MCP `board_read`
+    wrapper on the way out, so it is the shape an agent sees and NOT the shape the API
+    has, and a row written against it cannot read a single post (#531).
+    """
+    # `if why`, not `if payload is None`: a body of `null` decodes to None with nothing
+    # wrong with the request, and testing the payload would hand back an EMPTY reason
+    # for it — a blank cell in the table where a sentence belongs. The failure is
+    # carried by `why` alone, so `null` falls through to the shape check below and gets
+    # the same sentence as any other answer of the wrong shape.
+    payload, why = _board_json(host, path)
+    if why:
+        return None, why
+    if not isinstance(payload, list):
+        return None, f"the board did not answer a list to {path}"
     return payload, ""
 
 
@@ -2239,6 +2325,140 @@ def _spell_prs(numbers: list[int]) -> str:
     more = "" if len(numbers) <= 6 else f", +{len(numbers) - 6} more"
     word = "pull request" if len(numbers) == 1 else "pull requests"
     return f"{len(numbers)} {word} ({shown}{more})"
+
+
+#: The API ceiling for `/board` and `/blockers` alike. Named because the `escalations`
+#: row has to REASON about it: a full page is not the same fact on the two endpoints —
+#: `/board` pages newest-first, so a full page still contains the whole window, while
+#: `/blockers` pages oldest-first, where a full page can exclude the window entirely.
+_BOARD_PAGE = 1000
+
+#: The window both halves of the `escalations` row are counted over. 24h is not a
+#: tuning choice — it is the largest `window_min` the board's own read accepts, and
+#: the two counts have to come from the same span or the comparison says nothing.
+ESCALATION_WINDOW_MINUTES = 1440
+
+#: The post type `needs_human.announce()` writes. Named here rather than spelled at
+#: the call site because this row's entire claim is that these two writes come from
+#: one function, and a typo would make it report a severed producer forever.
+ESCALATION_POST = "stuck"
+
+
+def check_escalations(host: Host) -> Check:
+    """Is the escalation path writing rows, or only ringing the bell?
+
+    #523, and the row exists because this fleet has now built the same empty queue
+    three times. The `stuck` post type measured at ZERO over thirty days. Six
+    `needs-human/*` labels shipped with no producer, no consumer and no test. #328
+    landed a `blockers` table and no producer. None of the three was the wrong shape
+    and nothing ever wrote to them — which is a failure with no symptom, because an
+    empty queue and a working queue with nothing in it look identical from outside.
+
+    So the question is asked as a PAIR, the way `landed` asks its own. A blockers
+    table with nothing in it is not a fault: it is the correct state of a day nobody
+    got stuck. `stuck` posts with nothing in the table is the fault, and it is only
+    visible because ONE function makes both writes — `announce()` posts and then
+    stores, so a post without a row in the same window is that function's second
+    half failing, or never having been deployed.
+
+    STRICTLY ANY-VERSUS-NONE, and not a ratio, because rows are legitimately fewer
+    than posts. An escalation whose refs name no subject is announced and
+    deliberately not stored (#523), so `posts > rows` is the designed behaviour and
+    a proportional test here would fail on correct data. Zero rows against any post
+    is the only divergence that cannot be explained by the design.
+
+    A board with no `/blockers` at all reads `unknown`, not `fail`: an image
+    predating #328 has not severed anything, it has not been redeployed, and those
+    are different sentences to be handed.
+    """
+    window = ESCALATION_WINDOW_MINUTES
+    # A LIST, because that is what `GET /board` answers. Reading it as an object is the
+    # whole of #531: this row shipped unable to see a single post, and said so in a
+    # sentence — "the board did not answer an object" — that pointed at the `board` and
+    # `token` rows, both of which were `ok` and neither of which was the fault.
+    posts, why = board_get_list(
+        host,
+        f"/board?type={ESCALATION_POST}&window_min={window}&limit={_BOARD_PAGE}")
+    if posts is None:
+        return Check("escalations", host.base_url or "-", why, "unknown",
+                     manual="see the board and token rows")
+    # Dated HERE, because `window_min` is a request and not a promise: `/board` floors a
+    # quiet window at the ten most recent posts of the slice whatever their age
+    # (_ORIENT_FLOOR, app/api/posts.py), and `type=` is deliberately not one of the
+    # lookups that skip the floor. So asking for a day and being handed last week's ten
+    # makes `raised` non-empty on a day nobody escalated — and this row would read that
+    # as a severed producer and say so, on the evidence of posts that predate the
+    # question. Observed: the live board answered exactly ten, five of them older than
+    # the cutoff. The blocker half below has always dated its own rows; both halves now
+    # describe the same span, which is the only way their comparison means anything.
+    #
+    # `isinstance` before `.get`, on both halves: a list whose ELEMENTS are not objects
+    # is a board answering nonsense, and a diagnostic that raises AttributeError while
+    # diagnosing is worth less than one that reports what it found.
+    raised = [p for p in posts
+              if isinstance(p, dict)
+              and (age := _age_minutes(p.get("ts"))) is not None
+              and 0 <= age <= window]
+    rows, why = board_get(host, f"/blockers?open=false&limit={_BOARD_PAGE}")
+    if rows is None:
+        # Told apart from any other board failure, because the answer is a deploy and
+        # not a bug: `board_get` turns every non-200 into this one sentence shape.
+        missing = "404" in why
+        return Check("escalations", host.base_url or "-",
+                     ("this board serves no /blockers, so it is running an image from "
+                      "before #328 and the row half of an escalation has nowhere to land "
+                      f"— {len(raised)} {ESCALATION_POST} post(s) in the last "
+                      f"{_spell_age(window)} went to the board as posts only")
+                     if missing else why, "unknown",
+                     manual="redeploy the board (#328/#519), then re-run this row")
+    stored = rows.get("blockers")
+    if not isinstance(stored, list):
+        return Check("escalations", host.base_url or "-",
+                     "the board answered no list of blockers, so what the escalation path "
+                     "recorded could not be read", "unknown",
+                     manual=f"{host.base_url}/blockers?open=false")
+    span = _spell_age(window)
+    if len(stored) >= _BOARD_PAGE:
+        # `/blockers` orders by raised_at ASCENDING and then truncates, so a full page is
+        # the OLDEST rows and every row raised today can sit beyond it. Left unsaid, this
+        # row would count zero fresh rows against a real escalation and report the
+        # producer severed — the precise false alarm it exists to make trustworthy. An
+        # honest `unknown` is the only verdict available until the endpoint can be asked
+        # for a window rather than a page.
+        return Check("escalations", host.base_url or "-",
+                     f"the board returned a full page of {_BOARD_PAGE} blocker(s) and it "
+                     "pages oldest-first, so rows raised in the last "
+                     f"{span} can lie beyond it — this row cannot tell a severed producer "
+                     "from a long table", "unknown",
+                     manual="give /blockers a raised-after filter or a newest-first order, "
+                            "then count the window instead of the page",
+                     extra={"posts": len(raised), "page": len(stored),
+                            "window_minutes": window})
+    fresh = [b for b in stored
+             if isinstance(b, dict)
+             and (age := _age_minutes(b.get("raised_at"))) is not None
+             and 0 <= age <= window]
+    if raised and not fresh:
+        return Check("escalations", host.base_url or "-",
+                     f"{len(raised)} {ESCALATION_POST} post(s) in the last {span} and not "
+                     "one blocker row — the escalation path is ringing the bell and "
+                     "recording nothing, so nothing can answer 'what is waiting on me'",
+                     "fail",
+                     manual="run one escalation by hand and read the note it returns: "
+                            "`announce()` states which half failed on the line it returns "
+                            "(harness/loops/needs_human.py)",
+                     extra={"posts": len(raised), "rows": 0, "window_minutes": window})
+    if not raised and not fresh:
+        return Check("escalations", host.base_url or "-",
+                     f"nothing escalated in the last {span}, so an empty blockers table is "
+                     "the state of a quiet day and not evidence of a severed producer",
+                     "ok", extra={"posts": 0, "rows": 0, "window_minutes": window})
+    # Rows and no posts is not a fault either: a person can raise one by hand, and the
+    # window is a day while an unanswered blocker outlives it.
+    return Check("escalations", host.base_url or "-",
+                 f"{len(fresh)} blocker row(s) recorded against {len(raised)} "
+                 f"{ESCALATION_POST} post(s) in the last {span}", "ok",
+                 extra={"posts": len(raised), "rows": len(fresh), "window_minutes": window})
 
 
 def check_generated(host: Host) -> Check:
@@ -3672,6 +3892,37 @@ CHECKS = (
                     "behaviour #405 argued the queue exists to prevent.",
                 ),
                 needs=("ready",)),
+        }),
+    CheckSpec(
+        "escalations", "landing", check_escalations,
+        explanation=(
+            "Three times now this fleet has built a place for work that is stuck to be "
+            "recorded, and three times nothing wrote to it: the `stuck` post type "
+            "measured at zero across thirty days, six `needs-human/*` labels shipped with "
+            "no producer, and #328's `blockers` table landed with none either. That "
+            "failure has no symptom — an empty queue and a working queue with nothing in "
+            "it are the same table — so it can only be caught by asking a second source "
+            "the same question. One function makes both writes, which is what makes the "
+            "comparison meaningful: a `stuck` post with no row beside it is `announce()`'s "
+            "second half failing, and nothing else."),
+        briefs={
+            "fail": Brief(
+                audience="agent",
+                task=("The escalation path posted {posts} time(s) and stored nothing. Both "
+                      "writes come from `announce()` in harness/loops/needs_human.py, so "
+                      "the post half works and the row half does not. Run one escalation "
+                      "and read the note it returns — it names which half failed and why. "
+                      "The usual causes are a board without #328 deployed, a token without "
+                      "the `delegated` tier, and a subject the refs did not name."),
+                constraints=(
+                    "Do not write rows by hand to clear this. The row is measuring whether "
+                    "the producer works, and backfilling it makes the measurement lie "
+                    "while leaving every future escalation just as unrecorded.",
+                    "An escalation whose refs name no subject is announced and NOT stored, "
+                    "by design (#523). If that turns out to be all of them, the fix is in "
+                    "the callers' refs, not in the storing.",
+                ),
+                needs=("posts",)),
         }),
     CheckSpec(
         "tags", "landing", check_tags,

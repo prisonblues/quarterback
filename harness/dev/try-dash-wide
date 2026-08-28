@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# try-dash-wide — build a throwaway seat screen from THIS worktree, to try the
+# wide dash and the ⛶ on before any of it is installed.
+#
+#   harness/dev/try-dash-wide            two seats, shells rather than agents
+#   harness/dev/try-dash-wide --agents   two seats running the real agent
+#   harness/dev/try-dash-wide --kill     take it away again
+#
+# WHY A SCRIPT AND NOT THREE EXPORTS. One of them is load-bearing in a way that
+# fails SILENTLY: `qb-seats` records `beside_me qb-seat-key` on the session, and
+# `beside_me` asks PATH first — so a screen built from this worktree while PATH
+# still finds the INSTALLED harness records the installed qb-seat-key, hands off
+# to it on every press, and `C-q z` falls through its `*) exit 0` doing nothing
+# and saying nothing. That is the handoff working as designed (a screen is driven
+# by the copy it was built with), and it is exactly how the first live test of
+# this feature "passed" while moving no panes at all.
+set -euo pipefail
+
+HERE=$(cd -P "$(dirname "$0")/.." && pwd)          # the worktree's harness/
+BIN=$HERE/bin
+SESSION=${QB_TRY_SESSION:-dash-wide}
+
+case "${1:-}" in
+  --kill) tmux kill-session -t "$SESSION" 2>/dev/null && echo "$SESSION is gone" \
+            || echo "$SESSION was not up"; exit 0 ;;
+esac
+
+[ -x "$BIN/qb-seats" ] || { echo "no qb-seats in $BIN" >&2; exit 1; }
+tmux has-session -t "$SESSION" 2>/dev/null \
+  && { echo "$SESSION is already up — attach with: tmux attach -t $SESSION"; exit 0; }
+
+export PATH="$BIN:$PATH"
+export QB_SEATS_DASH="$BIN/qb-dash-tui"
+export QB_SEATS_PACE=off
+
+# SHELLS BY DEFAULT. This screen exists to be looked at, and two agents started
+# to look at a layout is two agents' worth of the shared subscription spent on it.
+#
+# `--cmd ''` since #540, and it is a plainer way to say the same thing: a seat is
+# given one line and an empty one leaves the pane's own shell. This used to export
+# QB_SEAT_AGENT with an `sh -c` that printed a notice and re-exec'd the shell —
+# which stopped being read when that variable was retired, and a guard that
+# silently stops guarding is worse here than no guard at all: the failure is two
+# real agents started to look at a layout, which is the one thing this avoids.
+SEATS_CMD=("--cmd" "")
+if [ "${1:-}" = "--agents" ]; then
+  SEATS_CMD=()
+fi
+
+"$BIN/qb-seats" -s "$SESSION" -n 2 -C "$HERE/.." ${SEATS_CMD[@]+"${SEATS_CMD[@]}"}
+
+cat <<EOF
+
+  attach:   tmux attach -t $SESSION
+  away:     $0 --kill
+
+  Make the terminal at least 157 columns and the dash goes two across on its own.
+  Narrower than that it stays exactly as it is today — that is the point.
+
+    C-q z     the dash full screen, and back
+    ⛶         same thing, top-left of the screen, with the mouse
+    z         same thing again, from inside the dash
+    C-q > <   nudge the dash wider or narrower, 8 columns at a time — which is
+              how to walk it across the threshold without resizing the terminal
+    ?         the whole key list
+EOF

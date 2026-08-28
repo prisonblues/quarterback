@@ -9,6 +9,7 @@
 #   seatN            jump to seat N
 #   tape             show or hide the tape
 #   dash             show or hide the dash
+#   expand           the dash to a window of its own, and back again
 #   fit              put the dash back to the width the screen asked for
 #   wider|narrower   nudge the dash by NUDGE columns, and remember the new width
 #   kill             kill the whole screen (the caller confirms)
@@ -59,6 +60,11 @@ NUDGE=8                 # columns per `wider`/`narrower` — a nudge you can see
 MIN_DASH=10             # a dash narrower than this is a column of ellipses, and
                         # tmux would happily take it to 1
 HOLDING=qb-hidden       # the window a hidden pane is parked in
+EXPANDED=qb-dash        # and the one an expanded dash is READ in. A name of its
+                        # own because this window is looked at: `qb-hidden` on
+                        # the window list above a full-screen dashboard reads as
+                        # a bug, and the two are told apart by @qb_dash_expanded
+                        # rather than by either name.
 
 # On the screen as well as on stderr, because stderr is nowhere: every binding
 # reaches this through `run-shell -b`, which discards both streams. The same
@@ -140,6 +146,7 @@ if [ "$ACTION" = guide ]; then
 
     t        show or hide the tape (the board along the bottom)
     d        show or hide the dash (the fleet down the right)
+    z        the dash full screen, and back
     =        the dash back to the width the screen asked for
     >  <     the dash $NUDGE columns wider / narrower, and keep it
 
@@ -319,6 +326,18 @@ pane_exists() {
 # the size into it.
 hidden_state() { tmux show-options -v -t "$SID:" "@qb_hidden_$1" 2>/dev/null || true; }
 
+# BOTH OPTIONS DESCRIBE ONE PANE, so a pane that is gone must take both with it.
+# `@qb_hidden_dash` is where it is parked and `@qb_dash_expanded` is which of the
+# two ways it got there; clearing only the first leaves a screen marked expanded
+# with nothing recorded, and every later `z` then takes the expanded branch and
+# reports "nothing recorded to put back" — the wrong problem named, on a screen
+# where the real one is that the dash process died. Neither key can put that
+# right, because the marker is the only thing either of them reads.
+forget_dash() {
+  tmux set-option -t "$SID:" -u @qb_hidden_dash
+  tmux set-option -t "$SID:" -u @qb_dash_expanded
+}
+
 # Every pane in the window as `<id>:<width>`, in reading order — top row left to
 # right, then the row under it. `resize-pane -x` moves a boundary inside one row
 # only, so laying them out in that order is what makes the reassert converge: the
@@ -358,7 +377,17 @@ restore_widths() {
 hide_pane() {   # hide_pane <what> <pane id> <size to come back at>
   local widths
   widths=$(pane_widths)
-  tmux break-pane -d -s "$2" -n "$HOLDING" \
+  # `-t "$SID:"` NAMES THE SESSION, and it is not decoration. `break-pane`
+  # with no destination puts the new window in the CLIENT'S CURRENT session,
+  # not in the one the source pane lives in — so on a server running more than
+  # one screen, hiding a pane on the screen you are NOT looking at parks it in
+  # the other screen's window list. Everything downstream then fails to find
+  # it: `pane_exists` and the restore path both search `list-panes -s -t
+  # "$SID"`, which is scoped to this session, so the pane is simultaneously
+  # alive, stranded, and reported as gone. Measured on 3.6a against two live
+  # screens; it cannot show up in a test with one session on the server, which
+  # is why it went unnoticed until a screen was built beside a real one.
+  tmux break-pane -d -s "$2" -t "$SID:" -n "$HOLDING" \
     || die "$1: tmux would not break the pane out"
   tmux set-option -t "$SID:" "@qb_hidden_$1" "$2 $3 $widths"
 }
@@ -422,14 +451,14 @@ toggle_tape() {
 # 78x32 over a full-width one. So the tape steps out, the dash goes in, the tape
 # comes back — the same three panes, the same processes, the order they were
 # built in.
-toggle_dash() {
+restore_dash() {
   local state p size widths target tape tape_h="" was
   was=$(active_pane)
   state=$(hidden_state dash)
   if [ -n "$state" ]; then
     read -r p size widths <<<"$state"
     if ! pane_exists "$p"; then
-      tmux set-option -t "$SID:" -u @qb_hidden_dash
+      forget_dash
       die "the hidden dash is gone — nothing to bring back"
     fi
     target=$(first_seat)
@@ -445,7 +474,9 @@ toggle_dash() {
       # purpose — a full-height dash down the side of a shortened tape, which is
       # the exact thing the step-aside exists to avoid. Nothing has moved at this
       # point, so refusing leaves a screen that is merely missing its dash.
-      tmux break-pane -d -s "$tape" -n "$HOLDING" \
+      # -t, for the reason hide_pane gives: without it this parks the tape in
+      # whichever session the client is looking at.
+      tmux break-pane -d -s "$tape" -t "$SID:" -n "$HOLDING" \
         || die "dash: the tape would not step out of the way, so nothing was moved"
     fi
     if ! tmux join-pane -h -f -l "$size" -s "$p" -t "$target"; then
@@ -475,11 +506,120 @@ toggle_dash() {
     restore_widths "$widths"
     keep_cursor "$was"
     tmux set-option -t "$SID:" -u @qb_hidden_dash
-  else
-    p=$(dash_pane)
-    [ -n "$p" ] || die "this screen has no dash"
-    hide_pane dash "$p" "$(tmux display-message -p -t "$p" '#{pane_width}')"
+    # EXPANDED AND HIDDEN COME BACK THE SAME WAY, so the marker that told them
+    # apart is cleared here rather than in `expand_dash` — there is one route back
+    # into the row and it must leave one truth behind it however it was reached.
+    tmux set-option -t "$SID:" -u @qb_dash_expanded
+    return 0
   fi
+  return 1
+}
+
+# The `d` half: out of the row and out of sight, or back.
+toggle_dash() {
+  local p
+  restore_dash && return 0
+  p=$(dash_pane)
+  [ -n "$p" ] || die "this screen has no dash"
+  hide_pane dash "$p" "$(tmux display-message -p -t "$p" '#{pane_width}')"
+}
+
+# THE DASH FULL SCREEN, AND IT IS THE SAME MOVE AS HIDING IT — `break-pane`
+# without `-d`, so the pane lands in a window of its own and the client follows
+# it there. Everything that makes `d` work makes this work: the widths are
+# recorded before the break and reasserted after the join, the process is never
+# touched (the dash keeps polling the whole time), and the way back is
+# `restore_dash`, which is the branch `d` has always used.
+#
+# NOT `resize-pane -Z`, which was the obvious answer and is the wrong one. Zoom is
+# a property of the WINDOW and tmux drops it on any layout change — and this
+# screen makes them constantly: `select-layout -E` when a seat is closed, and the
+# window-resized hook reasserting @qb_dash_width on every client attach. A dash
+# zoomed to read would pop back to 78 columns the moment somebody attached a
+# phone, with nothing on screen to say why.
+#
+# The break also takes the dash out of `qb-seats`' reach, and that is a property
+# rather than a risk: its `dash_pane` looks in `$SESSION_ID:seats` alone, so the
+# resize hook cannot find an expanded dash and cannot shrink it. Nothing had to be
+# taught about this mode for that to be true.
+#
+# WHAT THE DASH DOES WITH THE ROOM is its own business and is not arranged here.
+# It is a Textual app that lays its panels out to the width it is given, so a
+# window-wide pane simply crosses the threshold and goes two columns across. This
+# verb moves a pane; the layout is qb-dash-tui's.
+#
+# TWO TOGGLES OVER THREE STATES, and the states are `d`'s and this one's read
+# together: in the row, hidden, expanded. `d` means "in the row or not" and `z`
+# means "full screen or not", so the crossings are decided rather than
+# accidental — the middle case is the one worth stating.
+#
+#   z  in the row → expanded, and expanded → in the row
+#   z  HIDDEN     → expanded. Not "bring it back to the row", which is `d`, and
+#                   not a refusal: somebody pressing `z` is asking for a dash they
+#                   can read, and a hidden one is one step from that rather than
+#                   in the wrong state for it. Cheap, too — the pane is already
+#                   alone in a window of its own, so this is a rename and a
+#                   select and no geometry moves at all.
+#   d  expanded   → in the row. One route back, whichever route left.
+expand_dash() {
+  local state p size widths
+  # EXPANDED FIRST, because `restore_dash` answers for both states and this is
+  # the one where "put it back" is what was asked for. Asking it first would make
+  # `z` on a hidden dash restore it to the row — the one crossing that belongs to
+  # the other key.
+  if [ -n "$(tmux show-options -t "$SID:" -qv @qb_dash_expanded)" ]; then
+    restore_dash && return 0
+    # THE MARKER IS WRONG AND THIS IS THE PROOF, so it does not survive being
+    # disproved: `restore_dash` returning 1 means there is no `@qb_hidden_dash`
+    # to go back to, and a marker saying "expanded" with nothing recorded
+    # describes no pane. Left set, it makes this the answer to every later `z`.
+    tmux set-option -t "$SID:" -u @qb_dash_expanded
+    die "expand: the dash was marked expanded with nothing recorded to put back — \
+the marker is cleared, so the next z reads the screen as it actually is"
+  fi
+  state=$(hidden_state dash)
+  if [ -n "$state" ]; then
+    read -r p size widths <<<"$state"
+    if ! pane_exists "$p"; then
+      forget_dash
+      die "the hidden dash is gone — nothing to expand"
+    fi
+    # NOTHING IS BROKEN OUT AND NOTHING IS RECORDED. `hide_pane` already put this
+    # pane in a window of its own and wrote the widths to come back with, and both
+    # are still true — the row has not moved since. So the whole of promoting a
+    # hidden dash to an expanded one is renaming the window it is parked in and
+    # looking at it. `break-pane` here would fail outright: a window with one pane
+    # has nothing to break.
+    tmux rename-window -t "$p" "$EXPANDED" \
+      || die "expand: tmux would not rename the window the dash is parked in"
+    tmux select-window -t "$p"
+    tmux set-option -t "$SID:" @qb_dash_expanded "$p"
+    return 0
+  fi
+  p=$(dash_pane)
+  [ -n "$p" ] || die "this screen has no dash"
+  # BOTH READINGS HAPPEN BEFORE THE BREAK, and the dash's own width is the one
+  # that is easy to get wrong here in a way `d` never could: hide_pane is HANDED
+  # its size by a caller that read it first, while this function does its own
+  # break, so reading afterwards is one line away and looks identical. It is not.
+  # After the break the pane fills its new window, so the recorded size is the
+  # whole terminal — and the join back then asks for a 240-column pane inside a
+  # 240-column window and fails with "create pane failed: pane too small", which
+  # names neither the width nor the reading that produced it.
+  #
+  # The row's widths are before the break for hide_pane's stated reason:
+  # afterwards the dash's columns have already gone to a neighbour, and recording
+  # then would put the screen back the way the break left it.
+  size=$(tmux display-message -p -t "$p" '#{pane_width}') \
+    || die "expand: tmux reported no width for the dash"
+  widths=$(pane_widths)
+  # -t, for the reason hide_pane gives — and here it is the difference between
+  # a dash filling the screen you are on and a dash appearing in somebody
+  # else's window list while yours reports it missing.
+  tmux break-pane -s "$p" -t "$SID:" -n "$EXPANDED" \
+    || die "expand: tmux would not break the dash out"
+  tmux set-option -t "$SID:" @qb_hidden_dash "$p $size $widths"
+  tmux set-option -t "$SID:" @qb_dash_expanded "$p"
 }
 
 # A NUDGE UPDATES @qb_dash_width, and that is the point rather than a side
@@ -492,6 +632,12 @@ toggle_dash() {
 # fits, with qb-seats saying so on stderr as it always did.
 nudge_dash() {   # nudge_dash <+|->
   local p now want
+  # Two states, two sentences. "Hidden" about a dash filling the screen in front
+  # of you is the kind of wrong answer that makes somebody doubt the tool rather
+  # than the state.
+  if [ -n "$(tmux show-options -t "$SID:" -qv @qb_dash_expanded)" ]; then
+    die "the dash is expanded — it is a window of its own, so there is no row to widen it in"
+  fi
   [ -z "$(hidden_state dash)" ] || die "the dash is hidden — bring it back first"
   p=$(dash_pane)
   [ -n "$p" ] || die "this screen has no dash"
@@ -529,6 +675,7 @@ case "$ACTION" in
     ;;
   tape) toggle_tape ;;
   dash) toggle_dash ;;
+  expand) expand_dash ;;
   fit)  run_out "--dash-fit" "$(seats_bin)" --dash-fit -s "$SESSION" ;;
   wider)    nudge_dash + ;;
   narrower) nudge_dash - ;;

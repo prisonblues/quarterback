@@ -13,12 +13,13 @@ import shlex
 import socket
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"
@@ -522,117 +523,63 @@ def clip(s: str | None, n: int) -> str:
     return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
 
-#: How a seat spells itself on the board: `seat-<scope>-<n>`, where the scope is
-#: the project the seat sits in and is what stops two screens on one machine both
-#: wanting seat 1 (#208). The scope is optional because a seat whose scope slugged
-#: away to nothing — or that was deliberately started with an empty QB_SEAT_SCOPE —
-#: keeps the bare `seat-<n>` this had before, and the dashboard must go on
-#: recognising those.
-#:
-#: The NUMBER is the last hyphenated field, not the first: a scope may contain
-#: hyphens of its own, and `seat-nix-fleet-3` is seat 3 of nix-fleet rather than
-#: anything about `nix`. The bound is qb-seat's own 1-99.
-SEAT_RE = re.compile(r"^seat-(?:(.+)-)?([1-9][0-9]?)$")
-
-#: The most of `seat-<scope>-<n>` a scope may take, mirroring SEAT_SCOPE_MAX in
-#: qb-seat: the board allows 40 characters and `seat-`, a hyphen and two digits
-#: account for the other eight.
-SCOPE_MAX = 32
-
-
-def _seat(holder: str | None) -> "re.Match[str] | None":
-    """The seat match for a board identity, on the name half of `machine/name`."""
-    if not holder:
-        return None
-    return SEAT_RE.match(holder.rsplit("/", 1)[-1])
-
-
-def seat_number(holder: str | None) -> int | None:
-    """1 for 'zeus/seat-lexray-1' and for 'zeus/seat-1'.
-
-    None for anything that is not a seat.
-    """
-    match = _seat(holder)
-    return int(match.group(2)) if match else None
-
-
-def seat_machine(holder: str | None) -> str | None:
-    """'zeus' for 'zeus/seat-lexray-1'. None for anything that is not a seat.
-
-    The board is the FLEET's, not this box's: two machines can each hold a
-    `seat-lexray-1`, so the machine half is part of what identifies a seat and
-    leaving it out shows a remote agent's state against a local pane.
-    """
-    if _seat(holder) is None:
-        return None
-    machine, sep, _ = (holder or "").partition("/")
-    return machine if sep else None
-
-
-def seat_scope(holder: str | None) -> str | None:
-    """'lexray' for 'zeus/seat-lexray-1'.
-
-    None for 'zeus/seat-1', which is a seat numbered across the whole machine,
-    and None for anything that is not a seat at all. The two cases are told
-    apart by :func:`seat_number`, which answers for the first and not the second.
-    """
-    match = _seat(holder)
-    return match.group(1) if match else None
-
-
-def slug_scope(text: str | None) -> str | None:
-    """Turn a requested scope into the one a seat will actually carry.
-
-    MIRRORS `seat_scope_slug` in qb-seat, and is pinned to it by
-    test_the_scope_rule_is_the_one_qb_seat_actually_applies — two implementations
-    of one rule is exactly how a dashboard ends up showing one seat's state
-    against another seat's pane. Case folding is ASCII-only for the same reason:
-    qb-seat folds with `tr '[:upper:]' '[:lower:]'`, which is bytes, where
-    str.lower() is Unicode.
-    """
-    if not text:
-        return None
-    lowered = "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
-    slug = re.sub(r"[^a-z0-9]+", "-", lowered).strip("-")[:SCOPE_MAX].rstrip("-")
-    return slug or None
-
-
-def scope_of(repo_path: str | None) -> str | None:
-    """The scope qb-seat gives a seat working in ``repo_path`` and told nothing else.
-
-    The default half of the rule: a seat is named after its repository's own
-    directory.
-    """
-    return slug_scope(os.path.basename((repo_path or "").rstrip("/")))
-
-
-def pane_scope(seat: dict) -> str | None:
-    """The scope of the seat in a tmux pane, or None when the pane cannot say.
-
-    `@qb_scope` first, because a screen given an explicit QB_SEAT_SCOPE is the one
-    case the repository cannot answer for: two screens on ONE repository, which is
-    precisely what that knob exists for. `@qb_repo` otherwise, which is the default
-    the seat itself computed from its cwd.
-
-    An explicitly EMPTY scope reads here as "the pane cannot say", and that is the
-    right answer rather than a gap: an empty scope asks for the machine-wide seat
-    numbering, in which a second screen cannot hold the same number at all — so
-    there is never a second candidate for the caller to confuse it with.
-    """
-    return slug_scope(seat.get("scope")) or scope_of(seat.get("repo"))
+# ---- a seat is a pane, and a pane says which agent is in it (#540) ----------
+#
+# A vocabulary lived here for parsing `seat-<scope>-<n>` back out of a board
+# identity — SEAT_RE, seat_number, seat_machine, seat_scope, slug_scope, scope_of
+# and pane_scope, plus a test pinning its slug rule byte-for-byte against the one
+# `qb-seat` applied. All of it existed to answer one question: which tmux pane is
+# this board row sitting in?
+#
+# The board answers that itself and always did. `GET /active` returns a `session`
+# for every agent, and `qb-hook` stamps that same session id on the pane it is
+# running in (`@qb_session`, at SessionStart) — which is how the ✕ on the seat bar
+# has been ending the right agent since long before this. So the join is an
+# equality on the session id, and every one of those helpers went with the seat
+# name that made them necessary.
+#
+# It is also a better answer than the one it replaces, which had to narrow three
+# times and could still come back ambiguous: two screens on one box could each
+# hold a seat 1 (#208), two machines on the fleet could each hold a seat-lexray-1,
+# and the second narrowing was against a GUESS at this host's board name. A
+# session id is unique across all of it by construction — and a pane running an
+# agent this screen did not start now resolves too, where a name-derived seat
+# number could only ever see agents that had called themselves seats.
 
 
 class BoardConfig:
-    """Where the board is and how to authenticate to it."""
+    """Where the board is and how to authenticate to it.
 
-    def __init__(self, base_url: str, token: str, agent: str) -> None:
+    TWO URLS AND TWO CREDENTIALS, because the board has two front doors and they
+    are not interchangeable. `base_url` is the AGENT vhost, reached with a bearer
+    token, and it is what every read and every agent write here uses.
+    `human_url` is the BROWSER vhost, reached with a signed-in session cookie,
+    and it is the only door the human-only endpoints can be reached through at
+    all — `app/auth.py` has the agent vhost strip `X-Edge-Auth`, so a call that
+    only a person may make cannot be made on the agent side however it is
+    authenticated. See :class:`HumanClient`.
+    """
+
+    def __init__(self, base_url: str, token: str, agent: str,
+                 human_url: str = "", human_key: str = "",
+                 human_key_cmd: str = "") -> None:
         self.base_url, self.token, self.agent = base_url.rstrip("/"), token, agent
+        self.human_url = (human_url or "").rstrip("/")
+        #: A PERSON's key for the human-only endpoints (`X-Human-Key`), presented
+        #: to the SAME host as the bearer — the agent vhost, no Authelia. See
+        #: :class:`HumanClient`.
+        self.human_key = human_key or ""
+        #: How to GET it, for the same reason `token_cmd` exists beside `token`: a
+        #: secret that lives in 1Password is one `op` can re-read, and one that
+        #: never sits in a file on disk. A value is still accepted — a test, or a
+        #: box with no `op` — but the command is the form the fleet ships.
+        self.human_key_cmd = human_key_cmd or ""
 
 
 def resolve_config() -> BoardConfig:
     """Environment first, then the per-host config file.
 
-    The same contract qb-seat implements in bash, and read the same way: the
+    The same contract `qb-env` implements in bash, and read the same way: the
     config is an unrestricted shell script, so it is SOURCED IN A SUBSHELL with
     three values read back out. Sourcing it into this process would let it
     replace anything it liked; parsing it with a regex would get the quoting
@@ -646,17 +593,36 @@ def resolve_config() -> BoardConfig:
     url = os.environ.get("QUARTERBACK_BASE_URL", "")
     token = os.environ.get("QUARTERBACK_TOKEN", "")
     token_cmd = os.environ.get("QUARTERBACK_TOKEN_CMD", "")
+    # The browser vhost and a signed-in session for it. Both optional and both
+    # usually only in the file — a shell has no reason to carry them — which is
+    # why the condition below asks about them too. It used to read "no url or no
+    # token", and a host with those two in its environment then never sourced the
+    # config at all: the human URL sitting in that file was invisible, and the
+    # dashboard reported no human credential on a machine that had one.
+    human_url = os.environ.get("QUARTERBACK_HUMAN_URL", "")
+    human_key = os.environ.get("QUARTERBACK_HUMAN_KEY", "")
+    human_key_cmd = os.environ.get("QUARTERBACK_HUMAN_KEY_CMD", "")
 
-    if not url or not (token or token_cmd):
+    if (not url or not (token or token_cmd) or not human_url
+            or not (human_key or human_key_cmd)):
         config = (os.environ.get("QUARTERBACK_CONFIG")
                   or os.path.join(os.environ.get("XDG_CONFIG_HOME")
                                   or os.path.expanduser("~/.config"),
                                   "quarterback", "config"))
         if os.path.isfile(config):
+            # `%s\n` PER VALUE and nothing clever: a cookie is one line of opaque
+            # text that may carry `=` and `;`, so the reader below partitions on
+            # the FIRST `=` only — `name, _, value = line.partition("=")` keeps
+            # everything after it verbatim, which is what a `session=abc; other=d`
+            # needs. A cookie carrying a newline would break the framing, and
+            # cannot: HTTP header values do not have them.
             script = (f'. {shlex.quote(config)} >&2 || exit 1\n'
                       'printf "url=%s\\n" "${QUARTERBACK_BASE_URL:-}"\n'
                       'printf "token=%s\\n" "${QUARTERBACK_TOKEN:-}"\n'
-                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n')
+                      'printf "token_cmd=%s\\n" "${QUARTERBACK_TOKEN_CMD:-}"\n'
+                      'printf "human_url=%s\\n" "${QUARTERBACK_HUMAN_URL:-}"\n'
+                      'printf "human_key=%s\\n" "${QUARTERBACK_HUMAN_KEY:-}"\n'
+                      'printf "human_key_cmd=%s\\n" "${QUARTERBACK_HUMAN_KEY_CMD:-}"\n')
             got = subprocess.run(["bash", "-c", script], capture_output=True,
                                  text=True, timeout=15)
             if got.returncode == 0:
@@ -668,6 +634,12 @@ def resolve_config() -> BoardConfig:
                         token = value
                     elif name == "token_cmd" and not token_cmd:
                         token_cmd = value
+                    elif name == "human_url" and not human_url:
+                        human_url = value
+                    elif name == "human_key" and not human_key:
+                        human_key = value
+                    elif name == "human_key_cmd" and not human_key_cmd:
+                        human_key_cmd = value
 
     if not token and token_cmd:
         got = subprocess.run(["bash", "-c", token_cmd], capture_output=True,
@@ -677,7 +649,9 @@ def resolve_config() -> BoardConfig:
     if not url:
         raise RuntimeError("no board configured (QUARTERBACK_BASE_URL is unset "
                            "and the site config did not supply one)")
-    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0])
+    return BoardConfig(url, token, socket.gethostname().split(".", 1)[0],
+                       human_url=human_url, human_key=human_key,
+                       human_key_cmd=human_key_cmd)
 
 
 def _ssl_context():
@@ -701,14 +675,248 @@ def _ssl_context():
     return ssl.create_default_context(cafile=certifi.where())
 
 
+#: The header a person's own key travels in — `app.auth.HUMAN_KEY_HEADER`. Named
+#: rather than spelled inline so the two halves of one contract are greppable as a
+#: pair; the board owns the name and this is the client that honours it.
+HUMAN_KEY_HEADER = "X-Human-Key"
+
+
+class HumanClient:
+    """The writes only a PERSON may make, on a person's own key (#477, #479).
+
+    A separate class from :class:`BoardClient` and not a method on it, because
+    the credential is different and the difference is the whole point: this one
+    authorises as `human/<user>`, and a caller that could reach it by accident
+    from the ordinary client would be authoring decisions as a person.
+
+    **Same host as everything else, and no Authelia.** It presents `X-Human-Key`
+    to the agent vhost, beside the bearer that says which machine this is. That
+    is what makes it maintainable: an earlier cut of this class held a signed-in
+    Authelia session and posted to the browser vhost, and a session expires on a
+    wall clock — so the dashboard's `✎` would have gone dead every time the
+    cookie lapsed, and stayed dead until somebody re-minted it by hand. A static
+    key rotates when somebody decides to rotate it and never otherwise.
+
+    **What it costs is `app/config.py`'s to state and this class's to repeat**,
+    because a reader arrives here first: the key sits on this workstation,
+    readable by the processes running here, so an agent that goes looking can
+    find it and author as a person. Accepted deliberately (#479) and bounded by
+    being per person and revocable in one line.
+    """
+
+    #: What a caller is told when there is no human key here. Phrased as a remedy
+    #: because the usual reason is a machine that never had one — and because a UI
+    #: that greys a control out has room for a sentence and no room for a runbook.
+    NO_KEY = ("no human key on this host — set QUARTERBACK_HUMAN_KEY_CMD "
+              "in ~/.config/quarterback/config")
+
+    #: What the key command's own failure is reported as. Kept apart from NO_KEY
+    #: because they are opposite states with opposite remedies: nothing configured
+    #: is a box that never had one, and a command that failed is usually `op`
+    #: wanting to be unlocked — fixable in ten seconds by somebody who is told.
+    KEY_FAILED = "the human-key command failed"
+
+    #: Everything a key may be made of: printable ASCII, no controls. The bound
+    #: that matters is CR and LF — `http.client.putheader` refuses those, and
+    #: refuses them by raising a ValueError CARRYING THE HEADER VALUE, which this
+    #: dashboard would then print on its detail line. A credential in a UI string
+    #: is a credential in a screenshot, a scrollback and a tmux buffer.
+    _KEY_OK = re.compile(r"^[\x20-\x7e]+$")
+
+    def __init__(self, cfg: BoardConfig) -> None:
+        self.cfg = cfg
+        #: The resolved key, once something has resolved it. `None` is "not asked
+        #: yet" and not "there isn't one" — see :meth:`key`.
+        self._key: str | None = None
+
+    def key(self, refresh: bool = False) -> str:
+        """The key, resolved as late as possible.
+
+        **Lazily, and this is the difference between a credential and a copy of
+        one.** A value in the environment is in every child process of the shell
+        that set it and in the config file it came from; a command is run when a
+        write is actually made, which on this fleet means `op read` against a
+        vault that may need unlocking. The secret then lives in this process for
+        as long as it is useful and nowhere else.
+
+        `refresh` re-runs the command. Unlike the session this replaced, a static
+        key does not go stale on its own — so this exists for the one case that
+        remains, a key rotated while a long-lived dashboard was running.
+        """
+        if self._key is not None and not refresh:
+            return self._key
+        if self.cfg.human_key and not refresh:
+            # THROUGH THE SAME CHECK, and stripped the same way. A literal comes
+            # from a config file or an environment variable, both of which carry
+            # trailing newlines as readily as `op` does.
+            self._key = self._checked(self.cfg.human_key.strip())
+            return self._key
+        if not self.cfg.human_key_cmd:
+            raise RuntimeError(self.NO_KEY if not self.cfg.human_key else
+                               "this key is a fixed value and cannot be "
+                               "refreshed — update QUARTERBACK_HUMAN_KEY, or use "
+                               "the _CMD form")
+        try:
+            got = subprocess.run(["bash", "-c", self.cfg.human_key_cmd],
+                                 capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            # THE LIKELY CAUSE, NAMED. `op read` against a desktop-app
+            # integration raises a biometric prompt, and a prompt nobody answers
+            # is a command that never returns — measured here at 30s to fail and
+            # 8.7s to succeed once approved. "TimeoutExpired" tells a person
+            # nothing they can act on; "look at your desktop" tells them
+            # everything, and it is right far more often than it is wrong.
+            raise RuntimeError(
+                f"{self.KEY_FAILED}: it did not finish in 30s. If it is `op`, "
+                "there is probably an approval prompt waiting on your desktop — "
+                "answer it and press ✎ again") from exc
+        except Exception as exc:                  # noqa: BLE001
+            raise RuntimeError(f"{self.KEY_FAILED}: {type(exc).__name__}") from exc
+        value = got.stdout.strip()
+        if got.returncode != 0 or not value:
+            # stderr, clipped: `op` says "not signed in" there and nowhere else,
+            # and a remedy the caller cannot read is a remedy they do not have.
+            why = " ".join((got.stderr or "").split())[:200]
+            raise RuntimeError(f"{self.KEY_FAILED}" + (f": {why}" if why else ""))
+        self._key = self._checked(value)
+        return self._key
+
+    def _checked(self, value: str) -> str:
+        """One header-safe line, or a refusal that does NOT quote what was wrong.
+
+        Checked HERE rather than left to `putheader`, and the difference is the
+        whole point: the stdlib's own message is `Invalid header value
+        b'<the entire secret>'`, and every caller of this class turns an exception
+        into a sentence for a human to read.
+        """
+        if self._KEY_OK.match(value):
+            return value
+        bad = next((f"{c!r}" for c in value if not (0x20 <= ord(c) <= 0x7e)), "?")
+        raise RuntimeError(
+            f"the human key is not usable as a header — it contains {bad}. "
+            "A newline or control character in the vault field is the usual "
+            "cause; the value itself is not shown here on purpose")
+
+    def why_not(self) -> str | None:
+        """None when a human write could work here; otherwise why it cannot.
+
+        Asked BEFORE the control is drawn rather than after it is used. A verb
+        that looks available and fails on the click is the shape that gets read as
+        a broken button, and this one would fail against a board that is perfectly
+        healthy — the thing that is missing is on this host.
+
+        **A CONFIGURED COMMAND COUNTS**, and running it to find out does not
+        belong here: this is asked on every paint, `op read` is a network call and
+        a possible unlock prompt, and a dashboard that ran one every few seconds
+        would be its own bug. Whether the key WORKS is answered where it is used —
+        at the write, in a sentence the panel shows verbatim.
+        """
+        if not (self.cfg.human_key or self.cfg.human_key_cmd):
+            return self.NO_KEY
+        return None
+
+    def post(self, path: str, body: dict) -> dict:
+        """One human write. Raises with a sentence a panel can show verbatim."""
+        why = self.why_not()
+        if why:
+            raise RuntimeError(why)
+        headers = {"Content-Type": "application/json", HUMAN_KEY_HEADER: self.key()}
+        if self.cfg.token:
+            # The bearer rides along: it is what says which MACHINE this is, and
+            # the board reads both — the key answers "which person", the token
+            # answers "from where". A board that got only the key would authorise
+            # the write and have nothing to say about its origin.
+            headers["Authorization"] = f"Bearer {self.cfg.token}"
+        req = urllib.request.Request(
+            f"{self.cfg.base_url}{path}", data=json.dumps(body).encode(),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30,
+                                        context=_ssl_context()) as resp:
+                text = resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._refusal(exc)) from exc
+        except ValueError as exc:
+            # The stdlib refusing to send the header at all. `_checked` should have
+            # caught this; if something got past it, the one thing that must not
+            # happen is the message reaching a screen, because it quotes the value.
+            raise RuntimeError("this key cannot be sent as a header "
+                               f"({type(exc).__name__}); the value is withheld") from None
+        return json.loads(text) if text.strip() else {}
+
+    @staticmethod
+    def _refusal(exc: "urllib.error.HTTPError") -> str:
+        """What the board said, in words a panel can show.
+
+        The board names its own mechanism in the body, so the body is what is
+        worth relaying — a 403 here is "this key matches nobody" or "this endpoint
+        is human-only", and those want different things done about them.
+        """
+        try:
+            body = exc.read().decode()[:400]
+        except Exception:                             # noqa: BLE001
+            body = ""
+        said = ""
+        try:
+            detail = json.loads(body).get("detail")
+            said = detail if isinstance(detail, str) else json.dumps(detail)
+        except Exception:                             # noqa: BLE001
+            said = " ".join(body.split())[:200]
+        if exc.code in (401, 403):
+            return said or f"the board refused this key ({exc.code})"
+        return said or f"the board answered {exc.code}"
+
+    def set_dial(self, dial: str, value, reason: str, repo: str | None = None,
+                 expires_at: str | None = None) -> dict:
+        """Put a dial in force (`POST /dials`), as the person this key names.
+
+        **`value` is any JSON and this does not know what a dial means** — the
+        harness owns that vocabulary and a client that checked it would be the
+        second place a dial is written down (#56, #305). It is passed through as
+        given, `None` included: `null` is the documented off switch for three
+        dials and the board keeps it apart from "no row at all".
+
+        `reason` is required by the board and required here — a dial whose
+        argument was never written down is one nobody can decide to remove — so a
+        blank one is refused where it can be explained rather than at a 422.
+        """
+        if not (reason or "").strip():
+            raise RuntimeError("a dial needs a reason: why is this value in force?")
+        body: dict = {"dial": dial, "value": value, "reason": reason.strip()}
+        if repo:
+            body["repo"] = repo
+        if expires_at:
+            body["expires_at"] = expires_at
+        return self.post("/dials", body)
+
+    def clear_dial(self, dial: str, repo: str | None = None) -> dict:
+        """Take a dial off the board (`POST /dials/clear`); the repo's default returns."""
+        body: dict = {"dial": dial}
+        if repo:
+            body["repo"] = repo
+        return self.post("/dials/clear", body)
+
+
 class BoardClient:
     """The handful of calls the harness makes. stdlib only, on purpose."""
 
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
 
-    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False) -> dict:
+    #: How long a board call waits when the caller names no bound. Generous,
+    #: because most callers here are a dashboard refresh or a one-shot script for
+    #: which a slow answer beats no answer.
+    TIMEOUT = 30
+
+    def _request(self, req: urllib.request.Request, *, allow_empty: bool = False,
+                 timeout: float | None = None) -> dict:
         """One authenticated request. ``allow_empty`` belongs to the WRITE path only.
+
+        ``timeout`` is for the callers on a HOT PATH, where :data:`TIMEOUT` is the
+        wrong trade: ``harness_rules.DIALS_TIMEOUT`` makes the same argument for the
+        same read — a dial resolution runs on every loop tick, so a board that is
+        down must cost a moment rather than half a minute. ``None`` keeps the
+        generous default every existing caller was written against.
 
         An empty body is not ``{}``. A proxy's contentless 502, a 204 from a board
         mid-deploy, a truncated response — read as an empty object, every one of
@@ -725,17 +933,19 @@ class BoardClient:
         """
         if self.cfg.token:
             req.add_header("Authorization", f"Bearer {self.cfg.token}")
-        with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or self.TIMEOUT,
+                                    context=_ssl_context()) as resp:
             body = resp.read().decode()
         if allow_empty and not body.strip():
             return {}
         return json.loads(body)
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def get(self, path: str, params: dict | None = None,
+            timeout: float | None = None) -> dict:
         query = urllib.parse.urlencode(
             {k: v for k, v in (params or {}).items() if v is not None})
         url = f"{self.cfg.base_url}{path}" + (f"?{query}" if query else "")
-        return self._request(urllib.request.Request(url))
+        return self._request(urllib.request.Request(url), timeout=timeout)
 
     def post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(
@@ -2153,6 +2363,613 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
     return clip(" · ".join(bits), 400)
 
 
+# ---- the dials in force ------------------------------------------------------
+#
+# A dial is a setting: the repo supplies a default, the BOARD states the value in
+# force, and the layer that answered is part of the answer (#305). Until #477
+# nothing a person or an agent looks at showed one. `GET /dials` was written and
+# read by exactly two things — a browser endpoint and one function in
+# `panel_seats.py` — so the value governing every round on the fleet was invisible
+# on `qb-dash`, `qb-dash-tui`, `qb-board` and the web board alike.
+#
+# That was tolerable while a dial only configured what a review round costs. It
+# stops being tolerable with `tempo` (#474), which is the answer to "is this fleet
+# working right now, and how hard" — and that is a fact which has to be legible
+# from the place the fleet is driven from, which is a terminal.
+#
+# **This file does not learn the vocabulary, and that is not laziness.** The board
+# stores `dial` as opaque text and `value` as opaque JSON because the harness owns
+# the dial table (`harness/loops/harness_rules.py`), and a copy anywhere else is a
+# second place a dial is written down — #56's rule, and the confusion #305 exists
+# to end. So everything below renders what the board said and asserts nothing
+# about what it MEANS: `tempo` gets a cell of its own because the issue asks for
+# one, not because this module knows what an `eager` is.
+
+#: The dial the fleet's throttle lives on (#474). Named here for one reason: it is
+#: the dial that gets a cell of its own on the header line, next to the caps it is
+#: there to protect. Its VALUES are not named here, and must not be — a screen that
+#: knew the rungs would be a second copy of the ladder.
+TEMPO_DIAL = "tempo"
+
+#: The shape of an answer, so a caller that got an error still gets one it can
+#: read — `EMPTY_PLAN`'s argument, for the same reason.
+EMPTY_DIALS: dict = {"dials": [], "shadowed": [], "error": None, "asked": False,
+                     "now": None}
+
+
+def fetch_dials(client, repos: list[str] | None = None) -> dict:
+    """What the board says is in force, for the repos this screen watches.
+
+    One call per repo, because `GET /dials?repo=X` answers with X's own dials AND
+    the fleet-wide ones — which is the join a reader wants and a screen watching
+    two projects has to make twice. A screen that resolved no repo at all asks
+    once with no scope, which returns the fleet rows: the honest answer for a
+    dashboard that cannot say which project it is in.
+
+    Reading is free with the credential this dashboard already holds: `GET /dials`
+    takes `app.auth.reader`, which a machine bearer token passes. Writing is not,
+    and that asymmetry is the whole shape of #477 — see :func:`dials_url`.
+
+    Never raises. A board that will not answer is `error`, and `asked` stays True
+    so that a caller can tell "no dials are set" from "nobody has asked yet": the
+    first is a state worth drawing and the second is a screen that has not
+    finished starting, and #244's rule is that those must not look alike.
+    """
+    out: dict = {**EMPTY_DIALS, "asked": True}
+    scopes = [r for r in (repos if repos is not None else resolve_repos()) if r] or [None]
+    rows: list[dict] = []
+    seen: set[tuple] = set()
+    for scope in scopes:
+        try:
+            got = client.get("/dials", {"repo": scope} if scope else None)
+        except Exception as exc:                  # noqa: BLE001 — display it, don't die
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            break
+        # The BOARD's clock, kept for anything that has to write a time against
+        # it. "In four hours" computed from this machine's clock is four hours
+        # from whatever this machine believes, and a box whose clock is an hour
+        # slow has its expiry refused as being in the past — a validation error
+        # about a field nobody typed. `app/static/dials.html` corrects the same
+        # way from the same field.
+        out["now"] = (got or {}).get("now") or out.get("now")
+        for row in (got or {}).get("dials") or []:
+            # Two repos' answers both carry the fleet rows. Keyed on (repo, dial)
+            # rather than on identity because that pair is what the board's own
+            # `ix_dial_settings_live` holds unique: one live row per scope per
+            # dial, so a duplicate here is the same row arriving twice.
+            key = (row.get("repo"), row.get("dial"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    out["dials"], out["shadowed"] = dials_in_force(rows, scopes)
+    return out
+
+
+def dials_in_force(rows: list[dict], repos: list[str | None] | None = None
+                   ) -> tuple[list[dict], list[dict]]:
+    """Split the board's rows into the ones in force and the ones overridden.
+
+    **A repo dial beats a fleet dial of the same name**, and that precedence is
+    the client's to apply — the board says so in one line and deliberately does
+    not do it, because a repo read returns both scopes so that ONE call answers
+    "what is in force here".
+
+    A fleet row is shadowed only where every repo on this screen overrides it. A
+    screen watching two projects, one of which sets `review_panel.max_rounds` for
+    itself, still has that fleet row in force in the other — and a panel that
+    dropped it would be reporting the first repo's answer as the fleet's.
+
+    Ordered repo-first then by name, which is the order `GET /dials` returns and
+    the order a reader would write the table in.
+    """
+    scopes = [r for r in (repos or []) if r]
+    overridden: dict[str, set[str]] = {}
+    for row in rows:
+        if row.get("repo"):
+            overridden.setdefault(row.get("dial") or "", set()).add(row["repo"])
+    in_force, shadowed = [], []
+    for row in rows:
+        beaten = (not row.get("repo") and scopes
+                  and set(scopes) <= overridden.get(row.get("dial") or "", set()))
+        (shadowed if beaten else in_force).append(row)
+    return sorted(in_force, key=_dial_order), sorted(shadowed, key=_dial_order)
+
+
+def _dial_order(row: dict) -> tuple:
+    """Repo before fleet, then by name — `GET /dials`' own order, and the order a
+    reader would write the table in."""
+    return (row.get("repo") is None, row.get("dial") or "")
+
+
+def dial_of(dials: dict | None, name: str, repo: str | None = None) -> dict | None:
+    """The row in force for one dial, or None. Repo scope first, then fleet.
+
+    The precedence is applied again here rather than trusted to the sort, because
+    a caller asking for one dial by name is asking which value ANSWERS — and with
+    two rows for it in the list, the wrong one is a plausible answer rather than
+    a visible bug.
+    """
+    rows = [d for d in (dials or {}).get("dials") or [] if d.get("dial") == name]
+    if repo:
+        rows.sort(key=lambda d: d.get("repo") != repo)
+    else:
+        rows.sort(key=lambda d: d.get("repo") is not None)
+    return rows[0] if rows else None
+
+
+def dial_value(row: dict | None, width: int = 24) -> str:
+    """A dial's value, rendered without claiming to know what it means.
+
+    JSON spellings throughout — `true`, `false`, `null` — rather than a friendlier
+    `on`/`off`, because the friendly words are a vocabulary and this file does not
+    have one. `null` in particular is a real setting on three dials (the documented
+    off switch for `max_fix_growth`, `distant_merge_lines` and
+    `escalate_on.premise_repeated`), and the board goes to some trouble to keep it
+    apart from "no row at all"; rendering it as blank would put the two back
+    together on the one screen a person reads.
+    """
+    if row is None:
+        return ""
+    value = row.get("value")
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, bool) or value is None:
+        text = {True: "true", False: "false", None: "null"}[value]
+    elif isinstance(value, (int, float)):
+        text = f"{value}"
+    else:
+        text = json.dumps(value, separators=(",", ":"))
+    return clip(text, width)
+
+
+#: What an indefinite dial's remaining-life cell says. **Not** `until()`'s `—`,
+#: which every other panel uses for a value nobody reported: an expiry that was
+#: never set is a decision somebody made, and the opposite of an unknown one.
+DIAL_NO_END = "no end"
+
+
+def dial_life(row: dict | None) -> tuple[str, str]:
+    """How long this dial has left, and how loudly to say it — (text, style).
+
+    **The half that must not be dropped.** A `tempo: eager` with forty minutes on
+    it and a `tempo: eager` set indefinitely are different situations and they must
+    not render identically — #244's rule (being idle and being broken must not look
+    alike) applied to a switch instead of a queue.
+
+    Which is why the INDEFINITE one is the loud cell and the countdown is the quiet
+    one, rather than the other way about. A dial that expires will take itself off
+    the board with nobody remembering it; a dial with no end stays until a person
+    goes and clears it, and the failure mode of the whole layer is a temporary
+    setting that outlived its reason with nothing saying it is still in force.
+    """
+    if row is None:
+        return "", "grey50"
+    if not row.get("expires_at"):
+        return DIAL_NO_END, "yellow"
+    left = until(row.get("expires_at"))
+    mins = minutes_left(row.get("expires_at"))
+    return left, "grey50" if mins is None or mins >= 10 else "grey62"
+
+
+def tempo_cell(dials: dict | None, repo: str | None = None
+               ) -> tuple[str, str, str, str] | None:
+    """The header cell: ("TEMPO", value, life, colour) — or None before the first ask.
+
+    Four states and no two of them alike, because collapsing any pair is the bug
+    this issue is about:
+
+      * **not asked yet** — None, and the caller draws nothing. A screen that
+        printed "unset" while its first fetch was still in flight would be stating
+        something it did not know.
+      * **the board would not answer** — `?`, in the colour of a thing that is
+        wrong. Not "unset": an unreadable dial is not an absent one.
+      * **no dial set** — `unset`, quietly. The harness's own default governs, and
+        this screen does not know what that is (see the section note).
+      * **a dial in force** — its value, and its life beside it.
+      * **more than one answer** — see below. Only reachable on a screen watching
+        several projects, and only where they disagree.
+
+    `repo` is the question "what is the tempo HERE", and with it given there is one
+    answer by construction: that repo's row, or the fleet's behind it. Without it
+    the screen is asking about everything it watches, and everything it watches can
+    disagree — which is the case this cell must not paper over.
+    """
+    if not (dials or {}).get("asked"):
+        return None
+    if (dials or {}).get("error"):
+        return "TEMPO", "?", "", "red"
+    live = [d for d in (dials or {}).get("dials") or [] if d.get("dial") == TEMPO_DIAL]
+    if not live:
+        return "TEMPO", "unset", "", "grey50"
+    row = dial_of(dials, TEMPO_DIAL, repo)
+    life, _ = dial_life(row)
+    if repo or len(live) == 1:
+        return "TEMPO", dial_value(row, 12), life, "cyan"
+    # SEVERAL ANSWERS, and the cell has room for one. Printing either of them would
+    # be this panel's own defect — one layer's value stated as though it were
+    # everybody's — so it says how many there are and leaves the panel below to say
+    # which is which.
+    #
+    # **The expiry counts as a disagreement, not just the value.** Two repos both
+    # `eager`, one for forty minutes and one indefinitely, are the pair this whole
+    # issue says must not render alike; agreeing on the word and then showing one
+    # of the two countdowns beside it is that failure with an extra step. So a
+    # split expiry keeps the value — it IS agreed — and gives up the life cell,
+    # which is the half that has no single answer.
+    if len({json.dumps(d.get("value"), sort_keys=True) for d in live}) > 1:
+        return "TEMPO", "mixed", f"{len(live)} repos", "yellow"
+    if len({d.get("expires_at") for d in live}) > 1:
+        return "TEMPO", dial_value(row, 12), f"{len(live)} repos", "yellow"
+    return "TEMPO", dial_value(row, 12), life, "cyan"
+
+
+def parse_dial_value(text: str):
+    """What a person typed, as the VALUE it looks like — JSON where it parses.
+
+    `2`, `true`, `null` and `["a","b"]` are values several dials document, and a
+    `max_rounds` of `"2"` is a dial the harness refuses to apply and reports by
+    name — a puzzle handed to somebody at a keyboard. Anything that is not JSON is
+    the string it looks like, because `P3` and `eager` are values too and
+    demanding quotes round them would make the common case the fiddly one.
+
+    `app/static/dials.html` implements this same rule in JavaScript, deliberately
+    and unavoidably twice: one is a browser and one is a terminal. They are kept
+    honest by `tests/test_dials_page.py`, which asserts the page's half, and by
+    this function's tests, which assert the same table of inputs.
+    """
+    raw = (text or "").strip()
+    if raw == "":
+        return ""
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+#: How long a written expiry may be, and the units a person types. Deliberately
+#: not seconds: a dial is set for an afternoon or for a fortnight, and "14400" is
+#: a number somebody has to work out.
+#: DIGITS ARE BOUNDED, and not for tidiness: `timedelta` raises OverflowError —
+#: not ValueError — past about 2.7 million days, so `99999999999999999999d`
+#: escapes a caller that catches the documented failure and lands in a UI
+#: callback as a crash. Six digits is 2739 years: past every legitimate use and
+#: short of every overflow.
+_EXPIRY_RE = re.compile(r"^\s*(\d{1,6})\s*([mhd])\s*$", re.I)
+_EXPIRY_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_dial_expiry(text: str, now: str | None = None) -> str | None:
+    """`4h` → an ISO timestamp four hours from the BOARD's now. Blank → None.
+
+    None means indefinite, which is a real answer and the one the board stores as
+    "until somebody clears it" — so a blank box is not a missing value here.
+
+    Measured from `now` when the board supplied one (:func:`fetch_dials` keeps
+    it). A clock an hour slow otherwise writes "in one hour" as a time already
+    past, which `POST /dials` refuses at the door — correctly, and in words about
+    a field the person never filled in.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    match = _EXPIRY_RE.match(raw)
+    if not match:
+        raise ValueError(f"{raw!r} is not a duration — try 30m, 4h or 7d, "
+                         "or leave it empty for a dial with no end")
+    seconds = int(match.group(1)) * _EXPIRY_UNITS[match.group(2).lower()]
+    if seconds <= 0:
+        raise ValueError("an expiry of zero is a dial that is absent the moment "
+                         "it is written — leave it empty for no end")
+    base = datetime.now(timezone.utc)
+    if now:
+        try:
+            base = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except ValueError:
+            pass                                  # a board too old to send one
+    return (base + timedelta(seconds=seconds)).isoformat()
+
+
+def dial_where(row: dict, show_repo: bool = True) -> tuple[str, str]:
+    """Which LAYER answered — ("fleet" | the repo, style).
+
+    The one column on these panels that does not answer to the screen's scope,
+    and deliberately: everywhere else the repo cell names a PROJECT, and a screen
+    showing one project spends eleven columns restating it (#261). Here it names
+    the layer a value came from, which is half of what a dial's answer IS — "in
+    force fleet-wide" and "in force for this repo" are different facts about the
+    same number, and a reader who cannot tell them apart cannot tell whether
+    clearing it changes one project or all of them.
+
+    So the word `repo` stands in for the name on a single-project screen, where
+    the name is already in the header and only the layer is news.
+    """
+    repo = row.get("repo")
+    if not repo:
+        return "fleet", "cyan"
+    return (clip(short_repo(repo), 11) if show_repo else "repo"), "grey62"
+
+
+def dial_detail(row: dict) -> str:
+    """The whole of a dial, for the detail line under the tables.
+
+    Worth a click because the row is six narrow cells and the argument does not
+    fit in one of them. The board REQUIRES a reason on every write for exactly
+    this reason — "a dial nobody can read an argument for is a dial nobody can
+    decide to remove" — so a surface that renders the value and drops the reason
+    keeps the setting and throws away the only thing that lets anybody undo it.
+
+    The expiry is spelled out rather than counted down. `no end` in a six-column
+    cell is the fact; "set indefinitely — nothing will clear this but a person" is
+    what the fact MEANS, and that sentence is the whole of why the two states must
+    not render alike.
+    """
+    bits = [f"{row.get('dial') or '?'} = {dial_value(row, 200)}"]
+    bits.append("fleet-wide" if not row.get("repo") else f"for {row['repo']}")
+    if row.get("expires_at"):
+        left = until(row.get("expires_at"))
+        bits.append(f"expires in {left}" if left != "—" else "expired")
+    else:
+        bits.append("set indefinitely — nothing will clear this but a person")
+    who = " ".join(x for x in ("set by", row.get("set_by")) if x)
+    # HOW, when the board recorded one. The identity is the same by either door,
+    # so this is the half that says which — a browser the edge vouched for, or a
+    # key on a workstation (#479). Absent is a row older than the column, and it
+    # is left out rather than guessed at.
+    via = {"edge": "in a browser", "key": "with a key",
+           "dev": "via the dev bypass"}.get(row.get("set_via"), row.get("set_via"))
+    if via:
+        who += f" {via}"
+    when = ago(row.get("set_at"))
+    bits.append(f"{who} {when} ago" if when else who)
+    if row.get("reason"):
+        bits.append(row["reason"])
+    return clip(" · ".join(b for b in bits if b), 400)
+
+
+def dials_url(cfg, repo: str | None = None) -> str:
+    """The board's dials page — the OTHER surface, not the only one any more.
+
+    Two things want this URL and neither is a workaround. A person comparing
+    projects wants the page, because it shows every repo's dials at once where
+    the panel shows the screen's own. And a host with no human key wants it,
+    because that is the whole of what the dashboard could do before #477's second
+    half — the panel reads, and names the door.
+
+    **Which is #443's option (3), and it is still carrying weight.** That issue's
+    three shapes were: the client holds an edge session; a credential distinct
+    from the machine token; or read-only plus a printed URL. The dashboard now has
+    (2) — `X-Human-Key`, a person's key presented to the agent host, no Authelia —
+    and (3) is what it degrades to when the key is absent, which is every box that
+    has not been given one. #443 is also why the fallback names the URL rather
+    than implying it: it is the record of a person told the reorder was theirs to
+    do, in a terminal, whose reply was "i don't know how to re-order".
+
+    **(1) was built and thrown away, and the reason is worth keeping.** An earlier
+    cut of `HumanClient` held a signed-in Authelia session and posted to the
+    browser vhost. Three things were wrong with it and any of them is fatal: the
+    holder BECOMES the person, so every human-only endpoint opens at once rather
+    than the ones being asked for; the session is SSO for a whole estate; and it
+    expires on a wall clock, so the `✎` would have died whenever it lapsed and
+    stayed dead until somebody re-minted it by hand. #479 records the reversal.
+    """
+    #: The repo rides along so a reader arriving from a terminal lands on the scope
+    #: the terminal was showing rather than on the fleet's. A screen watching
+    #: several sends none: there is one box on that page and it would have to pick
+    #: one of them, which is a worse answer than letting the page ask.
+    base = f"{getattr(cfg, 'base_url', '') or ''}/dials/view"
+    watched = resolve_repos() or []
+    scope = repo if repo is not None else (watched[0] if len(watched) == 1 else None)
+    return f"{base}?repo={urllib.parse.quote(scope)}" if scope else base
+
+
+# ---- the dials a person may SET ----------------------------------------------
+#
+# Everything above renders what the board said and asserts nothing about what it
+# MEANS, and that is right for a reader: the board stores `dial` as opaque text and
+# `value` as opaque JSON, and a dashboard that had learnt the vocabulary would be a
+# second place a dial is written down (#56, #305).
+#
+# **A WRITER CANNOT WORK THAT WAY, and the difference is not a loophole.** Reading
+# an unknown dial is harmless — it is drawn, and the harness that owns the list
+# says what it made of it. Writing one is not: `POST /dials` accepts any dotted
+# path and any JSON, so a misspelt name or a quoted `"2"` is stored, returned as in
+# force, and then ignored by every harness that reads it. That gap is what #539 was
+# filed about — four empty boxes, one placeholder covering 29 dials and six value
+# kinds at once, and a typo that saves clean and is discovered by a round which ran
+# under the old value.
+#
+# So the write half READS THE HARNESS'S OWN TABLE at call time rather than carrying
+# a copy of it: `harness_rules.dial_specs()` for the names, kinds, defaults and
+# directions, and `harness_rules.dial_problem()` for the refusal sentence. That is
+# a client reading the one copy, which is what #56's rule asks for. Nothing below
+# names a dial, a band or a default.
+#
+# **It degrades to what shipped before.** A box with no `harness/loops` beside the
+# script — the dashboard installed on its own, or run out of a stripped checkout —
+# gets an empty vocabulary and no refusal, which is exactly today's behaviour: a
+# free-text name, a free-text value, and the board taking both. A form that refused
+# to open because it could not find the table would have made the dashboard less
+# useful than it was.
+
+
+def loops_dir(script: str | None = None) -> str | None:
+    """`harness/loops`, in the two layouts there are — a checkout and the package.
+
+    The third copy of this lookup (`qb-mode`, `qb-bump`), and it is repeated for
+    the reason `package.nix` gives rather than out of neglect: `bin/` and
+    `share/quarterback-harness/loops` are siblings in the store output, `bin/` and
+    `loops/` are siblings in a checkout, and home-manager links each file in bin/
+    as its own flat store path — so "beside the script" is the only relationship
+    that survives every layout, and a shared helper would have to live somewhere
+    that is not beside it.
+
+    `script` defaults to THIS file rather than to `sys.argv[0]`, which is the
+    difference that matters for a library: `qbdata.py` is installed beside the
+    dashboards, and a caller invoked through a wrapper or a `python -c` would
+    otherwise resolve the lookup against wherever the interpreter was started.
+    """
+    here = os.path.dirname(os.path.realpath(script or __file__))
+    parent = os.path.dirname(here)
+    for cand in (os.environ.get("QB_LOOPS_DIR"),
+                 os.path.join(parent, "loops"),
+                 os.path.join(parent, "share", "quarterback-harness", "loops")):
+        if cand and os.path.isfile(os.path.join(cand, "harness_rules.py")):
+            return cand
+    return None
+
+
+#: The module once it has been found, so that opening the modal a second time does
+#: not re-import a large one. SUCCESS ONLY — a failure is deliberately NOT
+#: remembered, and an earlier cut of this cached both on the grounds that "the
+#: modal asks on every keystroke", which is simply not true: `dial_vocabulary` is
+#: asked once when the modal opens and the keystrokes filter the dict it returned.
+#: So the saving was imaginary and the cost was real — a dashboard left open across
+#: a harness install would have gone on saying the table could not be read until
+#: somebody restarted it, which is the failure `expires_at` exists to prevent one
+#: layer up.
+_DIAL_RULES: list = []
+
+#: Why the table could not be read, in a sentence, or `""`. Written by
+#: `_dial_rules` and asked for by `dial_trouble` — see that function for why the
+#: two failures must not be told the same way.
+_DIAL_TROUBLE = ""
+
+
+def _dial_rules(script: str | None = None):
+    """The `harness_rules` module, or None where it cannot be read.
+
+    Never raises. An import that fails — a partial install, a syntax error in a
+    checkout mid-edit — leaves the form exactly as useful as it was before this
+    landed, which is a worse form and not a broken one.
+    """
+    global _DIAL_TROUBLE
+    if _DIAL_RULES:
+        return _DIAL_RULES[0]
+    where = loops_dir(script)
+    if not where:
+        _DIAL_TROUBLE = "no harness/loops beside this dashboard"
+        return None
+    if where not in sys.path:
+        sys.path.insert(0, where)
+    try:
+        import harness_rules  # noqa: PLC0415 — resolved at call time, by design
+    except Exception as exc:                   # noqa: BLE001 — degrade, don't die
+        _DIAL_TROUBLE = (f"{where}/harness_rules.py would not import: "
+                         f"{type(exc).__name__}: {exc}")
+        return None
+    if not hasattr(harness_rules, "dial_specs"):
+        # The harness beside this script can be OLDER than this file — a checkout on
+        # a branch that predates #539, or a half-updated install. Not the same fact
+        # as an absent directory, and not the same fact as a broken one.
+        _DIAL_TROUBLE = (f"the harness at {where} predates the dial table "
+                         f"(no dial_specs)")
+        return None
+    _DIAL_TROUBLE = ""
+    _DIAL_RULES.append(harness_rules)
+    return harness_rules
+
+
+def dial_trouble(script: str | None = None) -> str:
+    """Why the vocabulary is empty, in a sentence a screen can print, or `""`.
+
+    **THREE FAILURES, NOT ONE.** No `harness/loops` beside the dashboard is a box
+    that never had the table; a `harness_rules.py` that will not import is a box
+    that has it and is broken; a harness older than `dial_specs` is a box mid-
+    upgrade. All three end in an empty vocabulary and unvalidated writes, and until
+    this existed the screen told all three as the first one — so a partial upgrade
+    reported itself as an install that had never happened, which is a sentence that
+    sends somebody to look in the wrong place.
+
+    The board layer makes the same distinction one level up and for the same
+    reason: `_dials_unreadable` is "we could not find out", never "there is no
+    dial". A screen that cannot tell those apart is a screen that reports a
+    misconfigured box as a healthy one.
+    """
+    _dial_rules(script)
+    return _DIAL_TROUBLE
+
+
+def dial_vocabulary(script: str | None = None) -> dict[str, dict]:
+    """Every dial the harness will actually apply, as plain data. `{}` when unknown.
+
+    An empty answer is "this box cannot tell", NOT "no dial is settable" — the same
+    distinction `fetch_dials` draws with `asked`, and it is load-bearing for the
+    same reason: a form that drew "0 dials" would be stating as a fact the one
+    thing it failed to find out.
+    """
+    rules = _dial_rules(script)
+    if rules is None:
+        return {}
+    try:
+        return rules.dial_specs()
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return {}
+
+
+def dial_refusal(dial: str, value, script: str | None = None) -> str:
+    """Why this write will not be applied, or `""` — asked before it is made.
+
+    `""` also covers "cannot judge", and that is deliberate rather than sloppy: a
+    box that cannot read the harness's table must not refuse a write the board
+    would have taken, because the person at that keyboard has no other door. The
+    cost of the false negative is today's behaviour; the cost of a false refusal is
+    a dial nobody can set at all.
+    """
+    rules = _dial_rules(script)
+    if rules is None or not hasattr(rules, "dial_problem"):
+        return ""  # `hasattr` for `dial_specs`' reason, one function up
+    try:
+        return rules.dial_problem(dial, value) or ""
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return ""
+
+
+def dial_scope_refusal(dial: str, repo: str | None, script: str | None = None) -> str:
+    """Why this dial may not be set at this SCOPE, or `""`. `dial_refusal`'s twin.
+
+    Separate from it because they answer different questions about different fields
+    — one judges the VALUE, this judges where the row goes — and a screen that
+    folded them would have to guess which of the two boxes to put the message under.
+
+    `""` covers "cannot judge" for `dial_refusal`'s reason: a box that cannot read
+    the harness's table must not refuse a write the board would have taken.
+    """
+    rules = _dial_rules(script)
+    if rules is None or not hasattr(rules, "dial_scope_problem"):
+        return ""  # `hasattr` for `dial_specs`' reason, and for its version story
+    try:
+        return rules.dial_scope_problem(dial, repo) or ""
+    except Exception:                          # noqa: BLE001 — degrade, don't die
+        return ""
+
+
+def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> list[str]:
+    """The dial names worth offering for what has been typed so far.
+
+    Substring rather than prefix, because the useful half of a name is in the
+    middle of it: `budget` finds the five `review_panel.budget.*` and `enabled`
+    finds the seats, and a prefix filter would answer both with nothing until the
+    person had typed `review_panel.` — which is the part they know.
+
+    Prefix matches first, so typing a name in full still puts the exact one at the
+    top; case-folded, because a dial is lower-case and somebody reaching for
+    `Budget` has not made a mistake worth an empty list. Within those two groups the
+    order is the VOCABULARY'S OWN — `BOARD_DIALS` is written grouped by what a dial
+    decides, and sorting the names alphabetically would open the list on `enabled`,
+    the one dial that switches this repo's reviews off and nobody's answer to "what
+    did I come here to change".
+    """
+    want = (typed or "").strip().lower()
+    names = list(vocabulary)
+    if not want:
+        return names[:limit]
+    rank = {name: i for i, name in enumerate(names)}
+    hit = [n for n in names if want in n.lower()]
+    hit.sort(key=lambda n: (not n.lower().startswith(want), rank[n]))
+    return hit[:limit]
+
+
 # ---- the tmux screen ---------------------------------------------------------
 # The dashboard reads the seats off tmux rather than off the board, because they
 # are different questions. The board knows which AGENTS are live anywhere on the
@@ -2160,7 +2977,10 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
 # ones whose agent has exited and left a shell behind. Only the second can be
 # closed with a click.
 
-SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "repo", "scope")
+#: ``agent`` is the CONVERSATION in the pane (`@qb_session`), where ``session`` is
+#: the tmux session the pane is in. Two different things one word away from each
+#: other, so both are spelled out wherever they are read.
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "agent")
 
 
 def tmux_seats() -> list[dict]:
@@ -2170,14 +2990,16 @@ def tmux_seats() -> list[dict]:
     them and the only handle that survives a pane being added or closed — the
     index shifts and the agent rewrites the title.
 
-    `@qb_repo` and `@qb_scope` come back with it because `list-panes -a` is the
-    whole SERVER and not this screen: since #208 two screens can each have a seat
-    1, so the number alone no longer says which board identity a pane is. Both are
-    set on the SESSION (or, for `--add`, on the pane) and formats resolve a user
-    option up through the hierarchy, so every pane of a screen answers for its own
-    screen. Either can be empty — `@qb_scope` whenever the screen was not given an
-    explicit one, `@qb_repo` on a screen built by a qb-seats old enough not to set
-    it — which is why the dashboard falls back to matching on the number.
+    `@qb_session` comes back with it, and it is what joins a pane to the board.
+    `qb-hook` stamps the agent's session id there at SessionStart, and `/active`
+    returns that same id for every live agent, so :meth:`seat_state` is a dict
+    lookup rather than the three-way narrowing this needed while a pane could only
+    be identified through the agent's NAME (#540).
+
+    It is empty for a pane holding no agent — a seat someone closed the agent in,
+    a screen of bare shells, a pane whose agent predates the stamp — and that is a
+    state worth showing rather than a gap: those are exactly the seats free to be
+    given something to do.
 
     Returns [] rather than raising when there is no tmux, no server, or no
     screen: the dashboard runs inside the screen most of the time and in a bare
@@ -2188,8 +3010,7 @@ def tmux_seats() -> list[dict]:
         return []
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
-                     "pane_current_command", "pane_current_path", "@qb_repo",
-                     "@qb_scope"))
+                     "pane_current_command", "pane_current_path", "@qb_session"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
@@ -2588,8 +3409,8 @@ def pace_line(verdict: dict) -> str:
     """The verdict on one line, in one place.
 
     Shared rather than formatted at each call site for the same reason
-    `limit_cells` is: `qb-pace` prints this, `qb-seat` prints this before it
-    starts an agent, and two spellings of one judgement is how a fleet ends up
+    `limit_cells` is: `qb-pace` prints this, `qb-seats` prints this before it
+    starts a screen, and two spellings of one judgement is how a fleet ends up
     arguing with itself about whether it is allowed to spend.
     """
     out = f"pace: {verdict['verdict'].upper()} — {verdict['reason']}"

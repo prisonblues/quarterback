@@ -36,6 +36,35 @@ QB_ENV="$(qb_env_path "$0")" \
 qb_load_config
 qb_require_base_url || exit 1
 export QUARTERBACK_BASE_URL
+# This machine's DELEGATED credential, for the two writes app.auth.delegated
+# names (plan_reorder, plan_item_update). QUARTERBACK_HUMAN_URL rides along
+# because the config sets it and a stray unexported variable is a trap for the
+# next reader — nothing this script execs consumes it, and qb-doctor reads it
+# from its own environment. Exported here because qb_load_config only sets shell
+# variables and the server reads its whole world from the environment. All
+# optional: unset, those two tools refuse with the remedy and nothing else
+# changes. The credential is NOT a person's identity — see quarterback #478.
+#
+# QUARTERBACK_AGENT goes with them, and it is not decoration. The server resolves
+# `QUARTERBACK_ELEVATED_TOKEN_CMD` ITSELF, in a child process
+# (`client._resolve_elevated` -> `subprocess.run(..., shell=True)` with no `env=`,
+# so it inherits `os.environ` and nothing else), and the shipped fleet config
+# writes that command as
+#     op read "op://personal-nix/quarterback-$QUARTERBACK_AGENT/elevated"
+# `qb_load_config` sets the variable — `${QUARTERBACK_AGENT:-$(hostname -s)}`,
+# qb-env — but only as a SHELL variable, so an unexported one expands to empty in
+# that child and the ref becomes `quarterback-/elevated`: an item name no vault
+# has. The failure then arrives as "this host has no delegated credential", which
+# reads as an unprovisioned box rather than as a variable this script dropped.
+#
+# The bearer does not have this problem and that is why nobody found it sooner:
+# `qb_resolve_token` runs TOKEN_CMD here, in this shell where the variable IS in
+# scope, and exports the RESULT — so the only credential the server resolves for
+# itself is the only one that ever needed this export. `qb` has the same immunity
+# for the same reason. Measured 2026-08-27, on the first delegated write this
+# fleet attempted.
+export QUARTERBACK_AGENT QUARTERBACK_HUMAN_URL \
+       QUARTERBACK_ELEVATED_TOKEN QUARTERBACK_ELEVATED_TOKEN_CMD
 
 REPO="${QUARTERBACK_REPO:-$HOME/source/quarterback}"
 

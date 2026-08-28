@@ -198,7 +198,9 @@ like a full panel.
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.
   It says which severity floor the fixer is being briefed to, what buys another round,
-  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling. Read it BEFORE §4: the brief you build
+  whether the fixer may defer, the low-severity line budget, and the fix-growth ceiling
+  — which since #492 has TWO halves, a multiple and an absolute char count, and stops
+  the cycle on whichever is crossed first. Read it BEFORE §4: the brief you build
   depends on it, and it is the only place the round's policy is written down where
   you can see it (#165).
 - **To fix** — the master-confirmed findings the fix round is asked to clear (any
@@ -216,6 +218,14 @@ From its output collect:
 - **Coverage declared** — per reviewer, what it said it could not assess, plus
   any reviewer the panel reports as truncated. These are what separate "clean"
   from "I could not tell"; carry them to §6 rather than dropping them.
+- **Guard-to-guarded** — the line printed under that name (`guard_ratio` in the
+  JSON): test and doc lines ADDED against source lines added, over the whole PR. It is
+  REPORTED and gates nothing (#67's instrument-before-gate rule, #492), so there is no
+  threshold here for you to apply and none for you to invent — carry the number into
+  §6 the way you carry the coverage declarations. What makes it worth reading is
+  WHEN it arrives: it is available from round 1's diffstat, where `max_fix_growth`
+  needs a second round before it has a ratio at all, and the cycle it was filed from
+  produced 406 lines of test for a 66-line config change with nothing noticing.
 - **Rounds** — the `**Rounds:**` line (also `round_stop` in the JSON): whether
   the cycle should go again and whether stopping would be convergence.
 
@@ -276,6 +286,23 @@ with these overrides:
   low-severity finding unconditional, which is the 408-line round-1 fix pass this
   budget exists to stop. Copy the note under the heading verbatim — it carries the
   line count and the spend rule.
+- **Selecting findings and capping churn are INDEPENDENT controls, and naming
+  findings NEVER lifts the budget (#492).** A human who says "just fix the
+  concurrency ones" has narrowed *which* findings this pass may touch. They have said
+  nothing whatever about *how much churn* one pass may add, which is the separate
+  question `low_severity_fix_lines` answers — and that dial's own docstring is
+  emphatic that the question is **mechanical, not discretionary**: the spend is
+  COUNTED with `git diff --numstat` after each fix, never estimated, and the fixer is
+  never asked "does this risk ballooning?", because that is a judgement by the actor
+  whose judgement the 85% impugns. Reading a shorter list as the budget having been
+  spent by decision is a natural mistake for an orchestrator that has just been handed
+  one, and it has been made: on the cycle #492 was filed from the budget was lifted
+  for round 2 *because* the human had named the findings, and the pass came out at 422
+  lines and produced 13 new findings — the exact shape the budget exists to prevent,
+  with the one brake still capable of firing being the one that was removed. So relay
+  the budget with a narrowed list exactly as you would with the full one, and a pass
+  that runs out of it reports the unpaid findings exactly as it reports below-floor
+  ones (§4b's road 2).
 - **Relay the dials into the brief.** The sub-agent cannot read `.harness-rules` for
   itself in worktree mode and must not guess: state `fix_severity_floor`,
   `low_severity_fix_lines`, `reviewer_scope` and `fixer_may_defer` from the panel
@@ -338,8 +365,11 @@ cat <<'JSON' | qb record-outcome
   {"key": "<key of a finding the fixer resolved>", "outcome": "fixed"},
   {"key": "<key of one that was not a defect>", "outcome": "refuted",
    "note": "installPhase does `install -m 0755 bin/*` — it globs, the script IS installed"},
-  {"key": "<key of one left for later>", "outcome": "deferred",
-   "deferred_to": "prisonblues/quarterback#132"}
+  {"key": "<key of one left for later, at or above the issue gate>",
+   "outcome": "deferred", "deferred_to": "prisonblues/quarterback#132"},
+  {"key": "<key of one BELOW the gate — board row only, see below>",
+   "outcome": "deferred",
+   "note": "P4: the retry loop has no jitter; real, not this change's job"}
 ]}
 JSON
 ```
@@ -360,15 +390,13 @@ One of four per finding:
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
   confident-assertion-with-nothing-behind-it the release exists to measure.
-- **`deferred`** — real, not now. Put where it went in `deferred_to`. **Three roads
+- **`deferred`** — real, not now. **Three roads
   arrive here and all three are the same row.** (1) The fixer said so itself, under
   `review_panel.fixer_may_defer` — the defect is real and outside what this change is
   for, with the two justifying lines in its summary's `Deferred` block. (2) The
   panel reported it BELOW the round's `fix_severity_floor`, so it was never in the
   fixer's brief at all — or it was marked 💸 and the round's `low_severity_fix_lines`
-  budget ran out before it, which is the same row for the same reason (#297); one
-  issue for the batch is fine and usually right, since
-  filing nine issues for nine P3s is the overflow the floor exists to stop. (3) An
+  budget ran out before it, which is the same row for the same reason (#297). (3) An
   **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
   finding and `fixed` a lie about the code, and there is no fifth outcome to
@@ -387,6 +415,50 @@ One of four per finding:
 - **`superseded`** — a later finding replaced it; name that finding's key in
   `superseded_by`, which is **required** for the same reason a note is required
   for a refutation: without it the row records "replaced by something".
+
+### Which deferrals get a GitHub issue — `review_panel.file_deferral_issues` (#482)
+
+**Every deferral gets a board row. Only some of them get a GitHub issue**, and this
+setting is which. The report's dial line says the answer for the round you are
+recording, in words, so read it there rather than opening the rules file: *"deferrals
+at/above P2 get a GitHub issue, below it a board row only"*. `always` is the pre-#482
+behaviour (an issue for every one) and `never` files none.
+
+The two records were being conflated. The **board row** is the durable one — it
+chains by finding key across rounds, it feeds `/panel`, and it is what stops the
+leaderboard scoring a confident wrong finding like a real one. The **GitHub issue** is
+a work item on somebody's tracker. For a P1 or P2 deferral those coincide; for the
+P3/P4 tail they do not, and the tail is where the volume is. Measured on this repo on
+2026-08-26, roughly twenty open issues were panel deferred-finding exhaust and nothing
+else (#66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237 #285 #286
+#288 #300), and #283 is a rescue *from* one of them — three live defects that had been
+sitting inside a deferred-findings dump nobody read.
+
+So, per finding:
+
+- **At or above the gate** — open the issue and name it in `deferred_to`, exactly as
+  before. One issue for a batch is still fine and usually right.
+- **Below the gate** — open nothing. Record the row with **no `deferred_to`** (the
+  field is nullable, the API accepts a `deferred` outcome without one, and `/panel`
+  renders such a row with no target rather than as broken) and **a one-line `note`
+  saying what the defect is and why it was not fixed this round.**
+
+  **The note is not optional here and it is the whole difference between a record and
+  a dumping ground.** With an issue, the issue's title and body are what somebody
+  reads later; with no issue, the note is. A row with neither is the markdown list this
+  all replaced, wearing a database. It is also what makes the row *findable*: `GET
+  /review/findings?repo=<owner/name>&pr=<n>` returns every chain on the PR with its
+  outcome attached, which is how a fiddly finding gets found again — the read this
+  write exists to serve.
+- **An escalation is exempt at every setting, `never` included.** Its issue is not a
+  work item, it is the question being put to a human, and it is what carries that
+  question past the end of this session. Road 3 above is unchanged.
+
+**If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
+the relay that you did and why. Below the gate the row is the *only* record, so a
+board that refused the write and a gate that suppressed the issue between them lose
+the finding outright — which is the one outcome this setting must never produce. The
+tracker is the fallback, not the default.
 
 **Do not mark your own findings `refuted` unattended.** That is a self-grading
 loop and #40's constraint applies for the same reason. The board cannot tell a
@@ -431,6 +503,91 @@ all is reported the same way, and costs the round its confidence.)
 Pass **every** earlier round's payload as a `--baseline`, or a finding raised in
 round 1, missed in round 2 and raised again in round 3 counts as new.
 
+### Do not rewrite the branch between rounds, and know the cost if you must (#500)
+
+**A rebase or force-push between rounds disarms three of this cycle's convergence
+instruments at once**, because provenance (#48), recurrence (#67) and `--scope
+increment` all read the same thing: the range between the last round's `head_sha`
+and this one's. `compare/a...b` is the three-dot form, so after a rewrite the old
+head is no longer an ancestor and GitHub answers `diverged` — the range would span
+commits no fix pass wrote, so the panel refuses it rather than blaming the fixer for
+every line the PR ever added.
+
+What that costs is concrete. Every new finding is recorded `unknown` instead of
+`introduced` or `missed`, and **`escalate_on.fix_injection` (#497) cannot fire**:
+the rate is `introduced` over every new outstanding finding, and the unattributable
+ones sit in the denominator, so it is depressed toward zero however badly the fix
+pass behaved. On the cycle #500 was filed from, that happened on round 3 of a
+three-round cycle that ended on the cap — the exact shape the gate exists to stop.
+
+The round says so where the verdict is read: a **veto line, and `confident` false**,
+the same treatment a reviewer that could not read the whole diff gets.
+
+**And then it tries to repair it (#504).** The range is wrong, not the history: the
+fix pass's commits are still on the branch under new SHAs, and `git patch-id` names
+them by what they CHANGED rather than by where they sit. So a rewritten round rebuilds
+the pass out of the local object store, `payload.fix_range_source` reads
+`reconstructed`, provenance, recurrence and `escalate_on.fix_injection` come back, and
+the veto does not fire. Read `config_notes`: the round states what it rebuilt and what
+it cost.
+
+**It is exact or it refuses, and a refusal leaves the round exactly as blind as it
+was** — the veto fires and nothing is attributed, with `fix_range_rebuilt.why`
+naming which of these it hit:
+
+- **No local checkout.** `patch-id` is git rather than the compare API, so a repo
+  with no `path` in its rules cannot rebuild anything — and neither can a box that
+  never held the pre-rebase head, since a rewrite only orphans commits where
+  somebody still has them.
+- **A commit the last round reviewed changed content in the rewrite** — a conflict
+  resolved during the rebase, an amended tip. That commit is somewhere among the
+  ones this would call the fix pass and nothing can say which, so attributing them
+  would blame the fixer for work already reviewed.
+- **The pass is not the TAIL of the branch** (a reorder, an `--autosquash` that
+  landed a fixup low in the series). Then no single diff is the pass, and reading
+  its commits' patches separately would attribute lines the pass added and then
+  removed.
+- **An ambiguous patch-id** — the branch carries more copies of a patch than the
+  last round had, so which is the fixer's own cannot be told from which is the
+  replayed one.
+- **No correspondence at all** (a squash, a re-created branch), and **a branch reset
+  BACKWARDS**, where the pass was removed rather than rewritten. The round says the
+  second in those words, because a force-push that dropped work must not read as a
+  quiet cycle.
+
+Refusing rather than leaning is a deliberate trade, and worth knowing when you read a
+round that did not rebuild: `escalate_on.fix_injection` is calibrated on `introduced`
+being a FLOOR, so a reconstruction that over-counted would end cycles wrongly and no
+`config_notes` line prevents that — nothing reads a note before firing a brake.
+`--scope increment` is not repaired either way (scope is settled before the seats
+run), and neither is #506's proposal below, which reads the compare range.
+
+So:
+
+- **Prefer merging the base branch into the PR** over rebasing it. That leaves the
+  old head an ancestor (`status: ahead`), so the range still reads without a rebuild.
+  It is not free — the base branch's own commits then fall inside the range and their
+  lines are attributed to the fix pass, so `introduced` over-counts — but an
+  over-counting instrument is worth more than a dark one, and it fails toward stopping
+  the cycle rather than toward letting it run.
+- **If you must rewrite, do it between CYCLES rather than between rounds** — after a
+  stop, before the next `--round 1`. The rebuild is a repair, not a licence: it costs
+  an accuracy you did not have to spend.
+- **Rewrite in the checkout the panel reads.** A rebase done somewhere the panel will
+  never see — another box, a worktree that is then thrown away — is the one that
+  cannot be rebuilt, and it looks identical to the one that can until the round runs.
+- **If you already have, and `fix_range_source` is not `reconstructed`, do not read
+  that round's quiet as convergence.** The veto says as much. Re-running the round
+  with `--scope pr` gets the review back but not the attribution; only a round whose
+  fix pass can be reached — by range or by patch — can attribute.
+
+One instrument this does *not* disarm, worth knowing so you do not over-correct:
+#84's premise register is keyed on declared text rather than on commits, so it
+survives a rewrite intact. `max_fix_growth`/`max_fix_growth_chars` also keep working,
+but note they measure against `Baseline.first_reviewed` — a base-branch merge inflates
+the PR against a denominator from before it, so a ceiling may fire on growth the fix
+passes did not write.
+
 **Round 2+ reviews the fix commit, not the whole PR again** (v2.28), and it gets
 there off the baseline you just passed — `head_sha` in that payload is the anchor,
 so this needs no new flag from you. Behind the fix commit the reviewers get the PR
@@ -453,6 +610,73 @@ Three consequences worth knowing when you read the result:
   there. `scope: "pr"` on a round 2 is that, and it means the round cost what it
   always used to. The same list carries the caveats on a round that WAS scoped: a
   rebase between the rounds, or a merge commit inside the range.
+
+### When the cycle ends because the FIX PASS was generating the work (#489, #506)
+
+`escalate_on.fix_injection` ends the cycle when more than half a round's new
+outstanding findings were attributed to the fix pass immediately before them: the
+loop's rule 1 is being fed by the loop's own output, and a termination test fed by
+its own output can only end on the cap. You will see it as a veto line, `confident:
+false`, and a `stop_reason` that names the dial rather than the cap.
+
+**Ending the cycle is half the answer, and the other half is your job.** The fix
+pass that caused it is still on the branch — the PR ships carrying a change the panel
+has just finished saying generated more of the round's work than the pull request
+did, minus the round that would have found the rest of it. Stopping means the loop no
+longer makes it worse; it does not make it better.
+
+So the round now hands you the decision already priced, in `round_stop.revert`:
+
+```
+jq '.round_stop.revert' /tmp/tmp.AbC123/r<r>.json
+```
+
+- `range` / `commits` / `commit_count` — the offending pass's **commit range**,
+  which is the same range provenance attributed against, and the commits inside it.
+- `spans` — how many fix phases that range covers. Normally `1`. More than one means
+  no intervening round recorded a commit to anchor on, so the range is wider than "the
+  last fix pass" — the rate was computed over all of it too, but say so when you
+  relay it.
+- `command` — the `git revert --no-commit` invocation, with FULL SHAs. Nothing has run
+  it. **It can be `null` even when the proposal was made**, and then `no_command` says
+  why: a merge commit inside the range (a `git revert` of a range refuses a merge
+  without `-m`, and a merge is how the base branch got in there — reverting wholesale
+  would undo commits no fix pass wrote); a range GitHub's compare truncated, where a
+  merge past its 250-commit ceiling would be invisible so the merge count is a floor;
+  or commits that could not be listed at all.
+  The range is still named in both cases; it is only the paste-and-run shortcut that is
+  withheld. If you see `no_command`, **do not reconstruct the command** — go and read
+  `git log --oneline <range>` and decide what actually wants undoing.
+- `removes` — what undoing it would take off the board: the findings this round
+  attributed to it, with severities.
+- `costs` — what undoing it would hand back: the complaints that pass was **sent to
+  answer** and this round no longer raises.
+- `still_open` — the complaints it was sent to and did not clear. Those are
+  outstanding either way, so reverting costs nothing there.
+
+**Take it to the user; do not act on it.** Reverting a pass reverts the real fixes in
+it, and a pass that cleared three P2s and introduced eight P3s is a net loss to undo
+wholesale — nothing in the loop knows which is which without asking, which is exactly
+why this is a proposal. Read the two columns knowing they are biased in opposite
+directions on purpose: the cost is an **upper bound** (matched on finding keys alone,
+and under `increment` scope it includes complaints this round did not re-read) and
+the benefit is a **lower bound** (`introduced` is a documented floor). A revert those
+numbers still argue for is one they cannot have talked you into.
+
+**On a rebased branch there is no proposal, and the round says so rather than going
+quiet.** `revert.kind` carries the fix range's own verdict — `ok`, `no-fix`, `blind`,
+`rewritten`, `not-asked` — and the last two are the case the subsection above is
+about: the range that would name the offending pass is the range a rewrite removes, so
+the cycle can measure a change it cannot point at. `offered: false` with a `kind` of
+`blind` or `rewritten` means "we cannot see this", not "there was nothing wrong". This
+is the one thing #504 does **not** give back: a round can be attributing from a
+rebuilt pass and still be unable to offer a revert, because the proposal reads the
+compare range rather than the reconstruction.
+
+Two things this deliberately does **not** do, so you are not waiting for them:
+revert-and-re-run as an automatic mode, and re-running the fixer with a narrower
+brief instead of reverting. Both are open on #506 and both are decisions a human
+takes today.
 
 ### When the range between the rounds is an integration (#278)
 
@@ -513,6 +737,7 @@ round from 2 on, before you go back to §4:
 ```
 python3 ~/.claude/loops/panel.py --premise "<one sentence: what this fix pass assumes>" \
     --pr <pr> --round <r> --premise-file /tmp/tmp.AbC123/premises.json \
+    --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
 
@@ -526,12 +751,32 @@ does and for its reason: a premise about code carries backticks and `$(…)`, an
 inside a double-quoted argument bash executes them while a `$VAR` expands to
 empty and declares a premise you did not write.
 
-**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is the
-brake: `review_panel.escalate_on.premise_repeated` (default `2`) says a fix has
-already been written against this premise once in this cycle, and **the second one
-is not to be written**. Do not launch §4. The findings that premise explains become
-escalations under the `--escalated` rule below — relay them, open the premise
-issue, and stop the cycle. The command prints the `--escalated` keys for the round you are recording
+**`--premise-decidable` is the question the counter cannot ask (#491).** Answer `no`
+when the runtime the fix's assertion runs in cannot observe the property the fix
+asserts, `yes` when it can. Omitted is *not answered*, and nothing brakes on it.
+
+You are the right reader for this one for the same reason you are the right reader
+for the declaration itself: a fixer replacing one proxy with a better one is not
+being careless, it is answering the finding in front of it, and only somebody
+holding all the rounds can see that the proxies keep changing while the thing being
+approximated does not. **When you find yourself writing a premise that restates the
+last round's premise with a different signal in it, the answer to this flag is
+`no`.**
+
+**Read the exit code.** `0` records the declaration: brief the fix pass. `4` is a
+brake, and the report names which:
+
+- `escalate_on.premise_repeated` (default `2`) — a fix has already been written
+  against this premise once in this cycle, and **the second one is not to be
+  written**.
+- `escalate_on.premise_undecidable` (default `true`) — you answered `no`. It fires
+  on the **first** declaration: an unobservable property is not going to become
+  observable next round, so the cycle cannot converge on it whatever the counter
+  says.
+
+Do not launch §4. Either way, the findings that premise explains become escalations
+under the `--escalated` rule below — relay them, open the premise issue, and stop
+the cycle. The command prints the `--escalated` keys for the round you are recording
 against.
 
 **Why it is here and not at the end of a round.** The cap bounds cost; this bounds
@@ -558,7 +803,10 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
 A premise declared twice that reaches a round anyway ends the cycle there: it takes
 a veto line, `confident` is false, and `round_stop.reason` names the premise. That
 is the late half of the same brake — worse than stopping before the fix, better than
-the cap.
+the cap. A premise answered `decidable: no` that reaches a round does the same, on
+the same terms (#491), and the payload carries both lists under
+`round_stop.premises` with `undecidable_brake` saying whether this repo armed the
+second one.
 
 **An undeclared fix pass is unescalatable, and the report says so.** If a round's
 `config_notes` says the fix pass after round N declared no premise, that is a gap in
@@ -747,6 +995,12 @@ Then the part that is new, and is the point of running more than one round:
   for or against "the fixer is the slow part" is produced** (#192), and until
   several cycles have produced it the answer is a hunch — the panel's own hunch
   had the judge and the gating wait folded into a phase nobody had measured.
+- **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
+  a decision the user has to take, not as a footnote — the commit range, what
+  reverting it would remove, what it would cost, and that nothing has run it. If the
+  cycle ended on `fix_injection` and `offered` is false, say why: `revert.kind`
+  names it, and `blind` means a rewrite between rounds took away the range that would
+  have identified the pass.
 - **Escalated:** any finding a fixer reported as the approach being wrong rather
   than the code, with its premise, what it explains, what removing it would cost,
   and its `--ask` verdict if one was run. Say it even when the answer is none. This

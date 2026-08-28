@@ -201,15 +201,15 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 
 # ----------------------------------------------------------------- #165's dials
 #
-# The built-in half of `review_panel.{fixer_may_defer, fix_severity_floor,
-# round_trigger_floor, low_severity_fix_lines, max_fix_growth, reviewer_scope,
-# require_failing_test, max_rounds}`. WHY each number is this number lives beside the key in
-# `harness_rules.DEFAULTS`, which is the file an operator reads; these are what
-# the resolvers in `panel_seats` fall back to when a rules file (or a test's
-# hand-written `panel` literal) does not carry the key. The two are asserted equal
-# by `tests/test_panel_dials.py` — a drift between them would leave the documented
-# default and the applied default disagreeing, silently, in the direction nobody
-# checks.
+# The built-in half of `review_panel.{fixer_may_defer, file_deferral_issues,
+# fix_severity_floor, round_trigger_floor, low_severity_fix_lines, max_fix_growth,
+# reviewer_scope, require_failing_test, max_rounds}`. WHY each number is this number
+# lives beside the key in `harness_rules.DEFAULTS`, which is the file an operator
+# reads; these are what the resolvers in `panel_seats` fall back to when a rules
+# file (or a test's hand-written `panel` literal) does not carry the key. The two are
+# asserted equal by `tests/test_panel_dials.py` — a drift between them would leave the
+# documented default and the applied default disagreeing, silently, in the direction
+# nobody checks.
 
 #: Findings at or above this severity are what a fix round is asked to clear. P3 and
 #: not P2: severity is model-authored and wrong sometimes, and the defect class a P2
@@ -235,12 +235,33 @@ NO_SEVERITY_FLOOR = SEVERITIES[-1]
 #: How many times the first round's reviewed size a later round may review before
 #: the cycle stops and says the change wants splitting. None disables it.
 DEFAULT_MAX_FIX_GROWTH = 3.0
+#: The ABSOLUTE half of that ceiling (#492): chars the PR may GROW past the size the
+#: cycle's first round read it at, before the same stop fires. Whichever of this and
+#: the multiple is crossed FIRST binds, so it can only ever tighten the check. A pure
+#: multiple hands its rope out in proportion to the starting size — 226 lines on a
+#: 113-line PR, 4,000 on a 2,000-line one — and the second is the case most in need of
+#: a ceiling. None disables this half and leaves the multiple; `harness_rules` carries
+#: the calibration.
+DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
 #: What a reviewer is asked to look for: defects in the change (`diff`), or in the
 #: change and everything it touches (`repo` — the pre-#165 posture).
 DEFAULT_REVIEWER_SCOPE = "diff"
 REVIEWER_SCOPES = ("diff", "repo")
 #: May a fixer answer "real, and not this change's job"? See `harness_rules`.
 DEFAULT_FIXER_MAY_DEFER = True
+#: Which deferrals get a GitHub ISSUE as well as their board row (#482). Every
+#: deferral is recorded either way — this decides only whether a second copy is
+#: opened on a human's tracker. `P2` because the board row and the issue coincide
+#: for a P1/P2 deferral and do not for the P3/P4 tail, which is where the volume is.
+#: `harness_rules` carries the measurement.
+DEFAULT_FILE_DEFERRAL_ISSUES = "P2"
+#: The two ends of that dial, which are not severities: `always` is the pre-#482
+#: behaviour (an issue for every deferral) and `never` files none at all. Spelled as
+#: words rather than as `P4`/`P0` because a floor "below P4" has no band to name and
+#: `P0` is deliberately not a severity this panel has (see `SEVERITIES`).
+DEFERRAL_ISSUES_ALWAYS = "always"
+DEFERRAL_ISSUES_NEVER = "never"
+DEFERRAL_ISSUE_ENDS = (DEFERRAL_ISSUES_ALWAYS, DEFERRAL_ISSUES_NEVER)
 #: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
 DEFAULT_REQUIRE_FAILING_TEST = False
 #: Lines an integration merge may put into a PR's OWN files and still leave the
@@ -2351,8 +2372,11 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
-    "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
+    "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
+    "DEFAULT_FILE_DEFERRAL_ISSUES", "DEFERRAL_ISSUES_ALWAYS",
+    "DEFERRAL_ISSUES_NEVER", "DEFERRAL_ISSUE_ENDS",
     "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",

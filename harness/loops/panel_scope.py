@@ -14,11 +14,45 @@ from __future__ import annotations
 from panel_core import *            # noqa: F401,F403
 import panel_core                   # noqa: F401
 
-def _fix_range_diff(gh_repo: str, base_sha: str | None,
-                    head_sha: str | None) -> tuple[str | None, str | None]:
+#: What a missing fix range MEANS, as a value rather than as a sentence (#500).
+#:
+#: `no-fix` and `blind` both come back with no diff and both disable provenance,
+#: recurrence and increment scoping — and they are not the same news. Nothing
+#: landed between the rounds, so there is nothing to attribute and the instruments
+#: are VACUOUS; against that, the branch was rewritten (or the API refused, or the
+#: range would not fit) and the instruments are BLIND on a fix pass that really
+#: happened. The second is a coverage gap and takes a veto; the first is a fact
+#: about the cycle and takes none.
+#:
+#: A value and not a substring match on ``why``, on this repo's own rule: deriving
+#: a fact back out of a sentence written for a human is how the two drift apart,
+#: and `harness_rules` says as much where it refuses to sniff a layer out of its
+#: own provenance string. The caller gates on this; the sentence stays for the
+#: reader.
+#: `rewritten` is split out of `blind` (#512) because the two forbid different
+#: things. Blind is "this reader could not get the range" — too large to hold, an
+#: API refusal, patches it cannot parse — and says nothing about whether a sound
+#: copy of that range exists elsewhere; the round's own `Review.increment` often IS
+#: one, and refusing to attribute from it is a false blindness on a round that read
+#: the fix pass perfectly well. Rewritten is "the range is NOT the fix pass": after
+#: a rebase the three-dot merge base moves back, so any diff of that span — this
+#: reader's or the round's — widens toward the whole PR and attributing from either
+#: blames the fixer for every line the PR ever added. Nothing may attribute from
+#: THAT SPAN, which is not the same as nothing being attributable: the commits the
+#: fix pass wrote are still on the branch under new SHAs, and
+#: :func:`reconstruct_fix_range` (#504) names them by patch equivalence instead.
+#: This value is what sends it looking; a reconstruction that declines leaves the
+#: round exactly as blind as this verdict found it.
+FIX_RANGE_OK, FIX_RANGE_NO_FIX = "ok", "no-fix"
+FIX_RANGE_BLIND, FIX_RANGE_REWRITTEN = "blind", "rewritten"
+
+
+def _fix_range_diff(gh_repo: str, base_sha: str | None, head_sha: str | None
+                    ) -> tuple[str | None, str | None, str]:
     """The diff of everything that landed BETWEEN two rounds — i.e. the fix pass
     whose damage (or thoroughness) provenance is trying to attribute — as
-    `(diff, None)`; or `(None, why)` when there is no range to read.
+    `(diff, None, "ok")`; or `(None, why, kind)` when there is no range to read,
+    where `kind` is :data:`FIX_RANGE_NO_FIX` or :data:`FIX_RANGE_BLIND`.
 
     It never raises. A force-push that orphaned the earlier head, a baseline
     written before `head_sha` was recorded, no `gh` on PATH, an API refusal, a
@@ -36,6 +70,9 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
     was rebased or force-pushed it is every line the PR ever added, which would
     read as the fixer having written all of it. GitHub calls that case `diverged`
     and it is refused here. Two-dot is not an option — this endpoint 404s on it.
+    Refused, and then handed on: :func:`reconstruct_fix_range` rebuilds the pass
+    from the local object store when there is one (#504), because the range is
+    wrong rather than the history.
 
     Two biases remain and are written down rather than fixed. Merging the base
     branch INTO the PR between rounds leaves the old head an ancestor of the new
@@ -43,21 +80,23 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
     and their lines are attributed to the fix pass — `introduced` then
     over-counts. And the compare endpoint returns at most 300 files, so a fix
     pass wider than that is attributed on the first 300 and the rest read as
-    `missed`. #41 (review the increment) is what removes the guess altogether.
+    `missed`. #41 has landed and #512 acted on it — see :func:`_provenance` for what
+    that removed and what it did not.
     """
     if not gh_repo:
-        return None, "no GitHub repo is configured for this run"
+        return None, "no GitHub repo is configured for this run", FIX_RANGE_BLIND
     if not base_sha:
         return None, ("the baseline does not record which commit it reviewed "
-                      "(written before `head_sha` existed)")
+                      "(written before `head_sha` existed)"), FIX_RANGE_BLIND
     if not head_sha:
-        return None, "this round did not record the commit it reviewed"
+        return None, "this round did not record the commit it reviewed", FIX_RANGE_BLIND
     span = f"{base_sha[:8]}..{head_sha[:8]}"
     if base_sha == head_sha:
         # Not a failure and not worth an API call to be told nothing changed —
         # but told apart from one, or the operator goes looking for a GitHub
         # fault that never happened.
-        return None, f"no commit landed between rounds (head unchanged at {head_sha[:8]})"
+        return (None, f"no commit landed between rounds (head unchanged at {head_sha[:8]})",
+                FIX_RANGE_NO_FIX)
     try:
         got = json.loads(panel_core.sh(["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
                              "--jq", _FIX_RANGE_JQ], timeout=FIX_RANGE_TIMEOUT_S))
@@ -66,31 +105,548 @@ def _fix_range_diff(gh_repo: str, base_sha: str | None,
         # OSError, a hung call is a TimeoutExpired, a truncated body is a
         # ValueError, and each of them would otherwise take down a whole review
         # round over an attribution nothing gates on.
-        return None, f"could not read the range {span} ({type(e).__name__})"
+        return None, f"could not read the range {span} ({type(e).__name__})", FIX_RANGE_BLIND
     if not isinstance(got, dict):
-        return None, f"the compare API answered {span} with something that is not an object"
+        return (None, f"the compare API answered {span} with something that is not an object",
+                FIX_RANGE_BLIND)
     if got.get("status") == "diverged":
         return None, (f"{span} have diverged — the branch was rewritten between rounds, so "
-                      "the range would span commits no fix pass wrote")
+                      "the range would span commits no fix pass wrote"), FIX_RANGE_REWRITTEN
+    # `behind` is the other rewrite, and it reaches here looking like nothing at all
+    # (#500, found on review). The head is an ANCESTOR of the commit the last round
+    # reviewed — a reset backwards, a force-push that dropped commits — so the
+    # three-dot merge base IS the head and the compare comes back with no files. Left
+    # to the empty-compare road below that reads as "no commit landed between
+    # rounds", which is the opposite of what happened: commits were REMOVED, the fix
+    # pass this round is meant to attribute is gone from the branch, and the round is
+    # as blind as a diverged one. Named here rather than inferred from an empty file
+    # list, because the file list cannot tell the two apart.
+    if got.get("status") == "behind":
+        return None, (f"{span} is BEHIND — the branch was reset to an ancestor of the "
+                      "commit the last round reviewed, so the fix pass it would "
+                      "attribute is no longer on the branch"), FIX_RANGE_REWRITTEN
     out: list[str] = []
     size = 0
     for f in got.get("files") or []:
         name, patch = f.get("filename"), f.get("patch")
         if not (name and patch):
-            continue  # binary, or too large for the API to send a patch for
+            # Binary, or too large for the API to send a patch for. SKIPPED, and the
+            # range still comes back `ok` when other files were readable — raised on
+            # review as a possible under-veto and declined deliberately (#500).
+            #
+            # Partial attribution is a documented BIAS of this signal, not a blind
+            # instrument. The two ways a patch goes missing are worth separating,
+            # because they are not equally harmless and a reason that only covers the
+            # easy one is not a reason:
+            #
+            #   * BINARY — nothing is lost. A finding has a file and a line, and a
+            #     binary file has no lines for one to sit on, so there was never an
+            #     attribution here to miss.
+            #   * TOO LARGE for the compare API to send — lines ARE lost, and a
+            #     finding in that file comes back `missed` when the fix pass may well
+            #     have written it. This is accepted, and it is accepted because the
+            #     docstring above already accepts the identical loss from the same
+            #     API for the same reason: "the compare endpoint returns at most 300
+            #     files, so a fix pass wider than that is attributed on the first 300
+            #     and the rest read as `missed`". Same mechanism, same consequence,
+            #     same bias — and `_provenance` already documents `introduced` as a
+            #     FLOOR rather than a measurement, which is the honest place for it.
+            #
+            # What decides it either way is the alternative: vetoing here fires on any
+            # PR that touched a lockfile or an image, which is most of them, and a
+            # veto that fires on most rounds is the one readers learn to skip — the
+            # failure this whole change is against. #41 (review the increment) is what
+            # removes the guess rather than re-weighing it.
+            #
+            # The case where it IS blind is every file being unreadable, and that is
+            # caught below: then there is no attribution left at all.
+            continue
         body = patch.rstrip("\n")
         chunk = f"diff --git a/{name} b/{name}\n{body}\n"
         size += len(chunk)
         if size > FIX_RANGE_MAX_CHARS:
             return None, (f"the range {span} is larger than {FIX_RANGE_MAX_CHARS:,} chars — "
-                          "not attributed, rather than held whole in memory")
+                          "not attributed, rather than held whole in memory"), FIX_RANGE_BLIND
         out.append(chunk)
     if not out:
         # An empty compare — a revert that nets to nothing, an empty commit — is
         # "no range", not "a range with no added lines". The second reading calls
         # every new finding `missed`, confidently and with nothing to say so.
-        return None, f"the range {span} changed no line this can attribute against"
-    return "".join(out), None
+        #
+        # **Which KIND it is turns on whether any file changed at all**, and the two
+        # roads out of this loop are not the same news (#500, found on review). No
+        # files means nothing landed: the instruments are vacuous, there is no fix
+        # pass they failed to see, and a veto would fire on an honest empty round.
+        # Files that changed but carried no readable patch — every one binary, or
+        # each too large for the API to send — means a fix pass DID happen and this
+        # cannot see it, which is blind in exactly the sense a rewritten branch is.
+        # Collapsing them would suppress the veto on a round that genuinely lost its
+        # attribution, which is the failure this whole change exists to stop.
+        changed = len(got.get("files") or [])
+        if changed:
+            return (None, f"the range {span} changed {changed} file(s) and none of them "
+                    "carried a readable patch (binary, or too large for the compare "
+                    "API to send) — a fix pass landed that this cannot attribute",
+                    FIX_RANGE_BLIND)
+        return (None, f"the range {span} changed no line this can attribute against",
+                FIX_RANGE_NO_FIX)
+    return "".join(out), None, FIX_RANGE_OK
+
+
+#: What a reconstruction will spend before it gives up (#504). Both bounds are
+#: :func:`_fix_range_diff`'s, for its reason — nothing gates on provenance, so a
+#: slow or enormous history has to degrade to "unknown" rather than make a round
+#: wait on it — and the commit ceiling is the tighter of the two on purpose: a
+#: branch carrying more commits than this either side of a rewrite is not a fix
+#: pass anybody is about to attribute, and patching every one of them to discover
+#: that is the whole cost. Shorter than `FIX_RANGE_TIMEOUT_S` because these calls
+#: are local: a git command against an object store that is already on the disk
+#: does not get the allowance a network round trip does. It is a PER-CALL bound and
+#: a reconstruction makes at most six, so the figure a stalled round would show is
+#: the multiple — still a bounded delay on a path only a rewritten round takes, and
+#: still preferable to an unbounded one on an attribution nothing gates on.
+RECONSTRUCT_TIMEOUT_S = 30
+RECONSTRUCT_MAX_COMMITS = 250
+
+
+def _git(repo_path: str, *args: str, stdin: str = "") -> str | None:
+    """stdout of `git -C repo_path <args>`, or None if it could not run or failed.
+
+    ONE None for every failure — no `git` on PATH, no checkout at that path, a ref
+    this clone does not have, a hung call — because the caller does the same thing
+    with all of them: it stops reconstructing and says so. That is
+    :func:`panel_timing._commit_time`'s contract, arriving here for its reason, and
+    it is the contract the whole of #504 rests on: a repair that cannot run must
+    leave the round exactly as blind as it was, never half-attributed.
+
+    `subprocess.run` and not `panel_core.sh`, on two counts. `sh` raises on a
+    non-zero exit and every non-zero exit here is an ANSWER — "that commit is not
+    in this clone" is the reconstruction's commonest and most informative outcome.
+    And `sh` is what the suites replace with a `gh` double, so routing local git
+    through it would put every one of these calls in front of a stub that knows
+    only the forge.
+
+    `errors="replace"` and `ValueError` in the `except` are what make "never raises"
+    true rather than intended (found by Codex). `text=True` DECODES, and git output
+    is not guaranteed UTF-8 — a filename or a commit message in another encoding is
+    ordinary in a long-lived repository — so the decode raises `UnicodeDecodeError`
+    out of `subprocess.run` itself, past an `except` that named only `OSError` and
+    `SubprocessError`, and takes down a round over an attribution nothing gates on.
+    Replacement is safe for both readers here: the added-line scan wants `diff --git`,
+    `@@` and a leading `+`, and the patch stream is fed back to `git patch-id` after
+    the SAME substitution on both sides of the comparison, so two ids that should
+    match still do. `ValueError` (which `UnicodeDecodeError` subclasses) covers the
+    rest of the family, including a `repo_path` carrying an embedded NUL.
+    """
+    if not repo_path:
+        return None
+    try:
+        out = subprocess.run(["git", "-C", repo_path, *args], input=stdin,
+                             capture_output=True, text=True, errors="replace",
+                             timeout=RECONSTRUCT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _patch_ids(repo_path: str, shas: list[str]) -> dict[str, str] | None:
+    """`{commit: patch-id}` for the commits named, or None if they could not be read.
+
+    A patch-id is a hash of what a commit CHANGES with the line numbers, the hunk
+    headers and the whitespace taken out, which is exactly the property a rebase
+    preserves and a SHA does not. `--stable` pins the algorithm to the one that
+    does not depend on the order git happened to emit the files in; without it two
+    clones can disagree about whether the same patch is the same patch.
+
+    Commits git cannot reduce to a patch simply do not appear: an empty commit has
+    no lines and a merge has no single parent to diff against, so `diff-tree` emits
+    nothing for either and `patch-id` has nothing to hash. Both are correct to
+    drop — a commit that added no line cannot have introduced a defect on one —
+    and the caller reads a missing id as "not attributable", never as "matched".
+
+    None, not `{}`, when git failed. The two are opposite instructions: an empty
+    map is "these commits changed nothing", and the caller may go on; a failure is
+    "this cannot be corresponded", and the caller must stop, because a fix set
+    computed against patch-ids that were never read is every commit on the branch.
+    """
+    if not shas:
+        return {}
+    patches = _git(repo_path, "diff-tree", "--stdin", "-p", "-M", "--root",
+                   stdin="\n".join(shas) + "\n")
+    if patches is None or len(patches) > FIX_RANGE_MAX_CHARS:
+        return None
+    out = _git(repo_path, "patch-id", "--stable", stdin=patches)
+    if out is None:
+        return None
+    ids: dict[str, str] = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 2:
+            # A line this cannot read is a HOLE, and a hole is not the same as a
+            # commit with no patch (found by Codex). A commit missing from the prior
+            # side reserves nothing, so its counterpart on the new side reads as the
+            # fix pass — over-attribution bought by a parse this silently skipped.
+            # `patch-id` does not emit such a line today; the point is that if it
+            # ever did, the caller must decline rather than correspond two histories
+            # from a map it knows is incomplete.
+            return None
+        ids[parts[1]] = parts[0]
+    return ids
+
+
+def reconstruct_fix_range(repo_path: str, gh_repo: str, base_ref: str,
+                          anchor: str | None, head_sha: str | None) -> dict:
+    """The fix pass's own commits, identified across a branch REWRITE by patch
+    equivalence rather than by walking a range (#504).
+
+    :data:`FIX_RANGE_REWRITTEN` is where :func:`_fix_range_diff` stops, and #500's
+    observation is that stopping there is a choice rather than a limit: *the range
+    is wrong, not the history*. After a rebase `compare/a...b` diffs from a merge
+    base that has moved and widens toward the whole PR, so nothing may attribute
+    from that span — but the commits the fix pass actually wrote are still on the
+    branch, wearing new SHAs. `git patch-id` names them anyway, because it hashes
+    what a commit CHANGES and a rebase that did not resolve a conflict changes
+    nothing about that.
+
+    So: take the commits the last round had reviewed (`merge_base..anchor`), take the
+    commits the branch carries now (`merge_base..head`), and call the fix pass
+    whatever is left in the second once each of the first has claimed one
+    patch-equivalent. Both bounded by the same fork point — the comment at the
+    `rev-list` calls says why the obvious `head..anchor` is wrong for the first — and
+    claimed by COUNT rather than by membership, with any count the branch cannot
+    settle refused outright rather than decided by position.
+
+    Returns `{"diff", "why", "commits", "prior", "carried", "unmatched"}` and never
+    raises. `diff` is None with `why` set for every way this can decline, and a
+    decline leaves the round exactly as blind as :func:`_fix_range_diff` left it —
+    #509's veto still fires, nothing is attributed, and the operator is told which
+    of the reasons it was.
+
+    **The merge base comes from the forge, not from the clone, and that is not
+    fussiness.** A local `origin/<base>` is refreshed by nothing in this process, and
+    a stale one is an ancestor of the rebased head — so `git merge-base` answers with
+    the stale tip and every base-branch commit the rebase moved onto falls inside the
+    "fix pass". That is the 21-commit over-attribution #500 measured, reintroduced by
+    the repair meant to prevent it. :func:`_merge_base_now` asks GitHub where the
+    branch actually forks, and this declines rather than guess.
+
+    **It attributes only where the reconstruction is EXACT, and declines otherwise.**
+    That is a correction this made under review, and the argument is not about
+    honesty — every case below was reported in `config_notes` when this leaned — but
+    about what the number DOES. `escalate_on.fix_injection` ends a cycle, and the
+    README's case for a threshold at 0.5 is that "`introduced` is a documented FLOOR,
+    which is what makes a threshold on it err safe: a measured 0.64 is at least
+    0.64". A source that over-counts breaks that argument, and the price is a cycle
+    stopped with real findings left unfixed. Nothing reads a note before firing a
+    brake. So the five shapes below decline, and a decline costs only what was
+    already lost.
+
+    - **No correspondence at all** — the prior round had commits and none came
+      through (a squash, a re-created branch). Every commit on the branch would read
+      as the fix pass, which is the catastrophe `rewritten` exists to prevent.
+    - **Nothing left over** — no fix pass here to attribute, told apart from the
+      branch RESET BACKWARDS that removed one, which the caller needs in those words.
+    - **An UNMATCHED prior commit** — a rebase that resolved a conflict changed that
+      commit's content, so it is somewhere among the leftovers with no way to say
+      which. #504's own wording settles it: *that commit's lines cannot be
+      attributed*. `unmatched` bounds the damage at one COMMIT, which can be a
+      thousand lines and cover every finding in the round, so it is not a bound on
+      anything a reader could correct for.
+    - **A pass that is not the branch TAIL** — then no single diff is the pass, and
+      reading its commits' patches separately is a superset twice over: a line the
+      pass added and a later commit removed is still in it, and each line's number
+      comes from its own commit's tree rather than the head's.
+    - **An ambiguous patch-id** — the branch carries more copies of a patch than the
+      last round had, and which is the fixer's own cannot be told from which is the
+      replayed one.
+
+    What survives is one two-dot `git diff` from the commit before the pass to the
+    head: the exact net change, numbered in the head's own tree, which is what
+    findings are reported against. That is the ordinary rebase — #500's own measured
+    case — and it is the case worth having.
+    """
+    out: dict = {"diff": None, "why": None, "commits": [],
+                 "prior": 0, "carried": 0, "unmatched": 0}
+    if not repo_path:
+        out["why"] = ("no local checkout is configured for this repo, and patch-id is "
+                      "git rather than the compare API")
+        return out
+    if not (anchor and head_sha):
+        out["why"] = "the range has no two ends to reconstruct between"
+        return out
+    for ref in (anchor, head_sha):
+        # Explicitly, rather than by letting git decline it. A value starting `-`
+        # reads as an OPTION in argv, and while the worst that does here is make
+        # `rev-parse` exit non-zero — which this already treats as "not in the
+        # checkout" — the two are different news, and a decline that names the wrong
+        # reason sends an operator looking for a commit rather than for the baseline
+        # that is malformed. `_is_ref` is the same check `--since` already passes.
+        if not _is_ref(ref):
+            out["why"] = f"{ref!r} is not a ref this can ask git about"
+            return out
+        if _git(repo_path, "rev-parse", "--verify", "--quiet",
+                f"{ref}^{{commit}}") is None:
+            out["why"] = (f"{ref[:8]} is not in the checkout at {repo_path} — the "
+                          "commits a rewrite orphans stay reachable only where "
+                          "somebody still holds them")
+            return out
+    mb = _merge_base_now(gh_repo, base_ref, head_sha)
+    if not mb or _git(repo_path, "rev-parse", "--verify", "--quiet",
+                      f"{mb}^{{commit}}") is None:
+        out["why"] = ("the branch's fork point could not be read, so the "
+                      "reconstruction could not be bounded to the PR's own commits "
+                      "— the base branch's would be inside it")
+        return out
+    # BOTH sides bounded by the SAME fork point, and the prior side is why it has to
+    # be a fork point rather than the other head. `head..anchor` reads as the obvious
+    # spelling of "what the last round reviewed and this branch no longer has", and
+    # it is wrong on every rewrite that left part of the branch alone: an amended tip
+    # puts only the amended commit in it, so every commit BELOW the amend is missing
+    # from the prior set, matches nothing, and is attributed to a fix pass that did
+    # not write it. `mb..anchor` is the PR exactly as that round saw it, whatever the
+    # rewrite did — and `mb` bounds it correctly even though it is the NEW fork
+    # point, because the old one is an ancestor of it (the base branch grew).
+    # `--no-merges` on both sides. A merge has no single parent to diff against, so
+    # `patch-id` can say nothing about one and a merge on either side would be
+    # unmatchable by construction — every merge on the new branch would read as the
+    # fix pass. Dropping them also removes, for a reconstructed round only, the
+    # base-branch-merge over-count `_fix_range_diff`'s docstring records and cannot
+    # fix: main's own commits arrive through a merge, and a merge is not here.
+    new_out = _git(repo_path, "rev-list", "--no-merges", "--reverse",
+                   f"{mb}..{head_sha}")
+    prior_out = _git(repo_path, "rev-list", "--no-merges", f"{mb}..{anchor}")
+    if new_out is None or prior_out is None:
+        out["why"] = "the commits either side of the rewrite could not be listed"
+        return out
+    new, prior = new_out.split(), prior_out.split()
+    if max(len(new), len(prior)) > RECONSTRUCT_MAX_COMMITS:
+        out["why"] = (f"more than {RECONSTRUCT_MAX_COMMITS} commits sit either side of "
+                      "the rewrite — past the size any fix pass is, and past what is "
+                      "worth patching to find out")
+        return out
+    if not new:
+        out["why"] = "the rewritten branch carries no commit of its own"
+        return out
+    new_ids, prior_ids = _patch_ids(repo_path, new), _patch_ids(repo_path, prior)
+    if new_ids is None or prior_ids is None:
+        out["why"] = "the commits' patch-ids could not be computed"
+        return out
+    # AMBIGUITY IS A REFUSAL, and this is the check that makes the matching below
+    # safe to do by count (found by Codex, second pass). A patch-id is not unique: a
+    # fix pass that re-applies a change the last round reviewed produces a second
+    # commit with the SAME id. When the branch carries MORE of an id than the last
+    # round had, one of them is the rebased copy and the other is the fixer's own —
+    # and nothing here can say which. Deciding it by position was the first shape of
+    # this, justified by "a rebase replays the reviewed commits first"; that holds
+    # for a plain rebase and not for an interactive one, a reorder, a cherry-pick or
+    # an arbitrary force-push, and getting it backwards puts an already-reviewed
+    # commit inside the fix pass while leaving the fixer's own out. On a signal that
+    # ends cycles, a coin toss is not available.
+    prior_counts, new_counts = Counter(prior_ids.values()), Counter(new_ids.values())
+    ambiguous = sum(1 for pid, n in new_counts.items() if 0 < prior_counts[pid] < n)
+    if ambiguous:
+        out["why"] = (f"{ambiguous} patch(es) appear more often on the rewritten branch "
+                      "than in what the last round reviewed, so which copy is the "
+                      "fixer's own and which is the replayed one cannot be told apart")
+        return out
+    # With ambiguity refused above, spending the counts in branch order is arithmetic
+    # rather than a guess: every id the last round had appears at most that many
+    # times here, so which commit takes which claim cannot change the leftover SET.
+    unspent = Counter(prior_counts)
+    fix: list[str] = []
+    for c in new:
+        pid = new_ids.get(c)
+        if not pid:
+            # No patch to hash — an empty commit. It added no line, so it can have
+            # introduced a defect on none, and it is neither a match nor a leftover.
+            continue
+        if unspent[pid]:
+            unspent[pid] -= 1
+            continue
+        fix.append(c)
+    out["prior"] = len(prior_ids)
+    out["unmatched"] = sum(unspent.values())
+    out["carried"] = out["prior"] - out["unmatched"]
+    if prior_ids and not out["carried"]:
+        out["why"] = (f"none of the {len(prior_ids)} commit(s) the last round reviewed "
+                      "has a patch-equivalent on the rewritten branch, so the two "
+                      "histories cannot be corresponded and every commit on the "
+                      "branch would read as the fix pass")
+        return out
+    if not fix:
+        # Two different pieces of news, and `unmatched` is the only thing that can
+        # tell them apart. Nothing left over AND nothing missing is a pure rebase
+        # with no fix pass on it. Nothing left over WITH commits missing is a branch
+        # RESET BACKWARDS — the `behind` rewrite, which reaches the compare API
+        # looking like nothing at all — and the pass this round would attribute has
+        # been taken off the branch rather than rewritten on it. Both decline, and an
+        # operator reading the second needs to know a force-push dropped work.
+        out["why"] = ("every commit on the rewritten branch is patch-equivalent to one "
+                      "the last round already reviewed — "
+                      + (f"and {out['unmatched']} of that round's commits are no longer "
+                         "on the branch at all, so the fix pass was REMOVED rather than "
+                         "rewritten"
+                         if out["unmatched"] else
+                         "there is no fix pass here to attribute, and a rewrite is not "
+                         "evidence that one happened"))
+        return out
+    # ---- AND THE TWO REFUSALS THAT KEEP `introduced` A FLOOR (Codex, third pass).
+    #
+    # Both of these were leans this reported and attributed through, and the argument
+    # against that is not that a lean is dishonest — it was in `config_notes` — but
+    # that `escalate_on.fix_injection` ENDS A CYCLE, and the README's case for a
+    # threshold at 0.5 is "`introduced` is a documented FLOOR, which is what makes a
+    # threshold on it err safe: a measured 0.64 is at least 0.64". A source that
+    # over-counts breaks that argument, and the cost is a cycle stopped with real
+    # findings unfixed. A note beside the number does not stop that; nothing reads a
+    # note before firing a brake.
+    #
+    # An UNMATCHED prior commit is the first. Its content moved in the rewrite, so it
+    # is somewhere in the leftovers and there is no way to say which one it is — the
+    # whole of an already-reviewed commit is then inside the pass, and `unmatched`
+    # bounds that at one COMMIT, which can be a thousand lines and cover every finding
+    # in the round. #504's own wording is what settles it: *that commit's lines cannot
+    # be attributed*. Not "are attributed to the fixer with a caveat".
+    if out["unmatched"]:
+        out["why"] = (f"{out['unmatched']} of the {out['prior']} commit(s) the last round "
+                      "reviewed changed content in the rewrite (a conflict resolved "
+                      "during the rebase), so each is somewhere among the commits this "
+                      "would call the fix pass and there is no way to say which — "
+                      "attributing them would blame the fixer for work the last round "
+                      "had already reviewed")
+        return out
+    # A pass that is NOT the branch tip is the second. Concatenating each leftover
+    # commit's own patch was the fallback, and it is a superset twice over: a line the
+    # pass added and a later commit removed is still in the set, and each line's
+    # number comes from its own commit's tree rather than the head's. One net two-dot
+    # diff has neither problem, and it is available exactly when the leftovers are the
+    # tail of the branch — which a rebase makes them, by replaying the reviewed
+    # commits first.
+    #
+    # `linear` is the other half of the test and not pedantry: `new` has had merges
+    # dropped, so leftovers that look like the tail of `new` can still have a merge
+    # sitting inside the span, and the two-dot diff would carry whatever that merge
+    # brought in. Counting the range WITH merges is what tells the two apart.
+    linear = _git(repo_path, "rev-list", "--count", f"{mb}..{head_sha}")
+    if (linear or "").strip() != str(len(new)) or fix != new[len(new) - len(fix):]:
+        out["why"] = ("the fix pass is not the tail of the rewritten branch, so no one "
+                      "diff is the pass — and reading its commits' patches separately "
+                      "would attribute lines the pass added and then removed")
+        return out
+    diff = _git(repo_path, "diff", "-M", f"{fix[0]}^", head_sha)
+    if diff is None:
+        # `fix[0]^` on a root commit is the one shape this covers in practice, and
+        # a branch whose first commit is the repository's own is not a PR.
+        out["why"] = "the reconstructed range's diff could not be read"
+        return out
+    if not diff.strip():
+        out["why"] = ("the fix pass nets to no change against the commit before it — "
+                      "there is nothing for a finding to sit on")
+        return out
+    out["diff"], out["commits"] = diff, fix
+    return out
+
+
+#: How many of a fix pass's commits a proposal will list by name (#506). A revert
+#: proposal is read by a human deciding whether to undo a pass, and a pass of four
+#: commits is the shape that decision is usually about; beyond this the list stops
+#: informing and the COUNT is what matters, which is carried separately. Not a dial:
+#: nothing gates on it, and it bounds a payload field rather than a policy.
+FIX_PASS_COMMIT_CAP = 20
+
+#: What #506's proposal reads out of the same compare endpoint provenance already
+#: uses. `parents` is the load-bearing one — see :func:`fix_pass_commits`.
+_FIX_PASS_COMMITS_JQ = (
+    '{total: (.total_commits // 0), '
+    'commits: [(.commits // [])[] | {sha: .sha, '
+    'title: ((.commit.message // "") | split("\n")[0]), '
+    'parents: ((.parents // []) | length)}]}')
+
+
+def fix_pass_commits(gh_repo: str, base_sha: str | None, head_sha: str | None) -> dict:
+    """The commits a fix pass actually consists of, as
+    `{"commits": [...], "total": n, "merges": n}`, or `{}` when they cannot be read.
+
+    #506 names a fix pass by its commit range and offers a `git revert` for it, and
+    **the range alone is not enough to know that a revert of it is safe.** The bias is
+    already documented on :func:`_fix_range_diff`: merging the base branch INTO the PR
+    between rounds leaves the old head an ancestor, so the compare still reads `ahead`
+    and main's own commits fall inside the range. For attribution that over-counts
+    `introduced` and is recorded as a known lean. For a proposal it is worse than a
+    lean — the offered command would revert other people's commits, and `git revert`
+    refuses a merge commit outright without `-m`, so the invocation cannot even run as
+    written. `merges` is what tells the two apart, and a proposal withholds its command
+    unless it is zero.
+
+    Its own call rather than a fourth element on :func:`_fix_range_diff`, and it is
+    made ONLY on a round whose injection rate crossed the threshold — the terminal
+    round of a diverging cycle, and no other. An ordinary round pays nothing for this,
+    which is the whole reason it is not folded into the range read that every round
+    makes.
+
+    Never raises, on :func:`compare_facts`' contract and for its reason: this is an
+    assurance about a proposal nothing acts on, and a round must not die because the
+    commits behind an attribution it already made could not be listed. `{}` is the
+    honest empty, and a proposal reading it withholds the command rather than
+    assuming the range is clean.
+
+    ``complete`` is the other half of that honesty. The compare endpoint returns at
+    most 250 commits with `total_commits` naming the real figure, so on a longer range
+    ``merges`` is a FLOOR — a merge past the ceiling is invisible — and a proposal has
+    to read a zero there as "not known to be clean" rather than as clean."""
+    if not (gh_repo and base_sha and head_sha) or base_sha == head_sha:
+        return {}
+    try:
+        got = json.loads(panel_core.sh(
+            ["gh", "api", f"repos/{gh_repo}/compare/{base_sha}...{head_sha}",
+             "--jq", _FIX_PASS_COMMITS_JQ], timeout=FIX_RANGE_TIMEOUT_S))
+    except Exception:                       # every one, per the contract above
+        return {}
+    if not isinstance(got, dict):
+        return {}
+    raw = got.get("commits")
+    if not isinstance(raw, list):
+        return {}
+    commits, merges = [], 0
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        sha = _commit_id(c.get("sha"))
+        if not sha:
+            continue
+        # Counted over EVERY commit the compare returned, and the list is truncated
+        # after — a merge past the display cap is still a merge, and a count that
+        # stopped where the listing stopped would report a range as clean because it
+        # was long. The compare endpoint's own 250-commit ceiling still applies and is
+        # why `total` travels beside this: a range at that ceiling is one whose
+        # merge count is a floor, and a proposal reads `total > len(commits)` as a
+        # reason to say so rather than as a rounding.
+        parents = c.get("parents")
+        if isinstance(parents, int) and not isinstance(parents, bool) and parents > 1:
+            merges += 1
+        commits.append({"sha": sha, "title": str(c.get("title") or "").strip()})
+    total = got.get("total")
+    seen = len(commits)
+    # WAS THE WHOLE RANGE RETURNED? The compare endpoint carries at most 250 commits
+    # while `total_commits` reports the real number, so a long fix pass comes back
+    # short with a 200 and no error — and a merge past that ceiling would be invisible
+    # while `merges == 0` said the range was clean (found by Codex on the second pass).
+    # `merges` is therefore a FLOOR on an incomplete range, exactly as `introduced` is
+    # a floor on the attribution above, and only this flag can say which kind of zero a
+    # zero is.
+    #
+    # `==`, not `<=`: `total_commits` absent comes back through the `--jq` as `0`, and
+    # `0 <= seen` would call a range we know nothing about complete. An answer this
+    # cannot verify has to read as "not verified", because the command it gates is the
+    # one thing here a human runs.
+    complete = (isinstance(total, int) and not isinstance(total, bool)
+                and total == seen)
+    return {"commits": commits[:FIX_PASS_COMMIT_CAP], "merges": merges,
+            "total": total if isinstance(total, int) and not isinstance(total, bool)
+            else seen,
+            "complete": complete}
 
 
 def _commit_id(value: object) -> str | None:
@@ -287,8 +843,18 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
       `missed`. So the split is biased toward `missed` in BOTH directions, and the
       `introduced` count should be read as a floor rather than as a measurement.
 
-    #41 (review the increment) is what removes both: a finding raised against the
-    increment is introduced by construction, with no line arithmetic in the middle.
+    #41 (review the increment) HAS LANDED — `--scope increment`, v2.28, the default
+    — and #512 is what acted on it: a round that reviewed the increment now
+    attributes against that diff (`payload.fix_range_source == "increment"`) rather
+    than re-fetching the span through :func:`_fix_range_diff`. What that removed is
+    the second compare call, the anchor mismatch behind it, and the base-merge
+    over-count named above; the two biases in this docstring it did NOT remove,
+    because placing a finding in the increment is still a comparison and a deletion
+    still has no added line to sit on.
+
+    So this function is still reached, and still biased, on exactly the rounds #41
+    never covered: `round_scope: pr`, and any round whose increment fell back. Read
+    `fix_range_source` before reading these buckets.
     """
     if not have_range:
         return "unknown"
@@ -1740,18 +2306,89 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
     return "PASS", failing, None
 
 
+#: How long a round may wait for a PENDING CI to settle before dispatching the
+#: seats. Measured rather than guessed: on this repo a full run is ~4m30s wall
+#: clock with a 1-9 second queue wait, and a panel round is 20-40 minutes — so the
+#: build reliably finishes DURING a round that was told it had not.
+CI_SETTLE_WAIT = 600
+
+#: How often to ask. `gh pr checks` is a couple of seconds, and the thing being
+#: waited on changes on the order of minutes.
+CI_SETTLE_POLL = 20
+
+
+def review_ci_settled(gh_repo: str, pr_number: int, *,
+                      read=None,
+                      budget: float = CI_SETTLE_WAIT,
+                      poll: float = CI_SETTLE_POLL,
+                      now=time.monotonic, sleep=time.sleep):
+    """:func:`review_ci`, but give a PENDING build a bounded chance to finish.
+
+    **Why waiting beats reading it again afterwards.** The obvious fix for a stale
+    CI reading is to take a second one when the round ends. It does not work here,
+    and the reason is :func:`panel_rounds.coverage_veto`'s standing rule: a veto is
+    exempted *"off RECORDED STATE, never off the wording of a message or a
+    declaration"*. The veto in question is not the panel's own — it is a REVIEWER
+    saying "could not assess: CI result is unknown (still running)", free-form
+    prose produced because its prompt said so. Answering that afterwards would mean
+    matching model text for something CI-shaped, which is the one thing that rule
+    forbids, and forbids for a good reason: a regex over prose exempts a genuine
+    round-specific gap whose wording happens to match, and misses the structural
+    one that does not.
+
+    So the cause is removed instead of the symptom filtered. If the seats are told
+    a real answer, no reviewer has a gap to declare and nothing needs exempting.
+
+    Measured, fleet-wide over five days: 19 rounds, ``ci_status`` PENDING on 9 of
+    them, and ``stop_confident`` true on **none** — the field that separates a
+    converged cycle from one that gave up carried no information at all. That is
+    the failure `coverage_veto`'s docstring already names in the abstract: *"a
+    signal that is never positive carries no information and trains its reader to
+    ignore it."*
+
+    Bounded, and the bound fails in the honest direction: a build that is still
+    pending when the budget runs out is reported exactly as it is today, PENDING,
+    veto and all. Waiting can only ever turn an unknown into a fact.
+
+    Returns ``(status, failing, skip, waited_seconds)`` — the wait is returned
+    rather than logged so the caller can put it in `config_notes`, because a round
+    that sat for four minutes should say so rather than look slow for no reason.
+    """
+    # `read` is injected rather than resolved here, and the caller passes its OWN
+    # `review_ci`. That is not ceremony: a dozen suites stub `panel.review_ci` to
+    # keep a round off the network, and a wrapper that reached for this module's
+    # binding instead would slip past every one of them — shelling out to `gh` in
+    # tests and, on a PENDING answer, sitting on the whole budget.
+    read = read or review_ci
+    started = now()
+    status, failing, skip = read(gh_repo, pr_number)
+    if status != "PENDING":
+        return status, failing, skip, 0.0
+    while now() - started < budget:
+        sleep(min(poll, max(0.0, budget - (now() - started))))
+        status, failing, skip = read(gh_repo, pr_number)
+        if status != "PENDING":
+            break
+    return status, failing, skip, round(now() - started, 1)
+
+
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
 #: them silently. Generated from the module's own top level, so a helper added here
 #: is exported without anyone remembering to list it.
 __all__ = [
     "panel_core", "_fix_range_diff", "_commit_id", "_head_sha_now",
+    "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND", "FIX_RANGE_REWRITTEN",
+    "RECONSTRUCT_TIMEOUT_S", "RECONSTRUCT_MAX_COMMITS",
+    "_git", "_patch_ids", "reconstruct_fix_range",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now", "PROVENANCE", "_provenance",
     "RECURRENCE", "SITE_RADIUS", "_recurrence",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
+    "review_ci_settled", "CI_SETTLE_WAIT", "CI_SETTLE_POLL",
     "fetch_increment", "COMPARE_FILE_CAP", "_count", "compare_facts",
+    "FIX_PASS_COMMIT_CAP", "_FIX_PASS_COMMITS_JQ", "fix_pass_commits",
     "_range_notes", "MERGE_DISTANT", "MERGE_INVOLVED", "MERGE_UNREAD",
     "_changed_lines", "Integration", "MergeReading", "merge_involvement",
     "_is_commitish", "_is_ref", "_same_commit",

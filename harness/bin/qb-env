@@ -43,6 +43,13 @@
 #                          writes the five above — so until it does, `qb-doctor` takes it
 #                          from the environment or `--human-url`, and reports the row as
 #                          "could not check" rather than as a pass when it has neither.
+#   QUARTERBACK_ELEVATED_TOKEN[_CMD]  optional; this machine's DELEGATED credential
+#                          (quarterback #478), presented as X-Agent-Elevated beside the
+#                          bearer. It authorises exactly two plan writes for an agent
+#                          that keeps its own identity — NOT a way to be a person, and
+#                          everything else app.auth.human gates stays shut to it. Same
+#                          value-or-command shape as QUARTERBACK_TOKEN, and resolved the
+#                          same way; unset means those two tools refuse and say so.
 #
 # Environment beats the config file throughout, so a single invocation can override
 # any of it without editing anything.
@@ -52,7 +59,28 @@ QB_CONFIG="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/c
 qb_load_config() {
   # shellcheck disable=SC1090
   [ -r "$QB_CONFIG" ] && . "$QB_CONFIG"
-  QUARTERBACK_AGENT="${QUARTERBACK_AGENT:-$(hostname -s 2>/dev/null || hostname)}"
+  # `hostname` FIRST, so no host that has it sees its machine name change — that name
+  # is the board identity, the `quarterback-<host>` vault item and the ELEVATED_TOKENS
+  # key, and a derivation that shifted it would break all three at once.
+  #
+  # The fallbacks are new because the old pair could not do what it looked like it did:
+  # BOTH arms called `hostname`, so `2>/dev/null ||` bought nothing when the binary was
+  # simply ABSENT rather than failing. Then this expanded to empty, and an empty agent
+  # name is not an error anywhere — it silently becomes `quarterback-` in every `op://`
+  # reference built from it (#556). A nix check sandbox has no `hostname`; so, in
+  # principle, does the work island's thin PATH.
+  #
+  # `uname -n` is coreutils and `/etc/hostname` is a file, so between them there is
+  # somewhere to read on any box this script can run on at all.
+  if [ -z "${QUARTERBACK_AGENT:-}" ]; then
+    QUARTERBACK_AGENT="$(hostname -s 2>/dev/null || uname -n 2>/dev/null \
+                         || cat /etc/hostname 2>/dev/null)"
+    # Short name only, and only on the DEFAULT path: `uname -n` and `/etc/hostname` can
+    # carry a domain where `hostname -s` never does, and the board's machine names are
+    # bare. An explicitly set QUARTERBACK_AGENT is passed through untouched — it is
+    # somebody naming a machine, not this function guessing one.
+    QUARTERBACK_AGENT="${QUARTERBACK_AGENT%%.*}"
+  fi
   return 0
 }
 

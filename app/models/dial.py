@@ -108,6 +108,23 @@ class DialSetting(Base):
     set_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now())
 
+    #: HOW that person proved it — `edge`, `key` or `dev` (:mod:`app.auth`).
+    #:
+    #: The identity above is the same by either door and that is deliberate: a
+    #: person is one author however they arrived. But "a browser Authelia vouched
+    #: for" and "a key sitting on a workstation" are not the same event, and the
+    #: second carries a residual this repo writes down rather than argues away —
+    #: anything running as that user can read the key and author as them (#479).
+    #: A row that recorded only `set_by` could not tell the two apart afterwards,
+    #: which is exactly the moment somebody asks.
+    #:
+    #: NULLABLE, and null is "not recorded" rather than "some other method": every
+    #: row written after this column existed has one, and the rows written before
+    #: it honestly have no answer. Back-filling a guess would put the one value a
+    #: reader must be able to distrust into the column they consult to decide
+    #: whether to trust it.
+    set_via: Mapped[str | None] = mapped_column(Text(), nullable=True)
+
     #: NULL is indefinite. A past timestamp is absent, not expired-and-reported:
     #: "a resolution with no dial layer is indistinguishable from one that never
     #: had it" is #276's requirement and it is met by not returning the row.
@@ -117,6 +134,11 @@ class DialSetting(Base):
     cleared_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)
     cleared_by: Mapped[str | None] = mapped_column(Text(), nullable=True)
+    #: And how THEY proved it. `cleared_by` exists so "who moved the floor, when,
+    #: and what did they say about it" survives the next person moving it; the
+    #: argument for recording the method on a write is the same argument on the
+    #: write that ends it, so recording only half would be an odd place to stop.
+    cleared_via: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
     __table_args__ = (
         CheckConstraint("length(btrim(dial)) > 0", name="ck_dial_settings_dial"),

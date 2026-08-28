@@ -26,7 +26,7 @@ both sandboxed test trees — `harness/tests` and `harness/loops/tests`, `.py` a
 string literal, or at the head of a line, which is where one lands in a
 triple-quoted stub body. It cannot know whether that string is ever written to a
 file, so a mention in a comment or a deliberate literal is not evidence of a defect
-— and `test_qb_seat.py` has one of each, on purpose, in a test *about* this very
+— and `test_qb_seat.py` had one of each, on purpose, in a test *about* this very
 rule. Both are allowed by path below rather than by a pattern, so a new one has to
 be argued for here rather than slipped past.
 
@@ -75,11 +75,14 @@ _ENV_SHEBANG = re.compile(r"""(?:['"]\s*(?:#!\s*)?|^\s*#!\s*)/usr/bin/env\b""")
 #: read now and `conftest.py` is a name both may hold. The COUNT is the point:
 #: exempting a LINE rather than an occurrence would let a second bad literal be
 #: appended to an allowed line and go unread.
-ALLOWED = {
-    # A test whose SUBJECT is which shebangs work: it writes all three forms and
-    # asserts on what each does. Rewriting it would delete the coverage.
-    ("tests/test_qb_seat.py", 'for body in (', 1),
-}
+#:
+#: EMPTY, and that is the strongest state it has: nothing in either tree writes a
+#: shebang this guard has to make an exception for. It held one entry until #540 —
+#: `test_qb_seat.py`, whose subject was which shebangs work, so it wrote all three
+#: forms deliberately — and that file went with the script it tested. The fixture
+#: assertion it proved went too; this scanner is the wider guard of the two, since
+#: it reads every test source in both trees rather than the stubs of one fixture.
+ALLOWED = set()
 
 
 def _sources() -> list[Path]:

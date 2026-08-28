@@ -42,6 +42,8 @@ let
     QUARTERBACK_CONSUMER_FLAKE="${consumer.flake}"
   '' + lib.optionalString (consumer.attr != null) ''
     QUARTERBACK_CONSUMER_ATTR='${consumer.attr}'
+  '' + lib.optionalString (consumer.rebuild != null) ''
+    QUARTERBACK_REBUILD_CMD='${consumer.rebuild}'
   '';
 
   # What `qb-start` compiles in (its SPAWNABLE table). Restated here so a bad
@@ -52,6 +54,11 @@ let
   spawnableCommands = [
     "/investigate"
     "/fix-issue" "/fix-and-review" "/fix-and-land" "/review-pr" "/panel-review-pr"
+    # Takes no number: it reads the plan and self-selects (#541). Allowing it
+    # implies allowing everything it dispatches into — `qb-start` REFUSES a policy
+    # that names this without `/fix-issue`, `/fix-and-land`, `/review-pr` and
+    # `/panel-review-pr`, rather than granting them silently one hop along.
+    "/get-involved"
   ];
 
   # The machine's spawn policy, read by `qb-start` and by nothing else. Written ONLY
@@ -178,6 +185,20 @@ in
 
           The count is spawned tmux panes whose agent has not exited, so a
           window left open to read is not one of them.
+
+          THE FALLBACK, not the only source (#563). The board's
+          `spawn.max_sessions` dial answers first and this applies when no dial
+          is set, when the board cannot be reached, or when what it holds is not
+          a number — so a host with no dial behaves exactly as it did before.
+          The other two keys here are permissions and deliberately have no such
+          layer: whether this machine may spawn AT ALL, and what may come
+          through the gate, must not depend on a board being reachable or on
+          anything an agent can reach. A ceiling only counts a resource, dial
+          writes are human-only, and needing a nix build, a PR and a rebuild to
+          change a number is what this option is being relieved of.
+
+          `qb-start --policy` reports the effective ceiling and names the layer
+          that gave it.
         '';
       };
 
@@ -186,7 +207,7 @@ in
         default = true;
         description = ''
           Pass --dangerously-skip-permissions to a spawned agent. On by default,
-          for `qb-seat`'s reason: a spawned window is a pane nobody is watching,
+          for a seat screen's reason: a spawned window is a pane nobody is watching,
           so the first tool call wanting a permission it does not hold stops it
           in the one way this cannot recover from — the pane looks busy, the
           board shows a live agent holding a claim, and nothing is moving.
@@ -401,6 +422,31 @@ in
           slow, and can be defeated by a host that does not evaluate here at all.
         '';
       };
+
+      rebuild = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "rebuild switch";
+        description = ''
+          The command `qb-bump --apply` switches this machine with, when it is not
+          `sudo nixos-rebuild switch --flake <consumer>#<attr>`. Emitted as
+          `QUARTERBACK_REBUILD_CMD`.
+
+          Leave it and `qb-bump` looks for a `rebuild` wrapper on PATH, READS it (never
+          runs it), and uses it only when it names exactly one flake directory and that
+          is the one just built — and only when the attribute was matched against this
+          machine's hostname rather than named with `--host`, since a wrapper picks its
+          own attribute from the hostname and nothing in its text can be checked against
+          a named one. That covers this fleet, whose `rebuild` exists because
+          `nixos-rebuild switch` prints "Done" over a failed `home-manager-<user>.service`,
+          which is precisely how the harness scripts `qb-bump` delivers fail to arrive
+          while the switch reports success.
+
+          Set it on a host whose wrapper is named something else, or is assembled out of
+          shell variables no read can resolve. Doing so is CONSENT: a declared command is
+          used without the target check, because somebody has said what it builds.
+        '';
+      };
     };
   };
 
@@ -416,12 +462,14 @@ in
         (noSingleQuote "board.url" board.url)
         (noSingleQuote "board.agent" board.agent)
         (noSingleQuote "consumer.attr" consumer.attr)
+        (noSingleQuote "consumer.rebuild" consumer.rebuild)
         {
           # The consumer keys ride in the file `board.url` decides to render, so
           # declaring one without the other is a value that silently reaches nothing —
           # and the symptom is `qb-bump` scanning, finding two candidates and refusing,
           # on a host that thought it had said which. Named at eval time instead.
-          assertion = (consumer.flake == null && consumer.attr == null) || wantConfig;
+          assertion = (consumer.flake == null && consumer.attr == null
+            && consumer.rebuild == null) || wantConfig;
           message = ''
             programs.quarterback-harness.consumer is set but board.url is null, so this
             module renders no ~/.config/quarterback/config and the value would reach

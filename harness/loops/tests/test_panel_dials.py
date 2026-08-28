@@ -1,4 +1,4 @@
-"""#165's seven `review_panel` dials, and #297's eighth — thoroughness against convergence, per repo.
+"""#165's seven `review_panel` dials, #297's eighth and #492's ninth — thoroughness against convergence, per repo.
 
 The panel had one behaviour and no dials. Every choice it made about what counts as
 worth reporting, what a fix round has to clear, and what buys another round was a
@@ -8,8 +8,10 @@ had and **128 of them — 63.7% — were created by the fix pass immediately bef
 against a ~7% industry baseline for bad-fix injection. Every one of those panels
 terminated on the round cap, each saying in its own output "a stop, not convergence".
 
-So there are now eight settings — seven from #165 and `low_severity_fix_lines` from
-#297, which answers a second measurement taken five days later on the same panel — and
+So there are now nine settings — seven from #165, `low_severity_fix_lines` from #297,
+which answers a second measurement taken five days later on the same panel, and
+`max_fix_growth_chars` from #492, which answers a field report that the growth ceiling
+scales its rope with the starting size — and
 this suite is what says they are settings rather than documentation. Each one gets three tests, because there are exactly three ways a
 setting fails:
 
@@ -61,14 +63,16 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The eight, and where each one's default is written twice. `skip_title_patterns` and
+#: The ten, and where each one's default is written twice. `skip_title_patterns` and
 #: the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
+    "file_deferral_issues": "DEFAULT_FILE_DEFERRAL_ISSUES",
     "fix_severity_floor": "DEFAULT_FIX_SEVERITY_FLOOR",
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
     "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
+    "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",
     "max_rounds": "DEFAULT_MAX_ROUNDS",
@@ -232,10 +236,12 @@ def test_the_payload_records_every_dial_as_applied(monkeypatch, capsys, tmp_path
 #: severity either.
 BAD_VALUES = [
     ("fixer_may_defer", "maybe", "true or false"),
+    ("file_deferral_issues", "P-2", "P1, P2, P3, P4, always or never"),
     ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
     ("low_severity_fix_lines", "a few", "a whole number"),
     ("max_fix_growth", "lots", "is not a number"),
+    ("max_fix_growth_chars", "a lot", "a whole number"),
     ("reviewer_scope", "everything", "diff, repo"),
     ("require_failing_test", "sometimes", "true or false"),
     ("max_rounds", 2.5, "whole number of rounds >= 1"),
@@ -244,7 +250,7 @@ BAD_VALUES = [
 
 @pytest.mark.parametrize("key,bad,accepted", BAD_VALUES)
 def test_a_malformed_value_of_a_known_key_is_a_hard_exit(key, bad, accepted):
-    """All eight, in one table, because the failure they share is the one that matters:
+    """All ten, in one table, because the failure they share is the one that matters:
     a repo that wrote `fix_severity_floor: p-4` intending the pre-#165 "fix everything"
     silently got the default, stopped fixing P3s and P4s, and the review ran anyway —
     under a policy the file did not ask for, in the round the fixer was briefed from. A
@@ -278,9 +284,12 @@ def test_unset_is_still_the_silent_not_configured_reading(key, unset):
     WRITTEN null — `null` or `""`, as against an absent key — is its off switch, which
     is still not an error. `low_severity_fix_lines` is the second such key and the
     reading is the same: a written null is "no budget at all", which is not the same
-    answer as the default and not a mistake either."""
+    answer as the default and not a mistake either. `max_fix_growth_chars` is the third
+    and inherits the reading from the key it sits beside (#492) — the two halves of one
+    ceiling are nulled independently, which is most of why it is a second key."""
     dials = panel_seats.resolve_dials({key: unset}, None, [])
-    expected = (None if key in ("max_fix_growth", "low_severity_fix_lines")
+    expected = (None if key in ("max_fix_growth", "max_fix_growth_chars",
+                                "low_severity_fix_lines")
                 else harness_rules.DEFAULTS["review_panel"][key])
     assert getattr(dials, key) == expected
 
@@ -343,12 +352,18 @@ def test_the_bar_for_what_is_in_scope_did_not_move():
 
 
 def test_a_deferral_still_has_to_go_somewhere():
-    """`deferred_to` names an issue ref, so the row wants one — a `deferred` with
-    nowhere to go is the markdown list this replaced. The orchestrator opens it, never
-    the fixer, which is the same division step 3a already draws."""
+    """A `deferred` with nowhere to go is the markdown list this replaced, and #482
+    did not weaken that — it named WHERE. The board row is where every deferral goes;
+    a GitHub issue is a second copy the gate decides on. Either way the orchestrator
+    is the one who writes it, never the fixer, which is the same division step 3a
+    already draws."""
     orchestrator = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
     assert "deferred_to" in orchestrator
-    assert "the orchestrator files it — you open nothing" in orchestrator
+    assert ("the orchestrator records it — a board row always, an issue where "
+            "`file_deferral_issues` calls for one. You open nothing") in orchestrator
+    # And the prose above the template does not promise an issue the gate may refuse.
+    assert "the ORCHESTRATOR opens the issue and records the finding against it" \
+        not in orchestrator
     panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
     assert "Three roads arrive here and all three are the same row" in panel_md
     assert "review_panel.fixer_may_defer" in panel_md
@@ -669,18 +684,35 @@ def test_a_fix_that_did_not_multiply_the_change_is_not_stopped(monkeypatch, caps
     assert growth["over"] is False and 1 < growth["ratio"] < 3
 
 
-def test_null_switches_the_growth_check_off(monkeypatch, capsys, tmp_path):
+def test_null_switches_the_multiple_off_and_says_the_other_half_is_still_there(
+        monkeypatch, capsys, tmp_path):
     """The non-default value. `null` is the only spelling of "off" — the default IS a
     number, so reading null as "inherit" like every other setting would leave a check
-    whose only job is to stop a cycle with no way to opt out."""
+    whose only job is to stop a cycle with no way to opt out.
+
+    Since #492 it switches off the MULTIPLE and not the ceiling: there is an absolute
+    half beside it now, and a repo that wrote this null meant "no growth check",
+    because at the time that key WAS the whole check. Collapsing the one null onto both
+    halves is the obvious alternative and is worse — it makes a written value mean
+    something other than what it names — so the round says so instead, and names the
+    key that finishes the job. The stop still does not fire here (`HUGE` is 6.5x on a
+    growth of ~5,800 chars), which is what the null bought."""
     _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
                    max_rounds=3, diff=SMALL, config=cfg(max_fix_growth=None))
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
                         baseline=[r1], max_rounds=3, diff=HUGE, scope="pr",
                         config=cfg(max_fix_growth=None))
     assert payload["review_panel"]["max_fix_growth"] is None
-    assert payload["round_stop"]["fix_growth"] is None
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["limit"] is None and growth["over_ratio"] is False
+    assert growth["over"] is False
     assert payload["round_stop"]["stop"] is False
+    note, = notes_about(payload, "max_fix_growth_chars")
+    assert "30,000" in note and "in force" in note
+    # And it does NOT fire on the shipped defaults, where nobody wrote anything to be
+    # surprised about — a note on every run is a note nobody reads.
+    _, plain, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="plain")
+    assert not notes_about(plain, "max_fix_growth_chars")
 
 
 def test_an_absent_max_fix_growth_is_the_default_not_off():
@@ -708,6 +740,369 @@ def test_a_bad_max_fix_growth_is_refused_and_never_read_as_a_threshold(bad, why)
     assert why in str(refusal.value)
     assert "null to switch the check off" in str(refusal.value)
     assert notes == []
+
+
+# ------------------------------------------------------- 4b. max_fix_growth_chars
+
+#: A large first round and a large absolute growth that is nevertheless UNDER 3.0x —
+#: the shape #492 is about. 1,200 churned lines to 3,200: +2,000 lines, which at this
+#: repo's measured ~66 chars a churned line is the size of a whole second feature, and
+#: 2.66x, which the multiple waves straight through. The bigger the PR the wider that
+#: gap gets, and the PR most in need of a ceiling is the one handed the loosest.
+BIG = "diff --git a/a.py b/a.py\n" + LINE * 1200
+BIGGER = "diff --git a/a.py b/a.py\n" + LINE * 3200
+
+
+def test_the_absolute_ceiling_stops_growth_the_multiple_waves_through(monkeypatch,
+                                                                      capsys, tmp_path):
+    """A multiple hands its rope out in proportion to the starting size. At 3.0x a
+    113-line PR may grow ~226 lines and a 2,000-line one may grow 4,000, so the same
+    dial that stops the first at 226 waves four thousand lines of fix-pass output
+    through on the second — and "a fix pass that MULTIPLIES the diff has written a
+    second change" is a claim about ABSOLUTE second-change-ness that one multiple
+    cannot make at both ends of the range (#492)."""
+    # Stated as a property of the fixture, or this test asserts nothing: the multiple is
+    # NOT crossed here, so a run against the pre-#492 code goes on to another round.
+    # The default is spelled out rather than read off `panel_core`: this line is a
+    # property of the FIXTURE, and reading it from the code under test would make it
+    # the first thing to fail when the dial is absent — a red run that proves the
+    # constant is missing rather than that the ceiling does not bind.
+    assert len(BIGGER) / len(BIG) < 3.0
+    assert len(BIGGER) - len(BIG) > 30000
+
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG)
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=2, baseline=[r1], max_rounds=3, diff=BIGGER,
+                             scope="pr")
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over"] is True, growth
+    # WHICH half fired, because a stop that named the multiple would send an operator
+    # to raise a key that was never crossed.
+    assert growth["over_ratio"] is False and growth["over_chars"] is True
+    assert growth["grown"] == len(BIGGER) - len(BIG)
+    assert growth["limit_chars"] == 30000
+    assert stop["stop"] is True and stop["confident"] is False
+    assert "`max_fix_growth_chars` ceiling" in stop["reason"]
+    assert "`max_fix_growth` ceiling" not in stop["reason"], stop["reason"]
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    # The veto's CONCLUSION follows the half that fired. `config_notes` never reaches
+    # the board, so this list is the record's only copy of why a cycle ended — and "a
+    # fix pass that multiplies the change" is simply false at 2.7x, let alone of the
+    # 2,000,000-char baseline that grows by 30,001 and sits at 1.02x.
+    assert "whatever the ratio says" in veto
+    assert "multiplies the change" not in veto
+    assert "a stop, not convergence" in report
+
+
+def test_the_absolute_half_does_not_swallow_the_multiple_that_already_bound(
+        monkeypatch, capsys, tmp_path):
+    """The pair can only ever TIGHTEN, and a cycle the multiple already stopped must
+    still be told that is what stopped it. `SMALL` -> `HUGE` is 6.5x on a growth of
+    ~5,800 chars — nowhere near the absolute — so this is the case where the two
+    halves disagree in the other direction."""
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=HUGE, scope="pr")
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["over_ratio"] is True and growth["over_chars"] is False
+    assert growth["grown"] < 30000
+    assert "`max_fix_growth` ceiling" in payload["round_stop"]["reason"]
+    assert "`max_fix_growth_chars`" not in payload["round_stop"]["reason"]
+
+
+#: Over BOTH halves at once: 32.6x on a growth of ~33,000 chars.
+BOTH_OVER = "diff --git a/a.py b/a.py\n" + LINE * 2000
+
+
+def test_a_stop_that_crossed_both_halves_names_both_and_keeps_the_multiplied_wording(
+        monkeypatch, capsys, tmp_path):
+    """"3.4x AND +38,000 chars" is a different argument for splitting than either
+    alone, so both are said. And where the multiple DID fire the conclusion goes back
+    to "a fix pass that multiplies the change", because there it is true."""
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BOTH_OVER, scope="pr")
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over_ratio"] is True and growth["over_chars"] is True
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    assert "`max_fix_growth`" in veto and "ceilings" in veto
+    assert "multiplies the change" in veto and "whatever the ratio says" not in veto
+    assert "`max_fix_growth` ceiling" in stop["reason"]
+    assert "`max_fix_growth_chars` ceiling" in stop["reason"]
+
+
+def test_a_repo_that_nulled_the_multiple_is_told_in_the_VETO_which_half_stopped_it(
+        monkeypatch, capsys, tmp_path):
+    """The migration hazard at the one moment it costs something, and it rides on the
+    veto rather than staying a `config_notes` line because **`config_notes` never
+    reaches the board** — the veto list is the record's only copy, which is the same
+    reason a baseline problem is deliberately recorded as both.
+
+    `max_fix_growth` can only be None from a WRITTEN null (an absent key inherits
+    3.0), so this branch is exactly the repo that switched "the growth check" off
+    before #492 and has now been stopped by the half it never wrote. Without this it
+    would read the board record, see a cycle terminated by a ceiling, and have nothing
+    telling it the key it already set was not the one that fired."""
+    conf = cfg(max_fix_growth=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    stop = payload["round_stop"]
+    assert stop["stop"] is True and stop["fix_growth"]["over_chars"] is True
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    assert "switches off the MULTIPLE only" in veto
+    assert "nulling it too is the pre-#492 no-growth-check-at-all" in veto
+    # And NOT on a repo that wrote neither key: there the multiple is live, nobody's
+    # written intent changed meaning, and a pointer about a migration would be noise.
+    _, plain, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                      baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr", name="p")
+    assert not any("switches off the MULTIPLE only" in v
+                   for v in plain["round_stop"]["veto"])
+
+
+def test_null_switches_the_absolute_half_off_and_leaves_the_multiple(monkeypatch,
+                                                                     capsys, tmp_path):
+    """The non-default value, and the reason this is a second key rather than a
+    two-part value inside `max_fix_growth`: the two halves are nulled independently, so
+    a repo can keep the multiple and decline the absolute without either of them having
+    to answer what half a bare `null` switched off."""
+    conf = cfg(max_fix_growth_chars=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    assert payload["review_panel"]["max_fix_growth_chars"] is None
+    assert payload["review_panel"]["max_fix_growth"] == 3.0
+    growth = payload["round_stop"]["fix_growth"]
+    assert growth["limit_chars"] is None and growth["over"] is False
+    assert payload["round_stop"]["stop"] is False
+
+
+def test_nulling_both_halves_is_no_growth_check_at_all(monkeypatch, capsys, tmp_path):
+    """The pre-#165 behaviour, and it takes two nulls now rather than one. Asserted
+    rather than left to a comment, because the block that applies the ceiling runs
+    whenever EITHER half is set — the shape that most easily leaves an operator who
+    switched "the growth check" off still being stopped by it."""
+    conf = cfg(max_fix_growth=None, max_fix_growth_chars=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=BIG, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BIGGER, scope="pr",
+                        config=conf)
+    assert payload["round_stop"]["fix_growth"] is None
+    assert payload["round_stop"]["stop"] is False
+
+
+def test_an_absent_max_fix_growth_chars_is_the_default_not_off():
+    """The same distinction `max_fix_growth` draws one function up, and it has to be
+    drawn again here: the default is a number, so reading an absent key as `null` would
+    leave half a check whose only job is to stop a cycle with no way back on."""
+    assert panel_seats.fix_growth_chars_limit({}, []) == 30000
+    assert panel_seats.fix_growth_chars_limit({"max_fix_growth_chars": None}, []) is None
+
+
+@pytest.mark.parametrize("bad,why", [
+    (False, "a whole number"),
+    ("a lot", "a whole number"),
+    (2.5, "a whole number"),
+    (0, "above zero"),
+    (-30000, "above zero"),
+])
+def test_a_bad_max_fix_growth_chars_is_refused_and_never_read_as_a_threshold(bad, why):
+    """`0` is refused rather than read as "stop the moment it grows at all": a growth
+    ceiling of zero is one no cycle that ran a fix pass can be under, so it would stop
+    every one of them — the switch turned all the way on, which is the same failure
+    `max_fix_growth: false` produces beside it, and `null` is the spelling already
+    available for what the operator meant. `false` is refused for that key's reason
+    (`isinstance(True, int)`), and a fractional value because half a char is not a size
+    any diff has."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.fix_growth_chars_limit({"max_fix_growth_chars": bad}, notes)
+    assert why in str(refusal.value)
+    assert "null to switch this half of the check off" in str(refusal.value)
+    assert notes == []
+
+
+def test_the_dials_line_names_both_halves_of_the_growth_ceiling(monkeypatch, capsys,
+                                                                tmp_path):
+    """The report's **Panel dials** line is the only place a round's policy is written
+    down where an operator can see it, and `/panel-review-pr.md` briefs the fixer off
+    it. A line that named only the multiple would make the absolute stop, when it
+    fires, read as an arithmetic bug."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
+    assert "fix growth cap 3x or +30,000 chars" in report
+    # And "off" only where BOTH are null — a line that vanishes at some settings is one
+    # a reader cannot tell from a dial that was never applied.
+    off, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="off",
+                    config=cfg(max_fix_growth=None, max_fix_growth_chars=None))
+    assert "fix growth cap off" in off
+
+
+def test_the_orchestrator_is_told_that_naming_findings_does_not_lift_the_budget():
+    """#492's third part, and it is prose because the mistake is an orchestrator's.
+
+    `low_severity_fix_lines` caps ACCUMULATION and its docstring is emphatic that the
+    question is mechanical rather than discretionary — the spend is counted with `git
+    diff --numstat` after each fix and the fixer is never asked whether this risks
+    ballooning. On the cycle #492 was filed from the orchestrator LIFTED it for round
+    2, because the human had named which findings to fix: it read a narrowed finding
+    list as the budget having been spent by decision. The pass came out at 422 lines
+    and produced 13 new findings, which is the exact shape the budget exists to
+    prevent, and the one brake still capable of firing was the one removed.
+
+    Which findings a pass may touch and how much churn it may add are two controls.
+    Nothing in the brief said so, and collapsing them is a natural mistake for an
+    orchestrator that has just been handed a shorter list."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert ("Selecting findings and capping churn are INDEPENDENT controls, and naming "
+            "findings NEVER lifts the budget (#492)") in flat
+    assert "relay the budget with a narrowed list exactly as you would with the full one" in flat
+    # And the unpaid remainder goes where a below-floor finding goes, rather than
+    # vanishing because a narrower list implied it was already handled.
+    assert ("a pass that runs out of it reports the unpaid findings exactly as it "
+            "reports below-floor ones") in flat
+
+
+def test_the_orchestrator_is_told_the_growth_ceiling_now_has_two_halves():
+    """The **Panel dials** line is what §4 briefs the fixer from, and an orchestrator
+    that believed the ceiling was one number would read the absolute stop as an
+    arithmetic bug when it fired."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "TWO halves, a multiple and an absolute char count" in flat
+    assert "stops the cycle on whichever is crossed first" in flat
+
+
+def test_the_orchestrator_is_told_to_carry_guard_to_guarded_and_not_to_gate_on_it():
+    """Report-only has to be said to the actor that would otherwise invent a threshold.
+    An orchestrator handed a 6:1 ratio and no rule will supply one, and a rule supplied
+    that way is a ceiling with its argument written afterwards (#67)."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "**Guard-to-guarded**" in flat and "`guard_ratio` in the JSON" in flat
+    assert "no threshold here for you to apply and none for you to invent" in flat
+    assert "available from round 1's diffstat" in flat
+
+
+# ----------------------------------------------------- 4c. guard-to-guarded (#492)
+
+def guard_diff(*files):
+    """A unified diff that adds `n` lines to each named path — the shape
+    `_diff_added_lines` reads, headers and hunk marker included, because the
+    classifier's whole input is the `b/` path off those headers."""
+    out = []
+    for path, added in files:
+        out.append(f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+                   f"@@ -0,0 +1,{added} @@\n")
+        out.extend("+a line\n" for _ in range(added))
+    return "".join(out)
+
+
+#: The reported cycle's own shape: 406 lines of test for a 66-line config change.
+GUARDED = guard_diff(("harness/loops/harness_rules.py", 66),
+                     ("harness/loops/tests/test_dials.py", 406))
+
+
+def test_guard_to_guarded_is_measured_and_reported_from_round_one(monkeypatch, capsys,
+                                                                  tmp_path):
+    """406 lines of test for a 66-line config change, and nothing in the panel noticed
+    that the apparatus built to protect a change had outgrown the change (#492).
+
+    Round ONE, which is the point: `max_fix_growth` needs a second round before it has
+    a ratio at all, and this is answerable from the first round's diffstat — which is
+    the round where an operator can still act on it cheaply. It is also a DIFFERENT
+    failure from raw growth: a fix pass can sit well under 3.0x overall while the
+    test-to-source ratio inside it goes to 6:1."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=GUARDED)
+    assert "Guard-to-guarded" in report
+    assert "406 test + 0 doc line(s) added against 66 source — **6.15:1**" in report
+    assert payload["guard_ratio"] == {"test": 406, "doc": 0, "source": 66,
+                                      "guard": 406, "ratio": 6.15}
+    # REPORT-ONLY (#67's instrument-before-gate, the rule `provenance` and `recurrence`
+    # already live under). A threshold invented today would be a ceiling with its
+    # argument written afterwards; this one earns a gate over a few dozen cycles or
+    # never gets one.
+    assert "nothing stops on this" in report
+    assert payload["round_stop"]["stop"] is False
+    assert not any("uard" in v for v in payload["round_stop"]["veto"])
+
+
+def test_a_change_that_adds_no_source_has_no_ratio_rather_than_an_infinite_one(
+        monkeypatch, capsys, tmp_path):
+    """A pure test or docs PR is the commonest benign shape there is, and a large
+    number reported for it would be an accusation. The quantity is undefined, not
+    enormous, and the line says so instead of dividing."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=guard_diff(("docs/how-it-works.md", 40)))
+    assert "no source lines at all — no ratio to take" in report
+    assert payload["guard_ratio"] == {"test": 0, "doc": 40, "source": 0,
+                                      "guard": 40, "ratio": None}
+
+
+def test_a_diff_that_adds_nothing_is_not_measured_at_all(monkeypatch, capsys, tmp_path):
+    """Null, not a mapping of zeros. "Nobody measured one" and "measured, and it was
+    none" are different facts and the payload's other counters are all shaped to keep
+    them apart — a consumer handed `{}` here would index it and get a zero for a change
+    nothing ever read."""
+    deletion = ("diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+                "@@ -1,2 +0,0 @@\n-gone\n-also gone\n")
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=1, diff=deletion)
+    assert payload["guard_ratio"] is None
+    assert "Guard-to-guarded" not in report
+
+
+def test_the_ratio_counts_lines_ADDED_and_not_churn(monkeypatch, capsys, tmp_path):
+    """A deletion is not apparatus being built. Counting churn would make a fix pass
+    that rewrites one test file in place read the same as one that writes a second test
+    suite, and only the second is the thing this measures."""
+    rewrite = ("diff --git a/tests/test_a.py b/tests/test_a.py\n"
+               "--- a/tests/test_a.py\n+++ b/tests/test_a.py\n"
+               "@@ -1,3 +1,2 @@\n-old\n-old\n-old\n+new\n+new\n"
+               "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+               "@@ -1,0 +1,4 @@\n+x\n+x\n+x\n+x\n")
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                        diff=rewrite)
+    assert payload["guard_ratio"] == {"test": 2, "doc": 0, "source": 4,
+                                      "guard": 2, "ratio": 0.5}
+
+
+@pytest.mark.parametrize("path,kind", [
+    ("harness/loops/panel.py", "source"),
+    ("app/api/dials.py", "source"),
+    # A whole SEGMENT, never a substring: this is the one way the measurement goes
+    # quietly wrong, since a ratio over the wrong files reads exactly like one over
+    # the right files.
+    ("src/protest/client.py", "source"),
+    ("src/contests/rules.py", "source"),
+    ("harness/loops/tests/test_panel_dials.py", "test"),
+    ("tests/fixtures/big.json", "test"),
+    ("conftest.py", "test"),
+    ("web/ui/Button.spec.tsx", "test"),
+    ("internal/store/store_test.go", "test"),
+    # Directory beats basename: a README inside the test tree grew the test tree, and
+    # calling it documentation would be true and useless.
+    ("tests/README.md", "test"),
+    ("docs/architecture.rst", "doc"),
+    ("changelog.d/492.feat.md", "doc"),
+    ("README.md", "doc"),
+    ("harness/commands/panel-review-pr.md", "doc"),
+])
+def test_a_path_is_classified_by_segment_not_by_substring(path, kind):
+    """The classifier is deliberately coarse — it feeds a number that is reported and
+    gates nothing, so a misfiled path costs a slightly wrong line rather than a stopped
+    cycle. Coarse is not the same as loose about segments, though: `protest` and
+    `contests` both contain `test`, and a substring match would count a client library
+    as apparatus."""
+    assert panel_seats._guard_kind(path) == kind
 
 
 # --------------------------------------------------------------------- 5. reviewer_scope
@@ -1177,6 +1572,216 @@ def test_the_orchestrator_relays_the_marks_with_the_list():
         in panel_md
 
 
+# ------------------------------------------- 9. file_deferral_issues (#482)
+#
+# The tail arriving one step downstream of the fix floor. The floor keeps a P4 out of
+# the fix pass and §4b's bookkeeping then filed it as a GitHub issue anyway — twenty
+# open issues on this repo that are panel exhaust and nothing else (#66 #69 #72 #74
+# #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237 #285 #286 #288 #300), one of
+# which (#283 rescued three live defects from it) had become a place findings went to
+# not be found. The board row is the durable record; the GitHub issue is a work item
+# on a human's tracker; for the P3/P4 tail they are not the same thing.
+
+
+def gate(value=None):
+    """A `Dials` with just this dial set, since nothing else here interacts with it."""
+    return panel_seats.resolve_dials(
+        {} if value is None else {"file_deferral_issues": value}, None, [])
+
+
+def test_the_default_keeps_the_p3_p4_tail_off_the_tracker():
+    """P2: at or above it a deferral is a work item somebody will pick up, and the row
+    and the issue coincide. Below it they do not, and below it is where the volume is —
+    P3 and P4 are 67.4% of findings by #165's own severity split."""
+    d = gate()
+    assert d.file_deferral_issues == "P2"
+    assert d.files_issue("P1") and d.files_issue("P2")
+    assert not d.files_issue("P3") and not d.files_issue("P4")
+
+
+def test_the_row_is_never_in_question_only_the_issue():
+    """The whole claim of this dial, asserted where it can be: nothing here turns a
+    finding into no record at all. `files_issue` answers ONE question — is a second
+    copy opened on a tracker — and the `deferred` row is written at every setting, which
+    is what the briefs say and what `deferral_gist` tells a reader on every round."""
+    assert "board row" in gate("never").deferral_gist()
+    for value in ("always", "never", "P1", "P4"):
+        line = gate(value).deferral_gist()
+        assert "row" in line or "issue" in line
+
+
+def test_always_is_the_pre_482_behaviour():
+    """The non-default value that restores what §4b did before this key existed: an
+    issue for every deferral, whatever its severity. A repo that has not adopted the
+    argument must be able to keep its old bookkeeping in one word."""
+    d = gate("always")
+    assert all(d.files_issue(s) for s in ("P1", "P2", "P3", "P4"))
+    assert d.deferral_gist() == "every deferral gets a GitHub issue"
+
+
+def test_never_files_nothing_and_says_the_escalation_still_does():
+    """The other end, for a repo whose work is not queued on its tracker (`mode:
+    jungle`). It is not "discard": the rows are still written and still relayed. And
+    even here the line has to name the exemption, or a reader takes `never` literally
+    and drops the one issue that is a question rather than a task."""
+    d = gate("never")
+    assert not any(d.files_issue(s) for s in ("P1", "P2", "P3", "P4"))
+    assert "an escalation still does" in d.deferral_gist()
+
+
+@pytest.mark.parametrize("value", ["never", "always", "P1", "P2", "P3", "P4"])
+def test_an_escalation_is_exempt_at_every_setting(value):
+    """§4b has three roads to `deferred` and only two of them are work items. An
+    escalation's issue *asks* a question about the change's premise — it is what carries
+    that question past the end of the session, and the cycle is not finished until a
+    human answers it — so suppressing it would drop the question rather than save a
+    ticket. Same exemption a Sonar hard-gate issue gets from both severity floors."""
+    assert gate(value).files_issue("P4", escalated=True)
+
+
+@pytest.mark.parametrize("severity", ["", None, "blocker", "critical"])
+def test_an_unreadable_severity_files_the_issue(severity):
+    """The safe direction, and there is only one. An issue nobody needed costs a line on
+    a tracker; withholding one because the severity could not be read leaves the finding
+    in a row whose severity nothing can sort by — which is the dumping ground this dial
+    exists to prevent, arriving through the back door."""
+    assert gate().files_issue(severity)
+    # `never` is a decision somebody made about every deferral, so it still holds: the
+    # fallback is for an unreadable BAND, not an override of the dial.
+    assert not gate("never").files_issue(severity)
+
+
+@pytest.mark.parametrize("written,applied", [
+    (" p2 ", "P2"), ("P4", "P4"), (" ALWAYS ", "always"), ("Never", "never")])
+def test_the_gate_is_read_case_insensitively(written, applied):
+    """Both halves, each normalised to the spelling its own vocabulary uses everywhere
+    else — a band upper-cased like every severity that enters the panel, a word
+    lower-cased like every other word in a rules file. One written value must not mean
+    two things depending on which layer carried it."""
+    assert gate(written).file_deferral_issues == applied
+
+
+def test_the_report_says_a_below_floor_finding_is_a_board_row_at_the_default(
+        monkeypatch, capsys, tmp_path):
+    """This list IS §4b's road 2, so the orchestrator reading it is about to decide
+    issue-or-row for exactly these findings. The answer belongs on the artifact, not in
+    whoever remembers the repo's config — the same argument the dial line already makes
+    for the fix floor."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")])
+    assert "`review_panel.file_deferral_issues` is `P2`" in report
+    assert ("the board row is the whole record — no GitHub issue, so the `deferred` "
+            "row carries a one-line `note` instead") in report
+
+
+def test_the_report_says_each_gets_an_issue_when_the_gate_is_always(
+        monkeypatch, capsys, tmp_path):
+    """The non-default half of the same line, so the test above is not passing on a
+    sentence that is printed whatever the dial says."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")],
+                       config=cfg(file_deferral_issues="always"))
+    assert "`review_panel.file_deferral_issues` is `always`" in report
+    assert "each also gets a GitHub issue" in report
+
+
+def test_a_split_below_floor_tier_is_counted_rather_than_summarised(
+        monkeypatch, capsys, tmp_path):
+    """The case answering from the floor would get wrong. With the fix floor at P2 the
+    below-floor tier holds two bands, and a gate BETWEEN them files for some of it and
+    not the rest — so the line counts the findings it is actually true of instead of
+    stating one tier's answer for both."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path,
+                       [finding("P3"), finding("P4")],
+                       config=cfg(fix_severity_floor="P2",
+                                  file_deferral_issues="P3"))
+    assert "### Reported, not this round's work (2)" in report
+    assert ("1 of them also get a GitHub issue and the rest are a board row with a "
+            "one-line `note` and no issue") in report
+
+
+def test_the_board_may_set_the_gate_and_may_not_set_a_word_it_does_not_know():
+    """A policy knob a repo can only change by a commit reviewed by the panel that knob
+    configures is the shape #305 exists to fix, so this one is board-settable like the
+    floors beside it — and settable BOTH ways, since neither direction is the safe one.
+    Its two ends are words, which is why it is a `deferral_gate` and not a `severity`:
+    `never` is unwritable as a band and `always` would have to be spelled `P4`."""
+    dial = harness_rules.BOARD_DIALS["review_panel.file_deferral_issues"]
+    assert (dial.kind, dial.nullable, dial.rule) == ("deferral_gate", False, "either")
+    for good in ("P1", "p3", "always", " never "):
+        assert harness_rules._dial_problem("d", dial, good) == "", good
+    for bad in ("P0", "sometimes", "P-2", 2, True, None):
+        assert harness_rules._dial_problem("d", dial, bad), bad
+
+
+@pytest.mark.parametrize("dial_name", ["review_panel.file_deferral_issues",
+                                       "review_panel.fix_severity_floor"])
+@pytest.mark.parametrize("written", [" P2 ", "\tp2\n"])
+def test_a_board_set_severity_band_is_stripped_before_it_is_judged(dial_name, written):
+    """The layer must not decide what a written value means. `panel_seats._severity`
+    strips and upper-cases every severity that enters the panel, so `severity_floor`
+    accepts `" p2 "` out of a rules file — and a board dial that refused the same
+    value would make one written value mean two things depending on which layer
+    carried it, which is precisely the layer a person typing into a settings endpoint
+    cannot see. It refused: the regex ran against the raw string while the word
+    endpoints beside it were being trimmed, so `" always "` was accepted and `" P2 "`
+    was not."""
+    dial = harness_rules.BOARD_DIALS[dial_name]
+    assert harness_rules._dial_problem(dial_name, dial, written) == ""
+
+
+@pytest.mark.parametrize("written,applied", [("p3", "P3"), (" Always ", "always")])
+def test_a_board_set_gate_is_normalised_before_it_is_applied(written, applied,
+                                                             monkeypatch):
+    """Normalised where the dial is read rather than by each consumer, so the provenance
+    table shows the value the round actually applied. A table reading `p3` beside a
+    round that ran `P3` is one a reader has to second-guess."""
+    monkeypatch.setattr(harness_rules, "_dial_body", lambda github: (
+        {"dials": [{"dial": "review_panel.file_deferral_issues", "value": written}]},
+        "board", ""))
+    dials, _, problems, _ = harness_rules.board_dials("acme/board")
+    assert problems == []
+    assert dials["review_panel.file_deferral_issues"]["value"] == applied
+
+
+# ---------------------------------------------------- and the briefs say the same thing
+
+def test_the_orchestrator_brief_splits_the_row_from_the_issue():
+    """The enforcement point for this dial is prose — §4b is what opens (or does not
+    open) the issue — so a suite that reads no markdown is testing half a feature, the
+    same reason `fixer_may_defer`'s guards are here."""
+    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "review_panel.file_deferral_issues" in flat
+    assert "**Every deferral gets a board row. Only some of them get a GitHub issue**" \
+        in flat
+    # Below the gate: no target, and a note that makes the row worth reading later.
+    assert "Record the row with **no `deferred_to`**" in flat
+    assert "The note is not optional here and it is the whole difference between a " \
+           "record and a dumping ground." in flat
+    # The read the write exists for — named now, so the row is a memory rather than a
+    # dumping ground even before anything queries it across PRs.
+    assert "GET /review/findings?repo=<owner/name>&pr=<n>" in flat
+    # The exemption, and the fallback that stops the two records being lost together.
+    assert "An escalation is exempt at every setting, `never` included." in flat
+    assert "If `qb record-outcome` fails, file the issue whatever the gate says" in flat
+
+
+def test_the_review_brief_no_longer_says_every_deferral_gets_an_issue():
+    """Asserted partly as an ABSENCE, which is how a contradiction elsewhere in the same
+    brief survives a green suite. `review-pr.md` used to instruct the orchestrator to
+    open an issue on all three roads unconditionally, in the sentence a fixer's deferral
+    lands on."""
+    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Your job is the same on all three and it is the half the fixer is " \
+           "forbidden to do: open the issue," not in flat
+    assert "open an issue for it only if `review_panel.file_deferral_issues` says so" \
+        in flat
+    assert ("The row is the record; the issue is a work item, and they are not the "
+            "same thing (#482).") in flat
+    # And the deferral still has somewhere to go — the point was never that the record
+    # is optional.
+    assert "a one-line `note`" in flat
+    assert "An escalation is exempt at every setting" in flat
+
+
 # --------------------------------------------------------------- the report says which
 
 def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_path):
@@ -1187,7 +1792,9 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
     assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
             "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
-            "cap 3x · fixer may defer yes · failing test required no") in report
+            "cap 3x or +30,000 chars · fixer may defer yes · failing test "
+            "required no · deferrals at/above P2 get a GitHub issue, below it a "
+            "board row only (an escalation always gets one)") in report
 
 
 def _release_pr(monkeypatch, config):

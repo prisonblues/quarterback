@@ -55,7 +55,7 @@ from app.ordering import (
     suggest_order,
 )
 
-from .conftest import LAPTOP, PINNED_SETTINGS
+from .conftest import LAPTOP, LAPTOP_ELEVATED, PINNED_SETTINGS
 
 #: Fleet-scope (repo-less) plan items this module creates, so that it can take
 #: them out again. Every other scope here is namespaced by a made-up repo name and
@@ -643,29 +643,61 @@ async def test_a_suggestion_is_a_read_and_never_touches_the_live_order(client):
     assert [i["rank"] for i in live.json()["items"]] == [1, 2]
 
 
-async def test_the_suggested_order_is_applied_by_a_human_and_by_nobody_else(client):
+async def test_the_suggested_order_is_applied_by_a_person_or_a_delegated_agent(client):
     """``suggested_order`` is shaped exactly like ``POST /plan/reorder``'s ``order``
-    so that applying it is one call — and the payload says whose call it is. An
-    agent that could apply it would be an agent with human privileges, which is
-    what #232 says a planner must not be."""
+    so that applying it is one call — and the payload says whose call it is.
+
+    #232 says a planner must not be an agent with human privileges, and this test
+    used to enforce that by refusing every agent. #478 keeps the constraint and
+    drops the proxy: an agent applying an order does NOT gain human privileges —
+    it keeps its own identity, the row records ``derived`` rather than ``ordered``,
+    and `/dials`, `POST /plan/scope` and `exempt`'s grant half stay shut to it. So
+    the thing to pin is no longer "no agent may apply" but the three facts that
+    make applying safe, plus the one that has not changed: **a bearer on its own is
+    still refused.**"""
     repo = "acme/ord-apply"
     a = await add(client, repo, "a")
     b = await add(client, repo, "b")
     await add(client, repo, "c", depends_on=[b["item_id"]])
     body = await order(client, repo)
-    assert body["apply"] == {"endpoint": "POST /plan/reorder", "human_only": True,
+    assert body["apply"] == {"endpoint": "POST /plan/reorder", "human_only": False,
                             "body": {"repo": repo, "order": body["suggested_order"]}}
 
+    # Unchanged, and the reason the field going False is not a relaxation: an
+    # agent WITHOUT the delegated credential is still refused outright.
     refused = await client.post("/plan/reorder", json=body["apply"]["body"], headers=AGENT)
     assert refused.status_code == 403, refused.text
 
     applied = await client.post("/plan/reorder", json=body["apply"]["body"], headers=HUMAN)
     assert applied.status_code == 200, applied.text
     assert [i["item_id"] for i in applied.json()["items"]] == body["suggested_order"]
+    assert all(i["rank_source"] == "ordered" for i in applied.json()["items"]
+               if i["item_id"] in body["suggested_order"])
     # And once it is in force the suggestion is a no-op, which is the shape a
     # steady state should have.
     assert (await order(client, repo))["changed"] is False
     assert a["item_id"] in body["suggested_order"]
+
+
+async def test_a_delegated_agent_applying_it_records_derived_not_ordered(client):
+    """The other half of #232's constraint after #478: applying is available to an
+    agent, and the record says an agent did it. If this ever wrote `ordered` the
+    suggestion would launder itself into a human decision — which is exactly the
+    privilege #232 withholds, arriving through the field instead of the gate."""
+    repo = "acme/ord-delegated"
+    await add(client, repo, "a")
+    b = await add(client, repo, "b")
+    await add(client, repo, "c", depends_on=[b["item_id"]])
+    body = await order(client, repo)
+
+    applied = await client.post("/plan/reorder", json=body["apply"]["body"],
+                                headers=LAPTOP_ELEVATED)
+    assert applied.status_code == 200, applied.text
+    rows = applied.json()["items"]
+    assert [i["item_id"] for i in rows] == body["suggested_order"]
+    assert all(i["rank_source"] == "derived" for i in rows
+               if i["item_id"] in body["suggested_order"])
+    assert applied.json()["by"].split("/")[0] == "laptop"
 
 
 async def test_an_entry_says_whether_anybody_chose_the_rank_it_would_move(client):
