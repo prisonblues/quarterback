@@ -202,50 +202,57 @@ def test_the_reconstructed_lines_are_the_ones_provenance_places_findings_against
     assert _diff_added_lines(got["diff"]) == {"fix.py": {1}}
 
 
-def test_a_conflict_RESOLVED_in_the_rebase_degrades_that_commit_and_says_so(
+def test_a_conflict_RESOLVED_in_the_rebase_is_a_DECLINE_that_names_the_cost(
         tmp_path, fork_point):
-    """The honest failure the issue names, and the reason this degrades per-commit.
+    """The honest failure #504 names, and the answer it gets — which changed under
+    review, so the reasoning is worth having here rather than in a commit message.
 
-    A rebase that resolved a conflict CHANGED that commit's content, so its
-    patch-id moved and it reads as a commit no earlier round saw — i.e. as part of
-    the fix pass. Here `p1` is that commit: the last round reviewed it, the rebase
-    rewrote it, and it comes back inside the reconstructed pass.
+    A rebase that resolved a conflict CHANGED that commit's content, so its patch-id
+    moved and it is somewhere among the commits with no counterpart. Here `p1` is
+    that commit: the last round reviewed it, the rebase rewrote it, and nothing can
+    say which of the leftovers it is.
 
-    That is an over-count and it must be BOUNDED and REPORTED rather than either
-    hidden or escalated into a refusal. `unmatched` is the bound — one prior commit
-    failed to come through, so at most one prior commit is inside the pass — and
-    the caller turns it into a note. Refusing the whole reconstruction on any
-    unmatched commit was the alternative, and it hands the common case (one
-    conflict in a long rebase) straight back to the blindness this exists to end."""
-    r, anchor, head, expected = _cycle(tmp_path, conflict=True)
+    This first attributed anyway and reported the lean in `config_notes`, on the
+    reading that per-commit degradation was what the issue asked for. The argument
+    against it is not that a lean is dishonest but what the number DOES:
+    `escalate_on.fix_injection` ends a cycle, and the README's case for its 0.5
+    threshold is that `introduced` is a documented FLOOR — "a measured 0.64 is at
+    least 0.64". A source that over-counts breaks that, and the price is a cycle
+    stopped with real findings unfixed. Nothing reads a note before firing a brake.
+    And `unmatched` bounds the damage at one COMMIT, which can be a thousand lines
+    and cover every finding in the round.
+
+    #504's own wording is what settles it: *that commit's lines cannot be
+    attributed.* So this declines, and the reason names the rebase — which is the
+    "report what did not" half of the issue's own instruction."""
+    r, anchor, head, _ = _cycle(tmp_path, conflict=True)
     fork_point(r)
 
     got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main", anchor, head)
 
-    assert r.subjects(*got["commits"]) == expected == ["p1", "f1"]
+    assert got["diff"] is None
+    assert "changed content in the rewrite" in got["why"]
+    # The correspondence it DID find still travels, because that is what tells an
+    # operator a conflicted rebase is the thing to go and look at.
     assert (got["prior"], got["carried"], got["unmatched"]) == (2, 1, 1)
-    # `lib.py` is the control: it did NOT conflict, so it matched and stayed out.
-    # Without it this test cannot tell a working per-commit degradation from a
-    # reconstruction that gave up and returned the whole branch.
-    assert "lib.py" not in got["diff"]
-    assert "app.py" in got["diff"] and "fix.py" in got["diff"]
 
 
-def test_an_AMENDED_TIP_does_not_attribute_the_commits_below_it(tmp_path, fork_point):
-    """The defect the first cut of this had, and the one that decides how the prior
-    side is bounded.
+def test_an_AMENDED_TIP_corresponds_the_commits_BELOW_it(tmp_path, fork_point):
+    """The defect that decides how the prior side is bounded.
 
-    Not every rewrite is a rebase. A fixer who amends the tip, or force-pushes a
-    reworked last commit, leaves everything below it byte-identical — so
-    `head..anchor` (the obvious spelling of "what the last round had and this branch
-    no longer does") contains ONLY the amended commit. Every commit below the amend
-    is then absent from the prior set, matches nothing, and is attributed to a fix
-    pass that did not write it: on a long branch that is most of the PR blamed on
-    one amend.
+    Not every rewrite is a rebase. A fixer who amends the tip leaves everything below
+    it byte-identical — SHAs included — so `head..anchor` (the obvious spelling of
+    "what the last round had and this branch no longer does") contains ONLY the
+    amended commit, and every commit below the amend is absent from the prior set.
 
-    Bounding both sides by the fork point instead makes the prior set the PR exactly
-    as that round saw it, whatever the rewrite touched. `lib.py` is the assertion —
-    it is the commit below the amend, and it must stay out."""
+    Both bounds decline here, because an amended commit is content that moved and
+    that is the unmatched refusal. What they differ on is the ANSWER: bounded by the
+    fork point this says "1 of the 2 commits the last round reviewed changed content",
+    which is what happened; bounded by the other head it would say none of 1 came
+    through and the histories cannot be corresponded — the squash refusal, about a
+    branch that was not squashed. A `why` that names the wrong rewrite sends an
+    operator looking for the wrong thing, and on a long branch the same mis-bounding
+    is what would put the commits below the amend inside a fix pass."""
     r = _new_repo(tmp_path)
     r.commit("app.py", "a\n", "m1")
     r.git("checkout", "-q", "-b", "pr")
@@ -260,9 +267,9 @@ def test_an_AMENDED_TIP_does_not_attribute_the_commits_below_it(tmp_path, fork_p
     got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main",
                                             anchor, r.at("HEAD"))
 
-    assert r.subjects(*got["commits"]) == ["p2"]
-    assert "lib.py" not in got["diff"]
     assert (got["prior"], got["carried"], got["unmatched"]) == (2, 1, 1)
+    assert "changed content in the rewrite" in got["why"]
+    assert "cannot be corresponded" not in got["why"]
 
 
 def test_a_pass_at_the_TIP_is_read_as_its_net_change_not_as_its_working(
@@ -278,8 +285,8 @@ def test_a_pass_at_the_TIP_is_read_as_its_net_change_not_as_its_working(
 
     Where the pass is the branch tip — which a rebase makes it, by replaying the
     reviewed commits first — one two-dot diff answers exactly and neither problem
-    arises. That is the shape the round should get, and `shape` is what says it
-    did."""
+    arises. That is now the ONLY shape that attributes; the fallback declines, which
+    `test_a_pass_that_is_NOT_the_tail_of_the_branch_is_a_DECLINE` covers."""
     r = _new_repo(tmp_path)
     r.commit("app.py", "a\n", "m1")
     r.git("checkout", "-q", "-b", "pr")
@@ -296,47 +303,64 @@ def test_a_pass_at_the_TIP_is_read_as_its_net_change_not_as_its_working(
     got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main",
                                             anchor, r.at("HEAD"))
 
-    assert got["shape"] == "range"
     from panel_seats import _diff_added_lines
     # One line, not two. The concatenated shape reports `{1, 2}` here, and a finding
     # at fix.py:2 would then be attributed to a pass that deleted that line.
     assert _diff_added_lines(got["diff"]) == {"fix.py": {1}}
 
 
-def test_a_pass_that_is_NOT_the_tip_falls_back_to_its_commits_and_says_so(
-        tmp_path, fork_point):
-    """The other shape, on the case that produces it: a rebase that resolved a
-    conflict puts an already-reviewed commit inside the pass with a matched commit
-    after it, so the left-over set is not the tail of the branch and no single
-    two-dot diff covers it without sweeping in the matched one.
+def test_a_pass_that_is_NOT_the_tail_of_the_branch_is_a_DECLINE(tmp_path,
+                                                                fork_point):
+    """The other refusal that keeps `introduced` a floor.
 
-    `shape` is what tells a reader which instrument answered, and the round turns it
-    into a note — the concatenated form over-counts, and an `introduced` figure that
-    over-counts is the direction that ends cycles wrongly."""
-    r, anchor, head, _ = _cycle(tmp_path, conflict=True)
+    Reading each leftover commit's own patch was the fallback here, and it is a
+    superset twice over: a line the pass added and a later commit removed is still in
+    the set, and each line's number comes from its own commit's tree rather than the
+    head's. Both push `introduced` UP, into the brake — so where no single diff is
+    the pass, there is no attribution.
+
+    The history is built with `cherry-pick` rather than driven through `rebase -i`,
+    because what is under test is the SHAPE — the fixer's commit sitting BELOW two
+    the last round reviewed, which a reorder, an `--autosquash` or a hand-rebuilt
+    branch all produce — and not git's rebase driver."""
+    r = _new_repo(tmp_path)
+    r.commit("app.py", "a\n", "m1")
+    r.git("checkout", "-q", "-b", "pr")
+    p1 = r.commit("early.py", "reviewed\n", "p1")
+    anchor = r.commit("late.py", "reviewed too\n", "p2")
+    f1 = r.commit("fix.py", "the fix\n", "f1")
+    r.git("checkout", "-q", "main")
+    r.commit("main0.py", "moved on\n", "m2")
+    # The branch rebuilt onto the new base with the fix pass at the BOTTOM.
+    r.git("checkout", "-q", "-B", "pr", "main")
+    r.git("cherry-pick", f1, p1, anchor)
     fork_point(r)
-    got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main", anchor, head)
-    assert got["shape"] == "commits"
-    assert len(got["commits"]) == 2
+
+    got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main",
+                                            anchor, r.at("HEAD"))
+
+    # Every reviewed commit came through, so this is NOT the unmatched refusal — it
+    # is the shape alone, which is what makes the test worth having separately.
+    assert (got["prior"], got["carried"], got["unmatched"]) == (2, 2, 0)
+    assert got["diff"] is None
+    assert "not the tail of the rewritten branch" in got["why"]
 
 
-def test_a_pass_that_RE_APPLIES_a_reviewed_patch_is_still_the_pass(tmp_path,
-                                                                    fork_point):
-    """Found by Codex on the second pass, and it is why the two sides are matched by
-    COUNT rather than by membership.
+def test_a_pass_that_RE_APPLIES_a_reviewed_patch_is_AMBIGUOUS_and_refused(
+        tmp_path, fork_point):
+    """Found by Codex, and the reason it is a refusal rather than a tie-break.
 
     A patch-id is not unique. Here the fix pass deletes a file the last round
-    reviewed and puts it back byte for byte, so `f2` carries the SAME patch-id as
-    the reviewed commit that created the file. Asked as a set, "has this id been seen
-    before" is true of both the rebased copy and the fixer's own, and the fixer's
-    drops silently out of the pass. Asked as a count, the reviewed commit's one claim
-    is spent on the copy — the earlier claimant, which a rebase makes the copy — and
-    what is left over is the pass.
+    reviewed and puts it back byte for byte, so `f2` carries the SAME patch-id as the
+    reviewed commit that created it, and the branch now carries two copies of a patch
+    the last round had one of. One is the replayed commit and one is the fixer's own.
 
-    `commits` is the assertion, because that is where the two answers differ: set
-    matching returns `["f1", "f3"]` here and count matching returns all three. It is
-    also the list `payload.fix_range_rebuilt` publishes and the one anything naming
-    the pass would read."""
+    Deciding it by position was the first shape of this — "a rebase replays the
+    reviewed commits first, so the earlier claimant is the copy" — which holds for a
+    plain rebase and not for an interactive one, a reorder, a cherry-pick or an
+    arbitrary force-push. Getting it backwards puts an already-reviewed commit inside
+    the pass and leaves the fixer's own out, on a signal that ends cycles. A coin
+    toss is not available, so this declines."""
     r = _new_repo(tmp_path)
     r.commit("app.py", "a\n", "m1")
     r.git("checkout", "-q", "-b", "pr")
@@ -355,13 +379,8 @@ def test_a_pass_that_RE_APPLIES_a_reviewed_patch_is_still_the_pass(tmp_path,
     got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main",
                                             anchor, r.at("HEAD"))
 
-    assert r.subjects(*got["commits"]) == ["f1", "f2", "f3"]
-    assert (got["prior"], got["carried"], got["unmatched"]) == (1, 1, 0)
-    # The pass is the tip, so the lines are its NET change — `dup.py` came out and
-    # went back, so it is correctly absent, and only the file the pass really added
-    # is there.
-    from panel_seats import _diff_added_lines
-    assert _diff_added_lines(got["diff"]) == {"real.py": {1}}
+    assert got["diff"] is None
+    assert "appear more often on the rewritten branch" in got["why"]
 
 
 # ------------------------------------------------------------------ it declines
@@ -548,6 +567,68 @@ def test_git_returns_None_for_every_way_a_call_can_fail(tmp_path):
     assert panel_scope._git(str(r.path), "rev-parse", "HEAD") is not None
 
 
+def test_git_output_that_is_not_UTF_8_does_not_take_the_round_down(tmp_path,
+                                                                   fork_point):
+    """Found by Codex, and it is the difference between "never raises" being the
+    contract and being the intention.
+
+    `subprocess.run(text=True)` DECODES, and git output is not guaranteed UTF-8 — a
+    source file in another encoding is ordinary in a long-lived repository and its
+    bytes go straight into the diff. That decode raises `UnicodeDecodeError` out of
+    `subprocess.run` itself, past an `except` naming only `OSError` and
+    `SubprocessError`, and takes down a whole review round over an attribution
+    nothing gates on.
+
+    Asserted as a SUCCESS rather than as a clean decline, because `errors="replace"`
+    is what the fix is: the added-line scan wants `diff --git`, `@@` and a leading
+    `+`, none of which a replacement character disturbs, so the round keeps its
+    attribution instead of losing it to an encoding."""
+    r = _new_repo(tmp_path)
+    r.commit("app.py", "a\n", "m1")
+    r.git("checkout", "-q", "-b", "pr")
+    r.commit("lib.py", "reviewed\n", "p1")
+    anchor = r.at("HEAD")
+    (r.path / "latin.py").write_bytes(b"# caf\xe9 latin-1, not utf-8\nvalue = 1\n")
+    r.git("add", "latin.py")
+    r.git("commit", "-q", "-m", "f1")
+    r.git("checkout", "-q", "main")
+    r.commit("main0.py", "moved on\n", "m2")
+    r.git("checkout", "-q", "pr")
+    r.git("rebase", "main")
+    fork_point(r)
+
+    got = panel_scope.reconstruct_fix_range(str(r.path), GH_REPO, "main",
+                                            anchor, r.at("HEAD"))
+
+    assert got["why"] is None
+    assert r.subjects(*got["commits"]) == ["f1"]
+    from panel_seats import _diff_added_lines
+    assert _diff_added_lines(got["diff"]) == {"latin.py": {1, 2}}
+
+
+def test_patch_id_output_this_cannot_READ_is_a_failure_not_a_partial_map(tmp_path,
+                                                                        monkeypatch):
+    """Found by Codex. A line `_patch_ids` cannot parse is a HOLE, and a hole is not
+    the same as a commit that had no patch.
+
+    A commit missing from the PRIOR map reserves nothing, so its counterpart on the
+    rewritten branch reads as the fix pass — over-attribution bought by a parse that
+    was silently skipped. `patch-id` does not emit such a line today; what this pins
+    is that if it ever did, the caller declines rather than corresponding two
+    histories from a map it knows is incomplete."""
+    r = _new_repo(tmp_path)
+    first = r.commit("a.py", "1\n", "only")
+    real = panel_scope._git
+
+    def one_bad_line(repo_path, *args, **kw):
+        if args and args[0] == "patch-id":
+            return "deadbeef " + first + "\nthis line has three fields\n"
+        return real(repo_path, *args, **kw)
+
+    monkeypatch.setattr(panel_scope, "_git", one_bad_line)
+    assert panel_scope._patch_ids(str(r.path), [first]) is None
+
+
 def test_patch_ids_tells_an_empty_answer_apart_from_a_failed_one(tmp_path):
     """`{}` and None are opposite instructions to the caller — "these commits
     changed nothing, carry on" against "this cannot be corresponded, stop" — and a
@@ -644,27 +725,27 @@ def test_the_reconstruction_publishes_its_own_working(tmp_path, monkeypatch):
     assert "diff" not in got
 
 
-def test_a_reconstruction_that_LEANS_says_by_how_much_in_the_round_s_own_notes(
-        tmp_path, monkeypatch):
-    """The conflict-resolved commit, carried all the way to the line a human reads
-    off the PR comment.
+def test_a_CONFLICTED_rebase_is_reported_and_still_vetoes(tmp_path, monkeypatch):
+    """The refusal, carried all the way to what a human reads off the PR comment.
 
-    The bias is real — that commit is inside the reconstructed pass and the last
-    round had already reviewed it — and an operator reading `introduced: 2` with no
-    note would take a number that leans high for a measurement. `unmatched` bounds
-    it and the note states the bound."""
+    A conflict resolved during the rebase moved a reviewed commit's content, so the
+    reconstruction declines and the round is exactly as blind as #500 found it —
+    #509's veto fires, every finding is `unknown`. What it must NOT do is attribute
+    from a set it knows is a superset and leave the correction to a note:
+    `escalate_on.fix_injection` ends cycles and reads no notes.
+
+    The note is still worth asserting, because "the branch was rewritten" on its own
+    now reads as "so it was rebuilt", and an operator needs to know a conflicted
+    rebase is the thing that stopped it."""
     _, r2 = _rebased_round(tmp_path, monkeypatch, conflict=True)
-    # Behaviour first, for the reason above: a conflicted rebase attributed nothing
-    # at all before this, so the red is the attribution and not the new key.
-    assert r2["provenance_counts"]["introduced"] == 1
-    assert any("RECONSTRUCTED" in n and "reads high by up to" in n
-               for n in r2["config_notes"])
+
+    assert r2["fix_range_source"] is None
+    assert r2["provenance_counts"]["introduced"] == 0
+    assert r2["provenance_counts"]["unknown"] == 1
+    assert any("#500" in v for v in r2["round_stop"]["veto"])
     assert r2["fix_range_rebuilt"]["unmatched"] == 1
-    # A conflicted rebase leaves the pass off the tip, so the SECOND lean applies
-    # too and the note has to carry both — one clause saying nothing about the other
-    # is how a reader ends up correcting for half of it.
-    assert r2["fix_range_rebuilt"]["shape"] == "commits"
-    assert any("not the tip of the branch" in n for n in r2["config_notes"])
+    assert any("could not be reconstructed" in n and "changed content in the rewrite" in n
+               for n in r2["config_notes"])
 
 
 def test_a_rewrite_the_reconstruction_CANNOT_repair_still_vetoes(tmp_path,

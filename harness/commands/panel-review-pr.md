@@ -530,29 +530,36 @@ the pass out of the local object store, `payload.fix_range_source` reads
 the veto does not fire. Read `config_notes`: the round states what it rebuilt and what
 it cost.
 
-**Three things that stop it, and each of them leaves the round exactly as blind as it
-was** — the veto fires and nothing is attributed, with `fix_range_rebuilt.why` naming
-which it was:
+**It is exact or it refuses, and a refusal leaves the round exactly as blind as it
+was** — the veto fires and nothing is attributed, with `fix_range_rebuilt.why`
+naming which of these it hit:
 
-- **No local checkout.** `patch-id` is git rather than the compare API, so a repo with
-  no `path` in its rules cannot rebuild anything — and neither can a box that never
-  held the pre-rebase head, since a rewrite only orphans commits where somebody still
-  has them.
-- **No correspondence.** A squash or a re-created branch leaves none of the last
-  round's commits recognisable, and then every commit on the branch would read as the
-  fix pass. That refuses rather than leans.
-- **A branch reset BACKWARDS.** The pass was removed, not rewritten. The round says so
-  in those words, because a force-push that dropped work must not read as a quiet
-  cycle.
+- **No local checkout.** `patch-id` is git rather than the compare API, so a repo
+  with no `path` in its rules cannot rebuild anything — and neither can a box that
+  never held the pre-rebase head, since a rewrite only orphans commits where
+  somebody still has them.
+- **A commit the last round reviewed changed content in the rewrite** — a conflict
+  resolved during the rebase, an amended tip. That commit is somewhere among the
+  ones this would call the fix pass and nothing can say which, so attributing them
+  would blame the fixer for work already reviewed.
+- **The pass is not the TAIL of the branch** (a reorder, an `--autosquash` that
+  landed a fixup low in the series). Then no single diff is the pass, and reading
+  its commits' patches separately would attribute lines the pass added and then
+  removed.
+- **An ambiguous patch-id** — the branch carries more copies of a patch than the
+  last round had, so which is the fixer's own cannot be told from which is the
+  replayed one.
+- **No correspondence at all** (a squash, a re-created branch), and **a branch reset
+  BACKWARDS**, where the pass was removed rather than rewritten. The round says the
+  second in those words, because a force-push that dropped work must not read as a
+  quiet cycle.
 
-And where it does work it **leans, by a stated amount** — two of them, both pushing
-`introduced` up. A rebase that resolved a conflict changed that commit's content, so
-it matches nothing and joins the pass the round is attributing;
-`fix_range_rebuilt.unmatched` is the bound. And where the pass is not the tip of the
-branch (`shape: "commits"` rather than `"range"`), it is read as its commits' own
-patches rather than as one net diff, so a line the pass added and then removed is
-still in the set. The round's notes state whichever applied. `--scope increment` is not repaired either way — scope is settled before the seats
-run — and neither is #506's proposal below, which reads the compare range.
+Refusing rather than leaning is a deliberate trade, and worth knowing when you read a
+round that did not rebuild: `escalate_on.fix_injection` is calibrated on `introduced`
+being a FLOOR, so a reconstruction that over-counted would end cycles wrongly and no
+`config_notes` line prevents that — nothing reads a note before firing a brake.
+`--scope increment` is not repaired either way (scope is settled before the seats
+run), and neither is #506's proposal below, which reads the compare range.
 
 So:
 

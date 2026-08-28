@@ -2746,29 +2746,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # which of the repair's own refusals it hit, and most of them (no local checkout,
     # commits this box never held) are things an operator can act on.
     if rebuilt and rebuilt["diff"]:
+        # No caveat clause, and that is the point of the rewrite this had under review
+        # rather than an omission: a reconstruction that would have needed one now
+        # DECLINES. Every commit the last round reviewed came through the rewrite
+        # intact, the pass is the tail of the branch, and what is attributed is one
+        # net diff of it — so `introduced` is a floor here exactly as it is on a
+        # linear round, which is what `escalate_on.fix_injection`'s threshold is
+        # calibrated against.
         notes.append(
             "the fix range was RECONSTRUCTED across the branch rewrite (#504): "
             f"{len(rebuilt['commits'])} commit(s) on the branch have no patch-"
             f"equivalent among the {rebuilt['prior']} the last round reviewed, so "
             "provenance, recurrence and `escalate_on.fix_injection` read those. "
             "Not repaired by it: `--scope increment` (scope was settled before the "
-            "seats ran) and #506's revert proposal (it reads the compare range)"
-            + (f". {rebuilt['unmatched']} of the last round's commits changed "
-               "content in the rewrite — a conflict resolved during the rebase — so "
-               "each may be sitting inside the reconstructed pass, and `introduced` "
-               "reads high by up to that many commits"
-               if rebuilt["unmatched"] else "")
-            # The second lean, and it is a different one: the pass was not the tip of
-            # the branch, so it is read as its commits' own patches rather than as one
-            # net diff. A line an early commit added and a later one removed is still
-            # in the set, and line numbers are each commit's own. Said only when it
-            # happened — on the ordinary rebase the exact shape answers and there is
-            # nothing to warn about.
-            + (". The pass is not the tip of the branch, so it is read as its "
-               "commits' own patches rather than as one net diff — a line the pass "
-               "added and then removed is still in the set, and added-line numbers "
-               "are each commit's own, so `introduced` reads high on that too"
-               if rebuilt["shape"] == "commits" else ""))
+            "seats ran) and #506's revert proposal (it reads the compare range)")
     elif rebuilt:
         notes.append("the fix range could not be reconstructed across the rewrite "
                      f"(#504): {rebuilt['why']}")
@@ -3711,9 +3702,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # round that did not have to rebuild — which is nearly all of them — and
         # otherwise the commits it named, how many the last round had reviewed, how
         # many of those came through the rewrite intact, and `why` when it declined.
-        # The `unmatched` figure is the one a reader needs: it bounds how far
-        # `introduced` can read high on this round, and a trend that compares this
-        # round's rate against a linear round's has to be able to see it.
+        # `prior`/`carried`/`unmatched` are the correspondence it found. On a round
+        # that ATTRIBUTED they are always `n`/`n`/`0` — an inexact reconstruction
+        # declines rather than leaning — so what they are worth is on the declines,
+        # where they say how far off the two histories were and whether a rebase or a
+        # force-push is what an operator should go and look at.
         #
         # WITHOUT the diff, which is the one key here that is not a fact about the
         # round but a copy of the fix pass — up to `FIX_RANGE_MAX_CHARS` of it. This

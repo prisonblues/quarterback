@@ -1712,23 +1712,20 @@ Its known biases, since the defence of a heuristic is that they are written down
   genuinely "ahead" and indistinguishable from a fix commit at this grain. Under `increment` scope
   the merge bias is gone anyway (**#512**): the round attributes against the diff its seats read,
   which is narrowed to the PR's own files.
-- **A REBUILT range leans by however much the rewrite changed** (**#504**). A rewritten branch is
-  no longer the end of the road: the fix pass's commits are still on it under new SHAs, and
-  `patch-id` names them, so provenance, recurrence and `escalate_on.fix_injection` come back rather
-  than every finding landing in `unknown`. What a rebase that RESOLVED A CONFLICT costs is that the
-  conflicted commit's content moved, so it matches nothing and reads as part of the pass the last
-  round is being attributed for. `fix_range_rebuilt.unmatched` bounds that — it is how many of the
-  prior round's commits failed to come through — and the round says so in `config_notes`. Read
-  `introduced` on such a round as a floor with a stated ceiling on the lean. A second lean applies
-  when `fix_range_rebuilt.shape` is `commits` rather than `range`: the pass was not the tip of the
-  branch, so it is read as its commits' own patches rather than as one net diff, and a line the
-  pass added and then removed is still in the added-line set (as are line numbers taken from each
-  commit's own tree rather than the head's). Both leans push `introduced` UP, which for
-  `escalate_on.fix_injection` is the direction that ends cycles wrongly — hence both being stated
-  rather than absorbed. Two cases refuse
-  outright rather than lean: a rewrite where NONE of the prior round's commits came through (a
-  squash, a re-created branch — the histories have not been corresponded, so everything would read
-  as the fix pass) and a branch reset BACKWARDS, where the pass was removed rather than rewritten.
+- **A REBUILT range is EXACT or it is refused** (**#504**). A rewritten branch is no longer the
+  end of the road: the fix pass's commits are still on it under new SHAs, `patch-id` names them,
+  and provenance, recurrence and `escalate_on.fix_injection` come back rather than every finding
+  landing in `unknown`. What is deliberately NOT here is a leaning reconstruction. Every inexact
+  shape declines instead — a prior commit whose content changed in the rewrite (a conflict resolved
+  during the rebase, an amended tip), a pass that is not the TAIL of the branch, an ambiguous
+  patch-id, a rewrite where none of the prior round's commits came through, and a branch reset
+  BACKWARDS where the pass was removed rather than rewritten. `fix_range_rebuilt.why` names which.
+  The reason is not that a lean is dishonest — it was reported in `config_notes` when this leaned —
+  but that the threshold above is calibrated on `introduced` being a FLOOR ("a measured 0.64 is at
+  least 0.64"), and a source that over-counts breaks that argument at the cost of a cycle stopped
+  with real findings unfixed. Nothing reads a note before firing a brake. What survives is one net
+  two-dot diff of the pass, numbered in the head's own tree: the ordinary rebase, which is the case
+  worth having.
 - **Two changed files a finding's path could name** (a reviewer writes `panel.py`; the diff has
   two of them) yields `unknown`, not a coin toss.
 - **A defect the fix pass introduced by DELETING something reads as `missed`.** The fix range is
@@ -1874,7 +1871,7 @@ Run-level fields it depends on:
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
 | `fix_range_source` | **#512.** WHICH range the round attributed against, because the answers are not the same measurement and a reader comparing `introduced` across a cycle has to see the denominator change. `increment` — the diff the seats actually read, which is narrowed to the PR's own files and so drops a base-branch merge's; `compare` — the separate `gh api compare` fetch, used under `pr` scope and wherever the increment fell back; `reconstructed` (**#504**) — a rewritten branch's pass, rebuilt from the local object store by patch equivalence; `null` where the question does not arise (round 1, or a round with no range at all) |
-| `fix_range_rebuilt` | **#504.** #504's working, and `null` on every round that did not have to rebuild — which is nearly all of them. `commits` are the SHAs it called the fix pass, `shape` says whether it read them as one net `range` diff (the pass was the branch tip — nearly always) or as their own `commits`' patches concatenated (it was not, and then the added-line set is a superset), `prior` how many the last round had reviewed, `carried` how many of those came through the rewrite with their patch intact, and `unmatched` the difference — the bound on how far `introduced` can read high on this round, since each un-carried commit may be sitting inside the reconstructed pass. `why` is set when it declined, and the reconstructed patch itself is deliberately NOT here — the payload is a file, a `--baseline` and a board record, and nothing downstream reads a copy of the fix pass, and a decline leaves the round exactly as blind as #500 found it: #509's veto still fires and nothing is attributed |
+| `fix_range_rebuilt` | **#504.** #504's working, and `null` on every round that did not have to rebuild — which is nearly all of them. `commits` are the SHAs it called the fix pass, `prior` how many the last round had reviewed, `carried` how many of those came through the rewrite with their patch intact, and `unmatched` the difference . On a round that ATTRIBUTED those are always n/n/0, because an inexact reconstruction declines rather than leaning; what they are worth is on the declines, where they say how far apart the two histories were and whether a rebase or a force-push is the thing to go and look at. `why` is set when it declined, and the reconstructed patch itself is deliberately NOT here — the payload is a file, a `--baseline` and a board record, and nothing downstream reads a copy of the fix pass, and a decline leaves the round exactly as blind as #500 found it: #509's veto still fires and nothing is attributed |
 | `cycle_trend` | **#490.** The cross-round block as data — one object per round of the cycle *including this one*: `round`, `reviewed`, `findings`, `p1p2`, `introduced`, `pr_chars`, `growth`. Every count is nullable and none defaults to 0, because "did not measure" and "measured zero" are opposite readings and this block exists to stop that confusion. `growth` is stored rather than left to be recomputed, since its denominator is the cycle's first reviewed round's size and not this row's. `[]` outside a cycle, on the same rule `new_findings` and `round_stop` use |
 | `recurrence_counts`, `premise_counts` | **#67.** The two tallies over the same population, on exactly `provenance_counts`' terms (`{}` = the question does not arise; all-zero = it was asked and there was nothing). Two objects rather than one, because the whole value of asking twice is that they can disagree. `premise_counts` carries a `not-said` bucket — the judge having nothing to say is the commonest answer, and a shortfall against a denominator stored elsewhere would invent it |
 
