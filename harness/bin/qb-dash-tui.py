@@ -996,6 +996,11 @@ class Dash(App):
         # means "nothing is claimed" — see render_board.
         self.claims_err: str | None = None
         self.detail_text = ""
+        #: The dial a write is in flight for, or None. Read on the UI thread and
+        #: written only there — `run_dial_write` clears it through
+        #: `call_from_thread`. It exists so a second press can be REFUSED rather
+        #: than supersede an `exclusive` worker that has not reported yet (#577).
+        self.dial_writing: str | None = None
         self.last_dispatch: tuple[str, float] | None = None
         # Where launched work runs, what it runs, and whether it asks first.
         # A DIRECTORY, and that is why `--repo` cannot simply be assigned to it:
@@ -1992,6 +1997,24 @@ class Dash(App):
         self.detail_text = text
         self.query_one("#detail", Static).update(Text(text, style="bold"))
 
+    def alarm(self, text: str) -> None:
+        """`say`, for the answers a person must not be able to walk past.
+
+        The detail line is `color: $text-muted` and it is right for almost
+        everything that lands there — a row's expansion, what a launch did, which
+        pane took the key. A WRITE THAT DID NOT HAPPEN is the exception, and #577
+        is what the exception cost: a dial write that failed on a missing
+        credential said so in grey on a line the eye reads as chrome, next to a
+        modal that had already dismissed as if it had worked.
+
+        Bold red and the bell, which is exactly what `DialEdit._refuse` does one
+        screen up. The two are the same event — this side could not do what was
+        asked — and they had no business looking different.
+        """
+        self.detail_text = text
+        self.query_one("#detail", Static).update(Text(text, style="bold red"))
+        self.bell()
+
     # ---- clicks ----------------------------------------------------------
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -2665,8 +2688,19 @@ class Dash(App):
         """
         if not asked or not asked.get("dial"):
             return
+        if self.dial_writing:
+            # REFUSED, not superseded, and that is the whole of #577's last
+            # symptom. `run_dial_write` is `exclusive=True`, so a second press
+            # cancelled the first — and the first was the one holding the answer,
+            # thirty seconds into a key command that had not returned yet. A
+            # person who sees nothing presses it again, which is the one input
+            # that guaranteed they would go on seeing nothing.
+            self.alarm(f"still writing {self.dial_writing} — that one has not "
+                       f"come back yet. It waits up to 30s on the key command; "
+                       f"this press was ignored rather than cancelling it")
+            return
         if asked.get("clear"):
-            self.run_dial_write(asked, None, None)
+            self.start_dial_write(asked, None, None)
             return
         try:
             value = qd.parse_dial_value(asked.get("value", ""))
@@ -2687,12 +2721,34 @@ class Dash(App):
             self.say("a dial needs a reason — why is this value in force? "
                      "The board refuses one without, and so does this")
             return
+        self.start_dial_write(asked, value, expires)
+
+    def start_dial_write(self, asked: dict, value, expires: str | None) -> None:
+        """Announce the write, THEN start it. On the UI thread, in that order.
+
+        The announcement is the fix, and it is one line because the hole it fills
+        is one gap: between the modal dismissing and the worker returning, this
+        screen said nothing at all. On a host whose key command blocks — `op read`
+        against a vault that wants unlocking, which is every host on this fleet
+        the day somebody's session expires — that gap is the full thirty seconds
+        of the subprocess timeout, and a dismissed modal over an unchanged pane is
+        indistinguishable from a write that landed.
+
+        Naming the credential rather than saying "working…" is deliberate: the
+        wait is almost always `op`, and a person who reads the word has the answer
+        before the timeout does.
+        """
+        dial = asked["dial"]
+        self.dial_writing = dial
+        self.say(f"{'clearing' if asked.get('clear') else 'setting'} {dial} — "
+                 f"fetching your key first (this can wait on `op`, up to 30s)")
         self.run_dial_write(asked, value, expires)
 
     @work(thread=True, exclusive=True, group="dialwrite")
     def run_dial_write(self, asked: dict, value, expires: str | None) -> None:
         """The write itself, off the UI thread. Never raises into Textual."""
         dial, repo = asked["dial"], asked.get("repo")
+        failed = False
         try:
             if asked.get("clear"):
                 got = self.human.clear_dial(dial, repo)
@@ -2709,12 +2765,30 @@ class Dash(App):
                        for d in (got.get("replaced") or [])]
                 said = f"set {dial}" + (f" — it was {', '.join(was)}" if was else "")
         except Exception as exc:                  # noqa: BLE001 — show it, don't die
-            said = f"{dial}: {exc}"
-        self.call_from_thread(self.say, qd.clip(said, 400))
+            failed = True
+            # THE VERB FIRST, because the sentence is read left to right and the
+            # dial name is the half a person already knows. `{dial}: {exc}` put 34
+            # characters of `review_panel.budget.tokens_per_day` in front of the
+            # only words that mattered. The verb is the one `start_dial_write`
+            # announced, so the two lines are about visibly the same act.
+            verb = "clear" if asked.get("clear") else "set"
+            said = f"could not {verb} {dial} — {exc}"
+        finally:
+            # Cleared HERE and not at the end, so an exception that escapes the
+            # reporting below cannot leave this screen believing a write is in
+            # flight for ever — which would wedge every later press against the
+            # refusal in `dial_written`.
+            self.call_from_thread(self.clear_dial_writing)
+        self.call_from_thread(self.alarm if failed else self.say,
+                              qd.clip(said, 400))
         # Straight back to the board rather than waiting out the plan clock: the
         # person is looking at the row they just changed, and a panel that showed
         # the old value for fifteen seconds would be read as a write that failed.
         self.call_from_thread(self.refresh_plan)
+
+    def clear_dial_writing(self) -> None:
+        """No write in flight. On the UI thread, which owns this flag."""
+        self.dial_writing = None
 
     def open_dials(self) -> None:
         """The board's dials page — the only surface that can actually turn one.
