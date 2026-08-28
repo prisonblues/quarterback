@@ -193,12 +193,40 @@ async def test_an_unknown_class_is_refused_and_names_the_vocabulary(client):
 
 
 async def test_authorisation_is_not_a_class(client):
-    """Six, not seven. #328 proposed `authorisation`; `app/needs_human.py`'s own
-    growth rule is that a word is earned by turning up under `other`, and nothing
-    has ever been filed under it. Rich, 2026-08-26: agents have wide autonomy for
-    gh actions, so the evidence is unlikely to arrive."""
+    """Seven now, and `authorisation` is still not one of them.
+
+    #328 proposed it and it was refused on `app/needs_human.py`'s own growth rule:
+    a word is earned by turning up repeatedly under a wrong one, and nothing had
+    turned up. #578 then added `chore` — with the evidence that proposal lacked,
+    ten `stuck` posts over two days all filed as `environment` when no judgement
+    was owed by any of them.
+
+    The two are not the same word wearing different clothes, and the distinction is
+    the whole of why this test still passes. `authorisation` names what somebody
+    should GRANT; `chore` names what the item IS. #578 adds the ability to say "no
+    judgement is owed here" and deliberately grants nobody permission to act on
+    that sentence, so the class that would have described the permission is still
+    not a class."""
     r = await raise_one(client, kind="authorisation")
     assert r.status_code == 422
+
+
+async def test_a_chore_is_a_class_and_carries_no_permission_with_it(client):
+    """The seventh class stores like any other — and that is ALL it does.
+
+    #578's whole discipline is that widening the vocabulary widens nothing else.
+    A `chore` row is a row: it counts in `by_class`, it sits in the queue oldest
+    first, and it keeps `next` off the item exactly as a `decision` does. Nothing
+    reads `kind == "chore"` and decides anything, here or anywhere, and the test
+    that proves the other half — that a `needs-human/chore` label still refuses
+    autonomous pickup — is in `harness/loops/tests/test_appetite.py`."""
+    r = await raise_one(client, kind="chore")
+    assert r.status_code in (200, 201), r.text
+    listing = await client.get("/blockers?open=true")
+    assert listing.status_code == 200
+    body = listing.json()
+    assert body["by_class"].get("chore") == 1
+    assert "chore" in body["classes"]
 
 
 async def test_a_question_is_required_to_be_a_sentence(client):

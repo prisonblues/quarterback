@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import appetite  # noqa: E402
 import harness_rules as hr  # noqa: E402
+import needs_human as nh  # noqa: E402
 
 
 def cfg(**pickup):
@@ -131,10 +132,17 @@ def test_the_author_allowlist_is_case_insensitive():
 # ---------------------------------------------------------- the skip gate
 
 @pytest.mark.parametrize("cls", list(hr.DEFAULTS["issue_pickup"]["skip_labels"]) and
-                         ["decision", "taste", "ui", "environment", "auth", "other"])
+                         list(nh.NEEDS_HUMAN_CLASSES))
 def test_every_needs_human_class_refuses(cls):
     """Guards the wiring between the glob and #279's vocabulary — a default list
-    the matcher never consults would pass a narrower test."""
+    the matcher never consults would pass a narrower test.
+
+    Read off the vocabulary rather than restated, which is what makes this the
+    test that #578's `chore` did not weaken a gate. `chore` asserts that no
+    judgement is owed, and the obvious next move — letting the loops pick such an
+    issue up — is the one thing #578 is explicitly NOT allowed to do. So `chore`
+    refuses exactly like the other six, and this parametrisation is where that
+    stays true without anyone remembering to add a case."""
     v = appetite.refusal_verdict({}, [f"needs-human/{cls}"], number=7)
     assert v.allowed is False and v.setting == "issue_pickup.skip_labels"
 

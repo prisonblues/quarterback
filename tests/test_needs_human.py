@@ -106,7 +106,8 @@ async def stats(client, case: str) -> dict:
 # ---------------------------------------------------------------- the vocabulary
 
 def test_the_vocabulary_is_closed_and_every_class_carries_help_and_a_label():
-    assert NEEDS_HUMAN_CLASSES == ("decision", "taste", "ui", "environment", "auth", "other")
+    assert NEEDS_HUMAN_CLASSES == ("decision", "taste", "ui", "environment", "auth",
+                                   "chore", "other")
     for c in NEEDS_HUMAN_CLASSES:
         assert NEEDS_HUMAN_CLASS_HELP[c]
         assert NEEDS_HUMAN_LABELS[c] == f"needs-human/{c}"

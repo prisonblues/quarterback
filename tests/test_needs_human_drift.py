@@ -110,6 +110,14 @@ def test_every_class_a_producer_names_is_in_the_vocabulary():
     for path, pattern in (
         ("harness/loops/preland.py", r'hold_for_human\(\s*\n?\s*"([a-z]+)"'),
         ("harness/loops/epic.py", r'^(?:UNTRIAGED|RULING)_CLASS = "([a-z]+)"'),
+        # #578 made this one per REGISTRATION rather than per file: `qb-doctor`
+        # sent a single class for all twenty of its rows and every escalation it
+        # made said `environment`. Twenty literals is exactly the case this scan
+        # is for — `CheckSpec` cannot check them itself, because the door is
+        # imported at call time and there is no vocabulary in that file to check
+        # against.
+        ("harness/bin/qb-doctor", r'^\s*needs_human="([a-z]+)",$'),
+        ("harness/bin/qb-bump", r'^NEEDS_HUMAN_CLASS = "([a-z]+)"'),
     ):
         src = (REPO_ROOT / path).read_text(encoding="utf-8")
         found = set(re.findall(pattern, src, re.M))

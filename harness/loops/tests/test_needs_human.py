@@ -111,7 +111,7 @@ def test_no_app_in_reach_is_not_a_reason_to_have_no_vocabulary():
     """An installed harness is `share/quarterback-harness/loops` with nothing
     beside it, which is the ordinary case rather than the broken one."""
     assert nh._canonical(Path("/nonexistent/app/needs_human.py")) is None
-    assert len(nh.NEEDS_HUMAN_CLASSES) == 6
+    assert len(nh.NEEDS_HUMAN_CLASSES) == 7
 
 
 def test_a_file_that_is_not_the_module_is_not_loaded_as_it(tmp_path):

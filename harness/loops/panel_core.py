@@ -397,7 +397,9 @@ whether another review will be needed — you cannot observe findings you have n
   architecture, policy) · taste (is this the right name, the right sentence, the right
   shape) · ui (does it actually look and behave right on a real screen) · environment
   (does it work on the box it has to work on) · auth (does the credential path actually
-  work, end to end) · other (say which in the reason); and `needs_human_reason`, one line
+  work, end to end) · chore (nobody has to judge it — you can state the remedy exactly and
+  something here is simply not permitted to perform it) · other (say which in the reason);
+  and `needs_human_reason`, one line
   saying what the person has to answer. A flag with no reason is discarded, and a flag is
   a way OUT of work — reaching for it to end a review you find tedious is counted per seat.
 
