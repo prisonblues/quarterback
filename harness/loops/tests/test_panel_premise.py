@@ -934,3 +934,61 @@ def test_both_briefs_carry_the_limit_rather_than_implying_coverage():
     a brief that did not say so would be promising a detector."""
     assert "unescalatable" in REVIEW_PR.lower()
     assert "state the premise, never the proxy" in PANEL_REVIEW_PR
+
+
+# ------------------------------------------------------------------- the partition
+
+
+def test_the_escalation_names_both_halves_of_the_partition(repo, tmp_path, capsys):
+    """#555. "Fix everything else in the same pass" has been in the brief since
+    2026-08-18, and on lexray#1697 round 1 the fixer read it, fixed five findings and
+    four of them were about the behaviour of the flag its own escalation questioned.
+    The pass was reverted the next day. A sentence is not a mechanism; naming the two
+    halves on the screen the fixer is about to act on is one."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1, KEY_A)
+    declare(reg, LANDED, 2, KEY_A, KEY_B)
+    out = capsys.readouterr().out
+    assert "DOWNSTREAM OF THE PREMISE — write no patch for these:" in out
+    assert KEY_A in out and KEY_B in out
+    assert "INDEPENDENT" in out
+    assert "it does not end it" in out, "an escalation partitions the pass, not ends it"
+
+
+def test_a_declaration_that_named_no_findings_says_the_partition_is_missing(
+        repo, tmp_path, capsys):
+    """The half `declare` cannot compute is the independent one — it never sees the
+    round's findings, only the keys this declaration named. So a declaration with no
+    keys has stated no partition at all, and the fixer is told that in those words
+    rather than being handed a half-empty list it might read as complete."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1)
+    declare(reg, LANDED, 2)
+    out = capsys.readouterr().out
+    assert "NO PARTITION WAS DECLARED" in out
+    assert "DOWNSTREAM OF THE PREMISE" not in out
+
+
+def test_the_partition_rides_in_the_json_as_well_as_the_report(repo, tmp_path, capsys):
+    """An orchestrator reading `--json` gets the same two halves the report shows.
+    `findings` is the downstream set and has been in the payload all along; what
+    #555 adds is that it is now the thing the fixer is told to act on."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1, KEY_A)
+    capsys.readouterr()
+    declare(reg, LANDED, 2, KEY_A, KEY_B, json_out=True)
+    body = json.loads(capsys.readouterr().out)
+    assert body["escalate"] is True
+    assert sorted(body["findings"]) == sorted([KEY_A, KEY_B])
+    assert "board" in body, "what the board did is part of the machine-readable answer"
+
+
+def test_a_recorded_declaration_reports_no_partition_because_there_is_none(
+        repo, tmp_path, capsys):
+    """The partition belongs to the escalation. A first occurrence is a fix about to
+    be written in full, and printing a do-not-patch list there would tell the fixer
+    to skip findings nobody escalated."""
+    reg = tmp_path / "p.json"
+    declare(reg, LANDED, 1, KEY_A)
+    out = capsys.readouterr().out
+    assert "DOWNSTREAM OF THE PREMISE" not in out and "NO PARTITION" not in out

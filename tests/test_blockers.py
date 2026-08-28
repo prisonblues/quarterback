@@ -399,3 +399,104 @@ async def test_the_item_says_what_it_is_waiting_for_and_for_how_long(client):
     assert w["owner"] == "human/rich"
     assert w["idle_days"] is not None, "age is the signal nobody has to maintain"
     assert row["blocked_by"] == [], "a human blocker must not masquerade as an item edge"
+
+
+# ------------------ a blocker that names the forge reaches the item that carries it
+
+
+async def add_ref_item(client, title, repo, kind, value):
+    r = await client.post("/plan/item", json={"title": title, "repo": repo,
+                                              "ref_kind": kind, "ref_value": value},
+                          headers=LAPTOP)
+    assert r.status_code in (200, 201), r.text
+    MINE.add(r.json()["item_id"])
+    return r.json()["item_id"]
+
+
+@pytest.mark.parametrize("kind", ["issue", "pr"])
+async def test_next_skips_an_item_whose_ISSUE_OR_PR_is_blocked(client, kind):
+    """#555, and the reason #328's queue could not partition anything.
+
+    Every producer the fleet has raises the FORGE kind — `needs_human._subject_from`
+    prefers `pr`, then `issue`, and records `item` as the kind "nothing emits today"
+    — because a loop reviewing a pull request knows a PR number and has never heard
+    of a plan. While this matched `item` alone, the rows the fleet actually produced
+    attached to nothing and `next` went on handing the work out.
+    """
+    repo = f"acme/forge-{kind}"
+    parked = await add_ref_item(client, "parked on a premise", repo, kind, "1697")
+    free = await add_ref_item(client, "actually free", repo, kind, "1698")
+
+    before = await plan(client, repo)
+    assert before["next"]["item_id"] == parked, "precondition: it was next"
+
+    r = await client.post("/blockers", json={
+        "subject_kind": kind, "subject_value": "1697", "kind": "decision",
+        "question": "does the premise hold?", "repo": repo}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+
+    after = await plan(client, repo)
+    assert after["next"]["item_id"] == free, "next handed out work behind an open question"
+    row = next(i for i in after["items"] if i["item_id"] == parked)
+    (w,) = row["waiting_on_a_human"]
+    assert w["question"] == "does the premise hold?"
+    assert after["counts"]["waiting_on_a_human"] == 1
+
+
+async def test_a_blocker_on_one_repos_42_does_not_park_anothers(client):
+    """The scope is half of what a bare number means. `ix_plan_items_open_ref` is
+    unique on `(COALESCE(repo, ''), ref_kind, ref_value)` and this comparison is that
+    index's key — an item and a blocker that disagree about the repo are about two
+    different `#42`s, which is `app.claimkey`'s rule already."""
+    mine = await add_ref_item(client, "mine", "acme/scoped-a", "issue", "42")
+    theirs = await add_ref_item(client, "theirs", "acme/scoped-b", "issue", "42")
+
+    r = await client.post("/blockers", json={
+        "subject_kind": "issue", "subject_value": "42", "kind": "decision",
+        "question": "which?", "repo": "acme/scoped-a"}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+
+    blocked = await plan(client, "acme/scoped-a")
+    assert next(i for i in blocked["items"]
+                if i["item_id"] == mine)["waiting_on_a_human"]
+    untouched = await plan(client, "acme/scoped-b")
+    assert not next(i for i in untouched["items"]
+                    if i["item_id"] == theirs)["waiting_on_a_human"]
+    assert untouched["next"]["item_id"] == theirs
+
+
+async def test_a_blocker_naming_a_forge_ref_nobody_planned_attaches_to_nothing(client):
+    """Unchanged and correct: it is a real question in the queue, and there is no
+    plan row for it to hold up. The row is not lost — it is simply not an edge."""
+    repo = "acme/unplanned"
+    only = await add_ref_item(client, "planned", repo, "issue", "1")
+    r = await client.post("/blockers", json={
+        "subject_kind": "issue", "subject_value": "999", "kind": "decision",
+        "question": "about nothing on the plan", "repo": repo}, headers=LAPTOP)
+    assert r.status_code == 200, r.text
+
+    after = await plan(client, repo)
+    assert after["next"]["item_id"] == only
+    assert after["counts"]["waiting_on_a_human"] == 0
+    listed = await client.get("/blockers", params={"repo": repo}, headers=LAPTOP)
+    assert any(b["question"] == "about nothing on the plan"
+               for b in listed.json()["blockers"]), "still queued, just not an edge"
+
+
+async def test_an_answered_forge_blocker_releases_the_item(client):
+    """The edge is the OPEN question. Answering it is what makes the work next
+    again, and nothing has to remember to undo anything."""
+    repo = "acme/forge-answered"
+    parked = await add_ref_item(client, "parked", repo, "pr", "7")
+    r = await client.post("/blockers", json={
+        "subject_kind": "pr", "subject_value": "7", "kind": "decision",
+        "question": "does the premise hold?", "repo": repo}, headers=LAPTOP)
+    blocker_id = r.json()["blocker"]["id"]
+    assert (await plan(client, repo))["next"] is None
+
+    done = await client.post("/blockers/resolve",
+                             json={"blocker_id": blocker_id,
+                                   "resolution": "it does not — revert the flag"},
+                             headers=HUMAN)
+    assert done.status_code == 200, done.text
+    assert (await plan(client, repo))["next"]["item_id"] == parked

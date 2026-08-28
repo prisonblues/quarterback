@@ -479,15 +479,44 @@ if the script isn't there.
 
 - **Write no patch for it, and leave no half-change behind.** The absence of the
   patch is the point; a partly-applied redesign is worse than either outcome.
-- **Fix everything else in the same pass.** Every finding not downstream of the
-  premise still gets fixed, tested, verified, committed and pushed exactly as
-  step 3 says. An escalation is a report, not a stop-work.
-- **Open nothing and record nothing for it.** The premise issue and the board row
-  are the orchestrator's, after it has relayed your report — you were told to
-  decide nothing and write no patch, and filing the premise yourself is the first
-  move of the redesign you are declining to make. Your durable output is the
-  write-up in step 6 and the same finding named as escalated in the step-5 commit
-  body; those are what get lifted.
+- **Partition the rest, then fix one half of it.** An escalation is not a
+  stop-work — but "fix everything else" is not what it means either, and reading
+  it that way is what #555 is filed about. Split the remaining findings in two:
+
+  - **downstream of the premise** — anything whose fix only makes sense if the
+    premise holds, including tests that assert the behaviour it questions and
+    docstrings that describe it. **Write no patch for these.** If the premise
+    resolves the other way they describe something that no longer exists, and the
+    pass that wrote them is spend against an open question.
+  - **independent** — everything else. These get fixed, tested, verified,
+    committed and pushed exactly as step 3 says.
+
+  **Name the downstream half when you declare**, with one `--premise-for <key>`
+  per finding. That flag is the partition, not bookkeeping: it is what keeps the
+  next round from counting those findings as work a fix pass could have cleared,
+  and `--premise` prints the two halves back to you before you patch anything.
+
+  This is measured, not cautious. On lexray#1697 round 1 the fixer read this
+  bullet in its previous wording, fixed five findings, and **four of them were
+  about the behaviour of the very flag the escalation questioned**. The pass was
+  reverted the next day and everything it wrote had nothing left to attach to.
+  Exactly one finding was independent — and the line budget dropped that one.
+  The correct output was: escalate, fix nothing, stop.
+- **Open nothing yourself, and do not file the board row by hand.** The premise
+  ISSUE is still the orchestrator's, after it has relayed your report — you were
+  told to decide nothing and write no patch, and filing the premise yourself is
+  the first move of the redesign you are declining to make.
+
+  The board ROW is nobody's to file any more: when the brake refuses your fix,
+  `--premise` raises it for you (#555) and prints what it did on the `board` line
+  of its report. Re-raising an identical open question is a no-op at the board, so
+  a second declaration of the same premise re-uses the row rather than opening a
+  second one — which is why you should not "help" by opening one as well. If that
+  line says it was NOT recorded, say so in your write-up; it is a fact about the
+  board, and the escalation stands either way.
+
+  Your durable output is still the write-up in step 6 and the same finding named
+  as escalated in the step-5 commit body; those are what get lifted.
 - **Report it in step 6 under `Escalated`** — the premise in one sentence, the
   findings it explains, what removing it would cost, the patch you did not write,
   and the `--ask` verdict if you ran one. An escalation nobody reads is a
