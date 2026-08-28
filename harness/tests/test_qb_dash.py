@@ -2857,7 +2857,7 @@ def test_a_refused_write_is_reported_and_does_not_take_the_dashboard_down():
 # pin the three halves of being told: before, loudly, and not instead of.
 
 
-async def _writing(asked: dict, human=None, then=None):
+async def _writing(asked: dict, human=None, then=None, pause=0.4):
     """`_written`, but handing back the app so the STYLE and the bell can be read.
 
     Both matter here and neither is in the text: a sentence nobody's eye is drawn
@@ -2880,7 +2880,7 @@ async def _writing(asked: dict, human=None, then=None):
         app.dial_written(asked)
         if then is not None:
             then(app)
-        await pilot.pause(0.4)
+        await pilot.pause(pause)
         # Off the widget rather than off `detail_text`, because the STYLE is the
         # half this issue is about and the text is identical either way.
         style = repr(app.query_one("#detail").visual)
@@ -2962,18 +2962,29 @@ def test_a_second_press_is_refused_rather_than_cancelling_the_first():
     slow = Slow()
     asked = {"dial": "tempo", "value": "eager", "reason": "draining",
              "expiry": "", "repo": None}
+    refused = []
 
     def press_again(app):
         app.dial_written(dict(asked, dial="review_panel.max_rounds", value="2"))
+        refused.append(app.detail_text)
+        # RELEASED HERE, while the app is still running, so the first write
+        # actually completes inside `run_test` and this test proves what it says.
+        # Setting the event after `asyncio.run` returned proved nothing: the
+        # worker was finishing on its own timeout, after the app had gone.
+        held.set()
 
     app, said, style, rung = asyncio.run(
-        _writing(asked, human=slow, then=press_again))
-    held.set()
-    assert "still writing tempo" in said, said
-    assert "red" in style and rung, "the refusal was not loud"
-    # The FIRST write is allowed to finish — that is the point of refusing the
-    # second rather than superseding it. What must not be here is the second.
+        _writing(asked, human=slow, then=press_again, pause=1.5))
+    # The refusal, seen at the moment of the second press rather than inferred
+    # from whatever the line said once everything had settled.
+    assert "still writing tempo" in refused[0], refused
     assert "review_panel.max_rounds" not in [row[0] for row in slow.set], slow.set
+    # And the FIRST write was allowed to finish, which is the point of refusing
+    # the second rather than superseding it.
+    assert [row[0] for row in slow.set] == ["tempo"], slow.set
+    assert "set tempo" in said, said
+    # The flag is released, so the next press is not refused for ever.
+    assert app.dial_writing is None, app.dial_writing
 
 
 def test_ctrl_s_in_the_editor_is_what_sends_it():

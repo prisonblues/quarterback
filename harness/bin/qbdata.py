@@ -754,8 +754,20 @@ def resolve_config() -> BoardConfig:
     human_key = os.environ.get("QUARTERBACK_HUMAN_KEY", "")
     human_key_cmd = os.environ.get("QUARTERBACK_HUMAN_KEY_CMD", "")
 
+    # `not agent` BELONGS IN THIS LIST, and leaving it out was a real hole rather
+    # than a saving. The reasoning for omitting it was that the agent has a
+    # hostname fallback so the file is never *needed* for it — which confuses "we
+    # can always produce an answer" with "we can produce the right one". A host
+    # whose environment carried the other four values and whose config named an
+    # agent got the hostname instead, silently, and then resolved every credential
+    # against the wrong vault item and announced itself to the board under the
+    # wrong name. That is this module's own bug (#577) wearing a different hat.
+    #
+    # It costs approximately nothing. The condition already sources whenever
+    # `human_url` is absent, and a shell has no reason to carry that — so in
+    # practice the file was being read on nearly every call already.
     if (not url or not (token or token_cmd) or not human_url
-            or not (human_key or human_key_cmd)):
+            or not (human_key or human_key_cmd) or not agent):
         config = (os.environ.get("QUARTERBACK_CONFIG")
                   or os.path.join(os.environ.get("XDG_CONFIG_HOME")
                                   or os.path.expanduser("~/.config"),

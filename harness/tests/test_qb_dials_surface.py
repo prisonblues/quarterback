@@ -664,6 +664,29 @@ def test_the_agent_a_host_names_itself_beats_the_hostname(tmp_path, monkeypatch)
     assert cfg.token == "tok-the-named-one"
 
 
+def test_the_config_is_read_for_the_agent_even_when_nothing_else_is_missing(
+        tmp_path, monkeypatch):
+    """The case the test above does NOT cover, and the hole it was hiding.
+
+    That one leaves the environment bare, so the config is sourced because four
+    other values are absent and the agent rides along. Here the environment
+    carries everything else — so if `not agent` is not itself a reason to read the
+    file, the configured name is never seen and the hostname is substituted in
+    silence. The damage is not cosmetic: every credential command interpolates
+    this, so the host resolves another machine's vault item and announces itself
+    to the board under a name that is not its own.
+    """
+    config = tmp_path / "config"
+    config.write_text("QUARTERBACK_AGENT='the-named-one'\n")
+    monkeypatch.setenv("QUARTERBACK_CONFIG", str(config))
+    monkeypatch.setenv("QUARTERBACK_BASE_URL", "https://qb.invalid")
+    monkeypatch.setenv("QUARTERBACK_TOKEN", "tok")
+    monkeypatch.setenv("QUARTERBACK_HUMAN_URL", "https://human.invalid")
+    monkeypatch.setenv("QUARTERBACK_HUMAN_KEY", "key")
+    monkeypatch.delenv("QUARTERBACK_AGENT", raising=False)
+    assert qd.resolve_config().agent == "the-named-one"
+
+
 def test_a_host_that_names_no_agent_still_gets_the_short_hostname(tmp_path, monkeypatch):
     """The fallback, and shortened the way `qb-env` shortens it — the board's
     machine names are bare, and `uname -n` can carry a domain."""

@@ -2742,7 +2742,16 @@ class Dash(App):
         self.dial_writing = dial
         self.say(f"{'clearing' if asked.get('clear') else 'setting'} {dial} — "
                  f"fetching your key first (this can wait on `op`, up to 30s)")
-        self.run_dial_write(asked, value, expires)
+        try:
+            self.run_dial_write(asked, value, expires)
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            # THE WORKER MAY NEVER START, and a `finally` inside a function that
+            # was never entered cannot clean up after it. Textual refuses new work
+            # while the app is shutting down, and without this the flag stays set
+            # and the refusal above rejects every write for the rest of the
+            # session — a guard against one lost message that costs all of them.
+            self.dial_writing = None
+            self.alarm(f"could not start the write for {dial} — {exc}")
 
     @work(thread=True, exclusive=True, group="dialwrite")
     def run_dial_write(self, asked: dict, value, expires: str | None) -> None:
@@ -2776,9 +2785,19 @@ class Dash(App):
         finally:
             # Cleared HERE and not at the end, so an exception that escapes the
             # reporting below cannot leave this screen believing a write is in
-            # flight for ever — which would wedge every later press against the
-            # refusal in `dial_written`.
-            self.call_from_thread(self.clear_dial_writing)
+            # flight — which would wedge every later press against the refusal in
+            # `dial_written`.
+            #
+            # NOT A GUARANTEE, and the honest bound is worth writing down: this
+            # runs only once the worker body has been entered (the case where it
+            # is not is handled at the call site), and `call_from_thread` itself
+            # can be refused by an app that is already tearing down. What it
+            # covers is every path that raises out of the write, which is the one
+            # that happens.
+            try:
+                self.call_from_thread(self.clear_dial_writing)
+            except Exception:                     # noqa: BLE001 — the app is going away
+                pass
         self.call_from_thread(self.alarm if failed else self.say,
                               qd.clip(said, 400))
         # Straight back to the board rather than waiting out the plan clock: the
