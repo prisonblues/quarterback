@@ -136,11 +136,24 @@ def fleet(tmp_path):
                 f"exit {rc}\n")
             (stub_dir / "worktree-holder").chmod(0o755)
 
-        def run(self, *args, cwd=None):
+        def stub_date_that_fails(self):
+            """A `date` on PATH that refuses to answer.
+
+            Two different failures live behind this, both silent. An EMPTY `date`
+            becomes a unary minus inside `$(( ))`, so the age comes out negative and
+            the sweep confidently reports clock skew about a clock it never read. A
+            NON-NUMERIC one is an arithmetic syntax error, which under `set -u` and
+            without `set -e` leaves the variable unset and aborts the shell on the
+            next test of it — an unattended sweep dying of a clock."""
+            (stub_dir / "date").write_text("#!/bin/sh\nexit 1\n")
+            (stub_dir / "date").chmod(0o755)
+
+        def run(self, *args, fetch=False, cwd=None):
             env = dict(os.environ)
             env["PATH"] = f"{stub_dir}:{env['PATH']}"
+            no_fetch = [] if fetch else ["--no-fetch"]
             return subprocess.run(
-                [str(CATCHUP), "-C", str(cwd or self.main), "--no-fetch", *args],
+                [str(CATCHUP), "-C", str(cwd or self.main), *no_fetch, *args],
                 capture_output=True, text=True, env=env, timeout=60)
 
         def head(self, where):
@@ -663,3 +676,97 @@ def test_the_grace_window_agrees_with_qb_doctor():
     assert mine.group(1) == theirs.group(1), (
         "the sweep and the doctor would disagree about whether the same branch is a "
         "problem, which is worse than either being wrong alone")
+
+
+# ------------------------------------------- fetch scope and ref trust (#573, codex)
+#
+# `--not --remotes` subtracts the tracking refs of EVERY remote, so the set of refs it
+# trusts and the set the sweep refreshes have to be the same set. #567's Codex pass
+# found that mismatch in the Python sibling — one remote fetched, all of them trusted
+# — and a second pass over this script found four more ways in, all of them quiet
+# rather than loud, which is the dangerous direction for a warning about lost work.
+
+
+def test_a_fetch_that_failed_refuses_the_question_rather_than_answering_from_stale_refs(fleet):
+    """The sweep still runs — acting on what is already here is the point — but a
+    question measured against refs nobody refreshed is not answered."""
+    git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, "it answered out of a snapshot nobody refreshed"
+
+
+def test_a_namespace_under_refs_remotes_that_is_not_a_remote_refuses_the_question(fleet):
+    """The mirror image of the refspec check. The query trusts everything under
+    `refs/remotes/`; only configured remotes are refreshed. A namespace left by a
+    removed remote never self-corrects, because nothing will ever fetch it again."""
+    git(fleet.main, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "`refs/remotes/ghost/` belongs to no configured remote" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_negative_refspec_refuses_the_question(fleet):
+    """`^refs/heads/private/*` alongside `refs/heads/*` fetches everything except
+    those, and a positive refspec elsewhere does not undo the exclusion. The branches
+    it holds back are exactly the ones this would call work that exists nowhere else."""
+    git(fleet.main, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "excludes" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_refspec_that_lands_outside_refs_remotes_refuses_the_question(fleet):
+    """`refs/heads/*:refs/cache/*` brings back every head and puts none of it where
+    `--remotes` looks — full coverage to a check that reads only the source."""
+    git(fleet.main, "config", "remote.origin.fetch", "+refs/heads/*:refs/cache/origin/*")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "which is not under `refs/remotes/`" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_worktree_is_not_called_finished_with_when_the_question_was_refused(fleet):
+    """"Finished with" is a safety claim, and a claim that was never established must
+    not be made. A `git log` that failed for one worktree, or a run in which the
+    question was refused for all of them, would otherwise come out as a confident
+    "you can throw this away"."""
+    wt = fleet.worktree("feat/landed")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    git(fleet.main, "push", "-q", "origin", "--delete", "feat/landed")
+    git(fleet.main, "fetch", "-q", "--prune", "origin")
+    git(fleet.main, "update-ref", "refs/remotes/ghost/main", "HEAD")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "was not established" in done.stdout, done.stdout
+    assert "so this worktree is finished with" not in done.stdout, done.stdout
+
+
+def test_a_clock_that_will_not_answer_does_not_kill_the_sweep(fleet):
+    """Codex's finding, and the red run showed it fails one step earlier than either
+    of us expected: an empty `date` is a unary minus inside `$(( ))`, so the old form
+    did not abort — it reported "dated ahead of this clock", a confident diagnosis of
+    clock skew drawn from a clock it had not read. A non-numeric `date` is the abort.
+    Both are now the same honest answer: the count stands, and the age, which is the
+    part that was not measured, is withheld."""
+    commit(fleet.main, "mine-only", days_ago=19)
+    fleet.worktree("feat/after-the-clock")
+    fleet.stub_date_that_fails()
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "how old could not be read from this clock" in done.stdout, done.stdout
+    assert "feat/after-the-clock" in done.stdout, "the sweep died where the clock did"
+    assert "left alone, of 2 worktree(s)" in done.stdout, done.stdout

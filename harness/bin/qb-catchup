@@ -110,11 +110,20 @@ git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: 
 # so remote-tracking refs are shared too. Fetching once in any of them advances
 # `@{u}` for all of them. Bounded, because this runs from a hook: a remote that
 # hangs must cost the catch-up, never the turn.
+#
+# THE STATUS IS KEPT NOW, WHERE IT USED TO BE `|| true`. The fast-forward still runs
+# on a fetch that failed — acting on what is already here is the whole point of
+# `--no-fetch` and a remote that is down must not stop the sweep. But the
+# stranded-work question is measured AGAINST those refs, so a fetch that did not
+# happen is a fetch whose answer must not be quoted. `--all` exits non-zero when any
+# remote fails, which is exactly the granularity the question needs: one stale remote
+# contaminates a result that subtracts all of them.
+FETCH_FAILED=0
 if [ "$FETCH" = 1 ]; then
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$FETCH_TIMEOUT" git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || true
+    timeout "$FETCH_TIMEOUT" git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || FETCH_FAILED=1
   else
-    git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || true
+    git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || FETCH_FAILED=1
   fi
 fi
 
@@ -139,14 +148,29 @@ fi
 # is the repository that has no remote at all, where the question does not arise:
 # there is no elsewhere for a commit to be.
 #
-# What this does NOT guard is staleness. `--remotes` reads the refs on disk, so a
-# fetch that timed out or a `--no-fetch` run measures against what was true at the
-# last fetch — exactly as the upstream comparison it replaces did. The error is in
-# the loud direction, which is the right one for a warning: a branch pushed since
-# reads as stranded until the next sweep, never the reverse.
+# STALENESS CUTS BOTH WAYS, and the first draft of this comment claimed it only cut
+# the loud one. Codex caught that. `--remotes` reads the refs on disk, so:
+#
+#   * a branch pushed since the last fetch reads as stranded — loud, self-correcting
+#     on the next sweep, and the harmless direction;
+#   * a branch DELETED on the server since the last fetch keeps its local `origin/`
+#     ref, and the commits it names read as safely elsewhere when they are not. That
+#     is quiet, and it is the dangerous direction. `qb-doctor` documents the same hole
+#     and accepts it, because the only cure is a prune and a prune destroys the refs
+#     that make some commits reachable.
+#
+# So a fetch that FAILED refuses the question outright rather than answering out of
+# a snapshot nobody refreshed. `--no-fetch` does not: the hook passes it after a
+# forge merge, the refs are the same ones the upstream comparison has always been
+# trusted against, and refusing there would hold the better question to a standard
+# the worse one never met while removing it from the run it exists for.
+NL=$'\n'
 ASK_STRANDED=1
 ASK_WHY=""
-if ! REMOTES=$(git -C "$DIR" remote 2>/dev/null); then
+if [ "$FETCH_FAILED" = 1 ]; then
+  ASK_STRANDED=0
+  ASK_WHY="the fetch did not complete, and what exists only on this disk is measured against the refs it would have refreshed, so it was not asked"
+elif ! REMOTES=$(git -C "$DIR" remote 2>/dev/null); then
   ASK_STRANDED=0
   ASK_WHY="git would not list this repository's remotes, so what exists only on this disk was not asked"
 elif [ -z "$REMOTES" ]; then
@@ -161,16 +185,52 @@ else
     # in place of a correct answer, on the good path. Whether it fires depends on how
     # much output happened to fit in a buffer, which is not a property to rely on.
     maps_every_head=0
+    spec_why=""
     while IFS= read -r spec; do
       spec=${spec#+}          # a leading + is "force", not part of the source ref
-      [ "${spec%%:*}" = 'refs/heads/*' ] && maps_every_head=1
+      # A NEGATIVE REFSPEC EXCLUDES, and a positive one elsewhere does not undo it:
+      # `^refs/heads/private/*` alongside `refs/heads/*` fetches everything except
+      # those, and the branches it holds back are exactly the ones this would then
+      # call work that exists nowhere else. Codex's finding.
+      case "$spec" in ^*)
+        spec_why="\`$rem\` excludes \`${spec#^}\` from what it fetches, so some branches on the server have no ref here"
+        continue ;;
+      esac
+      # THE DESTINATION AS WELL AS THE SOURCE. `refs/heads/*:refs/cache/*` brings back
+      # every head and puts none of it where `--remotes` looks, which the source check
+      # alone reads as full coverage. Also Codex's.
+      [ "${spec%%:*}" = 'refs/heads/*' ] || continue
+      case "${spec#*:}" in refs/remotes/*) maps_every_head=1 ;;
+        *) spec_why="\`$rem\` fetches \`refs/heads/*\` into \`${spec#*:}\`, which is not under \`refs/remotes/\` and so is not what this question subtracts" ;;
+      esac
     done < <(git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null)
+    if [ -n "$spec_why" ]; then
+      ASK_STRANDED=0
+      ASK_WHY="$spec_why, so what exists only on this disk was not asked"
+      break
+    fi
     if [ "$maps_every_head" = 0 ]; then
       ASK_STRANDED=0
       ASK_WHY="\`$rem\` does not fetch \`refs/heads/*\`, so its tracking refs cover some branches and not others and what exists only on this disk was not asked"
       break
     fi
   done <<< "$REMOTES"
+  # THE MIRROR IMAGE OF THE REFSPEC CHECK, and Codex found this one too. The query
+  # trusts every ref under `refs/remotes/`; only CONFIGURED remotes are refreshed. A
+  # namespace left by a remote somebody removed, or one written there by hand, is
+  # therefore a permanent licence for whatever it reaches to read as safely
+  # elsewhere — and unlike a stale ref it never self-corrects, because nothing is
+  # ever going to fetch it again.
+  if [ "$ASK_STRANDED" = 1 ]; then
+    while IFS= read -r ns; do
+      [ -n "$ns" ] || continue
+      case "$NL$REMOTES$NL" in *"$NL$ns$NL"*) continue ;; esac
+      ASK_STRANDED=0
+      ASK_WHY="\`refs/remotes/$ns/\` belongs to no configured remote, so this question trusts refs that nothing here refreshes, and it was not asked"
+      break
+    done < <(git -C "$DIR" for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null \
+             | awk -F/ 'NF>3 { print $3 }' | sort -u)
+  fi
 fi
 [ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
 
@@ -278,8 +338,19 @@ while IFS= read -r wt; do
         else
           noun="$stranded_n commits"; verb=are
         fi
-        age_m=$(( ($(date +%s) - oldest) / 60 ))
-        if [ "$age_m" -lt 0 ]; then
+        now=$(date +%s 2>/dev/null) || now=""
+        if [ -z "$now" ] || [ -n "${now//[0-9]/}" ] || [ -n "${oldest//[0-9]/}" ]; then
+          # `set -u` and no `set -e`: an arithmetic expansion over an empty or
+          # non-numeric operand fails, `age_m` stays unset, and the very next test
+          # reads an unbound variable — which under `set -u` ABORTS, taking the rest
+          # of the sweep with it. An unattended tool must not die of a clock.
+          age_m=""
+        else
+          age_m=$(( (now - oldest) / 60 ))
+        fi
+        if [ -z "$age_m" ]; then
+          stranded_note=" — $noun on it $verb on no remote ref, and how old could not be read from this clock"
+        elif [ "$age_m" -lt 0 ]; then
           # A committer date in the future is clock skew or a rewritten history, and
           # either way the age this turns on is not a measurement. Report the count
           # and refuse the verdict rather than picking whichever side the skew lands.
@@ -316,17 +387,19 @@ while IFS= read -r wt; do
     # is almost always finished with, and the useful next move is to drop the
     # worktree rather than to go looking for a fault.
     if git -C "$wt" config --get "branch.$branch.merge" >/dev/null 2>&1; then
-      if [ "$stranded_state" = some ]; then
-        # "Finished with" is the one conclusion this state must never reach while
-        # the branch still carries commits no remote has — and the deleted upstream
-        # is precisely what made them unreachable from any remote ref. This is the
-        # shape that loses work, and the shape the old question was blind to twice
-        # over: it never ran here, and where it did run it was answering about a
-        # ref that no longer exists.
-        say "  · $name ($branch) — its upstream is gone, but this worktree is not finished with$stranded_note"
-      else
-        say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with"
-      fi
+      # "FINISHED WITH" IS A SAFETY CLAIM AND IT IS ONLY MADE WHEN IT WAS ESTABLISHED.
+      # It must never be reached while the branch still carries commits no remote has
+      # — the deleted upstream is precisely what made them unreachable from any remote
+      # ref, so this is the shape that loses work, and the shape the old question was
+      # blind to twice over. Nor may it be reached when the question was never asked
+      # or could not be answered: Codex's finding, and the direction it fails in is
+      # the one that matters, since a `git log` that failed for this worktree would
+      # otherwise come out as a confident "you can throw this away".
+      case "$stranded_state" in
+        none) say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with" ;;
+        some) say "  · $name ($branch) — its upstream is gone, but this worktree is not finished with$stranded_note" ;;
+        *)    say "  · $name ($branch) — its upstream is gone, so the branch was probably merged and deleted — but whether anything on it exists only on this disk was not established" ;;
+      esac
     else
       say "  · $name ($branch) — no upstream, nothing to catch up to$stranded_note"
     fi
