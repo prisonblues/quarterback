@@ -185,7 +185,8 @@ else
     # in place of a correct answer, on the good path. Whether it fires depends on how
     # much output happened to fit in a buffer, which is not a property to rely on.
     maps_every_head=0
-    spec_why=""
+    exclude_why=""      # disqualifying on its own
+    dest_why=""         # only if nothing else established coverage
     while IFS= read -r spec; do
       spec=${spec#+}          # a leading + is "force", not part of the source ref
       # A NEGATIVE REFSPEC EXCLUDES, and a positive one elsewhere does not undo it:
@@ -193,7 +194,7 @@ else
       # those, and the branches it holds back are exactly the ones this would then
       # call work that exists nowhere else. Codex's finding.
       case "$spec" in ^*)
-        spec_why="\`$rem\` excludes \`${spec#^}\` from what it fetches, so some branches on the server have no ref here"
+        exclude_why="\`$rem\` excludes \`${spec#^}\` from what it fetches, so some branches on the server have no ref here"
         continue ;;
       esac
       # THE DESTINATION AS WELL AS THE SOURCE. `refs/heads/*:refs/cache/*` brings back
@@ -201,12 +202,17 @@ else
       # alone reads as full coverage. Also Codex's.
       [ "${spec%%:*}" = 'refs/heads/*' ] || continue
       case "${spec#*:}" in refs/remotes/*) maps_every_head=1 ;;
-        *) spec_why="\`$rem\` fetches \`refs/heads/*\` into \`${spec#*:}\`, which is not under \`refs/remotes/\` and so is not what this question subtracts" ;;
+        *) dest_why="\`$rem\` fetches \`refs/heads/*\` into \`${spec#*:}\`, which is not under \`refs/remotes/\` and so is not what this question subtracts" ;;
       esac
     done < <(git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null)
-    if [ -n "$spec_why" ]; then
+    # THE TWO ARE NOT THE SAME KIND OF FAULT. An exclusion holds branches back no
+    # matter what else is configured, so it disqualifies on its own. A destination
+    # outside `refs/remotes/` only matters if nothing ELSE brought the heads to where
+    # this question looks — a second refspec that does is coverage, and refusing over
+    # the first one would be a false refusal on a legal configuration.
+    if [ -n "$exclude_why" ] || { [ -n "$dest_why" ] && [ "$maps_every_head" = 0 ]; }; then
       ASK_STRANDED=0
-      ASK_WHY="$spec_why, so what exists only on this disk was not asked"
+      ASK_WHY="${exclude_why:-$dest_why}, so what exists only on this disk was not asked"
       break
     fi
     if [ "$maps_every_head" = 0 ]; then
@@ -225,6 +231,13 @@ else
     while IFS= read -r ns; do
       [ -n "$ns" ] || continue
       case "$NL$REMOTES$NL" in *"$NL$ns$NL"*) continue ;; esac
+      # A remote name may itself contain a slash, in which case the first segment
+      # under `refs/remotes/` is only part of it and the plain match above misses.
+      slashed=0
+      while IFS= read -r rem; do
+        case "$rem" in "$ns"/*) slashed=1; break ;; esac
+      done <<< "$REMOTES"
+      [ "$slashed" = 1 ] && continue
       ASK_STRANDED=0
       ASK_WHY="\`refs/remotes/$ns/\` belongs to no configured remote, so this question trusts refs that nothing here refreshes, and it was not asked"
       break

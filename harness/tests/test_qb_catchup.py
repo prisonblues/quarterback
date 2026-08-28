@@ -737,6 +737,22 @@ def test_a_refspec_that_lands_outside_refs_remotes_refuses_the_question(fleet):
     assert "on no remote ref" not in done.stdout, done.stdout
 
 
+def test_a_second_refspec_that_does_land_in_refs_remotes_is_coverage(fleet):
+    """The two refspec faults are not the same kind of fault. An exclusion holds
+    branches back whatever else is configured; a destination outside `refs/remotes/`
+    only matters if nothing else brought the heads to where the question looks.
+    Refusing over the first of two legal refspecs would be a false refusal."""
+    git(fleet.main, "config", "remote.origin.fetch", "+refs/heads/*:refs/cache/origin/*")
+    git(fleet.main, "config", "--add", "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "not under `refs/remotes/`" not in done.stdout, done.stdout
+    assert "on no remote ref" in done.stdout, done.stdout
+
+
 def test_a_worktree_is_not_called_finished_with_when_the_question_was_refused(fleet):
     """"Finished with" is a safety claim, and a claim that was never established must
     not be made. A `git log` that failed for one worktree, or a run in which the
