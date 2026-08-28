@@ -59,14 +59,23 @@ from collections.abc import Iterable   # noqa: E402
 #: The `review_panel.escalate_on` rungs a constructive pass follows, in the order
 #: `round_stop` applies them.
 #:
-#: **All four built rungs, not the three the issue names, and the argument for the
-#: fourth is the argument for the other three.** #507 lists `fix_injection`,
+#: **Every built rung, not the three the issue names, and the argument for each one
+#: past those three is the argument for those three.** #507 lists `fix_injection`,
 #: `premise_repeated` and #505's `new_findings_not_falling`; `premise_undecidable`
 #: (#491) is the same kind of event — an `escalate_on` rung, ending the cycle, not
 #: as convergence, with a human at the veto line — and it is the rung where the
 #: fixer has most obviously been guessing, since every fix for an unobservable
 #: property is an approximation of it. A rule that covered "some escalations" would
 #: also be one a reader has to memorise the membership of.
+#:
+#: #554's `unrefereed_fix` joins on that rule and has a claim of its own on top of
+#: it. It fires precisely when the last fix pass wrote nothing anything could check —
+#: all test and prose, no production line — which is the strongest evidence this
+#: harness has that the fixer never found the change the findings were asking for.
+#: Asking each seat what its smallest satisfying change would be is the one question
+#: that answers it, and it is asked of the reviewers rather than of the fixer, which
+#: is #297's discipline: the actor whose judgement is in question is not the one
+#: polled about it.
 #:
 #: **What is NOT here, and why.** The round CAP is not an escalation: it is a cost
 #: bound, it ends healthy cycles and diverging ones in the same place, and a
@@ -78,8 +87,8 @@ from collections.abc import Iterable   # noqa: E402
 #: asking again would buy a second copy. The growth ceiling (#165's
 #: `max_fix_growth`) is a stop about the SIZE of the change and not about the
 #: findings, and a seat's smallest change is not an answer to it.
-PROPOSE_ESCALATIONS = ("new_findings_not_falling", "fix_injection",
-                       "premise_repeated", "premise_undecidable")
+PROPOSE_ESCALATIONS = ("new_findings_not_falling", "unrefereed_fix",
+                       "fix_injection", "premise_repeated", "premise_undecidable")
 
 
 def escalations_fired(stop: dict | None) -> list[str]:
@@ -114,6 +123,13 @@ def escalations_fired(stop: dict | None) -> list[str]:
     fired = []
     if (stop.get("new_findings_not_falling") or {}).get("fired"):
         fired.append("new_findings_not_falling")
+    # #554, read on `fired` for the two measured rungs' reason: `over` is a property
+    # of the MEASUREMENT and is true of rounds this rule deliberately does not touch.
+    # Its `armed` flag needs no separate check here — unlike `premise_undecidable`'s,
+    # it is already a conjunct of `over`, so a repo that switched the rung off can
+    # never reach `fired` and is never billed for the fan-out.
+    if (stop.get("unrefereed_fix") or {}).get("fired"):
+        fired.append("unrefereed_fix")
     if (stop.get("fix_injection") or {}).get("fired"):
         fired.append("fix_injection")
     premises = stop.get("premises") or {}

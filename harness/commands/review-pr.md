@@ -64,7 +64,7 @@ standard is not "good enough" — it's "nothing left to improve".
 
 **What that scope IS is a repo setting, not your judgement.** The orchestrator
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
-report prints them on its **Panel dials** line). Four of them define this pass:
+report prints them on its **Panel dials** line). Five of them define this pass:
 
 - **`fix_severity_floor`** (default `P3`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
@@ -75,6 +75,11 @@ report prints them on its **Panel dials** line). Four of them define this pass:
   band). A panel report marks those 💸. Step 3 has how to spend it; what matters here
   is that it is a budget for the round and not a cap per fix, because the failure it
   answers was 408 lines of individually reasonable small fixes on a 185-line PR.
+- **`unrefereed_line_weight`** (default `2`) — what ONE churned line of test or prose
+  costs that budget, against a line of production code at 1. The budget's unit is
+  exposure, not length. Step 3 has the arithmetic; what matters here is that it is
+  not a judgement you make about the work — it is a property of the file and the line
+  you are writing to, and you multiply rather than forecast.
 - **`reviewer_scope`** (default `diff`) — whether the change under review is the
   target or the starting point. Under `diff`, findings are about the change and the
   seams where it meets what was already there.
@@ -225,13 +230,56 @@ Spend it like this, and do not improvise around it:
    diff --numstat` for it, write down insertions + deletions, and put it back
    (`qb-stash push` it, or `git restore` the file — and mind the warning just below
    about discarding your own uncommitted work). You now have a counted cost for each one.
-3. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
-   order of that cost, subtracting each from the budget as you go. Stop at the first
-   one that does not fit — in ascending order, nothing after it fits either. If the
-   whole list fits, the whole list gets fixed and the budget never binds.
-4. Everything the budget did not reach goes into step 6 exactly as a below-floor
+3. **Price the lines by where they land, not just by how many there are.** Split each
+   fix's churn into two piles and apply `unrefereed_line_weight` (2 by default) to the
+   second:
+
+       cost = production_lines + weight x unrefereed_lines
+
+   - **production** — a line in a source file that is not a comment or blank.
+   - **unrefereed** — every line in a test file, every line in a documentation file
+     (`.md`, `.rst`, `docs/`, `changelog.d/`), and **every comment or docstring line
+     anywhere**, source files included.
+
+   **Read the split off `git diff` (the body), not off `git diff --numstat`.**
+   `--numstat` gives you the per-file insertion and deletion totals from step 2 and
+   nothing else — it cannot see a comment, a blank line or a docstring, so it can tell
+   you a file's churn but not which pile the lines belong in. The paths come from
+   numstat; the lines come from the diff you are already looking at. `git diff
+   --numstat` for the total, then the diff body for the two piles, and they must add
+   up.
+
+   The rule is that **a production fix has an external referee and a test fix has
+   none, because nothing tests a test.** Red/green either detects the bug or it does
+   not; the suite and CI are behind that. Nothing checks whether a new test also opens
+   a socket, whether its assertion is sufficient, or whether it is as strong as the
+   test beside it — and a docstring has no referee at all. Measured on lexray#1697: a
+   93-line pass that changed no production logic introduced ten findings, nine in the
+   test files it wrote and the tenth in the docstring it corrected.
+
+   **This is arithmetic about paths and lines, not a judgement about worth.** You are
+   never asked whether a fix is important, whether a test is a good one, or whether
+   the work risks ballooning. You classify each line by the file it is in and whether
+   it is a comment, and you multiply. At `unrefereed_line_weight: 1` every line costs
+   1 and this step is the plain count.
+4. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
+   order of that WEIGHTED cost, subtracting each from the budget as you go. Stop at
+   the first one that does not fit — in ascending order, nothing after it fits either.
+   If the whole list fits, the whole list gets fixed and the budget never binds.
+5. Everything the budget did not reach goes into step 6 exactly as a below-floor
    finding does: reported, recorded `deferred` against the issue you open for the
    batch, and **not** fixed. It is not dropped and it is not yours to sneak in.
+
+**A pass that is ALL test and prose ends the cycle, so make the production change
+where there is one to make.** `escalate_on.unrefereed_fix` stops a cycle whose last
+fix pass churned four or more lines and not one of them was production code — no
+threshold, no proportion, just the absence of anything a referee could check. It is
+not asking you to skip tests: a fix that changes behaviour and adds the regression
+test for it has production lines in it and cannot trip this. What it catches is the
+round that answers every complaint by writing more test, which is what the measured
+pass did. If the honest answer to a finding really is "the test was wrong and nothing
+else", write it — the stop is a signal to a human, not a penalty, and the veto line
+says exactly what happened.
 
 **Count, never estimate, and never ask yourself whether a fix "risks ballooning".**
 That question is a judgement, and it is the judgement the measurement indicts:

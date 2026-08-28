@@ -3350,6 +3350,126 @@ def injection_state(counts: dict | None, limit: float | None) -> dict:
             "min_new": FIX_INJECTION_MIN_NEW, "over": over}
 
 
+def unrefereed_fix_brake(panel: dict, notes: list[str]) -> bool:
+    """`review_panel.escalate_on.unrefereed_fix` (#554) — does a fix pass that wrote
+    nothing anything can check end the cycle?
+
+    Read per KEY through the same fallback :func:`premise_repeat_limit` uses and for
+    the identical reason: `review_panel` merges one level deep, so a repo writing
+    `escalate_on` at all replaces the default object wholesale, and without the
+    per-key fallback `{"premise_repeated": 2}` would silently switch THIS brake off.
+
+    **A flag, on :func:`premise_undecidable_brake`'s precedent and for its reason.**
+    That one is not counting either: it reads a fixer's answer to a question with a
+    fact for an answer. This reads a fact about the pass itself — whether a single
+    line of it landed where red/green, the suite or CI could catch it being wrong —
+    and "none did" is already the whole finding. A count over it would mean "write
+    unrefereed passes N times first", which is the behaviour the rule refuses.
+
+    **And a flag rather than a FRACTION, which is what makes it shippable as a gate
+    on one cycle's evidence.** #67's rule is that an instrument earns a threshold over
+    a few dozen cycles or not at all — the reason `panel_seats.guard_ratio` ships
+    report-only. There is no threshold here to earn: the rule is a predicate, and a
+    predicate has nothing to calibrate. A fraction would need a number nobody has
+    measured AND would be wrong on the commonest healthy shape there is, a small
+    production fix carrying a large regression test.
+
+    **The exact scope of that claim, which a Codex second opinion was right to press
+    on.** "Zero production lines" is not ground truth; it is what
+    :func:`panel_seats.referee_split` returned, and that reader is a set of
+    heuristics — a comment-marker table, a docstring fence tracker, a path
+    classifier. So the argument is not "the predicate cannot be wrong". It is that
+    **every way it can be wrong leans the same way**: toward counting a line as
+    production, which makes the pass look refereed and the brake decline to fire.
+    That property is what a threshold-free rule buys, and it is the whole of the case
+    for gating here — it is asserted by `referee_split`'s own docstring, tested
+    directly, and two violations of it (a bare `*` marker eating a pointer store, a
+    fence tracker ending a docstring a line early) were real and are fixed. A third
+    would be a bug of the same class and should be treated as one, not as a reason to
+    add a number.
+
+    (:data:`panel_seats.UNREFEREED_MIN_CHURN` is not that number. It is a minimum
+    SAMPLE — the same structural role :data:`FIX_INJECTION_MIN_NEW` plays for a rule
+    whose threshold is 0.5 — and it can only make this rung fire less often. A floor
+    under a predicate is not a threshold on it.)
+
+    ``false`` is a second spelling of ``null`` and is honoured as one, exactly as its
+    two siblings honour it. ``true`` is the only other value; anything else is a hard
+    exit through :func:`panel_seats._refuse_value`, on the line every dial in this
+    file draws between an unknown key and a malformed value of a known one."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — all four
+        # readers run off one config, and `run()` calls that one first — but this
+        # function is public and is called directly by tests, so it does not rely on
+        # a sibling having been called before it.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return False                                  # unreachable
+    want = rules.get("unrefereed_fix", ESCALATE_ON_DEFAULTS.get("unrefereed_fix"))
+    if want is None or want is False or want == "":
+        return False
+    if want is True:
+        return True
+    _refuse_value("escalate_on.unrefereed_fix", want,
+                  "true to end a cycle whose fix pass wrote nothing any mechanism "
+                  "can check, or false/null to leave the brake off. There is no "
+                  "number here: the rule is a predicate on the pass, not a threshold")
+    return False                                      # unreachable
+
+
+def referee_state(split: dict | None, armed: bool) -> dict:
+    """#554's measurement as this round read it, for `round_stop` and the payload.
+
+    ``split`` is :func:`panel_seats.referee_split` over the fix range and nothing
+    else — the churn of the pass that landed between the last round and this one,
+    classified into `production`/`test`/`prose`. ``None`` (or an empty mapping) on a
+    round with no pass to read, which is round 1 or a cycle whose fix range could not
+    be got at all. That is a CONTRACT and not a defended boundary, on
+    :func:`injection_state`'s terms and for its reason: every wrong shape here is
+    either loud at once or arrives from the file next door, and validation that can
+    only fire on a bug in a sibling buys a second place for the schema to disagree
+    with the first.
+
+    ``armed`` is :func:`unrefereed_fix_brake`'s answer. It is carried into the state
+    rather than consulted in `round_stop` because the payload has to record what the
+    cycle MEASURED whether or not the repo asked for it to be acted on — the same
+    split `premise_state` keeps between its `undecidable` list and its
+    `undecidable_brake` flag, and for the same reason: a repo that switched the brake
+    off must still be able to see that a fix pass wrote nothing checkable.
+
+    ``over`` is the RULE, and it is decided here rather than in `round_stop` on
+    :func:`injection_state`'s precedent: what the stop rule receives is a verdict
+    about a measurement it has no other way to make. Three conjuncts, and each is
+    load-bearing:
+
+    * **``armed``** — the repo did not switch it off;
+    * **``churn >= UNREFEREED_MIN_CHURN``** — the pass is big enough for "none of it
+      was refereed" to be a statement about the pass rather than about one line;
+    * **``production == 0``** — and this is the predicate itself. Not a share over a
+      threshold: a 5-line production fix carrying a 40-line regression test is 89%
+      unrefereed and is exactly the work the panel wants, so the claim has to be the
+      ABSENCE of a refereed component, which is what #554 measured.
+
+    Every field is present on every round, `premise_state`'s and `injection_state`'s
+    rule and for their reason. ``share`` is `None` where there was no churn to divide,
+    because zero is a claim about a fix pass and this is the absence of one."""
+    split = split or {}
+    counts = {k: int(split.get(k) or 0) for k in panel_seats.REFEREE_KINDS}
+    churn = sum(counts.values())
+    unrefereed = counts["test"] + counts["prose"]
+    over = bool(armed and churn >= panel_seats.UNREFEREED_MIN_CHURN
+                and counts["production"] == 0)
+    return {"armed": bool(armed), **counts, "churn": churn,
+            "unrefereed": unrefereed,
+            "share": round(unrefereed / churn, 4) if churn else None,
+            "min_churn": panel_seats.UNREFEREED_MIN_CHURN, "over": over}
+
+
 # --------------------------------------------------------------------- #506: and the
 # fix pass that did it is STILL ON THE BRANCH.
 #
@@ -3917,7 +4037,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                premises: dict | None = None,
                injection: dict | None = None,
                revert: dict | None = None,
-               not_falling: dict | None = None) -> dict:
+               not_falling: dict | None = None,
+               unrefereed: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -4231,6 +4352,75 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     :func:`injection_state`): they depress the rate, so a round the harness could
     not place is a round that does not end the cycle.
 
+    ``unrefereed`` is #554, and it is the FIFTH futility bound here. The other four
+    ask how much a cycle has cost (the cap), whether one assumption is being patched
+    twice (``premises``), whether the fix pass authored this round's findings
+    (``injection``) and whether the new-finding count is still falling
+    (``not_falling``). This one asks something none of them do: **whether anything
+    can check what the last fix pass wrote.**
+
+    The measurement is lexray#1697 round 1, since reverted. A 93-line fix pass across
+    three files changed NO production logic at all — the production file's entire
+    share of it was a docstring and a comment — and introduced ten findings, nine of
+    them in the test files it wrote and the tenth in the docstring it corrected.
+    Red/green ran and went red 4 of 4 and could not have caught any of them, because
+    it asks whether a test detects the thing it was written for and never whether the
+    test also opens a socket, whether its assertion is sufficient, or whether it is as
+    strong as the test beside it.
+
+    That is structural rather than unlucky: **a production fix has an external referee
+    and a test fix has none, because nothing tests a test.** A docstring fix has none
+    either. Every other dial the panel owns measures COST — lines, chars, multiples,
+    rounds — and ``injection`` measures the real quantity but only retrospectively,
+    one round late. Nothing priced work by whether anything could catch it being
+    wrong.
+
+    :func:`referee_state` is the measurement and it arrives already decided, on
+    ``premises``', ``injection``'s and ``not_falling``'s precedent.
+
+    **It is a PREDICATE and not a threshold, which is why it may gate at all.** #67's
+    rule is that an instrument earns a threshold over a few dozen cycles or not at
+    all, and it is why :func:`panel_seats.guard_ratio` ships report-only beside this
+    one. There is no threshold here to earn: the rule fires when the pass contains
+    zero refereed lines, which is a fact rather than a number somebody guessed. A
+    fraction would need the number AND would be wrong on the commonest healthy shape
+    there is — a 5-line production fix carrying a 40-line regression test is 89%
+    unrefereed and is exactly the work the panel wants.
+
+    **It takes the same two bounds as ``injection`` and ``not_falling``, and for the
+    same reasons.** It may only turn a ``go again`` into a STOP, checked on that
+    condition rather than merely obeying it; and it may only take away the round RULE
+    1 was buying, so it cannot cancel the repair round for a P1 an earlier round
+    raised. It reads the same ``going_again`` state they do, so a round over all three
+    records all three rather than whichever was applied first.
+
+    **What it buys over ``injection``**, since the two accuse the same pass: that rung
+    needs four new findings AND a rate over the threshold AND a readable range, so a
+    pass that wrote only tests and drew three findings sails past it. This one needs
+    the range and :data:`panel_seats.UNREFEREED_MIN_CHURN` churned lines, and it fires
+    on the SHAPE of the pass rather than on its consequences — which is why #554 calls
+    it the ex-ante half of #489. It does share #500's blindness with that rung, and
+    the sharing is worth saying because a reader could reasonably assume otherwise:
+    both read the fix range, so a rewrite between rounds that #504 cannot rebuild
+    disarms both — the caller passes whatever `fix_diff` it ended up with, so the
+    reconstruction is inherited here for free and so is its failure. ``not_falling``
+    remains the only rung computed from the rounds' own counts and therefore the only
+    one a rewrite cannot touch at all.
+
+    **``injection`` owns the ``reason`` when both fire**, on ``circling``'s ordering
+    rule: the more specific truth wins. A rate that names the fix pass as the AUTHOR
+    of this round's findings says more than a fact about the pass's shape, and both
+    veto lines are on the record either way.
+
+    **The honest case against it, recorded rather than argued away.** A round whose
+    only finding is "this branch has no test" gets a fix pass that is legitimately all
+    test, and this ends the cycle on it. Three things make that acceptable and none of
+    them is that it will not happen: the round it removes is a round that would have
+    reviewed those tests, which is the measured failure rather than a hypothetical;
+    the rule can only stop a cycle, so the worst case is one fewer round with a veto
+    line saying exactly why, never a merge and never a review that reads cleaner than
+    it is; and ``escalate_on.unrefereed_fix: false`` switches it off in one line.
+
     ``revert`` is #506, and it is the only argument to this function that DECIDES
     NOTHING. Every other one can move ``stop``; this one cannot, in either direction.
     It exists because ending the cycle on ``injection`` is half an answer — **the fix
@@ -4518,6 +4708,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"`escalate_on.new_findings_not_falling` limit of {flattening['limit']} — "
             "the count is not coming down, and a human triages what is left rather "
             "than another fix pass")
+    # #554, applied BETWEEN #505's rung and #489's so that the ordering matches what
+    # each one knows. `flat` says only that the work is not shrinking; this says what
+    # KIND of work the last pass did; `injected` names that pass as the author of this
+    # round's findings. The more specific truth wins the `reason` and every rung that
+    # fired keeps its veto line, which is `circling`'s ordering rule applied twice.
+    #
+    # `going_again` carries both of this rule's bounds, the same two the rungs either
+    # side of it take: `not stop` is the guarantee that it can only make a `go again`
+    # into a STOP, and the rest of it keeps the rule inside its own justification —
+    # the argument is about rule 1's input, so it may not cancel the repair round for
+    # a P1 an earlier round raised and this fix pass did not clear.
+    refereeing = (referee_state(None, False) if unrefereed is None else unrefereed)
+    unchecked = bool(refereeing["over"] and going_again)
+    if unchecked:
+        stop, reason = True, (
+            f"the fix pass before this round churned {refereeing['churn']} line(s) "
+            f"and not one of them was production code ({refereeing['test']} test, "
+            f"{refereeing['prose']} prose) — nothing in the loop can check what it "
+            "wrote, so another round would review artefacts no mechanism refereed: "
+            "a human answers this, not another fix pass")
     if injected:
         stop, reason = True, (
             f"{injecting['introduced']} of {injecting['new']} new finding(s) "
@@ -4593,6 +4803,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "and not from provenance, so unlike `fix_injection` a rebase "
                        "between rounds cannot have disarmed it (#500): this stop is "
                        "that count, not convergence (#505)"]
+    # #554, and BEFORE #489's line for the reason its stop is applied first: a reader
+    # coming down the veto list meets what the pass WAS, then the attribution saying
+    # what it cost. Unconditional for `injected`'s reason — `unchecked` is only ever
+    # true on a round this rule itself stopped, so there is no `go again` round it can
+    # fire on.
+    #
+    # It names red/green explicitly, because that is the mechanism a reader will
+    # otherwise assume covered this. It ran on the pass #554 measured and went red 4
+    # of 4; what it asks is whether a test detects the thing it was written for, never
+    # whether the test is sound in any other way.
+    if unchecked:
+        veto = [*veto, f"the fix pass before this round churned "
+                       f"{refereeing['churn']} line(s) — {refereeing['test']} test, "
+                       f"{refereeing['prose']} prose, and NO production code. Nothing "
+                       "in the loop can check any of it: a production fix has an "
+                       "external referee in red/green, the suite and CI, and a test "
+                       "fix has none because nothing tests a test. Red/green passing "
+                       "on such a pass says only that each new test detects the thing "
+                       "it was written for — not that it is sound. This stop is that "
+                       "fact, not convergence (#554)"]
     # #489. Unconditional for `circling`'s reason and one of its own: `injected` is
     # only ever true on a round this rule itself stopped, so there is no `go again`
     # round it can fire on. Said in full — both counts, the rate, the dial and the
@@ -4797,6 +5027,21 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # property of the VERDICT. A consumer that read the first as the second would
         # attach "the cycle ended without converging" to a confident, converged round.
         "new_findings_not_falling": {**flattening, "fired": flat},
+        # #554's measurement, ALWAYS present for the reason its three siblings are: a
+        # payload with no key and a round with no fix pass to read are different
+        # claims, and a consumer forced to tell them apart would be reading the
+        # payload's age rather than the cycle's state. `armed` says whether the repo
+        # asked for this to be acted on, kept apart from the counts for the reason
+        # `premises` keeps `undecidable_brake` apart from `undecidable`: a repo that
+        # switched the brake off still gets to see that a fix pass wrote nothing
+        # checkable.
+        #
+        # `over` AND `fired` kept apart on exactly `fix_injection`'s terms. `over` is a
+        # property of the MEASUREMENT and is true of plenty of rounds this rule
+        # deliberately does not touch — a below-floor policy stop, a round holding an
+        # escalation, a round going again for a P1 under rule 2. `fired` is the
+        # property of the VERDICT.
+        "unrefereed_fix": {**refereeing, "fired": unchecked},
     }
 
 
@@ -4827,6 +5072,7 @@ __all__ = [
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
+    "unrefereed_fix_brake", "referee_state",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

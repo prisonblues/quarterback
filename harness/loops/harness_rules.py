@@ -791,6 +791,53 @@ DEFAULTS: dict = {
         # fix floor is unconditional work; `0` fixes none of the band, which is
         # `fix_severity_floor` raised to the cut without saying so twice.
         "low_severity_fix_lines": 40,
+        # What one UNREFEREED churned line costs that budget, against a production
+        # line's 1 (#554). The budget above prices work by LENGTH; this makes its
+        # unit exposure instead.
+        #
+        # **The measurement**, on lexray#1697 round 1, since reverted: a 93-line fix
+        # pass across three files that changed NO production logic at all — the
+        # production file's entire share of it was a docstring and a comment —
+        # introduced ten findings, nine of them in the test files and the tenth in
+        # that docstring. The 40-line budget worked exactly as specified: 31 of 40
+        # lines, cheapest-first, one 17-line fix measured against 9 remaining and
+        # dropped. And it priced a 10-line comment correction as equal risk to an
+        # 11-line new assertion, because lines are all it could see. Four of the five
+        # budgeted fixes were "write more test".
+        #
+        # **Why the two are not equal risk.** A production fix has an external
+        # referee — red/green either detects the bug or it does not, and the suite and
+        # CI are behind that. A test fix has none, because nothing tests a test; a
+        # docstring fix has none either. So the same line of churn buys a different
+        # amount of exposure depending on where it lands, and a budget blind to that
+        # spends most of itself in the one place no mechanism can check.
+        #
+        # **Not value-weighting**, which #297 refuses deliberately: that would hand
+        # judgement back to the actor whose judgement the 63.7% measurement indicts.
+        # Being refereed is a property of the path and the line, read off the fix's
+        # OWN DIFF — the one the fixer already produces to measure the fix at all — and
+        # never an opinion about whether the work is worth doing. The fixer is asked
+        # for a multiplication, not a forecast: the same discipline as the count.
+        #
+        # Not `git diff --numstat`, which is what this said until a Codex second
+        # opinion pointed out that numstat reports per-file insertion and deletion
+        # TOTALS and can see neither a comment nor a blank nor a docstring. #554's own
+        # "classifying each PATH is free at that point" is true of numstat; extending
+        # it to LINES was not, and the line half is what makes the measurement mean
+        # what it says.
+        #
+        # **2 is the one number here that is a judgement rather than a fact.** For it:
+        # an unrefereed line has no referee, not a weaker one, so the budget must buy
+        # strictly fewer of them, and 2 is the smallest weight that says so. Against a
+        # larger number: this bounds a round's spend and is not a tax meant to stop
+        # fixers writing tests — at 40 lines a weight of 2 still affords a 20-line
+        # regression test inside the band, and the band is only the P3 tier, since a
+        # P1/P2 fix and its test are not on the budget at all.
+        #
+        # `1` prices every line alike, which is the pre-#554 behaviour and is the way
+        # to switch this off; there is no `null` spelling for the same thing, because
+        # one written value with two meanings is worse than one.
+        "unrefereed_line_weight": 2,
         # A fix pass that MULTIPLIES the diff has written a second change, not a
         # fix. If what a round reviews has grown by more than this multiple of what
         # the FIRST round of the cycle reviewed, the cycle stops and says the change
@@ -1122,8 +1169,71 @@ DEFAULTS: dict = {
         # the noise floor and is a constant rather than a dial, for the reason
         # `FIX_INJECTION_MIN_NEW` is: 1 -> 2 is arithmetic, not divergence, and a
         # second number nobody can calibrate is worse than one documented floor.
+        # #554's rung, and the FIFTH thing that can end a cycle. It asks a question
+        # none of the four above ask: not how many findings the last fix pass
+        # produced, nor how big it was, but whether ANYTHING CAN CHECK WHAT IT WROTE.
+        # It fires when a fix pass's entire churn was test and prose — no production
+        # line at all — over at least `panel_seats.UNREFEREED_MIN_CHURN` lines.
+        #
+        # **The measurement is the one on `unrefereed_line_weight` above**, read for
+        # its other half: nine of the ten findings that pass introduced were in the
+        # test files it wrote and the tenth was in the docstring it corrected. Red/
+        # green ran and went red 4 of 4, and could not have caught any of them — it
+        # asks whether a test detects the thing it was written for, never whether that
+        # test also opens a socket, whether its assertion is sufficient, or whether it
+        # is as strong as the test beside it. A clean demonstration of red/green's
+        # blind spot: necessary, nowhere near sufficient.
+        #
+        # **A FLAG and not a fraction, which is the whole reason this is shippable as
+        # a gate on one cycle's evidence.** #67's rule is that an instrument earns a
+        # threshold over a few dozen cycles or not at all, and it is why `guard_ratio`
+        # ships report-only: nobody has measured what test-to-source ratio is too
+        # much, so any number would be a ceiling with its argument written afterwards.
+        # THERE IS NO SUCH NUMBER HERE. The rule is a predicate — the pass contains
+        # zero refereed lines — and a predicate has nothing to calibrate. A fraction,
+        # by contrast, would need one and would be wrong: a 5-line production fix
+        # carrying a 40-line regression test is 89% unrefereed and is exactly the work
+        # the panel wants. The ABSENCE of a refereed component is a different claim
+        # from a high proportion of unrefereed ones.
+        #
+        # **What the predicate rests on, said plainly because a Codex second opinion
+        # was right to press on it.** "Zero production lines" is not ground truth; it
+        # is what `panel_seats.referee_split` returned, and that reader is heuristics
+        # — a marker table, a fence tracker, a path classifier. The case for gating is
+        # therefore not that it cannot be wrong, but that EVERY WAY IT CAN BE WRONG
+        # LEANS THE SAME WAY: toward counting a line as production, so the brake
+        # declines to fire on a pass it misread. Two violations of that property were
+        # found on review and fixed; a third is a bug of the same class, and the
+        # answer to it is to fix the reader rather than to put a number in front of
+        # it.
+        #
+        # **On by default, and the honest case against it.** The false positive is
+        # real and worth naming: a round whose only finding is "this branch has no
+        # test" gets a fix pass that is legitimately all test, and this ends the cycle
+        # on it. Three things make that acceptable. The round it removes is a round
+        # that would have reviewed those tests — which is the measured failure, not a
+        # hypothetical. It can only ever turn a `go again` into a STOP, so the worst
+        # case is one fewer round with a veto line saying exactly why, never a merge
+        # and never a review that looks cleaner than it is. And `false` switches it
+        # off in one line.
+        #
+        # **What it buys over `fix_injection`**, which is not "the same thing
+        # earlier": that rung needs four new findings AND a rate over the threshold
+        # AND a readable range, so a pass that wrote only tests and drew three
+        # findings sails past it. This one needs only the range and four churned
+        # lines, and it fires on the SHAPE OF THE PASS rather than on its
+        # consequences — which is why #554 calls it the ex-ante half of #489. It
+        # shares #500's blindness with it, though: both read the fix range, so a
+        # rewrite between rounds that #504 cannot rebuild disarms both.
+        # `new_findings_not_falling` is still the only rung computed from the rounds'
+        # own counts, and therefore the only one a rewrite cannot touch at all.
+        #
+        # `false` (or `null`) switches it off, exactly as `premise_undecidable`'s flag
+        # does. `true` is the only other value: there is no number this could take,
+        # and inventing one would be putting back the guess the predicate removes.
         "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
-                         "fix_injection": 0.5, "new_findings_not_falling": 1},
+                         "fix_injection": 0.5, "new_findings_not_falling": 1,
+                         "unrefereed_fix": True},
         # #507, and it is NOT a fifth rung — which is why it is here and not inside
         # the block above. Every key in `escalate_on` answers one question: does this
         # end the cycle? This one ends nothing, extends nothing and cannot move a
@@ -2310,7 +2420,8 @@ class Dial(NamedTuple):
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
     for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
     `escalate_on.premise_repeated`, `escalate_on.fix_injection`,
-    `escalate_on.new_findings_not_falling` and
+    `escalate_on.new_findings_not_falling`, `escalate_on.premise_undecidable`,
+    `escalate_on.unrefereed_fix` and
     `max_diff_chars`, and means "inherit the default" for everything else — so a
     dial that took `null` generally would have one written value with two
     meanings.
@@ -2429,6 +2540,13 @@ BOARD_DIALS: dict[str, Dial] = {
     # #297's budget for the band between them, and #298's growth ceiling.
     "review_panel.low_severity_fix_lines": Dial("number", False, "either",
         'churned lines a round may spend on findings over the fix floor and under the round floor'),
+    # #554's unit for that budget. NOT nullable, and it is the one dial here where
+    # that is a statement rather than an omission: `1` already means "price every line
+    # alike", so a `null` spelling for the same thing would be one written value with
+    # two meanings — the collapse `low_severity_fix_lines` avoids by keeping `0` and
+    # `null` distinct.
+    "review_panel.unrefereed_line_weight": Dial("number", False, "either",
+        'what a churned line of test or prose costs that budget, against production code at 1'),
     "review_panel.max_fix_growth": Dial("number", True, "either",
         'how many times its round-1 size the change may grow before the cycle stops'),
     # #492's absolute half of that ceiling. Settable on its own and nullable on its
@@ -2467,6 +2585,13 @@ BOARD_DIALS: dict[str, Dial] = {
     # channel carrying half a policy.
     "review_panel.escalate_on.new_findings_not_falling": Dial("number", True, "either",
         'consecutive rounds whose new-finding count may fail to fall before escalating'),
+    # #554's fifth rung, a `flag` on `premise_undecidable`'s precedent and for its
+    # reason: it is not counting anything. It reads whether a fix pass wrote a single
+    # line anything can check, and "none" is already the whole finding — a number over
+    # it would mean "produce unrefereed passes N times first", which is the behaviour
+    # the rule exists to refuse.
+    "review_panel.escalate_on.unrefereed_fix": Dial("flag", True, "either",
+        'escalate when a fix pass wrote nothing but test and prose — nothing can check it'),
     # #507's constructive pass. `either`, because it is the one dial here whose two
     # directions cost different things and neither is a merge policy: switching it ON
     # spends a fan-out on cycles that escalate, switching it OFF sends a human to a

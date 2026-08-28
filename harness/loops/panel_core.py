@@ -227,6 +227,41 @@ DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
 #: measurement.
 DEFAULT_LOW_SEVERITY_FIX_LINES = 40
+#: How much of the low-severity budget one UNREFEREED churned line costs, against a
+#: production line's 1 (#554). The budget's unit becomes exposure rather than length:
+#: a line written where nothing can check it spends more of the round than a line
+#: written where red/green, the suite and CI all can.
+#:
+#: **This is not value-weighting**, which #297 refuses deliberately because it hands
+#: judgement back to the actor whose judgement the 63.7% measurement indicts. Being
+#: refereed is a property of the PATH AND THE LINE, read off the fix's own diff — the
+#: one the fixer already produces to measure the fix at all — and never an opinion
+#: about whether the work is worth doing. The fixer is asked for a multiplication, not
+#: a forecast.
+#:
+#: **Not `git diff --numstat`**, which is what this said until a Codex second opinion
+#: pointed out that numstat reports per-file insertion and deletion TOTALS and cannot
+#: see a comment, a blank or a docstring. #554's own wording — "classifying each PATH
+#: is free at that point" — is true of numstat and was extended here to lines, where
+#: it is not. The line half needs the diff body, which costs nothing extra because the
+#: fixer is already looking at it.
+#:
+#: **2 is the one number in #554 that is a judgement rather than a fact**, and it is
+#: written down here so it can be argued with rather than discovered. For it: an
+#: unrefereed line has NO referee, not a weaker one, so the budget must buy strictly
+#: fewer of them, and 2 is the smallest weight that says so. Against a larger number:
+#: the budget bounds a round's spend and is not a tax meant to stop fixers writing
+#: tests — at 40 lines a weight of 2 still affords a 20-line regression test inside
+#: the band. `1` prices every line alike, which is the pre-#554 behaviour.
+#:
+#: **The band it applies to is narrow, and that is what makes the weight safe.**
+#: `low_severity_fix_lines` pays only for findings the fix floor admits and the round
+#: trigger floor does not — the P3 band at the shipped floors. A P1/P2 fix and its
+#: test are not on the budget at all and nothing here can price them. What this
+#: reprices is exactly the population #554 measured: four of the five budgeted fixes
+#: on that round were "write more test", the category with no referee and the highest
+#: injection rate. `harness_rules` carries the measurement.
+DEFAULT_UNREFEREED_LINE_WEIGHT = 2
 #: The floor value that means "no floor" — the least severe severity there is, so
 #: everything is at or above it. Both floors default to this INSIDE `round_stop`,
 #: which is what keeps every caller that has not heard of them on the old
@@ -2500,6 +2535,7 @@ __all__ = [
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",

@@ -36,6 +36,11 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 from harness_rules import (            # noqa: F401  — re-exported, see __all__
     AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, GROK_EFFORTS, PI_EFFORTS)
 
+# Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
+# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
+# above re-exports the name, and the last import wins.
+from collections.abc import Iterator   # noqa: E402
+
 # How long a seat may ALREADY have spent and still be allowed to lower an
 # unsatisfiable pin and go again (#215). A count of attempts is not a bound on
 # cost: every lowering is another whole CLI_TIMEOUT, serially, held against the
@@ -1535,6 +1540,61 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
+    """`unrefereed_line_weight` — a whole number >= 1, what one unrefereed churned
+    line costs the low-severity budget against a production line's 1 (#554).
+
+    NOT nullable, and the asymmetry with :func:`low_severity_budget` beside it is
+    deliberate. There, `null` had a meaning nothing else could spell — no budget at
+    all, as against a budget of zero. Here `1` already IS "off": it prices every line
+    alike, which is the pre-#554 behaviour, so a second spelling for it would be one
+    written value with two meanings and nothing gained. An explicit `null` therefore
+    inherits the default like any other absent value, which is what `null` means
+    everywhere in this block except the four keys documented as switches.
+
+    Below 1 is refused rather than clamped. A weight under 1 would make an unrefereed
+    line CHEAPER than a production one, which is not a looser version of this policy
+    but its inverse — a repo that wrote 0.5 meant something, and nothing here can tell
+    which of two opposite things it was. Zero is refused with it: an unrefereed line
+    that costs nothing is an unbounded budget for the one category the budget exists
+    to bound.
+
+    A bool is rejected before the integer read for :func:`low_severity_budget`'s
+    reason — ``isinstance(True, int)`` is True, so `unrefereed_line_weight: false`,
+    which is how a hand writes "off", would otherwise become a weight of 1 and be
+    right by accident and wrong in general. An integral float counts and a fractional
+    one does not: the weight multiplies a line count that the fixer holds as a running
+    total, and half a line is not a quantity `git diff --numstat` can report."""
+    raw = panel.get("unrefereed_line_weight", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        return DEFAULT_UNREFEREED_LINE_WEIGHT
+
+    def refuse(what: str) -> int:
+        _refuse_value("unrefereed_line_weight", raw,
+                      f"{what} — what one churned line of test or prose costs the "
+                      "low-severity budget against a production line's 1, or 1 to "
+                      "price every line alike")
+        return DEFAULT_UNREFEREED_LINE_WEIGHT     # unreachable; `_refuse_value` raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n < 1:
+        return refuse("1 or more")
+    return n
+
+
 def distant_merge_lines(panel: dict, notes: list[str]) -> int | None:
     """`distant_merge_lines` — whole lines >= 0, or ``None`` for "never distant".
 
@@ -1802,7 +1862,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The ten #165/#297/#492/#482 settings as this round applied them.
+    """The eleven #165/#297/#492/#482/#554 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1815,6 +1875,7 @@ class Dials:
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
+    unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
@@ -1829,6 +1890,7 @@ class Dials:
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
+                "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
                 "reviewer_scope": self.reviewer_scope,
@@ -1974,8 +2036,17 @@ class Dials:
         # head, and it is printed even where the band is empty (`fix_severity_floor`
         # at the cut) because a dial that vanishes from the line at some settings is
         # one a reader cannot tell from a dial that was never applied.
+        # The WEIGHT rides with the budget rather than getting a field of its own,
+        # because it is not a second setting a reader weighs separately: it is the
+        # unit the budget is counted in (#554), and a line saying "40 lines" beside
+        # one saying "x2" leaves the reader to work out what 40 buys. Printed
+        # whenever there is a budget at all, at `1` or not, on this line's own rule —
+        # a dial that vanishes from the report at some settings is one a reader
+        # cannot tell from a dial that was never applied. Suppressed only where the
+        # budget is off, where there is nothing for it to be a unit of.
         budget = ("off" if self.low_severity_fix_lines is None
-                  else f"{self.low_severity_fix_lines} lines")
+                  else f"{self.low_severity_fix_lines} lines, unrefereed "
+                       f"x{self.unrefereed_line_weight}")
         return (f"fix at/above {self.fix_severity_floor} · below-"
                 f"{self.round_trigger_floor} fix budget {budget} · another round "
                 f"at/above {self.round_trigger_floor} · "
@@ -1993,7 +2064,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all ten at once.
+    """Read, validate and report all eleven at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2015,6 +2086,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
         low_severity_fix_lines=low_severity_budget(panel, notes),
+        unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
@@ -3553,6 +3625,512 @@ def guard_ratio(diff: str) -> dict | None:
             "ratio": round(guard / counts["source"], 2) if counts["source"] else None}
 
 
+#: What a churned line counts as when the panel asks not how MUCH a fix pass wrote
+#: but whether anything can check it (#554). Three kinds, and only the first has a
+#: referee:
+#:
+#:   * `production` — a line of source that is not a comment. Red/green, the suite
+#:     and CI can each be wrong about it, and any of them can catch it being wrong.
+#:   * `test` — every churned line in a test path. **Nothing tests a test**, which
+#:     is the whole of the argument: a fix to a test has no external referee, so an
+#:     over-patched mock or an assertion weaker than the one beside it survives
+#:     every mechanism the loop has.
+#:   * `prose` — documentation files, and comment lines wherever they sit. A
+#:     docstring fix has no referee either, and #554's tenth finding was in one.
+#:
+#: NOT a second spelling of :data:`GUARD_KINDS`, which asks a different question over
+#: the same paths — how much APPARATUS a change is carrying — and answers it in
+#: `test`/`doc`/`source`. The two share :func:`_guard_kind` rather than each
+#: classifying paths their own way, because two path classifiers are two things that
+#: can disagree about one file. What this adds on top is the LINE half, and that half
+#: is what makes the measurement mean what it says: #554's fix pass touched a
+#: production file, so a path-only reading calls it partly refereed — and its entire
+#: share of that file was a docstring and a comment.
+REFEREE_KINDS = ("production", "test", "prose")
+
+#: Line-comment markers by file suffix. Coarse on purpose and in ONE direction: a
+#: marker missing here reads a comment as production, which under-counts `prose` and
+#: makes the brake LESS likely to fire. That is the safe lean and the one every
+#: approximation in this reader is chosen to take — the rule ends a cycle, so
+#: everything uncertain about it has to fail toward letting the cycle run.
+#:
+#: Keyed by suffix rather than sniffed from content: a heuristic reading the line
+#: itself would call a Python string containing a `#` a comment, and the file's name
+#: is the one thing here that is not a guess.
+_LINE_COMMENTS: dict[str, tuple[str, ...]] = {
+    **{s: ("#",) for s in (".py", ".pyi", ".sh", ".bash", ".zsh", ".rb", ".pl",
+                           ".r", ".yml", ".yaml", ".toml", ".cfg", ".ini",
+                           ".conf", ".tf", ".nix", ".ex", ".exs", ".jl")},
+    # NO `*` IN ANY FORM, and the two rounds it took to get here are the argument for
+    # :data:`_BLOCK_COMMENTS` below. A docblock continuation is written `* text`, so a
+    # bare `*` marker was tried first and ate `*dst = value;` — a pointer store in C,
+    # Go and Rust. Narrowing it to `* ` moved the collision rather than closing it:
+    # `* dst = value;` is the same store with a space in it, and `* generator() {` is
+    # a JavaScript method. Both were caught by successive Codex second opinions, and
+    # both ran in the one direction this table may never lean.
+    #
+    # A prefix cannot answer this, because the question is not what the line starts
+    # with — it is whether the line is INSIDE a `/* … */`. That is state, so it is
+    # tracked as state, and `*` stops being guessed about at all.
+    **{s: ("//", "/*") for s in (".js", ".mjs", ".cjs", ".ts", ".tsx",
+                                            ".jsx", ".go", ".java", ".c", ".h",
+                                            ".cc", ".cpp", ".hpp", ".cs", ".rs",
+                                            ".swift", ".kt", ".kts", ".scala",
+                                            ".php", ".dart", ".zig", ".proto")},
+    # Stylesheets are the same family one step further on: `*` there is the UNIVERSAL
+    # SELECTOR, so `* { margin: 0 }` is a rule and not a docblock line. `//` stays for
+    # SCSS and is harmless in plain CSS, where no statement begins with it.
+    **{s: ("//", "/*") for s in (".css", ".scss", ".less", ".sass")},
+    **{s: ("--",) for s in (".sql", ".lua", ".hs", ".elm")},
+    **{s: (";",) for s in (".el", ".clj", ".cljs", ".scm", ".lisp")},
+    ".vim": ('"',), ".tex": ("%",),
+    **{s: ("<!--", "-->") for s in (".html", ".htm", ".xml", ".svg", ".vue")},
+}
+
+#: `/* … */` delimiters by suffix — the C family and stylesheets, which is exactly the
+#: set whose comments span lines without a marker on each one.
+#:
+#: **State, because a prefix could not answer the question.** Two rounds of review went
+#: on narrowing a `*` line-comment marker (`*` then `* `) and both narrowings still ate
+#: production code, because "does this line start with a star" is not the question a
+#: docblock continuation answers — "is this line inside a block comment" is, and that
+#: is not knowable from the line. Tracked per hunk and per diff side exactly as
+#: :data:`_DOCSTRING_FENCES` is, and for the same reasons.
+_BLOCK_COMMENTS: dict[str, tuple[str, str]] = {
+    s: ("/*", "*/") for s in (
+        ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".java", ".c", ".h",
+        ".cc", ".cpp", ".hpp", ".cs", ".rs", ".swift", ".kt", ".kts", ".scala",
+        ".php", ".dart", ".zig", ".proto", ".css", ".scss", ".less", ".sass")}
+
+#: What a line must FOLLOW for a triple-quote at its head to be a docstring rather
+#: than a value. A docstring is the first statement of a module, class or function, so
+#: the line before it opens a suite and ends with a colon; a multiline literal passed
+#: as an argument or continued from an assignment follows a line ending in `(`, `,`,
+#: `=` or `[`.
+#:
+#: Raised by a Codex second opinion, which pointed out that
+#:
+#:     cur.execute(
+#:         <fence>SELECT 1
+#:         FROM t<fence>)
+#:
+#: is syntactically identical to a docstring opener and is production data. Nothing on
+#: the line itself separates the two; the line BEFORE it does.
+#:
+#: A trailing comment is stripped before the test, so `def f():  # noqa` still hosts
+#: one. An UNKNOWN predecessor — the first churned line of a hunk, where this reader
+#: has seen nothing — is not a host, which is the safe direction and the same lean
+#: `_referee_kind_lines` takes on a hunk that begins inside a docstring.
+_DOCSTRING_HOST_END = ":"
+
+
+def _hosts_docstring(prev: str) -> bool:
+    """Can a triple-quote opening the line after ``prev`` be a docstring?
+
+    ``prev`` is the last non-blank line seen on this side of this hunk, stripped, or
+    `""` where none has been seen. See :data:`_DOCSTRING_HOST_END` for the argument."""
+    head = prev.split("#", 1)[0].rstrip() if prev else ""
+    return head.endswith(_DOCSTRING_HOST_END)
+
+
+def _next_block(in_block: bool, text: str, delims: tuple[str, str] | None) -> bool:
+    """Is a `/* … */` block comment open after this line, given whether one was open
+    before it?
+
+    Scans the line rather than testing a prefix, so `x = 1; /* note */ y = 2;` neither
+    opens a block nor is mistaken for one, and `*/ y = 2;` closes the block it was in
+    and leaves the tail as code. Nesting is not modelled because C does not have it;
+    the languages here all terminate at the first `*/`."""
+    if not delims:
+        return False
+    opener, closer = delims
+    at, state = 0, in_block
+    while at < len(text):
+        want = closer if state else opener
+        found = text.find(want, at)
+        if found < 0:
+            return state
+        state, at = not state, found + len(want)
+    return state
+
+
+#: Suffixes whose prose is FENCED by a delimiter rather than prefixed by a marker —
+#: a Python docstring, which is where #554's tenth finding sat and which no
+#: line-comment rule can see. Only the triple-quoted family, because it is the one
+#: place the fence is unambiguous on the line it appears on.
+_DOCSTRING_FENCES: dict[str, tuple[str, ...]] = {
+    s: ('"""', "'''") for s in (".py", ".pyi")}
+
+#: Churn a fix pass needs before "none of it was refereed" is a statement about the
+#: PASS rather than about one line, and the reason it is a constant rather than a
+#: third uncalibrated dial.
+#:
+#: Four, and deliberately :data:`panel_rounds.FIX_INJECTION_MIN_NEW`'s number for its
+#: reason: two floors that differed by one would be two things to defend and one of
+#: them would be defended by "it is not the other one". Under four, a pass is a typo
+#: correction or a one-line comment fix, and ending a cycle on the observation that a
+#: typo had no test would be the brake firing on the cheapest round there is.
+#:
+#: Not a dial, for :data:`panel_rounds.FIX_INJECTION_MIN_NEW`'s reason sharpened by
+#: this rule having no threshold of its own: the whole argument for wiring this to a
+#: stop is that it is a PREDICATE on a fact rather than a number somebody guessed, and
+#: shipping a knob under it would put the guess back one level down.
+UNREFEREED_MIN_CHURN = 4
+
+def _suffix_of(path: str) -> str:
+    """The lowercased `.ext` of a path's BASENAME, or `""` where it has none.
+
+    Off the basename rather than the whole path, because `docs/v1.2/README` has a dot
+    in a directory and no suffix at all — and a suffix read out of a directory name
+    would key the comment table on `.2`."""
+    base = path.replace("\\", "/").rsplit("/", 1)[-1]
+    return "." + base.rsplit(".", 1)[-1].casefold() if "." in base else ""
+
+
+#: String prefixes a triple-quoted literal may carry (`r"""`, `rb'''`, `f"""`). Two
+#: characters at most, which is every combination Python allows, and matched
+#: case-insensitively because `R"""` is the same literal as `r"""`.
+_STRING_PREFIXES = ("r", "b", "u", "f", "rb", "br", "fr", "rf")
+
+
+#: The path :func:`_next_fence` asks :func:`_comment_line` about when it needs to know
+#: whether the text trailing a fence is a comment. The fences are Python's — no other
+#: suffix is in :data:`_DOCSTRING_FENCES` — so a Python path is the right question, and
+#: naming it once here beats spelling a literal at the call site.
+_COMMENTED_LIKE_PY = "x.py"
+
+
+def _unescaped_find(text: str, fence: str, start: int = 0) -> int:
+    """Index of the first occurrence of ``fence`` in ``text`` at or after ``start``
+    that is not backslash-escaped, or ``-1``.
+
+    A Codex second opinion found the raw `in` test this replaces: a docstring whose
+    body quotes its own delimiter escaped does not end there, and closing on the
+    substring ends it a line early. Everything after that reads as prose, which is the
+    direction that FIRES the brake — so this is one of the two corrections that keep
+    the reader's approximations all leaning the same way.
+
+    A delimiter is escaped when an ODD number of backslashes precedes it, so that a
+    literal backslash at the end of a line does not smuggle a real closer past this."""
+    at = text.find(fence, start)
+    while at != -1:
+        back = 0
+        while at - back - 1 >= 0 and text[at - back - 1] == "\\":
+            back += 1
+        if back % 2 == 0:
+            return at
+        at = text.find(fence, at + 1)
+    return -1
+
+
+def _fence_at_start(text: str, fences: tuple[str, ...]) -> str:
+    '''The triple-quote fence this line OPENS a docstring with, or the empty string.
+
+    Quoted with single-triples so the examples below can be written as they appear in
+    a real file; every other docstring in this module uses double.
+
+    A docstring opener starts its line — `"""Send it.` — where a multiline template
+    is assigned to something first (`sql = """SELECT`). That distinction is the only
+    thing separating the two from inside a hunk, and getting it wrong matters in the
+    direction that FIRES the brake: a template read as prose makes a production pass
+    look unrefereed. So the fence has to be at the start of the stripped line, after
+    at most a string prefix.
+
+    Raised on review by a Codex second opinion.'''
+    stripped = text.strip()
+    for pre in ("", *_STRING_PREFIXES):
+        for fence in fences:
+            if stripped[len(pre):].startswith(fence) and stripped[:len(pre)].lower() == pre:
+                return fence
+    return ""
+
+
+def _comment_line(path: str, text: str) -> bool:
+    """Is this churned line's own text a comment or blank — i.e. prose, whatever file
+    it sits in?
+
+    ``text`` is the line WITHOUT its diff marker. Blank counts, because a blank line
+    is not something a referee can be wrong about: a pass whose entire output is
+    whitespace has written nothing anything could catch.
+
+    Prefix matching on the stripped line and nothing cleverer. A trailing comment on a
+    line of code (`x = 1  # why`) is production, correctly — the line changes
+    behaviour and red/green can see it — and the marker table is keyed by suffix so
+    that a `#` inside a Python string is never read as one."""
+    stripped = text.strip()
+    if not stripped:
+        return True
+    markers = _LINE_COMMENTS.get(_suffix_of(path))
+    return bool(markers and stripped.startswith(markers))
+
+
+def _next_fence(open_fence: str, text: str, fences: tuple[str, ...],
+                host: bool = True) -> str:
+    '''The docstring fence still open after this line, given the one open before it.
+
+    Delimited with single-triples, like its two neighbours, so the examples can be
+    written as they appear in a real file.
+
+    A three-state machine and not a parity bit, which is the correction a Codex
+    second opinion made to the first cut of this reader. **Only the fence that opened
+    a string can close it.** A docstring delimited one way and quoting the OTHER style
+    in its text is ordinary — this module has several — and under a single bit toggled
+    by either style such a line comes out inverted, after which every production line
+    in the hunk reads as prose.
+
+    Closed -> open needs the fence to START the line (:func:`_fence_at_start`) AND
+    something to follow it on that line. Both conditions lean the same way:
+
+    * the start rule keeps an assigned template (``sql = """SELECT``) out, because a
+      template read as prose makes a production pass look unrefereed, which is the
+      direction that FIRES the brake;
+    * the trailing-content rule keeps a bare ``"""`` on its own line out, because from
+      inside a hunk that is indistinguishable from a template's CLOSING delimiter —
+      and reading a closer as an opener would flip every line after a template to
+      prose. The cost is that a docstring written with a bare opener has its body
+      counted as production, which is the safe direction.
+
+    A fence that opens and closes on the same line leaves the state closed: the second
+    occurrence is the close, and a one-line docstring opens nothing.'''
+    if not fences:
+        return ""
+    if open_fence:
+        # Open: only the SAME fence closes it, and only an UNESCAPED occurrence of it —
+        # a body that quotes its own delimiter escaped does not end the string, and
+        # closing there ends it a line early. Anything after the closer on that line is
+        # not examined; a docstring that closes and starts executable code on one line
+        # is rare enough that reading the tail would buy less than the state it needs.
+        return "" if _unescaped_find(text, open_fence) >= 0 else open_fence
+    fence = _fence_at_start(text, fences)
+    if not fence or not host:
+        # `host` is :func:`_hosts_docstring`'s answer about the line BEFORE this one.
+        # Without it a multiline literal passed as an argument opens a docstring, and
+        # its body — production data — reads as prose (a Codex second opinion).
+        return ""
+    # The fence `_fence_at_start` matched is at the head of the stripped line, so it is
+    # unescaped by construction; what matters is whether the SAME fence occurs again,
+    # unescaped, later on — that is the one-line docstring, which opens nothing.
+    stripped = text.strip()
+    after = stripped[stripped.index(fence) + len(fence):]
+    if _unescaped_find(after, fence) >= 0:
+        return ""
+    tail = after.strip()
+    # Nothing after the opener is a bare delimiter, read as a CLOSE that had no open
+    # rather than as an opener (see the docstring — the safe direction).
+    #
+    # AND NEITHER IS A DELIMITER TRAILED BY A COMMENT, which a Codex second opinion
+    # caught: a real closing fence is very often written `<fence>  # end docs`, and to
+    # a reader whose state says CLOSED — a hunk that began inside the docstring, or a
+    # body that quoted the delimiter — that is indistinguishable from an opener with
+    # content after it. Reading it as one opens a string that never closes and turns
+    # every production line left in the hunk into prose. An opener's text is prose;
+    # nobody writes a docstring whose first characters are a comment marker.
+    return fence if (tail and not _comment_line(_COMMENTED_LIKE_PY, tail)) else ""
+
+
+def _referee_kind_lines(diff: str) -> Iterator[tuple[str, str]]:
+    '''Every churned line of ``diff`` as `(path, kind)`, ``kind`` being one of
+    :data:`REFEREE_KINDS`.
+
+    Delimited with single-triples so the fence examples below can be written as they
+    appear in a real file.
+
+    **Churn, not added lines**, which is where this parts company with
+    :func:`guard_ratio` beside it, and it is not an inconsistency. That one asks how
+    much apparatus a change BUILT, so a deletion is not apparatus and is rightly
+    ignored. This one prices what a fix pass DID, in the unit
+    `low_severity_fix_lines` is already spent in — insertions plus deletions, which
+    is what `git diff --numstat` reports and what the fixer's brief counts. A pass
+    that deletes an assertion has done unrefereed work exactly as one that adds a
+    weak assertion has.
+
+    **Docstring parity is tracked per HUNK and starts OUTSIDE one**, which is an
+    approximation and is the one worth naming. A hunk that BEGINS inside a docstring
+    — an edit deep in a long one, whose context lines carry no fence — is read as
+    beginning outside, so its prose lines are counted `production`. That is the safe
+    direction and the only one this rule may lean in: it makes the pass look MORE
+    refereed than it was, so the brake declines to fire rather than firing on a pass
+    it misread. Closing it needs the file's whole text, which this reader does not
+    have and which the round has no reason to fetch.
+
+    Context lines MOVE the fence state and are not counted. They are not churn, and a
+    fence arriving on one is exactly how a hunk tells this reader where it is.
+
+    **The two SIDES keep separate state**, which is not a nicety. A unified diff is
+    two files interleaved, so one tracker over both reads a replaced docstring line
+    (`-` then `+`, each carrying the same fence) as opening and then closing, and
+    every prose line after it in that hunk comes back `production`. That is the
+    commonest docstring edit there is, and getting it wrong makes the pass look
+    refereed by exactly the lines that are not.
+
+    **And each side tracks WHICH fence opened it, not a parity bit.** Raised on review
+    by a Codex second opinion: a docstring delimited one way that quotes the OTHER
+    style in its text carries an odd number of fence occurrences, so a bit toggled by
+    either style comes out of that line in the wrong state and every production line
+    after it in the hunk reads as prose. Only the fence that opened a string can close
+    it — :func:`_next_fence` is that machine.
+
+    **THE PROPERTY THIS READER EXISTS TO HAVE**, and the one the gate above it rests
+    on: every way it can be wrong must count a line as PRODUCTION, so the brake
+    declines to fire on a pass it misread rather than ending a cycle over one. Three
+    successive review rounds found violations of it — each one production logic read
+    as prose — and the shape of the fixes is worth recording, because the next person
+    to add a marker or a suffix will be tempted by the same shortcut:
+
+    * a bare ``*`` line-comment marker ate ``*dst = value;``. Narrowing it to ``* ``
+      moved the collision to ``* dst = value;`` and ``* generator() {``. **No prefix
+      can answer this**, because the question is not what the line starts with but
+      whether it sits inside a ``/* … */`` — so :data:`_BLOCK_COMMENTS` tracks that as
+      state and ``*`` is not guessed about at all;
+    * a triple-quote at the head of a line opens a docstring OR a multiline value, and
+      the two are syntactically identical. The line BEFORE it is what separates them
+      (:func:`_hosts_docstring`): a docstring follows a suite header ending in a
+      colon, a value follows a call or an assignment;
+    * a one-line docstring with a statement after it (``<fence>doc<fence>; call()``)
+      is a line carrying code, and counting it prose hid the call.
+
+    Two approximations remain, and both lean the safe way:
+
+    * a hunk that BEGINS inside a docstring, whose context lines carry no fence, is
+      read as beginning outside one and its prose counts as production. Closing it
+      needs the file's whole text, which this reader does not have and the round has
+      no reason to fetch;
+    * an unknown predecessor is not a docstring host, so a fence on the first churned
+      line of a hunk is a value rather than a docstring.'''
+    path: str | None = None
+    fences: tuple[str, ...] = ()
+    blocks: tuple[str, str] | None = None
+    in_hunk = False
+
+    def fresh() -> dict:
+        """The per-side state, reset at each file and each hunk.
+
+        `fence` is the triple-quote that opened the current docstring, `block` whether
+        a `/* … */` is open, and `prev` the last non-blank line seen — which is what
+        :func:`_hosts_docstring` reads. A context line is in BOTH files and moves both
+        sides; a `-` line exists only in the old and a `+` only in the new."""
+        return {"-": {"fence": "", "block": False, "prev": ""},
+                "+": {"fence": "", "block": False, "prev": ""}}
+
+    state = fresh()
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path, in_hunk = _diff_file_path(line), False
+            state = fresh()
+            fences = _DOCSTRING_FENCES.get(_suffix_of(path), ()) if path else ()
+            blocks = _BLOCK_COMMENTS.get(_suffix_of(path)) if path else None
+        elif line.startswith("+++ ") and not in_hunk:
+            # The authoritative spelling, once it arrives — and gated on `in_hunk` for
+            # `_diff_added_lines`' reason, which a Codex second opinion caught missing
+            # here: an ADDED line whose content reads `++ b/x.py` is spelled
+            # `+++ b/x.py` in a diff and is CONTENT, not a header. Ungated, such a line
+            # both escapes the count and re-points `path` at whatever it names, which
+            # misclassifies every line after it. Past the first `@@` it falls through
+            # to the churn branch below and is counted, which is what it is.
+            got = _diff_file_path(line)
+            if got:
+                path = got
+                fences = _DOCSTRING_FENCES.get(_suffix_of(got), ())
+                blocks = _BLOCK_COMMENTS.get(_suffix_of(got))
+        elif path is None or line.startswith(("---", "\\", "index ")):
+            continue
+        elif line.startswith("@@"):
+            # Fence state is per hunk and is never carried across one: two hunks of a
+            # file are two separate windows into it, and a string opened in the first
+            # says nothing about where the second begins.
+            in_hunk = True
+            state = fresh()
+        elif line and line[0] in "+- ":
+            marker, text = line[0], line[1:]
+            sides = ("-", "+") if marker == " " else (marker,)
+            was = [state[s] for s in sides]
+            # Read BEFORE the state moves, so the line CARRYING a delimiter is prose
+            # whichever way it turns the state: an opener, a closer and a one-line
+            # docstring are all docstring lines and none of them is code.
+            #
+            # A fence at the head of the line only counts when the line before it
+            # could HOST a docstring — otherwise it is a multiline value, and its head
+            # is as much production as its body.
+            starts_doc = (bool(_fence_at_start(text, fences))
+                          and any(_hosts_docstring(w["prev"]) for w in was))
+            fenced = any(w["fence"] for w in was) or starts_doc
+            blocked = any(w["block"] for w in was) or (
+                blocks is not None and _next_block(False, text, blocks)
+                and text.strip().startswith(blocks[0]))
+            for side in sides:
+                cur = state[side]
+                cur["fence"] = _next_fence(cur["fence"], text, fences,
+                                           host=_hosts_docstring(cur["prev"]))
+                cur["block"] = _next_block(cur["block"], text, blocks)
+                if text.strip():
+                    cur["prev"] = text.strip()
+            # A one-line docstring that is FOLLOWED BY CODE is not a prose line: the
+            # statement after the `;` is production and the line has to be counted as
+            # what it mostly is. Raised by a Codex second opinion against
+            # `<fence>doc<fence>; authorize()`, which read as prose entire.
+            if starts_doc and not any(w["fence"] for w in was):
+                closed_at = _unescaped_find(
+                    text, _fence_at_start(text, fences),
+                    text.index(_fence_at_start(text, fences)) + 3)
+                tail = text[closed_at + 3:].strip() if closed_at >= 0 else ""
+                if tail and not _comment_line(_COMMENTED_LIKE_PY, tail):
+                    fenced = False
+            if marker == " ":
+                continue                 # context: moves the state, is not churn
+            guard = _guard_kind(path)
+            if guard == "test":
+                # Every churned line in a test path, comments included. The split is
+                # for a READER deciding which kind of unrefereed work a pass did, and
+                # a comment inside a test file is unrefereed under either heading —
+                # separating it would make `test` mean "test lines that are not
+                # comments", which is not a quantity anybody wants.
+                yield path, "test"
+            elif guard == "doc" or fenced or blocked or _comment_line(path, text):
+                yield path, "prose"
+            else:
+                yield path, "production"
+
+
+def referee_split(diff: str) -> dict:
+    """What a fix pass wrote, split by whether anything in the loop can check it
+    (#554) — `{production, test, prose, churn, unrefereed, share}`.
+
+    The measurement behind it, on lexray#1697 round 1: a 93-line fix pass across
+    three files that changed **no production logic at all** — the production file's
+    entire share of it was a docstring and a comment — introduced ten findings, nine
+    of them in the test files and the tenth in that docstring. Red/green ran and went
+    red 4 of 4, and could not have caught any of the ten: it asks whether a test
+    detects the thing it was written for, never whether that test also opens a
+    socket, whether its assertion is sufficient, or whether it is as strong as the
+    test beside it.
+
+    That is structural rather than unlucky, and the sentence explaining it is the
+    whole of this function: **a production fix has an external referee and a test fix
+    has none, because nothing tests a test.** A docstring fix has none either. So a
+    pass whose entire output is test and prose has produced only artefacts that no
+    mechanism in the loop can check.
+
+    `share` is `None` — not `0.0` — on a diff with no churn at all, because zero is a
+    claim about a fix pass and this is the absence of one. It is REPORTED and nothing
+    gates on it: what :func:`panel_rounds.referee_state` gates on is `production ==
+    0`, a predicate, and the share sits beside it so a reader can see how close a
+    pass came.
+
+    **Not a ratio, and that is the load-bearing choice.** A threshold on `share`
+    would fire on the commonest healthy shape there is — a 5-line production fix
+    carrying a 40-line regression test is 89% unrefereed and is exactly the work the
+    panel wants — and it would need a number nobody has measured, which is what #67
+    refuses. The ABSENCE of a refereed component is a different claim from a high
+    proportion of unrefereed ones, and it is the claim #554 makes."""
+    counts = {kind: 0 for kind in REFEREE_KINDS}
+    for _path, kind in _referee_kind_lines(diff):
+        counts[kind] += 1
+    churn = sum(counts.values())
+    unrefereed = counts["test"] + counts["prose"]
+    return {**counts, "churn": churn, "unrefereed": unrefereed,
+            "share": round(unrefereed / churn, 4) if churn else None}
+
+
 def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
     """Which files a reviewer handed only the first `budget` chars of `diff` could
     not read IN FULL — the tail that fell off the end of its prompt.
@@ -3623,6 +4201,12 @@ __all__ = [
     "low_severity_budget",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
+    "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",
+    "UNREFEREED_MIN_CHURN", "_suffix_of", "_comment_line",
+    "_BLOCK_COMMENTS", "_DOCSTRING_HOST_END", "_hosts_docstring",
+    "_next_block",
+    "_STRING_PREFIXES", "_COMMENTED_LIKE_PY", "_unescaped_find", "_fence_at_start", "_next_fence",
+    "_referee_kind_lines", "referee_split", "unrefereed_line_weight",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",

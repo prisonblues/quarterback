@@ -897,6 +897,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whole panel has been paid for, and the round's stop is computed under one policy
     # that was resolved in one place.
     not_falling = not_falling_limit(panel, notes)
+    # #554's rung, read here for its three siblings' reason and at their moment: a
+    # malformed value has to hard-exit before a seat is dispatched rather than after a
+    # whole panel has been paid for, and the round's stop is computed under one policy
+    # resolved in one place.
+    unrefereed_armed = unrefereed_fix_brake(panel, notes)
     # #507's constructive pass. Read at the same moment as the three brakes above, and
     # for their reason: a malformed value hard-exits before a seat is dispatched
     # rather than after a whole panel has been paid for. What it governs is not a
@@ -3068,6 +3073,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # computed twice: `over` is also the precondition for the extra API call under it,
     # and two `injection_state` calls could disagree about whether to make it.
     injecting = injection_state(provenance_counts, injection_limit)
+    # #554's measurement over the SAME fix range `injecting` was attributed against —
+    # `fix_diff`, whichever of the compare and the round's own increment supplied it —
+    # so the two rungs cannot end up accusing different passes. `None` where there is
+    # no range, which is `over: False` by construction: a round that could not see the
+    # pass does not end a cycle on what the pass contained. Reading `fix_diff` rather
+    # than the compare's own answer is what gets #504's reconstruction for free: a
+    # rewritten round that rebuilt its pass out of the local object store is measured
+    # here exactly as a linear one is, and a rewrite nothing could rebuild disarms
+    # this rung and #489's together.
+    #
+    # Cheap enough to compute on every attributable round rather than only where the
+    # brake is armed: it is one pass over a diff already in memory, and the payload
+    # records what the round KNEW — a repo that switched the rung off still gets to
+    # see that its fix pass wrote nothing checkable.
+    refereeing = referee_state(referee_split(fix_diff) if fix_diff else None,
+                               unrefereed_armed)
     revert_cleared, revert_open = fix_pass_outcome(prior.fixed_findings, outstanding)
     # The commits inside the range, and the ONE extra `gh api` call this whole feature
     # makes — paid only on a round whose rate crossed the threshold, which is the
@@ -3155,7 +3176,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # gate above.
                       not_falling=not_falling_state(
                           [(t.round, t.new_findings) for t in trend_rows],
-                          not_falling))
+                          not_falling),
+                      # #554's rung. The measurement is the fix range's own churn,
+                      # classified into production/test/prose, and the rule is a
+                      # predicate on it rather than a threshold: a pass with no
+                      # production line in it wrote only artefacts nothing in the loop
+                      # can check, so the round it would buy is a review of unrefereed
+                      # work. Empty on round 1 and on any round whose fix range could
+                      # not be read.
+                      unrefereed=refereeing)
     # Said in `config_notes` as well as in `round_stop`, because these two are read
     # by different people at different moments: the payload's `round_stop` is what
     # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
@@ -4065,6 +4094,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"**Guard-to-guarded:** {gr['test']} test + {gr['doc']} doc "
                      f"line(s) added against {against}. Reported, not a threshold — "
                      "nothing stops on this (#67).")
+    # ---- refereed-ness (#554), and it is the one instrument on this report that DOES
+    # gate — so it says so, rather than letting a reader carry the line above's
+    # "nothing stops on this" across two paragraphs. What it gates on is a predicate
+    # and not a threshold, which is the whole reason it may gate at all (#67); the
+    # numbers are printed either way so that a reader can check the verdict rather
+    # than take it, exactly as `fix_injection` publishes its rate beside its limit.
+    #
+    # Printed only where there was a fix pass to read. On round 1, and on a round
+    # whose range was unreadable, `churn` is 0 and there is no measurement — a line
+    # reading "0 test, 0 prose, 0 production" would say a pass wrote nothing when in
+    # fact none was looked at.
+    rf = (payload.get("round_stop") or {}).get("unrefereed_fix") or {}
+    if rf.get("churn"):
+        verdict = ("**no production code at all** — nothing in the loop can check it"
+                   if not rf["production"] else
+                   f"{rf['production']} production line(s), which red/green, the "
+                   "suite and CI can each catch being wrong")
+        armed = ("" if rf["armed"] else
+                 " `escalate_on.unrefereed_fix` is off for this repo, so this is "
+                 "recorded and gates nothing.")
+        lines.append(f"**Refereed-ness of the last fix pass:** {rf['churn']} churned "
+                     f"line(s) — {rf['test']} test, {rf['prose']} prose, "
+                     f"{verdict}.{armed}")
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "blocked": "🚧 gated — a run exists and will not execute without a human",
               "none": "🚫 no run exists for this commit",
@@ -4254,6 +4306,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"{dials.low_severity_fix_lines}-line budget for the WHOLE round: measure "
             "each fix's churned lines (`git diff --numstat`) rather than estimating "
             "them, spend cheapest first, and stop when the budget is spent. "
+            # #554, and it belongs HERE rather than only on the dials line: this note
+            # is what an orchestrator sweeps into the fixer's brief along with the
+            # findings it bounds, so a weight stated only elsewhere is a weight the
+            # fixer is never told about — raised by a Codex second opinion, which
+            # found the dial resolved, reported, and applied by nobody. Said at `1`
+            # too, on the dials line's own rule: a clause that vanishes at some
+            # settings is one a reader cannot tell from a dial that was never applied.
+            f"A line of test or prose costs "
+            f"{dials.unrefereed_line_weight}x a line of production code, because a "
+            "production fix has a referee in red/green and a test fix has none — "
+            "nothing tests a test (#554). "
             "Count, do not estimate, "
             "and do not ask yourself whether a fix risks ballooning — the budget is "
             "the answer to that question and it has already been given. What the "

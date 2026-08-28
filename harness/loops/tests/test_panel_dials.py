@@ -63,7 +63,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The ten, and where each one's default is written twice. `skip_title_patterns` and
+#: The eleven, and where each one's default is written twice. `skip_title_patterns` and
 #: the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
@@ -71,6 +71,7 @@ DIALS = {
     "fix_severity_floor": "DEFAULT_FIX_SEVERITY_FLOOR",
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
     "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "unrefereed_line_weight": "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
@@ -1810,7 +1811,8 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     weighing a quiet round needs to know whether the quiet was measured or configured."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
     assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
-            "40 lines · another round at/above P2 · reviewer scope diff · fix growth "
+            "40 lines, unrefereed x2 · another round at/above P2 · reviewer scope diff "
+            "· fix growth "
             "cap 3x or +30,000 chars · fixer may defer yes · failing test "
             "required no · deferrals at/above P2 get a GitHub issue, below it a "
             "board row only (an escalation and an unverifiable claim always get "
