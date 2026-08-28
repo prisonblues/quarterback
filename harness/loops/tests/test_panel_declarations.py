@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — run_cli lives here since #129
+import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
 from conftest import gh_stub  # noqa: E402
 
 
@@ -1296,7 +1297,7 @@ def test_the_veto_names_every_way_a_round_can_look_quiet_without_being_quiet():
         "antigravity": {"ran": True, "unstructured": True},
     }
     why = panel.coverage_veto(meta, judge_skip="judge: claude CLI absent",
-                              flagged=2, diff_chars=118_402)
+                              flagged=2, diff_chars=118_402, ci_status="PASS")
     joined = " | ".join(why)
     assert "claude saw 60,000 of 118,402" in joined
     assert "codex did not run" in joined
@@ -1318,12 +1319,12 @@ def test_a_seat_this_box_does_not_carry_is_reported_without_vetoing():
                               "skip": "antigravity (m): CLI absent"},
               "pi": {"ran": False, "absent": True, "skip": "pi (kimi): CLI absent"},
               "claude": {"ran": True}}
-    assert panel.coverage_veto(absent, None, 0, 1_000) == []
+    assert panel.coverage_veto(absent, None, 0, 1_000, ci_status="PASS") == []
     assert panel.round_stop(1, 2, [], [], [])["confident"] is True
     # Every other way of not running still says something about this round.
     crashed = {"antigravity": {"ran": False, "skip": "antigravity (m): exited 1 (boom)"},
                "claude": {"ran": True}}
-    assert panel.coverage_veto(crashed, None, 0, 1_000) == [
+    assert panel.coverage_veto(crashed, None, 0, 1_000, ci_status="PASS") == [
         "antigravity did not run (antigravity (m): exited 1 (boom))"]
 
 
@@ -1335,7 +1336,7 @@ def test_a_box_carrying_none_of_the_reviewer_clis_cannot_stop_confidently():
     lands on exactly the unattended hosts the exemption was added for."""
     none_ran = {"antigravity": {"ran": False, "absent": True, "skip": "a: CLI absent"},
                 "pi": {"ran": False, "absent": True, "skip": "p: CLI absent"}}
-    veto = panel.coverage_veto(none_ran, None, 0, 1_000)
+    veto = panel.coverage_veto(none_ran, None, 0, 1_000, ci_status="PASS")
     assert veto == ["no reviewer ran — nothing read this diff"]
     assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
 
@@ -1350,12 +1351,12 @@ def test_absence_is_recorded_state_rather_than_a_message_tail():
     nothing failing to say so."""
     lookalike = {"codex": {"ran": False, "skip": "codex (gpt): exited 1 — no CLI absent"},
                  "claude": {"ran": True}}
-    assert panel.coverage_veto(lookalike, None, 0, 1_000) == [
+    assert panel.coverage_veto(lookalike, None, 0, 1_000, ci_status="PASS") == [
         "codex did not run (codex (gpt): exited 1 — no CLI absent)"]
     decorated = {"codex": {"ran": False, "absent": True,
                            "skip": "codex (gpt): CLI absent — install it first"},
                  "claude": {"ran": True}}
-    assert panel.coverage_veto(decorated, None, 0, 1_000) == []
+    assert panel.coverage_veto(decorated, None, 0, 1_000, ci_status="PASS") == []
 
 
 def test_a_reviewer_whose_cli_is_missing_records_that_as_state(monkeypatch):
@@ -1390,12 +1391,12 @@ def test_a_seat_that_cannot_read_the_code_declares_without_vetoing():
                                              "the other two CI jobs' conventions"]},
              "codex": {"ran": True, "code_blind": True,
                        "could_not_assess": ["migrations/versions/"]}}
-    assert panel.coverage_veto(blind, None, 0, 1_000) == []
+    assert panel.coverage_veto(blind, None, 0, 1_000, ci_status="PASS") == []
     assert panel.round_stop(1, 2, [], [], [])["confident"] is True
     # A seat that COULD have read the tree is making a claim about this round.
     sighted = {"claude": {"ran": True, "code_blind": False,
                           "could_not_assess": ["migrations/versions/"]}}
-    assert panel.coverage_veto(sighted, None, 0, 1_000) == [
+    assert panel.coverage_veto(sighted, None, 0, 1_000, ci_status="PASS") == [
         "claude could not assess: migrations/versions/"]
 
 
@@ -1416,11 +1417,11 @@ def test_blindness_is_recorded_state_rather_than_read_out_of_the_declaration():
     round_shaped = {"codex": {"ran": True, "code_blind": True,
                               "could_not_assess": ["the fix in this very diff"]},
                     "claude": {"ran": True, "code_blind": True}}
-    assert panel.coverage_veto(round_shaped, None, 0, 1_000) == []
+    assert panel.coverage_veto(round_shaped, None, 0, 1_000, ci_status="PASS") == []
     design_shaped = {"codex": {"ran": True, "code_blind": False,
                                "could_not_assess": ["anything outside the diff"]},
                      "claude": {"ran": True, "code_blind": False}}
-    assert panel.coverage_veto(design_shaped, None, 0, 1_000) == [
+    assert panel.coverage_veto(design_shaped, None, 0, 1_000, ci_status="PASS") == [
         "codex could not assess: anything outside the diff"]
 
 
@@ -1440,7 +1441,7 @@ def test_a_blind_panel_still_vetoes_every_other_way_of_coming_up_short():
         "pi": {"ran": True, "code_blind": True, "unstructured": True},
     }
     why = panel.coverage_veto(meta, judge_skip="judge: claude CLI absent",
-                              flagged=1, diff_chars=118_402)
+                              flagged=1, diff_chars=118_402, ci_status="PASS")
     joined = " | ".join(why)
     assert "claude saw 60,000 of 118,402" in joined
     assert "codex did not run" in joined
@@ -1460,7 +1461,7 @@ def test_a_partial_meta_dict_still_vetoes_its_declarations():
     key nobody set — and that is the direction every other exemption in this file
     is written to avoid."""
     unrecorded = {"claude": {"ran": True, "could_not_assess": ["the caller"]}}
-    assert panel.coverage_veto(unrecorded, None, 0, 1_000) == [
+    assert panel.coverage_veto(unrecorded, None, 0, 1_000, ci_status="PASS") == [
         "claude could not assess: the caller"]
 
 
@@ -1478,11 +1479,11 @@ def test_the_kernel_ceiling_is_reported_without_vetoing():
     kernel = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
                               "max_diff_chars": 116_771, "code_blind": True},
               "claude": {"ran": True, "code_blind": True}}
-    assert panel.coverage_veto(kernel, None, 0, 175_547) == []
+    assert panel.coverage_veto(kernel, None, 0, 175_547, ci_status="PASS") == []
     budget = {"antigravity": {"ran": True, "truncated": True, "argv_capped": False,
                               "max_diff_chars": 6_000, "code_blind": True},
               "claude": {"ran": True, "code_blind": True}}
-    assert panel.coverage_veto(budget, None, 0, 175_547) == [
+    assert panel.coverage_veto(budget, None, 0, 175_547, ci_status="PASS") == [
         "antigravity saw 6,000 of 175,547 diff chars"]
 
 
@@ -1495,19 +1496,19 @@ def test_a_panel_whose_every_running_seat_was_argv_capped_cannot_stop_confidentl
     lands on the unattended loops where the claim is believed."""
     alone = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
                              "max_diff_chars": 116_771, "code_blind": True}}
-    veto = panel.coverage_veto(alone, None, 0, 175_547)
+    veto = panel.coverage_veto(alone, None, 0, 175_547, ci_status="PASS")
     assert veto == ["every reviewer that ran was cut by the argv ceiling — "
                     "nothing read this diff whole"]
     assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
     # One seat that saw the whole thing is enough to lift it — that seat's reading
     # is what the round rests on, and it is not truncated.
     beside = dict(alone, claude={"ran": True, "code_blind": True})
-    assert panel.coverage_veto(beside, None, 0, 175_547) == []
+    assert panel.coverage_veto(beside, None, 0, 175_547, ci_status="PASS") == []
 
 
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
     meta = {"claude": {"ran": True, "truncated": False, "could_not_assess": []}}
-    assert panel.coverage_veto(meta, None, 0, 1_000) == []
+    assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS") == []
 
 
 # ---- the master rules on coverage, findings or not -------------------------
@@ -1555,7 +1556,7 @@ def test_an_ambiguous_judge_reply_is_not_a_ruling(monkeypatch):
     out, skip, note = panel.adjudicate([[leak]], "diff", "", 34)
     assert [c.verdict for c in out] == ["unjudged"] and note == ""
     assert skip and "unparseable" in skip
-    assert "not adjudicated" in " | ".join(panel.coverage_veto({}, skip, 0, 1_000))
+    assert "not adjudicated" in " | ".join(panel.coverage_veto({}, skip, 0, 1_000, ci_status="PASS"))
 
 
 def test_a_coverage_only_reply_is_not_a_judge_that_failed_to_rule(monkeypatch):
@@ -2192,7 +2193,7 @@ def test_sonarqube_cannot_switch_off_the_argv_floor():
     capped = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
                               "max_diff_chars": 116_771, "code_blind": True},
               "sonarqube": {"ran": True, "skip": None}}
-    veto = panel.coverage_veto(capped, None, 0, 175_547)
+    veto = panel.coverage_veto(capped, None, 0, 175_547, ci_status="PASS")
     assert any("nothing read this diff whole" in v for v in veto), (
         "a running sonarqube suppressed the floor")
     assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
@@ -2200,4 +2201,199 @@ def test_sonarqube_cannot_switch_off_the_argv_floor():
     # An LLM seat that saw the whole diff still lifts it — that seat's reading is
     # what the round rests on.
     with_reader = dict(capped, claude={"ran": True, "code_blind": True})
-    assert panel.coverage_veto(with_reader, None, 0, 175_547) == []
+    assert panel.coverage_veto(with_reader, None, 0, 175_547, ci_status="PASS") == []
+
+
+# ------------------------------------------- #546: nothing executed vs a green suite
+
+
+def _one_seat_ran() -> dict:
+    """A round with nothing wrong with its READING: one seat, installed, ran, whole
+    diff, structured reply, no declared gaps. Every veto above `ci_status` is
+    silent on it, so anything the assertions below see came from the CI state."""
+    return {"claude": {"ran": True, "code_blind": False, "could_not_assess": []}}
+
+
+def test_a_round_with_no_ci_run_cannot_stop_confidently():
+    """#546. `ci_status` did not reach this function at all, so a round whose full
+    suite passed on the exact commit and one where NO RUN EXISTS produced the same
+    empty veto list and the same `confident: True`.
+
+    That was latent only because four seats each declared "I cannot run the tests"
+    and each declaration vetoed. #547 removes those declarations, and the whole
+    point of landing this first is that it must not be what was holding the line."""
+    green = panel.coverage_veto(_one_seat_ran(), None, 0, 1_000, ci_status="PASS")
+    assert green == []
+    assert panel.round_stop(1, 2, [], [], green)["confident"] is True
+
+    nothing = panel.coverage_veto(_one_seat_ran(), None, 0, 1_000, ci_status="none")
+    assert nothing == ["no CI run exists for this commit — nothing mechanical "
+                       "executed this code"]
+    assert panel.round_stop(1, 2, [], [], nothing)["confident"] is False
+
+
+def test_a_red_suite_is_evidence_and_does_not_cost_the_round_its_confidence():
+    """The line this issue turns on, and the one it would be easiest to get wrong:
+    a FAILED run is *evidence*, and `ci_brief` already tells every seat to "treat
+    that as a fact you may reason from, not as a finding to re-report". A round
+    that read a real failure is not a round that read nothing — and `preland.check_ci`
+    refuses the merge on FAIL regardless, so nothing is bought by vetoing here."""
+    assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000, ci_status="FAIL") == []
+
+
+def test_each_unsettled_state_keeps_its_own_sentence():
+    """Four states, four sentences, and the separation is the point (#546).
+
+    Only two of them are claims about EXECUTION. `none` is nothing ran. `blocked`
+    (#324) is a run that EXISTS and will not execute without a person — it must not
+    borrow `none`'s wording, which is the conflation that made PR #282 look
+    untouched for two days. The other two are weaker on purpose: `PENDING` is
+    #501's residue after the bounded wait and may be a suite whose other checks
+    went green, and `unknown` is a lookup that failed and says nothing either way.
+    They veto for the same reason — no settled result to earn confidence on — and
+    they must not be WORDED the same, because could-not-check is not
+    nothing-to-report. #548 is the sibling issue about filling the channel;
+    nothing here folds its case into this one."""
+    said = {state: panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,
+                                       ci_status=state)
+            for state in ("PENDING", "none", "blocked", "unknown")}
+    assert all(len(v) == 1 for v in said.values())
+    assert len({v[0] for v in said.values()}) == 4, "two states share a sentence"
+    assert "gated on a human" in said["blocked"][0]
+    assert "no CI run exists" in said["none"][0]
+    assert "had not settled" in said["PENDING"][0]
+    assert "could not be read" in said["unknown"][0]
+    # Neither of the two that is NOT about execution may claim anything ran or
+    # did not: that is the stronger fact, it is false of both, and asserting it
+    # here is what stops the wording drifting back into it. `unknown` is allowed
+    # to name execution — it is the thing it says it cannot determine — but only
+    # as the open question it leaves, never as an answer.
+    assert "execut" not in said["PENDING"][0]
+    assert said["unknown"][0].endswith("is unknown")
+    for weaker in ("PENDING", "unknown"):
+        assert "nothing" not in said[weaker][0]
+
+
+def test_a_repo_that_declared_it_has_no_ci_is_not_asked_again_every_round():
+    """`coverage_veto`'s forbidden constant, caught by codex on this change.
+
+    `preland.check_ci` refuses `none` by naming the remedy in its own refusal:
+    say so with `"preland": {"disabled_checks": ["ci"]}`. A repo that HAS said so
+    would otherwise carry this veto on every round it will ever run — an
+    observation true of all of them, which distinguishes nothing, makes
+    `--require-earned-stop` unsatisfiable and trains its reader to ignore the
+    signal. That is the exact failure the absent-CLI exemption above was added for.
+
+    Exactly `none` is exempted. The declaration explains an ABSENT run; a gated
+    run, an unsettled suite and a failed lookup all contradict it rather than
+    being covered by it, and a repo with no CI cannot produce any of them."""
+    said = panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,
+                               ci_status="none", ci_declared_absent=True)
+    assert said == []
+    assert panel.round_stop(1, 2, [], [], said)["confident"] is True
+    for still in ("PENDING", "blocked", "unknown"):
+        assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,
+                                   ci_status=still,
+                                   ci_declared_absent=True) != [], still
+
+
+def test_an_unexplained_absence_of_ci_still_vetoes():
+    """The other half of the exemption, and the whole of its value. "This repo has
+    no CI" is a written statement somebody made; "no run exists for this commit" is
+    what a repo with a workflow that failed to trigger looks like. They produce the
+    identical `ci_status`, and only the declaration tells them apart — so the
+    default is the strict one, and a caller that knows nothing about the repo's
+    rules gets the veto rather than the exemption."""
+    assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,
+                               ci_status="none") != []
+    assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000, ci_status="none",
+                               ci_declared_absent=False) != []
+
+
+def test_an_unrecognised_ci_state_vetoes_rather_than_passing():
+    """Fail closed, by construction. The set is written as the two states that DO
+    NOT veto, so a seventh `CI_STATE_WORDS` entry added next year costs the round
+    its confidence until somebody argues it into `CI_EXECUTED` — rather than
+    passing silently, which is exactly how `none` reached today."""
+    assert sorted(panel.CI_SETTLED) == ["FAIL", "PASS"]
+    covered = set(panel.CI_UNSETTLED) | set(panel.CI_SETTLED)
+    assert covered == set(panel_scope.CI_STATE_WORDS.values()), \
+        "a CI state exists that this function neither exempts nor has a sentence for"
+    for odd in ("", "queued", "PASSED"):
+        assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,
+                                   ci_status=odd) != []
+
+
+def test_the_ci_veto_cannot_be_forgotten_by_a_caller():
+    """`ci_status` is keyword-only with no default. The alternative — defaulting to
+    a value — picks between two bad answers: `PASS` silently buys a confident stop
+    for any path that forgets, and anything else silently vetoes rounds nobody
+    meant to veto. A TypeError is neither, and `coverage_veto`'s standing
+    discipline is that a path which forgets to set something must not fail open."""
+    with pytest.raises(TypeError):
+        panel.coverage_veto(_one_seat_ran(), None, 0, 1_000)
+
+
+def _cycle_payload(monkeypatch, capsys, tmp_path, ci, cfg=PANEL_CFG):
+    """One whole `run()` as a CYCLE round, returning the payload it wrote.
+
+    A cycle round because `round_stop` is `None` on a review-only payload — a
+    verdict about a loop nobody is running — so `max_rounds` is what makes the
+    field this is about exist at all."""
+    _stub_panel(monkeypatch, findings=[], cfg=cfg)
+    monkeypatch.setattr(panel, "review_ci", lambda *a: (ci, [], None))
+    out = tmp_path / f"{ci}.json"
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     round_no=1, max_rounds=2) == 0
+    capsys.readouterr()
+    return json.loads(out.read_text())
+
+
+def test_the_ci_veto_reaches_the_payload_a_consumer_actually_reads(
+        monkeypatch, capsys, tmp_path):
+    """The plumbing, not the rule — asserted end to end because the two can be
+    right separately and still not meet.
+
+    `--require-earned-stop`, `/fix-and-land`'s merge gate and the board's own
+    column all read `round_stop.confident` out of the payload, not
+    `coverage_veto`'s return value. A call site passing a stale `ci_status`, or
+    dropping the veto between the function and the file, is invisible to every
+    unit test above and is exactly the shape of defect this issue is about."""
+    green = _cycle_payload(monkeypatch, capsys, tmp_path, "PASS")
+    assert green["ci_status"] == "PASS"
+    assert green["round_stop"]["confident"] is True
+    assert green["round_stop"]["veto"] == []
+
+    dark = _cycle_payload(monkeypatch, capsys, tmp_path, "none")
+    assert dark["ci_status"] == "none"
+    assert dark["round_stop"]["confident"] is False
+    assert any("no CI run exists" in v for v in dark["round_stop"]["veto"])
+
+
+def test_a_repos_written_no_ci_declaration_reaches_the_round_from_harness_rules(
+        monkeypatch, capsys, tmp_path):
+    """The exemption's own plumbing. The declaration lives in `.harness-rules`
+    under the key `preland` refuses `none` by naming, and it has to travel from
+    the resolved config through `run()` to the veto — otherwise a repo can write
+    it, watch preland honour it at land time, and still never earn a stop."""
+    declared = {**PANEL_CFG, "preland": {"disabled_checks": ["ci"]}}
+    said = _cycle_payload(monkeypatch, capsys, tmp_path, "none", cfg=declared)
+    assert said["round_stop"]["confident"] is True
+    assert said["round_stop"]["veto"] == []
+    # The declaration covers the absence it explains and nothing else: a gated
+    # run contradicts "this repo has no CI" rather than being covered by it.
+    gated = _cycle_payload(monkeypatch, capsys, tmp_path, "blocked", cfg=declared)
+    assert gated["round_stop"]["confident"] is False
+
+
+def test_a_malformed_disabled_checks_does_not_hand_out_the_exemption(
+        monkeypatch, capsys, tmp_path):
+    """`preland.disabled_checks` hard-exits on a list it cannot read, which is
+    right for a merge gate and wrong for a read-only review: a typo in a section
+    the panel does not otherwise touch must not stop a round running. So the
+    panel reads the key straight, and every way of being unreadable fails in the
+    strict direction — no "ci" in it, so the veto stands."""
+    for junk in ("ci", {"ci": True}, None, ["c i"], 7):
+        cfg = {**PANEL_CFG, "preland": {"disabled_checks": junk}}
+        got = _cycle_payload(monkeypatch, capsys, tmp_path, "none", cfg=cfg)
+        assert got["round_stop"]["confident"] is False, junk

@@ -2535,7 +2535,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     manifest_veto = ([f"this round read a MANIFEST of a move, not the code — "
                       f"{pre.shape.moved:,} relocated lines went unread by every seat"]
                      if pre.verdict == "manifest" else [])
-    veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target))
+    # `ci_status` here is `review_ci_settled`'s answer — the one taken before the
+    # seats were dispatched and after #501's bounded wait, which is the same value
+    # the payload records and the report prints. Not re-read: a second fetch at the
+    # end of the round would judge the round's confidence on a build that finished
+    # after the seats had already reviewed without it.
+    #
+    # `ci_declared_absent` is the repo's own written answer to the question the CI
+    # veto asks, read from the SAME key `preland` reads and refuses `none` by
+    # pointing at. Read straight rather than through `preland.disabled_checks`,
+    # which validates the list and hard-exits on a name nothing recognises: that is
+    # the right behaviour for a merge gate, whose whole job is the checks, and the
+    # wrong one for a read-only review that would then refuse to run over a typo in
+    # a section it does not otherwise touch. A malformed list simply does not
+    # contain "ci", so the veto stands — the strict direction — and preland still
+    # hard-exits on it at land time, where it matters.
+    _off = (cfg.get("preland") or {}).get("disabled_checks")
+    # `isinstance(..., list)` is not defensive noise. `"ci" in "ci"` is True, and so
+    # is `"ci" in "cinema"` — a `disabled_checks` written as a bare string rather
+    # than a list would hand out the exemption by substring, which is the fail-OPEN
+    # direction on the one setting here that can buy a confident stop.
+    ci_declared_absent = isinstance(_off, list) and "ci" in _off
+    veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target),
+                          ci_status=ci_status,
+                          ci_declared_absent=ci_declared_absent)
             + manifest_veto + judge_gaps + inherited + prior.problems)
     # Declared this round, plus every key an earlier round declared. The earliest
     # round that said so owns the answer, so `prior` wins a collision — a caller

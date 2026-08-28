@@ -981,6 +981,29 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   list looking fixed. `/panel-review-pr` drives several rounds, so exempting only
   `coverage_veto` would have undone the change exactly where it matters. A budget
   truncation still carries: raise the number and the next round really does read it.
+- **No settled CI result is its own veto, and it is not the same as nothing read**
+  (#546). Every bullet above asks whether a seat read the diff; a round can satisfy
+  all of them and still have had no test run against the code. `ci_status` used to
+  reach the report as a warning and `coverage_veto` not at all, so a round whose
+  full suite passed on the exact commit and one where **no run exists** were the
+  same round as far as `confident` was concerned. `PASS` and `FAIL` do not veto: a
+  red suite is *evidence*, `ci_brief` already tells the seats to reason from it,
+  and `preland.check_ci` refuses the merge on it anyway. The other four each veto
+  in **their own sentence**, and the wording matters because only two of them are
+  claims about execution — `none` (nothing ran) and `blocked` (#324: a run exists,
+  is gated on a person and has executed nothing) — while `PENDING` is #501's
+  residue after the bounded wait and may hold green checks, and `unknown` is a
+  lookup that failed and says nothing either way. Could-not-check is not
+  nothing-to-report.
+  **One exemption, off recorded state:** a repo that has written
+  `"preland": {"disabled_checks": ["ci"]}` — the declaration `preland.check_ci`
+  refuses `none` by naming — is not asked again every round, because there the
+  veto would be the standing constant the bullet above rules out. Exactly `none`,
+  since the declaration explains an absent run and not a gated, unsettled or
+  unreadable one; an **unexplained** `none` still vetoes. The set is written as
+  the two states that do NOT veto, so a CI state added later vetoes until somebody
+  argues it out, and `ci_status` is keyword-only with no default so a caller
+  cannot forget it and quietly buy a confident stop.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause

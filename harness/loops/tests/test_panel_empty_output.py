@@ -350,7 +350,7 @@ def test_narration_passes_the_emptiness_guard_but_is_still_not_a_clean_review(mo
     # is null (never said), not [] (asked, and had no gap).
     assert got.could_not_assess is None
     veto = panel.coverage_veto(
-        {"antigravity": {"ran": True, "unstructured": True}}, None, [], len(NARRATION))
+        {"antigravity": {"ran": True, "unstructured": True}}, None, [], len(NARRATION), ci_status="PASS")
     assert any("no structured reply" in v for v in veto)
 
 

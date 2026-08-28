@@ -860,7 +860,7 @@ def test_a_capped_seat_that_is_cut_off_records_a_skip_and_vetoes(monkeypatch):
     assert got.skip and panel.BUDGET_EXHAUSTED in got.skip
     assert got.absent is False, "a spent cap is not a missing CLI"
     veto = panel.coverage_veto(
-        {"claude": {"ran": False, "skip": got.skip, "absent": False}}, None, 0, 1_000)
+        {"claude": {"ran": False, "skip": got.skip, "absent": False}}, None, 0, 1_000, ci_status="PASS")
     assert any(panel.BUDGET_EXHAUSTED in v for v in veto)
 
 

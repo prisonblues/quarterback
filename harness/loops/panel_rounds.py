@@ -1915,8 +1915,83 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     return b
 
 
+#: The two CI states that carry a SETTLED result — a suite ran on this exact
+#: commit and reported. Green is evidence the project's own tests pass; red is
+#: evidence they do not, and `ci_brief` already tells every seat to "treat that as
+#: a fact you may reason from, not as a finding to re-report". A round that read a
+#: real failure is not a round that read nothing, and `preland.check_ci` refuses
+#: the merge on red anyway, so FAIL costs the round nothing here. That division is
+#: only sound while both gates are applied: this says the round HAD evidence, never
+#: that a red build is harmless.
+#:
+#: Written as the states that DO NOT veto rather than as the four that do, and that
+#: is the fail-closed direction on purpose: a seventh CI state added to
+#: `CI_STATE_WORDS` next year vetoes until somebody argues it into this set, rather
+#: than passing silently the way `none` did before #546.
+CI_SETTLED = frozenset({"PASS", "FAIL"})
+
+#: One sentence per state, because each says a different thing — the discipline
+#: `_ci_line` and `ci_brief` already keep, and the reason #548 is a separate issue
+#: from this one. Every line names a cause somebody can discharge; none of them is
+#: discharged by a human acknowledging it.
+#:
+#: "No settled result" and NOT "nothing executed", which is the stronger claim and
+#: is false of two of these four: `PENDING` can be a suite whose other checks have
+#: already passed, and `unknown` is a lookup that failed and says nothing either
+#: way about what ran. Only `none` and `blocked` are claims about execution. The
+#: veto is the same for all four — none of them gives the round a result to earn
+#: its confidence on — but the wording has to survive being read closely, because
+#: could-not-check is not nothing-to-report and this whole change is about not
+#: conflating those.
+CI_UNSETTLED = {
+    # #501 already gives a PENDING build a bounded wait before the seats are
+    # dispatched. This is the residue AFTER that wait — the honest case its own
+    # docstring names — not a substitute for it. Deliberately not "nothing ran":
+    # `review_ci` reports PENDING when ANY check is pending, and the others may
+    # have finished green.
+    "PENDING": "CI had not settled when the seats were dispatched — no complete "
+               "suite result exists for this commit yet",
+    # The case #546 is about, and one of the two here that really is a statement
+    # about execution. #324 is what made this distinguishable from `blocked` at
+    # all, and #548 is the proposal to fill the empty channel at source rather
+    # than only pricing its emptiness here.
+    "none": "no CI run exists for this commit — nothing mechanical executed "
+            "this code",
+    # #324's state, and it must not borrow `none`'s sentence: a run EXISTS. It
+    # simply will not execute until a person clicks, so it contributes nothing.
+    "blocked": "a CI run exists for this commit and is gated on a human "
+               "approval — it has executed nothing",
+    # Not "nothing ran" — nobody knows whether anything ran. Could-not-check is
+    # not nothing-to-report, and stating it as the former would be the same
+    # conflation this veto exists to undo.
+    "unknown": "CI could not be read — whether anything executed this code is "
+               "unknown",
+}
+
+#: The one state a repo can declare its way out of, and the declaration that does
+#: it. `preland.check_ci` refuses `none` with, in its own words, *"if this repo
+#: genuinely has no CI, say so with `"preland": {"disabled_checks": ["ci"]}` in
+#: .harness-rules rather than reading silence as green"* — so a repo that HAS
+#: said so has answered this question in writing, and asking it again every round
+#: is `coverage_veto`'s own forbidden constant: an observation true of every round
+#: the repo will ever run, which distinguishes nothing and makes `confident`
+#: unreachable rather than rare.
+#:
+#: Exactly `none`, and not the other three. The declaration explains an ABSENT
+#: run; it does not explain a run that exists and is gated, a suite that did not
+#: settle, or a lookup that failed — each of those contradicts the declaration
+#: rather than being covered by it, and a repo with no CI cannot produce them.
+#:
+#: Recorded state, like every other exemption in this file: a key in a rules file,
+#: not a model's prose and not a seat's account of itself. And an EXPLICIT one —
+#: an unexplained `none` still vetoes, which is the whole difference between "this
+#: repo has no CI" and "nothing ran on this commit".
+CI_NOT_APPLICABLE = "none"
+
+
 def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
-                  flagged: int, diff_chars: int) -> list[str]:
+                  flagged: int, diff_chars: int, *, ci_status: str,
+                  ci_declared_absent: bool = False) -> list[str]:
     """Reasons a quiet round is not evidence of a quiet PR.
 
     A counter cannot tell a genuinely dry round from a broken one — a reviewer
@@ -1945,7 +2020,46 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     declaration, and each has a floor beneath it so that exempting seats one at a
     time cannot empty the list on a round where nothing was read. Every other way
     of coming up short — a crash, a timeout, a budget someone typed, a reply that
-    would not parse — is about THIS run and still vetoes."""
+    would not parse — is about THIS run and still vetoes.
+
+    **`ci_status` asks the same question about EXECUTION EVIDENCE that everything
+    above asks about READING** (#546). Every observation above is about whether a
+    seat saw the diff; a round can satisfy all of them and still have had no test
+    run against the code. Until #546 that fact reached
+    the report as a warning and reached this function not at all, so a round with a
+    green suite behind it and a round where no run exists were the same round as
+    far as `confident` was concerned. It is `coverage_veto`'s shape and not a
+    seat's: derived from recorded state (`review_ci_settled`'s answer), one line,
+    no adjudication, no exemption doctrine — where today the same fact arrives as
+    four seats each declaring in prose that they could not run the tests.
+
+    It distinguishes four things rather than merging them, and the wording of each
+    line is load-bearing: a settled result exists (`PASS`/`FAIL`), no run executed
+    (`none`), a run exists and is gated so it executed nothing (`blocked`), and the
+    result is not settled or not readable (`PENDING`, `unknown`). Only the middle
+    two are claims about EXECUTION — a `PENDING` suite may have several green
+    checks in it, and `unknown` is a lookup that failed and says nothing either way.
+    Could-not-check is not nothing-to-report, so each keeps its own sentence, as it
+    does in `ci_brief`.
+
+    **The one exemption, and why it is not the constant the paragraph above rules
+    out.** An absent CLI is true of every round this box will ever run and says
+    nothing about any of them; "nothing executed" is false the moment CI runs, so
+    on a repo that has CI it is a fact about the round and vetoes. On a repo that
+    genuinely has none it WOULD be a standing veto — so `ci_declared_absent`
+    carries the declaration `preland.check_ci` already asks such a repo to make
+    (`"preland": {"disabled_checks": ["ci"]}`), and a repo that has made it is not
+    asked again every round. Exactly `none` is exempted; see
+    :data:`CI_NOT_APPLICABLE`. An UNEXPLAINED `none` still vetoes, which is the
+    whole distance between "this repo has no CI" and "nothing ran on this commit".
+
+    `ci_status` is keyword-only and has NO DEFAULT, which is the fail-closed
+    direction: a caller that forgets it raises rather than quietly buying a
+    confident stop for a round with no settled CI result behind it, which is the
+    failure mode this whole function exists to make impossible. `ci_declared_absent`
+    does default, because its default is the STRICT answer — a caller that knows
+    nothing about the repo's rules has not been told CI is inapplicable, and must
+    not assume it."""
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -2028,6 +2142,16 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     if ran and all(m.get("truncated") and m.get("argv_capped") for m in ran):
         out.append("every reviewer that ran was cut by the argv ceiling — "
                    "nothing read this diff whole")
+    # Read off the state `review_ci_settled` RECORDED, never off `ci_brief`'s
+    # prose or a seat's account of it — the same rule every exemption above
+    # keeps, applied to an inclusion. The fallback line is reached only by a
+    # status outside the six `CI_STATE_WORDS` names; it vetoes rather than
+    # passing, because a status this function does not recognise is not a pass.
+    exempt = ci_declared_absent and ci_status == CI_NOT_APPLICABLE
+    if ci_status not in CI_SETTLED and not exempt:
+        out.append(CI_UNSETTLED.get(
+            ci_status, f"CI reported {ci_status or 'nothing'} — no settled "
+                       "suite result for this commit"))
     if judge_skip:
         # Phrased for both halves of the judge's job: on a round with no findings
         # it is the coverage split that went unadjudicated, not the findings.
@@ -4132,7 +4256,8 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "load_baseline", "coverage_veto", "round_stop",
+    "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "CI_NOT_APPLICABLE", "round_stop",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
