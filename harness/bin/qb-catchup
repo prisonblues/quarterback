@@ -37,9 +37,15 @@
 #     mean rewriting a live checkout because the board was down. A board that is
 #     unreachable must never become a licence.
 #   * a dirty tree, holder or not
-#   * unpushed commits — the failure #45 actually suffered. Said loudly, because
-#     a checkout whose only copy of some work is local is the one thing here that
-#     cannot be reconstructed from the remote.
+#   * commits that are on NO REMOTE REF — the failure #45 actually suffered, and
+#     the one thing here that cannot be reconstructed from the remote. The question
+#     is `git rev-list <branch> --not --remotes` and never `<branch>
+#     ^origin/<branch>` (#573). Those are different questions and the second is
+#     wrong in both directions at once: on zeus it called six worktrees endangered
+#     that were ancestors of `origin/main` in their entirety, and said nothing
+#     whatever about the five that really were carrying work no remote had — a
+#     branch nobody ever pushed has no `origin/` ref to be compared against, so the
+#     largest hoards on the machine were the ones it could not see.
 #   * a branch that has DIVERGED from its upstream. Fast-forward means
 #     fast-forward: if HEAD is not already a strict ancestor, this reports it and
 #     stops. Most re-integrations are fast-forwards; the interesting ones are
@@ -53,6 +59,19 @@ set -uo pipefail
 
 PROG=${0##*/}
 FETCH_TIMEOUT=20        # seconds; a slow remote must not hold a hook open
+
+# How long a commit may sit on a branch and on no remote before this stops calling
+# it work in flight. AGE IS THE SIGNAL, NOT THE COUNT — a sweep that says the same
+# number after every merge is wallpaper inside a week, and there is no count this
+# fleet reaches that would be green: something is always mid-flight. Unpushed for
+# an hour is the ordinary state of work; unpushed for nineteen days is the only
+# copy of it in the world.
+#
+# 24 is `qb-doctor`'s UNPUSHED_GRACE_HOURS and must stay so: two tools disagreeing
+# about whether the same branch is a problem is worse than either being wrong on
+# its own. Nothing can import a Python constant into a shell script, so a test
+# reads the number out of both and fails when they drift.
+STRANDED_GRACE_HOURS=24
 DIR="."
 DRY=0
 QUIET=0
@@ -89,6 +108,65 @@ if [ "$FETCH" = 1 ]; then
     git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || true
   fi
 fi
+
+# CAN `--not --remotes` BE TRUSTED IN THIS REPOSITORY? Once for the sweep, not once
+# per worktree: remotes and their refspecs live in the common git dir, so every
+# worktree gets the same answer.
+#
+# `--remotes` means every remote-tracking ref there is, which is the whole point —
+# a commit is only stranded if NOTHING anywhere has it, and subtracting one remote
+# while trusting all of them is how this reports work as lost that was pushed to
+# another. The trap is a remote whose fetch refspec does not bring back
+# `refs/heads/*`: a single-branch clone configures
+# `+refs/heads/main:refs/remotes/origin/main`, so `refs/remotes/` is complete for
+# `main` and empty for everything else, and every feature branch on the server
+# would answer here as work that exists only on this disk. That is #573's
+# cry-wolf failure arriving through the refspec instead of through the comparison.
+# Codex found it in `qb-doctor`'s equivalent row; it is the same trap in a
+# different language, so it gets the same guard rather than a second discovery.
+#
+# ASK_STRANDED=0 with a reason means the question is refused and said once, up
+# here, rather than guessed at a hundred times below. ASK_STRANDED=0 with NO reason
+# is the repository that has no remote at all, where the question does not arise:
+# there is no elsewhere for a commit to be.
+#
+# What this does NOT guard is staleness. `--remotes` reads the refs on disk, so a
+# fetch that timed out or a `--no-fetch` run measures against what was true at the
+# last fetch — exactly as the upstream comparison it replaces did. The error is in
+# the loud direction, which is the right one for a warning: a branch pushed since
+# reads as stranded until the next sweep, never the reverse.
+ASK_STRANDED=1
+ASK_WHY=""
+if ! REMOTES=$(git -C "$DIR" remote 2>/dev/null); then
+  ASK_STRANDED=0
+  ASK_WHY="git would not list this repository's remotes, so what exists only on this disk was not asked"
+elif [ -z "$REMOTES" ]; then
+  ASK_STRANDED=0
+else
+  while IFS= read -r rem; do
+    [ -n "$rem" ] || continue
+    if ! git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null \
+         | sed 's/^+//; s/:.*//' | grep -qx 'refs/heads/\*'; then
+      ASK_STRANDED=0
+      ASK_WHY="\`$rem\` does not fetch \`refs/heads/*\`, so its tracking refs cover some branches and not others and what exists only on this disk was not asked"
+      break
+    fi
+  done <<< "$REMOTES"
+fi
+[ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
+
+# `_spell_since` in qb-doctor, in shell and for the same reason: the reader has to
+# feel a fortnight at a glance, and "27360 minutes" reads as a number rather than
+# as a length of time.
+spell_age() {   # spell_age <minutes>
+  if [ "$1" -lt 90 ]; then
+    if [ "$1" = 1 ]; then printf '1 minute'; else printf '%d minutes' "$1"; fi
+  elif [ "$1" -lt 2880 ]; then
+    printf '%d hours' $(($1 / 60))
+  else
+    printf '%d days' $(($1 / 1440))
+  fi
+}
 
 # Resolved once rather than per worktree — this loops over every one of them, and
 # `command -v` inside was pure repetition. Same resolution order as everywhere
@@ -146,6 +224,56 @@ while IFS= read -r wt; do
     SKIPPED=$((SKIPPED + 1)); continue
   fi
 
+  # WHAT EXISTS ONLY ON THIS DISK — and the question is emphatically not "is it
+  # ahead of its upstream". `git rev-list <branch> --not --remotes` is the commits
+  # reachable from this branch and from no remote-tracking ref anywhere;
+  # `<branch> ^origin/<branch>` is the commits its own remote branch has not got,
+  # which for a branch that merged and had its remote deleted is every merge commit
+  # on it — all of them sitting on `origin/main`.
+  #
+  # MEASURED HERE, BEFORE THE UPSTREAM IS RESOLVED, because the branches the old
+  # question was worst about are the ones that never reach a comparison at all: a
+  # branch nobody has pushed leaves this loop a few lines below with "no upstream,
+  # nothing to catch up to", and on zeus the two largest hoards of unpushed work on
+  # the machine were behind exactly that line. It is a local ref walk, so it belongs
+  # with the other cheap local facts and above the board round trip.
+  #
+  # `--` terminates the revision list: a branch sharing a name with a path in the
+  # working tree must not turn this into a question about a file.
+  stranded_state=unknown
+  stranded_note=""
+  if [ "$ASK_STRANDED" = 1 ]; then
+    if dates=$(git -C "$wt" log --format=%ct "$branch" --not --remotes -- 2>/dev/null); then
+      stranded_n=0; oldest=""
+      # Newest first, so the last line is the oldest and the age this turns on.
+      while IFS= read -r ts; do
+        [ -n "$ts" ] || continue
+        stranded_n=$((stranded_n + 1)); oldest=$ts
+      done <<< "$dates"
+      if [ "$stranded_n" = 0 ]; then
+        stranded_state=none
+      else
+        stranded_state=some
+        if [ "$stranded_n" = 1 ]; then
+          noun="1 commit"; verb=is
+        else
+          noun="$stranded_n commits"; verb=are
+        fi
+        age_m=$(( ($(date +%s) - oldest) / 60 ))
+        if [ "$age_m" -lt 0 ]; then
+          # A committer date in the future is clock skew or a rewritten history, and
+          # either way the age this turns on is not a measurement. Report the count
+          # and refuse the verdict rather than picking whichever side the skew lands.
+          stranded_note=" — $noun on it $verb on no remote ref, dated ahead of this clock, which is not an age this can measure"
+        elif [ "$age_m" -lt $((STRANDED_GRACE_HOURS * 60)) ]; then
+          stranded_note=" — $noun on it $verb not on any remote yet, the oldest $(spell_age "$age_m") old: work in flight, which is the ordinary state"
+        else
+          stranded_note=" — $noun on it $verb on no remote ref, the oldest $(spell_age "$age_m") old: if this disk failed that work is gone"
+        fi
+      fi
+    fi
+  fi
+
   # THE EXIT STATUS, NOT THE OUTPUT, and the difference is a whole second case.
   # `rev-parse --abbrev-ref --symbolic-full-name '@{u}'` on a branch whose
   # upstream ref is GONE — the ordinary state of a worktree left lying around
@@ -169,14 +297,24 @@ while IFS= read -r wt; do
     # is almost always finished with, and the useful next move is to drop the
     # worktree rather than to go looking for a fault.
     if git -C "$wt" config --get "branch.$branch.merge" >/dev/null 2>&1; then
-      say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with"
+      if [ "$stranded_state" = some ]; then
+        # "Finished with" is the one conclusion this state must never reach while
+        # the branch still carries commits no remote has — and the deleted upstream
+        # is precisely what made them unreachable from any remote ref. This is the
+        # shape that loses work, and the shape the old question was blind to twice
+        # over: it never ran here, and where it did run it was answering about a
+        # ref that no longer exists.
+        say "  · $name ($branch) — its upstream is gone, but this worktree is not finished with$stranded_note"
+      else
+        say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with"
+      fi
     else
-      say "  · $name ($branch) — no upstream, nothing to catch up to"
+      say "  · $name ($branch) — no upstream, nothing to catch up to$stranded_note"
     fi
     SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [ -z "$up" ]; then
-    say "  · $name ($branch) — no upstream, nothing to catch up to"
+    say "  · $name ($branch) — no upstream, nothing to catch up to$stranded_note"
     SKIPPED=$((SKIPPED + 1)); continue
   fi
 
@@ -226,27 +364,39 @@ while IFS= read -r wt; do
   behind=$(printf '%s' "$state" | cut -f1)
   ahead=$(printf '%s' "$state" | cut -f2)
   case "${behind:-x}${ahead:-x}" in *x*)
-      say "  · $name ($branch) — git would not say where it stands, left alone"
+      say "  · $name ($branch) — git would not say where it stands, left alone$stranded_note"
       SKIPPED=$((SKIPPED + 1)); continue ;;
   esac
 
   if [ "$ahead" != 0 ] && [ "$behind" != 0 ]; then
-    say "  · $name ($branch) — $behind behind and $ahead ahead of $up: that is a rebase, not a fast-forward. Left alone."
+    say "  · $name ($branch) — $behind behind and $ahead ahead of $up: that is a rebase, not a fast-forward. Left alone.$stranded_note"
     SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [ "$ahead" != 0 ]; then
-    # LOUDLY. This is the one state where the only copy of somebody's work is in
-    # this directory, and it is the state #45 was actually in.
-    say "  · $name ($branch) — $ahead unpushed commit(s), left alone. Push them or they exist nowhere else."
+    # AHEAD OF ITS UPSTREAM IS A FACT ABOUT THE FAST-FORWARD, AND NOTHING MORE.
+    # It is why this worktree cannot be moved, and it is not evidence that anything
+    # here is at risk: five of the six worktrees this used to shout about on zeus
+    # were ancestors of `origin/main` in their entirety, with their own `origin/`
+    # ref deleted underneath them by the merge that landed them. Whether any of it
+    # exists only on this disk is a separate question, already asked above.
+    case "$stranded_state" in
+      none) say "  · $name ($branch) — $ahead ahead of $up, and nothing on it is missing from every remote, left alone" ;;
+      *)    say "  · $name ($branch) — $ahead ahead of $up, left alone$stranded_note" ;;
+    esac
     SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [ "$behind" = 0 ]; then
-    say "  · $name ($branch) — already current"
+    # `$stranded_note` is normally empty in every branch below this line: nothing is
+    # 0 ahead of a REMOTE-tracking ref and yet missing from every remote. It is not
+    # empty when the upstream is a LOCAL branch (`branch.<x>.remote = .`), which git
+    # allows and which nothing else here rules out, so the annotation is carried
+    # rather than assumed away.
+    say "  · $name ($branch) — already current$stranded_note"
     continue
   fi
 
   if [ "$DRY" = 1 ]; then
-    say "  → $name ($branch) — would fast-forward $behind commit(s) to $up"
+    say "  → $name ($branch) — would fast-forward $behind commit(s) to $up$stranded_note"
     MOVED=$((MOVED + 1)); continue
   fi
 
@@ -255,7 +405,7 @@ while IFS= read -r wt; do
   # the branch, and the flag is what makes that a refusal rather than a merge
   # commit nobody asked for.
   if err=$(git -C "$wt" merge --ff-only "$up" 2>&1 >/dev/null); then
-    say "  ✓ $name ($branch) — fast-forwarded $behind commit(s) to $up"
+    say "  ✓ $name ($branch) — fast-forwarded $behind commit(s) to $up$stranded_note"
     MOVED=$((MOVED + 1))
   else
     say "  ✗ $name ($branch) — fast-forward refused: $(printf '%s' "$err" | head -1)"

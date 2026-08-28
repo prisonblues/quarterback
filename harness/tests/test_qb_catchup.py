@@ -20,8 +20,10 @@ Run: pytest harness/tests
 """
 
 import os
+import re
 import shutil
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,10 +37,23 @@ def git(where, *args, check=True):
                           capture_output=True, text=True, check=check)
 
 
-def commit(where, name, text="x"):
+def commit(where, name, text="x", days_ago=0):
+    """A commit, optionally dated into the past.
+
+    `days_ago` exists because the verdict this tool now reaches turns on AGE and not
+    on count (#573): the same two commits are the ordinary state of work this morning
+    and a single point of failure a fortnight later, and only a dated fixture can tell
+    those two apart.
+    """
     (Path(where) / name).write_text(text)
     git(where, "add", name)
-    git(where, "-c", "user.email=t@e", "-c", "user.name=T", "commit", "-qm", name)
+    env = None
+    if days_ago:
+        when = (datetime.now(UTC) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S%z")
+        env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
+    subprocess.run(["git", "-C", str(where), "-c", "user.email=t@e", "-c", "user.name=T",
+                    "commit", "-qm", name],
+                   capture_output=True, text=True, check=True, env=env)
 
 
 @pytest.fixture
@@ -84,6 +99,16 @@ def fleet(tmp_path):
             d = tmp_path / f"proj-{branch.replace('/', '-')}"
             git(main, "worktree", "add", "-q", "-b", branch, str(d), at or "main")
             return d
+
+        def land_branch(self, branch):
+            """Merge `branch` into main on the remote, the way a PR merge does — and
+            leave `origin/<branch>` where it was, which is the state #573 is about."""
+            git(self.elsewhere, "fetch", "-q", "origin")
+            git(self.elsewhere, "checkout", "-q", "main")
+            git(self.elsewhere, "reset", "-q", "--hard", "origin/main")
+            git(self.elsewhere, "merge", "-q", "--no-ff", "-m", f"Merge {branch}",
+                f"origin/{branch}")
+            git(self.elsewhere, "push", "-q", "origin", "main")
 
         def land_upstream(self, name="landed"):
             """Advance origin/main the way another machine's merge would."""
@@ -224,14 +249,16 @@ def test_a_worktree_with_uncommitted_changes_is_left_alone(fleet):
     assert fleet.head(fleet.main) == before
 
 
-def test_unpushed_commits_are_left_alone_and_said_loudly(fleet):
+def test_work_on_no_remote_is_left_alone_and_said_loudly(fleet):
     """The state #45 was actually in, and the one thing here that cannot be
-    reconstructed from the remote."""
-    commit(fleet.main, "mine-only")
+    reconstructed from the remote — now asked as `--not --remotes` and dated."""
+    commit(fleet.main, "mine-only", days_ago=19)
     done = fleet.run()
     assert done.returncode == 0, done.stderr
-    assert "unpushed" in done.stdout, done.stdout
-    assert "exist nowhere else" in done.stdout, "the loud part is the point"
+    assert "on no remote ref" in done.stdout, done.stdout
+    assert "19 days old" in done.stdout, done.stdout
+    assert "if this disk failed that work is gone" in done.stdout, "the loud part is the point"
+    assert fleet.head(fleet.main) == git(fleet.main, "rev-parse", "HEAD").stdout.strip()
 
 
 def test_a_diverged_branch_is_a_rebase_and_is_refused(fleet):
@@ -443,3 +470,172 @@ def test_a_branch_that_never_had_an_upstream_still_says_so(fleet):
     assert done.returncode == 0, done.stderr
     assert "no upstream, nothing to catch up to" in done.stdout, done.stdout
     assert "upstream is gone" not in done.stdout
+
+
+# ------------------------------------------------- what exists nowhere else (#573)
+#
+# The loud line used to decide on `<branch> ^origin/<branch>` — the branch against its
+# own remote ref — and that is a different question from the one it was printing an
+# answer to. Measured on zeus the day #573 was filed, it named six worktrees as work
+# that existed nowhere else; every one of the six was an ancestor of `origin/main` in
+# its entirety. In the same sweep, five worktrees really were carrying commits no
+# remote had and it said nothing about any of them.
+
+
+def test_a_branch_caught_up_with_main_is_ahead_of_its_own_ref_and_not_endangered(fleet):
+    """RED/GREEN, and the exact shape #573 was filed about: `feat/issue-262` on zeus.
+
+    A PR merges, the local branch is fast-forwarded onto `origin/main` — by this very
+    tool, among other things — and it is now ahead of `origin/<branch>`, which still
+    points at the pre-merge tip. Every commit in that gap is on `origin/main`. Nothing
+    about it is at risk and the old line called it the only copy in the world.
+    """
+    wt = fleet.worktree("feat/landed")
+    commit(wt, "the-work")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    fleet.land_branch("feat/landed")
+    git(fleet.main, "fetch", "-q", "origin")
+    git(wt, "merge", "-q", "--ff-only", "origin/main")
+
+    naive = int(git(wt, "rev-list", "--count", "feat/landed",
+                    "^origin/feat/landed").stdout.strip())
+    assert naive > 0, "the near-miss has to fire, or this test proves nothing"
+    assert int(git(wt, "rev-list", "--count", "feat/landed",
+                   "--not", "--remotes", "--").stdout.strip()) == 0
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "nothing on it is missing from every remote" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_branch_that_was_never_pushed_is_found_although_it_has_no_upstream(fleet):
+    """The blind spot, and the worse half of the two failures.
+
+    `origin/<branch>` cannot be compared against when it does not exist, so a branch
+    nobody ever pushed was invisible — including the two largest hoards on zeus,
+    `feat/qb-dash-merged` (8 commits) and `feat/qb-dash-buttons` (5). This worktree
+    exits the sweep before the upstream comparison is ever reached, which is why the
+    measurement is taken above it.
+    """
+    wt = fleet.worktree("feat/never-pushed")
+    commit(wt, "only-here", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "no upstream, nothing to catch up to" in done.stdout, done.stdout
+    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+    assert "19 days old" in done.stdout, done.stdout
+
+
+def test_an_upstream_that_is_gone_is_not_finished_with_while_it_carries_work(fleet):
+    """RED/GREEN. `fix/issue-44` on zeus: one commit on no remote anywhere, and the
+    sweep telling the reader the worktree was finished with.
+
+    The deleted upstream is precisely what made those commits unreachable from any
+    remote ref, so this is the state in which "probably merged and deleted" is not
+    merely unhelpful but backwards.
+    """
+    wt = fleet.worktree("feat/landed")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    git(fleet.main, "push", "-q", "origin", "--delete", "feat/landed")
+    git(fleet.main, "fetch", "-q", "--prune", "origin")
+    commit(wt, "written-after-the-delete", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "its upstream is gone, but this worktree is not finished with" in done.stdout
+    assert "so this worktree is finished with" not in done.stdout, done.stdout
+    assert "if this disk failed that work is gone" in done.stdout, done.stdout
+
+
+def test_work_from_this_morning_is_in_flight_and_not_a_loss(fleet):
+    """AGE IS THE VERDICT, NOT THE COUNT. This sweep runs on every merge, so a line
+    that says the same alarming thing every time is wallpaper inside a week — and
+    something is always mid-flight on a working machine."""
+    commit(fleet.main, "mine-only")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "work in flight, which is the ordinary state" in done.stdout, done.stdout
+    assert "if this disk failed" not in done.stdout, done.stdout
+
+
+def test_the_line_reports_and_does_not_instruct(fleet):
+    """`qb-catchup` runs unattended from a hook, and the remedy is a decision per
+    branch rather than a push: several of these are abandoned experiments, pushing
+    them litters the remote with branches nobody wants, and on zeus at least one
+    duplicated work that had already landed by another route."""
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "Push them" not in done.stdout, done.stdout
+    assert "unpushed commit" not in done.stdout, done.stdout
+
+
+def test_a_remote_whose_refs_do_not_cover_every_head_refuses_the_question(fleet):
+    """Codex's finding on `qb-doctor`'s equivalent row (#567), which is the same trap
+    in a different language and therefore gets the same guard rather than a second
+    discovery. A single-branch clone configures
+    `+refs/heads/main:refs/remotes/origin/main`, so `refs/remotes/` is complete for
+    `main` and empty for everything else — and `--not --remotes` would then call every
+    feature branch on the server work that exists only on this disk. That is #573's
+    own cry-wolf failure, arriving through the refspec instead of the comparison."""
+    wt = fleet.worktree("feat/on-the-server")
+    commit(wt, "pushed-and-safe")
+    git(wt, "push", "-q", "origin", "feat/on-the-server")
+    # Exactly the state that refspec leaves behind: the branch is on the server and
+    # nothing here has a ref for it.
+    git(fleet.main, "config", "remote.origin.fetch",
+        "+refs/heads/main:refs/remotes/origin/main")
+    git(fleet.main, "update-ref", "-d", "refs/remotes/origin/feat/on-the-server")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "does not fetch `refs/heads/*`" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, "it answered a question it had refused"
+
+
+def test_a_repository_with_no_remote_says_nothing_about_stranded_work(fleet):
+    """There is no elsewhere for a commit to be, so nothing here is stranded and the
+    question does not arise. `qb-doctor` reaches the same conclusion in the same
+    shape."""
+    git(fleet.main, "remote", "remove", "origin")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "on no remote ref" not in done.stdout, done.stdout
+    assert "does not fetch" not in done.stdout, done.stdout
+
+
+# ------------------------------------------------ the two tools have to agree (#573)
+#
+# `qb-doctor` is Python and `qb-catchup` is shell, so the logic is DUPLICATED and not
+# shared: there is nothing a 5000-line Python module and a hook-budget shell script
+# can import from one another, and a shell-out from the sweep would put a Python
+# start-up per worktree inside a 20-second budget. What can be shared is the answer,
+# and these two tests are what keep the duplicate honest — because two tools
+# disagreeing about "does this work exist elsewhere" is worse than either being wrong
+# on its own.
+
+
+def test_both_tools_ask_git_the_same_question():
+    catchup = (BIN / "qb-catchup").read_text()
+    doctor = (BIN / "qb-doctor").read_text()
+    assert '"$branch" --not --remotes --' in catchup, (
+        "the sweep must ask `--not --remotes`, never `origin/<branch>`")
+    assert re.search(r'"--not",\s*"--remotes"', doctor), (
+        "qb-doctor's query moved; qb-catchup was written to match it")
+
+
+def test_the_grace_window_agrees_with_qb_doctor():
+    catchup = (BIN / "qb-catchup").read_text()
+    doctor = (BIN / "qb-doctor").read_text()
+    mine = re.search(r"^STRANDED_GRACE_HOURS=(\d+)$", catchup, re.M)
+    theirs = re.search(r"^UNPUSHED_GRACE_HOURS = (\d+)$", doctor, re.M)
+    assert mine and theirs, "one of the two constants was renamed"
+    assert mine.group(1) == theirs.group(1), (
+        "the sweep and the doctor would disagree about whether the same branch is a "
+        "problem, which is worse than either being wrong alone")
