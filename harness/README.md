@@ -1186,6 +1186,7 @@ either.
 ```bash
 qb-start /fix-issue 277               # a session working issue 277
 qb-start /panel-review-pr 352         # …reviewing PR 352
+qb-start /get-involved                # …taking its own next item off the plan (#541)
 qb-start --dry-run /fix-issue 277     # every refusal, nothing started
 qb-start --policy --json              # what will this machine start? (starts nothing)
 qb-start --via dash /fix-issue 277    # …and record what pulled it
@@ -1214,6 +1215,25 @@ programs.quarterback-harness.spawn = {
   maxSessions = 1;                  # 0 is a freeze
 };
 ```
+
+**`/get-involved` takes no number, and allowing it implies allowing what it runs (#541).**
+Every other spawnable command is aimed at an issue or a PR; this one reads the plan and
+selects its own item, so the brief is the command alone and no claim is taken up front —
+the interlock moves inside the session, where `plan_claim` is atomic and is what makes
+three seats take three different items.
+
+Two consequences worth reading before switching it on:
+
+* **It dispatches**, into `/fix-issue`, `/fix-and-land`, `/review-pr` and
+  `/panel-review-pr`. A policy naming `/get-involved` without those is **refused**, rather
+  than granting them silently one hop along — otherwise the allowlist would say one thing
+  and permit another, on the one gate whose whole job is meaning exactly what it says.
+  `qb-start --policy` reports any command it lists but refuses, and why.
+* **It asks the board whether anything is free** before spawning, and refuses at exit 8 if
+  not. That is not dispatch — nothing is passed to the agent, and the item it eventually
+  claims may not be the one that was free — it is the refusal that costs nothing, because
+  the alternative is a session that starts, reads the plan, finds nothing and stops. This
+  one gate fails **open**: a board that did not answer has said nothing about the plan.
 
 **A malformed policy fails CLOSED, which is the opposite of `qb-admit` and is the same
 principle.** `in_flight.max` is a restriction, so failing open on a typo admits one agent too

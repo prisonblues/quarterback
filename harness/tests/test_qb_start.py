@@ -82,6 +82,7 @@ def stub_tool(path: Path, exit_code: int = 0, log: Path | None = None) -> None:
 
 
 def sandbox(tmp_path: Path, *, policy: object = "absent", explode: bool = True,
+            plan_next: object = "unset",
             pace: int = 0, admit: int = 0, claim: int = 0, release: int = 0,
             tmux_exit: int | None = 0, new_window_exit: int | None = None,
             set_option_exit: int | None = None,
@@ -109,6 +110,13 @@ class _Client:
         with open({str(posts)!r}, "a") as fh:
             fh.write(json.dumps({{"path": path, "body": body}}) + "\\n")
         return {{}}
+
+    def get(self, path, params=None):
+        # `unset` means this stub has no `get` worth speaking of, which is the
+        # pre-#541 board: qb-start's plan question then fails OPEN and says so.
+        if {plan_next!r} == "unset":
+            raise AttributeError("this stub board answers no reads")
+        return {{"next": {plan_next!r} or None}}
 
 
 def repo_slug(path="."):
@@ -880,14 +888,26 @@ def test_the_nix_module_and_the_script_agree_on_what_can_be_spawned():
     assert set(re.findall(r'"(/[a-z-]+)"', nix)) == read_spawnable()
 
 
-def test_every_spawnable_command_claims_something():
+def test_every_spawnable_command_says_what_it_claims_even_when_that_is_nothing():
     """A command whose unit of work nobody has worked out is a command that cannot
-    be started — not one that is started uncounted."""
+    be started — not one that is started uncounted.
+
+    Restated for #541 rather than relaxed. The old form read the ref kind out of
+    the table and required one for every entry, which WAS the arity check as long
+    as every command took a number. `/get-involved` takes none, so the invariant
+    is now: every entry names a kind, or names `None` deliberately — and `None`
+    means the session claims its own item once it has read the plan, never that
+    nobody thought about it. An entry the pattern below cannot match at all still
+    fails, which is the half that matters."""
     body = START.read_text()
-    block = body.split("SPAWNABLE = {", 1)[1].split("}", 1)[0]
-    kinds = dict(re.findall(r'"(/[a-z-]+)"\s*:\s*"([a-z]+)"', block))
-    assert set(kinds) == read_spawnable()
-    assert set(kinds.values()) <= {"issue", "pr"}
+    block = body.split("SPAWNABLE = {", 1)[1].split("\n}", 1)[0]
+    kinds = dict(re.findall(r'"(/[a-z-]+)":\s*Spawnable\(\s*(None|"[a-z]+")', block))
+    assert set(kinds) == read_spawnable(), "an entry nobody declared an arity for"
+    assert set(kinds.values()) <= {'"issue"', '"pr"', "None"}
+    claimless = {c for c, k in kinds.items() if k == "None"}
+    assert claimless == {"/get-involved"}, (
+        "a new claimless command needs the claim-skip path and its own test, not "
+        "just a table entry")
 
 
 def test_the_module_and_the_script_agree_on_the_policys_key_names():
@@ -913,3 +933,120 @@ def test_the_module_writes_the_policy_only_when_spawning_is_enabled():
     assert re.search(r"commands = lib\.mkOption \{\s*\n\s*type = lib\.types\.listOf "
                      r"lib\.types\.str;\s*\n\s*default = \[ \];", nix), \
         "spawn.commands must ship empty — that is the second lock"
+
+
+# ------------------------------------------------- #541: a command with no number
+
+#: A policy that admits `/get-involved` honestly — it and everything it dispatches
+#: into. Written out rather than computed, so a test cannot pass because the
+#: production table and the fixture drifted the same way.
+INVOLVED_OK = {"enabled": True, "max_sessions": 2, "commands": [
+    "/get-involved", "/fix-issue", "/fix-and-land", "/review-pr", "/panel-review-pr"]}
+
+
+def test_a_numberless_command_is_accepted_and_briefs_without_one(tmp_path):
+    """`/get-involved` reads the plan and self-selects, so there is no number to
+    pass. The brief must be the command ALONE — not `"/get-involved "` and not
+    `"/get-involved None"`, both of which a slash-command parser matching on
+    equality would miss."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next={"item_id": "x"})
+    got = run(box, "--dry-run", "/get-involved")
+    assert got.returncode == STARTED, got.stderr
+    assert "-- /get-involved" in got.stderr
+    assert "/get-involved None" not in got.stderr
+
+
+def test_a_numbered_command_still_refuses_a_missing_number(tmp_path):
+    """The arity moved into the table; it did not go away."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False)
+    got = run(box, "--dry-run", "/fix-issue")
+    assert got.returncode == MISUSE, got.stderr
+    assert "takes an issue or PR number" in got.stderr
+
+
+def test_a_number_handed_to_a_numberless_command_is_a_misuse(tmp_path):
+    """The other direction, and it is not pedantry: a caller passing a number
+    believes it has aimed this at something specific. Silently dropping it would
+    start a session that picks its own work while the caller's records say
+    otherwise."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False)
+    got = run(box, "--dry-run", "/get-involved", "7")
+    assert got.returncode == MISUSE, got.stderr
+    assert "takes no number" in got.stderr
+
+
+def test_the_claimless_path_takes_no_claim_and_releases_none(tmp_path):
+    """The work interlock moves inside the session (`plan_claim`), because which
+    item it takes is not known until it has read the plan. What must NOT happen is
+    a claim on the wrong thing — or a release of one that was never taken, on a
+    spawn that fails."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False,
+                  plan_next={"item_id": "x"}, new_window_exit=1)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START, got.stderr
+    assert not [c for c in got.ran if c[0] in ("qb-claim", "qb-release")], got.ran
+    assert "no claim was taken" in got.stderr
+
+
+def test_a_policy_allowing_get_involved_but_not_what_it_dispatches_is_refused(tmp_path):
+    """The second lock, kept true in fact rather than in form. `/get-involved`
+    runs `/fix-issue` one hop along, so a machine that allows the first and
+    withholds the second gets the second anyway — and its operator has no way to
+    see it, because `--policy` reports the allowlist."""
+    policy = {"enabled": True, "commands": ["/get-involved", "/review-pr",
+                                            "/panel-review-pr", "/fix-and-land"]}
+    box = sandbox(tmp_path, policy=policy, explode=False)
+    got = run(box, "--dry-run", "/get-involved")
+    assert got.returncode == NOT_ALLOWED, got.stderr
+    assert "/fix-issue" in got.stderr and "one hop along" in got.stderr
+
+
+def test_policy_reports_a_command_it_lists_but_refuses(tmp_path):
+    """A file that disagrees with itself is the one thing an operator cannot read
+    off the file."""
+    policy = {"enabled": True, "commands": ["/get-involved", "/review-pr",
+                                            "/panel-review-pr", "/fix-and-land"]}
+    got = run(sandbox(tmp_path, policy=policy, explode=False), "--policy")
+    assert got.returncode == STARTED, got.stderr
+    assert "listed but refused" in got.stderr
+    assert "/get-involved" in got.stderr
+
+
+def test_dry_run_prints_a_claim_line_for_a_numbered_command_and_not_otherwise(tmp_path):
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next={"item_id": "x"})
+    numbered = run(box, "--dry-run", "/fix-issue", "277")
+    assert "claim:    issue 277" in numbered.stderr, numbered.stderr
+    involved = run(box, "--dry-run", "/get-involved")
+    assert "claim:    none" in involved.stderr, involved.stderr
+
+
+def test_a_plan_with_nothing_free_refuses_before_a_session_exists(tmp_path):
+    """The refusal that costs nothing. Without it the session starts, reads the
+    plan, finds the same nothing and stops — correct, and a whole session spent to
+    reach it. At the tail of a drain that is the common case."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False, plan_next=None)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == HELD, got.stderr
+    assert "nothing on the plan is free" in got.stderr
+    assert not [c for c in got.ran if c[0] == "qb-claim"], got.ran
+
+
+def test_a_board_that_cannot_answer_the_plan_question_fails_OPEN(tmp_path):
+    """The one gate here that does not fail closed, and the asymmetry is the point:
+    the gates above it are counting a resource, and this one is only avoiding a
+    wasted session. A board that did not answer has said nothing about the plan,
+    and refusing on silence would make an unreachable board look like a finished
+    one."""
+    box = sandbox(tmp_path, policy=INVOLVED_OK, explode=False,  # `unset`: no reads
+                  new_window_exit=1)
+    got = run(box, "/get-involved", tmux="/tmp/fake,1,0")
+    assert got.returncode == COULD_NOT_START, got.stderr
+    assert "could not ask whether the plan has anything free" in got.stderr
+
+
+def test_via_drain_is_not_accepted_yet(tmp_path):
+    """#476 adds it, with a line here and a line in harness/README.md. Until then
+    an unknown trigger is a caller nobody wrote."""
+    got = run(sandbox(tmp_path, policy=INVOLVED_OK, explode=False),
+              "--dry-run", "--via", "drain", "/get-involved")
+    assert got.returncode != STARTED
