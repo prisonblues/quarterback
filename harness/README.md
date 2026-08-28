@@ -3748,6 +3748,17 @@ only file this ever writes into a consumer's checkout is `flake.lock`, only unde
 and only when a person typed the command. It is left *modified*, never committed: what that
 lock means for a fleet's history is the consumer's business.
 
+**And it knows its own handwriting (#537).** Leaving the lock modified meant a successful
+`--apply` created the exact state the *next* run refused — "flake.lock has uncommitted
+changes … commit or revert that file first" — which since #533 fires on the second command
+rather than in some corner. The refusal's reasoning is untouched: an uncommitted lock is
+normally a nixpkgs bump somebody was part-way through, and preparing against HEAD would
+discard it. But the cache records precisely what was last written (`Proposal.new_lock_sha`),
+so "somebody's in-flight bump" and "the lock I installed ten minutes ago" are
+distinguishable rather than both being "not HEAD". A working-tree lock that hashes to the
+cached proposal's, for that same flake, is this tool's own output and is prepared over. A
+lock edited since, a proposal for another flake, a cleared cache — all still refuse.
+
 #### Finding the quarterback checkout it compares against
 
 The drift is a comparison between two directories, and one of them is a checkout of this
