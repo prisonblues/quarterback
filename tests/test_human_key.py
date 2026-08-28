@@ -132,9 +132,10 @@ async def test_the_key_reaches_every_human_endpoint_and_not_more(client, human_k
     """It authorises a PERSON, so it opens what a person opens — that is the whole
     design, and `/dials/clear` is the second endpoint the dashboard needs.
 
-    What it does NOT do is reach past `human()`: an endpoint gated on something
-    else is unaffected, which is why this is a method on one gate rather than a
-    tier that outranks it.
+    What it does NOT do is become a TIER that outranks `human()`. It is a second
+    method on one gate, so it opens exactly what a person opens and nothing a
+    person cannot — see the test below for the one endpoint that reading changed
+    the answer for in #591, and why that was a gap rather than a widening.
     """
     await client.post("/dials", json={
         "dial": "tempo", "value": "eager", "reason": "to be cleared",
@@ -143,6 +144,43 @@ async def test_the_key_reaches_every_human_endpoint_and_not_more(client, human_k
                           headers=keyed(human_key))
     assert r.status_code == 200, r.text
     assert [d["dial"] for d in r.json()["cleared"]] == ["tempo"]
+
+
+async def test_the_key_reaches_the_delegated_endpoints_too_as_a_person(client,
+                                                                        human_key):
+    """#591. `delegated()` had only ever honoured the EDGE-proved person, so the
+    two gates disagreed about who a person is: Rich with a browser could reorder
+    the plan and Rich at a terminal, holding the very key `human()` accepts, could
+    not. Nothing wanted that — the browser was the only door anyone had walked
+    through when `delegated()` was written.
+
+    It is a GAP being closed, not the credential widening: the key still authorises
+    a person, and what it reaches is what that person already reached from a
+    browser. The proof that it is not a relabelling is the rank source — a person
+    writes `ordered`, and an agent holding the machine secret still writes
+    `derived`.
+    """
+    seeded = []
+    for title in ("keyed-a", "keyed-b"):
+        r = await client.post("/plan/item", json={"repo": REPO, "title": title},
+                              headers=LAPTOP)
+        assert r.status_code in (200, 201), r.text
+        seeded.append(r.json()["item_id"])
+    a, b = seeded
+    try:
+        r = await client.post("/plan/reorder",
+                              json={"repo": REPO, "order": [b, a]},
+                              headers=keyed(human_key))
+        assert r.status_code == 200, r.text
+        assert r.json()["by"] == "human/rich", r.json()["by"]
+
+        got = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
+        rows = {i["item_id"]: i for i in got.json()["items"]}
+        assert rows[b]["rank_source"] == "ordered", rows[b]
+    finally:
+        for item_id in seeded:
+            await client.post("/plan/item/done", json={"item_id": item_id},
+                              headers=LAPTOP)
 
 
 async def test_the_edge_still_comes_first_and_is_unchanged(client, human_key):

@@ -1253,9 +1253,14 @@ resource rather than guarding a door, so an unreadable dial leaves the file's nu
 and an unreachable board leaves the fleet gate silent. A permission that failed open would
 start sessions nobody authorised; a ceiling that failed closed would stop every box on the
 fleet over a board hiccup, which is worse than the thing it guards. Safe to put on the board
-because dial **writes are human-only** (`POST /dials` takes `app.auth.human`) — an agent may
-read its own ceiling and cannot raise it, which is the whole of what makes this a throttle
-rather than an escalation.
+because an agent may read its own ceiling and cannot raise it — which is the whole of what
+makes this a throttle rather than an escalation. That used to be a property of the GATE
+(`POST /dials` took `app.auth.human`); since [#591](https://github.com/prisonblues/quarterback/issues/591)
+the endpoint also takes a delegated agent, so it is enforced by the READER instead:
+`ceilings_from_board` drops any row whose `set_via` is `agent`, names who set it, and leaves
+the file's number in force. A null `set_via` predates the column and is honoured. This is the
+one dial whose subject is the agent reading it, which is why it is the one that cannot follow
+the rest.
 
 **The fleet number is a runaway guard, not an allocator.** It exists to stop a hundred agents
 opening at once against a long queue — [#476](https://github.com/prisonblues/quarterback/issues/476),
@@ -2317,10 +2322,16 @@ decision somebody made.
 
 **Turning one is a `✎` on the row, and what makes that possible is a credential rather
 than a looser gate.** `GET /dials` takes `app.auth.reader`, which the machine bearer token
-passes, so reading was always free from a terminal. `POST /dials` takes `app.auth.human` and
-still does — every agent on a box holds the same machine token, so nothing inside a request
-from one distinguishes it from a person, and a tempo an agent could raise for itself is the
-self-approval shape #85, #86, #78, #232 and #335 each settled separately.
+passes, so reading was always free from a terminal. `POST /dials` took `app.auth.human` and
+since [#591](https://github.com/prisonblues/quarterback/issues/591) takes `app.auth.delegated`
+— **a person, or an agent holding its machine's own `X-Agent-Elevated` secret**. A bare
+machine token is still refused, and that is the half of the argument that matters: every agent
+on a box holds the same bearer, so nothing inside a request carrying only that distinguishes
+it from a person. The delegated secret is a second credential a caller has to hold, and the
+write records `set_via: "agent"` beside the agent's own name, so a dial an agent turned is
+never mistaken for one somebody typed. The self-approval shape #85, #86, #78, #232 and #335
+each settled separately is handled where it actually bites — `spawn.max_sessions` is the dial
+whose subject is the agent reading it, and `qb-start` refuses an agent-set value outright.
 
 What `human()` gained is a second **method**: `HUMAN_TOKENS`, `name:secret` pairs in
 `API_TOKENS`' format, presented as **`X-Human-Key`** to the **agent host** beside the ordinary
@@ -2450,14 +2461,21 @@ is the trade — open it wide now, tighten later — and #479 carries the menu f
 It is narrower than the design considered before it, a signed-in Authelia session, which is
 SSO for an entire estate. It is also why the delegated **agent** credential
 (`X-Agent-Elevated`, #480) is a *different* thing and stays narrow: that one is for an agent
-acting unattended and names the two endpoints it may reach, `/dials` deliberately not among
-them. Two credentials, two blast radii; an unattended agent still cannot set a dial.
+acting unattended and names the endpoints it may reach. `/dials` was deliberately not among
+them until [#591](https://github.com/prisonblues/quarterback/issues/591), which added it on a
+direct ask — an agent told to turn a dial could not turn it. `POST /plan/scope` and `exempt`'s
+`grant: true` did not move. Two credentials, two blast radii, and the dial one is bounded by
+being reversible: the row is cleared rather than deleted, it can carry an expiry, and
+`set_via` says which of the two turned it.
 
 **Which door a dial came through is recorded**, and shown. `human/rich` is `human/rich`
 either way — a person is one author however they arrived — so the identity alone cannot tell
 a browser write from a key on a workstation, and the second is the one carrying the residual
-above. `GET /dials` returns `set_via` (`edge`, `key` or `dev`); the page draws it as a chip
-beside the author and a dial row's detail line says *"set by human/rich with a key"*. A row
+above. `GET /dials` returns `set_via` (`edge`, `key`, `dev` or — since #591 — `agent`); the page
+draws it as a chip beside the author and a dial row's detail line says *"set by human/rich
+with a key"*. The first three are all a person, arriving by different doors; `agent` is a
+different kind of answer, meaning no person was in the request at all and `set_by` names the
+agent that made it. A row
 older than the column says nothing rather than guessing, because a default there would be the
 one value a reader must be able to distrust sitting in the field they consult to decide.
 

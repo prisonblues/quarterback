@@ -56,21 +56,52 @@ off ``GET /dials`` (``harness/bin/qbdata.py``, ``fetch_dials``), and
 :func:`app.api.board_view.dials_view` serves the page at ``/dials/view`` that the
 dashboards print the URL of — because they cannot write here and say so instead.
 
-## Writes are human-only, and that is the security argument
+## Writes take a person, or an agent a person has delegated to (#591)
 
-``harness_rules``' two-ref rule exists so that a poisoned pull request cannot
-rewrite the rules governing its own review. A board layer read on the unattended
-path is a new door into exactly that, and the honest version of it is named rather
-than argued away: **anything running while a branch under review is checked out**
-— a test suite, a build step, a git hook — runs as a user whose machine token this
-board accepts. If a machine token could set a dial, that code could turn the
-``claude`` seat off, or raise the fix floor to P1, on the review of its own change.
+**A machine token still cannot set a dial, and that part of the argument is
+unchanged.** ``harness_rules``' two-ref rule exists so that a poisoned pull
+request cannot rewrite the rules governing its own review, and the threat it
+names is real: **anything running while a branch under review is checked out** —
+a test suite, a build step, a git hook — runs as a user whose machine token this
+board accepts. If a *machine token* could set a dial, that code could turn the
+``claude`` seat off, or raise the fix floor to P1, on the review of its own
+change. It cannot. :func:`app.auth.delegated` refuses a bare bearer.
 
-So :func:`set_dial` and :func:`clear_dial` take :func:`app.auth.human`, the same
-gate the plan's order takes, for a related reason: every agent on a box holds the
-same machine token, so nothing inside a request distinguishes one from a person.
-A dial is a judgement about what a review is worth, which is a decision; reads are
-:func:`app.auth.reader`, because every enrolled agent must be able to resolve.
+What changed in #591 is that a bearer **plus that machine's own
+``X-Agent-Elevated`` secret** now passes, because Rich asked for an agent he has
+told to turn a dial to be able to turn it. Reads stay :func:`app.auth.reader`,
+because every enrolled agent must be able to resolve.
+
+**The residual, stated rather than argued away.** #479 says it plainly for the
+credential as a whole — *"any process running as the user can read the secret"* —
+and hydrating it to ``/run/op-secrets/quarterback-elevated`` (nix-fleet#50) does
+not change that: the file is the user's to read. So the poisoned-PR path above is
+not closed, only **lengthened**: that code must now find and read a second
+credential rather than reuse the bearer it already has. That is a real reduction
+and it is not a proof, and anybody weighing a further tightening should start
+from this paragraph rather than from the sentence that used to be here.
+
+**What makes it acceptable is that a dial is reversible and a plan order is
+not.** #479's own list of tightenings puts "undo" first for ``/plan/reorder``
+precisely because nothing stores the previous order — *"a snapshot before each
+reorder turns 'an agent clobbered my order' from a loss into an annoyance"*. A
+dial already has that: the row is **cleared, not deleted**, ``expires_at`` bounds
+it in time, and ``set_via`` records which door it came through, so a dial an
+agent turned is legible as such on ``GET /dials`` and on the page. The exclusion
+was argued on blast radius, and the blast radius here is one named key whose last
+value survives its own replacement.
+
+**Provenance is the thing that must not be lost**, and it is the reason this
+takes :func:`app.auth.delegated` rather than lending an agent a person's key.
+A delegated caller keeps its own identity: ``set_by`` records
+``hermes/mist-harbour``, never ``human/rich``, and ``set_via`` records
+``agent``. That is ``rank_source: "derived"`` applied to the same problem — the
+lesson of #183 and of the design #479 records as rejected, where an agent that
+borrowed a person's cookie became indistinguishable from them in the history.
+
+**Two of the three exclusions stand.** ``POST /plan/scope`` and ``exempt``'s
+``grant: true`` remain :func:`app.auth.human`-only; only the dial one was
+reversed, and each still has its test in ``tests/test_delegated_writes.py``.
 
 #276's budget throttle is the constrained case of this layer, not a second one. It
 wants the opposite write gate — an automatic governor, holding a machine token,
@@ -96,7 +127,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import is_unique_violation
-from app.auth import human, human_method, reader
+from app.auth import delegated, human_method, reader
 from app.claimkey import BadRef, canonical_repo
 from app.db import get_session
 from app.models.dial import MAX_DIAL, MAX_REASON, DialSetting
@@ -270,10 +301,11 @@ async def list_dials(
 async def set_dial(
     request: Request,
     body: DialIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Set a dial. **Human-only** — see the module docstring for why.
+    """Set a dial. **A person, or an agent one has delegated to** (#591) — see the
+    module docstring for what that does and does not open.
 
     Idempotent per (repo, dial): whatever occupies the slot is cleared and the new
     row inserted beside it, so the history of a floor's moves survives and
@@ -353,10 +385,15 @@ async def set_dial(
 async def clear_dial(
     request: Request,
     body: ClearIn,
-    editor: str = Depends(human),
+    editor: str = Depends(delegated),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Take a dial off the board. **Human-only**, like setting one.
+    """Take a dial off the board. **Same gate as setting one**, deliberately.
+
+    A dial an agent can set but not clear is a trap: the reversal is the half that
+    makes the write safe to have granted, and #479's standard for this credential
+    is reversibility rather than prevention. Splitting the two gates would leave an
+    agent able to make a change only a person could undo.
 
     The repo's own default takes over on the next resolution, which is the state a
     repo with no board dial has always been in. Clearing something that is not

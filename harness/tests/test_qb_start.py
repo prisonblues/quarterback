@@ -62,12 +62,22 @@ COULD_NOT_START = 9
 AT_FLEET_CAP = 10
 
 
-def dial(name: str, value: object, repo: str | None = None) -> dict:
+def dial(name: str, value: object, repo: str | None = None,
+         set_by: str = "human/rich", set_via: str | None = None) -> dict:
     """One row as `GET /dials` returns it. Fleet scope by default, which is the only
-    scope either spawn dial can mean — `repo` is for the row that should not exist."""
-    return {"dial": name, "value": value,
-            "scope": "repo" if repo else "fleet", "repo": repo,
-            "reason": "a test", "set_by": "human/rich", "expires_at": None}
+    scope either spawn dial can mean — `repo` is for the row that should not exist.
+
+    `set_via` defaults to ABSENT rather than to `"edge"`, and that is the honest
+    default for this helper: it is what a row written before the column existed
+    looks like, and every ceiling test that predates #591 is asserting about
+    exactly such a row. Pass `set_via="agent"` for the case that dial cannot take.
+    """
+    row = {"dial": name, "value": value,
+           "scope": "repo" if repo else "fleet", "repo": repo,
+           "reason": "a test", "set_by": set_by, "expires_at": None}
+    if set_via is not None:
+        row["set_via"] = set_via
+    return row
 
 
 def agents(n: int, subagents: int = 0) -> dict:
@@ -1184,6 +1194,63 @@ def test_a_dial_that_is_not_a_number_of_sessions_is_refused_and_not_substituted(
     assert answer["max_sessions_source"] == "policy", value
     assert "not a non-negative whole number" in (answer["dials_problem"] or ""), \
         (value, answer)
+
+
+def test_a_ceiling_an_agent_set_for_itself_is_refused(tmp_path):
+    """The one dial an agent may not set, and since #591 the only thing enforcing
+    that is here.
+
+    `POST /dials` was human-only when this ceiling was put on the board, and the
+    module docstring says that is what made it a throttle rather than a hole. The
+    endpoint now also takes a delegated agent, so "an agent cannot raise its own
+    ceiling" stopped being a property of the gate and had to become a property of
+    the reader. An agent lifting its own cap from 2 to 40 is the self-approval
+    shape #85, #86, #78, #232 and #335 each settled separately.
+    """
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 40,
+                              set_by="hermes/mist-harbour", set_via="agent")])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert got.returncode == STARTED, got.stderr
+    answer = json.loads(got.stdout)
+    assert answer["max_sessions"] == 2, (
+        "the file's number must apply — an agent-set ceiling is not a ceiling")
+    assert answer["max_sessions_source"] != "board"
+
+
+def test_the_refused_agent_ceiling_says_who_set_it_and_what_to_do(tmp_path):
+    """Refused NOISILY, for the reason every other ignored row here is: a spawner
+    that quietly used the file's number leaves somebody looking at a board saying
+    40 and a box behaving like 2, with nothing connecting the two."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 40,
+                              set_by="hermes/mist-harbour", set_via="agent")])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    problem = json.loads(got.stdout)["dials_problem"] or ""
+    assert "hermes/mist-harbour" in problem, problem
+    assert "not by a person" in problem, problem
+
+
+def test_a_ceiling_a_person_set_with_a_key_is_still_honoured(tmp_path):
+    """`agent` is the only refused value, not "anything that is not the edge". A
+    person at a terminal with an `X-Human-Key` is a person — that is the whole
+    point of the second method — and refusing `key` here would quietly retire the
+    door #477 added."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 5, set_via="key")])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert json.loads(got.stdout)["max_sessions"] == 5
+
+
+def test_a_row_older_than_the_set_via_column_is_honoured(tmp_path):
+    """Null is "not recorded", never "some other method" — and a row with no
+    `set_via` predates the column, which is to say predates an agent being able to
+    write one at all. Treating absent as suspect would silently retire ceilings
+    nobody can see are being ignored."""
+    box = sandbox(tmp_path, policy=DIALLED, explode=False,
+                  dials=[dial("spawn.max_sessions", 5)])
+    got = run(box, "--policy", "--json", tmux="/tmp/fake,1,0")
+    assert json.loads(got.stdout)["max_sessions"] == 5
 
 
 def test_the_ceiling_is_asked_for_at_fleet_scope_and_bounded(tmp_path):
