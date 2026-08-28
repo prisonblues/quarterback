@@ -101,6 +101,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -234,6 +235,11 @@ class Check:
     #: than passed at every construction site, so a check function cannot file itself
     #: under a group its registration disagrees with.
     group: str = "host"
+    #: Whose fault this row describes, in :data:`SCOPES`. Assigned by `run_checks` from
+    #: the registration, like `group`. The default is `host` and it is the fail-safe
+    #: one: a `Check` built anywhere but the registry announces per machine, which costs
+    #: a duplicate post and can never suppress another box's news.
+    scope: str = "host"
     #: Why this row matters, in prose — copied off the registration by `run_checks`,
     #: for the same reason `group` is. Per-ROW and not per-verdict: the paragraph is
     #: the same however the row came out, because it is about the mechanism rather
@@ -253,7 +259,8 @@ class Check:
         assert self.verdict in VERDICTS, f"{self.verdict!r} is not one of {VERDICTS}"
 
     def as_dict(self) -> dict:
-        return {"name": self.name, "group": self.group, "subject": self.subject,
+        return {"name": self.name, "group": self.group, "scope": self.scope,
+                "subject": self.subject,
                 "detail": self.detail, "verdict": self.verdict, "manual": self.manual,
                 "fix": self.fix, "explanation": self.explanation, "prompt": self.prompt,
                 "prompt_for": self.prompt_for, "no_prompt": self.no_prompt or None,
@@ -310,6 +317,51 @@ class Brief:
         assert self.task.strip(), "a brief with no task is not a brief"
 
 
+#: WHOSE fault a row describes — and therefore whether another machine saying the same
+#: thing is the same news or different news. #569.
+#:
+#: * ``repo`` — the row is about a resource the fleet SHARES: a queue, a branch, a
+#:   forge setting, the board's own escalation path. Every enrolled machine watching
+#:   that repository reaches the same verdict about it, so N machines announcing it is
+#:   one fact announced N times. zeus and hermes posted *3 PRs (#566, #564, #538) ready*
+#:   six minutes apart, twice in one day, and duplicate alarms are how an alarm becomes
+#:   background noise.
+#: * ``host`` — the row is about THIS BOX: what is installed here, what is checked out
+#:   here, what has never left this disk. *"8 harness scripts are not on zeus"* and
+#:   *"7 harness scripts are not on hermes"* are two true facts about two machines and
+#:   both have to be raised.
+#:
+#: **The two directions of a mistake here are not symmetric, and that is why this is a
+#: declaration and not a heuristic.** Calling a shared row `host` costs a duplicate
+#: post. Calling a host row `repo` SILENCES A REAL PER-MACHINE FAULT — the first box to
+#: notice speaks for boxes it knows nothing about. So there is no default and no
+#: inference: :class:`CheckSpec` requires the field, and a check whose scope is not
+#: obvious to its author is `host`, which is the direction that only ever costs noise.
+#:
+#: **It is not the group, and the group is the trap.** `group` answers *which question
+#: is this* (#204's "is this host wired up", #406's "can work actually land"), and it is
+#: nearly right — nearly enough to reach for. Seven of the ten rows outside the `host`
+#: group are nonetheless about one machine. `unpushed` counts commits on THIS disk
+#: (#567). `briefs` reads the briefs THIS HOST would open — the ones the harness on PATH
+#: ships, a different set the moment that harness falls behind — and `instructions` asks
+#: the same of the same host's prose. And four more only look fleet-wide, which Codex
+#: found and this list did not: `merges` reads the pre-push hook installed HERE as well
+#: as the repo's tagger, `stamper` reads this checkout's files and its own
+#: `git config`, `generated` and `tags` answer through locally fetched refs and a
+#: checkout that can be stale. Every one of them can reach a different verdict on two
+#: boxes watching one repository, and every one of them sits beside rows that really are
+#: shared. A rule keyed on the group would have silenced all seven.
+#:
+#: **The subject is a second lock, and it is why a wrong answer here degrades safely.**
+#: The peer match is on the headline — repo, class, row name and the row's own
+#: `subject` — so a row whose subject is a path on this disk cannot match another
+#: machine's post even when it is misclassified as `repo`. That is not a coincidence: a
+#: subject that names something host-local is exactly what makes a row host-local. The
+#: rule for a new row is therefore also a test somebody can apply: **a row may be `repo`
+#: only if every machine watching that repository would compute the same subject.**
+SCOPES = ("host", "repo")
+
+
 @dataclass(frozen=True)
 class CheckSpec:
     """One registration: the check, and everything about it that is not a verdict.
@@ -336,10 +388,15 @@ class CheckSpec:
     group: str
     fn: object
     explanation: str
+    #: `host` or `repo` — see :data:`SCOPES`. No default, so a new row cannot be
+    #: registered without its author deciding, which is the only way the answer stays
+    #: correct as rows are added.
+    scope: str
     briefs: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         assert self.explanation.strip(), f"{self.name} has no explanation"
+        assert self.scope in SCOPES, f"{self.name}: {self.scope!r} is not one of {SCOPES}"
         for verdict, brief in self.briefs.items():
             assert verdict in VERDICTS, f"{self.name}: {verdict!r} is not a verdict"
             assert isinstance(brief, Brief), f"{self.name}: {verdict} is not a Brief"
@@ -3928,7 +3985,7 @@ GROUPS = {
 #: before anything runs.
 CHECKS = (
     CheckSpec(
-        "checkout", "host", check_checkout,
+        "checkout", "host", check_checkout, scope="host",
         explanation=(
             "Every row below that compares something against *this checkout* is only as "
             "current as the checkout is. `git status` says a branch is up to date with "
@@ -3954,7 +4011,7 @@ CHECKS = (
                 needs=("behind",)),
         }),
     CheckSpec(
-        "board", "host", check_board,
+        "board", "host", check_board, scope="host",
         explanation=(
             "The board, the harness and the client are versioned independently and none "
             "of them can see the other two, so skew surfaces as somebody else's error: "
@@ -3975,7 +4032,7 @@ CHECKS = (
                 needs=("served", "declared")),
         }),
     CheckSpec(
-        "harness", "host", check_harness,
+        "harness", "host", check_harness, scope="host",
         explanation=(
             "The harness on PATH is a nix store path built from a pinned rev, and no "
             "script inside it can tell you it is stale because each one knows only its "
@@ -4016,7 +4073,7 @@ CHECKS = (
                 ))
         }),
     CheckSpec(
-        "client", "host", check_client,
+        "client", "host", check_client, scope="host",
         explanation=(
             "`qb-mcp` execs `$QUARTERBACK_REPO/mcp/.venv/bin/python`, so the venv that "
             "matters is the CONFIGURED checkout's and not whichever directory you happen "
@@ -4025,7 +4082,7 @@ CHECKS = (
             "than about a venv — which is how #204's third symptom was chased for a day."),
         briefs={}),
     CheckSpec(
-        "token", "host", check_token,
+        "token", "host", check_token, scope="host",
         explanation=(
             "A token is what makes a post on the board attributable to a machine, and "
             "every claim, lease and escalation this fleet coordinates through depends on "
@@ -4046,7 +4103,7 @@ CHECKS = (
                 )),
         }),
     CheckSpec(
-        "hooks", "host", check_hooks,
+        "hooks", "host", check_hooks, scope="host",
         explanation=(
             "The guards live in `harness/githooks/` in git, and `ls` on that directory "
             "succeeds on a machine where not one of them is installed — which is exactly "
@@ -4078,7 +4135,7 @@ CHECKS = (
                 )),
         }),
     CheckSpec(
-        "stash", "host", check_stash,
+        "stash", "host", check_stash, scope="host",
         explanation=(
             "Every worktree of a repository shares one `refs/stash` — it lives in the "
             "common git dir — so `stash@{{0}}` means whatever the last pusher meant, "
@@ -4101,7 +4158,7 @@ CHECKS = (
                 needs=("entries",)),
         }),
     CheckSpec(
-        "reconcile", "host", check_reconcile,
+        "reconcile", "host", check_reconcile, scope="host",
         explanation=(
             "The board's plan is what a cold agent reads to find out what to do next, and "
             "`qb-reconcile` is what keeps it honest by noticing that an item's issue has "
@@ -4129,7 +4186,7 @@ CHECKS = (
                 )),
         }),
     CheckSpec(
-        "edge", "host", check_edge,
+        "edge", "host", check_edge, scope="host",
         explanation=(
             "`HUMAN_EDGE_SECRET` is what lets the browser vhost vouch for a person, and it "
             "was documented in DEPLOY.md with a checklist and deployed nowhere — so every "
@@ -4165,7 +4222,7 @@ CHECKS = (
                 )),
         }),
     CheckSpec(
-        "tools", "host", check_tools,
+        "tools", "host", check_tools, scope="host",
         explanation=(
             "Half the rows in this report are a subprocess, and a missing `gh` or an "
             "unauthenticated one turns them into unknowns rather than answers. This row "
@@ -4173,7 +4230,7 @@ CHECKS = (
             "instead of leaving a reader to infer a cause from eight symptoms."),
         briefs={}),
     CheckSpec(
-        "merges", "landing", check_merges,
+        "merges", "landing", check_merges, scope="host",
         explanation=(
             "If something reserves a release number at push time and the repository "
             "squashes or rebases on merge, the commit the tag was reserved against stops "
@@ -4201,7 +4258,7 @@ CHECKS = (
                 needs=("reserves", "allows")),
         }),
     CheckSpec(
-        "queue", "landing", check_queue,
+        "queue", "landing", check_queue, scope="repo",
         explanation=(
             "`queued > 0 && ready == 0` is the ordinary state of a queue that is working, "
             "for as long as a landing takes. Past that it means the head of the line is "
@@ -4235,7 +4292,7 @@ CHECKS = (
                 needs=("head_holder", "waited_minutes")),
         }),
     CheckSpec(
-        "unpushed", "landing", check_unpushed,
+        "unpushed", "landing", check_unpushed, scope="host",
         explanation=(
             "On the machine this row was written for, eleven branches carried twenty-eight "
             "commits that existed on no remote anywhere, the oldest nineteen days old — "
@@ -4279,7 +4336,7 @@ CHECKS = (
                 needs=("stranded", "commits", "age")),
         }),
     CheckSpec(
-        "landed", "landing", check_landed,
+        "landed", "landing", check_landed, scope="repo",
         explanation=(
             "A pull request GitHub calls CLEAN can land, so if one has been CLEAN while "
             "the tip of the integration branch has not moved for hours, something between "
@@ -4307,7 +4364,7 @@ CHECKS = (
                 needs=("ready",)),
         }),
     CheckSpec(
-        "escalations", "landing", check_escalations,
+        "escalations", "landing", check_escalations, scope="repo",
         explanation=(
             "Three times now this fleet has built a place for work that is stuck to be "
             "recorded, and three times nothing wrote to it: the `stuck` post type "
@@ -4338,7 +4395,7 @@ CHECKS = (
                 needs=("posts",)),
         }),
     CheckSpec(
-        "tags", "landing", check_tags,
+        "tags", "landing", check_tags, scope="host",
         explanation=(
             "A release tag is the durable claim that a version number means one specific "
             "commit. When one points off the history it names, the claim is false for "
@@ -4364,7 +4421,7 @@ CHECKS = (
                 needs=("orphaned",)),
         }),
     CheckSpec(
-        "generated", "landing", check_generated,
+        "generated", "landing", check_generated, scope="host",
         explanation=(
             "`CHANGELOG.md` is output: the release job writes it and nothing else does. "
             "Every branch that shipped anything used to edit the same lines at the top of "
@@ -4398,7 +4455,7 @@ CHECKS = (
                 needs=("offenders",)),
         }),
     CheckSpec(
-        "stamper", "landing", check_stamper,
+        "stamper", "landing", check_stamper, scope="host",
         explanation=(
             "#122 removed branch-side release stamping: a branch names no version, because "
             "the number belongs to the commit that lands on `main` and a branch cannot "
@@ -4424,7 +4481,7 @@ CHECKS = (
                 )),
         }),
     CheckSpec(
-        "briefs", "landing", check_briefs,
+        "briefs", "landing", check_briefs, scope="host",
         explanation=(
             "A brief is what an agent DOES. #122 removed branch-side release stamping from "
             "the code, and on the night of 2026-08-23 five agents stamped anyway — every "
@@ -4476,7 +4533,7 @@ CHECKS = (
                 needs=("unreadable",)),
         }),
     CheckSpec(
-        "instructions", "semantic", check_instructions,
+        "instructions", "semantic", check_instructions, scope="host",
         explanation=(
             "The deterministic `briefs` row reads fenced code blocks, and it is right to: a "
             "predicate can tell whether a document RUNS a removed command. What it cannot "
@@ -4577,6 +4634,7 @@ def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
             check = Check(spec.name, "-",
                           f"the check itself raised {type(exc).__name__}: {exc}", "unknown")
         check.group = spec.group
+        check.scope = spec.scope
         check.explanation = spec.explanation
         # The brief is composed HERE, from the registration, for the same reason the
         # group is assigned here: a check function that could write its own brief
@@ -4825,6 +4883,149 @@ def _instance(check: Check) -> str:
     return json.dumps(keeps, sort_keys=True, default=str)
 
 
+#: How long a peer's announcement of a shared condition speaks for this host too, when
+#: `needs_human` will not say. The fallback for :data:`needs_human.REPEAT_AFTER`, and the
+#: same twelve hours, because the two windows are one promise read from two sides: the
+#: local cache says *I already rang this bell*, and the board says *somebody did*. A peer
+#: window shorter than the local one would not remove a duplicate, only delay it — the
+#: announcing host falls quiet as soon as its own key is set, so the moment a shorter
+#: window lapsed the second host would ring the same bell a few minutes late.
+PEER_REPEAT_AFTER = 12 * 60 * 60
+
+
+def _this_machine(host: Host) -> tuple[str, str]:
+    """What the BOARD calls this box, or `("", why-not)` — for telling my posts from a
+    peer's.
+
+    Only `/whoami` answers this, and an unanswered `/whoami` is a refusal rather than a
+    guess. `gethostname` was the obvious fallback and it is the wrong one: Codex found
+    that a box whose token was minted under another name would fail to recognise its own
+    posts, read them as a peer's, and suppress itself against its own escalation. That is
+    the one direction of this mistake that loses news, and it would happen exactly when
+    the board is half-reachable — the moment nobody is watching.
+
+    So the gate does not run without this answer, and the escalation goes out. The
+    hostname is still what a KEY is built from, where the requirement is the opposite:
+    the same string on every tick whether or not there is a network.
+    """
+    if not host.base_url or not host.token:
+        return "", "this host is on no board, so its own posts cannot be told from a peer's"
+    payload, why = board_get(host, "/whoami")
+    if why:
+        return "", why
+    machine = payload.get("machine") if isinstance(payload, dict) else None
+    if not isinstance(machine, str) or not machine.strip():
+        return "", "the board did not say which machine this token belongs to"
+    return machine.strip(), ""
+
+
+def _raised_by(machine: str) -> str:
+    """What raised this escalation — the sentence that goes where an agent would be.
+
+    Every one of #569's ten posts carried `from: zeus` and `session: null`, and a null
+    session reads as *an agent that failed to identify itself*. Under a timer it means
+    something else entirely: **a systemd unit is not an agent and has no session**, so
+    inventing one — stamping `INVOCATION_ID` into the post's `session` — would put a
+    plausible identity in a field that joins against leases, `/sessions` and every
+    session-scoped read on the board, and resolve in none of them. That is the same null
+    wearing a better costume.
+
+    So the post says what it actually is. When Claude Code is running the doctor there IS
+    a session and :func:`announce_failures` files the post under it, which is the case
+    where "ask the thing that raised this" has an answer. When a timer is running it,
+    this line names the unit, the host and the systemd invocation instead — and the
+    invocation is what makes two escalations from one box two escalations rather than one
+    box twice, which is the second half of what `session: null` cost a reader.
+
+    (#156 is the wider question of an agent's identity on the board and is not answered
+    here. This says accurately what raised THIS post; it does not invent an agent.)
+    """
+    unit = os.environ.get("QB_DOCTOR_UNIT") or _systemd_unit() or ""
+    invocation = os.environ.get("INVOCATION_ID") or ""
+    if unit or invocation:
+        where = f"systemd {unit}" if unit else "systemd"
+        run = f", invocation {invocation}" if invocation else ""
+        return (f"a timer on {machine} — {where}{run}. No agent session: a unit is the "
+                "machine, not an agent, so there is nothing here to ask for more (#156)")
+    return (f"`qb-doctor --announce` on {machine}, run by hand or by a caller that is "
+            "not a systemd unit")
+
+
+def _systemd_unit() -> str | None:
+    """The systemd unit this process is running under, or None.
+
+    Read off the cgroup rather than the environment because systemd exports no unit
+    name to a service: `INVOCATION_ID` says *which run* and nothing says *of what*, and
+    "invocation 0f3c… on zeus" is a worse answer than the unit that produced it. Any
+    failure is None — this is a line of provenance on a post, and a doctor that raised
+    while describing itself would be silent in exactly the way #405 is about.
+    """
+    try:
+        text = Path("/proc/self/cgroup").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for part in reversed(text.strip().split("/")):
+        name = part.strip()
+        if name.endswith((".service", ".scope", ".timer")):
+            return name
+    return None
+
+
+def _peer_announcements(host: Host, slug: str, machine: str,
+                        window_minutes: int) -> tuple[dict[str, str], str]:
+    """Which rows ANOTHER machine has already announced for `slug`. `({row: who}, why)`.
+
+    This is #569's first half and the whole of "deduplication belongs on the board". The
+    board keeps no dedupe table and this change does not add one: the record of an
+    announcement is the announcement, so a producer asks whether its own headline is
+    already on the board and stays quiet if it is. `needs_human.headline` composes the
+    string on both sides, so the writer and the reader cannot drift apart.
+
+    **Own posts are excluded, and that is what preserves escalation.** zeus announced two
+    ready pull requests, then three, then four, because its local key carries WHICH pull
+    requests are ready and a different set is different news. Suppressing a host against
+    its own history would collapse that growth into one post; suppressing it against a
+    PEER's removes only the second telling. So a single host's behaviour is exactly what
+    it was, and the fleet's is one bell instead of N.
+
+    **Every failure is an empty answer, never a suppression.** An unreachable board, a
+    body of the wrong shape, an unparseable timestamp: all of them announce. A duplicate
+    post costs a glance and losing the escalation is the fault #569 is filed about.
+    """
+    posts, why = board_get_list(
+        host, f"/board?type={ESCALATION_POST}&window_min={window_minutes}"
+              f"&limit={_BOARD_PAGE}")
+    if posts is None:
+        return {}, why
+    # Dated here, exactly as `check_escalations` dates its own read and for the same
+    # reason: `window_min` is a request and not a promise. `/board` floors a quiet window
+    # at the ten most recent posts of the slice whatever their age, and `type=` is not one
+    # of the lookups that skip the floor — so a peer post from last week can arrive in
+    # answer to a question about the last twelve hours. Trusting the floor here would
+    # suppress a live escalation on the evidence of a stale one, which is the direction
+    # of this mistake that loses news.
+    seen: dict[str, str] = {}
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        age = _age_minutes(post.get("ts"))
+        if age is None or not 0 <= age <= window_minutes:
+            continue
+        author = post.get("from")
+        if not isinstance(author, str) or not author:
+            continue
+        # `machine/name` addresses one agent and `machine` addresses the box; both are
+        # this box when the head matches. A post whose author cannot be read at all is
+        # not assumed to be a peer — an unattributable post must not silence anybody.
+        if author.split("/", 1)[0] == machine:
+            continue
+        summary = post.get("summary")
+        if not isinstance(summary, str):
+            continue
+        seen.setdefault(summary, author)
+    return seen, ""
+
+
 def loops_dir(script: str) -> Path | None:
     """`harness/loops`, in the two layouts there are — a checkout and the package.
 
@@ -4841,13 +5042,34 @@ def loops_dir(script: str) -> Path | None:
     return None
 
 
-def _escalation(check: Check, slug: str, base_url: str) -> tuple[str, str]:
+def _headline_of(check: Check) -> str:
+    """The part of an escalation's summary that names WHICH finding this is.
+
+    The row and its subject, and the subject is here because of what reads it back.
+    `/board` returns summaries and not details, so the subject — the branch a queue is
+    keyed on, the ref a tag is judged against, the board a measurement was taken from —
+    was invisible to a reader and is now the difference between two findings that share
+    a row name. Codex found the first cut matching on the row name alone, where a stalled
+    queue on `main` would have suppressed a stalled queue on `test`.
+
+    It is a gain for a person too: `board_read` shows this line and nothing else, so the
+    subject used to reach nobody who did not open the post.
+    """
+    return f"{check.name} ({check.subject})"
+
+
+def _escalation(check: Check, slug: str, base_url: str, raised_by: str = "") -> tuple[str, str]:
     """`(summary, detail)` for one failing row — what a person reads on the board."""
-    summary = f"{check.name}: {check.detail}"
-    lines = [f"row:     {check.name} ({check.group})",
+    summary = f"{_headline_of(check)}: {check.detail}"
+    lines = [f"row:     {check.name} ({check.group}, {check.scope}-wide)",
              f"subject: {check.subject}",
-             f"verdict: {check.verdict}",
-             "", check.detail]
+             f"verdict: {check.verdict}"]
+    if raised_by:
+        # Above the finding, because it is the first thing a reader of a `stuck` post
+        # wants and the one thing #569 found missing: `from: zeus` names a box that runs
+        # several agents and `session: null` names nobody at all.
+        lines.append(f"raised by: {raised_by}")
+    lines += ["", check.detail]
     if check.explanation:
         lines += ["", "why it matters:", check.explanation]
     if check.manual:
@@ -4874,6 +5096,66 @@ def _escalation(check: Check, slug: str, base_url: str) -> tuple[str, str]:
     return summary, "\n".join(lines)
 
 
+def _host_part(check: Check) -> tuple[str, ...]:
+    """The host, folded into a `host`-scoped row's dedupe key — and nothing otherwise.
+
+    `gethostname` and not the board's name for this box, deliberately: a key must be the
+    same string on every tick, and the board's answer depends on the board being
+    reachable. A key that changed when the network did would re-announce a fault that
+    had not changed, which is the failure the key exists to prevent.
+    """
+    return (socket.gethostname(),) if check.scope != "repo" else ()
+
+
+def _peer_gate(host: Host, slug: str, failing: list[Check],
+               door: object) -> tuple[dict[str, str], str]:
+    """`({peer summary: author}, why-it-could-not-be-asked)` — asked at most once a run.
+
+    Not asked at all when nothing would use the answer: no failing row is fleet-wide, or
+    this checkout names no GitHub repo for one to be about. That is silence and not a
+    failure, so `why` stays empty and no post grows a caveat about a question nobody had.
+    It is also where `/whoami` is resolved, for the same reason — a report of host rows
+    alone must not pay for a round trip whose answer nothing reads.
+    """
+    if not slug or not any(c.scope == "repo" for c in failing):
+        return {}, ""
+    if not callable(getattr(door, "headline", None)):
+        # The harness on PATH goes stale — the `harness` row exists for exactly that —
+        # and a `needs_human` predating #569 cannot tell this reader how the writer
+        # spells a headline. Guessing the format here is how a matcher silently stops
+        # matching; saying so and announcing is the honest failure.
+        return {}, ("the needs_human on this host predates #569 and states no headline "
+                    "format, so a peer's post cannot be recognised")
+    machine, why = _this_machine(host)
+    if why:
+        return {}, why
+    window = int(getattr(door, "REPEAT_AFTER", PEER_REPEAT_AFTER) // 60)
+    # The board caps `window_min` at a day and a half. Clamped rather than sent and
+    # refused: a 422 would read as "the board was unreachable" and put that on the post.
+    return _peer_announcements(host, slug, machine, max(1, min(window, 1440)))
+
+
+def _peer_that_said_it(check: Check, slug: str, peers: dict[str, str],
+                       door: object) -> str:
+    """Who has already announced this row for this repo, or "" — nobody, or not asked.
+
+    A `host`-scoped row is never matched, whatever is on the board. That is the whole
+    safety property of #569: the two directions of a misclassification are not
+    symmetric, and this is the line at which the cheap mistake and the expensive one
+    part company.
+
+    Matched on the headline PREFIX — the repo, the class and the row name — composed by
+    the same function that writes it. Everything after that prefix is the finding as one
+    machine phrased it a few minutes ago, down to how it spells an age, and requiring
+    two hosts to agree on that would mean never matching at all.
+    """
+    if check.scope != "repo" or not peers:
+        return ""
+    prefix = door.headline(cls=NEEDS_HUMAN_CLASS, repo=slug,
+                           summary=f"{_headline_of(check)}: ")
+    return next((who for summary, who in peers.items() if summary.startswith(prefix)), "")
+
+
 def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]:
     """Put every failing row on the board, through #274's one door. Never raises.
 
@@ -4896,6 +5178,23 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
     #227 both settled that the queue stays advisory and the measurements held the
     argument up: the system was never wrong about who should land next, only about
     who was still there. This says so out loud and names somebody to ask.
+
+    TWO THINGS #569 ADDED, and both are about who is speaking rather than about what
+    is wrong:
+
+    * **A shared condition is announced once by the fleet, not once per machine.** Ten
+      posts over two days included two pairs six minutes apart — zeus and hermes saying
+      the identical thing about the identical queue, because each host dedupes in its
+      own cache file. A row registered `scope="repo"` now asks the board whether a PEER
+      has already announced it, and stays quiet if one has. A row registered
+      `scope="host"` never asks: *"8 harness scripts are not on zeus"* and *"7 harness
+      scripts are not on hermes"* are two facts and both must be raised. See
+      :data:`SCOPES` for why that is a declaration on each registration and not a rule
+      derived from the group.
+    * **A host row's own key carries the host.** Belt as well as braces: even where two
+      machines find the byte-identical host-local fault, their keys differ by
+      construction, so no shared record of *what has been said* can ever collapse them.
+      Whoever adds the next check gets that property whether or not they think about it.
     """
     where = loops_dir(script)
     if where is None:
@@ -4907,9 +5206,33 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
     except Exception as exc:  # noqa: BLE001 — an escalation must survive its courier
         return [f"qb-doctor: NOT announced — {type(exc).__name__} importing needs_human"]
     slug = github_slug(host) or ""
+    failing = [c for c in checks if c.verdict in ANNOUNCED]
     said: list[str] = []
-    for check in (c for c in checks if c.verdict in ANNOUNCED):
-        summary, detail = _escalation(check, slug, host.base_url or "")
+    # `gethostname` and not the board's name for this box: the provenance line is a
+    # statement about the machine this ran on, and it must not depend on a board being
+    # reachable to be made. `_peer_gate` asks `/whoami` when the board's own spelling is
+    # what matters — telling my posts from a peer's.
+    raised_by = _raised_by(socket.gethostname()) if failing else ""
+    # A session only when there IS one. Claude Code exports it; a systemd timer does
+    # not, and `_raised_by` argues why that null is left alone rather than filled with
+    # something that looks like a session and joins to nothing.
+    session = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip() or None
+    peers, peers_why = _peer_gate(host, slug, failing, needs_human)
+    for check in failing:
+        peer = _peer_that_said_it(check, slug, peers, needs_human)
+        if peer:
+            said.append(f"qb-doctor: {check.name} NOT announced — {peer} already told the "
+                        f"board, and this row is about {slug}, which that machine sees "
+                        "too (#569)")
+            continue
+        summary, detail = _escalation(check, slug, host.base_url or "", raised_by)
+        if peers_why and check.scope == "repo":
+            # Said on the post rather than only on stderr: a duplicate that arrives
+            # because the board could not be read is a different thing from one nobody
+            # tried to prevent, and the reader deciding whether this is noise is the
+            # person who benefits from knowing which.
+            detail += (f"\n\nthe fleet-wide dedupe could not run: {peers_why} — so this "
+                       "may repeat something another machine already said (#569)")
         refs = [{"kind": "repo", "value": slug}] if slug else []
         pr = check.extra.get("head_pr")
         if slug and isinstance(pr, int):
@@ -4927,7 +5250,8 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
                 # twelve hours, which is #274's dedupe protecting the fleet from
                 # noise by hiding the news.
                 key=needs_human.digest("qb-doctor", check.name, check.subject,
-                                       _instance(check)),
+                                       _instance(check), *_host_part(check)),
+                session=session,
                 refs=refs or None)
         except Exception as exc:  # noqa: BLE001 — the courier, not the news
             # `announce` documents that it never raises, and this does not take its

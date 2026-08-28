@@ -171,6 +171,38 @@ def test_the_post_is_a_stuck_post_carrying_the_class_the_label_and_the_reason(do
     assert body["refs"] == [{"kind": "pr", "value": "9", "repo": "o/r"}]
 
 
+def test_the_headline_a_reader_composes_is_the_one_the_post_carries(door):
+    """#569 moved deduplication of a fleet-wide condition onto the board, and the board
+    keeps no dedupe table: the record of an announcement IS the announcement. So a
+    producer asking *has another machine already rung this bell* has to recognise its own
+    headline coming back off `GET /board`, and it composes the string it looks for with
+    the same function that wrote it.
+
+    A prefix has to survive that composition intact, which is why `headline` neither
+    trims nor truncates — `announce` does both, and `.strip()` on a prefix ending in a
+    space would silently eat the space and match the wrong row's post."""
+    nh.announce(cls="environment", reason="nothing can land", summary="landed: 3 ready",
+                repo="o/r")
+
+    whole = nh.headline(cls="environment", repo="o/r", summary="landed: 3 ready")
+    prefix = nh.headline(cls="environment", repo="o/r", summary="landed: ")
+
+    assert door[0]["summary"] == whole
+    assert prefix.endswith("landed: ")
+    assert door[0]["summary"].startswith(prefix)
+
+
+def test_a_headline_prefix_does_not_match_another_row_or_another_repo(door):
+    """The prefix carries the repo, the class and the row name, and matching on less
+    than all three is how one repository's stalled queue speaks for another's."""
+    posted = nh.headline(cls="environment", repo="o/r", summary="landed: 3 ready")
+
+    assert not posted.startswith(nh.headline(cls="environment", repo="o/r",
+                                             summary="queue: "))
+    assert not posted.startswith(nh.headline(cls="environment", repo="o/other",
+                                             summary="landed: "))
+
+
 def test_switching_it_off_is_silence_and_not_a_refusal(door, monkeypatch):
     """Off is a decision, so it must not print a diagnostic on every run."""
     for off in ("", "0", "off", "no", "FALSE"):

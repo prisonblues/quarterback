@@ -217,6 +217,26 @@ def digest(*parts: object) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
+def headline(*, cls: str, repo: str, summary: str) -> str:
+    """The board summary :func:`announce` writes, composed in ONE place — #569.
+
+    Split out because a second reader needs it. Deduplication of a fleet-wide
+    condition belongs on the board rather than in each host's cache file, and the
+    only record the board keeps of an announcement is the post itself — so a
+    producer asking *has anybody already rung this bell* has to recognise its own
+    headline coming back off ``GET /board``. Recognising it against a format spelled
+    a second time at the reader is how a matcher silently stops matching: the post
+    still lands, the peer still duplicates, and nothing says so.
+
+    Neither trimmed nor truncated here, so that the same call composes a whole
+    headline and a PREFIX of one — ``summary="landed: "`` has to keep its trailing
+    space. :func:`announce` applies ``.strip()[:900]`` to what it posts, which is a
+    no-op on a real summary and would eat exactly that space.
+    """
+    where = f"[{repo}] " if repo else ""
+    return f"{where}needs a human ({cls}): {summary}"
+
+
 def _load_seen() -> dict[str, float]:
     """The "already said this" record. An unreadable one is an empty one: the
     cost of losing it is a duplicate post, which is the right failure."""
@@ -425,7 +445,6 @@ def announce(*, cls: str, reason: str, summary: str, repo: str = "",
     now = time.time()
     if key and _recently_announced(key, now):
         return ""
-    where = f"[{repo}] " if repo else ""
     lines = [f"class:  {known}{unknown}",
              f"label:  {label_for(known)}",
              f"reason: {said}"]
@@ -435,7 +454,7 @@ def announce(*, cls: str, reason: str, summary: str, repo: str = "",
         lines += ["", detail.strip()]
     body: dict = {
         "type": "stuck",
-        "summary": f"{where}needs a human ({known}): {summary}".strip()[:900],
+        "summary": headline(cls=known, repo=repo, summary=summary).strip()[:900],
         "detail": "\n".join(lines),
     }
     to = addressee(cfg)
