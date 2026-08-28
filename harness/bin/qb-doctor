@@ -451,6 +451,13 @@ class Host:
     #: same pull requests, which is both slow and a way for them to disagree. Per-Host
     #: rather than module-level so a test drives one survey and not a leftover.
     gh_cache: dict = field(default_factory=dict)
+    #: One `git fetch` per run, for the same reason and with a sharper one behind it.
+    #: `checkout` fetches so that "0 behind" is a sentence about now; `unpushed` fetches
+    #: because its whole query is answered out of the remote-tracking refs, and against
+    #: week-old ones it reports work as stranded that was pushed on Tuesday. Two rows
+    #: needing the same refresh must not pay for it twice, and must not be able to
+    #: disagree about whether it succeeded.
+    git_cache: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -938,6 +945,40 @@ def check_client(host: Host) -> Check:
     return Check("client", str(py), f"importable, from {want}", "ok")
 
 
+def fetched(host: Host, remote: str | None = None) -> tuple[bool, str]:
+    """Refresh ONE remote's tracking refs, once per run — ``(did it, why not)``.
+
+    Memoised per remote on the `Host` because two rows depend on this and `git fetch` is
+    the slowest thing this tool does. It is one function rather than two call sites for
+    the reason `open_pull_requests` is one: a second hand-rolled copy is how two rows come
+    to disagree about whether the refs under them are current. The memo caches a REFUSAL
+    as well as a success — a cache that only remembered good news would let the second row
+    retry, succeed against a flapping remote, and disagree with the first.
+
+    Per REMOTE and not per host, which Codex found: `checkout` asks about one remote and
+    `unpushed` subtracts `--remotes`, meaning every remote there is. Refreshing only the
+    configured one and then trusting all of them is the stale-ref fault the `unpushed` row
+    is written against, one level up from where it looks for it.
+
+    It does NOT prune, deliberately. `--prune` deletes remote-tracking refs, and a deleted
+    remote-tracking ref is the last thing making some commits reachable — so the tidying
+    gesture is a way to lose exactly the work the `unpushed` row counts. The cost is stated
+    where it bites: a branch deleted upstream *without having been merged* still has a
+    local `origin/` ref naming it, so `unpushed` reads that work as safely elsewhere when
+    it is not. Measured on zeus the day this landed, `git fetch --prune --dry-run` named
+    zero such refs.
+    """
+    remote = remote or host.remote
+    key = f"fetched:{remote}"
+    if key not in host.git_cache:
+        rc, _out, err = run_cmd(["git", "-C", str(host.repo), "fetch", "--quiet", remote])
+        host.git_cache[key] = (
+            rc == 0,
+            "" if rc == 0 else f"could not fetch {remote}: "
+                               f"{clip_line(err) or f'exit {rc}'}")
+    return host.git_cache[key]
+
+
 def check_checkout(host: Host) -> Check:
     """Is this checkout current with its remote?
 
@@ -947,10 +988,9 @@ def check_checkout(host: Host) -> Check:
     a fetch that fails is an `unknown` rather than a clean bill.
     """
     r = str(host.repo)
-    rc, _out, err = run_cmd(["git", "-C", r, "fetch", "--quiet", host.remote])
-    if rc != 0:
-        return Check("checkout", r, f"could not fetch {host.remote}: {err or f'exit {rc}'}",
-                     "unknown", manual=f"git -C {r} fetch {host.remote}")
+    ok, why = fetched(host)
+    if not ok:
+        return Check("checkout", r, why, "unknown", manual=f"git -C {r} fetch {host.remote}")
     _rc, branch, _ = run_cmd(["git", "-C", r, "rev-parse", "--abbrev-ref", "HEAD"])
     _rc, head, _ = run_cmd(["git", "-C", r, "rev-parse", "--short", "HEAD"])
     base = _default_branch(host)
@@ -1929,6 +1969,19 @@ QUEUE_STALL_MINUTES = 30
 #: pull requests waiting is the single most legible statement of #405's night.
 MAIN_STALL_MINUTES = 120
 
+#: How long a commit may sit on a local branch and on no remote before the `unpushed`
+#: row calls it a finding. Age is the whole signal, and #567 states the boundary in the
+#: only terms that make it safe: unpushed for an hour is normal, unpushed for nineteen
+#: days is the only copy of that work in the world. So the row has exactly ONE threshold
+#: and it is on age, never on count — a count threshold would fire on a busy afternoon
+#: and stay quiet through a fortnight of drift, which is the wrong way round.
+UNPUSHED_GRACE_HOURS = 24
+
+#: How many branches the `unpushed` detail line names before it stops. The whole table is
+#: in `extra` and in the brief; a report row is a row. Ordered oldest-first, because the
+#: branch a reader needs to see is the one nothing has touched since the week before last.
+UNPUSHED_SAMPLE = 6
+
 #: How many open pull requests the GitHub-backed rows read. A cap, because these run on a
 #: command a person types when something feels wrong and `gh` pages until it has them all.
 #: Reaching it is NOT reported and moved on from: a row that saw the first N and found
@@ -2199,6 +2252,315 @@ def check_queue(host: Host) -> Check:
                  f"{queued} queued on {base}, none ready yet — the oldest has waited "
                  f"{_spell_age(waited)}, which is inside a landing", "ok",
                  extra={"queued": queued, "ready": 0, "waited_minutes": int(waited)})
+
+
+def _is_are(n: int) -> str:
+    """The verb a count takes, so a row reads as English at 1 as well as at 27."""
+    return "is" if n == 1 else "are"
+
+
+def _plural(n: int, word: str) -> str:
+    """`1 branch`, `12 branches` — because `12 branch(es)` is a row nobody reads twice."""
+    return f"{n} {word}" if n == 1 else f"{n} {word}{'es' if word.endswith('h') else 's'}"
+
+
+def _spell_since(minutes: float) -> str:
+    """`19 days`, `31 hours`, `40 minutes` — the coarsest unit that is still true.
+
+    Not `_spell_age`, which renders `456h 12m` for nineteen days. That form is right for
+    the `landed` row, where the question is whether something has been still for two
+    hours and the minutes are the answer; it is wrong here, where the reader has to feel
+    a fortnight at a glance and a four-digit hour count reads as a number rather than as
+    a length of time.
+    """
+    if minutes < 90:
+        return f"{int(minutes)} minute{'' if int(minutes) == 1 else 's'}"
+    hours = minutes / 60
+    if hours < 48:
+        return f"{int(hours)} hours"
+    return f"{int(hours // 24)} days"
+
+
+def _remote_names(host: Host) -> list[str] | None:
+    """Every remote configured here, or None when git could not be asked."""
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "remote"])
+    if rc != 0:
+        return None
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _no_remote_has(host: Host, rev: str) -> list[tuple[str, str]] | None:
+    """``[(sha, committer date)]`` for commits reachable from `rev` and from NO remote
+    ref at all — newest first — or None when git could not be asked.
+
+    This is `git rev-list <rev> --not --remotes`, which is the exact query #567 is
+    about, spelled once so that the total and the per-branch breakdown cannot be
+    computed two different ways and disagree.
+
+    `--not --remotes` and not `origin/<branch>`, and the difference is not a nicety.
+    Measured on zeus on 2026-08-28, the same afternoon, against the same 100 branches:
+    this form found 12 branches carrying 27 distinct commits; comparing each branch to
+    its own `origin/` ref found 8 branches carrying 133, of which FIVE — `feat/issue-262`,
+    `feat/issue-80-ranking`, `fix/issue-335`, `fix/issue-387`, `fix/issue-406` — were
+    ancestors of `origin/main` in their entirety, with nothing stranded on any of them.
+    A merged branch whose remote was deleted keeps its local merge commits, and those
+    commits are on `origin/main`; comparing to a ref that no longer exists calls every
+    one of them lost. The same form also MISSED seven of the twelve real cases, because
+    a branch that was never pushed has no `origin/` ref to be compared against. Wrong
+    five times in eight, silent seven times in twelve.
+
+    The `--` terminates the revision list, so a branch sharing a name with a path in the
+    working tree cannot turn this into a question about a file.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "log", "--format=%H %cI",
+                          rev, "--not", "--remotes", "--"])
+    if rc != 0:
+        return None
+    found: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        sha, _, when = line.strip().partition(" ")
+        if not (sha and when):
+            # Codex's finding, and the direction it fails in is the one that matters: a
+            # dropped line is a commit this row did not count, so a run where every line
+            # is unparseable answers `ok` about a measurement it never made. There is no
+            # safe number to fall back to, so this reports that it could not be asked.
+            return None
+        found.append((sha, when))
+    return found
+
+
+def _maps_every_head(host: Host, remote: str) -> bool:
+    """Does this remote's refspec bring back EVERY branch, or only some of them?
+
+    Codex's finding. A single-branch clone configures
+    `+refs/heads/main:refs/remotes/origin/main`, so `refs/remotes/` is complete for `main`
+    and empty for everything else — and `--not --remotes` would then report every feature
+    branch on the server as work that exists only on this disk. That is the cry-wolf
+    failure this row was written to avoid, arriving through the refspec instead of through
+    the comparison.
+
+    A remote with no `fetch` refspec at all answers False for the same reason: nothing
+    here can say what it would have brought back.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "config", "--get-all",
+                          f"remote.{remote}.fetch"])
+    if rc != 0:
+        return False
+    return any(spec.lstrip("+").split(":")[0] == "refs/heads/*"
+               for spec in (line.strip() for line in out.splitlines()) if spec)
+
+
+def _branch_tips(host: Host) -> list[tuple[str, str]] | None:
+    """``[(sha, branch)]`` for every local branch, or None when git could not be asked.
+
+    Every branch in the repository, which on this fleet means every branch in every one
+    of its ninety-odd worktrees: `refs/heads/` lives in the common git dir and is shared
+    between them. That is the property that makes one row enough — a per-worktree answer
+    would need ninety-odd runs, and the branch nobody has checked out for a fortnight is
+    exactly the one no run would cover.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "for-each-ref",
+                          "--format=%(objectname) %(refname:short)", "refs/heads/"])
+    if rc != 0:
+        return None
+    tips: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        sha, _, name = line.strip().partition(" ")
+        if sha and name:
+            tips.append((sha, name))
+    return tips
+
+
+def check_unpushed(host: Host) -> Check:
+    """Is there work on this disk that exists nowhere else, and how old is the oldest?
+
+    #567, measured on zeus: eleven branches carrying twenty-eight commits that existed on
+    no remote anywhere, the oldest nineteen days old, with ninety-four worktrees to hide
+    them in and nothing on the host saying so. `landed` asks whether finished work is
+    reaching the branch it has to reach; this asks the same question one step earlier,
+    where the work has not left the machine it was written on. If the disk failed, that is
+    what would be gone.
+
+    WHY IT REPORTS AN AGE AND NOT JUST A COUNT. A count alone has no green state that any
+    working fleet reaches: something is always mid-flight, so the row would be red on a
+    perfectly healthy afternoon and a reader would learn to skip it in a week. The age is
+    what separates the two populations — a branch committed this morning and not yet
+    pushed is the ordinary state of work, and a branch nobody has touched since the week
+    before last is a single point of failure nobody chose. So the row reports the count in
+    both states and takes its VERDICT from `UNPUSHED_GRACE_HOURS`.
+
+    WHY THERE IS NO BASELINE, which #567 asked to be argued either way rather than
+    defaulted. The proposal was to record the first run's backlog and report against it —
+    "3 new since you last looked" instead of "28 total". Rejected, for three reasons that
+    compound:
+
+    * **It silences the exact material it was invented for.** The twenty-eight commits
+      from nineteen days ago are the ones actually at risk; folding them into a baseline
+      makes the row go green while the exposure is unchanged. That is a false green, which
+      is the one rendering this whole file exists to forbid.
+    * **It puts the verdict at the mercy of state nothing can see.** A baseline lives in a
+      file on one host, so the same repository answers differently on two machines and a
+      fresh checkout re-reports everything as new. Every other row here is a function of
+      what it can read right now, on purpose.
+    * **The premise is wrong: this count does not only go up.** It falls the moment a
+      branch is pushed, cherry-picked or deleted — it moved 11 → 12 on the afternoon this
+      was written, because another agent committed on `feat/issue-292-grok-reviewer` while
+      this was being measured, and it will move to 0 when the twelve are decided on. It is
+      a backlog gauge, not a tally of things that have ever happened.
+
+    What actually keeps the row from becoming wallpaper is that every line of it is
+    individually clearable, and the brief is a `human` one that hands over the enumeration
+    ordered oldest-first. The delta a baseline would have computed is available without any
+    stored state, because each line carries its own date.
+
+    TWO THINGS IT DOES NOT SEE, both stated because a limit nobody wrote down is a limit
+    nobody remembers:
+
+    * **A detached HEAD.** `--branches` is local branches, so commits made in a worktree
+      with no branch checked out are invisible here. That is a narrower and rarer hole
+      than the one this closes, and covering it would mean walking `git worktree list` and
+      reporting rows about directories rather than about work.
+    * **A remote branch deleted upstream since the last fetch.** `fetched` does not prune
+      — pruning deletes the refs that make commits reachable, which is a way to lose the
+      very work this counts — so a stale `origin/<branch>` ref makes its commits look
+      safely elsewhere when the server no longer has them. This is the one direction in
+      which the row can read green about work that is not, and it is a deliberate trade
+      against a remedy that can destroy data.
+    """
+    r = str(host.repo)
+    remotes = _remote_names(host)
+    if remotes is None:
+        return Check("unpushed", r, "could not list this repository's remotes, so whether "
+                     "anything here exists nowhere else cannot be asked", "unknown",
+                     manual=f"git -C {r} remote -v")
+    # A repository with no remote at all: the question does not arise rather than being
+    # unanswerable. Every commit is on no remote and none of it is stranded, because there
+    # is no elsewhere for it to be. `check_generated` says "no changelog.d/, so not a
+    # fault" in the same shape and for the same reason — an `unknown` here would be a row
+    # complaining that a local scratch repo is not a fleet.
+    if not remotes:
+        return Check("unpushed", r, "this repository has no remote, so there is no "
+                     "elsewhere for its commits to be and nothing here is stranded", "ok",
+                     extra={"branches": 0, "commits": 0})
+    # Remotes exist and the one this host is configured against is not among them. The
+    # QUERY would still run — `--remotes` reads every remote-tracking ref there is — and
+    # that is exactly the trap: it would answer out of refs nothing here can refresh.
+    if host.remote not in remotes:
+        return Check("unpushed", r,
+                     f"there is no `{host.remote}` remote here ({', '.join(remotes)}), so "
+                     "the remote-tracking refs this is measured against cannot be "
+                     f"refreshed — and `git rev-list --not --remotes` against stale ones "
+                     "answers confidently and wrongly", "unknown",
+                     manual=f"git -C {r} remote -v")
+    # EVERY remote, not just the configured one. `--not --remotes` subtracts the tracking
+    # refs of all of them, so refreshing `origin` and then trusting a month-old `upstream`
+    # is the stale-ref fault this row is written against, happening one level up. Codex
+    # found it; the memo means a repo with one remote still fetches once.
+    for remote in remotes:
+        ok, why = fetched(host, remote)
+        if not ok:
+            return Check("unpushed", r, f"{why} — and this row subtracts the tracking refs "
+                         "of every remote, so one that could not be refreshed reports work "
+                         "as stranded that was pushed since", "unknown",
+                         manual=f"git -C {r} fetch {remote}")
+        if not _maps_every_head(host, remote):
+            return Check("unpushed", r,
+                         f"`{remote}` does not fetch `refs/heads/*` — a single-branch or "
+                         "custom refspec brings back some branches and not others, so a "
+                         "branch that IS on the server would answer here as work that "
+                         "exists only on this disk", "unknown",
+                         manual=f"git -C {r} config --get-all remote.{remote}.fetch")
+    everywhere = _no_remote_has(host, "--branches")
+    tips = _branch_tips(host)
+    if everywhere is None or tips is None:
+        return Check("unpushed", r, "`git rev-list --branches --not --remotes` could not be "
+                     "run in this checkout", "unknown",
+                     manual=f"git -C {r} rev-list --count --branches --not --remotes")
+    if not everywhere:
+        return Check("unpushed", r, f"every one of {_plural(len(tips), 'local branch')} is "
+                     "reachable from a remote ref — nothing here exists only on this disk",
+                     "ok", extra={"branches": 0, "commits": 0, "local_branches": len(tips)})
+    # A remote that fetched cleanly and has no branches at all. The first cut called this
+    # `unknown` to keep a whole history out of the report; Codex was right that it is the
+    # opposite error — the measurement succeeded, and refusing a verdict it made is the
+    # same laundering of ignorance in the other direction. So it answers, and says which
+    # shape it is in, because "nothing has ever been pushed" and "some work went missing"
+    # want very different things from the reader.
+    rc, first_remote_ref, _ = run_cmd(["git", "-C", r, "for-each-ref", "--count=1",
+                                       "--format=%(refname)", "refs/remotes/"])
+    unpushed_repo = (" — the remote fetched cleanly and has no branches at all, so nothing "
+                     "here has ever been pushed" if rc == 0 and not first_remote_ref.strip()
+                     else "")
+    # A branch carries stranded commits if and only if its OWN TIP is stranded: anything
+    # reachable from a tip that some remote ref reaches is reached by that ref too. So one
+    # walk over the union names the branches worth asking about, and the per-branch calls
+    # are twelve rather than a hundred.
+    stranded = {sha for sha, _ in everywhere}
+    affected = [name for sha, name in tips if sha in stranded]
+    rows = _enumerate(host, affected or [name for _, name in tips])
+    if not rows:
+        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} {_is_are(len(everywhere))} on no remote ref and "
+                     "no local branch accounts for them, which nothing here can explain",
+                     "unknown",
+                     manual=f"git -C {r} rev-list --branches --not --remotes | head")
+    oldest = min(when for _, when in everywhere)
+    age = _age_minutes(oldest)
+    named = ", ".join(f"{row['branch']} ({row['commits']})" for row in rows[:UNPUSHED_SAMPLE])
+    more = "" if len(rows) <= UNPUSHED_SAMPLE else f", +{len(rows) - UNPUSHED_SAMPLE} more"
+    extra = {"commits": len(everywhere), "branches": len(rows),
+             "oldest": rows[0]["oldest"], "oldest_branch": rows[0]["branch"],
+             "local_branches": len(tips),
+             # Date-first so that `_spell`'s alphabetical sort of a list is chronological:
+             # the brief must not reorder the one ranking that carries the signal.
+             "stranded": [f"{row['oldest']}  {row['branch']}  {_plural(row['commits'], 'commit')}"
+                          for row in rows]}
+    if age is None or age < 0:
+        # A committer date in the future is clock skew or a rewritten history, and either
+        # way the age this row's verdict turns on is not a measurement. Report the count
+        # and refuse the verdict rather than picking whichever side the skew lands on.
+        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
+                     f"{_is_are(len(everywhere))} on no remote ref, and the oldest is dated {oldest}, which is not "
+                     "an age this can measure against", "unknown",
+                     manual=f"git -C {r} log --format='%cI %h %s' --branches --not --remotes",
+                     extra=extra)
+    extra["age"] = _spell_since(age)
+    if age < UNPUSHED_GRACE_HOURS * 60:
+        return Check("unpushed", r, f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
+                     f"{_is_are(len(everywhere))} not on any remote yet, the oldest {extra['age']} old ({named}"
+                     f"{more}){unpushed_repo or ' — work in flight, which is the ordinary state'}",
+                     "ok", extra=extra)
+    return Check("unpushed", r,
+                 f"{_plural(len(everywhere), 'commit')} on {_plural(len(rows), 'branch')} "
+                 f"exist{'s' if len(everywhere) == 1 else ''} on no remote ref, the oldest {extra['age']} old ({rows[0]['oldest']}, "
+                 f"{rows[0]['branch']}): {named}{more}{unpushed_repo} — if this disk failed "
+                 "that work is gone, and nothing else on this host says so", "fail",
+                 manual=f"git -C {r} log --format='%cI %h %s' --branches --not --remotes"
+                        "   # `--not --remotes`, never `origin/<branch>`",
+                 extra=extra)
+
+
+def _enumerate(host: Host, branches: list[str]) -> list[dict]:
+    """One entry per branch that carries stranded commits, OLDEST FIRST.
+
+    Oldest first and not largest first: a branch with eight commits from yesterday is
+    ordinary and a branch with one from three weeks ago is the finding, so a ranking by
+    size would put the wrong line at the top of a row that only shows six.
+
+    The per-branch counts SUM TO MORE than the row's headline when branches share
+    commits — twenty-nine against twenty-seven on the machine this was written for, where
+    two commits sit on a branch and on a branch forked from it. The headline is the
+    de-duplicated union, because "how many commits exist nowhere else" has one answer.
+    """
+    rows: list[dict] = []
+    for name in branches:
+        found = _no_remote_has(host, f"refs/heads/{name}")
+        if found:
+            rows.append({"branch": name, "commits": len(found),
+                         "oldest": min(when for _, when in found)[:10]})
+    rows.sort(key=lambda row: (row["oldest"], -row["commits"], row["branch"]))
+    return rows
 
 
 def open_pull_requests(host: Host) -> tuple[list[dict] | None, str]:
@@ -3866,6 +4228,50 @@ CHECKS = (
                 needs=("head_holder", "waited_minutes")),
         }),
     CheckSpec(
+        "unpushed", "landing", check_unpushed,
+        explanation=(
+            "On the machine this row was written for, eleven branches carried twenty-eight "
+            "commits that existed on no remote anywhere, the oldest nineteen days old — "
+            "with ninety-four worktrees to hide them in and nothing on the host saying so. "
+            "`landed` asks whether finished work is reaching the branch it has to reach; "
+            "this asks it one step earlier, where the work has not left the disk it was "
+            "written on. The query is `git rev-list <branch> --not --remotes`, and the "
+            "near-miss it deliberately is not — comparing each branch to `origin/<branch>` "
+            "— was measured the same afternoon on the same repository: eight branches, "
+            "five of them ancestors of `origin/main` in their entirety, and seven of the "
+            "twelve real cases missed because a branch that was never pushed has no "
+            "`origin/` ref to compare against. A row that is wrong five times in eight is "
+            "a row people switch off inside a week."),
+        briefs={
+            "fail": Brief(
+                audience="human",
+                task=("Decide what happens to each of these branches — that is the remedy "
+                      "and there is no other one. `stranded` below lists them oldest "
+                      "first, one line each with the date the oldest commit on it was "
+                      "written. For each line: push it, cherry-pick the part worth "
+                      "keeping, or delete the branch. Every line you settle removes a "
+                      "line from this row, which is why the count comes down and not only "
+                      "up — {oldest_branch} has been sitting for {age}."),
+                constraints=(
+                    "Do NOT push them all to clear the row. Several of these are abandoned "
+                    "experiments, and pushing them litters the remote with branches nobody "
+                    "wants; on the machine this row was written for at least one of them "
+                    "duplicated work that had already landed by another route. The row is "
+                    "asking for a decision per branch, not a bulk `git push --all`.",
+                    "Nothing automated may make this call, which is why this is an "
+                    "escalation and not a task. Whether {oldest_branch} is worth keeping is "
+                    "a judgement about what somebody meant, and the only evidence is its "
+                    "diff and whoever wrote it.",
+                    "Deleting one of these branches really does destroy its commits — they "
+                    "are on no remote, which is the entire finding. Read the diff first: "
+                    "`git log -p <branch> --not --remotes`.",
+                    "A branch that turns out to duplicate work already landed is a delete, "
+                    "not a push. Check whether its change is in the default branch by "
+                    "content before you assume the count is real work.",
+                ),
+                needs=("stranded", "commits", "age")),
+        }),
+    CheckSpec(
         "landed", "landing", check_landed,
         explanation=(
             "A pull request GitHub calls CLEAN can land, so if one has been CLEAN while "
@@ -4547,8 +4953,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="the whole report as JSON")
     parser.add_argument("--only", metavar="NAMES",
                         help="comma-separated check names ("
-                             + ",".join(spec.name for spec in CHECKS)
-                             + ") or group names (" + ",".join(GROUPS) + ")")
+                             + ", ".join(spec.name for spec in CHECKS)
+                             + ") or group names (" + ", ".join(GROUPS) + ")")
     parser.add_argument("--human-url", metavar="URL", dest="human_url",
                         help="the browser vhost, for the edge check (else QUARTERBACK_HUMAN_URL)")
     parser.add_argument("--quiet", action="store_true",

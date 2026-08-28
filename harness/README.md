@@ -3121,6 +3121,7 @@ edge       https://quarterback.fo.ls       302 — forward-auth, and this host h
 tools      PATH                            git, gh, curl, jq present, gh authenticated       ok
 merges     ~/source/quarterback            nothing here reserves a tag at push time (#122)    ok
 queue      prisonblues/quarterback@main    nothing is queued to land on main                  ok
+unpushed   ~/source/quarterback            27 commits on 12 branches on no remote, oldest 19d  FAIL
 landed     prisonblues/quarterback         2 PRs ready, tip of main committed 7h 20m ago    FAIL
 tags       origin/main                     every release on origin/main is tagged, on-ref     ok
 generated  ~/source/quarterback            none of 2 open PRs edits CHANGELOG.md              ok
@@ -3130,6 +3131,61 @@ briefs     …/share/quarterback-harness     fix-and-land.md runs a removed comm
 
 Rows are grouped by which question they answer, and `--only` takes a group name as well as a
 row name. `host` is the first two questions; `landing` is the third.
+
+#### `unpushed` asks the landing question one step earlier (#567)
+
+`landed` asks whether finished work is reaching the branch it has to reach. `unpushed` asks
+whether it has left the disk it was written on. On zeus, on the afternoon #567 was filed,
+eleven branches carried twenty-eight commits that existed on no remote anywhere, the oldest
+nineteen days old — with ninety-four worktrees to hide them in and nothing on the box saying
+so. If the disk had failed, that work was gone.
+
+The query is exact and that is what makes it cheap:
+
+```bash
+git rev-list --count <branch> --not --remotes    # reachable from here, and from NO remote ref
+```
+
+**The obvious near-miss is much worse, and the row deliberately does not build it.** Compare
+each branch to its own `origin/<branch>` instead and, measured the same afternoon on the same
+hundred branches, you get eight branches carrying 133 commits — of which **five are entirely
+ancestors of `origin/main`**: a merged branch whose remote was deleted keeps its local merge
+commits, and comparing against a ref that no longer exists calls every one of them lost. The
+same comparison also *misses* seven of the twelve real cases, because a branch that was never
+pushed has no `origin/` ref to be compared against at all. Wrong five times in eight, silent
+seven times in twelve. `--not --remotes` asks the question a person actually means.
+
+**Age is the verdict, not the count.** Something is always in flight, so a row that failed on
+a non-zero count would be red on a healthy afternoon and skipped within a week. Under
+`UNPUSHED_GRACE_HOURS` the row reports the number and stays `ok`; over it, the row fails and
+names the oldest date. There is deliberately **no stored baseline** — "3 new since you last
+looked" would put the verdict at the mercy of a state file, would go green on the nineteen-day
+backlog that is the actual exposure, and is answering a premise that is false anyway: this
+count falls the moment a branch is pushed, cherry-picked or deleted. It moved 11 → 12 while
+the row was being written, because another agent committed on a branch mid-measurement.
+
+**The remedy is a decision per branch, so it is a `human` brief** (#408): push it,
+cherry-pick the part worth keeping, or delete it. Several of these are abandoned experiments
+and pushing them all would litter the remote with branches nobody wants; on zeus at least one
+of them duplicated work that had already landed by another route. Nothing automated may make
+that call.
+
+A host that cannot make the measurement gets `unknown` and never `ok`. That covers a fetch
+that failed, a configured remote that is not there, and — Codex's finding on this change — a
+remote whose refspec does not bring back `refs/heads/*`, since a single-branch clone would
+otherwise report every feature branch on the server as work that exists only on this disk.
+**Every** remote is refreshed, not only the configured one, because `--not --remotes`
+subtracts the tracking refs of all of them. A remote that fetched cleanly and holds no
+branches is not an unknown: the query succeeded, and the answer is that nothing here has
+ever been pushed.
+
+Two limits it states rather than hides: commits on a **detached HEAD** are invisible to
+`--branches`, and a branch **deleted upstream without having been merged** since the last
+fetch still has a local `origin/` ref that makes its commits look safely elsewhere. The
+second is a deliberate trade — `qb-doctor` never fetches with `--prune`, because pruning
+deletes the refs that keep those commits reachable, which is a way to lose exactly the work
+this row counts. On zeus the day this landed, `git fetch --prune --dry-run` named no such
+refs.
 
 #### Look where the mechanism runs, not where its source lives
 

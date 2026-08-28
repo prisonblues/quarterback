@@ -24,6 +24,7 @@ import ast
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -2337,6 +2338,365 @@ def test_a_truncated_read_can_still_report_what_it_did_see(monkeypatch, landing_
     assert "#999" in check.detail
 
 
+# ----------------------------------------------------------------- unpushed
+
+def _commit(repo: Path, message: str, *, days_ago: float = 0) -> str:
+    """One empty commit, optionally back-dated. Age is this row's whole signal, so a
+    fixture that could only make commits dated *now* could not test the boundary."""
+    when = (datetime.now(UTC) - timedelta(days=days_ago)).isoformat()
+    subprocess.run(["git", "-C", str(repo), "-c", "core.hooksPath=/nonexistent",
+                    "commit", "-q", "--allow-empty", "-m", message],
+                   env={**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when},
+                   check=True)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+@pytest.fixture
+def pushed(tmp_path: Path) -> Path:
+    """A repo with a real remote on disk, one commit, and everything on it pushed.
+
+    A local bare repository rather than a network one: this suite runs inside
+    flake.nix's `worktree-tests` sandbox, which has no network, and a fixture that
+    needed one would SKIP there and be green about nothing.
+    """
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    _commit(work, "init")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-q", "origin", "main")
+    _git(work, "fetch", "-q", "origin")
+    return work
+
+
+def _naive_count(repo: Path, branch: str) -> int:
+    """What the near-miss would have said: this branch against its own `origin/` ref.
+
+    Spelled out in the test rather than in the tool, because the tool must never contain
+    it. A branch with no `origin/` ref counts as its whole history, which is the other
+    half of how that comparison is wrong.
+    """
+    remote = f"refs/remotes/origin/{branch}"
+    if subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", remote],
+                      capture_output=True).returncode != 0:
+        return int(_git(repo, "rev-list", "--count", branch))
+    return int(_git(repo, "rev-list", "--count", branch, f"^origin/{branch}"))
+
+
+def test_a_repo_whose_every_branch_is_reachable_from_a_remote_is_ok(pushed):
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "ok"
+    assert "reachable from a remote ref" in check.detail
+    assert check.extra["commits"] == 0
+
+
+def test_a_merged_branch_whose_remote_ref_is_behind_is_not_a_finding(pushed):
+    """The whole reason the query is `--not --remotes` and not `origin/<branch>`.
+
+    A branch that was merged and then caught up with `main` carries commits its own
+    `origin/` ref has never seen — and every one of them is on `origin/main`. Five of the
+    eight branches the near-miss reported on zeus were exactly this, which is a row that
+    cries wolf five times in eight and gets switched off inside a week.
+    """
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "the work")
+    _git(pushed, "push", "-q", "origin", "feat/x")
+    _git(pushed, "checkout", "-q", "main")
+    subprocess.run(["git", "-C", str(pushed), "-c", "core.hooksPath=/nonexistent",
+                    "merge", "-q", "--no-ff", "-m", "merge feat/x", "feat/x"], check=True)
+    _git(pushed, "push", "-q", "origin", "main")
+    _git(pushed, "checkout", "-q", "feat/x")
+    _git(pushed, "merge", "-q", "--ff-only", "main")
+    _git(pushed, "fetch", "-q", "origin")
+
+    assert _naive_count(pushed, "feat/x") > 0, "the near-miss has to fire, or this proves nothing"
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "ok", check.detail
+    assert check.extra["commits"] == 0
+
+
+def test_a_branch_that_was_never_pushed_is_found_even_though_it_has_no_remote_ref(pushed):
+    """The other half of the near-miss: `origin/<branch>` cannot be compared against when
+    it does not exist, so seven of the twelve real cases on zeus were invisible to it."""
+    _git(pushed, "checkout", "-q", "-b", "feat/never")
+    _commit(pushed, "stranded", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "fail"
+    assert check.extra["branches"] == 1
+    assert check.extra["oldest_branch"] == "feat/never"
+    assert "19 days" in check.detail
+
+
+def test_work_older_than_the_grace_window_fails_and_the_same_work_today_does_not(pushed):
+    """Age is the verdict and the count is not, which is what stops the row being a red
+    light on every healthy afternoon. Five commits made this morning are ordinary; one
+    commit made a fortnight ago is the only copy of that work in the world."""
+    _git(pushed, "checkout", "-q", "-b", "feat/today")
+    for i in range(5):
+        _commit(pushed, f"in flight {i}")
+
+    fresh = qd.check_unpushed(host_for(pushed))
+    assert fresh.verdict == "ok"
+    assert fresh.extra["commits"] == 5, "an `ok` still has to report the number"
+    assert "work in flight" in fresh.detail
+
+    _git(pushed, "checkout", "-q", "-b", "feat/stale")
+    _commit(pushed, "left behind", days_ago=qd.UNPUSHED_GRACE_HOURS / 24 + 1)
+    stale = qd.check_unpushed(host_for(pushed))
+    assert stale.verdict == "fail"
+    assert stale.extra["oldest_branch"] == "feat/stale"
+
+
+def test_the_headline_counts_a_commit_once_however_many_branches_carry_it(pushed):
+    """`27 commits on 12 branches` is a de-duplicated union — the per-branch numbers summed
+    to 29 on zeus, because two commits sat on a branch and on a branch forked from it.
+    "How many commits exist nowhere else" has one answer."""
+    _git(pushed, "checkout", "-q", "-b", "feat/one")
+    _commit(pushed, "shared", days_ago=19)
+    _git(pushed, "checkout", "-q", "-b", "feat/two")
+
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "fail"
+    assert check.extra["commits"] == 1
+    assert check.extra["branches"] == 2
+    assert len(check.extra["stranded"]) == 2
+
+
+def test_the_enumeration_is_ordered_oldest_first_and_stays_that_way_in_the_brief(pushed):
+    """A branch with eight commits from yesterday is ordinary and a branch with one from
+    three weeks ago is the finding, so a row that shows six lines must not rank by size.
+    `_spell` sorts a list alphabetically for the brief, which is why each line leads with
+    its date — alphabetical and chronological are then the same order."""
+    _git(pushed, "checkout", "-q", "-b", "feat/big")
+    for i in range(4):
+        _commit(pushed, f"big {i}", days_ago=2)
+    _git(pushed, "checkout", "-q", "main")
+    _git(pushed, "checkout", "-q", "-b", "feat/ancient")
+    _commit(pushed, "ancient", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.extra["oldest_branch"] == "feat/ancient"
+    assert check.extra["stranded"] == sorted(check.extra["stranded"])
+    assert "feat/ancient" in check.extra["stranded"][0]
+
+
+def test_a_repo_with_no_remote_at_all_is_ok_and_not_unknown(repo):
+    """Not applicable, said in prose. Every commit is on no remote and none of it is
+    stranded, because there is nowhere else for it to be — the same shape as `generated`
+    on a repo with no `changelog.d/`. An `unknown` here would be the row complaining that
+    a local scratch repo is not a fleet."""
+    check = qd.check_unpushed(host_for(repo))
+    assert check.verdict == "ok"
+    assert "no remote" in check.detail
+    assert check.extra["commits"] == 0
+
+
+def test_a_repo_whose_configured_remote_is_not_there_is_unknown(pushed):
+    """`--remotes` would still read every remote-tracking ref in the repo and answer
+    confidently — out of refs nothing on this host can refresh. That is the failure this
+    row exists to prevent, so it declines to answer instead."""
+    _git(pushed, "remote", "rename", "origin", "upstream")
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "unknown"
+    assert "upstream" in check.detail
+
+
+def test_a_fetch_that_fails_is_unknown_even_though_stale_refs_would_answer(pushed):
+    """The dangerous case, because an answer IS available: the remote-tracking refs are
+    right there from the last successful fetch. A row that used them would report work as
+    stranded that was pushed since, which is `git rev-list` being confident and wrong."""
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "work", days_ago=19)
+    _git(pushed, "remote", "set-url", "origin", str(pushed.parent / "gone.git"))
+
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "unknown"
+    assert "could not fetch" in check.detail
+    assert not check.extra, "an unknown must not carry the finding it declined to make"
+
+
+def test_a_remote_with_no_branches_answers_rather_than_refusing(tmp_path):
+    """Codex's finding, and it corrected the first cut. A remote that fetched cleanly and
+    holds no branches is not a measurement that failed — it is a repository nobody has ever
+    pushed, and every commit on it really is on this disk and nowhere else. Reporting
+    `unknown` about a query that succeeded launders ignorance in the opposite direction to
+    the false green, and the row says which shape it is in so the reader is not left to
+    guess between "never pushed" and "work went missing"."""
+    origin = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    work = tmp_path / "never"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "T")
+    _commit(work, "one", days_ago=19)
+    _git(work, "remote", "add", "origin", str(origin))
+
+    check = qd.check_unpushed(host_for(work))
+    assert check.verdict == "fail"
+    assert "has no branches at all" in check.detail
+    assert check.extra["commits"] == 1
+
+
+def test_every_remote_is_refreshed_and_not_only_the_configured_one(pushed, tmp_path):
+    """Codex's finding, and the sharpest of them. `--not --remotes` subtracts the tracking
+    refs of EVERY remote, so refreshing `origin` and then trusting a month-old `upstream`
+    is the stale-ref fault this row is written against, arriving one level above where the
+    row looks for it. A remote that cannot be fetched makes the whole answer unknown."""
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "work", days_ago=19)
+    _git(pushed, "remote", "add", "upstream", str(tmp_path / "never-existed.git"))
+
+    check = qd.check_unpushed(host_for(pushed))
+    assert check.verdict == "unknown"
+    assert "upstream" in check.detail
+    assert "every remote" in check.detail
+
+
+def test_a_refspec_that_does_not_bring_back_every_branch_is_unknown(pushed):
+    """A single-branch clone fetches `+refs/heads/main:refs/remotes/origin/main`, so
+    `refs/remotes/` is complete for `main` and empty for everything else — and every
+    feature branch on the server would answer here as work that exists only on this disk.
+    Cry wolf arriving through the refspec instead of through the comparison."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/main:refs/remotes/origin/main")
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "refs/heads/*" in check.detail
+
+
+def test_a_log_line_that_did_not_parse_is_not_read_as_nothing_stranded(pushed, monkeypatch):
+    """Codex's finding, and the direction it fails in is the one that matters: a dropped
+    line is a commit the row did not count, so a run where every line is unparseable
+    answers `ok` about a measurement it never made. There is no safe number to fall back
+    to, so it reports that it could not be asked."""
+    real = qd.run_cmd
+
+    def garbled(argv, **kwargs):
+        if argv[:1] == ["git"] and "log" in argv:
+            return 0, "not-a-commit-line\nanother\n", ""
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", garbled)
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "could not be run" in check.detail
+
+
+def test_the_row_holds_no_state_so_two_runs_answer_the_same(pushed):
+    """#567 asked whether the first run's backlog should become a baseline the row reports
+    against. It should not: a verdict that depends on a file written by an earlier run
+    goes green on the nineteen-day backlog that is the actual exposure, and answers
+    differently on two machines looking at the same work. Nothing here is remembered."""
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "stranded", days_ago=19)
+
+    first = qd.check_unpushed(host_for(pushed))
+    second = qd.check_unpushed(host_for(pushed))
+    assert first.verdict == second.verdict == "fail"
+    assert first.extra["commits"] == second.extra["commits"] == 1
+
+
+def _unpushed_spec() -> qd.CheckSpec:
+    return next(spec for spec in qd.CHECKS if spec.name == "unpushed")
+
+
+def test_the_row_asks_the_landing_question_one_step_before_landed():
+    names = [spec.name for spec in qd.CHECKS]
+    assert _unpushed_spec().group == "landing"
+    assert names.index("unpushed") < names.index("landed")
+
+
+def test_the_fail_brief_is_an_escalation_and_never_tells_anybody_to_push(pushed):
+    """#408's audience split, and #567 is emphatic about which side this lands on: the
+    remedy is a decision per branch — push, cherry-pick or delete — and several of these
+    are abandoned experiments whose remote nobody wants. Nothing automated may decide."""
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "stranded", days_ago=19)
+    host = host_for(pushed)
+    check = qd.check_unpushed(host)
+    prompt, audience, why = qd.compose(_unpushed_spec(), check, host)
+
+    assert audience == "human", why
+    assert prompt is not None and "this is an escalation, not a fix" in prompt
+    assert "cherry-pick" in prompt and "delete the branch" in prompt
+    assert "Do NOT push them all" in prompt
+    assert "git push --all" not in prompt.replace("not a bulk `git push --all`", "")
+
+
+def test_a_host_it_could_not_read_gets_an_unknown_with_a_reason_and_no_brief(pushed):
+    """The bug this row exists to prevent is going GREEN on a host it could not read, and
+    the answer to that is `unknown` — not a brief. `test_no_landing_row_produces_a_brief_
+    on_a_host_that_can_see_nothing` is the group-wide form of the same rule and it is
+    right: on a box where nothing can reach a remote every landing row turns unknown at
+    once, and nine near-identical briefs about one broken hop is noise a reader skips.
+
+    What the row owes instead is a detail naming the hop that stopped it, a command a
+    person can run, and a `no_prompt` saying why there is no brief — so "nothing to
+    dispatch here" is never confusable with "the brief broke".
+    """
+    _git(pushed, "checkout", "-q", "-b", "feat/x")
+    _commit(pushed, "work", days_ago=19)
+    _git(pushed, "remote", "set-url", "origin", str(pushed.parent / "gone.git"))
+    host = host_for(pushed)
+    check = qd.check_unpushed(host)
+    prompt, _audience, why = qd.compose(_unpushed_spec(), check, host)
+
+    assert check.verdict == "unknown"
+    assert prompt is None
+    assert why, "a row with no brief has to say why"
+    assert check.manual and "fetch" in check.manual
+    assert "could not fetch origin" in check.detail, "the detail has to name the hop"
+    assert not check.extra, "an unknown must not carry the finding it declined to make"
+
+
+def test_the_whole_run_fetches_once_however_many_rows_need_it(pushed, monkeypatch):
+    """Two rows depend on the same refresh. Paying for it twice is slow; being able to
+    disagree about whether it succeeded is worse, which is why it is one memoised call
+    and not two `git fetch` invocations written out at two call sites."""
+    real = qd.run_cmd
+    fetches = []
+
+    def counting(argv, **kwargs):
+        if argv[:1] == ["git"] and "fetch" in argv:
+            fetches.append(argv)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", counting)
+    host = host_for(pushed)
+    qd.check_checkout(host)
+    qd.check_unpushed(host)
+
+    assert len(fetches) == 1, fetches
+
+
+def test_a_fetch_that_failed_stays_failed_for_every_row_that_asks(pushed, monkeypatch):
+    """The memo caches the REFUSAL as well as the success. A cache that only remembered
+    good news would let the second row retry, succeed against a flapping remote and
+    disagree with the first about the state of the refs both of them read."""
+    real = qd.run_cmd
+    tries = []
+
+    def flaky(argv, **kwargs):
+        if argv[:1] == ["git"] and "fetch" in argv:
+            tries.append(argv)
+            return (1, "", "boom") if len(tries) == 1 else real(argv, **kwargs)
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", flaky)
+    host = host_for(pushed)
+
+    assert qd.fetched(host)[0] is False
+    assert qd.fetched(host)[0] is False, "the second row must not get a different answer"
+    assert len(tries) == 1
+    assert qd.check_unpushed(host).verdict == "unknown"
+
+
 # ----------------------------------------------------------------- generated
 
 def test_a_pull_request_editing_the_generated_changelog_is_the_finding(
@@ -2795,8 +3155,8 @@ def test_the_real_tagger_answers_the_argv_this_row_sends_it(landing_repo):
 def test_the_landing_group_holds_every_row_that_answers_can_work_land():
     names = {spec.name for spec in qd.CHECKS if spec.group == "landing"}
 
-    assert names == {"merges", "queue", "landed", "tags", "generated", "stamper",
-                     "briefs", "escalations"}
+    assert names == {"merges", "queue", "unpushed", "landed", "tags", "generated",
+                     "stamper", "briefs", "escalations"}
 
 
 def test_no_landing_row_goes_green_on_a_host_that_can_see_nothing(monkeypatch, tmp_path,
