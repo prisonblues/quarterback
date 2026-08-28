@@ -1788,6 +1788,112 @@ def plan_depends(ctx: Context, item_id: str, depends_on: list[str]) -> dict:
 
 
 @mcp.tool()
+def dials(ctx: Context, repo: str | None = None) -> dict:
+    """What the harness dials are set to right now — the values IN FORCE.
+
+    The repo supplies a default, the board states the override, and this is the
+    override. A repo dial beats a fleet dial of the same name; both come back
+    labelled with their scope so you can apply that precedence yourself.
+
+    Free to call: reads take the ordinary bearer, because every enrolled agent has
+    to be able to resolve what is in force.
+
+    Read `set_via` before you trust a row. `edge`, `key` and `dev` mean a PERSON
+    set it; `agent` means an agent set it on somebody's say-so (#591), and those
+    are not equally strong evidence about what was intended. `set_by` names which
+    person or which agent.
+
+    Args:
+        repo: `owner/name` or `project:<name>` — returns that repo's own dials AND
+            the fleet-wide ones. Omit for the fleet-wide set alone.
+    """
+    try:
+        return _get_client(ctx).dials(repo)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "dials")
+
+
+@mcp.tool()
+def dial_set(ctx: Context, dial: str, value: object, reason: str,
+             repo: str | None = None, expires_at: str | None = None) -> dict:
+    """Put a dial in force. **A human's decision, which you may be asked to apply.**
+
+    Same credential and the same standing as `plan_reorder`: your bearer plus your
+    machine's `QUARTERBACK_ELEVATED_TOKEN`, and it does not make you a person. The
+    row records YOUR name in `set_by` and `agent` in `set_via`, so nothing can
+    mistake it for a dial somebody turned by hand (#591).
+
+    **Only when you were asked.** A dial decides what a review costs and what it is
+    worth — `review_panel.fix_severity_floor` decides which findings a fix pass may
+    touch. Turning one because you formed an opinion about your own review is the
+    exact thing the endpoint was human-only to prevent; #479 is the standing record
+    of what this door is open for, which is a person saying "turn it down". Nothing
+    here can stop you, and that is the issue, not permission.
+
+    **Say on the board that you did it, and on whose say-so.** The row says an agent
+    set this; it cannot say WHO asked, and that half only ever exists in your post.
+
+    **The board does not know what a dial IS.** The name is opaque text and the
+    value opaque JSON — the harness owns the vocabulary and reports a name it does
+    not recognise. A typo is stored and ignored, loudly, rather than refused here,
+    so read `dials` first and match a name that is already in use.
+
+    Args:
+        dial: a dotted path into the harness rules, e.g.
+            `review_panel.fix_severity_floor`.
+        value: any JSON. `null` is a real value for several dials (their documented
+            off switch) and is NOT the same as clearing the dial — use `dial_clear`
+            for that.
+        reason: why. Required, and a dial whose argument is not written down is one
+            nobody can later decide to remove. Name who asked you.
+        repo: `owner/name` or `project:<name>`; omit for a FLEET-wide dial, which
+            is in force everywhere and is the wider of the two blast radii.
+        expires_at: ISO-8601. Omit for a dial that stays until somebody clears it.
+            Prefer setting one when you are applying a temporary instruction — a
+            setting that cannot outlive its reason is the cheapest safety there is.
+    """
+    body: dict = {"dial": dial, "value": value, "reason": reason}
+    if repo is not None:
+        body["repo"] = repo
+    if expires_at is not None:
+        body["expires_at"] = expires_at
+    try:
+        return _get_client(ctx).dial_set(body)
+    except RuntimeError as e:
+        raise ToolError(f"dial_set: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "dial_set")
+
+
+@mcp.tool()
+def dial_clear(ctx: Context, dial: str, repo: str | None = None) -> dict:
+    """Take a dial off the board; the repo's own default takes over again.
+
+    The reversal half of `dial_set`, on the same credential deliberately — a dial an
+    agent can set but not clear would be a change only a person could undo.
+
+    Clearing something that is not set is **not an error**: it is the state you
+    asked for, and the reply's `cleared` list is empty. The previous value comes
+    back in that list when there was one, which is the record of what you undid.
+
+    Args:
+        dial: the dotted name to clear.
+        repo: the scope to clear it from, EXACTLY. This is not widened for you —
+            omitting it clears the FLEET dial and leaves a repo dial of the same
+            name untouched, which are two different outcomes.
+    """
+    body: dict = {"dial": dial}
+    if repo is not None:
+        body["repo"] = repo
+    try:
+        return _get_client(ctx).dial_clear(body)
+    except RuntimeError as e:
+        raise ToolError(f"dial_clear: {e}") from e
+    except httpx.HTTPStatusError as e:
+        _raise(e, "dial_clear")
+
+
+@mcp.tool()
 def plan_reorder(ctx: Context, order: list[str], repo: str | None = None) -> dict:
     """Put an order into force. **A human's decision, which you may be asked to apply.**
 

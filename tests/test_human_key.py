@@ -132,9 +132,10 @@ async def test_the_key_reaches_every_human_endpoint_and_not_more(client, human_k
     """It authorises a PERSON, so it opens what a person opens — that is the whole
     design, and `/dials/clear` is the second endpoint the dashboard needs.
 
-    What it does NOT do is reach past `human()`: an endpoint gated on something
-    else is unaffected, which is why this is a method on one gate rather than a
-    tier that outranks it.
+    What it does NOT do is become a TIER that outranks `human()`. It is a second
+    method on one gate, so it opens exactly what a person opens and nothing a
+    person cannot — see the test below for the one endpoint that reading changed
+    the answer for in #591, and why that was a gap rather than a widening.
     """
     await client.post("/dials", json={
         "dial": "tempo", "value": "eager", "reason": "to be cleared",
@@ -143,6 +144,84 @@ async def test_the_key_reaches_every_human_endpoint_and_not_more(client, human_k
                           headers=keyed(human_key))
     assert r.status_code == 200, r.text
     assert [d["dial"] for d in r.json()["cleared"]] == ["tempo"]
+
+
+async def test_the_key_reaches_the_delegated_endpoints_too_as_a_person(client,
+                                                                        human_key):
+    """#591. `delegated()` had only ever honoured the EDGE-proved person, so the
+    two gates disagreed about who a person is: Rich with a browser could reorder
+    the plan and Rich at a terminal, holding the very key `human()` accepts, could
+    not. Nothing wanted that — the browser was the only door anyone had walked
+    through when `delegated()` was written.
+
+    It is a GAP being closed, not the credential widening: the key still authorises
+    a person, and what it reaches is what that person already reached from a
+    browser. The proof that it is not a relabelling is the rank source — a person
+    writes `ordered`, and an agent holding the machine secret still writes
+    `derived`.
+    """
+    seeded = []
+    for title in ("keyed-a", "keyed-b"):
+        r = await client.post("/plan/item", json={"repo": REPO, "title": title},
+                              headers=LAPTOP)
+        assert r.status_code in (200, 201), r.text
+        seeded.append(r.json()["item_id"])
+    a, b = seeded
+    try:
+        r = await client.post("/plan/reorder",
+                              json={"repo": REPO, "order": [b, a]},
+                              headers=keyed(human_key))
+        assert r.status_code == 200, r.text
+        assert r.json()["by"] == "human/rich", r.json()["by"]
+
+        got = await client.get("/plan", params={"repo": REPO}, headers=LAPTOP)
+        rows = {i["item_id"]: i for i in got.json()["items"]}
+        assert rows[b]["rank_source"] == "ordered", rows[b]
+    finally:
+        for item_id in seeded:
+            await client.post("/plan/item/done", json={"item_id": item_id},
+                              headers=LAPTOP)
+
+
+async def test_a_stale_key_does_not_suppress_the_dev_bypass(client, human_key,
+                                                            monkeypatch):
+    """`delegated()` must not become non-monotonic: adding a header that proves
+    nothing must never turn a request that would have succeeded into a refusal.
+
+    An earlier draft of #591 raised on a wrong `X-Human-Key` before consulting
+    either the bearer or the bypass, so on a dev board the SAME request succeeded
+    without the header and failed with it. Caught by an adversarial review.
+    """
+    monkeypatch.setattr(settings, "browser_dev_human", True)
+    monkeypatch.setattr(settings, "browser_dev_user", "devuser")
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "local dev", "repo": REPO},
+        headers={**LAPTOP, KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "dev"
+
+
+async def test_a_stale_key_beside_a_bearer_names_the_credential_actually_missing(
+        client, human_key):
+    """An agent holding a good bearer and no elevated secret was being told to check
+    `HUMAN_TOKENS` — the one credential that was not its problem. The refusal now
+    names `X-Agent-Elevated` as the thing this call wants from a machine, and still
+    mentions that the key it sent matched nobody, because both are true."""
+    r = await client.post("/plan/reorder", json={"repo": REPO, "order": []},
+                          headers={**LAPTOP, KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 403, r.text
+    assert "X-Agent-Elevated" in r.json()["detail"]
+
+
+async def test_a_stale_key_alone_still_says_to_check_human_tokens(client, human_key):
+    """When the key IS the only credential offered, it is the answer, and the
+    specific message is the useful one. The fix for the two tests above must not
+    cost this."""
+    r = await client.post("/dials", json={
+        "dial": "tempo", "value": "eager", "reason": "x", "repo": REPO},
+        headers={KEY_HEADER: "nope-not-a-real-key"})
+    assert r.status_code == 403, r.text
+    assert "HUMAN_TOKENS" in r.json()["detail"]
 
 
 async def test_the_edge_still_comes_first_and_is_unchanged(client, human_key):

@@ -84,9 +84,22 @@ that is where it was written, and it inherited the permission file's deployment 
 password, for a number. So the board's `spawn.max_sessions` answers first and the
 file is the fallback; with no dial set this box behaves exactly as it did before.
 
-Two things make that a throttle rather than a hole. Dial WRITES are human-only
-(`set_dial` takes `Depends(human)`, and `app/api/dials.py` calls that the security
-argument), so an agent may read its own ceiling and cannot raise it. And the read
+Two things make that a throttle rather than a hole. An agent may read its own
+ceiling and cannot raise it — which until #591 was a property of the GATE (`POST
+/dials` took `Depends(human)`) and is now enforced HERE, because that endpoint also
+accepts a delegated agent. `ceilings_from_board` honours only the three `set_via`
+values that mean a person (`edge`, `key`, `dev`), plus a null one, which predates
+the column; anything else is dropped with a line naming who set it. This is
+the one dial whose subject is the agent reading it, so it is the one that cannot
+follow the rest.
+
+That is only half of it, and the half here is the weaker one. An agent that could
+CLEAR a person's ceiling would raise its own without ever writing a bigger number —
+a person sets 2, the file says 8, the dial goes away and 8 applies — because
+"nobody set one" and "an agent removed the one somebody set" are the same empty
+answer by the time it reaches this function. The other half is on the BOARD:
+`app.api.dials` refuses a delegated agent replacing or clearing a person-authored
+row. And the read
 FAILS OPEN, unlike its neighbours in that file and for `qb-admit`'s reason: an
 unreadable dial means the file's number applies, because this one is counting a
 resource. A permission that failed open would start sessions nobody authorised; a
@@ -579,6 +592,48 @@ def read_ceilings(repo_path: str | None = None) -> Ceilings:
                 f"fleet configuration: this ceiling counts panes on one tmux server "
                 f"and does not know which checkout each is in, so a per-repo answer "
                 f"is not one. Set it with no repo")
+            continue
+        # AN AGENT MAY NOT RAISE ITS OWN CEILING, and since #591 that has to be
+        # enforced HERE rather than assumed from the gate. `POST /dials` used to
+        # take `app.auth.human`, which is what made this dial safe to put on the
+        # board at all — see the module docstring. It now also accepts an agent
+        # holding its machine's delegated secret, so the board alone no longer
+        # answers "was a person behind this".
+        #
+        # It still records the answer, which is the whole reason `set_via` exists:
+        # `agent` means no person was in the request. This is the ONE consumer that
+        # has to care, because it is the one dial whose subject is the agent
+        # reading it — a self-approval shape #85, #86, #78, #232 and #335 each
+        # settled separately, and reopening it by a longer route would be exactly
+        # the failure #479 names.
+        #
+        # Refused rather than clamped, and noisily: a spawner that quietly used the
+        # file's number would leave somebody looking at a board that says 40 and a
+        # box behaving like 8, with nothing connecting the two.
+        #
+        # `None` is HONOURED. Null is "not recorded" — a row written before the
+        # column existed, which is to say before an agent could write one at all —
+        # and treating it as suspect would retire ceilings nobody can see are being
+        # ignored. Only the explicit `agent` is refused.
+        via = row.get("set_via")
+        # AN ALLOWLIST, not `!= "agent"`. The three values below are the ways a
+        # PERSON proves it (`app.auth`); anything else is refused, so a misspelling,
+        # a value from a newer board than this box, or a malformed row cannot become
+        # trusted provenance merely by failing to match one string. A denylist here
+        # answers "is this the one bad value I know about" when the question is "do
+        # I know this was a person".
+        #
+        # `None` is honoured, and it is the one exception. Null means the row
+        # predates the column — and every return path through `human()` and
+        # `delegated()` sets a method, so a row written today cannot be null.
+        # Refusing it would silently retire ceilings set before the column existed,
+        # which is the failure this whole function is trying not to have.
+        if via is not None and via not in ("edge", "key", "dev"):
+            problems.append(
+                f"`{name}` on the board was set by {row.get('set_by') or 'an agent'} "
+                f"({via!r}), which is not a person — ignored. This is the one dial an "
+                f"agent may not set for itself: it is the ceiling on the agent reading "
+                f"it. Ask a person to set it, from a browser or with an X-Human-Key")
             continue
         value = row.get("value")
         if bad_ceiling(value):

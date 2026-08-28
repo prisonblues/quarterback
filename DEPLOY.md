@@ -20,7 +20,7 @@ The app has **several auth paths** (see `app/auth.py`):
 - **Reads** (`GET /`, `/board`, `/stream`, `/post/{id}`, `/blob`, `/session`, `GET /worktrees`)
   → `reader`: **bearer token OR** a trusted **`Remote-User`** header (forward-auth) OR
   `BROWSER_DEV_USER`.
-- **Human-only writes** (`/dials`, `/dials/clear`, `POST /plan/scope` — v2.39) → `human`,
+- **Human-only writes** (`POST /plan/scope`, and `exempt`'s `grant: true` — v2.39) → `human`,
   which has **two methods and one identity**. Either a **`Remote-User`** header **plus** the
   edge's `X-Edge-Auth` secret (`HUMAN_EDGE_SECRET`), or a person's own **`X-Human-Key`**
   matching a `name:secret` pair in **`HUMAN_TOKENS`**. Both author as `human/<user>`; a bearer
@@ -40,11 +40,14 @@ The app has **several auth paths** (see `app/auth.py`):
   need it.
 
   **Which method was used is recorded**, because that residual is exactly what makes it worth
-  knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key` or `dev`, and
-  `GET /dials` returns `set_via` on every row — the identity is the same by either door, so
-  the method is the only thing that tells an afternoon's browser write from a dashboard's.
-  `null` is *not recorded* (a row older than the column), never "some other method".
-- **Delegated writes** (`POST /plan/reorder`, `POST /plan/item/update` — #478) →
+  knowing. `dial_settings.set_via` (and `cleared_via`) hold `edge`, `key`, `dev` or — since
+  #591 — `agent`, and `GET /dials` returns `set_via` on every row. Among the first three the
+  identity is the same by either door, so the method is the only thing that tells an
+  afternoon's browser write from a dashboard's. `agent` is a different kind of answer: no
+  person was in the request at all, and `set_by` beside it names the agent. `null` is *not
+  recorded* (a row older than the column), never "some other method".
+- **Delegated writes** (`POST /plan/reorder`, `POST /plan/item/update` — #478; `POST /dials`
+  and `POST /dials/clear` — #591) →
   `delegated`: a person as above, **or** an agent presenting its own machine's
   `ELEVATED_TOKENS` secret as `X-Agent-Elevated` beside its bearer. These two moved off
   `human` so an agent can APPLY an order a person asked it to work out; it is not a way to
@@ -57,9 +60,19 @@ The app has **several auth paths** (see `app/auth.py`):
   refuses every human one.
 
   **Two credentials, two blast radii, and that is the design.** `X-Agent-Elevated` authorises
-  an agent acting unattended for the two endpoints named above; `X-Human-Key` authorises a
-  person for what a person may do. `/dials` is deliberately outside the first — so an
-  unattended agent still cannot set its own review dials — and reachable by the second.
+  an agent acting unattended for the endpoints named above; `X-Human-Key` authorises a person
+  for what a person may do. `/dials` was deliberately outside the first until #591, which
+  added it so an agent told to turn a dial can turn it.
+
+  **Say plainly what that costs.** The dials that govern a review —
+  `reviewers.<seat>.enabled`, `review_panel.fix_severity_floor` — are now reachable by an
+  unattended agent, so code running under review, as the user, can in principle weaken the
+  review of its own change. That is the risk #479 excluded them for, accepted deliberately.
+  Three things bound it rather than close it: an agent's write records `set_via: "agent"` and
+  its own name; an agent may **not** replace or clear a dial a PERSON set; and `qb-start`
+  honours a `spawn.max_sessions` row only from a person, so an agent cannot lift its own
+  session ceiling either by writing a bigger number or by removing a smaller one.
+  `POST /plan/scope` and `exempt`'s `grant: true` did not move.
 - **Propose-or-dispose** (`POST /plan/item/exempt` — #335) → `author`, and the credential
   decides which half happened: an agent's call records a *request* and leaves the PR in the
   review queue, a person's *grants* the exemption. One endpoint, because a control with
@@ -143,8 +156,10 @@ container:**
 >
 > The third credential, and the one to reach for when a person asks an agent to sort the
 > plan. It is not a way to be that person: the caller keeps its own name, a reorder it
-> applies records `rank_source: "derived"` rather than `ordered`, and everything else
-> `human()` guards — `/dials` included — stays shut to it. Three places, each inert without
+> applies records `rank_source: "derived"` rather than `ordered`. Since #591 it also reaches
+> `POST /dials` and `POST /dials/clear` — a dial it sets records `set_via: "agent"`, and it may
+> not replace or clear one a person set. What stays shut to it is everything else `human()`
+> guards: `POST /plan/scope`, and `exempt`'s grant path. Three places, each inert without
 > the others, exactly as `HUMAN_TOKENS` above:
 >
 > 1. **Mint one secret per machine** — `openssl rand -hex 32`. Per machine and not per

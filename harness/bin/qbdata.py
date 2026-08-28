@@ -2884,12 +2884,21 @@ def dial_detail(row: dict) -> str:
     else:
         bits.append("set indefinitely — nothing will clear this but a person")
     who = " ".join(x for x in ("set by", row.get("set_by")) if x)
-    # HOW, when the board recorded one. The identity is the same by either door,
-    # so this is the half that says which — a browser the edge vouched for, or a
-    # key on a workstation (#479). Absent is a row older than the column, and it
-    # is left out rather than guessed at.
+    # HOW, when the board recorded one. For the three PERSON methods the identity
+    # is the same by either door, so this is the half that says which — a browser
+    # the edge vouched for, or a key on a workstation (#479). Absent is a row older
+    # than the column, and it is left out rather than guessed at.
+    #
+    # `agent` (#591) is not a fourth door onto the same person: it says NO person
+    # was in the request, and `set_by` beside it is the agent's own name. Spelled
+    # out here rather than left to fall through to the bare word, because this
+    # line is the one place a reader is deciding how much a dial's provenance is
+    # worth and "set by hermes/mist-harbour agent" reads like a typo where "on a
+    # person's say-so" reads like the fact it is.
     via = {"edge": "in a browser", "key": "with a key",
-           "dev": "via the dev bypass"}.get(row.get("set_via"), row.get("set_via"))
+           "dev": "via the dev bypass",
+           "agent": "as a delegated agent, on a person's say-so",
+           }.get(row.get("set_via"), row.get("set_via"))
     if via:
         who += f" {via}"
     when = ago(row.get("set_at"))

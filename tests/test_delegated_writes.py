@@ -15,11 +15,25 @@ Three properties carry the whole argument and each has a test below:
     spend another's;
   * the endpoints this does NOT cover stay human-only, which is the entire reason
     for a second credential rather than lending out the first.
+
+**That third list is shorter since #591**, and the change is recorded here rather
+than left for a reader to infer from a deleted test. `POST /dials` and
+`POST /dials/clear` moved onto this credential on Rich's ask. The argument that
+had kept them out was blast radius, and a dial does not have the shape that
+argument feared: the row is cleared rather than deleted, it can carry an expiry,
+and `set_via` names who turned it — so the "undo" #479 calls the highest-value
+tightening for `/plan/reorder` is something `/dials` already had. `POST
+/plan/scope` and `exempt`'s `grant: true` did NOT move, and still have their
+tests below.
 """
 
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import delete
+
+from app.db import async_session
+from app.models.dial import DialSetting
 
 from .conftest import DESKTOP, LAPTOP, LAPTOP_ELEVATED, PINNED_SETTINGS, SERVER
 
@@ -54,6 +68,28 @@ async def _leave_the_plan_as_we_found_it(client):
 
 HUMAN = {"Remote-User": "rich", "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
 REPO = "acme/one"
+
+
+@pytest.fixture
+async def _no_dials_survive():
+    """Clean in BOTH directions, for `test_human_key.py`'s reason and not tidiness.
+
+    The schema is rebuilt once per session, so a dial set here is still in force in
+    the next test and in the next FILE — and a fleet dial is returned by every
+    repo-scoped read, so the failure surfaces in somebody else's assertion with
+    nothing pointing back to this module. That is exactly how it bit when
+    `test_human_key.py` was added, and this is the same guard.
+
+    Requested by name rather than autouse: only the dial tests below need it, and
+    a module-wide truncation would delete rows the plan tests here never made.
+    """
+    async with async_session() as s:
+        await s.execute(delete(DialSetting))
+        await s.commit()
+    yield
+    async with async_session() as s:
+        await s.execute(delete(DialSetting))
+        await s.commit()
 
 
 async def seed(client, n=2) -> list[str]:
@@ -152,14 +188,172 @@ async def test_an_unauthenticated_caller_gets_401_not_403(client):
     assert r.status_code == 401
 
 
-async def test_the_credential_does_not_open_dials(client):
-    """The whole point of a second credential rather than lending out the first:
-    what it does NOT cover is where the blast radius stops. A dial is a judgement
-    about what a review is worth and stays a person's."""
+async def test_a_delegated_agent_may_turn_a_dial(client, _no_dials_survive):
+    """Reversed in #591, and the docstring it replaced is quoted so the change is
+    legible rather than silent. It used to read: *"The whole point of a second
+    credential rather than lending out the first: what it does NOT cover is where
+    the blast radius stops. A dial is a judgement about what a review is worth and
+    stays a person's."*
+
+    What changed is not the appetite for blast radius but the observation that a
+    dial is reversible where a plan order is not — see the module docstring.
+    """
     r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
-                                          "value": 9, "reason": "test"},
+                                          "value": 9, "reason": "asked to",
+                                          "repo": REPO},
                           headers=LAPTOP_ELEVATED)
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
+
+
+async def test_a_dial_an_agent_turned_is_not_recorded_as_a_persons(client,
+                                                                   _no_dials_survive):
+    """The property that made the reversal safe to make, and the reason this went
+    on `delegated()` rather than handing an agent a person's key.
+
+    `set_by` is the AGENT and `set_via` is `agent`. Had the capability arrived the
+    way #479 records as rejected — an agent borrowing Rich's credential — both
+    fields would have said `human/rich` and no later reader could have told a dial
+    Rich turned from one an agent turned for him. That is `rank_source: derived`'s
+    argument applied to a second table.
+    """
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 4, "reason": "asked to",
+                                          "repo": REPO},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    assert r.json()["by"].split("/")[0] == "laptop", r.json()["by"]
+    assert not r.json()["by"].startswith("human/"), "a delegated agent is not a person"
+
+    got = await client.get("/dials", params={"repo": REPO}, headers=LAPTOP)
+    row = next(d for d in got.json()["dials"] if d["dial"] == "review_panel.max_rounds")
+    assert row["set_via"] == "agent", row
+    assert not row["set_by"].startswith("human/"), row
+
+
+async def test_a_delegated_agent_may_also_clear_one(client, _no_dials_survive):
+    """Both halves or neither. A dial an agent can set but not clear is a trap:
+    the reversal is what makes the write safe to have granted, and #479's standard
+    for this credential is reversibility rather than prevention."""
+    await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                      "value": 9, "reason": "asked to",
+                                      "repo": REPO},
+                      headers=LAPTOP_ELEVATED)
+    r = await client.post("/dials/clear", json={"dial": "review_panel.max_rounds",
+                                                "repo": REPO},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    assert [d["dial"] for d in r.json()["cleared"]] == ["review_panel.max_rounds"]
+
+    got = await client.get("/dials", params={"repo": REPO}, headers=LAPTOP)
+    assert "review_panel.max_rounds" not in [d["dial"] for d in got.json()["dials"]]
+
+
+async def test_an_agent_may_not_clear_a_dial_a_person_set(client, _no_dials_survive):
+    """THE BYPASS THE FIRST PASS LEFT OPEN, and the reason there is a rule here at
+    all rather than only in `qb-start`.
+
+    Guarding the WRITE guards the wrong half. `qb-start` refuses a
+    `spawn.max_sessions` row authored by an agent, which stops an agent writing
+    itself a bigger number — and does nothing about it deleting the smaller one a
+    person wrote. Person sets 2, policy file says 8, agent clears the dial,
+    `ceilings_from_board` reports no board ceiling, 8 applies. The ceiling has been
+    raised to 8 without one agent-authored value ever being accepted.
+
+    Absence is what the reader cannot interpret: "nobody set one" and "an agent
+    removed the one somebody set" arrive there as the same empty answer. So it has
+    to be refused where the difference is still visible.
+    """
+    r = await client.post("/dials", json={"dial": "spawn.max_sessions", "value": 2,
+                                          "reason": "a person's ceiling"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    r = await client.post("/dials/clear", json={"dial": "spawn.max_sessions"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+    assert "set by a person" in r.text
+
+    got = await client.get("/dials", headers=LAPTOP)
+    live = {d["dial"]: d for d in got.json()["dials"]}
+    assert live["spawn.max_sessions"]["value"] == 2, "the person's ceiling survived"
+
+
+async def test_an_agent_may_not_overwrite_a_dial_a_person_set(client, _no_dials_survive):
+    """Replacing destroys the person's row exactly as clearing does — `set_dial`
+    clears every live prior row before inserting — so the same rule has to cover it.
+    Guarding only `clear` would leave the identical bypass one verb away."""
+    await client.post("/dials", json={"dial": "review_panel.fix_severity_floor",
+                                      "value": "P2", "reason": "a person's floor"},
+                      headers=HUMAN)
+    r = await client.post("/dials", json={"dial": "review_panel.fix_severity_floor",
+                                          "value": "P4", "reason": "an agent's idea"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 403, r.text
+
+    got = await client.get("/dials", headers=LAPTOP)
+    live = {d["dial"]: d for d in got.json()["dials"]}
+    assert live["review_panel.fix_severity_floor"]["value"] == "P2"
+
+
+async def test_an_agent_may_replace_and_clear_its_own_dial(client, _no_dials_survive):
+    """The rule is "not a person's", not "not anybody's". An agent that could set a
+    dial and never correct it would be the trap the clear path was opened to avoid,
+    one step along."""
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 3, "reason": "asked to"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 4, "reason": "asked again"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+    r = await client.post("/dials/clear", json={"dial": "review_panel.max_rounds"},
+                          headers=LAPTOP_ELEVATED)
+    assert r.status_code == 200, r.text
+
+
+async def test_a_person_may_still_overwrite_an_agents_dial(client, _no_dials_survive):
+    """The rule is one-directional and must be. A person who could not correct what
+    an agent set would be locked out by a control meant to protect them — #479's own
+    warning that "a gate nobody can satisfy is an outage"."""
+    await client.post("/dials", json={"dial": "review_panel.max_rounds", "value": 9,
+                                      "reason": "an agent's"},
+                      headers=LAPTOP_ELEVATED)
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds", "value": 2,
+                                          "reason": "a person overriding"},
+                          headers=HUMAN)
+    assert r.status_code == 200, r.text
+    assert r.json()["dial"]["set_via"] == "edge"
+
+
+async def test_a_bare_machine_token_still_cannot_turn_a_dial(client, _no_dials_survive):
+    """The half of the security argument that #591 did NOT reverse, and the one
+    that actually protects a review from itself.
+
+    `app.api.dials`' docstring names the threat: anything running while a branch
+    under review is checked out — a test suite, a build step, a git hook — runs as
+    a user whose machine token this board accepts, and could otherwise turn the
+    `claude` seat off on the review of its own change. It holds the bearer by
+    definition. It does not hold the delegated secret by definition, and that is
+    now the whole of the distance between the two.
+    """
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 9, "reason": "trying it on",
+                                          "repo": REPO},
+                          headers=LAPTOP)
+    assert r.status_code == 403, r.text
+
+
+async def test_one_machine_cannot_spend_anothers_secret_on_a_dial(client,
+                                                                  _no_dials_survive):
+    """The per-machine keying reaches the new endpoint too — it is a property of
+    `delegated()`, not of the plan endpoints, and a test that only ever proved it
+    at `/plan/reorder` would not have noticed if it had not."""
+    r = await client.post("/dials", json={"dial": "review_panel.max_rounds",
+                                          "value": 9, "reason": "wrong machine",
+                                          "repo": REPO},
+                          headers={**DESKTOP, "X-Agent-Elevated": "not-a-secret-laptop"})
+    assert r.status_code == 403, r.text
 
 
 async def test_the_credential_does_not_let_an_agent_declare_a_scope(client):

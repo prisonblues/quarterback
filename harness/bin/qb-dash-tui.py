@@ -177,7 +177,8 @@ class DialEdit(ModalScreen[dict | None]):
     """Set or clear one dial, from the pane — the write half of #477.
 
     The dashboard could always READ what was in force; turning one was a browser
-    action, because `POST /dials` takes `app.auth.human` and this program
+    action, because `POST /dials` takes `app.auth.delegated` (a person, or an
+    agent one has delegated to — #591) and this program
     authenticates with the machine bearer token every agent on the box holds.
     What changed is the credential, not the gate: :class:`qbdata.HumanClient`
     presents a person's own key to the agent host, so the person at this keyboard
@@ -1686,7 +1687,8 @@ class Dash(App):
         read back by one function in `panel_seats.py`, and invisible everywhere
         else.
 
-        **The last row is always the door.** `POST /dials` takes `app.auth.human`
+        **The last row is always the door.** `POST /dials` takes
+        `app.auth.delegated`
         and this dashboard holds a machine bearer token, which is precisely the
         credential that gate exists to refuse — every agent on a box holds it, and
         nothing inside a request distinguishes one from a person. So the row that

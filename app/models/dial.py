@@ -101,22 +101,40 @@ class DialSetting(Base):
     #: was never written down is one nobody can decide to remove.
     reason: Mapped[str] = mapped_column(Text(), nullable=False)
 
-    #: The human who set it. Writes are human-authenticated (see
-    #: :func:`app.api.dials.set_dial`), so this is a person's name and not a
-    #: machine token's.
+    #: Who set it — a person (``human/rich``) or, since #591, the agent a person
+    #: delegated to (``hermes/mist-harbour``). Never a bare machine token: writes
+    #: take :func:`app.auth.delegated` (see :func:`app.api.dials.set_dial`), which
+    #: refuses a bearer presented on its own.
+    #:
+    #: An agent keeps its OWN name here rather than borrowing the name of whoever
+    #: asked it. That is the whole reason the capability arrived as a second
+    #: credential instead of a lent-out first one: the design #479 records as
+    #: rejected would have written ``human/rich`` for a dial an agent turned, and
+    #: no later reader could have told the two apart. Read this column with
+    #: ``set_via`` below, which says which of the two it was.
     set_by: Mapped[str] = mapped_column(Text(), nullable=False)
     set_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now())
 
-    #: HOW that person proved it — `edge`, `key` or `dev` (:mod:`app.auth`).
+    #: HOW it was proved — `edge`, `key`, `dev` or `agent` (:mod:`app.auth`).
     #:
-    #: The identity above is the same by either door and that is deliberate: a
-    #: person is one author however they arrived. But "a browser Authelia vouched
-    #: for" and "a key sitting on a workstation" are not the same event, and the
-    #: second carries a residual this repo writes down rather than argues away —
-    #: anything running as that user can read the key and author as them (#479).
-    #: A row that recorded only `set_by` could not tell the two apart afterwards,
-    #: which is exactly the moment somebody asks.
+    #: The first three are all a PERSON, and the identity above is the same by any
+    #: of those doors, deliberately: a person is one author however they arrived.
+    #: But "a browser Authelia vouched for" and "a key sitting on a workstation"
+    #: are not the same event, and the second carries a residual this repo writes
+    #: down rather than argues away — anything running as that user can read the
+    #: key and author as them (#479). A row that recorded only `set_by` could not
+    #: tell the two apart afterwards, which is exactly the moment somebody asks.
+    #:
+    #: `agent` is the fourth and it is a different KIND of answer: not a door a
+    #: person came through, but a statement that no person was in the request at
+    #: all — an agent presented its machine's delegated secret and `set_by` is
+    #: that agent (#591). It is the dial equivalent of `rank_source: "derived"` on
+    #: a plan order, and it exists so that "Rich turned this floor down" and "an
+    #: agent turned this floor down because Rich told it to" are two facts and not
+    #: one. They are not equally strong evidence about intent, and a reader
+    #: deciding whether to trust a dial needs to be able to see which it is
+    #: holding.
     #:
     #: NULLABLE, and null is "not recorded" rather than "some other method": every
     #: row written after this column existed has one, and the rows written before

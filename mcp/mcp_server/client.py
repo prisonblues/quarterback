@@ -281,6 +281,23 @@ class QuarterbackClient:
         """``POST /plan/item/update`` — retitle, move, re-reason, drop. Delegated."""
         return self._delegated_post("/plan/item/update", body)
 
+    def dials(self, repo: str | None = None) -> dict:
+        """``GET /dials`` — every dial in force. The ORDINARY bearer, not the
+        delegated secret: reads are `app.auth.reader` because every enrolled agent
+        has to be able to resolve what is in force, and always could."""
+        resp = self._http.get(self._url("/dials"),
+                              params={"repo": repo} if repo else None)
+        resp.raise_for_status()
+        return resp.json()
+
+    def dial_set(self, body: dict) -> dict:
+        """``POST /dials`` — put a dial in force. Delegated (#591)."""
+        return self._delegated_post("/dials", body)
+
+    def dial_clear(self, body: dict) -> dict:
+        """``POST /dials/clear`` — take one off the board. Delegated (#591)."""
+        return self._delegated_post("/dials/clear", body)
+
     def _url(self, path: str) -> str:
         return f"{self._base_url}{path}"
 
