@@ -4529,6 +4529,38 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             else:
                 lines.append(f"{bullet}{why}")
 
+    # #42, and UNDER the veto lines for #507's reason one line down: a reader coming
+    # down this comment meets what ended the cycle before what is still owed because
+    # of it. Only on a round that is ENDING one — `handed_to` is null on a `go again`,
+    # where the next round's fix pass takes the findings through the ordinary path and
+    # a line here would announce a final pass nobody is running.
+    #
+    # Printed even when the answer is `nobody`, which is the half a reader cannot get
+    # anywhere else: "the cycle stopped and left nothing" and "the cycle stopped and
+    # left four findings under the fix floor" render identically without it, and the
+    # second reading as the first is the silence this whole block exists to end.
+    handoff = (stop.get("outstanding") or {}) if cycle_run else {}
+    if handoff.get("handed_to"):
+        head = {"fixer": "Outstanding — handed to a final fix pass",
+                "human": "Outstanding — handed to a human",
+                # Not "handed to nobody", which is the shape of the bug and would
+                # read as one here. Nothing is owed, and the sentence says why.
+                "nobody": "Outstanding — nothing handed on"}[handoff["handed_to"]]
+        lines.append(f"\n**{head}:** {handoff['why']}")
+        # The keys themselves, so the brief for that pass can be built off the PR
+        # comment rather than off a payload the reader may not have. Bounded, because
+        # a capped round can carry dozens and the comment has a size budget
+        # (`fit_comment`); the payload's `round_stop.outstanding` is always whole.
+        for label, keys in (("to fix", handoff.get("fixable") or []),
+                            ("escalated, for a human only",
+                             handoff.get("escalated") or []),
+                            (f"under the {stop['fix_floor']} fix floor — reported, "
+                             "not fixed here", handoff.get("below_floor") or [])):
+            if keys:
+                shown = ", ".join(f"`{k}`" for k in keys[:20])
+                more = f" … and {len(keys) - 20} more" if len(keys) > 20 else ""
+                lines.append(f"  - {label} ({len(keys)}): {shown}{more}")
+
     # #507, and UNDER the veto lines rather than over them. A reader coming down
     # this comment meets what ended the cycle first and what the seats would do
     # about it second; a proposal above the veto reads as a plan, and a plan at the

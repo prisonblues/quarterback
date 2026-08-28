@@ -819,11 +819,59 @@ no with complete confidence):
   and SonarCloud's hard-gate issues count here exactly like the judged ones). Fix
   them (§4 again, with only this round's findings in the brief), then run the
   panel again as round `r+1`. Repeat until `stop` is true or the cap is reached.
-- **`stop: true`** — the cycle is done. Note `confident`: **false** means the
-  stop was not convergence — a reviewer read a prefix of the diff, never ran,
-  returned nothing parseable or declared a gap; the cap ran out; or the round had
-  no baseline to compare against. The `veto` list says which. Report it as a stop,
-  never as "clean".
+- **`stop: true`** — **no further PANEL runs.** That is the whole of what it says,
+  and reading it as "the cycle is done, nothing is left" is the bug #42 records: a
+  capped round's findings were found, judged, posted and handed to nobody. Note
+  `confident`: **false** means the stop was not convergence — a reviewer read a
+  prefix of the diff, never ran, returned nothing parseable or declared a gap; the
+  cap ran out; or the round had no baseline to compare against. The `veto` list says
+  which. Report it as a stop, never as "clean". **Then read
+  `round_stop.outstanding`** — the answer to the other question — and do what it
+  says.
+
+### What is left when the cycle ends, and who gets it (#42)
+
+`stop` answers *should another panel run*: a question about cost, the cap and
+convergence. It is not the answer to *should these findings be fixed*, which by this
+command's own bar is always yes — every confirmed finding, every SonarCloud hard-gate
+issue. The cap is where the two come apart, and it is the common case: the last
+round's P1/P2s, the repeats whose fix did not land, the gate issues and everything
+that round newly found are all outstanding at the moment the loop is told to end.
+
+`jq .round_stop.outstanding` and dispatch on `handed_to`. Do not substitute your own
+judgement here either — it is computed from which rule stopped the cycle.
+
+- **`handed_to: "fixer"`** — run **one** final fix pass (§4, with `fixable` as the
+  brief) and then **stop**. Do not run a panel over it: the cycle has ended and there
+  is no round left to read the result.
+
+  **Say in the relay, in these words, that the commit is unreviewed** — "the round-N
+  fix commit was not itself re-reviewed". This is the honest end state and it is not
+  a footnote: a cycle that ends with clearable work left ends with either unfixed
+  findings or an unreviewed fix, there is no third option, and the user is entitled
+  to know which one they got. Do not run "one more round to check it" — that is the
+  cap being raised by the agent it was there to bound.
+
+  **It is a proposal and not an order.** If the user has said they would rather ship
+  with the findings unfixed and triage them separately, that is theirs to choose —
+  do that instead, and record each finding `deferred` (§4b) so nothing is lost.
+- **`handed_to: "human"`** — **do not run a fixer.** The cycle ended on a futility
+  rung (#84, #489, #491, #505, #554) or on an escalation, and every one of those says
+  in its own `reason` that a human answers this rather than another fix pass. Sending
+  the remainder to one contradicts the verdict you are relaying. Relay `why`, list
+  `fixable` and `escalated`, and record the findings `deferred` (§4b) with the issue
+  that carries the question.
+- **`handed_to: "nobody"`** — nothing is owed. Either the round was dry, or
+  everything left is under the repo's `fix_severity_floor` and the repo's own policy
+  is that those are reported and not fixed here (#165). Relay `below_floor` anyway if
+  it is non-empty: a policy stop that says nothing about what it held back reads as a
+  dry one.
+- **`handed_to: null`** — the round is going again; this is the `stop: false` bullet
+  above and there is no final pass to run.
+
+`escalated` is never a fixer's, at any of these: no fix round may touch an escalated
+finding (#221). It goes to §6's **Escalated** item and to the issue that asks the
+question.
 
 **Before a `stop: false` becomes another fix pass, declare the premise that pass
 will rest on.** This is the futility brake (#84), and it is yours to run — not the
@@ -1066,9 +1114,13 @@ which key it dropped; pass it again on the next round that runs.
   redesign is worth its cost. `holds` is not permission to go back and patch.
 
 Two things this must NOT do:
-- **Never let a fix ride out unreviewed silently.** At the cap, if the last fix
-  pass changed anything, say so in the relay: "the round-N fix commit was not
-  itself re-reviewed".
+- **Never let a fix ride out unreviewed silently.** If the last fix pass changed
+  anything and no round read it, say so in the relay: "the round-N fix commit was
+  not itself re-reviewed". This used to be written for the cap alone and assumed a
+  fix pass had happened at round N — at the cap, none had, which is how #42's hole
+  stayed invisible. It now covers both: the round-N pass that no round followed,
+  **and** the final pass `outstanding.handed_to: "fixer"` asks for, which is
+  unreviewed by construction.
 - **Never re-run a round to get a nicer answer.** Each panel run is recorded on
   the board as an observation; re-rolling one corrupts the record it exists to be.
 - **Never `--force` past a refusal to keep the cycle moving.** A refused round is
@@ -1113,6 +1165,14 @@ Then the part that is new, and is the point of running more than one round:
   for or against "the fixer is the slow part" is produced** (#192), and until
   several cycles have produced it the answer is a hunch — the panel's own hunch
   had the judge and the gating wait folded into a phase nobody had measured.
+- **What the cycle left behind, and who got it (#42):** `round_stop.outstanding`,
+  every time the cycle ended — **including when the answer is nothing**. Say
+  `handed_to`, the counts in `fixable` / `escalated` / `below_floor`, and what you
+  then did about it: a final fix pass ran (and **its commit was not reviewed**), or
+  the remainder went to a human, or nothing was owed. This is the one line that
+  distinguishes "the panel converged" from "the panel ran out of rounds with eleven
+  findings still open", and until #42 the relay could not tell a reader which had
+  happened.
 - **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
   a decision the user has to take, not as a footnote — the commit range, what
   reverting it would remove, what it would cost, and that nothing has run it. If the
