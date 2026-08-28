@@ -2223,21 +2223,39 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
 #: is the fail-closed direction on purpose: a seventh CI state added to
 #: `CI_STATE_WORDS` next year vetoes until somebody argues it into this set, rather
 #: than passing silently the way `none` did before #546.
-CI_SETTLED = frozenset({"PASS", "FAIL"})
+#:
+#: #548's two are the first states argued in, and the argument is the one this set is
+#: for: a suite that RAN on this exact commit and reported is execution evidence,
+#: which is the only thing the veto asks about. Weaker evidence than a CI run, and
+#: every renderer says so — but "weaker" is not the axis here. Nothing in this
+#: function grades evidence; it asks whether the round had any.
+#:
+#: **`local-fail` sits beside `FAIL` rather than vetoing, and that was a reversal.**
+#: The first draft vetoed it, reasoning that `FAIL`'s exemption comes with a stated
+#: precondition — `preland.check_ci` refuses the merge on red anyway, and "that
+#: division is only sound while both gates are applied" — which is false of a local
+#: run, since `check_ci` reads GitHub. Codex called that special pleading on PR #604
+#: and was right, on two counts. It answers a question this set does not ask: whether
+#: a second gate consumes the evidence is a fact about deployment policy, and
+#: `coverage_veto`'s standing rule is that this list comes off recorded state.
+#: And it closed nothing: the only repo that could reach `local-fail` with the merge
+#: gate satisfied has written `preland.disabled_checks: ["ci"]`, and that repo merges
+#: a red GitHub `FAIL` too — the check is not run at all. An asymmetry that buys no
+#: safety costs only coherence.
+CI_SETTLED = frozenset({"PASS", "FAIL", panel_scope.LOCAL_PASS, panel_scope.LOCAL_FAIL})
 
 #: One sentence per state, because each says a different thing — the discipline
-#: `_ci_line` and `ci_brief` already keep, and the reason #548 is a separate issue
-#: from this one. Every line names a cause somebody can discharge; none of them is
-#: discharged by a human acknowledging it.
+#: `_ci_line` and `ci_brief` already keep. Every line names a cause somebody can
+#: discharge; none of them is discharged by a human acknowledging it.
 #:
 #: "No settled result" and NOT "nothing executed", which is the stronger claim and
-#: is false of two of these four: `PENDING` can be a suite whose other checks have
-#: already passed, and `unknown` is a lookup that failed and says nothing either
-#: way about what ran. Only `none` and `blocked` are claims about execution. The
-#: veto is the same for all four — none of them gives the round a result to earn
-#: its confidence on — but the wording has to survive being read closely, because
-#: could-not-check is not nothing-to-report and this whole change is about not
-#: conflating those.
+#: is false of three of these five: `PENDING` can be a suite whose other checks have
+#: already passed, `unknown` is a lookup that failed and says nothing either way
+#: about what ran, and `local-unknown` is a command that was started and did not
+#: report. Only `none` and `blocked` are claims about execution. The veto is the same
+#: for all five — none of them gives the round a result it can earn its confidence on
+#: — but the wording has to survive being read closely, because could-not-check is
+#: not nothing-to-report and this whole change is about not conflating those.
 CI_UNSETTLED = {
     # #501 already gives a PENDING build a bounded wait before the seats are
     # dispatched. This is the residue AFTER that wait — the honest case its own
@@ -2248,14 +2266,25 @@ CI_UNSETTLED = {
                "suite result exists for this commit yet",
     # The case #546 is about, and one of the two here that really is a statement
     # about execution. #324 is what made this distinguishable from `blocked` at
-    # all, and #548 is the proposal to fill the empty channel at source rather
-    # than only pricing its emptiness here.
+    # all. Since #548 it also carries a second fact by implication: a round that
+    # reaches this state either declared no `review_panel.local_suite` or could not
+    # run the one it declared, because a suite that RAN would have replaced this
+    # status. The config note says which, and it is a note rather than a longer
+    # sentence here — this is the veto's vocabulary, and the reason a channel is
+    # empty belongs to whoever configures it.
     "none": "no CI run exists for this commit — nothing mechanical executed "
             "this code",
     # #324's state, and it must not borrow `none`'s sentence: a run EXISTS. It
     # simply will not execute until a person clicks, so it contributes nothing.
     "blocked": "a CI run exists for this commit and is gated on a human "
                "approval — it has executed nothing",
+    # #548's one vetoing state, and it is like `unknown` rather than like `none`: a
+    # command was started and told us nothing. Whether it executed any of the code is
+    # exactly what is not known — which is also what a passing suite becomes when the
+    # checkout moved out from under it mid-run (`review_local_suite`).
+    panel_scope.LOCAL_UNREAD:
+        "the repo's own suite was run locally on this commit and produced no "
+        "result — no settled suite result exists for it either way",
     # Not "nothing ran" — nobody knows whether anything ran. Could-not-check is
     # not nothing-to-report, and stating it as the former would be the same
     # conflation this veto exists to undo.

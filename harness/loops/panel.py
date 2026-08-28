@@ -496,6 +496,9 @@ def _payload_defaults() -> dict:
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
+        # Null and not `{}` for `code_access`'s reason: a round that never reached
+        # the CI read did not decline to run a local suite, it never asked. #548.
+        "local_suite": None,
         "judged": False,
         "judge_model": None,
         "judge_skip": None,
@@ -909,6 +912,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # verdict is final — it governs whether an escalation ARRIVES with a proposal on
     # it or with a list of complaints and nothing else.
     propose_armed = panel_flag(panel, "propose_on_escalation", True, notes)
+    # #548's local suite, read at the same moment as the brakes above and for their
+    # reason: a malformed value has to hard-exit before a seat is dispatched rather
+    # than after a whole panel has been paid for. It is read here and USED much
+    # further down, beside the CI settle — the one place that knows whether GitHub
+    # had anything to say — because running the suite is only ever the answer to
+    # that question. Nothing is executed by this read.
+    #
+    # And NOT from `panel`, which is the only reader in this function that does not
+    # use the resolved block. `panel` includes the working tree on the interactive
+    # path, and a round is usually run from a worktree checked out at the PR's own
+    # head — so `panel["local_suite"]` would be a command the pull request under
+    # review chose, executed by the thing reviewing it. `trusted_panel_block` reads
+    # the default branch in both modes; `harness_rules.default_branch_rules` has the
+    # argument, and PR #604 has the review that found this.
+    trusted = trusted_panel_block(cfg, notes)
+    local_cmds = local_suite_commands(trusted)
+    local_timeout = local_suite_timeout(trusted)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
 
@@ -1943,6 +1963,69 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             f"{settled} ({ci_status}). A reviewer told the build is still running "
             f"declares it as a gap it cannot assess, and that costs the round its "
             f"confident stop (#501)")
+    # #548. `none` is the state the wait above cannot help: there is nothing to wait
+    # for, so the channel #501 built is simply empty and every seat is told "no run
+    # exists" about a repo that may have a perfectly good suite in it. If this repo
+    # has declared one, run it once — here, before the seats, so that one execution
+    # is shared by all of them — and let the answer travel down the same channel in
+    # states of its own that can never read as CI.
+    #
+    # NOT on the refusal path above, which reads CI and dispatches nobody: there is
+    # no seat to raise a floor under, and spending a suite's wall clock on a round
+    # that reviews nothing contradicts "a refusal must cost nothing".
+    local_record = None
+    if local_cmds and ci_status in LOCAL_SUITE_WHEN:
+        instead_of = ci_status
+        (local_status, local_failing, local_why, local_output,
+         local_secs) = review_local_suite(
+            local_cmds, str(cfg.get("path") or ""), head_sha, timeout=local_timeout)
+        # Recorded whatever happened, including the case where nothing ran: "this
+        # repo declares a suite and the checkout was in no state to run it" is the
+        # fact a reader of a `none` round now needs, and it is invisible in
+        # `ci_status`, which is unchanged in exactly that case.
+        # NO `output` KEY, and its absence is the point. The payload is POSTed to the
+        # board, so persisting a failing command's own text there would take the
+        # thing this feature keeps out of a public PR comment — output from code
+        # under review, which on this fleet has included a `DATABASE_URL` with a
+        # password in it — and put it on a remote service instead, where it is
+        # retained by something with a different retention policy from this process.
+        # Moving a leak is not closing one. The operator's terminal gets it (below),
+        # and that is the only place with no retention at all.
+        local_record = {"commands": list(local_cmds), "status": local_status or None,
+                        "failed": list(local_failing), "seconds": local_secs,
+                        "why": local_why or None, "instead_of": instead_of,
+                        "timeout": local_timeout}
+        if local_status:
+            ci_status, ci_failing = local_status, local_failing
+            # The seats get the harness's own sentence for a run that told us
+            # nothing, and NEVER the gist of a failing command's output: `ci_brief`
+            # renders `skip` into four reviewer prompts and the judge's, and that
+            # text is produced by code from the PR under review.
+            ci_skip = local_why if local_status == LOCAL_UNREAD else None
+            notes.append(
+                f"GitHub CI reported `{instead_of}` for this commit, so the repo's own "
+                f"suite was run here instead (`{'`, `'.join(local_cmds)}`): "
+                f"{local_status} in {local_secs:.0f}s"
+                + (f" — {local_why}" if local_why else "")
+                + ". A local run is weaker evidence than a green CI run and buys no "
+                  "merge: the gate still reads GitHub (#548)")
+            # The command's own OUTPUT goes here and NOWHERE else — not the note
+            # above (`--post` publishes `config_notes` as a public PR comment), not
+            # the prompt (`ci_brief` renders into four reviewers and the judge), and
+            # not the payload (it is POSTed to the board). A failing test prints
+            # whatever it was holding, which on this fleet has included a
+            # `DATABASE_URL` with a password in it. This stream is read by the person
+            # who started the round and retained by nothing.
+            if local_output:
+                print(f"! local suite: {local_output}", file=chatter)
+        else:
+            # The setting is live and did nothing, which must not be silent — a
+            # repo that configured a suite and never sees it run would otherwise
+            # have to read this source to find out why.
+            notes.append(
+                f"`review_panel.local_suite` is set (`{'`, `'.join(local_cmds)}`) and "
+                f"was NOT run: {local_why}. CI still reports `{instead_of}` (#548)")
+
     ci_text = ci_brief(ci_status, ci_failing, ci_skip)
 
     # A manifest round asks a different question, so it sends a different brief —
@@ -3719,6 +3802,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "sonar_gate": result.sonar_gate,
         "ci_status": ci_status,
         "ci_failing": ci_failing,
+        # #548's recorded state. `ci_status` already carries the verdict; this
+        # carries what produced it — which commands, how long they took, and what
+        # CI state they stood in for — so that a `local-pass` round can be told
+        # apart from a `PASS` one by a reader six weeks later without the notes.
+        # Null on a round that ran none, which is every round on a repo that has
+        # not declared a suite.
+        "local_suite": local_record,
         "judged": judged,
         "judge_model": panel.get("judge_model", "") or None,
         "judge_skip": judge_skip,
@@ -4120,15 +4210,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     ci_txt = {"PASS": "✅ PASS", "FAIL": "❌ FAIL", "PENDING": "⏳ pending",
               "blocked": "🚧 gated — a run exists and will not execute without a human",
               "none": "🚫 no run exists for this commit",
-              "unknown": "❓ could not be determined"}.get(ci_status, ci_status)
-    lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}")
+              "unknown": "❓ could not be determined",
+              LOCAL_PASS: "✅ passed LOCALLY — no GitHub run exists for this commit",
+              LOCAL_FAIL: "❌ failed LOCALLY — no GitHub run exists for this commit",
+              LOCAL_UNREAD: "❓ run locally and produced no result — no GitHub run "
+                            "exists for this commit"}.get(ci_status, ci_status)
+    # The heading names the SOURCE, because "hard gate" is a claim about what
+    # `preland` will refuse and it is false of a local run: `check_ci` reads GitHub,
+    # so nothing a suite does on this box is a gate at all. A local answer under a
+    # heading promising one is precisely the reading `_ci_line` refuses (#548).
+    from_local_suite = ci_status in LOCAL_STATES
+    lines.append(f"**CI (`gh pr checks`, hard gate):** {ci_txt}" if not from_local_suite
+                 else f"**Test suite (the repo's own, run locally — NOT a gate):** {ci_txt}")
     if ci_failing:
-        lines.append("  - failing: " + ", ".join(ci_failing[:10])
+        lines.append(("  - failed: " if from_local_suite else "  - failing: ")
+                     + ", ".join(ci_failing[:10])
                      + (f" (+{len(ci_failing) - 10} more)" if len(ci_failing) > 10 else ""))
     # Every state that is not PASS, since #324. "no checks reported" used to print
     # with no warning under it at all, which is how an absent result read as a
     # benign one — the three added here are the three that cannot fix themselves.
-    if ci_status != "PASS":
+    #
+    # And `local-pass` is warned about too, which is the one line in this block that
+    # is not about a missing or failing suite: it is green, and it is still not the
+    # thing the merge gate reads. A pass under no warning at all is how a reader
+    # concludes the PR is mergeable from a run that has no bearing on whether it is.
+    if from_local_suite:
+        lines.append("  - ⚠️ this is the LOCAL suite and not CI — a different "
+                     "machine, possibly different service versions, and nothing "
+                     "says this is the commit that will merge. The merge gate reads "
+                     "GitHub, which still reports nothing for this commit")
+    elif ci_status != "PASS":
         lines.append(f"  - ⚠️ CI is not green ({ci_status}) — do not merge, even if "
                      "the review below is clean")
     gate_txt = {"OK": "✅ PASS", "ERROR": "❌ FAIL"}.get(result.sonar_gate, result.sonar_gate)

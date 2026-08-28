@@ -2316,13 +2316,23 @@ def test_an_unexplained_absence_of_ci_still_vetoes():
 
 
 def test_an_unrecognised_ci_state_vetoes_rather_than_passing():
-    """Fail closed, by construction. The set is written as the two states that DO
-    NOT veto, so a seventh `CI_STATE_WORDS` entry added next year costs the round
-    its confidence until somebody argues it into `CI_EXECUTED` — rather than
-    passing silently, which is exactly how `none` reached today."""
-    assert sorted(panel.CI_SETTLED) == ["FAIL", "PASS"]
+    """Fail closed, by construction. The set is written as the states that DO NOT
+    veto, so a seventh `CI_STATE_WORDS` entry added next year costs the round its
+    confidence until somebody argues it into `CI_EXECUTED` — rather than passing
+    silently, which is exactly how `none` reached today.
+
+    #548's two are the first states argued in, and they are spelled out here rather
+    than derived so that the next one is also somebody's decision: a suite that RAN
+    on this commit and reported is execution evidence, which is the only thing this
+    veto asks about. `local-unknown` is not in it — a command that reported nothing
+    established nothing."""
+    assert sorted(panel.CI_SETTLED) == ["FAIL", "PASS", panel.LOCAL_FAIL,
+                                        panel.LOCAL_PASS]
     covered = set(panel.CI_UNSETTLED) | set(panel.CI_SETTLED)
-    assert covered == set(panel_scope.CI_STATE_WORDS.values()), \
+    # Every state `ci_status` can arrive as: the six the forge can report, plus the
+    # three a local run produces. A state in neither mapping falls to the generic
+    # fallback line, which vetoes — safe, and mute about which fact it is stating.
+    assert covered == set(panel_scope.CI_STATE_WORDS.values()) | set(panel.LOCAL_STATES), \
         "a CI state exists that this function neither exempts nor has a sentence for"
     for odd in ("", "queued", "PASSED"):
         assert panel.coverage_veto(_one_seat_ran(), None, 0, 1_000,

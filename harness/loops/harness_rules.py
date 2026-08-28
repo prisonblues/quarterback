@@ -1333,6 +1333,38 @@ DEFAULTS: dict = {
         # ceiling — and a fleet that could set only one of them would be setting a
         # number whose meaning it could not see.
         "budget_window_hours": 24,
+        # THE REPO'S OWN SUITE, run once before the seats are dispatched, when
+        # GitHub CI has nothing to say about this commit (#548). `null` is off and
+        # off is what every repo gets until it writes this, because this is the one
+        # setting in the file that names something to EXECUTE.
+        #
+        # A string is one command; a list is several, run in order — `make test`,
+        # plus a DB-backed target where the box has the service. Each is split with
+        # `shlex` and run WITHOUT a shell, so the list is where "and then" is
+        # spelled and a value cannot smuggle in a pipeline.
+        #
+        # It fires only on `none`, `blocked` and `unknown`: a real CI result is
+        # never displaced by a weaker local one, and `PENDING` belongs to #501's
+        # bounded wait. It runs only where the checkout is ALREADY at the PR's head
+        # with no tracked edits — see `panel_scope._local_head_problem`, which is
+        # the security boundary and the reason this key is safe to have at all.
+        # Its result travels to the seats through `ci_brief` in three states of its
+        # own (`local-pass`/`local-fail`/`local-unknown`) that never read as CI,
+        # and it buys a round its confident stop without buying a merge:
+        # `preland.check_ci` reads GitHub and has never heard of it.
+        #
+        # DELIBERATELY NOT A BOARD DIAL. Every other `review_panel` setting the
+        # board may state is a number or a switch; this one is a command line, and
+        # a dial for it would be a way to run code on every box in the fleet by
+        # POSTing to an API. It is settable in the tracked sample, where a person
+        # reviewing a branch sees it, and nowhere else.
+        "local_suite": None,
+        # Wall clock for the WHOLE run, not per command, and the bound fails in the
+        # honest direction: a suite that does not finish is reported as not having
+        # finished and vetoes the round's confident stop. It never becomes a pass
+        # and it never becomes a failure — "broken" and "did not fit in the budget"
+        # are different facts about a diff.
+        "local_suite_timeout": 900,
     },
     "loops": {
         "dependabot_lander": False,
@@ -1818,6 +1850,44 @@ def _read_rules(root: Path, default_branch: str,
         return (_baseline_json(f.read_text(), str(f)), str(f), present[0],
                 _shadowed(present[0], lost), False)
     return {}, "none (defaults)", "", [], False
+
+
+def default_branch_rules(root: Path | str) -> tuple[dict, str]:
+    """The repo's tracked rules as ``origin/<default branch>`` has them, and the
+    sentence saying where they came from — **never the working tree's** (#548).
+
+    `resolve_repo` reads the working tree on the interactive path, which is right for
+    everything it governs: those are numbers and switches, a person is present, and
+    reading the branch in front of you is the whole convenience. It is wrong for a
+    setting that names a COMMAND to execute. A panel round is frequently run from a
+    worktree checked out at the PR's own head — that is where the fix loop lives — so
+    the working tree's `.harness-rules.sample` is the PR's, and a `local_suite` read
+    from it would be a command the pull request chose, run by the thing reviewing it.
+    "Checking a branch out is already consent to run it" is not true: checkout writes
+    files, it does not execute them.
+
+    So the one executable setting takes the protection the unattended path already
+    has, in BOTH modes: `from_default_branch=True`, the same argument
+    `.harness-rules.sample`'s own `_two_refs` note makes — a poisoned PR cannot
+    rewrite the rules governing its own review. The cost is that a change to the
+    command does not take effect until it lands on the default branch, which is the
+    intended shape: it is a policy edit, and policy is reviewed.
+
+    Returns `({}, why)` on any failure — an unfetched branch, no rules file, a
+    checkout with no remote — and the caller falls back to DEFAULTS, where
+    `local_suite` is `None`. Fail-closed by construction: a command that cannot be
+    read from the protected branch is not run.
+    """
+    root = Path(root)
+    try:
+        branch = detect_default_branch(root)
+        rules, provenance, _baseline, _problems, unreadable = _read_rules(
+            root, branch, True)
+    except Exception as e:                       # never raises; see the contract above
+        return {}, f"the default branch's rules could not be read ({e.__class__.__name__})"
+    if unreadable:
+        return {}, f"`origin/{branch}` could not be read"
+    return strip_comments(rules), provenance
 
 
 def _is_tracked(root: Path, name: str) -> bool:

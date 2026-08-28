@@ -327,6 +327,8 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.propose_on_escalation` | On an escalation, ask each seat that still has outstanding findings on this PR one question: **given these findings of yours, what is the smallest change that resolves them?** **true**, and on. It is NOT a fifth `escalate_on` rung and is deliberately not filed inside that block: every key there answers *does this end the cycle?*, and this one ends nothing, extends nothing and moves no verdict — it decides what an escalation ARRIVES WITH. The hole it fills is #507's: every seat returns findings, which is the right contract for an ordinary round, but on a cycle that will not converge the fixer is inferring the reviewer's INTENT from a criticism and guessing at a change that satisfies it — and that guess is what the next round reads. 128 of 201 new findings across seven PRs were created by the fix immediately before them. **On escalation, not every round**: it fires where an `escalate_on` rung FIRED (`fix_injection`, `new_findings_not_falling`, `premise_repeated`, `premise_undecidable` — `fired`, never merely `over`), so it costs one fan-out on a PR whose cycle was already ending badly and nothing at all on a healthy round. The round CAP is not an escalation and does not trigger it: a cap is a cost bound that ends healthy cycles and diverging ones in the same place. `--ask` (#129) is the machinery and the wrong question — it adjudicates a premise somebody already wrote, and here nobody has, because the whole problem is that the fixer does not know what the claim should be — so `panel_propose` reuses the fan-out and reuses neither the question nor, deliberately, the **tally**: four seats proposing four incompatible changes is the most useful answer a stuck cycle can get, and a verdict struck over them would average away the one thing worth collecting. Nothing is reconciled and no agreement is computed. **A proposal is not a finding**: it enters no leaderboard, no cross-round defect chain and no severity floor, it reaches `round_stop` through nothing, and the board's `extra="ignore"` ingest drops the key — a reviewer that proposes is not thereby right (#79). **It cannot make a review look cleaner than it is**: it runs after `stop`, `reason`, `veto` and `confident` are final and writes to none of them, and its section is printed UNDER the veto lines rather than over them. An escalated finding is shown and MARKED as the human's to answer, never as work for a fixer. Recorded every round as `proposals`, with each seat's verdict (`change` / `no small change` / `cannot tell`), its one-line proposal, where, which of its findings it claims to resolve, and the exact listing it was shown. `false` switches it off — and a round that then escalates says so in `config_notes`, because a repo that declined this must not be indistinguishable from one where nothing fired. |
 | `review_panel.budget` | #55's spend ceiling: `tokens_per_day`, `runs_per_day`, `tokens_per_pr`, `runs_per_pr`, `fleet_tokens_per_day`. **Every one `null` — no ceiling — which is what landing it did to every repo.** Checked against `GET /review/spend` *before any seat is dispatched*, and a repo at its ceiling is refused through the pre-flight's own machinery: printed, recorded with `reviewed: false` and a per-seat `ran: false`, posted to the PR, and carrying `stop_confident: false` so a budget stop cannot read as convergence. Tokens are input + output (`/review/stats`' `billable`); the run ceilings are what still binds where nothing was instrumented, and `runs_per_pr` is the one that binds a caller which renumbers its rounds. `0` is a real value and means nothing may be spent; `--force` overrides none of them. Board-settable, and the board's value beats this file's — a ceiling a repo can raise from inside itself is decorative. |
 | `review_panel.budget_window_hours` | What "per day" means for the two rolling ceilings. **24**. A dial rather than a constant because the window and the ceiling are one decision: halving the window halves the ceiling. The per-PR ceilings have no window — they are about one pull request's whole cost, and a rolling one would let a PR reviewed daily for a fortnight stay under a ceiling it passed on day two. |
+| `review_panel.local_suite` | The repo's **own test suite**, run once on this box before the seats are dispatched, when GitHub CI has nothing to say about this commit (#548). `null` — **off**, and off is what every repo gets until it writes this, because it is the one key in the file that names something to EXECUTE. A string is one command; a list is several, run in order (`make test`, plus a DB-backed target where the box has the service). Each is split with `shlex` and run **without a shell**, so the list is where "and then" is spelled. **Read from `origin/<default branch>` in both modes**, never from the working tree — unlike every other key here — so a change to it takes effect when it lands, not when it is pushed. **Not board-settable** either: a dial for a command line would run code on every box in the fleet with one POST. See below. |
+| `review_panel.local_suite_timeout` | Wall clock for the **whole** declared run, in seconds. **900**, and at most 3600. Per-command would bound nothing — four commands would be four times the number in the docs. The bound fails in the honest direction: a run that does not finish is reported as not having finished and vetoes. |
 | `loops` | `dependabot_lander` / `stacked_driver` / `issue_executor` — which loops may run. |
 | `issue_pickup` | What a loop may pick up **of its own accord** — on/off, an author allowlist, a label allowlist, human triage, and the labels that refuse outright. Every default refuses; see below. |
 | `issue_filing` | How much a loop may **file** — a per-run cap, a duplicate search, and whether an unattended run may file at all. See below. |
@@ -992,20 +994,24 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   full suite passed on the exact commit and one where **no run exists** were the
   same round as far as `confident` was concerned. `PASS` and `FAIL` do not veto: a
   red suite is *evidence*, `ci_brief` already tells the seats to reason from it,
-  and `preland.check_ci` refuses the merge on it anyway. The other four each veto
+  and `preland.check_ci` refuses the merge on it anyway. The other states each veto
   in **their own sentence**, and the wording matters because only two of them are
   claims about execution — `none` (nothing ran) and `blocked` (#324: a run exists,
   is gated on a person and has executed nothing) — while `PENDING` is #501's
-  residue after the bounded wait and may hold green checks, and `unknown` is a
-  lookup that failed and says nothing either way. Could-not-check is not
-  nothing-to-report.
+  residue after the bounded wait and may hold green checks, `unknown` is a
+  lookup that failed and says nothing either way, and #548's `local-unknown` is a
+  command that was started and did not report. Could-not-check is not
+  nothing-to-report. #548's `local-pass` and `local-fail` are the states argued INTO
+  the non-vetoing set since, on the ground this set is for — a suite that ran and
+  reported is evidence, whatever it reported — and the section below has the
+  argument, including the draft that got the second half of it wrong.
   **One exemption, off recorded state:** a repo that has written
   `"preland": {"disabled_checks": ["ci"]}` — the declaration `preland.check_ci`
   refuses `none` by naming — is not asked again every round, because there the
   veto would be the standing constant the bullet above rules out. Exactly `none`,
   since the declaration explains an absent run and not a gated, unsettled or
   unreadable one; an **unexplained** `none` still vetoes. The set is written as
-  the two states that do NOT veto, so a CI state added later vetoes until somebody
+  the states that do NOT veto, so a CI state added later vetoes until somebody
   argues it out, and `ci_status` is keyword-only with no default so a caller
   cannot forget it and quietly buy a confident stop.
 - **A declaration no seat here could ever resolve becomes an obligation, not a
@@ -1136,6 +1142,133 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   and then panels the fix commit, 2 rounds by default (`--rounds N`), so the fixer's
   own work is read by somebody. `panel.py` itself stays read-only either way: the
   fix/verify/commit lives in the skill, and so does the loop.
+
+### When CI has nothing to say, the repo's own suite does (#548)
+
+`ci_brief` gives every seat a real answer about execution and #546 prices the rounds
+that have none. `none` is the state neither can help: there is nothing to **wait**
+for, so the channel #501 built is empty — on a repo with no CI, and on a stacked PR
+whose CI branch filter never fired. A repo that sets `review_panel.local_suite` has
+its own suite run once, on this box, before the seats are dispatched, and the answer
+travels down that same channel.
+
+**Evidence, not a seat.** Sonar is a panel MEMBER because it produces findings; a
+test run produces **evidence**, and evidence raises the floor under every seat at
+once rather than adding a fifth voice with a coverage row that answers a different
+question. It is also not "give the seats a shell": three vendor CLIs each holding a
+live database is expensive, nondeterministic, and costs the seats the independence
+that is the only reason to seat four of them. One execution, attributable to one
+commit, shared by all of them — the shape `review_ci` already has.
+
+**It fires only where GitHub has no result and none is coming** — `none` and
+`unknown`. A real CI result about this exact commit is never displaced by a weaker
+local one, and `PENDING` belongs to #501's bounded wait, which is in the business of
+turning it into a real one. **`blocked` is excluded too**, and that one had to be
+argued out: #324 named it because it is *actionable* — a run exists, a person must
+click — and replacing it with `local-pass` would overwrite the field every downstream
+consumer reads with a value that says nothing about the click, while handing the round
+the confident stop that is the only thing still making anybody look.
+
+**The command is read from the default branch, never from the working tree**, which
+is the one place this diverges from how every other setting resolves. A round usually
+runs from a worktree checked out at the PR's *own* head — that is where the fix loop
+lives — so the working tree's `.harness-rules.sample` is the pull request's, and a
+command read from it would be one the PR chose, executed by the thing reviewing it.
+"Checking a branch out is consent to run it" is false: checkout writes files, it does
+not execute them. So `harness_rules.default_branch_rules` gives this one key the
+protection the unattended path already had, in both modes. An unreadable branch means
+no run and a note saying so.
+
+**It runs only in a checkout already sitting on the PR's head, with nothing
+uncommitted or unignored in it** (`panel_scope._local_head_problem`). That is what
+makes a `local-pass` a statement about a commit rather than about a directory:
+`panel.py --repo x --pr N` reviews a PR without ever checking it out, and a suite run
+against some other branch would be evidence about code nobody is reviewing.
+
+*Ignored* files are tolerated and *unignored* untracked ones are not, which is the
+line `git status --porcelain` already draws. A provisioned worktree carries a `.env`,
+a virtualenv and scratch of its own, all gitignored and none of it listed — refusing
+that would mean this never runs anywhere real. A file that is untracked and not
+ignored is a different animal: a stray `conftest.py` is loaded by pytest before a
+line of the suite runs, a shadowing executable is found on `PATH` first, and either
+decides the result of a run recorded as evidence about a commit neither is in. That
+the ignore list is itself part of the commit is what makes this a line the repo drew.
+
+**The checkout is checked again after the run**, and a pass whose tree moved
+underneath it becomes `local-unknown`. Three things falsify the first answer without
+anyone acting in bad faith: another agent on the same box, a command earlier in the
+list that rewrote a tracked file, and the plain race between the check and the first
+`execve`.
+
+**Three states of its own, which can never read as CI.** `local-pass`, `local-fail`
+and `local-unknown` each open by saying no GitHub run exists for this commit, in
+`ci_brief` for the seats, `_ci_line` for a human and the round's report. A local pass
+refutes the same class of finding a green CI run does — "this new test never runs",
+"this may not even import" — carries the same warning that it is not evidence the
+code is correct, and carries one more: it is **weaker** than a green CI run, being a
+different machine, possibly different service versions, and no guarantee this is the
+commit that will merge.
+
+**What it buys, and what it does not.** `local-pass` joins `CI_SETTLED`, so it earns
+a round its confident stop — the whole point. It buys no merge: `preland.check_ci`
+reads GitHub and has never heard of it, so a repo with no CI is refused there exactly
+as before. `local-fail` **vetoes**, which is the one asymmetry with CI's `FAIL`, and
+it is argued rather than inherited: `FAIL` costs the round nothing *because* the
+merge gate refuses on red anyway — a division `CI_SETTLED` says is "only sound while
+both gates are applied" — and for a local failure the second gate does not exist.
+`local-fail` joins it, beside CI's `FAIL` and for the same reason: a suite that ran
+and reported is evidence, whatever it reported. An earlier draft of this vetoed a
+local failure, arguing that `FAIL`'s exemption is conditioned on `preland.check_ci`
+refusing the merge on red — a division `CI_SETTLED` says is "only sound while both
+gates are applied" — which `check_ci` cannot do for a run it never sees. A Codex
+second opinion on PR #604 called that special pleading and was right twice over: it
+answers a question this list does not ask, since whether a second gate consumes the
+evidence is deployment policy while the list comes off recorded state; and it closed
+nothing, because the only repo that reaches `local-fail` with the merge gate satisfied
+has written `preland.disabled_checks: ["ci"]`, and that repo merges a red GitHub
+`FAIL` too. `local-unknown` is the one local state that vetoes, in its own sentence: a
+command was started and told us nothing, which is not the same claim as `none`'s
+"nothing mechanical executed this code".
+
+The **board** agrees without being told. `app.ordering` compares `ci_status` against
+`PASS` and `FAIL` for equality and treats anything else as neither known-green nor
+known-red, so a `local-pass` reaching the plan orders that item as conservatively as
+a `none` would. Left alone on purpose: the board is ordering work for people, and "a
+suite passed on somebody's laptop" is not the fact its green rule is about.
+
+**A failing command's OUTPUT never reaches a reviewer prompt, and never reaches the
+PR either** — only its name and its exit code do. Two different readers, two
+different reasons. `ci_brief` is rendered into four reviewer prompts and the judge's,
+and that output is text produced by code from the PR under review, which is the door
+`member_sandbox` exists to close; `config_notes` is published as a **public comment**
+by `--post`, and a failing test prints whatever it was holding — on this fleet that
+has included a `DATABASE_URL` with a password in it. So `review_local_suite` returns
+the harness's sentence and the command's output as two fields, and the output goes to
+the operator's terminal and **nowhere else** — not the payload either, which is POSTed
+to the board: moving a leak onto a remote service with its own retention is not
+closing one. The commands, their timing
+and the CI state they stood in for are recorded in the payload as `local_suite`, so a
+`local-pass` round can be told from a `PASS` one six weeks later without the notes.
+
+**The bound is a bound on this process, not a request.** The command's output is
+spooled to a temporary file rather than a pipe, and only its tail is read back: a
+suite that prints for fifteen minutes must not be measured in the panel's RSS, on a
+box already holding four reviewer prompts and a diff. That file is also what makes
+the timeout real — `subprocess.run` kills its child and then reads the pipes to EOF,
+and a surviving grandchild holding the write end keeps that read open for as long as
+it likes. The run gets its own session and the whole process group is killed on the
+bound, so a suite that started a database or a `docker compose` does not outlive the
+round. Three residuals, stated rather than implied: **disk is not bounded**, a
+descendant that calls `setsid` or hands its work to a container runtime leaves the
+group and survives, and the post-kill reap can add up to ten seconds past the budget.
+Bounding those needs a cgroup or a systemd scope, which is a heavier feature than this
+one.
+
+**The honest limit, recorded before anyone leans on it.** This answers a *subset*. On
+the PR that prompted the issue the open questions were a jsonb size ceiling, whether
+a reader delivers a field to a browser, and whether stored rows are now a mixed
+corpus — a test database holds no corpus, so a local `make test` would have answered
+none of the three. It is the structural fix for a class, not a fix for that round.
 
 ### Caps — the round ceiling and the spend ceiling (#55)
 
@@ -2349,6 +2482,9 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
 ## Gate model (recap from #117)
 
 - **Hard gates** (block merge): CI (`gh pr checks`) + the SonarQube quality gate.
+  A `review_panel.local_suite` run (#548) is **not** one of them: it is evidence for
+  the seats and for `round_stop`, and `preland.check_ci` reads GitHub, so nothing a
+  suite does on this box moves the merge button.
 - **Soft gates** (advisory): Claude + Codex reviewers. Never a lone-LLM hard block.
 - Auto-merge only within the `auto_merge` policy; everything else → human at the
   merge button.
