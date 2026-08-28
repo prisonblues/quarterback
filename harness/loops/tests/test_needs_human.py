@@ -1002,3 +1002,189 @@ def test_a_board_that_drops_the_condition_says_so_on_the_line(door, monkeypatch)
                        condition="harness@zeus",
                        refs=[{"kind": "repo", "value": "acme/one"}])
     assert "did not keep the condition" in note and "#576" in note
+
+
+# --------------------------- door 5: an escalated premise is a question, not a comment
+
+
+@pytest.fixture
+def cycle(monkeypatch, tmp_path):
+    """A repo whose brake is armed, and an empty register to declare into.
+
+    `declare()` resolves its dial through `load_repo_cfg` like every other entry
+    point, so that is the one thing doubled: the register, the count, the verdict
+    and the announcement are all the real code below.
+    """
+    monkeypatch.setattr(panel_rounds, "load_repo_cfg", lambda name: {
+        "name": "acme/r", "github": "acme/r",
+        "review_panel": {"escalate_on": {"premise_repeated": 2}}})
+    return tmp_path / "premises.json"
+
+
+def declare_twice(cycle, *, keys=("cd" * 8,), pr=7):
+    """Declare one premise in two rounds — the second is the escalation."""
+    premise = "a local repository can say where a release number landed"
+    panel.declare("acme/r", premise, str(cycle), 1, list(keys), pr, False, "unknown")
+    return panel.declare("acme/r", premise, str(cycle), 2, list(keys), pr,
+                         False, "unknown")
+
+
+def test_an_escalated_premise_reaches_the_board_and_not_just_the_pr_comment(door, cycle):
+    """#555's producer. The escalation names a premise, the findings it explains and
+    what the brake was set at — everything `plan_block` asks a caller for — and until
+    this existed it went into a PR comment and was counted by nobody. #520 measured
+    #328's table at 0 rows for exactly this reason."""
+    assert declare_twice(cycle) == panel_rounds.PREMISE_REPEATED_EXIT
+    assert len(door) == 1, "the escalation is announced once, on the refusal"
+    assert "needs a human (decision)" in door[0]["summary"]
+    assert "release number landed" in door[0]["summary"]
+    assert len(door.blockers) == 1
+    row = door.blockers[0]
+    assert row["kind"] == "decision", "a premise is a decision, never `other`"
+    assert (row["subject_kind"], row["subject_value"]) == ("pr", "7")
+    assert row["condition"].startswith("premise:")
+    assert "cd" * 8 in row["detail"], "the findings it explains ride with the question"
+
+
+def test_the_ordinary_declaration_says_nothing_and_costs_no_network(door, cycle):
+    """`declare` runs before EVERY fix pass, and its whole standing is that it is
+    cheap enough to. Only the refusal is an escalation; a recorded first occurrence
+    is a fix about to be written, which is nobody's decision to make."""
+    premise = "a local repository can say where a release number landed"
+    assert panel.declare("acme/r", premise, str(cycle), 1, ["cd" * 8], 7,
+                         False, "unknown") == 0
+    assert posted_nothing(door) and not door.blockers
+
+
+def test_two_premises_on_one_pr_are_two_rows_and_not_one_answered_twice(door, cycle):
+    """#576, one level up. The subject and the class are identical for both, so
+    `condition` is the only thing keeping them apart — and without it the second
+    escalation on a pull request is answered "already an open blocker" and dropped."""
+    other = "the panel exiting 0 means it reviewed the diff"
+    declare_twice(cycle)
+    panel.declare("acme/r", other, str(cycle), 1, ["ef" * 8], 7, False, "unknown")
+    panel.declare("acme/r", other, str(cycle), 2, ["ef" * 8], 7, False, "unknown")
+    assert len(door.blockers) == 2
+    assert len({b["condition"] for b in door.blockers}) == 2
+    assert len({(b["subject_kind"], b["subject_value"], b["kind"])
+                for b in door.blockers}) == 1
+
+
+def test_a_restatement_re_raises_the_same_row_rather_than_opening_a_second(door, cycle):
+    """`premise_key` is stable across a rewording and `find_premise` maps a
+    restatement onto the same register entry, so the condition built from it does
+    too. A premise restated in a later round is the same unanswered question."""
+    declare_twice(cycle)
+    panel.declare("acme/r", "a local repository CAN say where a release number landed!",
+                  str(cycle), 3, ["cd" * 8], 7, False, "unknown")
+    assert len({b["condition"] for b in door.blockers}) == 1
+
+
+def test_a_board_that_will_not_take_the_row_still_refuses_the_fix(door, cycle, monkeypatch):
+    """The courier, not the news. A fix pass must not proceed because a board is
+    down, and it must not fail because one is either — the exit code is the brake
+    and it does not consult the network."""
+    def broken(path, body):
+        raise RuntimeError("board is down")
+    monkeypatch.setattr(nh, "_board_json", broken)
+    assert declare_twice(cycle) == panel_rounds.PREMISE_REPEATED_EXIT
+
+
+def test_what_the_board_did_is_printed_where_the_fixer_is_already_reading(
+        door, cycle, capsys):
+    """The fixer is told the row exists, on the screen it already has to read. The
+    brief tells it not to file one by hand, and that instruction is only safe if it
+    can see whether the tool managed it."""
+    declare_twice(cycle)
+    assert "recorded as a blocker" in capsys.readouterr().out
+
+
+def test_a_board_that_refuses_the_row_says_so_on_that_same_line(door, cycle, monkeypatch,
+                                                                capsys):
+    """The failure is reported where the success would have been. A fixer told
+    nothing would reasonably assume the row exists — and the brief has just told it
+    not to open one — so a silent failure is how a question stops being asked at
+    all."""
+    def refuse(path, body):
+        if path == "/blockers":
+            return None, "board said 503"
+        door.append(body)
+        return {"id": 1}, ""
+    monkeypatch.setattr(nh, "_board_json", refuse)
+    declare_twice(cycle)
+    assert "not recorded as a blocker" in capsys.readouterr().out
+
+
+def test_the_row_is_scoped_by_the_github_slug_and_not_the_local_name(door, monkeypatch,
+                                                                     tmp_path):
+    """`cfg["name"]` and `cfg["github"]` are different strings — the first falls back
+    to the checkout's directory name — and only the slug is what a plan item stores
+    in `repo`. Scoping the row by the other one files every question under a name no
+    item carries, which silently undoes the half of #555 that makes the plan
+    partition: the row exists, is counted, and matches nothing."""
+    monkeypatch.setattr(panel_rounds, "load_repo_cfg", lambda name: {
+        "name": "quarterback", "github": "prisonblues/quarterback",
+        "review_panel": {"escalate_on": {"premise_repeated": 2}}})
+    reg = tmp_path / "p.json"
+    premise = "a local repository can say where a release number landed"
+    panel.declare("quarterback", premise, str(reg), 1, ["cd" * 8], 7, False, "unknown")
+    panel.declare("quarterback", premise, str(reg), 2, ["cd" * 8], 7, False, "unknown")
+
+    (row,) = door.blockers
+    assert row["repo"] == "prisonblues/quarterback", "the slug, not the directory name"
+    assert row["subject_kind"] == "pr" and row["subject_value"] == "7"
+
+
+def test_a_door_too_old_for_the_condition_loses_the_field_and_not_the_question(
+        door, cycle, monkeypatch, capsys):
+    """The harness on PATH goes stale — that is what `qb-doctor`'s `harness` row is
+    for — so this file can be newer than the `needs_human` beside it. An unexpected
+    keyword is a `TypeError`, the guard would turn it into "NOT announced", and the
+    escalation would be lost for the sake of a field that only makes the row tidier.
+    `qb-bump` and `qb-doctor` both ask first; so does this."""
+    real = nh.announce
+
+    def old_door(*, cls, reason, summary, repo="", detail="", refs=None, key="",
+                 cfg=None, session=None):
+        return real(cls=cls, reason=reason, summary=summary, repo=repo, detail=detail,
+                    refs=refs, key=key, cfg=cfg, session=session)
+
+    monkeypatch.setattr(nh, "announce", old_door)
+    declare_twice(cycle)
+    assert len(door) == 1, "the escalation still reached a person"
+    assert len(door.blockers) == 1, "and still became a row"
+    assert door.blockers[0].get("condition", "") == "", "the field is what was lost"
+    assert "NOT announced" not in capsys.readouterr().out
+
+
+def test_a_lost_register_still_leaves_the_question_somewhere_durable(door, cycle,
+                                                                     monkeypatch, capsys):
+    """Announcing before the register write is checked is deliberate, and this pins
+    what it buys AND what it costs.
+
+    Buys: an unwritten register loses the occurrence, so the next declaration counts
+    as the first and the brake will not fire again — precisely the run where the
+    question most needs to be somewhere durable, and the row is the only durable
+    thing left.
+
+    Costs: the two states then disagree. The board holds an open question while the
+    register has no occurrence behind it. The exit code says the declaration was not
+    recorded, so a caller is told; resolving it is a person answering or withdrawing
+    the row, which is what the row is for. The alternative — the question existing
+    nowhere at all — is strictly worse.
+    """
+    # Fails on the ESCALATING declaration only. Failing on both would mean the
+    # register never persisted an occurrence, so the brake could not fire and there
+    # would be no escalation to test — the run would pass for the wrong reason.
+    real = panel_rounds.write_payload
+    calls: list[int] = []
+
+    def fail_the_second(path, payload):
+        calls.append(1)
+        return real(path, payload) if len(calls) == 1 else "disk full"
+
+    monkeypatch.setattr(panel_rounds, "write_payload", fail_the_second)
+    assert declare_twice(cycle) == panel_rounds.UNWRITTEN_PAYLOAD_EXIT
+    assert len(door.blockers) == 1, "the question survived the register that did not"
+    err = capsys.readouterr().err
+    assert "NOT recorded" in err, "and the caller is told the declaration was lost"

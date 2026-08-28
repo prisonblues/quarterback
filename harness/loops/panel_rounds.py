@@ -32,6 +32,9 @@ import math                                   # noqa: E402
 # is what lets :class:`CoverageRuling` default to an empty mapping without the
 # shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
 import hashlib                                # noqa: E402
+# #555: asked of the `needs_human` this box actually has, because a harness on PATH
+# can be older than this file and an unexpected keyword would cost the escalation.
+import inspect                                # noqa: E402
 from types import MappingProxyType            # noqa: E402
 from typing import NamedTuple                 # noqa: E402
 
@@ -3570,10 +3573,14 @@ def _by_severity(records: Iterable[dict]) -> str:
 
 
 def premise_report(verdict: dict, register_path: str, notes: list[str],
-                   problems: list[str]) -> str:
+                   problems: list[str], board: str = "") -> str:
     """The one screen a fixer sees when it declares a premise. Plain text, because
     the reader is an agent about to decide whether to write a patch and the decision
-    has to survive being read out of a Bash tool's stdout."""
+    has to survive being read out of a Bash tool's stdout.
+
+    ``board`` is what :func:`announce_escalation` did with it, appended verbatim
+    when there is anything to say. It is a phrase and not a verdict: the
+    escalation stands whether or not the board took the row."""
     out = [f"premise  {verdict['text']}",
            f"key      {verdict['key']}",
            f"cycle    {register_path}"]
@@ -3634,16 +3641,184 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
             "patch for the findings it explains, fix everything else in the pass, and "
             "report the premise, what it explains and what removing it would cost.",
         ]
-        if keys:
-            out += ["", "The next round must not count them as work a fix pass can "
-                        "clear:", f"    panel.py ... {keys}"]
+        # THE PARTITION, named as two halves (#555). The brief has told a fixer to
+        # "fix everything else" since 2026-08-18 and lexray#1697 still spent a whole
+        # pass on findings the premise explains — four of the five it fixed — so the
+        # sentence is evidently not the mechanism. This is: the halves are listed,
+        # the downstream one by key, and the fixer is told which list its next
+        # command belongs to. What it cannot do is compute the independent half —
+        # `declare` never sees the round's findings, only the keys this declaration
+        # named — so that half is described rather than enumerated, which is the
+        # honest shape and not an omission to be filled in with a guess.
+        if verdict["findings"]:
+            rounds = ", ".join(str(r) for r in verdict["rounds"])
+            out += ["", "DOWNSTREAM OF THE PREMISE — write no patch for these. Every "
+                        f"key declared against it, across round(s) {rounds}:"]
+            out += [f"    {k}" for k in verdict["findings"]]
+            out += ["", "INDEPENDENT — every outstanding finding of THIS round that is "
+                        "not listed above. Fix those, exactly as step 3 says: an "
+                        "escalation partitions the pass, it does not end it.",
+                    "", "The list above is cumulative, so it can name a key from an "
+                        "earlier round that is already fixed or no longer outstanding. "
+                        "That costs nothing — it forbids a patch nobody was going to "
+                        "write. What it must NOT be read as is this round's finding "
+                        "list: subtract it from your own, and anything left over is "
+                        "the independent half.",
+                    "", "The next round must not count the downstream half as work a "
+                        "fix pass can clear:", f"    panel.py ... {keys}"]
         else:
-            out += ["", "No --premise-for keys were given, so nothing here names the "
-                        "findings to escalate — pass them, or map the finding IDs "
-                        "yourself (panel-review-pr.md §4b) before the next round."]
+            out += ["", "NO PARTITION WAS DECLARED. --premise-for named no findings, so "
+                        "nothing here says which of this round's findings are "
+                        "downstream of the premise and which are independent — and "
+                        "the difference is what you are about to act on. Declare it "
+                        "(--premise-for <key> ...) or map the finding IDs yourself "
+                        "(panel-review-pr.md §4b) before you patch anything or run "
+                        "the next round."]
     else:
         out.append(verdict["reason"])
+    if board:
+        out += ["", f"board    {board}"]
     return "\n".join(out)
+
+
+def _door_takes_condition(door: object) -> bool:
+    """Does this box's ``needs_human`` know about #576's ``condition``?
+
+    Asked rather than assumed, and copied in shape from `qb-doctor`'s guard of the
+    same name because the hazard is identical. The harness on PATH goes stale —
+    that is what the `harness` row is FOR — while this file may be a fresh
+    checkout, so a signature mismatch between the two is the live case and not a
+    hypothesis. An unexpected keyword is a ``TypeError``, the caller's guard would
+    turn that into "NOT announced", and the escalation would be lost for the sake
+    of a field that only makes the row tidier. A stale door gets the call it
+    understands and yesterday's collapsing behaviour, which is strictly what it
+    would have done anyway.
+
+    A ``**kwargs`` door counts as taking it: that is what accepting a keyword means.
+    """
+    try:
+        params = inspect.signature(door.announce).parameters.values()
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return any(p.name == "condition" or p.kind is inspect.Parameter.VAR_KEYWORD
+               for p in params)
+
+
+def announce_escalation(verdict: dict, gh_repo: str, pr_number: int | None) -> str:
+    """An escalated premise becomes a question a human owes an answer to (#555).
+
+    ``gh_repo`` is the ``owner/name`` SLUG (``cfg["github"]``), never the repo's
+    local ``name``. They are different strings — ``cfg["name"]`` falls back to the
+    checkout's directory name — and only the slug is what a plan item stores in
+    ``repo``, so scoping the row by the other one would file every question under a
+    name no item carries and quietly undo the half of #555 that makes the plan
+    partition. `load_premises` reads the same field, two lines above the call.
+
+    **The escalation was already the best-defined blocker this fleet produces, and
+    it was the only one that went nowhere.** It names a premise in one sentence,
+    the findings it explains, the rounds it survived and what the brake was set at
+    — everything `plan_block`'s own docstring asks a caller for — and #328's table
+    measured **0 rows** two months after it was built, because the four things
+    that form this judgement all wrote it into prose. `qb-doctor` reaches
+    :func:`needs_human.announce` for a stalled queue; the panel, which produces
+    the sharper question, reached it for nothing.
+
+    So this is the join, and it is deliberately the SAME door (#274) rather than a
+    second one: `announce` posts the `stuck`, writes the `blockers` row, dedupes
+    on `key` and collapses re-raises on `condition`. Nothing new is invented here
+    except the mapping from a verdict to that call.
+
+    **`decision`, and not `other`.** A premise asks *which of these, or whether at
+    all* about the shape of a change — #279's own gloss on `decision`, and the
+    class the human surface is built to show. `other` is for a judgement none of
+    the six names, and this one is named.
+
+    **`condition` is the premise key, not the sentence.** #576 is exactly this
+    hazard: without it, two different premises escalated on one pull request
+    collapse into one row and the second is answered "already an open blocker".
+    :func:`premise_key` is stable across a rewording — that is what it is for, and
+    :func:`find_premise` maps restatements onto the same entry — so a premise
+    restated in round 3 re-raises the row it opened in round 2 instead of opening
+    a second one.
+
+    **That holds only where the door takes the field**, and the qualifier is not a
+    quibble: against a `needs_human` predating #576 the call goes without it (see
+    :func:`_door_takes_condition`) and two premises on one pull request DO collapse
+    into one row, exactly as they did before #576. That is the trade `qb-doctor`
+    and `qb-bump` already make — a stale harness loses the field, never the
+    escalation — but it means "two premises are two rows" is a statement about a
+    current board and a current harness, not an invariant of this function.
+
+    **Best-effort, and it never raises.** `declare`'s contract is that it is cheap
+    enough to run before every fix pass, and a fix pass must not fail because a
+    board is down. A failure comes back as a phrase for the report rather than an
+    exception, on `announce`'s own rule: an escalation that cannot be stored is
+    still an escalation. Only the escalating path reaches here at all, so the
+    ordinary declaration still costs no network.
+
+    Returns the phrase to print, or "" when there is nothing to say.
+    """
+    if not gh_repo:
+        # Without a repo the row has no scope, `_subject_from` has no ref to read
+        # and the question would arrive as "something, somewhere" — which is the
+        # noise `needs_human` refuses to store rather than the escalation it is.
+        return "needs-human NOT announced: no repo, so nothing scopes the question"
+    try:
+        import needs_human  # noqa: PLC0415 — resolved on the escalating path only
+    except Exception as exc:  # noqa: BLE001 — an escalation must survive its courier
+        return f"needs-human NOT announced: {type(exc).__name__} importing needs_human"
+    refs: list[dict] = [{"kind": "repo", "value": gh_repo}]
+    if pr_number:
+        refs.append({"kind": "pr", "value": str(pr_number), "repo": gh_repo})
+    where = f"#{pr_number}" if pr_number else gh_repo
+    detail = "\n".join([
+        f"premise: {verdict['text']}",
+        f"key:     {verdict['key']}",
+        f"rounds:  {', '.join(str(r) for r in verdict['rounds'])}"
+        f" (occurrence {verdict['occurrence']}"
+        + (f" of {verdict['limit']}" if verdict["limit"] is not None else "")
+        + ")",
+        f"decidable where the assertion runs: {verdict['decidable']}",
+        "",
+        verdict["reason"],
+        "",
+        ("findings the premise explains, which no fix pass may clear:\n"
+         + "\n".join(f"    {k}" for k in verdict["findings"])
+         if verdict["findings"] else
+         "no --premise-for keys were declared, so which findings this explains is "
+         "not recorded — that partition is the fixer's and it did not state one"),
+        "",
+        "What is being asked: whether the premise holds. If it does not, the "
+        "findings above describe something that should not exist, and the fix pass "
+        "they would have bought is spend against an open question. Nothing here "
+        "decides that — no patch was written for them and none will be until this "
+        "is answered.",
+    ])
+    try:
+        return needs_human.announce(
+            cls="decision",
+            reason=verdict["reason"],
+            summary=f"premise escalated on {where}: {verdict['text']}",
+            repo=gh_repo,
+            detail=detail,
+            refs=refs,
+            # The KEY is per-occurrence and the CONDITION is per-premise, which is
+            # the distinction #576 draws: a post is news (this premise escalated
+            # again, in a later round, explaining more findings) and a row is a
+            # standing state (this premise is unanswered). Without the round and
+            # the findings in the key, a premise that escalates again three rounds
+            # later says nothing for twelve hours.
+            key=needs_human.digest("panel-premise", gh_repo, pr_number or "",
+                                   verdict["key"], verdict["occurrence"],
+                                   *verdict["findings"]),
+            # A stale door loses the FIELD and never the escalation — `qb-doctor`
+            # and `qb-bump` both ask this before passing it, for the reason
+            # `_door_takes_condition` states.
+            **({"condition": f"premise:{verdict['key']}"}
+               if _door_takes_condition(needs_human) else {}))
+    except Exception as exc:  # noqa: BLE001 — the courier, not the news
+        return (f"needs-human NOT announced: {type(exc).__name__} from "
+                "needs_human.announce")
 
 
 def declare(repo_name: str | None, premise: str, register_path: str,
@@ -3652,10 +3827,15 @@ def declare(repo_name: str | None, premise: str, register_path: str,
             decidable: str = "unknown") -> int:
     """`panel.py --premise` — #84's futility brake, evaluated where a fix is PROPOSED.
 
-    No seats, no diff, no judge, no vendor call and no board record: it reads the
-    repo's dial, reads the cycle's register, counts the occurrences of this premise
-    and either records it and returns 0, or refuses the fix and returns
-    :data:`PREMISE_REPEATED_EXIT`.
+    No seats, no diff, no judge and no vendor call: it reads the repo's dial, reads
+    the cycle's register, counts the occurrences of this premise and either records
+    it and returns 0, or refuses the fix and returns :data:`PREMISE_REPEATED_EXIT`.
+
+    **One board write, and only on the refusal** (#555): a refusal IS the
+    escalation, and :func:`announce_escalation` is what stops it being a sentence
+    in a PR comment that nobody counts. The ordinary declaration — the one that
+    runs before every fix pass and returns 0 — still touches no network, which is
+    what keeps the paragraph below true.
 
     Cheap on purpose. `--ask` (#79) is the other half of the same argument and costs
     a vendor call per seat, so it is best-effort and skippable; this one must run
@@ -3691,13 +3871,29 @@ def declare(repo_name: str | None, premise: str, register_path: str,
                      "`escalate_on.premise_undecidable` is off — the fix is not "
                      "refused, and the answer is in the register for the round to "
                      "report")
+    # Announced BEFORE the register write is checked, and that ordering is the
+    # deliberate half: an unwritten register loses the occurrence, so the next
+    # declaration counts as the first and the brake does not fire again. That is
+    # precisely the run where the question most needs to be somewhere durable, and
+    # the board row is the only durable thing left.
+    #
+    # THE COST OF THAT CHOICE, said out loud rather than left to be discovered: on
+    # a failed write the two states disagree. The board holds an open question that
+    # parks the work, while the register has no occurrence — so a later declaration
+    # counts as the first, the brake does not fire, and a fix pass is written
+    # against a premise a human has not answered. The alternative disagreement is
+    # strictly worse: the question would exist nowhere at all, and the exit code
+    # already tells the caller the declaration was not recorded. Resolving it is a
+    # person answering or withdrawing the blocker, which is what the row is for.
+    board = (announce_escalation(verdict, cfg.get("github") or "", pr_number)
+             if verdict["escalate"] else "")
     write_failed = write_payload(register_path, reg)
     if json_out:
         print(json.dumps({**verdict, "register": register_path, "notes": notes,
-                          "problems": problems, "write_failed": write_failed},
-                         indent=2))
+                          "problems": problems, "write_failed": write_failed,
+                          "board": board}, indent=2))
     else:
-        print(premise_report(verdict, register_path, notes, problems))
+        print(premise_report(verdict, register_path, notes, problems, board))
     if write_failed:
         # The same rule `finish` applies to a round's payload, for a sharper reason:
         # an unwritten register loses the occurrence entirely, so the NEXT
@@ -4634,5 +4830,5 @@ __all__ = [
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
-    "premise_report", "declare",
+    "premise_report", "declare", "announce_escalation",
 ]

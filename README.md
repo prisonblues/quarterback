@@ -575,6 +575,22 @@ other), `placed`, or `ordered` (a human). `GET /plan` reports `order_trust`, and
 carries a `caveat` for the agent that reads only the headline instead of answering rank 1
 with confidence while the stated top priority sits at rank 20.
 
+**An open question holds the work behind it, and a question about a pull request counts
+(#328, #555).** An open `blockers` row against an item makes `next` pass it over and shows
+up as `waiting_on_a_human` — counted apart from `blocked`, because one waits on work
+finishing and the other on somebody answering. A row reaches an item two ways: by naming
+the plan row, or by naming the **issue or pull request** the item carries as its ref, which
+is the path that makes an escalation partition the plan rather than merely report itself.
+The second one had to be added: every producer the fleet has raises the forge kind — a loop
+reviewing a pull request knows a PR number and has never heard of a plan — so while only
+`item` matched, the rows being produced attached to nothing and `next` went on handing out
+the work behind them. `ix_plan_items_open_ref` is unique on `(COALESCE(repo, ''), ref_kind,
+ref_value)`, so at most one open item can carry a given ref and the mapping cannot be
+ambiguous; the repo is part of the comparison, because an item and a blocker that disagree
+about it are about two different issues numbered 42. A blocker naming a ref nobody planned
+still attaches to nothing and stays in the queue, which is correct — there is no plan row
+for it to hold up.
+
 ### A suggested order, and the ledger it writes to (#232)
 
 "Only a human reorders it" is a rule about who may **write** the sequence. It left the fleet
@@ -981,13 +997,19 @@ thirty days, while an escalation path was documented at length in three skill fi
 `harness/loops/needs_human.py` is the door: one `announce()` that posts a `stuck` post carrying the
 class, the reason and the artefact it is about, and **the only place** that knows the destination —
 so when a durable blocker row lands there is one function to repoint, not four call sites, and the
-fleet cannot end up with two homes for one judgement. All four producers go through it: `epic.py`'s
+fleet cannot end up with two homes for one judgement. All five producers go through it: `epic.py`'s
 blocked ruling (with a class the triage judge now names, and `environment` rather than `decision`
 for an issue the judge never managed to rule on), `preland`'s HOLD reasons that only a person can
 clear (a merge conflict, a repo with no CI, an unreadable board — never a mechanical `RECONCILE`,
-or the board becomes a CI log), a panel seat's flag, and `panel.py --escalated-from-board`, which
+or the board becomes a CI log), a panel seat's flag, `panel.py --escalated-from-board`, which
 reads the escalation list off `needs_human_keys` instead of asking a fixer to transcribe a hex key
-out of its own prose. An announcement costs a reason, an unrecognised class goes to `other` with
+out of its own prose, and — **#555** — `panel.py --premise` when #84's brake REFUSES a fix, which
+is the sharpest question the fleet asks and was the last one still going into a pull-request
+comment. It arrives as `decision` with the premise as the question and the findings it explains in
+the detail, keyed on the premise rather than the sentence so two premises on one PR are two rows
+and a restatement re-raises the first — on a board and a harness that both carry #576's `condition`;
+against an older door the field is dropped and they collapse, which is the trade every producer
+here makes rather than lose the escalation. An announcement costs a reason, an unrecognised class goes to `other` with
 the spelling named, and the same question is asked once every twelve hours rather than once per
 tick. `QUARTERBACK_NEEDS_HUMAN=off` switches it off; `QUARTERBACK_NEEDS_HUMAN_TO` (or
 `needs_human.to` in `.harness-rules`) addresses it, and there is deliberately no default addressee.

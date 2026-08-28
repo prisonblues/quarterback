@@ -821,10 +821,31 @@ brake, and the report names which:
   observable next round, so the cycle cannot converge on it whatever the counter
   says.
 
-Do not launch §4. Either way, the findings that premise explains become escalations
-under the `--escalated` rule below — relay them, open the premise issue, and stop
-the cycle. The command prints the `--escalated` keys for the round you are recording
-against.
+**Partition the round; do not simply drop it (#555).** Either way the findings that
+premise explains become escalations under the `--escalated` rule below — relay
+them, open the premise issue, and stop the cycle after this pass. The command
+prints the `--escalated` keys for the round you are recording against, under
+`DOWNSTREAM OF THE PREMISE`, and what you do with them is the whole of this rule:
+
+- **The downstream findings do not get a fix pass.** That is what the brake
+  refused, and it is refused whoever writes it — you may not hand them to a fixer
+  under a different description.
+- **The independent findings still do.** Launch §4 with **the escalated keys
+  withheld from the brief**, exactly as you would brief any fix pass, then stop
+  the cycle when it returns. An escalation partitions this pass; it does not
+  cancel it.
+- **Unless nothing is left.** If every outstanding finding is downstream of the
+  premise, there is no independent half and no pass to launch — relay, open the
+  issue, stop. That is a real outcome and not a failure to try.
+
+This used to read *"do not launch §4"* full stop, and that was the same defect
+#555 was filed about, one level up. The rule is that work downstream of an open
+question is speculative spend — it is not that everything alongside such a
+question is. On lexray#1697 the fixer made the opposite error, spending a whole
+pass on findings the premise had already voided; a blanket stop here makes the
+mirror-image one, dropping the findings the premise says nothing about. The
+partition is what both halves of #555 are for, and this is the reader that has
+it: the command prints the two halves, and you are the one holding the brief.
 
 **Why it is here and not at the end of a round.** The cap bounds cost; this bounds
 futility — it stops when the rounds have stopped being about *different things*. On

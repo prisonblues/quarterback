@@ -1189,29 +1189,66 @@ async def _view_items(session: AsyncSession, items: list[PlanItem], now: datetim
 
 async def _human_blockers_for(session: AsyncSession,
                               items: list[PlanItem]) -> dict[str, list[Blocker]]:
-    """Open blockers keyed by the plan item they are about (#328).
+    """Open blockers keyed by the plan item they are about (#328, #555).
 
     A SECOND source feeding ``blocked_by``; the item-to-item edges are unchanged
     and this does not touch them. The two kinds are reported apart because the
     REMEDY is different — one waits on work, the other waits on a person — which
     is the argument `_next_caveat` already makes about the kinds it can see.
 
-    Matched on ``subject_value`` against the item's id. A blocker may also name an
-    issue or a PR that no plan item points at, and that is the case
-    ``depends_on`` structurally cannot express — those live in the queue and are
-    simply not attached to a row here.
+    **Two ways a blocker reaches an item, and the second one is #555.** An
+    ``item`` blocker names the plan row directly. An ``issue`` or ``pr`` blocker
+    names the *forge* — and an item that carries that ref is the same work, so it
+    is attached here too.
+
+    That second path is what makes an escalation partition the plan rather than
+    merely report itself. Every producer the fleet has raises the forge kind:
+    :func:`harness.loops.needs_human._subject_from` prefers ``pr`` then ``issue``
+    and documents ``item`` as the kind "nothing emits today", because a loop
+    reviewing a pull request knows the PR number and has never heard of a plan.
+    So while this matched ``item`` alone, the rows the fleet actually produces
+    attached to nothing, ``next`` kept handing the work out, and the queue #328
+    built was invisible to the one reader that decides what happens next. #520
+    measured the table at 0 rows; the rows that arrived afterwards had nowhere to
+    land.
+
+    **Exactly one open item can carry a given ref**, so the mapping cannot be
+    ambiguous: ``ix_plan_items_open_ref`` is UNIQUE on
+    ``(COALESCE(repo, ''), ref_kind, ref_value)`` where the item is open and the
+    ref is present. The scope comparison here is that index's key, spelled the
+    same way — an item and a blocker that disagree about the repo are about two
+    different issues numbered 42, and `app.claimkey` already treats the repo as
+    part of what a bare number means.
+
+    A blocker naming an issue or PR that no open item points at still attaches to
+    nothing, and that is unchanged and correct: it is a real question in the
+    queue, and there is no plan row for it to hold up.
     """
-    open_ids = [str(i.id) for i in items if i.state == "open"]
-    if not open_ids:
+    open_items = [i for i in items if i.state == "open"]
+    if not open_items:
         return {}
+    open_ids = [str(i.id) for i in open_items]
+    # (repo, kind, value) -> item id, in `ix_plan_items_open_ref`'s spelling.
+    by_ref: dict[tuple[str, str, str], str] = {
+        (i.repo or "", i.ref_kind, i.ref_value): str(i.id)
+        for i in open_items if i.ref_kind and i.ref_value
+    }
+    reaches = [(Blocker.subject_kind == "item") & Blocker.subject_value.in_(open_ids)]
+    if by_ref:
+        # COALESCE on the blocker side as well: `repo` is nullable on both tables
+        # and NULL never equals NULL, so a fleet-scope blocker on a fleet-scope
+        # item would drop out of an ordinary comparison.
+        reaches.append(tuple_(func.coalesce(Blocker.repo, ""), Blocker.subject_kind,
+                              Blocker.subject_value).in_(list(by_ref)))
     rows = (await session.execute(
-        select(Blocker).where(Blocker.subject_kind == "item",
-                              Blocker.subject_value.in_(open_ids),
-                              Blocker.resolved_at.is_(None))
+        select(Blocker).where(or_(*reaches), Blocker.resolved_at.is_(None))
         .order_by(Blocker.raised_at))).scalars().all()
     out: dict[str, list[Blocker]] = {}
     for b in rows:
-        out.setdefault(b.subject_value, []).append(b)
+        item_id = (b.subject_value if b.subject_kind == "item"
+                   else by_ref.get((b.repo or "", b.subject_kind, b.subject_value)))
+        if item_id is not None:
+            out.setdefault(item_id, []).append(b)
     return out
 
 
