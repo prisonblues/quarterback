@@ -519,23 +519,59 @@ ones sit in the denominator, so it is depressed toward zero however badly the fi
 pass behaved. On the cycle #500 was filed from, that happened on round 3 of a
 three-round cycle that ended on the cap — the exact shape the gate exists to stop.
 
-The round now says so where the verdict is read: a **veto line, and `confident`
-false**, the same treatment a reviewer that could not read the whole diff gets.
-That is honesty, not repair — the instruments are still off.
+The round says so where the verdict is read: a **veto line, and `confident` false**,
+the same treatment a reviewer that could not read the whole diff gets.
+
+**And then it tries to repair it (#504).** The range is wrong, not the history: the
+fix pass's commits are still on the branch under new SHAs, and `git patch-id` names
+them by what they CHANGED rather than by where they sit. So a rewritten round rebuilds
+the pass out of the local object store, `payload.fix_range_source` reads
+`reconstructed`, provenance, recurrence and `escalate_on.fix_injection` come back, and
+the veto does not fire. Read `config_notes`: the round states what it rebuilt and what
+it cost.
+
+**Three things that stop it, and each of them leaves the round exactly as blind as it
+was** — the veto fires and nothing is attributed, with `fix_range_rebuilt.why` naming
+which it was:
+
+- **No local checkout.** `patch-id` is git rather than the compare API, so a repo with
+  no `path` in its rules cannot rebuild anything — and neither can a box that never
+  held the pre-rebase head, since a rewrite only orphans commits where somebody still
+  has them.
+- **No correspondence.** A squash or a re-created branch leaves none of the last
+  round's commits recognisable, and then every commit on the branch would read as the
+  fix pass. That refuses rather than leans.
+- **A branch reset BACKWARDS.** The pass was removed, not rewritten. The round says so
+  in those words, because a force-push that dropped work must not read as a quiet
+  cycle.
+
+And where it does work it **leans, by a stated amount** — two of them, both pushing
+`introduced` up. A rebase that resolved a conflict changed that commit's content, so
+it matches nothing and joins the pass the round is attributing;
+`fix_range_rebuilt.unmatched` is the bound. And where the pass is not the tip of the
+branch (`shape: "commits"` rather than `"range"`), it is read as its commits' own
+patches rather than as one net diff, so a line the pass added and then removed is
+still in the set. The round's notes state whichever applied. `--scope increment` is not repaired either way — scope is settled before the seats
+run — and neither is #506's proposal below, which reads the compare range.
 
 So:
 
 - **Prefer merging the base branch into the PR** over rebasing it. That leaves the
-  old head an ancestor (`status: ahead`), so the range still reads. It is not free —
-  the base branch's own commits then fall inside the range and their lines are
-  attributed to the fix pass, so `introduced` over-counts — but an over-counting
-  instrument is worth more than a dark one, and it fails toward stopping the cycle
-  rather than toward letting it run.
+  old head an ancestor (`status: ahead`), so the range still reads without a rebuild.
+  It is not free — the base branch's own commits then fall inside the range and their
+  lines are attributed to the fix pass, so `introduced` over-counts — but an
+  over-counting instrument is worth more than a dark one, and it fails toward stopping
+  the cycle rather than toward letting it run.
 - **If you must rewrite, do it between CYCLES rather than between rounds** — after a
-  stop, before the next `--round 1`.
-- **If you already have, do not read that round's quiet as convergence.** The veto
-  says as much. Re-running the round with `--scope pr` gets the review back but not
-  the attribution; only a round whose baseline anchor is reachable can attribute.
+  stop, before the next `--round 1`. The rebuild is a repair, not a licence: it costs
+  an accuracy you did not have to spend.
+- **Rewrite in the checkout the panel reads.** A rebase done somewhere the panel will
+  never see — another box, a worktree that is then thrown away — is the one that
+  cannot be rebuilt, and it looks identical to the one that can until the round runs.
+- **If you already have, and `fix_range_source` is not `reconstructed`, do not read
+  that round's quiet as convergence.** The veto says as much. Re-running the round
+  with `--scope pr` gets the review back but not the attribution; only a round whose
+  fix pass can be reached — by range or by patch — can attribute.
 
 One instrument this does *not* disarm, worth knowing so you do not over-correct:
 #84's premise register is keyed on declared text rather than on commits, so it
@@ -621,10 +657,13 @@ numbers still argue for is one they cannot have talked you into.
 
 **On a rebased branch there is no proposal, and the round says so rather than going
 quiet.** `revert.kind` carries the fix range's own verdict — `ok`, `no-fix`, `blind`,
-`not-asked` — and `blind` is the case the subsection above is about: the range that
-would name the offending pass is the range a rewrite removes, so the cycle can
-measure a change it cannot point at. `offered: false` with `kind: "blind"` means "we
-cannot see this", not "there was nothing wrong".
+`rewritten`, `not-asked` — and the last two are the case the subsection above is
+about: the range that would name the offending pass is the range a rewrite removes, so
+the cycle can measure a change it cannot point at. `offered: false` with a `kind` of
+`blind` or `rewritten` means "we cannot see this", not "there was nothing wrong". This
+is the one thing #504 does **not** give back: a round can be attributing from a
+rebuilt pass and still be unable to offer a revert, because the proposal reads the
+compare range rather than the reconstruction.
 
 Two things this deliberately does **not** do, so you are not waiting for them:
 revert-and-re-run as an automatic mode, and re-running the fixer with a narrower

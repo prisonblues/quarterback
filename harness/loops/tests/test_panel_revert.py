@@ -598,7 +598,7 @@ def test_the_proposal_rides_in_the_payload_whether_it_was_offered_or_not():
 
 CFG = {
     "github": "acme/e2e",
-    "path": "/tmp/acme-e2e",
+    "path": "/nonexistent/acme-e2e",
     "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     # Whole-PR scope on purpose: under the default `increment` a round 2 re-reads only

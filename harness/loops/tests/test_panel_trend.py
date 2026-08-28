@@ -340,7 +340,7 @@ COMPARE = json.dumps({"status": "ahead", "files": [
     {"filename": "app/f0.py",
      "patch": "@@ -9,2 +9,4 @@\n context\n+introduced one\n+introduced two\n"}]})
 
-CFG = {"github": "acme/e2e", "path": "/tmp/acme-e2e",
+CFG = {"github": "acme/e2e", "path": "/nonexistent/acme-e2e",
        "_rules_baseline": ".harness-rules.sample",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
        # The pre-flight refusal and the manifest substitution have their own

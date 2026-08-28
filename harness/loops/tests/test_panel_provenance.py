@@ -657,7 +657,12 @@ FIX_COMPARE = _compare()
 
 CFG = {
     "github": "acme/e2e",
-    "path": "/tmp/acme-e2e",
+    # A path that CANNOT exist, not merely one that does not. #504 reconstructs a
+    # rewritten fix range out of the local object store at `path`, so a round in this
+    # file now runs local git against whatever is there — and `/tmp/acme-e2e` is a
+    # name somebody could plausibly create, which would make these rounds behave
+    # differently on one developer's box than on CI.
+    "path": "/nonexistent/acme-e2e",
     "_rules_baseline": ".harness-rules.sample",
     "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
     "review_panel": {},
