@@ -64,7 +64,13 @@ def door(monkeypatch, tmp_path):
     def fake_board_json(path, body):
         if path == "/blockers":
             blockers.append(body)
-            return {"blocker": {"id": f"b{len(blockers)}"}, "raised": True}, ""
+            # The condition comes back, because the real board returns it — that
+            # is what lets a producer see an old board silently dropping it
+            # (#576). A double that swallowed it would make every test below
+            # exercise the "this board has not been upgraded" path.
+            return ({"blocker": {"id": f"b{len(blockers)}",
+                                 "condition": body.get("condition", "")},
+                     "raised": True}, "")
         posted.append(body)
         return {"id": 100 + len(posted)}, ""
 
@@ -920,3 +926,79 @@ def test_the_note_distinguishes_a_new_row_from_an_existing_one(door, monkeypatch
     note = nh.announce(cls="ui", reason="r", summary="s", repo="acme/one",
                        refs=[{"kind": "pr", "value": "2", "repo": "acme/one"}])
     assert "already an open blocker" in note
+
+
+# ------------------------------------------------------- #576: one row per QUESTION
+
+
+def test_the_machine_is_spelled_one_way(monkeypatch):
+    """Short, lowercased, trimmed — because a `condition` outlives every cache a
+    hostname used to be compared against. `qb-bump` truncated at the first dot and
+    `qb-doctor` did not, which is one box under two names across the two halves of
+    one escalation."""
+    monkeypatch.setattr(nh.socket, "gethostname", lambda: "  ZEUS.fo.ls ")
+    assert nh.machine_id() == "zeus"
+
+
+def test_a_condition_drops_empty_parts_rather_than_leaving_a_dangling_join():
+    """A host-scoped fault on a box whose name could not be read must degrade to
+    the bare fault, not to `harness@` — which would be a third spelling of one
+    question."""
+    assert nh.condition_for("harness", "zeus") == "harness@zeus"
+    assert nh.condition_for("harness", "") == "harness"
+    assert nh.condition_for(" Unpushed ") == "unpushed"
+
+
+def test_a_condition_is_bounded_the_way_the_board_bounds_it():
+    """Overshooting `MAX_CONDITION` is a 422, and a 422 here refuses an
+    escalation. The door trims instead."""
+    assert len(nh.condition_for("x" * 400)) == nh.MAX_CONDITION
+
+
+def test_the_condition_reaches_the_row(door):
+    """#576: without it every `environment` escalation about one repo was one row,
+    and the second and third questions were answered "already an open blocker"."""
+    nh.announce(cls="environment", reason="r", summary="25 commits on no remote",
+                repo="acme/one", condition="unpushed",
+                refs=[{"kind": "repo", "value": "acme/one"}])
+    (row,) = door.blockers
+    assert row["condition"] == "unpushed"
+
+
+def test_no_condition_is_the_empty_string_and_not_a_null(door):
+    """NULLs are distinct in a unique index, so a null here would switch the
+    deduplication off for every producer that passes nothing — which is most of
+    them. The column is NOT NULL and this is what feeds it."""
+    nh.announce(cls="decision", reason="r", summary="s", repo="acme/one",
+                refs=[{"kind": "pr", "value": "1", "repo": "acme/one"}])
+    (row,) = door.blockers
+    assert row["condition"] == ""
+
+
+def test_two_conditions_on_one_subject_are_two_rows(door):
+    """The whole of #576, at this layer: same repo, same class, two faults. The
+    door must send two distinguishable bodies and leave the board to enforce it."""
+    for cond, said in (("landed", "4 PRs ready"), ("unpushed", "25 commits")):
+        nh.announce(cls="environment", reason="r", summary=said, repo="acme/one",
+                    condition=cond, refs=[{"kind": "repo", "value": "acme/one"}])
+    assert [b["condition"] for b in door.blockers] == ["landed", "unpushed"]
+    assert len({(b["subject_kind"], b["subject_value"], b["kind"])
+                for b in door.blockers}) == 1, \
+        "the subject and the class are identical — the condition is the only difference"
+
+
+def test_a_board_that_drops_the_condition_says_so_on_the_line(door, monkeypatch):
+    """A board predating #576 ignores an unknown field and stores the row under the
+    old, coarser key. Silent degradation is the failure #576 is filed about, so the
+    producer is told on the line it is already printing rather than left to find out
+    by counting rows."""
+    def old_board(path, body):
+        if path == "/blockers":
+            return {"blocker": {"id": "b1"}, "raised": True}, ""
+        door.append(body)
+        return {"id": 1}, ""
+    monkeypatch.setattr(nh, "_board_json", old_board)
+    note = nh.announce(cls="environment", reason="r", summary="s", repo="acme/one",
+                       condition="harness@zeus",
+                       refs=[{"kind": "repo", "value": "acme/one"}])
+    assert "did not keep the condition" in note and "#576" in note

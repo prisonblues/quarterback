@@ -42,6 +42,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -217,6 +218,49 @@ def digest(*parts: object) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
 
+#: The longest `condition` the board will take (`app.models.blocker.MAX_CONDITION`).
+#: Restated for the same reason the vocabulary is: the harness is a separate
+#: distribution and cannot import the app. Overshooting it is a 422 that refuses
+#: an escalation, so the door trims rather than lets one be refused.
+MAX_CONDITION = 120
+
+
+def machine_id() -> str:
+    """This box's name, spelled ONE way for everything that keys on it.
+
+    `qb-doctor` folded `socket.gethostname()` into its dedupe key and `qb-bump`
+    folded `socket.gethostname().split(".", 1)[0]` into a summary, which is two
+    spellings of one machine — and a `condition` is durable in a way a cache key
+    is not. Two spellings there means one host's standing fault arriving as two
+    rows the day something starts returning the FQDN, or, in the direction that
+    actually loses news, two hosts collapsing into one row when they do not.
+
+    That is the shape Codex caught in #569: a box that could not recognise its own
+    name suppressed itself against its own escalation. Short, lowercased, trimmed
+    — the form both producers already meant.
+
+    `gethostname` and not the board's name for this box, for the reason
+    `_host_part` gives: a key must be the same string on every tick, and the
+    board's answer depends on the board being reachable.
+    """
+    return socket.gethostname().strip().split(".", 1)[0].lower()
+
+
+def condition_for(*parts: object) -> str:
+    """A `condition` assembled from parts, canonically — ``"harness@zeus"``.
+
+    Empty parts are dropped rather than left as empty segments, so a host-scoped
+    row on a box whose name could not be read degrades to the bare fault instead
+    of to ``"harness@"``, which would be a third spelling of the same question.
+
+    Lowercased and trimmed here as well as at the board, so the string a producer
+    logs is the string that was stored. The board normalises because it must not
+    trust a client; this normalises so the two never have to be compared.
+    """
+    kept = [str(p).strip().lower() for p in parts if str(p).strip()]
+    return "@".join(kept)[:MAX_CONDITION]
+
+
 def headline(*, cls: str, repo: str, summary: str) -> str:
     """The board summary :func:`announce` writes, composed in ONE place — #569.
 
@@ -361,7 +405,7 @@ def _subject_from(refs: list[dict] | None) -> tuple[str, str, str] | None:
 
 
 def _raise_blocker(*, cls: str, question: str, detail: str, repo: str,
-                   refs: list[dict] | None) -> str:
+                   refs: list[dict] | None, condition: str = "") -> str:
     """Record the question as a row as well as announcing it (#328, #523).
 
     **The post announces; the row persists.** #274 built the door every producer
@@ -377,8 +421,17 @@ def _raise_blocker(*, cls: str, question: str, detail: str, repo: str,
     line an operator is already reading rather than in a log nobody opens.
 
     Re-raising an identical open question is a no-op at the board — the partial
-    unique index on (subject, class) is what makes this safe to call every run
-    without the caller checking first.
+    unique index on (subject, class, condition) is what makes this safe to call
+    every run without the caller checking first.
+
+    `condition` is #576 and it is the difference between *the same question* and
+    *the same subject*. Without it every `environment` escalation about one repo
+    was one row, so `qb-doctor`'s `landed`, `harness` and `unpushed` collapsed and
+    the two that lost were answered "already an open blocker" and dropped. It
+    names the FAULT and never the reading — see the row's own docstring, and note
+    that it is deliberately coarser than `key` above: a post is news and a row is
+    a standing state, so the thing that makes a second POST worth sending (four
+    pull requests where there were three) must not make a second ROW.
     """
     subject = _subject_from(refs)
     if subject is None:
@@ -386,18 +439,31 @@ def _raise_blocker(*, cls: str, question: str, detail: str, repo: str,
     kind, value, ref_repo = subject
     body = {"subject_kind": kind, "subject_value": value, "kind": cls,
             "question": question[:500], "detail": detail or None,
-            "repo": ref_repo or repo or None}
+            "repo": ref_repo or repo or None,
+            "condition": condition[:MAX_CONDITION]}
     answer, why = _board_json("/blockers", body)
     if why:
         return f", not recorded as a blocker ({why})"
     raised = isinstance(answer, dict) and answer.get("raised")
+    if condition and isinstance(answer, dict):
+        # A board predating #576 ignores an unknown field and stores the row
+        # under the old, coarser key — so it comes back without the condition we
+        # sent, and every escalation this producer raises about this subject will
+        # continue to collapse into one. Said on the line the operator is already
+        # reading rather than left to be discovered by counting rows, which is
+        # the failure mode #576 is filed about.
+        stored = (answer.get("blocker") or {}).get("condition")
+        if stored != condition[:MAX_CONDITION]:
+            return (", recorded as a blocker but this board did not keep the "
+                    "condition, so rows for this subject will still collapse "
+                    "(#576 has not been deployed here)")
     return ", recorded as a blocker" if raised else ", already an open blocker"
 
 
 def announce(*, cls: str, reason: str, summary: str, repo: str = "",
              detail: str = "", refs: list[dict] | None = None,
              key: str = "", cfg: dict | None = None,
-             session: str | None = None) -> str:
+             session: str | None = None, condition: str = "") -> str:
     """Tell the board a human has to answer something. Returns a line to print.
 
     This is the single destination for every escalation the harness raises. It
@@ -426,6 +492,16 @@ def announce(*, cls: str, reason: str, summary: str, repo: str = "",
             commit — :func:`digest` is what the producers fold that into.
         cfg: the resolved repo config, read only for its addressee.
         session: the session id to file the post under.
+        condition: WHICH standing question this is, when one producer raises
+            several about one subject in one class (#576). Empty — the default —
+            means the subject and the class are the whole question, which is
+            right for a producer that already keys on a real PR or issue.
+            Deliberately COARSER than `key`: `key` decides whether to ring the
+            bell again and carries the reading, this decides whether a second row
+            exists and must carry only the fault. :func:`condition_for` builds
+            one. **New keyword, and a producer that may run against an installed
+            harness older than #576 must check for it before passing it** — the
+            two are separate distributions and this signature is not versioned.
 
     Returns:
         A one-line note for the caller to print, or ``""`` when there is nothing
@@ -473,7 +549,7 @@ def announce(*, cls: str, reason: str, summary: str, repo: str = "",
     # person sees now and the row is what they can find later, so a board that
     # accepts one and refuses the other should still have rung the doorbell.
     stored = _raise_blocker(cls=known, question=summary, detail=detail,
-                            repo=repo, refs=refs)
+                            repo=repo, refs=refs, condition=condition)
     addressed = f" to {to}" if to else ""
     return (f"needs-human announced on the board{addressed} as post "
             f"{post_id} ({known}){stored}")
