@@ -17,6 +17,1063 @@ no other branch will ever open. `changelog.d/README.md` is the whole contract, i
 This preamble is not output and is edited when the convention changes, which is why the guard
 starts at the first release heading below it.
 
+## v3.23 — a review round can end on a decision, and the board stops handing chores to a person
+
+### when CI has nothing to say, the repo's own suite says it
+
+A panel round asks whether anything mechanical has checked this code, and until now
+the only place it could look was GitHub. #501 taught it to wait for a build that was
+still running and #546 made a round with no settled result unable to stop
+confidently — but `none` is the state neither of those can help. There is nothing to
+wait for and nothing to read, so on a repo with no CI, or a stacked PR whose branch
+filter never fired, every seat was told "no run exists for this commit" about a repo
+with a perfectly good suite sitting in it, and spent a `could_not_assess` saying it
+could not run anything.
+
+A repo may now name its own suite, and the panel runs it once — before the seats are
+dispatched, so one execution is shared by all of them — and sends the answer down the
+same channel `ci_brief` already owns:
+
+```json
+"review_panel": {
+  "local_suite": ["make test", "make test-db"],
+  "local_suite_timeout": 900
+}
+```
+
+Off for every repo that does not write it. This is the one setting in the rules file
+that names something to **execute**, and it is fenced accordingly. It is opt-in. It is
+not a board dial — a dial for a command line would run code on every box in the fleet
+with one POST. It is read from `origin/<default branch>` in **both** modes, unlike
+every other key in the file, because a round usually runs from a worktree checked out
+at the PR's own head: the working tree's rules file is the pull request's there, and a
+command read from it would be one the PR chose, executed by the thing reviewing it.
+And it runs only where the checkout is **already sitting on the PR's head** with
+nothing uncommitted or unignored in it — checked again after the run, so a pass whose
+tree moved underneath it becomes `local-unknown` rather than a pass. Where any of that
+fails, the round says so in its notes and keeps today's behaviour.
+
+#### It is evidence, not a fifth reviewer
+
+Sonar is a panel member because it produces findings. A test run produces evidence,
+and evidence raises the floor under every seat at once instead of adding a voice with
+a coverage row that answers a different question. It is also not "give the seats a
+shell": three vendor CLIs each holding a live database is expensive, nondeterministic
+and costs the seats the independence that is the only reason to seat four of them.
+
+#### It can never be mistaken for CI
+
+Three states of its own — `local-pass`, `local-fail`, `local-unknown` — each opening
+by saying that no GitHub run exists for this commit, in the reviewer prompt, the
+human line and the round's report. A local pass refutes the same class of finding a
+green CI run does ("this new test never runs", "this may not even import"), carries
+the same warning that it is not evidence the code is correct, and carries one more:
+it is **weaker** than a green CI run, being a different machine, possibly different
+service versions, and no guarantee this is the commit that will merge.
+
+So `local-pass` earns a round its confident stop and buys no merge: `preland.check_ci`
+reads GitHub and has never heard of it. `local-fail` sits beside CI's `FAIL` and does
+not veto, on the ground that a suite which ran and reported is evidence whatever it
+reported. A run that does not finish inside `local_suite_timeout` is reported as not
+having finished, and vetoes; it never becomes a pass, and it never quietly becomes a
+failure either.
+
+`blocked` is **not** one of the states a local run may answer for, though the issue
+proposed it. #324 named that state because it is actionable — a run exists and a person
+must click — and replacing it with `local-pass` would overwrite the field every
+downstream consumer reads with a value that says nothing about the click, while handing
+the round the confident stop that is the only thing still making anybody look.
+
+#### What it does not answer
+
+A subset. On the PR that prompted this the open questions were a jsonb size ceiling,
+whether a reader delivers a field to a browser, and whether stored rows are now a
+mixed corpus — a test database holds no corpus, so a local `make test` would have
+answered none of the three. This is the structural fix for a class of wasted
+`could_not_assess`, not a fix for that round.
+
+A failing command's **output** stays out of the reviewer prompts, and out of the PR:
+only its name and exit code travel. That text is produced by code from the PR under
+review, and the prompt it would otherwise land in belongs to everything judging it —
+while the round's config notes are published as a public comment by `--post`, and a
+failing test prints whatever it was holding. It goes to the operator's terminal and
+the run's payload instead. The run itself is spooled to a temporary file rather than
+a pipe, gets its own process group, and has that group killed when the budget runs
+out — so the timeout bounds this process rather than politely asking a suite that
+started a database to stop.
+
+### the panel stops pricing a fix by cost alone and asks whether anything can check it
+
+Every dial the reviewer panel owned measured **cost**. Lines
+(`low_severity_fix_lines`), chars and multiples (`max_fix_growth`,
+`max_fix_growth_chars`), rounds (`max_rounds`), claimed importance (the two severity
+floors). `escalate_on.fix_injection` is the one that touches the real quantity, and it
+can only do so retrospectively — the findings have to exist before the rate can be
+computed. Nothing priced work by whether any mechanism in the loop could catch it
+being wrong.
+
+Measured on lexray#1697 round 1, since reverted. A fix pass churned **93 lines across
+three files and changed no production logic at all** — the production file's entire
+share of it was a docstring and a comment — and introduced **ten findings, nine of
+them in the test files it wrote and the tenth in that docstring**.
+
+Red/green ran and went red 4 of 4. It could not have caught any of the ten, and that
+is structural rather than unlucky:
+
+> A production fix has an external referee — red/green either detects the bug or it
+> does not, with the suite and CI behind it. **A test fix has none, because nothing
+> tests a test.** A docstring fix has none either.
+
+Red/green asks whether a new test detects the thing it was written for. It never asks
+whether that test also opens a socket, whether its assertion is sufficient, or whether
+it is as strong as the test beside it. Necessary, nowhere near sufficient.
+
+#### The budget's unit is now exposure, not length
+
+`review_panel.unrefereed_line_weight` (**2**) is what one churned line of test or prose
+costs the low-severity budget, against a line of production code at 1. The fixer's
+brief has the arithmetic: `cost = production_lines + weight x unrefereed_lines`, spent
+cheapest-first as before.
+
+On the measured round the 40-line budget worked exactly as specified — 31 of 40 lines,
+one 17-line fix measured against 9 remaining and dropped — and it priced a 10-line
+comment correction as equal risk to an 11-line new assertion, because lines are all it
+could see. Four of the five budgeted fixes were "write more test".
+
+**This is not value-weighting**, which the budget refuses deliberately: that hands
+judgement back to the actor whose judgement the 63.7% injection measurement indicts.
+Being refereed is a property of the path and the line, read off the fix's own diff —
+the one the fixer already produces to measure the fix at all. The fixer is asked for a
+multiplication, not a forecast. (Not `git diff --numstat`: that reports per-file
+totals and cannot see a comment, a blank or a docstring. Paths are free from numstat;
+the line half needs the diff body.)
+
+The band it applies to is narrow, and that is what makes the weight safe: the budget
+pays only for findings above the fix floor and below the round trigger floor. A P1/P2
+fix and its test are not on it at all.
+
+#### A fifth rung: a fix pass nothing can check ends the cycle
+
+`review_panel.escalate_on.unrefereed_fix` (**true**) stops a cycle when the pass that
+landed between the last round and this one churned four or more lines and **not one of
+them was production code**. The round it removes is a round that would have reviewed
+artefacts no mechanism refereed.
+
+It is a **flag and not a fraction**, and that is what makes it shippable as a gate on
+one cycle's evidence. The house rule is that an instrument earns a threshold over a
+few dozen cycles or not at all — which is why the guard-to-guarded ratio still ships
+report-only. There is no threshold here to earn: the rule is a predicate, and a
+predicate has nothing to calibrate. A fraction would also be *wrong*, because the
+commonest healthy pass there is — a five-line production fix carrying a forty-line
+regression test — is 89% unrefereed and is exactly the work the panel wants.
+
+**What the predicate rests on**, since "zero production lines" is not ground truth but
+the classifier's output: the case for gating is not that the reader cannot be wrong,
+it is that **every way it can be wrong leans the same way** — toward counting a line
+as production, so the brake declines to fire on a pass it misread. That property is
+asserted by the classifier's docstring and tested directly, and a violation of it is a
+bug of that class rather than a reason to put a number in front of the rule.
+
+What it buys over `fix_injection`, which accuses the same pass: that rung needs four
+new findings **and** a rate over the threshold **and** a readable range, so a pass that
+wrote only tests and drew three findings sails past it. This one fires on the shape of
+the pass rather than on its consequences.
+
+It takes the same two bounds as the rungs beside it — it can only turn a `go again`
+into a stop, and only the round rule 1 was buying — so it can never cancel the repair
+round for a blocker an earlier round raised, and never make a review read cleaner than
+it is. It is never dressed up as convergence: a veto line, `confident` false, and a
+reason that says a human answers this. The constructive pass follows it like the other
+rungs, so where that is armed each seat has already been asked for the smallest change
+that satisfies its findings.
+
+**The honest case against it**, recorded rather than argued away: a round whose only
+finding is "this branch has no test" gets a fix pass that is legitimately all test, and
+this ends the cycle on it. Three things make that acceptable, and none of them is that
+it will not happen. The round it removes is a round that would have reviewed those
+tests. The rule can only stop a cycle, so the worst case is one fewer round with a veto
+line saying exactly why. And `escalate_on.unrefereed_fix: false` switches it off in one
+line.
+
+#### Classifying a line, and the one approximation in it
+
+`panel_seats.referee_split` splits a fix range's churn into `production` / `test` /
+`prose`. It reuses the path classifier the guard-to-guarded ratio already had — two
+path classifiers are two things that can disagree about one file — and adds the **line**
+half on top, which is what makes the measurement mean what it says: the measured pass
+touched a production file, so a path-only reading calls it partly refereed and the rung
+never fires.
+
+A line is unrefereed when it is in a test path, in a documentation path, or is a
+comment, docstring or blank line anywhere. Docstring fences are tracked per hunk, per
+diff side and per quote style, and closed only on an *unescaped* delimiter — a unified
+diff is two files interleaved, a docstring may quote the other style or its own, and a
+real closing fence carrying a trailing comment must not be read as an opener. Each of
+those was a way to end a docstring early and turn every production line left in the
+hunk into prose, which is the direction that fires the brake.
+
+`*` is not treated as a comment marker in any form. A bare `*` ate `*dst = value;`
+— a pointer store in C, Go and Rust — and narrowing it to `* ` only moved the
+collision to `* dst = value;` and `* generator() {`. No prefix can answer that
+question, because it is not what the line starts with but whether it sits inside a
+`/* … */`, so block comments are tracked as state and the star is not guessed about.
+The same applies one level up: a triple-quote at the head of a line opens a docstring
+or a multiline value, and only the line *before* it tells them apart — a docstring
+follows a suite header ending in a colon, a value follows a call or an assignment.
+
+A hunk that *begins* inside a long docstring, whose context lines carry no fence, is
+read as beginning outside one and counts as production. That is the safe direction and
+the only one this rule may lean in: it makes a pass look more refereed than it was, so
+the brake declines to fire on a pass it misread rather than firing on one it did.
+
+Both signals ride in every round's payload — `round_stop.unrefereed_fix`, with `armed`
+apart from the counts and `over` apart from `fired` — and print on the report as
+**Refereed-ness of the last fix pass**, whether they fired or not.
+
+### an escalated premise stops the work that depends on it
+
+An escalation is the best-defined question this fleet produces. It names a premise
+in one sentence, the findings it explains, the rounds it survived and what the
+brake was set at — everything `plan_block` asks a caller for. It was also the only
+one that went nowhere: it was written into a pull-request comment, and #520
+measured #328's `blockers` table at **0 rows** two months after it was built.
+
+So two things did not happen that everyone assumed did. The question was never
+counted, and the work behind it was never held.
+
+#### The fix pass spent its whole budget on findings the premise had already voided
+
+`/review-pr` has told a fixer to fix "every finding not downstream of the premise"
+since 2026-08-18. On lexray#1697 round 1 the fixer read that sentence, fixed five
+findings, and **four of them were about the behaviour of the very flag its own
+escalation questioned**. The pass was reverted the next day and everything it wrote
+had nothing left to attach to. Exactly one finding was independent — and the line
+budget dropped that one. The correct output was: escalate, fix nothing, stop.
+
+A sentence in a brief is not a mechanism. `panel.py --premise` now prints the
+partition as two named halves before the fixer patches anything: the findings the
+premise explains, by key, under **write no patch for these**, and everything else
+in the round as the independent half that still gets fixed. A declaration that
+named no findings is told it has stated **no partition at all**, rather than being
+handed a half-empty list it might read as complete — the independent half is the
+one `--premise` structurally cannot compute, because it never sees the round's
+findings, only the keys the declaration named.
+
+#### And in the panel flow, nobody was doing the independent half at all
+
+Found by a second opinion on the first cut of this change, and it is the sharper
+half of the same defect.
+
+In `/panel-review-pr` the **orchestrator** declares the premise — "it is yours to
+run, not the fixer's", because it is the only reader with both rounds in front of
+it — and `§4` is *launch the fixer sub-agent*. On a brake the brief said **"Do not
+launch §4."** So the fixer was never launched, and the findings the premise says
+nothing about were fixed by nobody. A test pinned that string, which is how
+deliberate it was.
+
+That is #555's own defect one level up and in the mirror direction. On lexray#1697
+the fixer spent a whole pass on findings the premise had voided; a blanket stop
+throws away the ones it had not. The rule is that work downstream of an open
+question is speculative spend — not that everything alongside such a question is.
+
+A brake now partitions the orchestrator's round too: no fix pass for the escalated
+keys, a fix pass for the rest with those keys withheld from the brief, and the stop
+after it. If every outstanding finding is downstream there is no independent half
+and nothing to launch, which is named as a real outcome so that a reader with
+nothing left does not invent a pass to justify launching one.
+
+The fixer's own brief lost an imperative in the same pass. "The correct output was:
+escalate, fix nothing, stop" sat directly under the instruction that independent
+findings still get fixed — true of lexray#1697's round 1, where four of five
+findings were downstream and the budget dropped the fifth, but read as a rule by
+anything executing the prompt. It now says so: that is the arithmetic of one round,
+not what an escalation means.
+
+#### The refusal now raises the question instead of mentioning it
+
+When the brake refuses a fix, that refusal **is** the escalation, and it goes
+through #274's one door: a `stuck` post and a `blockers` row, class `decision` —
+*which of these, or whether at all*, which is what a premise asks and what the
+human surface is built to show.
+
+`condition` is the premise key rather than the sentence, so two premises escalated
+on one pull request are two rows instead of one answered twice (#576, one level
+up), while a premise **restated** in a later round re-raises the row it already
+opened — `premise_key` is stable across a rewording by construction.
+
+Where the installed `needs_human` predates #576 the field is dropped rather than
+passed, and those two premises collapse into one row again. That is the trade
+`qb-doctor` and `qb-bump` already make and it is the right way round — a stale
+harness loses the field, never the escalation — but it is worth stating, because
+"two premises are two rows" is true of a current harness and not of the function.
+
+Only the refusal announces. The ordinary declaration, the one that runs before
+every fix pass and returns 0, still touches no network, which is what keeps
+`--premise` cheap enough to be mandatory.
+
+#### A blocker that names a pull request now reaches the plan row that carries it
+
+This is what made the queue unable to partition anything, and it was invisible
+because both halves were correct on their own.
+
+`GET /plan` matched an open blocker to an item by `subject_kind = "item"`. Every
+producer the fleet has raises the **forge** kind — `needs_human._subject_from`
+prefers `pr`, then `issue`, and records `item` as the kind "nothing emits today" —
+because a loop reviewing a pull request knows a PR number and has never heard of a
+plan. So the rows that were finally being produced attached to nothing, `next` went
+on handing out the work behind the open question, and the queue was invisible to
+the one reader that decides what happens next.
+
+An `issue` or `pr` blocker is now attached to the open item carrying that ref.
+`ix_plan_items_open_ref` is unique on `(COALESCE(repo, ''), ref_kind, ref_value)`,
+so at most one item can carry a given ref and the mapping cannot be ambiguous; the
+scope comparison is that index's key, spelled the same way, because an item and a
+blocker that disagree about the repo are about two different issues numbered 42.
+
+A blocker naming a ref nobody planned still attaches to nothing, and that is
+unchanged and correct: it is a real question in the queue with no plan row to hold
+up.
+
+#### What this deliberately does not do
+
+It does not let anything act on the answer, and it does not decide one. The fixer
+still writes no patch, opens no issue and redesigns nothing on its own authority —
+the only change is that it no longer files the board row by hand, because the tool
+raises it and prints what it did.
+
+**A pull-request escalation does not yet reach an item that names the ISSUE that PR
+closes.** Resolving one to the other needs the forge, and `GET /plan` does not talk
+to it. Where the plan names the PR, the partition holds today; where it names the
+issue, the row is raised, counted and queued but is not an edge.
+
+### a word for the jobs nobody has to think about
+
+`needs_human` had six classes and every one of them named a kind of judgement a
+person owes — `decision`, `taste`, `ui`, `environment`, `auth`, `other`. There
+was no word for the case where **no judgement is owed at all**: where the fleet
+can state the remedy exactly and simply is not permitted to carry it out.
+
+Measured rather than argued. Ten `stuck` posts over two days, from two machines,
+every single one classed `environment`. One of them read *"4 pull requests (#566,
+#565, #564, #538) ready to land and the tip of main was committed 2h 21m ago"*.
+Nothing about that was unclear and nobody had to weigh anything; when a person
+finally reached it the whole remedy was `gh pr merge` four times. It was filed
+under `environment` because that was the least-wrong of six wrong options and
+`other` would have said even less.
+
+**`chore` is the seventh class.** It asserts a property of the item — *this
+contains no judgement* — and not a course of action. It was deliberately not
+named `permission`, `approve` or `ready`: those name the act rather than the
+item, and so read as arguing for something this change does not decide.
+
+#### What it does not do
+
+**Nothing in this release lets anything act on the new class.** No merge, no
+land, no deploy, no retry keys on it; every gate in the fleet is shaped around
+the *presence* of an escalation and never its class, and that is still true
+afterwards. Whether the fleet may perform a chore is a policy question, kept
+separate on purpose — #85, #86, #78 and #335 each settled the same point from a
+different direction: the party that classifies must not also be the party that
+acts on the classification.
+
+Concretely, the change that was **refused**: a `needs-human/chore` label makes
+every autonomous loop decline to pick the issue up, through the `needs-human/*`
+glob in `issue_pickup.skip_labels`. Carving `chore` out of that glob is the
+obvious tidy-up and it is exactly the forbidden one — it would let work be
+picked up on the strength of a class the fleet assigned itself. The parametrised
+test that proves every class refuses now reads the vocabulary instead of a
+six-name literal, so `chore` refuses like the rest and stays that way.
+
+#### `qb-doctor` now classifies row by row
+
+It sent one class for all twenty of its rows — a module constant reading
+`"environment"` — which is the mechanical reason those ten posts were identical.
+`CheckSpec` carries the class per registration with **no default**, on the same
+terms `scope` has none: a new row cannot be registered without its author
+deciding. Eleven rows are chores. Four are `decision` — `stash`, `unpushed`,
+`tags` and `merges`, each a judgement per branch, per entry or per tag that only
+the person who made it can settle. Two are `auth` — `token` and `edge`, both
+asking whether a credential path works end to end. One is `taste`:
+`instructions`, which asks whether a paragraph directs a worker or merely
+describes what used to happen, and is the only question in the tool that no
+predicate can decide.
+
+Two stay `environment`, and they are the interesting ones. `harness` was expected
+to move and did not: its own registration documents three separate ways the
+remedy may not be knowable — `qb-bump` can refuse and ask which host attribute is
+meant (#414), the `differ` list may hold packaging rewrites nobody has accounted
+for (#353), and the staler the host the likelier it is missing the very tool that
+repairs it (#422). "A password is needed" would have been reason enough to move
+it to `chore`; "the fleet cannot state the remedy" is why it stays. `tools` stays
+because a missing `gh` and an unauthenticated one are a chore and an `auth`
+respectively, and the row cannot tell which — "does it work on the box it has to
+work on" is the honest answer when the cause is genuinely ambiguous.
+
+The single class on `Check` remains as the fallback for a row built outside the
+registry, and it is deliberately still `environment` rather than `chore` — a row
+that reaches the door without a registration behind it must still ask for a
+person.
+
+#### Also
+
+The two review-side CHECK constraints
+(`ck_review_findings_needs_human_class`, `ck_review_finding_reports_needs_human_class`)
+were written as literal six-element lists and are now composed from the
+vocabulary, like `ck_blockers_kind` already was. Widening only `blockers` would
+have left a review finding unable to carry the seventh class, with the symptom
+arriving as an ingest failure rather than as anything visible at the vocabulary.
+
+The prose copies of the vocabulary were found the same way and updated with it:
+`app/models/blocker.py` was headed *"Six classes, not seven"* in the module that
+owns `ck_blockers_kind`, and quoted the growth rule this change had just
+rewritten; `app/api/reviews.py` and `harness/loops/appetite.py` each spelled the
+six out in a docstring a producer reads to discover the vocabulary. A closed list
+copied into prose drifts exactly as one copied into code does, and this change
+widened the constraint those three describe.
+
+`tests/test_needs_human_drift.py` also pins the qb-doctor scan to the number of
+registrations. The scan reads `needs_human="x",` lines and asserted only that it
+found *one*, so a registration formatted any other way would have been skipped
+silently and its class never checked against the vocabulary — the guard going
+half-blind rather than red.
+
+Migration `mb3e5f721`.
+
+### an agent asked to turn a dial can turn it
+
+`POST /dials` and `POST /dials/clear` move from `app.auth.human` to
+`app.auth.delegated` — a person, **or** an agent presenting its machine's own
+`X-Agent-Elevated` secret beside its bearer. A bare machine token is still refused,
+so the gate is a second credential rather than the one every agent on a box already
+holds — a build step or a git hook running while a branch is under review no longer
+gets dial writes for free with its bearer.
+
+**Do not read that as the threat being closed.** The delegated secret is a file
+readable by the same user, so code running as that user can read it on demand; #479
+says so about this credential in general and hydrating it to `/run/op-secrets` does
+not change whose file it is. The poisoned-build-step path is **lengthened, not
+closed**, and an earlier draft of this note claimed such code "does not hold the
+delegated secret by definition", which was simply wrong. What actually bounds the
+risk is below: provenance on every row, an agent that may not overwrite a person,
+and a session ceiling that ignores agent-authored values.
+
+**This reverses a decision #479 records as deliberate**, and the reversal is argued
+rather than quietly applied. The exclusion was justified on blast radius, and a dial
+does not have the shape that argument feared. #479's own list of tightenings puts
+"undo" first for `/plan/reorder` precisely because nothing stores the previous order
+— *"a snapshot before each reorder turns 'an agent clobbered my order' from a loss
+into an annoyance"*. A dial already has that: the row is **cleared, not deleted**,
+`expires_at` bounds it in time, and the value it replaced comes back in the reply.
+The two other exclusions did not move — `POST /plan/scope` and `exempt`'s
+`grant: true` stay human-only, and each keeps its test.
+
+**A dial an agent turned is never mistaken for one a person typed.** `set_via` gains
+a fourth value, `agent`, beside `edge`/`key`/`dev`; the first three are one person
+arriving by different doors, and the fourth means no person was in the request at
+all. `set_by` records the agent's own name — `hermes/mist-harbour`, never
+`human/rich`. That is `rank_source: "derived"` applied to a second table, and it is
+why this arrived as a second credential instead of lending an agent a person's key.
+
+**An agent may not replace or clear a dial a PERSON set.** Stated without a
+vocabulary, because this module does not know what a dial is and a table of protected
+names here would be the second place a dial is written down. It covers
+`reviewers.*.enabled` and the fix floors on the same terms as the ceilings.
+
+**`spawn.max_sessions` needed that rule as much as its own.** `qb-start`'s ceiling was
+safe on the board *because* writes were human-only — an agent may read its own ceiling
+and must not raise it. `ceilings_from_board` now honours a row only when `set_via` is
+one of the three that mean a person (an allowlist: an unknown or misspelled value is
+not trusted by failing to match one string), with null honoured as predating the
+column. That alone was **not enough**, and an adversarial review found why: an agent
+that CLEARS a person's ceiling of 2 gets the policy file's 8, having raised its own
+limit without ever writing a bigger number — and `spawn.max_sessions_fleet` has no file
+fallback, so clearing it removes the fleet runaway guard outright. Absence is exactly
+what the reader cannot interpret, which is why the other half of the fix is on the
+board.
+
+**What this does not defend against, said plainly.** The dials that govern a review —
+`reviewers.<seat>.enabled`, `review_panel.fix_severity_floor` — are now reachable by an
+unattended agent, so code under review can in principle weaken its own review if no
+person has set those dials. That is the risk #479 excluded them for, accepted
+deliberately rather than argued away.
+
+New MCP tools: `dials` (read, ordinary bearer — every agent must be able to resolve
+what is in force), `dial_set` and `dial_clear` (delegated).
+
+`delegated()` also learned a person's `X-Human-Key`, which was a gap rather than a
+decision: it had only ever honoured the edge-proved person, so Rich with a browser
+could reorder the plan and Rich at a terminal holding the very key `human()` accepts
+could not. Without it, moving `/dials` onto that dependency would have broken
+`qb-dash-tui`'s own dial write in the same commit that opened the endpoint to agents.
+
+### a capped panel round's findings are handed to somebody
+
+`round_stop`'s `stop` answers **one** question — *should another panel run?* — and it
+is a question about cost, the cap and convergence. `panel-review-pr.md` §5 read it as
+answering a second one it was never computed from: *should these findings be fixed?*
+By that command's own bar the second answer is always yes, for every confirmed finding
+and every SonarCloud hard-gate issue.
+
+**The cap is where the two come apart, and the cap is the common case.** §5 launched a
+fixer only on `stop: false`, so a capped round's findings — P1/P2s still outstanding,
+repeats whose fix did not land, gate issues, and everything that round newly found —
+were found, judged, posted to the PR, recorded on the board, and handed to nobody. §5's
+own instruction, *"never let a fix ride out unreviewed silently"*, assumed a fix pass had
+happened at round N; at the cap none had, which is how the hole stayed invisible.
+
+The payload now states both questions. `round_stop.outstanding` carries **`fixable`**
+(what a fix pass is asked to clear, gate issues included since they are exempt from both
+floors), **`below_floor`**, **`escalated`**, and **`handed_to`** — `fixer`, `human`,
+`nobody`, or null. §5 dispatches on it and the PR comment renders it, because a payload
+field nobody renders is a field nobody acts on.
+
+**Measurement and verdict are kept apart**, on exactly the terms `fix_injection` keeps
+`over` from `fired`: the three lists are a property of the ROUND and are computed on
+every round including one that is going again, while `handed_to` is the property of the
+VERDICT and is null there. A caller gating a final, unreviewed fix pass on that field
+must not have it answered by a round that is mid-cycle.
+
+**A futility rung's remainder goes to a HUMAN, not to a fixer.** `premise_repeated`,
+`premise_undecidable`, `fix_injection`, `new_findings_not_falling` and `unrefereed_fix`
+each end the cycle by saying *in their own `reason`* that a human answers this rather
+than another fix pass, so routing their leftovers to one would contradict a sentence the
+same payload is carrying. A cap says only that the cycle has spent enough, which is not a
+claim about what the next fix pass is worth — that difference is why the cap is the rule
+this block was written for. Below-floor findings stay handed to nobody **deliberately**
+(#165's policy stop) and are now listed rather than dropped, because silence about them is
+what lets such a stop read as a dry one.
+
+**The honest end state is the point of it rather than a caveat on it.** A cycle that ends
+with clearable work left ends with **either unfixed findings or an unreviewed fix**; there
+is no third option, the choice belongs to the operator, and the workflow used to take the
+first in silence. `handed_to: "fixer"` names the second as the default and `why` says in
+as many words that the resulting commit ships unreviewed — **a proposal and not an
+action**, on #506's terms: nothing here runs a fixer.
+
+One shadowing fixed alongside it: #506's veto block bound a string to `held`, this
+function's frozenset of escalated keys. Nothing read it after that line, so it cost
+nothing — until this change gave that set a second reader.
+
+### the sweep stops calling merged work the only copy in the world
+
+`qb-catchup` runs on every merge, and the loudest thing it printed was wrong every
+time it fired. It decided on `git rev-list --left-right --count '@{u}...HEAD'` —
+the branch against its own `origin/` ref — and then reported the answer as though
+the question had been *does this exist anywhere else*:
+
+```
+· quarterback-feat-issue-262 (feat/issue-262) — 1 unpushed commit(s), left alone.
+  Push them or they exist nowhere else.
+```
+
+That commit is `e48ad28`, the merge that landed its own pull request. It is on
+`origin/main`. Nothing about it was ever at risk.
+
+Two different questions had been quietly substituted for one another, and the
+substitute is wrong in both directions at once. Measured across the ninety-odd
+worktrees on zeus:
+
+* **Six alarms, six of them false.** `feat/issue-262`, `feat/issue-80-ranking`,
+  `fix/issue-335`, `fix/issue-387`, `fix/issue-406` and `fix/issue-546` were every
+  one of them an ancestor of `origin/main` *in their entirety*, carrying nothing
+  that any remote lacked. A branch that is merged and then caught up with `main` —
+  by this very tool, among other things — ends up ahead of an `origin/<branch>` ref
+  still pointing at the pre-merge tip, and every commit in that gap is on
+  `origin/main`.
+* **Five real cases, and silence about all of them.** A branch nobody ever pushed
+  has no `origin/<branch>` to be compared against, so it was structurally invisible:
+  `feat/qb-dash-merged` (8 commits), `feat/qb-dash-buttons` (5), `fix/issue-179`
+  (2), `fix/issue-163` (1) and `fix/issue-44` (1). Two of those never reached the
+  comparison at all — they left the sweep four lines earlier under "no upstream,
+  nothing to catch up to" — and `fix/issue-44` was being told the opposite of the
+  truth: *its upstream is gone, so this worktree is finished with*, about a
+  directory holding the only copy of a commit.
+
+**The question is now `git rev-list <branch> --not --remotes`**: commits reachable
+from this branch and from no remote-tracking ref anywhere. That is the query #567
+landed as `qb-doctor`'s `unpushed` row, and it is asked here *before* the upstream
+is resolved, because the branches the old form was worst about are the ones that
+never reach an upstream comparison.
+
+`$ahead` and `$behind` are unchanged and still decide fast-forward versus rebase
+versus current. Being ahead of an upstream is a fact about the fast-forward and
+nothing more; whether any of it exists only on this disk is a separate question,
+now asked separately.
+
+#### It reports, and it no longer instructs
+
+"Push them or they exist nowhere else" was an instruction, and the wrong one.
+Several of these branches are abandoned experiments — pushing them litters the
+remote with branches nobody wants — and at least one on this machine duplicated
+work that had already landed by another route. The remedy is a decision per branch:
+push it, cherry-pick the part worth keeping, or delete it. Nothing running
+unattended from a hook can make that call, so the line states the fact and stops.
+
+**Age is the verdict, not the count**, for the reason `qb-doctor` took it: this
+sweep fires on every merge, and a line that says the same alarming number every time
+is wallpaper inside a week. There is no count a working fleet reaches that would be
+green — something is always mid-flight. So under 24 hours reads *work in flight,
+which is the ordinary state*, and beyond it reads *the oldest 19 days old: if this
+disk failed that work is gone*. The threshold is `qb-doctor`'s
+`UNPUSHED_GRACE_HOURS`, and a test fails when the two drift apart.
+
+#### The refspec trap, inherited rather than rediscovered
+
+`--not --remotes` trusts every remote-tracking ref there is, which is the point — a
+commit is only stranded if nothing anywhere has it. A remote whose fetch refspec
+does not bring back `refs/heads/*` breaks that: a single-branch clone configures
+`+refs/heads/main:refs/remotes/origin/main`, so `refs/remotes/` is complete for
+`main` and empty for everything else, and every feature branch on the server would
+answer here as work that exists only on this disk. That is this issue's own
+cry-wolf failure, arriving through the refspec instead of the comparison. Codex
+found it in `qb-doctor`'s equivalent row; the sweep now refuses the question once,
+out loud, rather than answering it wrongly a hundred times.
+
+#### Five more ways in, from a second Codex pass
+
+The same reviewer, asked the same question of this script, found four more routes to
+the same fault and one route to a worse one. All five are quiet failures, which is
+the dangerous direction for a warning about work that exists nowhere else:
+
+* **A fetch that failed** was being thrown away with `|| true`, so nothing said the
+  refs were older than the sweep. The status is now kept, said once, and spent on the
+  *reassurance* rather than on the question. Refusing outright was tried and was worse
+  than it looked: `fetch --all` exits non-zero if *any* remote fails, so one permanently
+  dead remote — a retired fork, a box that is off — bought the hedge on every worktree
+  line of every merge for ever, on the hook path that never passes `--no-fetch`, and
+  never the signal. Stale refs mislead in both directions but the two do not cost the
+  same: a warning off older refs is at worst crying wolf, while *"finished with"* off
+  older refs sends someone to delete the only copy of something. So the question is still
+  asked and still shouts, and where a failed fetch would have answered *nothing is
+  stranded* the line hedges instead. The `!` line names no remote and quotes no git
+  output: git puts the remote URL in its diagnostics and a URL carries userinfo.
+* **A negative refspec.** `^refs/heads/private/*` alongside `refs/heads/*` fetches
+  everything except those, and the branches it holds back are exactly the ones this
+  would then call the only copy in the world. A positive refspec elsewhere does not
+  undo the exclusion, so finding one was not proof of coverage.
+* **A destination outside `refs/remotes/`.** `refs/heads/*:refs/cache/*` brings back
+  every head and puts none of it where `--remotes` looks. The guard read only the
+  source half of the refspec.
+* **A ref under `refs/remotes/` that no remote's refspec writes to** — left by a remote
+  somebody removed, or written there by hand. It is trusted by the question and
+  refreshed by nothing, and unlike a stale ref it never self-corrects. Ownership is
+  read off the fetch refspecs' DESTINATIONS and never off the remotes' names: `origin`
+  fetching into `refs/remotes/origin/branches/*` does not own `refs/remotes/origin/old`,
+  a configured `team/alice` does not vouch for an orphaned `refs/remotes/team/bob/`, and
+  a ref written directly at `refs/remotes/<name>` has no `<remote>/<branch>` shape for a
+  name comparison to look at in the first place.
+* **"Finished with" was being said about a question that failed.** A per-worktree
+  `git log` that could not run left the state unknown and the note empty, and the
+  deleted-upstream line then read as a confident *you can throw this away*. That
+  sentence is a safety claim and is now made only when it was established.
+
+A sixth, on the clock, failed one step earlier than either of us expected. An empty
+`date` is a unary minus inside `$(( ))`, so the script did not abort — it reported
+*dated ahead of this clock*, a confident diagnosis of skew drawn from a clock it had
+never read. A non-numeric one is the abort. Both now withhold the age and keep the
+count.
+
+The comment above the query also claimed staleness could only fail loudly. It cannot:
+a branch **deleted** on the server since the last fetch keeps its local `origin/` ref,
+and the commits under it read as safely elsewhere when they are not. `qb-doctor`
+documents the same hole and accepts it for the same reason — the only cure is a prune,
+and a prune destroys the refs that make some commits reachable.
+
+#### Why the logic is duplicated and not shared
+
+`qb-doctor` is a five-thousand-line Python module and `qb-catchup` is a shell script
+on a twenty-second hook budget, so there is nothing for one to import from the
+other, and shelling out per worktree would put a Python start-up inside that budget
+ninety times over. What is shared is the *answer* on the path both of them
+walk: three tests pin the tools to the same query, the same grace window and — by running
+both against one checkout and comparing what they say — the same age verdict, because two
+tools disagreeing about whether work exists elsewhere is worse than either being wrong on
+its own. The third exists because the first two match strings in the two sources, and a
+literal being present in a file is not evidence that it is on the live code path.
+
+They are **not** pinned to each other on the refspec and ref-ownership guards above, and
+the tests do not claim to be. Those are `qb-catchup`-only: `qb-doctor`'s
+`_maps_every_head` reads the source half of a refspec and nothing else, so a negative
+refspec, a destination outside `refs/remotes/`, an orphaned ref under `refs/remotes/` and
+a `config` read that failed are four configurations where the doctor still answers and the
+sweep refuses. Closing that means changing `qb-doctor`, and is filed separately.
+
+The walk is taken **once per worktree**, and that is deliberate. A single
+repository-wide `rev-list --branches --not --remotes` above the loop would name every
+stranded tip in one pass, and it was tried — but it is a *snapshot*, while each
+worktree's tip is resolved fresh as the loop reaches it. A worktree that takes a
+local-only commit in between has a tip the stale set never named, falls through to
+"nothing is stranded here", and the sweep prints the safety claim that nothing is
+missing: the false negative this whole question exists to prevent, in the state an
+actively worked fleet is normally in. Measured before it was removed, the per-worktree
+walk costs about 4ms against 121 remote-tracking refs — roughly 360ms over ninety
+worktrees, against `qb-hook`'s twenty-five second budget. The saving was not worth the
+failure.
+
+The walk is also given the **resolved tip**, not the branch name. `gitrevisions`
+resolves a bare `feat/x` as `refs/feat/x`, then `refs/tags/feat/x`, then
+`refs/heads/feat/x`, so a tag of the same name wins over the branch — and the walk
+would measure the tag's history instead. A tag the remote already has answers zero, and
+the sweep declares itself finished with a directory that may hold the only copy of
+something. The branch is resolved through `refs/heads/` once and the walk is handed the
+SHA.
+
+And the age is a **minimum over the set**, not the last line of the output. Git's walk
+guarantees only that a child is emitted before its parent; descending committer date is
+not promised, and a rebase, a `git am` or an explicit `GIT_COMMITTER_DATE` — all of
+which this fleet does routinely — can date a child before its parent and put the newer
+commit last. Taking it under-measures the age, which reads a fortnight-old only copy as
+work in flight. `qb-doctor` takes `min(when …)` over the whole set for the same reason,
+and tracking a minimum makes the answer independent of emission order altogether.
+
+They do differ in one measurable way, deliberately. `qb-catchup` fetches with
+`--prune`, which it needs in order to tell a deleted upstream from one that was
+never configured; `qb-doctor` refuses to prune, on the grounds that a pruned
+tracking ref is the last thing making some commits reachable. So the sweep sees a
+branch deleted upstream *without* having been merged, and the doctor reads that same
+branch as safely elsewhere. The disagreement runs in the direction of reporting
+rather than silence, which is the right way round for a warning.
+
+### every question a machine owes you is its own row again
+
+'Needs a human' became a first-class row with #328, and the one place a person
+looks was counting wrong. Open blockers were unique on `(repo, subject, class)`,
+and `class` is #279's six-word vocabulary — of which `environment` carries nearly
+every machine-shaped escalation. So one producer asking several different things
+about one repository got **one row**.
+
+Measured on the live board rather than argued. `qb-doctor` had raised `landed`
+("4 pull requests ready and the tip of main has not moved"), `harness` ("13
+scripts differ from this checkout") and `unpushed` ("25 commits on 11 branches
+exist on no remote") against `prisonblues/quarterback`. Two of the three came back
+`"an open blocker already asks this of this subject"` and were dropped. The table
+held **two rows for this repo while five distinct questions were outstanding** —
+and the `stuck` posts behind them were all correct and all present, because #569
+had made them per-condition that same day. The doorbell rang five times and the
+queue said two. That is #274's deduplication protecting the fleet from noise by
+hiding the news, one layer lower than where it was caught the first time.
+
+**A blocker now carries a `condition`: which standing question this is.** It is
+the third part of the key, and the boundary it draws is the whole of the change:
+
+> A condition names the **fault**, never the **reading**. `unpushed` is a
+> condition; "25 commits on 11 branches" is not. The test is whether the string
+> changes when the fault gets *worse* without becoming a *different* fault — if it
+> does, it is an instance, and it belongs in the question and the detail where
+> nothing keys on it.
+
+So a loop re-raising the same question every run is still one row and still a
+no-op, which is what the index was always for. Two different questions that merely
+share a class and a repo are now two.
+
+**It is deliberately coarser than the key on the announcement**, and that is worth
+reading twice, because reusing the post's dedupe key here is the obvious move and
+it is wrong. A post is news: zeus announced two pull requests ready to land, then
+three, then four, and each was worth saying. A row is a standing state, and a state
+that re-keys itself every time the fault worsens fills the table just as surely
+from the other direction.
+
+Most producers pass nothing and are unchanged — `preland`, `panel`, `epic` and
+`issue_watch` all key on a real pull request or issue and raise one question per
+class about it, which is already the granularity a person wants.
+
+**`qb-bump` had the same defect and is fixed in the same breath.** Both its
+escalations pointed at a fixed issue number with class `environment`, so "the flake
+bump does not build" and "N harness scripts are not on this box" were one row — and
+so were zeus and hermes, because an issue number says nothing about which machine
+cannot be rebuilt. Hermes escalated on the 27th and had no row at all.
+
+#### Three things found on the way
+
+**One spelling of a machine name.** `qb-bump` truncated the hostname at the first
+dot and `qb-doctor` did not, which is one box under two names across the two halves
+of one escalation. A `condition` outlives every cache a hostname used to be
+compared against, so both now go through `needs_human.machine_id`, and a
+`host`-scoped row's dedupe key spells it the same way its row does.
+
+**A stale door loses the field and never the escalation.** The harness on `PATH`
+goes stale — that is what the `harness` check is for, and it was failing on zeus
+while this was written — so a fresh script can be calling a `needs_human` older
+than the keyword it wants to pass. Both producers now ask the door what it takes.
+`qb-bump` also gained the guard its own docstring had been promising: it returned
+`needs_human.announce(...)` directly, so anything the door raised escaped a
+function whose contract is that it never does.
+
+**Fleet-scope questions were never deduplicated at all.** `repo` is nullable and
+NULL means fleet scope — a real value, not a missing one — but PostgreSQL treats
+NULLs in a unique index as distinct, so the index skipped those rows entirely and
+the `repo IS NULL` branch written to recover from a collision could never run for
+want of one. The index is now `NULLS NOT DISTINCT`.
+
+### no dial had ever been set, and the dashboard said so in grey
+
+`GET /dials` was empty fleet-wide. Not "nobody had chosen to turn one" — **every dial
+write from the dashboard since #477 had failed**, and the way it failed is why nobody
+knew.
+
+`qbdata` pulled the credential commands out of the site config and ran them itself
+without exporting `QUARTERBACK_AGENT`, which `qb-env` sets after sourcing that file and
+before evaluating anything from it. Every site's commands interpolate it, so this
+fleet's key command resolved `op://personal-nix/quarterback-/human` — a well-formed
+vault path with an empty segment where the host name belongs, addressing nothing. This
+is #235's defect in a third place; `HumanClient` arrived after that issue was written,
+so it was not on its list. `qb-doctor` has done it correctly all along, which is why it
+could see a token on a host where this module could not.
+
+**The token path had the same bug and got away with it for months**, because
+`QUARTERBACK_TOKEN_CMD` on this fleet begins `cat /run/op-secrets/quarterback-token ||`
+and that file exists, so `op` was never reached. Every read, post and claim worked. The
+human key has no such fallback, and it is the only credential the `✎` uses. Both sites
+now go through one `command_env`, which is the rule written down once instead of
+remembered three times.
+
+**And the failure is now loud, which is the half that was actually reported.** `op read`
+against a vault that wants unlocking does not fail fast — it blocks until the 30s
+subprocess timeout. In that window the modal had already dismissed, the pane was
+unchanged and nothing had been said, which is indistinguishable from a write that
+landed. Three changes: the write announces itself before it can block and names `op`,
+because the person who reads the word has the answer before the timeout does; a failure
+draws bold red and rings, the same treatment `DialEdit._refuse` gives a refusal one
+screen up, instead of the muted grey the detail line uses for chrome; and a second press
+while one is in flight is **refused rather than superseding it** — `run_dial_write` is
+`exclusive=True`, so pressing again cancelled the attempt that was about to report, and
+seeing nothing is exactly what makes a person press again.
+
+The failure sentence leads with the verb now. `{dial}: {exc}` spent thirty-four
+characters of `review_panel.budget.tokens_per_day` before reaching the only words that
+mattered, on a line that has to survive a 78-column pane.
+
+### a boot-cached credential cannot refresh itself
+
+The delegated credential's 403 retry re-reads `QUARTERBACK_ELEVATED_TOKEN_CMD` and
+replays only when the value comes back **different**. That is correct while the
+command reaches 1Password on every call — and it silently stopped being correct the
+moment the fleet started serving that credential from a boot cache.
+
+nix-fleet#50 hydrates it to `/run/op-secrets`, for a good reason: `op read` against a
+desktop integration does not fail fast when the vault session is cold, it blocks on a
+prompt, and this credential is read about once a fortnight so the session is reliably
+cold. But the generated command then reads a file, re-running it returns the same
+bytes for ever, and the retry never fires. "A rotation costs a retry rather than a
+rebuild" is written down in the code and would have quietly become false.
+
+`QUARTERBACK_ELEVATED_TOKEN_REFRESH_CMD` is the same split the bearer has had all
+along, for the same reason: after the board has refused a credential BY NAME, the
+cached copy is precisely what is known to be wrong, so that one read goes past it. The
+cold first fetch still uses the cache, which is the whole point of having one — and a
+host that sets no refresh command keeps re-reading its ordinary one, which is right
+wherever that already reaches the store.
+
+### a test that could only pass on a box that is not called hermes
+
+`tests/test_lapsed_claims.py::test_a_tree_recorded_on_another_box_is_unknown_here_not_gone`
+was red on hermes and green everywhere else, CI included. The code was right and
+the fixture was wrong.
+
+`_recorded_tree_lines` decides which sentence to print by comparing the recorded
+host against `this_host()` — a tree on another machine cannot be checked from
+here, and saying it is *gone* would send somebody to redo work that is sitting on
+that machine. The fixture spelled the recording host as the literal `"hermes"`,
+which is a machine in this fleet. On that box the two strings are equal, the
+same-box branch is taken, and the test whose entire subject is the other-box
+message asserted it against the opposite case:
+
+```
+  neither that worktree nor `feat/issue-563` is on this box now — it was pruned
+  and the branch deleted, which usually means it landed
+```
+
+The host is now derived rather than spelled — `zeus` unless this box is zeus, in
+which case `hermes` — so "another box" is constructed rather than assumed. What
+made this worth more than a one-word edit is that the defect was invisible on
+every machine but one, so the property is pinned by its own test:
+`_elsewhere(qd) != qd.this_host()` holds wherever the suite runs. Checked against
+`hermes`, `zeus`, a laptop and the CI runner's name.
+
+The rest of the file was checked for the same shape, which the issue asked for.
+It is the only instance: the other seven `lapsed_redirect` tests pass
+`qd.this_host()` deliberately to build the same-box case, and the remaining
+`hermes`/`zeus` literals are assertions on values round-tripped through the
+board, which never meet the local hostname.
+
+### eight dashboard panels answered two questions, so now there are two tables
+
+One frame of `qb-dash`, measured on 2026-08-28: **61 rows across eight panels**, into the
+38-row pane #269 measured. That is the *capped* number — #269's fix was the per-panel row
+limits, and `…and 30 more` plus `…and 18 more` were already standing in for 48 rows nobody
+could see.
+
+`#578` was on that pane four times: a claim in CLAIMED, rank 2 in PLANS, and twice more as
+its PR `#587` — once in OPEN PRs and again in REVIEW QUEUE. Those two printed **the same
+three PRs** in ten lines, which was never a coincidence of that frame: the queue is derived
+FROM the open-PR list (`fetch_review_queue`), so it is a subset by construction, and all the
+PR panel added was the CI glyph.
+
+#### The two questions
+
+  **AGENTS** — who is here, and how are they doing. Was SEATS + FLEET + CLAIMED, which were
+  three renderings of one subject: a seat is an agent with a pane in front of you, a claim is
+  what an agent holds, and `panel_claims` already re-derived its holder by splitting `holder`
+  on `/` exactly the way `panel_agents` did.
+
+  **WORK** — what is in flight, and where has it got to. Was PLANS + REVIEW QUEUE + OPEN PRs
+  + ISSUES, in the board's order, with the review queue folded into the rows it is about.
+
+Both renderers draw from one row model in `qbdata` (`agent_rows`, `work_rows`), because there
+are two renderers and they have to agree about what a merged row means. They already shared
+every cell helper; the row was the one thing they did not, which is how six pairs of panel
+functions came to drift a word at a time.
+
+#### What the merge could finally say
+
+**A claim nobody answers for gets a row, and says which kind of nobody.** `machine` — the
+claim names a bare machine name while the agents on that box are `machine/name`, so nothing
+can say which of them holds it (#444, arriving where it costs something). `gone` — it names
+an agent presence no longer lists, so that agent finished and its claim outlived it, which is
+the most actionable row on the dashboard and read exactly like a live one under CLAIMED.
+`elsewhere` — the holder is live and this pane's scope hid it; that row was **dropped
+entirely** by the first cut, which is the panel-that-filtered-silently defect applied to the
+one fact that prevents duplicated work.
+
+**The counts are counted once.** The head line stated a live count and a seat count from its
+own join while FLEET stated the same two from the rows it had drawn, and on the first frame
+with a seat in it they disagreed: `4 live · 1 seats` over a table headed `5 live · 3 seats`.
+
+#### What is deliberately still two rows
+
+A plan item names its **issue**, and nothing anywhere records which PR implements it (#396).
+So an issue and the PR that closes it stay two rows, `#578` goes from four to two rather than
+to one, and the missing edge is a fact about the board rather than a shortcut taken here.
+
+#### The order, and the row budget
+
+Review rows are drawn **above** the plan. That overrules nothing: the board's order is an
+order over plan items and says nothing about where a PR sits among them, because PRs are not
+in it — the same silence the queue's own oldest-first reading order fills (#232). Appending
+was the first cut and it read badly on real data: forty-two plan rows above five review rows,
+in a table showing twenty.
+
+The printed renderer has one row cap where it had four, and it is split by section rather
+than sliced off the top: **a cap that always eats the same section is a section that is never
+drawn**, and under a straight `rows[:cap]` the panel said `5 in review` in its title and
+showed none of them — #273's hole reopened by a display limit rather than by a data model.
+
+#### The backlog, behind one key
+
+Open PRs review has finished with, and open issues nobody has planned or taken, are off by
+default: they are a catalogue rather than state, and twelve rows of issue list was the single
+biggest consumer of the old frame. `b` in `qb-dash-tui`, `--backlog` in `qb-dash`,
+`QB_DASH_BACKLOG=1` to open that way.
+
+**Their counts stay on the header line either way** — `PRs 3 · 1 red`, `ISSUES 30 · 25 free`
+— because a toggled list that left no number behind would be a way of forgetting the work
+exists. The CI tally in particular is the one thing the OPEN PRs panel said that the review
+queue replacing its rows cannot: a PR can be green and unreviewed, or red and already signed
+off.
+
+#### And what a person owes an answer to (#328)
+
+The board has held a blocker as a first-class row since #274 — subject, class, question,
+owner, and a resolution required to close it — and the web board and the plan page have both
+drawn one since. **The terminal never had.** `/plan` serves `waiting_on_a_human` on every
+item and `qbdata` referenced it **zero times**, so an item nobody could proceed on rendered
+`○`, in the cyan this panel uses for *free to take* — which is the strongest possible
+invitation to pick up work that is stuck.
+
+A blocked row wears `⚑` magenta, and that is **not a new glyph**: it is what a PR wears when
+its checks are gated (#324) — *a run exists, will not execute without a human, and so will
+never report*. A plan item waiting on a decision is the same sentence about a different
+subject, so it unifies the vocabulary rather than growing it, which matters more here than
+usual because the merged state cell already means two things.
+
+**Every question gets a row.** A blocker's subject is one of item, issue, pr or repo, and
+`qb-doctor` raises `landed`, `harness` and `unpushed` against the **repo** — the "the fleet is
+stuck" ones, which no piece of work on this table can carry. Left out they were counted by
+the header and drawn nowhere: the first cut said `WAITING 4` over a table holding one, and a
+number that disagrees with the rows under it is the one thing a surface a person is asked to
+trust cannot do. Three separate versions of that mismatch were found and fixed before this
+landed — the header counting fleet-wide while the table was scoped, the header counting
+questions while the title counted rows, and a filtered view reporting `40 elsewhere` about
+rows the filter had removed anyway.
+
+**Nothing is offered on a blocked row.** The `⚒` and the `⚖` keep their shape and go grey:
+taking an issue whose shape is still being decided is work done before the answer that
+governs it, which is #522's waste arriving through a button. A row that is only a question
+gets no icon at all.
+
+`WAITING n` leads the header line and is scoped like every other tally there. `w` in the
+clickable renderer, `--waiting` in the printed one, `QB_DASH_WAITING=1` to open that way.
+
+#### And the plan can be reordered from the terminal (#443)
+
+The plan could be read from four surfaces and reordered from exactly one, and the person it
+belongs to works in a terminal. The record of what that cost is two lines in #443: *"i don't
+know how to re-order"*, then *"so no TUI way to do it? html only?"*
+
+**That issue's central claim — "the auth constraint, which is why this is not a small UI job" —
+is out of date.** `POST /plan/reorder` depends on `app.auth.delegated` rather than `human`, and
+that tier accepts a person's own `X-Human-Key`: the credential this dashboard has held since
+#477 for the dial `✎`. `auth.delegated` names the gap it closed in as many words — *"Rich with
+a browser could reorder the plan, and Rich at a terminal holding the very same key that
+`human()` accepts could not."* So there is no new endpoint, no new credential and no new
+plumbing here; `HumanClient.post` was already a generic authenticated POST.
+
+`m` marks a plan row, `k`/`j` move one place, `K`/`J` move five, `[`/`]` go to the ends, `g`
+asks for a position. Marked rows move together keeping the order they are shown in.
+
+**The endpoint takes an order, never a move**, so every verb is the same call with a
+differently computed array — #388's finding on the web board, reused rather than rediscovered,
+and the reason multi-select costs nothing extra at the wire.
+
+**`g` asks for a position and not the rank on the row.** Ranks go non-contiguous as work
+finishes — `prisonblues/quarterback` was on `1, 3, 4, 5, 10, …` with 37 open items — so "move
+it to 10" means two different rows depending on which number was meant. The box says where the
+row is now and how long the list is. It heals after one use: a reorder renumbers the scope
+`1..n`.
+
+**A move is painted before it is posted**, and a refusal puts the rows back. The plan's
+fifteen-second poll is held off while a write is in flight, or a tick arriving mid-move would
+carry the order the board still has and produce two jumps for one keypress. The web board makes
+only its drag optimistic — there the DOM has already moved — and every verb here is a keypress.
+
+**The moved row stays under the cursor and the marks stay set**, so pressing `j` four times
+moves one thing four places. A move rewrites the whole table and a DataTable's cursor is an
+*index*, so without following the row key the thing being moved slides out from under the
+person; dropping the marks does the same by another route, leaving the next key moving one row
+while they believe they are still moving three.
+
+Refused, each naming its remedy: a row with no order, rows marked across two scopes, a
+truncated plan (an order computed from a partial list would move everything the pane was never
+sent), a move that changes nothing (posting an unchanged order stamps `rank_source` on rows
+nobody touched — #183), and a second move while one is in flight (#577's rule).
+
+**Found by its own test:** the detail line's first render crashed with `MarkupError` because
+the obvious way to write the two bracket keys — `[/]` — is a Rich closing tag with nothing to
+close, and `#detail` parses markup.
+
+#### The numbers
+
+The fixture the panel tests draw — three plan items, one PR, one issue, three queue entries —
+was **34 rows** and is **24**, and that comparison is a real one: `frame()` exists on both
+sides of this change, so `test_the_frame_answers_two_questions_in_two_tables` runs against
+the old renderer and fails there, naming the defect (`the frame draws 8 panels, not the
+header, the dials and two tables`).
+
+A live frame on this repo, same width, is **43 rows** where the same data through eight
+panels comes to 63 — sixteen of those rows were borders and headings. WORK is capped at 16
+rows and AGENTS is not, for FLEET's old reason: every row there is somebody.
+
+#### Found by review, not by the change
+
+Three defects in this work came from `codex` reading the diff, and all three were real. Both
+`gh` failures were called `gh` and keyed a row on the first 24 characters of the message, so
+two `gh` calls failing the same way — the usual way for them to fail — keyed two rows
+identically. `work_sig` carried the fact of a holder and not its name, so a claim passing
+from one agent to another left the old name on the row indefinitely. And the printed
+`panel_work` was threaded its inputs one at a time, ran to ten arguments, and had simply
+lost `pr_err` and `issue_err` on the way — the `gh` half arrives as one dict now, which is
+the shape `fetch_gh` returns.
+
 ## v3.22 — a panel can earn its stop, and work that was dropped leaves a trail
 
 ### a fifth vendor, and the seat that would not review without its tools
