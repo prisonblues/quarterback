@@ -705,18 +705,27 @@ def test_a_repository_with_no_remote_says_nothing_about_stranded_work(fleet):
     assert "does not fetch" not in done.stdout, done.stdout
 
 
-# ------------------------------------------------ the two tools have to agree (#573)
+# --------------------------- the two tools agree on the query and the window (#573)
 #
 # `qb-doctor` is Python and `qb-catchup` is shell, so the logic is DUPLICATED and not
 # shared: there is nothing a 5000-line Python module and a hook-budget shell script
 # can import from one another, and a shell-out from the sweep would put a Python
 # start-up per worktree inside a 20-second budget. What can be shared is the answer,
-# and these two tests are what keep the duplicate honest — because two tools
-# disagreeing about "does this work exist elsewhere" is worse than either being wrong
-# on its own.
+# and these tests are what keep the duplicate honest — because two tools disagreeing
+# about "does this work exist elsewhere" is worse than either being wrong on its own.
+#
+# AND ON EXACTLY THREE THINGS, WHICH IS NOT THE SAME AS AGREEING. Pinned here: the QUERY,
+# the GRACE WINDOW, and the age verdict both reach about one ordinary checkout. The
+# refspec and ref-ownership guards this sweep grew for #573 are `qb-catchup`-ONLY —
+# `qb-doctor`'s `_maps_every_head` reads the SOURCE half of a refspec and nothing else,
+# so on a negative refspec, a destination outside `refs/remotes/`, an orphaned ref under
+# `refs/remotes/` or a `config` read that failed, the doctor answers where the sweep
+# refuses. Nothing below catches that, deliberately: closing it means changing
+# `qb-doctor`. Do not read these as a general agreement invariant.
 
 
 def test_both_tools_ask_git_the_same_question():
+    """The query only — not the guards around it, which are qb-catchup-only."""
     catchup = (BIN / "qb-catchup").read_text()
     doctor = (BIN / "qb-doctor").read_text()
     assert '"$tip" --not --remotes --' in catchup, (
@@ -746,16 +755,54 @@ def test_the_grace_window_agrees_with_qb_doctor():
 # rather than loud, which is the dangerous direction for a warning about lost work.
 
 
-def test_a_fetch_that_failed_refuses_the_question_rather_than_answering_from_stale_refs(fleet):
-    """The sweep still runs — acting on what is already here is the point — but a
-    question measured against refs nobody refreshed is not answered."""
+def test_a_fetch_that_failed_names_the_remote_and_the_reason(fleet):
+    """It used to refuse the question outright and say only "the fetch did not complete",
+    which is a standard `--no-fetch` has never been held to: the refs are still there and
+    still subtracted, merely older than this sweep. Naming the remote is the difference
+    between a fault to go and look for and a fact about a box that is off."""
     git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
     commit(fleet.main, "mine-only", days_ago=19)
 
     done = fleet.run(fetch=True)
     assert done.returncode == 0, done.stderr
-    assert "the fetch did not complete" in done.stdout, done.stdout
-    assert "on no remote ref" not in done.stdout, "it answered out of a snapshot nobody refreshed"
+    assert "the fetch did not complete for `origin`" in done.stdout, done.stdout
+    assert "gone.git" in done.stdout, "git's own reason was thrown away with 2>/dev/null"
+    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+
+
+def test_one_unreachable_remote_does_not_silence_the_question_for_the_others(fleet):
+    """`git fetch --all` exits non-zero if ANY remote fails, and that single status used
+    to refuse the stranded question for the whole run. `qb-hook` passes no `--no-fetch`,
+    so a machine carrying one permanently-dead remote — a retired fork, a box that is off
+    — got the hedge on every worktree line on every merge, for ever, and never the
+    signal. That is worse than the line this replaced, so the failure is now per-remote:
+    named, and not a veto."""
+    git(fleet.main, "remote", "add", "retired", str(fleet.tmp / "retired.git"))
+    git(fleet.main, "config", "remote.retired.fetch",
+        "+refs/heads/*:refs/remotes/retired/*")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete for `retired`" in done.stdout, done.stdout
+    assert "`origin`" not in done.stdout, "the working remote was blamed too"
+    assert "1 commit on it is on no remote ref" in done.stdout, (
+        "one dead remote silenced the whole question")
+    assert "19 days old" in done.stdout, done.stdout
+
+
+def test_every_remote_is_fetched_even_when_an_earlier_one_failed(fleet):
+    """The loop is fed by a here-string, so a `git fetch` that read stdin — a credential
+    prompt on an unreachable remote is exactly this case — would swallow the remaining
+    remote names and those would silently never be fetched at all."""
+    git(fleet.main, "remote", "add", "aaa-dead", str(fleet.tmp / "dead.git"))
+    fleet.stub_git_that_records()
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    fetched = [c for c in fleet.git_ran("fetch") if "--prune" in c]
+    assert any("aaa-dead" in c for c in fetched), fetched
+    assert any(c.endswith("origin") for c in fetched), fetched
 
 
 def test_a_namespace_under_refs_remotes_that_is_not_a_remote_refuses_the_question(fleet):
@@ -1172,16 +1219,22 @@ def _doctor_unpushed(repo):
 
 
 @pytest.mark.parametrize("days_ago,verdict,loud", [(19, "fail", True), (0, "ok", False)])
-def test_the_two_tools_reach_the_same_verdict_about_the_same_repository(
+def test_the_two_tools_reach_the_same_verdict_about_the_age_of_unpushed_work(
         fleet, days_ago, verdict, loud):
     """EXECUTING BOTH, where the two tests above only match strings in the two sources.
 
     A grep proves a literal is present in a file, never that it is on the live code
     path: a dead query, a branch that cannot be reached, or a second constant hardcoded
     somewhere further down would all leave those green while the tools said different
-    things about the same branch in front of a user. Two tools disagreeing about "does
-    this work exist elsewhere" is worse than either being wrong on its own, so this runs
-    each of them against one checkout and compares the answers rather than the text.
+    things about the same branch in front of a user. So this runs each of them against
+    one checkout and compares the answers rather than the text.
+
+    ON THE AGE/GRACE-WINDOW PATH AND NOTHING WIDER. The repository here has one ordinary
+    remote fetching `refs/heads/*` into `refs/remotes/origin/*` and no stray refs, which
+    is the only configuration on which the two tools are known to agree. Point either of
+    them at a negative refspec, a destination outside `refs/remotes/`, or an orphaned
+    ref under `refs/remotes/` and they part company, because those guards live in the
+    sweep alone — see the note above the section.
     """
     commit(fleet.main, "mine-only", days_ago=days_ago)
 
