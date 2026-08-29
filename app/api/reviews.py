@@ -5742,12 +5742,25 @@ async def next_door(
     **A hint, and never a finding.** Nothing here asserts anything about the
     caller's diff — every row is an observation about somebody else's, with the
     run and the timestamp that produced it, and a reviewer must find the defect in
-    the diff in front of it before reporting one. That constraint is not
-    enforceable from this side, so the *prompt* carries it
-    (:data:`panel_core.NEXT_DOOR_SLOT`); what this side does is refuse to publish
-    anything that could be mistaken for a verdict. Were a hint able to become a
-    finding on its own, the recurrence chain would start eating its own tail and
-    a leaderboard would begin rewarding repetition.
+    the diff in front of it before reporting one.
+
+    **Nothing enforces that, and it should not be described as though something
+    does.** This side refuses to publish anything shaped like a verdict, and the
+    prompt (:data:`panel_core.NEXT_DOOR_SLOT`) instructs the seat; an instruction
+    is not a mechanism. Nothing checks that a returned finding cites a line in the
+    current diff, carries evidence independent of the hint, or differs from the
+    text it was shown — so a seat that copies a hint back produces a finding this
+    endpoint cannot distinguish from one somebody found. Were that common, the
+    recurrence chain would eat its own tail and repetition would start scoring.
+
+    That is a known and deliberate gap rather than an oversight, on #67's rule
+    that the instrument comes before the gate: the measurement that would justify
+    provenance-tagging hints and refusing findings that merely echo one is the
+    measurement nobody has yet, and building the gate first is how the panel ends
+    up with a rule calibrated on nothing. What would close it is per-hint ids on
+    the wire, a textual-overlap check at judging time, and a record of which hints
+    a round was shown — which is a separate issue, and wants a few dozen cycles of
+    this shipped before anybody designs it.
 
     **Confirmed only, and never `refuted`.** Two filters, and they are not the
     same one. `verdict == "confirmed"` keeps out what a judge threw away — a
@@ -5835,6 +5848,13 @@ async def next_door(
             ReviewFinding.title.label("title"),
             ReviewFinding.detail.label("detail"),
             ReviewFinding.finding_key.label("finding_key"),
+            # Carried so the newest-observation pick can be filtered on it AFTER
+            # the pick rather than before — see the DISTINCT ON comment below.
+            ReviewFinding.verdict.label("verdict"),
+            # The stable final tie-break. `ts` and `run_id` are both equal for
+            # every finding of one run, so without this the cap chooses between
+            # them arbitrarily and two identical calls can return different eights.
+            ReviewFinding.id.label("finding_id"),
             ReviewFindingOutcome.outcome.label("outcome"),
         )
         .join(ReviewFinding, ReviewFinding.run_id == ReviewRun.id)
@@ -5851,7 +5871,6 @@ async def next_door(
         .where(
             ReviewRun.repo == repo,
             ReviewRun.pr != pr,
-            ReviewFinding.verdict == "confirmed",
             # `IS NULL OR <> 'refuted'`, never a bare `<> 'refuted'`: SQL's
             # three-valued logic drops every row whose outcome is NULL from a
             # plain inequality, and those rows are the majority of the table and
@@ -5865,6 +5884,19 @@ async def next_door(
         # Newest observation per (rival PR, defect). The ORDER BY leader must
         # match the DISTINCT ON expressions — Postgres requires it — so the
         # recency tiebreak rides behind them.
+        #
+        # **`verdict` is NOT filtered here, and that ordering is the point.** The
+        # obvious version puts `verdict == "confirmed"` in the WHERE above, which
+        # reads identically and is wrong: it removes the dismissals BEFORE the
+        # newest-per-key pick, so a defect confirmed in round 1 and DISMISSED by a
+        # later round has its dismissal deleted from the population and its stale
+        # confirmation resurrected as "the newest observation". The endpoint would
+        # then quote, as confirmed next door, a finding that PR's own judge has
+        # since thrown out — and `GET /review/findings` would disagree with it.
+        # So: pick the newest observation of each defect first, then ask what that
+        # observation said (below). The outcome table catches the `refuted` case
+        # and cannot catch this one, because a later judge dismissal is not an
+        # outcome.
         .distinct(ReviewRun.pr, ReviewFinding.finding_key)
         .order_by(ReviewRun.pr, ReviewFinding.finding_key,
                   ReviewRun.ts.desc(), ReviewFinding.id.desc())
@@ -5873,6 +5905,14 @@ async def next_door(
         hints = hints.where(ReviewRun.ts >= cutoff)
 
     inner = hints.subquery()
+    # The verdict test, AFTER the newest-per-key pick. A defect whose newest
+    # observation is a dismissal drops out here; one whose newest observation is a
+    # confirmation stays, whatever earlier rounds said about it.
+    picked = (
+        select(inner)
+        .where(inner.c.verdict == "confirmed")
+        .subquery()
+    )
     # COUNTED, then FETCHED, rather than fetched and measured. `considered` has to
     # be the pre-cap number — a cap that trims an answer announces itself — and the
     # obvious way to get it is `len(rows)` over an unbounded select. That reads fine
@@ -5886,17 +5926,34 @@ async def next_door(
     #
     # Two queries against one subquery, so the number and the rows cannot disagree
     # about what was selected.
-    considered = await session.scalar(
-        select(func.count()).select_from(inner)
-    ) or 0
+    #
+    # ONE statement, not two, and that is a correctness fix rather than a tuning
+    # one. A separate `SELECT count(*)` followed by a separate `SELECT … LIMIT`
+    # gets a separate SNAPSHOT under Postgres' default READ COMMITTED, so a run
+    # recorded between them makes `considered` describe a population the rows were
+    # not drawn from — `hints_dropped` then lies, and `considered` can even come
+    # back smaller than the number of rows returned. Sharing a subquery OBJECT
+    # shares no snapshot; only being one statement does.
     rows = (await session.execute(
         # Recency is the ranking, and the only one. Severity is deliberately NOT
         # the leader: a P3 confirmed in this file an hour ago is the sentence
         # #508 was filed about, and a P1 from six days ago in the same file is
         # not more likely to be about the diff in front of the reviewer. Both
         # are on the row for a caller that disagrees.
-        select(inner).order_by(inner.c.ts.desc(), inner.c.run_id.desc()).limit(limit)
+        #
+        # `finding_id` closes the ordering: every finding of one run shares its
+        # `ts` and `run_id`, so those two alone leave the cap free to return a
+        # different eight on each identical call.
+        select(picked, func.count().over().label("considered"))
+        .order_by(picked.c.ts.desc(), picked.c.run_id.desc(),
+                  picked.c.finding_id.desc())
+        .limit(limit)
     )).all()
+    # The window counts the whole pre-LIMIT population, so it is on every row and
+    # identical across them. No rows means none were selected, which is a count of
+    # zero — the one case the window cannot report, because there is no row to
+    # carry it.
+    considered = rows[0].considered if rows else 0
 
     now = datetime.now(UTC)
     return {
@@ -5918,7 +5975,7 @@ async def next_door(
         # reads as the whole one.
         "considered": considered,
         "hints": [_hint_view(r, now) for r in rows],
-        "hints_dropped": max(0, considered - limit),
+        "hints_dropped": max(0, considered - len(rows)),
         "scope": "confirmed findings on other PRs this board has panelled "
                  "within the window, in files this PR touches",
         # Said on the wire and not only in the docstring, because it is the one

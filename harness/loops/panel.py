@@ -221,27 +221,40 @@ def board_escalations(gh_repo: str, pr_number: int) -> tuple[list[str], str]:
 #: it writes when a board is too old to publish it.
 NEXT_DOOR_KEY = "hints"
 
-#: What a board that does not serve #508 answers, and why it is not one code.
+#: What a board that does not serve #508 answers — **422, and NOT 404.**
 #:
-#: **404** is the obvious one — no such route. **422 is the one nobody predicts,
-#: and it is what the live board actually returned** the day this was written:
-#: `GET /review/{run_id}` is declared on the same prefix, so on a board predating
-#: this endpoint the path falls through to it, `next-door` fails the `int`
-#: validation, and FastAPI answers 422. It reads like "your request was
-#: malformed" and means "this board is older than the feature".
+#: The obvious guess is 404, and taking it costs a real diagnostic. `GET
+#: /review/{run_id}` is declared on the same prefix with an `int` path parameter,
+#: so on a board predating this endpoint the path falls through to it,
+#: `next-door` fails that validation, and FastAPI answers **422**. That is what
+#: the live board really returned the day this was written. It reads like "your
+#: request was malformed" and means "this board is older than the feature".
 #:
-#: Both are CAPABILITY answers and neither is a fault to report — the same
-#: distinction `preland.check_queue` draws on its own 404, and the reason
-#: `board_request` returns the status at all. A round is not less correct without
-#: hints, so a board that cannot serve them must be silent: a note on every round
-#: of every PR is a note that gets trained away, and the one that fires when
-#: something is genuinely wrong has to still be readable.
+#: **404 is therefore NOT absence, and treating it as absence hides a real
+#: answer.** `/review/next-door` raises 404 itself, for one specific and
+#: reportable thing: no run of this PR ever recorded a changed-file list, so the
+#: board cannot tell what this PR touches and has nothing to look for. Folded in
+#: with "old board" that becomes silence, and the round loses the one sentence
+#: that explains why its reviewers were told nothing — while `{run_id}` guarantees
+#: no board with a `/review` prefix can 404 for route absence anyway.
+#:
+#: The 422 branch is a CAPABILITY answer and is silent, on the distinction
+#: `preland.check_queue` draws for its own 404 and the reason `board_request`
+#: returns the status at all: a round is not less correct without hints, and a
+#: note on every round of every PR is a note that gets trained away.
 #:
 #: A 422 from a board that DOES have the route would mean the parameters were
 #: refused, and the only parameter this sends that could be is `days` — clamped
 #: to `NEXT_DOOR_DAYS_MAX` before it leaves, precisely so this branch cannot
-#: swallow a real one.
-NEXT_DOOR_ABSENT = (404, 422)
+#: swallow a real one. That is an assumption about validation this code controls,
+#: and it is written down here so the next parameter added is checked against it.
+NEXT_DOOR_ABSENT = (422,)
+
+#: The board answered, and the answer is about THIS PR rather than about the
+#: board: no run of it recorded a changed-file list. Reported, because it is
+#: actionable in a way "the board is old" is not — it means this PR has never been
+#: panelled with file recording, and the fix is a round, not an upgrade.
+NEXT_DOOR_NO_FILES = 404
 
 
 def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict], str]:
@@ -278,6 +291,10 @@ def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict]
         # the feature, which is the ordinary state of a fleet mid-rollout and not
         # a fault anybody can act on.
         return [], ""
+    if code == NEXT_DOOR_NO_FILES:
+        return [], ("next-door context: the board has no changed-file list for "
+                    f"{gh_repo}#{pr_number}, so it could not look for defects "
+                    "confirmed in these files on other PRs")
     if err:
         return [], (f"next-door context: {err} — this round's reviewers were not "
                     "told what was confirmed in these files on other PRs")

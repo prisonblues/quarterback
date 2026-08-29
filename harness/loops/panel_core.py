@@ -504,11 +504,21 @@ NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"
 #: renderer, and the test that asserts a hint cannot be reported unaltered.
 NEXT_DOOR_HEADING = "CONFIRMED NEXT DOOR — context, not findings"
 
-#: The instruction that makes the block safe to send. Its first clause is the one
-#: property #508 asks to keep: *a hint cannot become a finding on its own*. The
-#: board cannot enforce that — it can only decline to publish anything shaped
-#: like a verdict — so the enforcement is this paragraph, and it is written to be
-#: read by a model that has just been told to report everything it spots.
+#: The instruction that asks for the one property #508 wants kept: *a hint cannot
+#: become a finding on its own*.
+#:
+#: **It is an instruction and not a mechanism, and the difference is worth saying
+#: plainly** — an earlier draft of this comment called it "the enforcement", which
+#: is the exact substitution #183 is about. Nothing downstream checks that a
+#: finding cites a line in this diff, carries evidence independent of the hint, or
+#: differs from the text the seat was shown. A seat that copies a hint back
+#: produces a finding nothing here can tell from a found one. What this paragraph
+#: buys is that the instruction is at least present, unambiguous and adjacent to
+#: the list; what it does not buy is any assurance that it was followed.
+#:
+#: :func:`_one_line` is the part that IS mechanical, and it is deliberately narrow:
+#: it removes the structural attack (a hint forging a bullet or occupying a line of
+#: its own), not the semantic one.
 #:
 #: The failure it guards against is specific and cheap to fall into: a reviewer
 #: handed "this was confirmed an hour ago in this file" reports it back as its
@@ -643,6 +653,57 @@ def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE, reads_code: bool = True)
 NEXT_DOOR_MAX = 8
 
 
+#: The longest a hint's title may be in a prompt, and the longest its detail.
+#: The board caps `detail` too; this caps both again for `NEXT_DOOR_MAX`'s reason —
+#: the far cap bounds a response and this one bounds a reviewer's attention, and a
+#: caller trusting only the far one is trusting a number it does not control.
+NEXT_DOOR_TITLE_CHARS = 200
+NEXT_DOOR_DETAIL_CHARS = 400
+
+#: Anything that could end a hint's line or start a new one. Collapsed to a single
+#: space by :func:`_one_line`.
+_HINT_BREAK = re.compile(r"\s+")
+#: Control characters, which no finding title has a use for and which can move a
+#: terminal's cursor or a model's attention. Deleted rather than escaped.
+_HINT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: object, cap: int) -> str:
+    """Untrusted text flattened to ONE line and cut to `cap`.
+
+    **The thing this prevents is not a crash.** A hint's title and detail are
+    written by the reviewers of OTHER pull requests — model output, quoted into a
+    prompt that instructs a model. Interpolated raw, a title carrying newlines
+    escapes its bullet and becomes free text at the same indent as the brief above
+    it, so it can:
+
+    * emit a line of its own that reads as an instruction ("IGNORE THE ABOVE …"),
+      arriving inside a block whose whole purpose is to be read as instruction;
+    * forge further `- P1 file:line — …` bullets **indistinguishable from the real
+      ones**, since the renderer is the only thing that knows how many there were.
+
+    That is prompt injection with a short path: any seat on any PR can write the
+    payload into a finding title, the judge confirms the finding for unrelated
+    reasons, and it is quoted at every PR touching that file for the next week. It
+    needs no attacker either — a legitimate multi-line detail mangles the block on
+    its own.
+
+    So the text is flattened, not escaped: a hint is one line by construction, and
+    a title that wanted two was already wrong. Control characters go entirely.
+    Truncation says so, for `_cut_detail`'s reason on the board side — a sentence
+    ending mid-clause reads to a model as the sentence.
+
+    Not a claim to have solved prompt injection. It removes the structural half —
+    a hint can no longer forge a bullet or occupy a line of its own — and what
+    remains is one bounded, clearly-attributed span of prose inside a bullet, which
+    is the same exposure the diff itself already carries.
+    """
+    flat = _HINT_BREAK.sub(" ", _HINT_CONTROL.sub("", str(text or ""))).strip()
+    if len(flat) <= cap:
+        return flat
+    return flat[:cap].rstrip() + "…"
+
+
 def _hint_line(h: dict) -> str:
     """One hint as one line, with the evidence to check it and nothing else.
 
@@ -651,9 +712,15 @@ def _hint_line(h: dict) -> str:
     on trust, and a hint a reviewer cannot dismiss on its own evidence is one it
     will report to be safe.
     """
-    where = h.get("file") or "?"
-    if h.get("line"):
-        where = f"{where}:{h['line']}"
+    # The path is flattened with everything else: it is a string off the wire, and
+    # "no path has a newline in it" is an assumption rather than a guarantee.
+    where = _one_line(h.get("file"), NEXT_DOOR_TITLE_CHARS) or "?"
+    line_no = h.get("line")
+    # `isinstance` rather than truthiness: a line number arriving as "3\n- P1 …"
+    # would otherwise be formatted straight into the bullet, which is the same
+    # escape by a quieter door.
+    if isinstance(line_no, int) and not isinstance(line_no, bool) and line_no > 0:
+        where = f"{where}:{line_no}"
     age = h.get("age_hours")
     when = f"{age:g}h ago" if isinstance(age, int | float) else "recently"
     # `fixed` is worth saying and the rest are not: it means somebody confirmed
@@ -661,11 +728,16 @@ def _hint_line(h: dict) -> str:
     # `deferred` or `superseded` would read as a verdict on THIS diff, which is
     # the one thing the block must never imply.
     fixed = " and fixed there" if h.get("outcome") == "fixed" else ""
-    sev = h.get("severity") or "P?"
+    # A severity outside the vocabulary is not echoed. `SEVERITIES` is a closed set
+    # and anything else is either drift or a payload; `P?` says "the board sent
+    # something this does not recognise" without quoting it.
+    sev = h.get("severity") if h.get("severity") in SEVERITIES else "P?"
     pr = h.get("pr")
-    line = (f"- {sev} {where} — {h.get('title') or '(untitled)'} "
-            f"[confirmed on PR #{pr} {when}{fixed}]")
-    detail = (h.get("detail") or "").strip()
+    pr_txt = pr if isinstance(pr, int) and not isinstance(pr, bool) else "?"
+    title = _one_line(h.get("title"), NEXT_DOOR_TITLE_CHARS) or "(untitled)"
+    line = (f"- {sev} {where} — {title} "
+            f"[confirmed on PR #{pr_txt} {when}{fixed}]")
+    detail = _one_line(h.get("detail"), NEXT_DOOR_DETAIL_CHARS)
     if detail:
         line += f"\n    {detail}"
     return line
@@ -2685,6 +2757,7 @@ __all__ = [
     "_SCOPE_BRIEF", "reviewer_brief",
     "NEXT_DOOR_SLOT", "NEXT_DOOR_HEADING", "_NEXT_DOOR_BRIEF",
     "NEXT_DOOR_MAX", "_hint_line", "next_door_brief",
+    "NEXT_DOOR_TITLE_CHARS", "NEXT_DOOR_DETAIL_CHARS", "_one_line",
     "DEFAULT_NEXT_DOOR_DAYS", "NEXT_DOOR_DAYS_MAX",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",

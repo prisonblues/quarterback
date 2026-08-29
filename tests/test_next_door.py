@@ -377,8 +377,87 @@ async def test_a_long_detail_is_cut_and_says_that_it_was(client, repo):
 
 async def test_the_default_limit_is_the_documented_one(client, repo):
     """The cap is part of the contract — a caller that never passes `limit` is
-    entitled to know what it got."""
-    await record(client, repo, 1, changed_files=files(AUTH))
-    body = await next_door(client, repo, 1)
-    assert body["hints_dropped"] == 0
-    assert len(body["hints"]) <= NEXT_DOOR_LIMIT
+    entitled to know what it got.
+
+    It has to be exercised with MORE hints than the cap. An earlier version of
+    this recorded none and asserted `len(hints) <= NEXT_DOOR_LIMIT`, which is
+    vacuously true of an empty list and would have passed against any default at
+    all, including a broken one.
+    """
+    over = NEXT_DOOR_LIMIT + 3
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding(f"finding {i}", key=f"k{i}") for i in range(over)])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    body = await next_door(client, repo, 2)
+    assert len(body["hints"]) == NEXT_DOOR_LIMIT
+    assert body["considered"] == over
+    assert body["hints_dropped"] == over - NEXT_DOOR_LIMIT
+
+
+# ---- 5. what the newest observation actually said -------------------------
+
+
+async def test_a_defect_a_later_round_dismissed_is_not_resurrected(client, repo):
+    """**The filter-order regression.**
+
+    Round 1 confirms a defect; a later round of the same PR raises it again and
+    the judge DISMISSES it. Written the obvious way — `verdict == "confirmed"` in
+    the WHERE, before the newest-per-key pick — the dismissal is deleted from the
+    population first and the stale round-1 confirmation is resurrected as "the
+    newest observation". This endpoint would then quote as confirmed a finding
+    that PR's own judge has since thrown out, and `GET /review/findings` would
+    disagree with it.
+
+    The outcome table cannot catch this: a later judge dismissal is not an
+    outcome, so nothing in `review_finding_outcomes` records it.
+    """
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("thought better of", key="turned")])
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 dismissed=[finding("thought better of", key="turned")])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    body = await next_door(client, repo, 2)
+    assert body["hints"] == [], "a dismissed defect was resurrected from an older round"
+
+
+async def test_a_defect_dismissed_then_confirmed_again_is_carried(client, repo):
+    """The same rule in the other direction, so the fix is a REORDERING and not a
+    second exclusion: a defect the judge dismissed and a later round confirmed is
+    live again, and the newest observation is what says so."""
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 dismissed=[finding("wrong at first", key="revived")])
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("wrong at first", key="revived")])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    assert titles(await next_door(client, repo, 2)) == ["wrong at first"]
+
+
+async def test_the_cap_is_stable_across_identical_calls(client, repo):
+    """Every finding of one run shares its `ts` and its `run_id`, so ordering on
+    those two alone leaves the cap free to return a different subset each time.
+    Two identical calls that disagree about which defects a reviewer is shown is a
+    round that cannot be reproduced from its own record."""
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding(f"same instant {i}", key=f"s{i}") for i in range(6)])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    first = titles(await next_door(client, repo, 2, limit=3))
+    for _ in range(4):
+        assert titles(await next_door(client, repo, 2, limit=3)) == first
+
+
+async def test_considered_counts_the_population_the_rows_came_from(client, repo):
+    """`considered` rides on the rows as a window count rather than arriving from a
+    second statement. Two statements get two snapshots under READ COMMITTED, so a
+    run recorded between them makes `considered` describe a population the rows
+    were not drawn from — and `hints_dropped` a number about neither."""
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding(f"f{i}", key=f"c{i}") for i in range(5)])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    body = await next_door(client, repo, 2, limit=2)
+    assert body["considered"] == 5
+    assert body["hints_dropped"] == 5 - len(body["hints"]) == 3
