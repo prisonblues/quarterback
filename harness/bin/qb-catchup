@@ -326,7 +326,20 @@ else
     fi
   fi
 fi
-[ "$FETCH_FAILED" = 1 ] && say "  ! the fetch did not complete, so remote-tracking refs may be older than this sweep — what exists only on this disk was still measured against them, and no worktree below is called finished with"
+# AND THE MEASUREMENT CLAIM ONLY HOLDS IF THE MEASUREMENT HAPPENED. These two
+# banners fire from independent conditions and a run can trip both — an unreachable
+# single-branch clone, or a dead remote plus an orphaned `refs/remotes/ghost/*` — so
+# the fetch line saying "was still measured against them" printed directly above
+# `ASK_WHY` saying "was not asked". Flatly contradictory, and the half that is wrong
+# is the reassuring one. When the question was refused this says only the stale-refs
+# half and leaves the rest to `ASK_WHY`.
+if [ "$FETCH_FAILED" = 1 ]; then
+  if [ "$ASK_STRANDED" = 1 ]; then
+    say "  ! the fetch did not complete, so remote-tracking refs may be older than this sweep — what exists only on this disk was still measured against them, and no worktree below is called finished with"
+  else
+    say "  ! the fetch did not complete, so remote-tracking refs may be older than this sweep"
+  fi
+fi
 [ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
 
 # `_spell_since` in qb-doctor, in shell and for the same reason: the reader has to

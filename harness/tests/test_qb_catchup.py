@@ -68,6 +68,21 @@ def commit(where, name, text="x", days_ago=0, seconds_ahead=0):
                    capture_output=True, text=True, check=True, env=env)
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_git(monkeypatch, tmp_path):
+    """No global or system git config reaches these tests.
+
+    The sibling of `test_qb_doctor.py`'s `_hermetic_git`, for the reason its
+    docstring gives — this host's `~/.gitconfig` made a check take the wrong branch
+    there. It matters here now because #573 made this tool's answer a function of
+    exactly that surface: `remote.<r>.fetch` and the `refs/remotes/` inventory, either
+    of which a developer's config can add to, and a run that also executes `qb-doctor`
+    in-process against the same repo.
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitconfig-system"))
+
+
 @pytest.fixture
 def fleet(tmp_path):
     """A bare 'remote', a main checkout tracking it, and a way to add worktrees.
@@ -788,6 +803,24 @@ def test_a_fetch_that_failed_withholds_the_reassurance(fleet):
     assert "nothing on it is missing from every remote" not in done.stdout, done.stdout
     assert "was not established" in done.stdout, (
         "it neither reassured nor hedged, which reads as a clean answer")
+
+
+def test_a_failed_fetch_does_not_claim_a_measurement_the_refspec_refused(fleet):
+    """Both banners fire from their own condition, and a repository can trip both: the
+    remote is unreachable AND its refspecs disqualify the question. The fetch line used
+    to assert the measurement happened ("was still measured against them") directly
+    above the line saying it was not asked."""
+    git(fleet.main, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete" in done.stdout, done.stdout
+    assert "was still measured against them" not in done.stdout, (
+        "it claimed a measurement the refspec guard had just refused")
+    assert "excludes" in done.stdout, (
+        "the refusal's own reason went unsaid, leaving the fetch line unexplained")
 
 
 def test_one_unreachable_remote_does_not_silence_the_question_for_the_others(fleet):
