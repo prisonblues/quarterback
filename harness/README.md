@@ -1543,6 +1543,7 @@ because the branch happened to be pushed: luck, not design.
 | commits on no remote ref, inside the window | left alone — *"work in flight, which is the ordinary state"* |
 | the stranded question could not be asked | left alone, and every line **says so** rather than reading as clean |
 | a fetch that would not complete | said once — the question is still asked, but nothing is called *finished with* |
+| a fetch that would not complete, **and** the question was refused | said shorter — only that the refs may be stale; the refusal's own line gives the reason |
 | diverged from upstream | left alone — "that is a rebase, not a fast-forward" |
 | its upstream was deleted, nothing stranded on it | left alone — *"probably merged and deleted, so this worktree is finished with"* |
 | its upstream was deleted, something stranded on it | left alone — *"not finished with"*, with the count and the age |
@@ -1580,7 +1581,10 @@ signal. But stale refs do not mislead symmetrically. *"N commits here exist nowh
 else"* off older refs is at worst crying wolf; *"finished with"* off older refs sends
 someone to delete the only copy of something. So the sweep says once that the fetch did
 not complete — no remote URL, because git quotes credentials in those — still asks the
-question, still shouts, and demotes only the reassuring verdict to a hedge.
+question, still shouts, and demotes only the reassuring verdict to a hedge. A run can
+trip both guards at once, though, and then that line says less: when the question was
+*also* refused it stops at the stale-refs half rather than claiming a measurement
+nothing took, and the refusal's own `!` line underneath gives the reason.
 
 **It sweeps WORKTREES, which is a real limit and not an oversight.** A branch checked out
 nowhere is outside it by construction — on zeus that was six of the eleven branches

@@ -823,6 +823,47 @@ def test_a_failed_fetch_does_not_claim_a_measurement_the_refspec_refused(fleet):
         "the refusal's own reason went unsaid, leaving the fetch line unexplained")
 
 
+def test_a_failed_fetch_and_a_refused_question_do_not_call_a_worktree_finished_with(fleet):
+    """The banner is not the verdict, and the verdict is the half that deletes things.
+
+    The combined condition above asserts only what the run-level line says. Here the
+    same repository also carries the shape that loses work — a worktree whose upstream
+    is gone — so `stranded_state` never leaves `unknown` and the per-worktree line has
+    to hedge. A regression that kept "finished with" under a failed fetch plus a
+    refused question would leave every banner test green."""
+    wt = fleet.worktree("feat/landed")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    git(fleet.main, "push", "-q", "origin", "--delete", "feat/landed")
+    git(fleet.main, "fetch", "-q", "--prune", "origin")
+    git(fleet.main, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete" in done.stdout, done.stdout
+    assert "was still measured against them" not in done.stdout, done.stdout
+    assert "so this worktree is finished with" not in done.stdout, (
+        "a directory was called disposable out of a measurement nothing took")
+    assert "its upstream is gone, so the branch was probably merged and deleted" in (
+        done.stdout), done.stdout
+
+
+def test_a_failed_fetch_still_says_what_it_did_measure_when_the_question_stood(fleet):
+    """The long half of the split, and the only assertion in this file that it is ever
+    printed. Every other failed-fetch test here checks an absence, so the `ASK_STRANDED=1`
+    branch could be deleted outright and the suite would stay green — leaving a run that
+    did measure the disk against its refs silently indistinguishable from one that did
+    not. Healthy refspecs, unreachable remote."""
+    git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert ("the fetch did not complete, so remote-tracking refs may be older than this "
+            "sweep — what exists only on this disk was still measured against them, "
+            "and no worktree below is called finished with") in done.stdout, done.stdout
+
+
 def test_one_unreachable_remote_does_not_silence_the_question_for_the_others(fleet):
     """One dead remote fails `--all`, and that status used to refuse the question for the
     whole run — including for the remotes that answered. It now costs the reassurance."""
