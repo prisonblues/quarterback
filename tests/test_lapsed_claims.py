@@ -338,14 +338,38 @@ def _repo_with(tmp_path, commits: list[str], branch: str = "feat/qb-dash-buttons
     return root
 
 
+def _elsewhere(qd) -> str:
+    """A host name that is definitely not this one.
+
+    Not a literal. `_recorded_tree_lines` decides which branch to take by
+    comparing the recorded host against `this_host()`, so a fixture that spells a
+    real machine asserts something about *where the suite is running*: on the box
+    it names, the two strings are equal, the same-box branch is taken, and a test
+    whose whole subject is the other-box message tests the opposite case. #595 —
+    the name spelled here used to be `hermes`, which is a machine in this fleet,
+    and the suite was red there and green everywhere else including CI.
+    """
+    return "zeus" if qd.this_host() != "zeus" else "hermes"
+
+
 def test_a_tree_recorded_on_another_box_is_unknown_here_not_gone(tmp_path):
     qd = _qbdata()
+    other = _elsewhere(qd)
     lines = "\n".join(qd.lapsed_redirect(
-        {"redirect": "…", "worktree": {"branch": "feat/issue-563", "host": "hermes"}},
+        {"redirect": "…", "worktree": {"branch": "feat/issue-563", "host": other}},
         str(tmp_path)))
-    assert "hermes" in lines and qd.this_host() in lines
+    assert other in lines and qd.this_host() in lines
     assert "cannot" in lines, "could-not-check is not nothing-to-report"
     assert "gone" not in lines and "pruned" not in lines
+
+
+def test_the_other_box_fixture_cannot_collide_with_the_box_it_runs_on():
+    """The guard for #595 itself, and the reason it is a test rather than a
+    comment: the bug was invisible on every machine but one, so what has to be
+    pinned is the property the fixture must have — not the string it happens to
+    produce on whichever box ran the suite last."""
+    qd = _qbdata()
+    assert _elsewhere(qd) != qd.this_host()
 
 
 def test_a_tree_that_was_pruned_still_points_at_the_branch_that_has_the_work(tmp_path):
