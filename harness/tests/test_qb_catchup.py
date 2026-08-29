@@ -755,28 +755,44 @@ def test_the_grace_window_agrees_with_qb_doctor():
 # rather than loud, which is the dangerous direction for a warning about lost work.
 
 
-def test_a_fetch_that_failed_names_the_remote_and_the_reason(fleet):
-    """It used to refuse the question outright and say only "the fetch did not complete",
-    which is a standard `--no-fetch` has never been held to: the refs are still there and
-    still subtracted, merely older than this sweep. Naming the remote is the difference
-    between a fault to go and look for and a fact about a box that is off."""
+def test_a_fetch_that_failed_still_warns_about_work_that_exists_nowhere_else(fleet):
+    """It used to refuse the question outright. `fetch --all` exits non-zero if ANY
+    remote fails, so one permanently dead remote bought the hedge on every line of every
+    merge for ever and never the signal. Warning off older refs is at worst crying wolf."""
     git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
     commit(fleet.main, "mine-only", days_ago=19)
 
     done = fleet.run(fetch=True)
     assert done.returncode == 0, done.stderr
-    assert "the fetch did not complete for `origin`" in done.stdout, done.stdout
-    assert "gone.git" in done.stdout, "git's own reason was thrown away with 2>/dev/null"
-    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+    assert "the fetch did not complete" in done.stdout, done.stdout
+    assert "1 commit on it is on no remote ref" in done.stdout, (
+        "a failed fetch silenced the question it exists to ask")
+    assert "19 days old" in done.stdout, done.stdout
+
+
+def test_a_fetch_that_failed_withholds_the_reassurance(fleet):
+    """The other half, and the whole of the rule: "finished with" and "nothing on it is
+    missing" are safety claims, and off refs nobody refreshed they send someone to delete
+    the only copy of something. So the reassurance hedges where the warning does not."""
+    wt = fleet.worktree("feat/landed")
+    git(wt, "push", "-q", "-u", "origin", "feat/landed")
+    git(fleet.main, "push", "-q", "origin", "--delete", "feat/landed")
+    git(fleet.main, "fetch", "-q", "--prune", "origin")
+    git(fleet.main, "remote", "set-url", "origin", str(fleet.tmp / "gone.git"))
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete" in done.stdout, done.stdout
+    assert "so this worktree is finished with" not in done.stdout, (
+        "a safety claim was made out of refs nobody refreshed")
+    assert "nothing on it is missing from every remote" not in done.stdout, done.stdout
+    assert "was not established" in done.stdout, (
+        "it neither reassured nor hedged, which reads as a clean answer")
 
 
 def test_one_unreachable_remote_does_not_silence_the_question_for_the_others(fleet):
-    """`git fetch --all` exits non-zero if ANY remote fails, and that single status used
-    to refuse the stranded question for the whole run. `qb-hook` passes no `--no-fetch`,
-    so a machine carrying one permanently-dead remote — a retired fork, a box that is off
-    — got the hedge on every worktree line on every merge, for ever, and never the
-    signal. That is worse than the line this replaced, so the failure is now per-remote:
-    named, and not a veto."""
+    """One dead remote fails `--all`, and that status used to refuse the question for the
+    whole run — including for the remotes that answered. It now costs the reassurance."""
     git(fleet.main, "remote", "add", "retired", str(fleet.tmp / "retired.git"))
     git(fleet.main, "config", "remote.retired.fetch",
         "+refs/heads/*:refs/remotes/retired/*")
@@ -784,25 +800,10 @@ def test_one_unreachable_remote_does_not_silence_the_question_for_the_others(fle
 
     done = fleet.run(fetch=True)
     assert done.returncode == 0, done.stderr
-    assert "the fetch did not complete for `retired`" in done.stdout, done.stdout
-    assert "`origin`" not in done.stdout, "the working remote was blamed too"
+    assert "the fetch did not complete" in done.stdout, done.stdout
     assert "1 commit on it is on no remote ref" in done.stdout, (
         "one dead remote silenced the whole question")
     assert "19 days old" in done.stdout, done.stdout
-
-
-def test_every_remote_is_fetched_even_when_an_earlier_one_failed(fleet):
-    """The loop is fed by a here-string, so a `git fetch` that read stdin — a credential
-    prompt on an unreachable remote is exactly this case — would swallow the remaining
-    remote names and those would silently never be fetched at all."""
-    git(fleet.main, "remote", "add", "aaa-dead", str(fleet.tmp / "dead.git"))
-    fleet.stub_git_that_records()
-
-    done = fleet.run(fetch=True)
-    assert done.returncode == 0, done.stderr
-    fetched = [c for c in fleet.git_ran("fetch") if "--prune" in c]
-    assert any("aaa-dead" in c for c in fetched), fetched
-    assert any(c.endswith("origin") for c in fetched), fetched
 
 
 def test_a_namespace_under_refs_remotes_that_is_not_a_remote_refuses_the_question(fleet):

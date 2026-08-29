@@ -105,51 +105,31 @@ done
 
 git -C "$DIR" rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository: $DIR"
 
-# THE REMOTES ONCE, ABOVE THE FETCH. The fetch below is per-remote and the refspec
-# audit further down needs the same list, so it is read here and both use it.
-if REMOTES=$(git -C "$DIR" remote 2>/dev/null); then REMOTES_READ=1; else REMOTES_READ=0; REMOTES=""; fi
-
 # ONE FETCH FOR EVERY WORKTREE, and that is a property of git rather than an
 # optimisation worth checking: linked worktrees share the common git directory,
 # so remote-tracking refs are shared too. Fetching once in any of them advances
 # `@{u}` for all of them. Bounded, because this runs from a hook: a remote that
 # hangs must cost the catch-up, never the turn.
 #
-# ONE REMOTE AT A TIME, WHERE THIS WAS `--all`, AND A FAILURE IS NAMED RATHER THAN A
-# VETO. `--all` exits non-zero if ANY remote fails, so one permanently-unreachable one —
-# a retired fork, a box that is off — was a failed status on every sweep for ever; and
-# `qb-hook` passes no `--no-fetch`, so that machine got the hedge on every worktree line
-# on every merge and never the signal. The feature off, silently, and worse than the
-# line it replaced.
+# THE STATUS IS KEPT NOW, WHERE IT USED TO BE `|| true`. The fast-forward still runs
+# on a fetch that failed — acting on what is already here is the whole point of
+# `--no-fetch` and a remote that is down must not stop the sweep. But the
+# stranded-work question is measured AGAINST those refs, so a fetch that did not
+# happen is a fetch whose answer is worth less than it looks. `--all` exits non-zero
+# when any remote fails, which is the granularity the question needs: one stale remote
+# contaminates a result that subtracts all of them. What is done with that status is
+# settled below — it is no longer a veto.
 #
-# SO THE QUESTION IS STILL ASKED. Those refs are still there and still subtracted, only
-# older than this sweep — the same "staleness cuts both ways" trade documented below,
-# accepted by `qb-doctor`, and already allowed here for `--no-fetch`, which is the hook's
-# own path. The remote and git's own reason are said once instead.
-#
-# THE BUDGET IS THE SWEEP'S AND NOT EACH REMOTE'S: `--all` was bounded once at
-# FETCH_TIMEOUT, and one at a time under that same flag would multiply it by the number
-# of remotes, inside `qb-hook`'s 25s.
-FETCH_WARN=""
-if [ "$FETCH" = 1 ] && [ -n "$REMOTES" ]; then
-  n=$(printf '%s\n' "$REMOTES" | grep -c .) || n=1
-  [ "$n" -gt 0 ] || n=1
-  per=$(( FETCH_TIMEOUT / n )); [ "$per" -gt 0 ] || per=1
-  bound=()
-  command -v timeout >/dev/null 2>&1 && bound=(timeout "$per")
-  while IFS= read -r rem; do
-    [ -n "$rem" ] || continue
-    # STDERR KEPT, WHERE IT WAS `2>/dev/null`. "the fetch did not complete" sends the
-    # reader to look for a fault with no idea which remote or why; git already knows
-    # both and was being thrown away.
-    # `</dev/null` because the loop is fed by a here-string: a fetch that prompted for
-    # a credential would eat the remaining remote names and skip those remotes silently.
-    err=$("${bound[@]}" git -C "$DIR" fetch --quiet --prune "$rem" </dev/null 2>&1 >/dev/null) && continue
-    # THE FIRST non-empty line: git puts the diagnosis at the top ("does not appear to
-    # be a git repository") and the boilerplate advice at the bottom.
-    why=$(printf '%s' "$err" | awk 'NF { print; exit }')
-    FETCH_WARN="${FETCH_WARN:+$FETCH_WARN; }\`$rem\` (${why:-no reason given})"
-  done <<< "$REMOTES"
+# AND STDERR STAYS DISCARDED. Naming which remote failed and why was tried and taken
+# out: git quotes the remote URL in its diagnostics and a URL carries userinfo, so
+# `https://user:TOKEN@host/...` lands in a hook transcript that gets pasted around.
+FETCH_FAILED=0
+if [ "$FETCH" = 1 ]; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$FETCH_TIMEOUT" git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || FETCH_FAILED=1
+  else
+    git -C "$DIR" fetch --quiet --all --prune 2>/dev/null || FETCH_FAILED=1
+  fi
 fi
 
 # CAN `--not --remotes` BE TRUSTED IN THIS REPOSITORY? Once for the sweep, not once
@@ -184,8 +164,14 @@ fi
 #     and accepts it, because the only cure is a prune and a prune destroys the refs
 #     that make some commits reachable.
 #
-# A fetch that FAILED lands in the second of those, is named above, and is answered
-# anyway — see the comment on the fetch for why, and for what it used to do instead.
+# A FAILED FETCH THEREFORE WARNS AND DOES NOT REASSURE, where it used to refuse the
+# question outright. Refusing was worse than it looked: `--all` fails if ANY remote does
+# and the hook never passes `--no-fetch`, so one permanently-dead remote — a retired
+# fork, a box that is off — bought the hedge on every line of every sweep for ever and
+# never the signal. But the two directions above do not cost the same: a warning off refs
+# nobody refreshed is at worst crying wolf, while "finished with" off them sends someone
+# to delete the only copy of something. So the question is still asked and still shouts,
+# and only the safety claim is withheld — see the `none` demotion in the worktree loop.
 ASK_STRANDED=1
 ASK_WHY=""
 # THE QUESTION DOES NOT ARISE, which is not the same as "could not be answered". A
@@ -198,7 +184,7 @@ STRANDED_MOOT=0
 # `refs/remotes/` is one that some remote refreshes, and the only thing that can answer
 # that is a refspec DESTINATION. See the comment on that loop.
 COVERED=()
-if [ "$REMOTES_READ" = 0 ]; then
+if ! REMOTES=$(git -C "$DIR" remote 2>/dev/null); then
   ASK_STRANDED=0
   ASK_WHY="git would not list this repository's remotes, so what exists only on this disk was not asked"
 elif [ -z "$REMOTES" ]; then
@@ -340,7 +326,7 @@ else
     fi
   fi
 fi
-[ -n "$FETCH_WARN" ] && say "  ! the fetch did not complete for $FETCH_WARN, so its refs are as old as the last one that did — what exists only on this disk was still measured against them"
+[ "$FETCH_FAILED" = 1 ] && say "  ! the fetch did not complete, so remote-tracking refs may be older than this sweep — what exists only on this disk was still measured against them, and no worktree below is called finished with"
 [ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
 
 # `_spell_since` in qb-doctor, in shell and for the same reason: the reader has to
@@ -536,6 +522,10 @@ while IFS= read -r wt; do
       fi
     fi
   fi
+  # AND A FAILED FETCH DEMOTES THE REASSURANCE AND NOTHING ELSE. `none` is the only
+  # verdict that reads as "you may delete this directory"; `some` is a warning, and a
+  # warning off older refs is at worst crying wolf. See the fetch comment above.
+  [ "$FETCH_FAILED" = 1 ] && [ "$stranded_state" = none ] && stranded_state=unknown
   # AN UNANSWERED QUESTION SAYS SO, ON EVERY LINE THAT WOULD OTHERWISE READ AS AN
   # ANSWER. An empty note is indistinguishable from a clean result, so in a run where
   # the question was refused — a failed fetch, a partial refspec, a ref nothing

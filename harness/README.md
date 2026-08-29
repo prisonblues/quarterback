@@ -1542,7 +1542,7 @@ because the branch happened to be pushed: luck, not design.
 | commits on **no remote ref**, older than the grace window | left alone — *"if this disk failed that work is gone"* |
 | commits on no remote ref, inside the window | left alone — *"work in flight, which is the ordinary state"* |
 | the stranded question could not be asked | left alone, and every line **says so** rather than reading as clean |
-| a remote that would not fetch | named, with git's reason — the question is still answered from its older refs |
+| a fetch that would not complete | said once — the question is still asked, but nothing is called *finished with* |
 | diverged from upstream | left alone — "that is a rebase, not a fast-forward" |
 | its upstream was deleted, nothing stranded on it | left alone — *"probably merged and deleted, so this worktree is finished with"* |
 | its upstream was deleted, something stranded on it | left alone — *"not finished with"*, with the count and the age |
@@ -1572,14 +1572,15 @@ trusts, so the sweep prints one `!` line saying which, and no worktree line clai
 anything about stranded work. An empty note would be indistinguishable from a clean
 answer, which is how a safety claim gets made by accident.
 
-**A fetch that failed is named, not a veto.** Remotes are fetched one at a time, and the
-`!` line says *which* one did not answer and what git said about it. It used to be
-`fetch --all`, which exits non-zero if **any** remote fails — so one permanently dead
-remote (a retired fork, a box that is off) refused the question on every merge for ever,
-on a hook path that never passes `--no-fetch`, and that machine got the hedge in place of
-the signal on every worktree line. The refs of a remote that would not answer are still
-there and still subtracted; they are older than this sweep, which is the same staleness
-trade `--no-fetch` has always been allowed to make.
+**A fetch that failed warns, and does not reassure.** It used to refuse the question
+outright: `fetch --all` exits non-zero if **any** remote fails, so one permanently dead
+remote (a retired fork, a box that is off) bought the hedge on every worktree line of
+every merge for ever, on a hook path that never passes `--no-fetch`, and never the
+signal. But stale refs do not mislead symmetrically. *"N commits here exist nowhere
+else"* off older refs is at worst crying wolf; *"finished with"* off older refs sends
+someone to delete the only copy of something. So the sweep says once that the fetch did
+not complete — no remote URL, because git quotes credentials in those — still asks the
+question, still shouts, and demotes only the reassuring verdict to a hedge.
 
 **It sweeps WORKTREES, which is a real limit and not an oversight.** A branch checked out
 nowhere is outside it by construction — on zeus that was six of the eleven branches
