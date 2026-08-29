@@ -1595,7 +1595,6 @@ def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     return n
 
 
-
 def next_door_days(panel: dict, notes: list[str]) -> int:
     """`next_door_days` — whole days >= 0, how far back #508's hints may reach.
 
@@ -1663,6 +1662,7 @@ def next_door_days(panel: dict, notes: list[str]) -> int:
             "next-door context (#508)")
         return NEXT_DOOR_DAYS_MAX
     return n
+
 
 def distant_merge_lines(panel: dict, notes: list[str]) -> int | None:
     """`distant_merge_lines` — whole lines >= 0, or ``None`` for "never distant".

@@ -303,18 +303,19 @@ def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict]
                     f"with a {type(body).__name__}, not an object")
     hints = body.get(NEXT_DOOR_KEY)
     if hints is None:
-        # A CAPABILITY answer and not a failure, and — unlike `board_escalations`
-        # — not one worth naming two causes for. A board older than #508 has no
-        # such endpoint and answers 404, which `board_get` already reported above
-        # as an error; reaching HERE means the endpoint answered and omitted the
-        # field, which no shipped version does. Reported plainly rather than
-        # guessed at.
+        # NOT the capability case, which is the whole reason this branch says
+        # something rather than nothing. A board older than #508 has no such
+        # endpoint and answers 404 or 422, and `NEXT_DOOR_ABSENT` above has
+        # already swallowed both in silence; reaching HERE means the endpoint
+        # answered and then omitted the field, which no shipped version does.
+        # Reported plainly rather than guessed at.
         return [], ("next-door context: the board answered /review/next-door "
                     f"with no `{NEXT_DOOR_KEY}`")
     if not isinstance(hints, list):
         return [], (f"next-door context: `{NEXT_DOOR_KEY}` came back as a "
                     f"{type(hints).__name__}, not a list")
     return [h for h in hints if isinstance(h, dict)], ""
+
 
 def announce_escalations(payload: dict, cfg: dict) -> list[str]:
     """Tell the board about every finding this round says a human has to settle.

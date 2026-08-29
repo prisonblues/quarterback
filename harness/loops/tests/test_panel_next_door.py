@@ -13,7 +13,7 @@ to become a finding on its own. All the board can do is decline to publish
 anything shaped like a verdict; what stops a seat reporting a listed defect it
 never found is the paragraph in front of the list.
 
-So this file pins four things, and three of them are about what does NOT happen:
+So this file pins five things, and three of them are about what does NOT happen:
 
 * **the OFF path** — `next_door_days: 0` makes no board call at all and leaves the
   reviewer prompt byte-identical to its pre-#508 self. The same holds with the dial
@@ -30,7 +30,13 @@ So this file pins four things, and three of them are about what does NOT happen:
   the text because the text IS the mechanism;
 * **the MANIFEST round** — asks for no hints and is given none. Its whole
   instruction is "do not review the moved code", and a list of defects confirmed
-  in those files is an invitation to do exactly that.
+  in those files is an invitation to do exactly that;
+* **the SEAM** — that any of the above reaches a seat at all. Every prompt above
+  is built by `rendered()`, this file's own spelling of `panel.prompt_for`, which
+  is a closure inside `run()` and so cannot be called directly. A copy asserts on
+  the copy: cutting the swap out of `run()` altogether left every test here green
+  while every reviewer prompt shipped a raw `<<<NEXT_DOOR>>>` and no hint reached
+  anybody. The last three tests go through `run()` for that reason.
 
 A failure that costs the round nothing is a failure that gets REPORTED, never one
 that is silently swallowed: unlike `board_escalations`, an unreachable board here
@@ -47,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402
 import panel_seats  # noqa: E402
+from conftest import gh_stub  # noqa: E402
 
 
 #: The real fetch, captured at import — BEFORE any fixture has run, so this is the
@@ -457,3 +464,94 @@ def test_a_manifest_prompt_carries_no_slot_to_fill():
     confirmed in those same files is an invitation to do exactly that, so it gets
     none — and the template has no slot even if a future caller tries."""
     assert panel_core.NEXT_DOOR_SLOT not in panel_core.MOVE_MANIFEST_PROMPT
+
+
+# ---- the seam, through `run()` and not through a copy of it ----------------
+#
+# Everything above builds the prompt with `rendered()`, which is this file's own
+# spelling of what `panel.prompt_for` does. That is a useful spelling and it is not
+# evidence: `prompt_for` is a closure inside `run()`, so a copy of it asserts on the
+# copy. Deleting `.replace(NEXT_DOOR_SLOT, next_door)` from `run()` outright — which
+# would ship every reviewer prompt with a literal `<<<NEXT_DOOR>>>` in it and carry
+# no hint to any seat, ever — left the whole harness suite green.
+#
+# So these three go through `run()` to the one function that receives the finished
+# prompt, and they are the ones that fail when the wiring is cut rather than when
+# the copy is.
+
+
+def a_round(monkeypatch, prompts: list[str], panel_block: dict | None = None) -> None:
+    """`run()` with every outside edge pinned, collecting what each seat was sent.
+
+    Modelled on `test_panel_ci_brief`'s end-to-end round, and for its reason: the
+    fact under test is that a value computed in `run()` reaches a seat, and the only
+    place that can be observed is the call that dispatches one.
+    """
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
+        "github": "acme/board", "path": "/tmp/r",
+        "review_panel": {} if panel_block is None else panel_block,
+        "_rules_baseline": ".harness-rules.sample",
+        "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}})
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff="diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate",
+                        lambda *a, **k: ([], None, panel.CoverageRuling()))
+
+    def fake_review(name, model, prompt, effort="", **_kw):  # **_kw: code_tree since #113
+        prompts.append(prompt)
+        return panel.ReviewerRun([], None, 800, None)
+
+    monkeypatch.setattr(panel, "review_llm", fake_review)
+    assert panel.run("board", 34, post=False, record=False) == 0
+    assert prompts, "no seat was dispatched"
+
+
+def test_a_hint_reaches_the_seats_own_prompt_braces_and_all(monkeypatch):
+    """**The assertion the feature is worthless without.**
+
+    A hint fetched, rendered and swapped into the prompt the seat is actually
+    handed — end to end through `run()`, with a brace in the title so the ordering
+    is proved on the real render rather than on this file's copy of it. Under the
+    substituted-before-`.format` spelling the round dies with `KeyError: "'a'"`;
+    with the swap removed the prompt still carries the raw token.
+    """
+    answering(monkeypatch, {"hints": [hint(title="dict literal {'a': 1} in the handler")]})
+    prompts: list[str] = []
+    a_round(monkeypatch, prompts)
+    for p in prompts:
+        assert panel_core.NEXT_DOOR_SLOT not in p, "the slot was never filled"
+        assert panel_core.NEXT_DOOR_HEADING in p
+        assert "dict literal {'a': 1} in the handler" in p
+        assert "PR #493" in p
+
+
+def test_a_round_with_nothing_next_door_hands_the_seat_no_token(monkeypatch):
+    """The byte-identical claim, asserted where it matters. An unfilled slot is not
+    a cosmetic blemish: `<<<NEXT_DOOR>>>` in front of "Review for:" is a line of
+    unexplained machine text in a prompt whose every other line was written for the
+    model reading it."""
+    answering(monkeypatch, {"hints": []})
+    prompts: list[str] = []
+    a_round(monkeypatch, prompts)
+    for p in prompts:
+        assert panel_core.NEXT_DOOR_SLOT not in p
+        assert "NEXT DOOR" not in p
+        # No token at all, unqualified: `JUDGE_CODE_SLOT` is the judge's and
+        # never reaches here, so a `<<<` in a REVIEWER's prompt is always a fill
+        # that did not happen.
+        assert "<<<" not in p
+        assert "\n\nReview for:\n" in p
+
+
+def test_the_dial_off_reaches_the_seat_as_a_prompt_and_the_board_not_at_all(monkeypatch):
+    """`0` end to end: no board call from the round, and no seam in the prompt. The
+    off switch is the one path an operator can be certain of, so it is pinned
+    through `run()` rather than at the fetch alone."""
+    called: list = []
+    monkeypatch.setattr(panel, "board_request",
+                        lambda *a, **k: called.append(a) or ({}, "", 200))
+    prompts: list[str] = []
+    a_round(monkeypatch, prompts, panel_block={"next_door_days": 0})
+    assert called == [], "the dial was off and the round called the board anyway"
+    for p in prompts:
+        assert panel_core.NEXT_DOOR_SLOT not in p and "NEXT DOOR" not in p
