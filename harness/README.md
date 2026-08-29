@@ -2098,6 +2098,45 @@ doing to itself; this is the only one that is somebody's to act on. A zero still
 failed reports `?` rather than a confident nothing (#244). `w` in the clickable renderer,
 `--waiting` in the printed one, `QB_DASH_WAITING=1` to open that way.
 
+**AND IT PUTS THE PLAN IN ORDER** ([#443](https://github.com/prisonblues/quarterback/issues/443)).
+`m` marks a plan row, `k`/`j` move one place, `K`/`J` move five, `[`/`]` go to the ends, and
+`g` asks for a position. Marked rows move together, keeping the order you see them in.
+
+**The auth constraint that issue was written around has lifted, which is why this is now a
+small job and was not one then.** `POST /plan/reorder` depends on `app.auth.delegated`, not
+`human`, and that tier accepts a person's own `X-Human-Key` — the credential this dashboard
+already holds for the dial `✎` (#477). `auth.delegated` names the gap it closed in as many
+words: *"Rich with a browser could reorder the plan, and Rich at a terminal holding the very
+same key that `human()` accepts could not."* A move from here is stamped `ordered`, exactly as
+the browser's ▲▼ are, because it is the same person deciding.
+
+**The endpoint takes an order, never a move**, so up-one, jump-five, to-the-top and
+go-to-position are the same call with a differently computed array — #388's finding on the web
+board, reused rather than rediscovered. It is also why multi-select costs nothing extra at the
+wire: N items splice in together and it is still one request.
+
+**`g` asks for a POSITION, not the rank on the row, and the box says which one it is now.**
+Ranks go non-contiguous as work finishes — `prisonblues/quarterback` was on `1, 3, 4, 5, 10, …`
+with 37 open items when this was written — so "move it to 10" means two different rows
+depending on which number a person meant. It heals itself after one use: the endpoint
+renumbers the whole scope `1..n`, so the first reorder makes rank and position the same number.
+
+Three refusals, each naming its remedy, because a control that silently does nothing is
+indistinguishable from a broken one. A row with no order — a PR, an unplanned issue, a question
+owed to a person — says so. Rows marked across two scopes say so, because each plan has its own
+order and the endpoint reorders one exact scope. And **a truncated plan is refused outright**:
+the endpoint renumbers every open item in the scope and appends the ones the caller did not
+list, so an order computed from a partial list would silently move everything the pane was
+never sent.
+
+A move that changes nothing is **not sent** — the endpoint stamps `rank_source` on every item
+it is handed, so posting an unchanged order would write "a human chose this position" onto rows
+nobody touched (#183). And a second move while one is in flight is refused rather than stacked,
+which is `dial_writing`'s rule (#577) for its reason.
+
+The keys are letters because the arrows are the DataTable's cursor and always will be. The
+printed renderer has no input loop, so this is the clickable one's alone — as `s` already is.
+
 **The backlog is behind `b`** — open PRs review has finished with, and open issues nobody has
 planned or taken. They are a catalogue rather than state, and twelve rows of issue list was
 the biggest single consumer of the old frame. `--backlog` in the printed renderer, which has

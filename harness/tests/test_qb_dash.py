@@ -1655,6 +1655,272 @@ def test_w_shows_only_what_is_waiting_on_a_person():
     assert "open" not in title and "next" not in title, title
 
 
+#: A plan with three open items in one scope, one in another and one fleet-wide —
+#: enough to prove a move stays inside its own list.
+REORDER_PLAN = {
+    "items": [
+        {"item_id": "a", "repo": "prisonblues/quarterback", "state": "open",
+         "title": "first", "rank": 1, "rank_source": "ordered", "ref": None,
+         "blocked_by": [], "claim": None},
+        {"item_id": "b", "repo": "prisonblues/quarterback", "state": "open",
+         "title": "second", "rank": 3, "rank_source": "appended", "ref": None,
+         "blocked_by": [], "claim": None},
+        {"item_id": "c", "repo": "prisonblues/quarterback", "state": "open",
+         "title": "third", "rank": 9, "rank_source": "appended", "ref": None,
+         "blocked_by": [], "claim": None},
+    ],
+    "counts": {"open": 3}, "order_trust": {}, "next": None, "truncated": False,
+}
+
+
+async def _drive_reorder(keys=(), mark_rows=(), before=None, inside=None):
+    """Render a plan, press some keys, and record what would have been sent.
+
+    `run_reorder` is replaced rather than the client, so nothing reaches the board:
+    what is under test is the array this screen computes and the refusals it makes
+    before computing one.
+    """
+    app_module, app = _quiet_dash()
+    sent: list = []
+    async with app.run_test(size=(110, 46)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        # A key that resolves, so the write path is not refused for the one reason
+        # this driver is not about. `why_not()` is what the code asks.
+        app.human = SimpleNamespace(why_not=lambda: None, NO_KEY="no key")
+        app.run_reorder = lambda scope, order, moved: sent.append(
+            {"scope": scope, "order": order, "moved": moved})
+        app.render_plan(REORDER_PLAN, None)
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+        by_key = {str(rk.value): i for i, rk in enumerate(table.rows)}
+        if before:
+            before(app, table, by_key)
+        for want in mark_rows:
+            table.move_cursor(row=by_key[f"plan:{want}"], animate=False)
+            await pilot.pause(0.1)
+            await pilot.press("m")
+            await pilot.pause(0.1)
+        for key in keys:
+            await pilot.press(key)
+            await pilot.pause(0.3)
+        # ANYTHING THAT NEEDS THE APP ALIVE runs here. `app.screen` raises
+        # `ScreenStackError` once `run_test` has exited, so a driver that handed
+        # the app back and let the test look at a modal was asking a torn-down
+        # object what was on screen.
+        looked = inside(app, table, pilot) if inside else None
+        return app, sent, table, looked
+
+
+def test_a_nudge_sends_the_whole_order_for_one_scope():
+    """`POST /plan/reorder` takes an ORDER, never a move — so up-one, jump-five and
+    go-to-the-top differ only in the index handed to `reorder_ids` (#388's finding
+    on the web board, reused rather than rediscovered)."""
+    async def drive():
+        _, sent, _, _ = await _drive_reorder(
+            keys=("j",),
+            before=lambda a, t, by: t.move_cursor(row=by["plan:a"], animate=False))
+        return sent
+
+    sent = asyncio.run(drive())
+    assert len(sent) == 1, sent
+    assert sent[0]["scope"] == "prisonblues/quarterback"
+    assert sent[0]["order"] == ["b", "a", "c"], "down one did not move one place"
+    assert sent[0]["moved"] == 1
+
+
+def test_marked_rows_move_together_and_the_rank_cell_says_so():
+    """The mark goes on the RANK cell, which is the column marking is about: a row
+    is marked so the next move takes it, and the rank is where a move shows up."""
+    async def drive():
+        app, sent, table, _ = await _drive_reorder(mark_rows=("a", "b"))
+        # Narrow: glyph verb kind rank ref title why.
+        ranks = [str(table.get_row_at(i)[3]) for i in range(table.row_count)]
+        return app, sent, ranks
+
+    app, sent, ranks = asyncio.run(drive())
+    assert [r for r in ranks if r.startswith("▪")] == ["▪1", "▪~3"], ranks
+    assert len(app.marked) == 2
+
+
+def test_moving_marked_rows_keeps_the_order_they_are_shown_in():
+    async def drive():
+        _, sent, _, _ = await _drive_reorder(mark_rows=("a", "b"), keys=("]",))
+        return sent
+
+    sent = asyncio.run(drive())
+    assert sent and sent[0]["order"] == ["c", "a", "b"], sent
+    assert sent[0]["moved"] == 2
+
+
+def test_a_move_that_changes_nothing_is_not_sent():
+    """The endpoint stamps `rank_source` on every item it is handed, so an
+    unchanged order would write "a human chose this" onto rows nobody moved."""
+    async def drive():
+        app, sent, _, _ = await _drive_reorder(
+            keys=("k",),
+            before=lambda a, t, by: t.move_cursor(row=by["plan:a"], animate=False))
+        return app, sent
+
+    app, sent = asyncio.run(drive())
+    assert sent == [], "a no-op was sent to the board"
+    assert "already there" in app.detail_text, app.detail_text
+
+
+def test_a_row_with_no_order_says_so_rather_than_doing_nothing():
+    """A control that silently does nothing is indistinguishable from a broken one,
+    which is the rule the dim ⚒ already keeps one column over."""
+    async def drive():
+        app_module, app = _quiet_dash()
+        sent: list = []
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = SimpleNamespace(why_not=lambda: None, NO_KEY="no key")
+            app.run_reorder = lambda *a: sent.append(a)
+            app.render_prs(_TWO_REPOS_PRS[:1], None)
+            app.render_board({"agents": [], "claims": []})
+            await pilot.pause(0.2)
+            table = app.query_one("#work")
+            table.move_cursor(row=0, animate=False)
+            await pilot.pause(0.1)
+            await pilot.press("k")
+            await pilot.pause(0.3)
+            return app.detail_text, sent
+
+    said, sent = asyncio.run(drive())
+    assert sent == []
+    assert "only the plan has an order" in said, said
+
+
+def test_the_box_asks_for_a_position_and_says_which_one_it_is_now():
+    """Ranks go non-contiguous as work finishes — `prisonblues/quarterback` was on
+    `1, 3, 4, 5, 10, …` with 37 open items — so "move it to 10" means two different
+    rows depending on which number a person meant. The box states the position and
+    the length, and reads the typed number against those."""
+    async def drive():
+        _, _, _, looked = await _drive_reorder(
+            keys=("g",),
+            before=lambda a, t, by: t.move_cursor(row=by["plan:b"], animate=False),
+            inside=lambda a, t, p: (type(a.screen).__name__,
+                                    getattr(a.screen, "here", None),
+                                    getattr(a.screen, "total", None),
+                                    getattr(a.screen, "scope", "?")))
+        return looked
+
+    name, here, total, scope = asyncio.run(drive())
+    assert name == "MoveTo", name
+    assert (here, total) == (2, 3), f"the box says position {here} of {total}"
+    assert scope == "prisonblues/quarterback"
+
+
+def test_the_box_refuses_a_position_that_is_not_one_before_spending_a_round_trip():
+    async def drive():
+        def refuse(app, table, pilot):
+            box, out = app.screen, []
+            for typed in ("nine", "0", "99"):
+                box.query_one("#to").value = typed
+                box.action_save()
+                out.append(str(box.query_one("#why").content))
+            return out, type(app.screen).__name__
+
+        _, sent, _, looked = await _drive_reorder(
+            keys=("g",),
+            before=lambda a, t, by: t.move_cursor(row=by["plan:a"], animate=False),
+            inside=refuse)
+        said, still_open = looked
+        return said, still_open, sent
+
+    said, still_open, sent = asyncio.run(drive())
+    assert "not a position" in said[0], said[0]
+    assert "outside this plan" in said[1] and "outside this plan" in said[2], said
+    assert still_open == "MoveTo", "a refused number closed the box"
+    assert sent == []
+
+
+def test_a_second_move_while_one_is_in_flight_is_refused_not_stacked():
+    """`dial_writing`'s rule (#577) and for its reason: the worker is `exclusive`,
+    so a second press would cancel the write that was about to report — and seeing
+    nothing is exactly what makes a person press again."""
+    async def drive():
+        app, sent, _, _ = await _drive_reorder(
+            keys=("j", "j"),
+            before=lambda a, t, by: t.move_cursor(row=by["plan:a"], animate=False))
+        return app.detail_text, sent
+
+    said, sent = asyncio.run(drive())
+    assert len(sent) == 1, f"a second move was sent while one was in flight: {sent}"
+    assert "already going" in said, said
+
+
+def test_a_mark_the_filter_hides_is_still_moved():
+    """Reading the marks off the visible TABLE meant a row the `w` filter or the
+    `s` scope had since hidden was silently left out — so a person who marked
+    three rows and pressed a key was told "moved 2". That is the silent-narrowing
+    defect arriving at the one control that rewrites the fleet's shared intent."""
+    def hide_then_move(app, table, pilot):
+        # Hide everything: nothing here is waiting on a person, so `w` empties the
+        # table while the marks stay on this client.
+        app.waiting = True
+        app.plan_sig = None
+        app.render_work()
+        app.reorder("bottom")
+        table = app.query_one("#work")
+        return [str(rk.value) for rk in table.rows]
+
+    async def drive():
+        _, sent, _, showing = await _drive_reorder(mark_rows=("a", "b"),
+                                                   inside=hide_then_move)
+        return sent, showing
+
+    sent, showing = asyncio.run(drive())
+    assert not [k for k in showing if k.startswith("plan:")], \
+        f"the filter did not actually hide the marked rows: {showing}"
+    assert sent and sent[0]["moved"] == 2, \
+        f"a hidden mark was dropped from the move: {sent}"
+    assert sent[0]["order"] == ["c", "a", "b"], sent
+
+
+def test_a_mark_on_work_that_is_no_longer_open_refuses_the_whole_move():
+    """Every mark or none. An item somebody finished cannot be placed, and moving
+    the rest would quietly do less than was asked while reporting success."""
+    def finish_one_then_move(app, table, pilot):
+        # `b` is gone from the board's answer — done, or dropped.
+        app.plan = {**REORDER_PLAN,
+                    "items": [i for i in REORDER_PLAN["items"] if i["item_id"] != "b"]}
+        app.reorder("down")
+        return app.detail_text
+
+    async def drive():
+        _, sent, _, said = await _drive_reorder(mark_rows=("a", "b"),
+                                                inside=finish_one_then_move)
+        return sent, said
+
+    sent, said = asyncio.run(drive())
+    assert sent == [], "a partial move was sent"
+    assert "no longer open" in said, said
+
+
+def test_a_refused_move_keeps_the_marks():
+    """A write the board refused is the moment a person most wants to press the key
+    again, and clearing the selection first makes them mark three rows to do it."""
+    async def drive():
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.marked = {"plan:a", "plan:b"}
+            app.clear_reordering(moved=False)
+            kept = set(app.marked)
+            app.marked = {"plan:a", "plan:b"}
+            app.clear_reordering(moved=True)
+            return kept, set(app.marked)
+
+    kept, cleared = asyncio.run(drive())
+    assert kept == {"plan:a", "plan:b"}, "a failed move threw the selection away"
+    assert cleared == set(), "a move that landed left its marks behind"
+
+
 def _quiet_dash():
     """A Dash with every background worker off, for panels driven by hand.
 

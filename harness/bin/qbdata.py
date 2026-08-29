@@ -2535,6 +2535,135 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
     return clip(" · ".join(bits), 400)
 
 
+# ---- putting the plan in order, from the terminal ----------------------------
+#
+# #443: the plan could be read from four surfaces and reordered from exactly one,
+# and the person it belongs to works in a terminal. The record of what that cost
+# is a two-line exchange in that issue — *"i don't know how to re-order"*, then
+# *"so no TUI way to do it? html only?"*.
+#
+# THE AUTH CONSTRAINT THAT ISSUE WAS WRITTEN AROUND HAS LIFTED, which is why this
+# is now a small job and was not one then. `POST /plan/reorder` depends on
+# `app.auth.delegated`, not `human`, and that tier accepts a person's own
+# `X-Human-Key` — the credential this dashboard already holds for the dial `✎`
+# (#477). `auth.delegated` names the gap it closed in as many words: *"Rich with a
+# browser could reorder the plan, and Rich at a terminal holding the very same key
+# that `human()` accepts could not."*
+#
+# THE ENDPOINT TAKES AN ORDER, NEVER A MOVE. `POST /plan/reorder` is handed the
+# whole sequence for one exact scope, so nudging up one, jumping five, going to
+# the top and moving three marked rows to position 9 are all the SAME call with a
+# differently computed array — which is #388's finding on the web board, reused
+# here rather than rediscovered. It is also why multi-select costs nothing extra
+# at the wire: N items splice in together and it is still one request.
+
+#: How far a "jump" moves, in the words this was asked for on the web board
+#: (#388's `JUMP`). Quoted from there rather than chosen again, so the two
+#: surfaces move by the same amount when a person uses both.
+REORDER_JUMP = 5
+
+#: What the WHOLE order looks like when it is one scope's open items. `null` is
+#: the fleet-wide scope and is a real value, not a missing one — which is why
+#: every function here takes the scope as it was stored rather than as a slug
+#: `plan_repo` resolved: `project:65lowther` and `None` are both scopes and
+#: neither survives that resolution.
+
+
+def plan_scope_items(plan: dict | None, scope: str | None) -> list[dict]:
+    """One EXACT scope's open plan items, in the order the board has them.
+
+    Exact, because `POST /plan/reorder` is: *"the scope being reordered, EXACTLY:
+    `null` reorders the fleet-wide list"*, and a reorder that matched loosely
+    would renumber another scope's items behind the caller's back.
+
+    **The stored repo, not a resolved slug.** `plan_repo` exists to turn a plan
+    item's free-text repo into an `owner/name` a `gh` command can use, and it
+    answers `None` for a fleet-wide item and for `project:<name>` alike — so
+    grouping by it would put three different scopes in one bucket and reorder them
+    as one list.
+
+    Open only, because only open items have an order: the endpoint renumbers open
+    ones and refuses ids that are not, and a dropped item *"used to be re-ranked by
+    every reorder and named in `appended` while being absent from the `items` the
+    same response returned"*.
+    """
+    return [item for item in plan_items(plan)
+            if item.get("repo") == scope and (item.get("state") or "open") == "open"]
+
+
+def reorder_ids(ids: list[str], moving: list[str], at: int) -> list[str] | None:
+    """`ids` with `moving` lifted out and put back at 0-based `at`, or None if unchanged.
+
+    CLAMPED AND NEVER WRAPPED, which is the web board's rule and worth keeping
+    identical: *"'down 5' on the third-from-last row goes to the bottom, it does
+    not reappear at the top"*. A person who overshoots gets the end of the list,
+    not the other end of it.
+
+    `None` for a move that changes nothing, and the caller must not send it: the
+    endpoint stamps `rank_source` on every listed item, so posting an unchanged
+    order would write *"a human chose this position"* onto rows nobody touched —
+    which is #183's substitution, arriving through a no-op.
+
+    The moved items keep their RELATIVE order. Marking three rows and sending them
+    to position 9 is "these three, in the order you see them, starting there"; any
+    other answer would mean the mark had also to record a sequence.
+    """
+    lifted = [i for i in ids if i in set(moving)]
+    if not lifted:
+        return None
+    rest = [i for i in ids if i not in set(moving)]
+    at = max(0, min(len(rest), at))
+    out = [*rest[:at], *lifted, *rest[at:]]
+    return None if out == ids else out
+
+
+def nudge_index(ids: list[str], moving: list[str], how: str) -> int:
+    """Where a verb puts the moved run — the 0-based index `reorder_ids` wants.
+
+    Measured from the FIRST moved item, so a marked run moves as a block from
+    where it starts. `top` and `bottom` are absolute; the rest are relative and
+    are clamped by `reorder_ids` rather than here, so there is one place that
+    decides what the end of the list means.
+    """
+    rest = [i for i in ids if i not in set(moving)]
+    here = min((ids.index(i) for i in moving if i in ids), default=0)
+    # Against the list WITHOUT the moved items in it, because that is the list
+    # they are being put back into: measuring "down one" against a sequence that
+    # still contains the row being moved is how a one-place nudge becomes a no-op.
+    here -= sum(1 for i in ids[:here] if i in set(moving))
+    return {"top": 0, "bottom": len(rest),
+            "up": here - 1, "down": here + 1,
+            "up5": here - REORDER_JUMP, "down5": here + REORDER_JUMP}.get(how, here)
+
+
+def reorder_refusal(plan: dict | None, rows: list[dict]) -> str | None:
+    """Why these rows cannot be reordered together, or None if they can.
+
+    Every refusal names the remedy, because the alternative on a 78-column pane is
+    a control that does nothing and a person who cannot tell a rule from a bug.
+
+    **A truncated plan is refused outright**, and that is the one worth reading
+    twice: the endpoint renumbers every open item in the scope and appends the
+    ones the caller did not list, so a reorder computed from a partial list would
+    silently move everything the pane had not been sent. The board says whether it
+    truncated; this asks.
+    """
+    if not rows:
+        return "nothing selected — put the cursor on a plan row"
+    if any(row.get("kind") != "plan" for row in rows):
+        return ("only the plan has an order — a pull request, an issue nobody has "
+                "planned and a question owed to a person all sit where they are")
+    if (plan or {}).get("truncated"):
+        return ("the board truncated this plan, so an order computed here would "
+                "renumber the items it did not send — reorder from the board page")
+    scopes = {(row.get("item") or {}).get("repo") for row in rows}
+    if len(scopes) > 1:
+        named = ", ".join(sorted(s or "fleet" for s in scopes))
+        return (f"those rows are in different plans ({named}) and each has its own "
+                "order — mark rows from one")
+    return None
+
+
 # ---- what a person owes an answer to -----------------------------------------
 #
 # #328's row, on the surface a person actually has open. The board has held this

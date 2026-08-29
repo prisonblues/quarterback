@@ -41,6 +41,17 @@ Keys: r refresh now, o open the selected row, p panel-review it, f take its
 issue, w only what a person owes an answer about, b the backlog nothing is
 waiting on, s widen or narrow the scope, q quit.
 
+IT ALSO PUTS THE PLAN IN ORDER (#443), which until now could be done from a
+browser and nowhere else — and the person the plan belongs to works in a
+terminal. `m` marks a row, `k`/`j` move one place, `K`/`J` move five, `[`/`]` go
+to the ends, and `g` asks for a position. Marked rows move together, keeping the
+order you see them in.
+
+The credential is the one the `✎` already uses: `POST /plan/reorder` depends on
+`app.auth.delegated`, which accepts a person's own `X-Human-Key`. A move from
+here is stamped `ordered`, exactly as the browser's ▲▼ are, because it is the
+same person deciding.
+
 It opens NARROW: the rows of the project this screen is for (`--repo`, else
 QB_DASH_REPOS, else the cwd's origin), with the repo column dropped, because on a
 one-project screen that column is the same word on every row and the pane is
@@ -181,6 +192,92 @@ class Confirm(ModalScreen[bool]):
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+
+class MoveTo(ModalScreen[int | None]):
+    """Where in the plan should this go — a POSITION, not the rank on the row.
+
+    THE DISTINCTION IS NOT PEDANTRY AND THE PANE HAS TO STATE IT. Ranks go
+    non-contiguous as work finishes: `prisonblues/quarterback` was on
+    `1, 3, 4, 5, 10, 11, …` with 37 open items when this was written, so "move it
+    to 10" means two different rows depending on which number a person meant. A
+    position is unambiguous and is what `POST /plan/reorder` takes — it is handed
+    a sequence, and the rank falls out of where a thing sits in it.
+
+    It heals itself after one use: the endpoint renumbers the whole scope `1..n`,
+    so the first reorder makes rank and position the same number and they stay
+    that way until something is finished or dropped.
+
+    So the box says where the row is NOW and how long the list is, and the number
+    typed is read against that. `enter` applies, `esc` cancels — the shape
+    `Confirm` uses, because this is the same kind of decision and a second habit
+    would be one too many.
+    """
+
+    # NO `enter` BINDING, and its absence is the point: an `Input` with focus
+    # consumes Enter and turns it into `Input.Submitted`, so a screen-level
+    # binding for it never fires — the first cut of this box would not close.
+    # `DialEdit` reaches for `ctrl+s` to sidestep exactly this; here the submit
+    # event is the more natural door, because there is one field and pressing
+    # Enter in it means "that is my answer".
+    BINDINGS = [("escape", "cancel", "cancel")]
+
+    CSS = """
+    MoveTo { align: center middle; }
+    #box { width: 90%; max-width: 64; height: auto; padding: 1 2;
+           background: $panel; border: thick $accent; }
+    #where { color: $text-muted; padding: 0 0 1 0; }
+    #why { color: $error; height: auto; }
+    """
+
+    def __init__(self, what: str, scope: str | None, here: int, total: int) -> None:
+        super().__init__()
+        self.what, self.scope = what, scope
+        #: 1-based, because that is what the box shows and what a person types.
+        self.here, self.total = here, total
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Static(Text(f"move {self.what}", style="bold"))
+            yield Static(Text(f"now at {self.here} of {self.total} "
+                              f"in {self.scope or 'the fleet-wide plan'}", style="dim"),
+                         id="where")
+            yield Input(placeholder=f"position 1–{self.total}", id="to")
+            yield Static("", id="why")
+            yield Static(Text("enter — move     esc — cancel", style="bold $accent"))
+
+    def on_mount(self) -> None:
+        self.query_one("#to", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the field — the only field — is the answer."""
+        self.action_save()
+
+    def action_save(self) -> None:
+        """Refuse HERE rather than at the write, because this is where the typing is.
+
+        A number nobody can parse and a number outside the list are both mistakes a
+        person makes mid-keystroke, and the box has a line to say so on. Sending
+        either would spend a round trip to be told something this screen already
+        knows.
+        """
+        typed = self.query_one("#to", Input).value.strip()
+        try:
+            at = int(typed)
+        except ValueError:
+            self.query_one("#why", Static).update(
+                Text(f"{typed!r} is not a position — type a number between 1 "
+                     f"and {self.total}", style="bold $error"))
+            return
+        if not 1 <= at <= self.total:
+            self.query_one("#why", Static).update(
+                Text(f"{at} is outside this plan — it holds {self.total} open "
+                     f"item{'s' if self.total != 1 else ''}", style="bold $error"))
+            return
+        self.dismiss(at - 1)                      # 0-based, which is what splices
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class DialEdit(ModalScreen[dict | None]):
@@ -899,6 +996,19 @@ class Dash(App):
         # nobody has started and this is work nobody can start, and a reader
         # looking for one is not looking for the other.
         ("w", "toggle_waiting", "waiting"),
+        # PUTTING THE PLAN IN ORDER (#443). Lower case moves one, upper case moves
+        # five, the brackets go to the ends, `g` asks for a position and `m` marks
+        # a row to take with it. Letters rather than arrows because the arrows are
+        # the DataTable's cursor and always will be — a reorder key that fought
+        # the cursor would make the pane unnavigable to fix one thing.
+        ("m", "mark", "mark"),
+        ("k", "move_up", "up"),
+        ("j", "move_down", "down"),
+        ("K", "move_up5", "up 5"),
+        ("J", "move_down5", "down 5"),
+        ("left_square_bracket", "move_top", "to top"),
+        ("right_square_bracket", "move_bottom", "to bottom"),
+        ("g", "move_to", "move to…"),
         ("z", "expand", "expand"),
         ("question_mark", "help", "keys"),
     ]
@@ -1043,6 +1153,17 @@ class Dash(App):
         self.blockers: dict | None = None
         self.waiting = os.environ.get("QB_DASH_WAITING", "").strip().lower() in (
             "1", "true", "yes", "on")
+        #: Plan rows the next move takes together, by row key. A SET and not an
+        #: ordered list on purpose: the moved rows keep the order they are shown
+        #: in, so marking three and sending them to position 9 means "these three,
+        #: as you see them, starting there" — a mark that also recorded a sequence
+        #: would be a second order to keep in step with the board's.
+        self.marked: set[str] = set()
+        #: Whether a reorder is in flight, so a second press is refused rather than
+        #: superseding it — `dial_writing`'s rule (#577), and for its reason: the
+        #: worker is `exclusive`, so pressing again would cancel the write that was
+        #: about to report and seeing nothing is what makes a person press again.
+        self.reordering = False
 
     # ---- layout ---------------------------------------------------------
 
@@ -1076,7 +1197,15 @@ class Dash(App):
         yield Static("click: seat→pane, ✕→close it, ＋→add one, agent→where it "
                      "is, claim→its note, work row→why it is where it is, "
                      "⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
-                     "   b for the backlog, ? for keys",
+                     # NO SQUARE BRACKETS IN THIS STRING. `#detail` is a Static
+                     # that parses markup, and `[/]` — the obvious way to write
+                     # the two keys that send a row to the ends — is a closing
+                     # tag with nothing to close, which takes the first render
+                     # down with a MarkupError. The keys are named in words here
+                     # and shown as themselves by `?`, which goes through `say`
+                     # and is wrapped in a Text.
+                     "   m mark · k j move · K J five · brackets to the ends · "
+                     "g move to · ? for keys",
                      id="detail")
         yield Footer()
 
@@ -1835,7 +1964,13 @@ class Dash(App):
                 Text(icon, style="bold cyan" if verb else "grey30"),
                 Text(qd.work_kind(row), style="grey50"),
                 *self.repo_cell(qd.short_repo(row["repo"] or "fleet")),
-                Text(rank, style=rank_colour),
+                # THE MARK GOES ON THE RANK CELL, which is the column marking is
+                # about: a row is marked so that the next move takes it, and the
+                # rank is where a move shows up. It costs the cell one of its four
+                # characters and `~12` is the longest thing it ever holds.
+                Text(("▪" if row["key"] in self.marked else "") + rank,
+                     style="bold magenta" if row["key"] in self.marked
+                     else rank_colour),
                 Text(row["ref"], style="bold grey70"),
                 # A fleet-wide item has no repo to name, and with the column gone
                 # it would read as one of this project's (qbdata.scope_mark).
@@ -2829,6 +2964,184 @@ class Dash(App):
         # refresh's number while the rows down here showed this one's.
         self.render_limits(self.limits, self.limits_err)
 
+    # ---- putting the plan in order (#443) ----------------------------------
+
+    def moving_rows(self) -> list[dict]:
+        """The rows the next move takes: everything marked, else the one selected.
+
+        MARKS WIN over the cursor, and silently. A person who has marked three
+        rows and then moved the cursor to read a fourth has not unmarked anything,
+        and a move that took the row under the cursor instead would be the pane
+        answering a question nobody asked. Every refusal and every report below
+        names the count, so "three moved" is never a surprise.
+        """
+        if self.marked:
+            # FROM EVERY ROW THIS CLIENT KNOWS, not from the rows on screen. Reading
+            # the table meant a mark the `w` filter or the `s` scope had since hidden
+            # was silently left out, so a person who marked three rows and pressed a
+            # key was told "moved 2" — the silent-narrowing defect, arriving at the
+            # one control that rewrites the fleet's shared intent. `reorder` checks
+            # every mark against the scope's open items and refuses a partial move;
+            # the ORDER they keep is the plan's, which is the order they are shown
+            # in whenever they are all shown.
+            return [self.rows[key] for key in self.marked if key in self.rows]
+        row = self.selected_work()
+        return [row] if row else []
+
+    def action_mark(self) -> None:
+        """`m` — take this row along on the next move, or stop taking it."""
+        row = self.selected_work()
+        if row is None:
+            return
+        if row.get("kind") != "plan":
+            self.say("only the plan has an order — nothing to mark on this row")
+            return
+        key = row["key"]
+        self.marked.symmetric_difference_update({key})
+        # The rank cell is what changes, so the table has to be redrawn — and the
+        # signature cannot see a mark, which is this client's state rather than
+        # the board's.
+        self.plan_sig = None
+        self.render_work()
+        self.say(f"{len(self.marked)} marked — k/j to move them, g for a position"
+                 if self.marked else "nothing marked")
+
+    def action_move_up(self) -> None: self.reorder("up")
+
+    def action_move_down(self) -> None: self.reorder("down")
+
+    def action_move_up5(self) -> None: self.reorder("up5")
+
+    def action_move_down5(self) -> None: self.reorder("down5")
+
+    def action_move_top(self) -> None: self.reorder("top")
+
+    def action_move_bottom(self) -> None: self.reorder("bottom")
+
+    def action_move_to(self) -> None:
+        """`g` — ask for a position, then move there.
+
+        The count in the box is the SCOPE's open items, not the rows on screen:
+        WORK draws the review queue above the plan and the backlog below it, and
+        narrows to this screen's repos, so the table's row numbers are not the
+        plan's positions and never were.
+        """
+        rows = self.moving_rows()
+        why = qd.reorder_refusal(self.plan, rows)
+        if why:
+            self.say(why)
+            return
+        scope = (rows[0].get("item") or {}).get("repo")
+        ids = [i.get("item_id") for i in qd.plan_scope_items(self.plan, scope)]
+        marked = {(r.get("item") or {}).get("item_id") for r in rows}
+        moving = [i for i in ids if i in marked]
+        here = min((ids.index(i) for i in moving if i in ids), default=0)
+        what = (f"{len(rows)} items" if len(rows) > 1
+                else qd.clip(rows[0].get("title") or "", 46))
+        self.push_screen(MoveTo(what, scope, here + 1, len(ids)),
+                         lambda at: None if at is None else self.reorder(at=at))
+
+    def reorder(self, how: str | None = None, at: int | None = None) -> None:
+        """Work out the new order and send it, or say why not.
+
+        ONE PLACE COMPUTES THE ARRAY, whatever asked for it. `POST /plan/reorder`
+        takes the whole sequence for one exact scope rather than a move
+        instruction, so up-one, jump-five, to-the-top and go-to-position differ
+        only in the index they hand `reorder_ids` — which is #388's finding on the
+        web board, and the reason multi-select costs nothing extra at the wire.
+        """
+        if self.reordering:
+            self.say("a move is already going — waiting for the board to answer")
+            return
+        rows = self.moving_rows()
+        why = qd.reorder_refusal(self.plan, rows)
+        if why:
+            self.say(why)
+            return
+        if self.human is None or self.human.why_not():
+            # The same door the ✎ has, refused the same way and for the same
+            # reason: a control that greys out has room for a sentence.
+            self.say(qd.HumanClient.NO_KEY if self.human is None
+                     else self.human.why_not())
+            return
+        scope = (rows[0].get("item") or {}).get("repo")
+        ids = [i.get("item_id") for i in qd.plan_scope_items(self.plan, scope)]
+        marked = {(r.get("item") or {}).get("item_id") for r in rows}
+        # EVERY MARK OR NONE. A mark on an item the board no longer lists as open —
+        # somebody finished it, or dropped it — cannot be placed, and moving the
+        # rest would quietly do less than was asked while reporting success.
+        lost = len(marked) - sum(1 for i in ids if i in marked)
+        if lost:
+            self.say(f"{lost} of {len(marked)} marked are no longer open in "
+                     f"{scope or 'the fleet-wide plan'} — m to unmark, r to refresh")
+            return
+        # In the PLAN's order, which is the order they are shown in whenever they
+        # are all on screen, and the only defined one when they are not.
+        moving = [i for i in ids if i in marked]
+        index = at if at is not None else qd.nudge_index(ids, moving, how)
+        order = qd.reorder_ids(ids, moving, index)
+        if order is None:
+            # NOT SENT, and that is not tidiness: the endpoint stamps `rank_source`
+            # on every item it is handed, so posting an unchanged order would write
+            # "a human chose this position" onto rows nobody moved (#183).
+            self.say("already there — nothing to move")
+            return
+        self.reordering = True
+        self.say(f"moving {len(moving)} in {scope or 'the fleet-wide plan'}…")
+        self.run_reorder(scope, order, len(moving))
+
+    @work(thread=True, exclusive=True, group="reorder")
+    def run_reorder(self, scope: str | None, order: list[str], moved: int) -> None:
+        """The write itself, off the UI thread. Never raises into Textual.
+
+        `run_dial_write`'s shape, because it is the same act through the same
+        credential: a person's key, a sentence a panel can show verbatim, and the
+        in-flight flag cleared in a `finally` so a write that dies cannot wedge
+        every later press against the refusal above.
+        """
+        failed = False
+        try:
+            got = self.human.post("/plan/reorder", {"repo": scope, "order": order})
+            said = f"moved {moved} — {got.get('reordered')} placed by {got.get('by')}"
+            # WHAT THE BOARD CARRIED ALONG. Items the pane did not list keep their
+            # relative order and follow the listed ones, and the endpoint names
+            # them rather than assuming: on a stale plan that is the difference
+            # between a move and a silent reshuffle of work somebody else added.
+            carried = len(got.get("appended") or [])
+            if carried:
+                said += f", {carried} carried along that this pane had not seen"
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            failed = True
+            said = f"could not move — {exc}"
+        finally:
+            try:
+                self.call_from_thread(self.clear_reordering, not failed)
+            except Exception:                     # noqa: BLE001 — the app is going away
+                pass
+        self.call_from_thread(self.alarm if failed else self.say, qd.clip(said, 400))
+        # Straight back to the board rather than waiting out the plan clock: the
+        # person is looking at the row they just moved, and a table that showed the
+        # old order for fifteen seconds would be read as a move that failed.
+        self.call_from_thread(self.refresh_plan)
+
+    def clear_reordering(self, moved: bool = True) -> None:
+        """Released, and the marks dropped only if the move actually happened.
+
+        The marks go on success because the move they were for has happened —
+        carrying them into the next one is how a person moves three rows twice by
+        accident. **They stay on failure**, which is the half that was wrong: a
+        write refused by the board is the moment a person most wants to press the
+        key again, and clearing the selection first makes them mark three rows a
+        second time to do it.
+
+        The signature goes either way, because a failed write still leaves this
+        table drawn from a plan the board may have moved on from.
+        """
+        self.reordering = False
+        if moved:
+            self.marked.clear()
+        self.plan_sig = None
+
     def action_toggle_waiting(self) -> None:
         """`w` — only the rows a person owes an answer about, or everything.
 
@@ -2920,7 +3233,9 @@ class Dash(App):
 
     def action_help(self) -> None:
         self.say("o open the selected row on GitHub · p panel-review it · f take "
-                 "its issue · w only what a person owes an answer about · b the "
+                 "its issue · m mark a plan row · k/j move it one · K/J five · "
+                 "[ ] to the ends · g move it to a position · "
+                 "w only what a person owes an answer about · b the "
                  "backlog nothing is waiting on · d the board's "
                  "dials page · z this pane full screen and back · s this project's "
                  "rows or the whole fleet's · r refresh · q quit · click ⚖ to "
