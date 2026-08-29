@@ -164,7 +164,6 @@ fi
 # forge merge, the refs are the same ones the upstream comparison has always been
 # trusted against, and refusing there would hold the better question to a standard
 # the worse one never met while removing it from the run it exists for.
-NL=$'\n'
 ASK_STRANDED=1
 ASK_WHY=""
 # THE QUESTION DOES NOT ARISE, which is not the same as "could not be answered". A
@@ -317,28 +316,6 @@ else
 fi
 [ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
 
-# ONE WALK FOR THE SWEEP, NOT ONE PER WORKTREE. `--not --remotes` has to load every
-# remote-tracking ref there is and mark it uninteresting before it can answer, and this
-# runs inside a hook that `qb-hook` wraps in `timeout 25` and drops entirely on
-# overrun — so ninety worktrees each paying for that walk is paid as silent loss of the
-# whole report, not as latency somebody notices. `refs/heads/` lives in the common git
-# dir and is shared between worktrees, so `--branches` from here is every branch in
-# every one of them: the same call `qb-doctor` makes exactly once for the repository.
-#
-# WHAT MAKES ONE WALK ENOUGH is that a branch carries stranded commits if and only if
-# its own TIP is stranded — anything reachable from a tip that some remote ref reaches
-# is reached by that ref too. So this set names the worktrees worth a second walk, and
-# on a machine where nothing is stranded there is no second walk at all.
-STRANDED_ALL=""
-STRANDED_ASKED=0
-if [ "$ASK_STRANDED" = 1 ]; then
-  if STRANDED_ALL=$(git -C "$DIR" rev-list --branches --not --remotes -- 2>/dev/null); then
-    STRANDED_ASKED=1
-  else
-    STRANDED_ALL=""
-  fi
-fi
-
 # `_spell_since` in qb-doctor, in shell and for the same reason: the reader has to
 # feel a fortnight at a glance, and "27360 minutes" reads as a number rather than
 # as a length of time.
@@ -437,79 +414,93 @@ while IFS= read -r wt; do
     # No remote at all: there is no elsewhere for a commit to be, so this says nothing
     # rather than hedging about a question that does not arise.
     stranded_state=moot
-  elif [ "$STRANDED_ASKED" = 1 ]; then
-    if [ -z "$STRANDED_ALL" ]; then
-      stranded_state=none
-    elif ! tip=$(git -C "$wt" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null); then
+  elif [ "$ASK_STRANDED" = 1 ]; then
+    # THE RESOLVED TIP, NOT THE BARE BRANCH NAME. `gitrevisions` resolves a bare
+    # `feat/x` as `refs/feat/x`, then `refs/tags/feat/x`, then `refs/heads/feat/x`, so
+    # a TAG of the same name WINS over the branch — and this fleet tags. The walk then
+    # measures the tag's history instead: if that tag is reachable from a remote it
+    # answers 0, `stranded_state` becomes `none`, and the sweep says "finished with"
+    # about a directory that may hold the only copy of something. Resolving
+    # `refs/heads/` once and walking from the SHA settles which ref is meant, and
+    # removes the double resolution too. A branch that will not resolve stays
+    # `unknown` rather than being answered from the wrong ref.
+    #
+    # ONE WALK PER WORKTREE, AND DELIBERATELY. A repository-wide
+    # `rev-list --branches --not --remotes` snapshot taken once above this loop would
+    # save most of them, and it was tried: but the snapshot ages while the loop runs,
+    # each worktree's tip is resolved fresh, and a worktree that takes a local-only
+    # commit in between is absent from the stale set and falls through to `none` — the
+    # sweep then prints the safety claim that nothing is missing, which is precisely
+    # the false negative this question exists to prevent, in the state an actively
+    # worked fleet is normally in. Measured before it was removed: this walk costs
+    # ~4ms with 121 remote refs, ~360ms over ninety worktrees, against `qb-hook`'s 25s
+    # budget. The saving was never worth reintroducing the failure.
+    if ! tip=$(git -C "$wt" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null); then
       stranded_state=unknown
     else
-      case "$NL$STRANDED_ALL$NL" in
-        *"$NL$tip$NL"*)
-          # COUNT AND MINIMUM IN ONE PASS, in awk rather than in the shell. The
-          # shell form kept the whole `git log` output in a variable and read the
-          # LAST line as the oldest, on the assumption that git emits in descending
-          # committer-date order. It does not: the walk guarantees only that a child
-          # is emitted before its parent, which is monotone in date only when the
-          # dates are. A rebase, a `git am`, an explicit `GIT_COMMITTER_DATE` — all
-          # of which this fleet does routinely — can date a child before its parent,
-          # and the last line is then NEWER than the true oldest. Age is what the
-          # verdict turns on, so that reads weeks-old work as work in flight: a false
-          # green in exactly the direction this exists to prevent. `qb-doctor` takes
-          # `min(when …)` over the whole set for the same reason; tracking the
-          # minimum makes the answer independent of emission order altogether, and
-          # streaming it keeps a large local-only history out of a shell variable.
-          if summary=$(git -C "$wt" log --format=%ct "$branch" --not --remotes -- 2>/dev/null \
-                       | awk 'NF { n++; if (m == "" || $1 + 0 < m + 0) m = $1 }
-                              END { printf "%d %s\n", n, m }'); then
-            stranded_n=${summary%% *}
-            oldest=${summary#* }
+      # COUNT AND MINIMUM IN ONE PASS, in awk rather than in the shell. The
+      # shell form kept the whole `git log` output in a variable and read the
+      # LAST line as the oldest, on the assumption that git emits in descending
+      # committer-date order. It does not: the walk guarantees only that a child
+      # is emitted before its parent, which is monotone in date only when the
+      # dates are. A rebase, a `git am`, an explicit `GIT_COMMITTER_DATE` — all
+      # of which this fleet does routinely — can date a child before its parent,
+      # and the last line is then NEWER than the true oldest. Age is what the
+      # verdict turns on, so that reads weeks-old work as work in flight: a false
+      # green in exactly the direction this exists to prevent. `qb-doctor` takes
+      # `min(when …)` over the whole set for the same reason; tracking the
+      # minimum makes the answer independent of emission order altogether, and
+      # streaming it keeps a large local-only history out of a shell variable.
+      if summary=$(git -C "$wt" log --format=%ct "$tip" --not --remotes -- 2>/dev/null \
+                   | awk 'NF { n++; if (m == "" || $1 + 0 < m + 0) m = $1 }
+                          END { printf "%d %s\n", n, m }'); then
+        stranded_n=${summary%% *}
+        oldest=${summary#* }
+      else
+        stranded_n=""; oldest=""
+      fi
+      if [ -z "$stranded_n" ]; then
+        stranded_state=unknown
+      elif [ "$stranded_n" = 0 ]; then
+        stranded_state=none
+      else
+        stranded_state=some
+        if [ "$stranded_n" = 1 ]; then
+          noun="1 commit"; verb=is
+        else
+          noun="$stranded_n commits"; verb=are
+        fi
+        now=$(date +%s 2>/dev/null) || now=""
+        if [ -z "$now" ] || [ -n "${now//[0-9]/}" ] || [ -z "$oldest" ] || [ -n "${oldest//[0-9]/}" ]; then
+          # `set -u` and no `set -e`: an arithmetic expansion over an empty or
+          # non-numeric operand fails, `age_s` stays unset, and the very next test
+          # reads an unbound variable — which under `set -u` ABORTS, taking the rest
+          # of the sweep with it. An unattended tool must not die of a clock.
+          age_s=""
+        else
+          # THE SIGN IS TAKEN IN SECONDS, BEFORE THE DIVISION. Bash truncates
+          # toward zero, so dividing first turns a commit dated 1 to 59 seconds
+          # ahead of this clock into `age_m=0` — which is not `< 0`, falls into
+          # the grace window, and reports skew as fresh work in flight. Sub-minute
+          # skew is the ordinary size of skew.
+          age_s=$(( now - oldest ))
+        fi
+        if [ -z "$age_s" ]; then
+          stranded_note=" — $noun on it $verb on no remote ref, and how old could not be read from this clock"
+        elif [ "$age_s" -lt 0 ]; then
+          # A committer date in the future is clock skew or a rewritten history, and
+          # either way the age this turns on is not a measurement. Report the count
+          # and refuse the verdict rather than picking whichever side the skew lands.
+          stranded_note=" — $noun on it $verb on no remote ref, dated ahead of this clock, which is not an age this can measure"
+        else
+          age_m=$(( age_s / 60 ))
+          if [ "$age_m" -lt $((STRANDED_GRACE_HOURS * 60)) ]; then
+            stranded_note=" — $noun on it $verb not on any remote yet, the oldest $(spell_age "$age_m") old: work in flight, which is the ordinary state"
           else
-            stranded_n=""; oldest=""
+            stranded_note=" — $noun on it $verb on no remote ref, the oldest $(spell_age "$age_m") old: if this disk failed that work is gone"
           fi
-          if [ -z "$stranded_n" ]; then
-            stranded_state=unknown
-          elif [ "$stranded_n" = 0 ]; then
-            stranded_state=none
-          else
-            stranded_state=some
-            if [ "$stranded_n" = 1 ]; then
-              noun="1 commit"; verb=is
-            else
-              noun="$stranded_n commits"; verb=are
-            fi
-            now=$(date +%s 2>/dev/null) || now=""
-            if [ -z "$now" ] || [ -n "${now//[0-9]/}" ] || [ -z "$oldest" ] || [ -n "${oldest//[0-9]/}" ]; then
-              # `set -u` and no `set -e`: an arithmetic expansion over an empty or
-              # non-numeric operand fails, `age_s` stays unset, and the very next test
-              # reads an unbound variable — which under `set -u` ABORTS, taking the rest
-              # of the sweep with it. An unattended tool must not die of a clock.
-              age_s=""
-            else
-              # THE SIGN IS TAKEN IN SECONDS, BEFORE THE DIVISION. Bash truncates
-              # toward zero, so dividing first turns a commit dated 1 to 59 seconds
-              # ahead of this clock into `age_m=0` — which is not `< 0`, falls into
-              # the grace window, and reports skew as fresh work in flight. Sub-minute
-              # skew is the ordinary size of skew.
-              age_s=$(( now - oldest ))
-            fi
-            if [ -z "$age_s" ]; then
-              stranded_note=" — $noun on it $verb on no remote ref, and how old could not be read from this clock"
-            elif [ "$age_s" -lt 0 ]; then
-              # A committer date in the future is clock skew or a rewritten history, and
-              # either way the age this turns on is not a measurement. Report the count
-              # and refuse the verdict rather than picking whichever side the skew lands.
-              stranded_note=" — $noun on it $verb on no remote ref, dated ahead of this clock, which is not an age this can measure"
-            else
-              age_m=$(( age_s / 60 ))
-              if [ "$age_m" -lt $((STRANDED_GRACE_HOURS * 60)) ]; then
-                stranded_note=" — $noun on it $verb not on any remote yet, the oldest $(spell_age "$age_m") old: work in flight, which is the ordinary state"
-              else
-                stranded_note=" — $noun on it $verb on no remote ref, the oldest $(spell_age "$age_m") old: if this disk failed that work is gone"
-              fi
-            fi
-          fi ;;
-        *) stranded_state=none ;;
-      esac
+        fi
+      fi
     fi
   fi
   # AN UNANSWERED QUESTION SAYS SO, ON EVERY LINE THAT WOULD OTHERWISE READ AS AN

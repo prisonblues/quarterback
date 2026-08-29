@@ -719,8 +719,9 @@ def test_a_repository_with_no_remote_says_nothing_about_stranded_work(fleet):
 def test_both_tools_ask_git_the_same_question():
     catchup = (BIN / "qb-catchup").read_text()
     doctor = (BIN / "qb-doctor").read_text()
-    assert '"$branch" --not --remotes --' in catchup, (
-        "the sweep must ask `--not --remotes`, never `origin/<branch>`")
+    assert '"$tip" --not --remotes --' in catchup, (
+        "the sweep must ask `--not --remotes`, never `origin/<branch>` — and about the "
+        "resolved `refs/heads/` tip, never a bare name a tag can shadow")
     assert re.search(r'"--not",\s*"--remotes"', doctor), (
         "qb-doctor's query moved; qb-catchup was written to match it")
 
@@ -1090,30 +1091,14 @@ def test_a_clock_that_answers_with_nonsense_does_not_kill_the_sweep(fleet):
     assert "left alone, of 2 worktree(s)" in done.stdout, done.stdout
 
 
-def test_the_stranded_walk_is_taken_once_for_the_sweep_and_not_once_per_worktree(fleet):
-    """`--not --remotes` has to load and mark uninteresting every remote-tracking ref
-    there is before it can answer, and this runs inside a hook `qb-hook` wraps in
-    `timeout 25` and drops WHOLE on overrun. Ninety worktrees each paying for that walk
-    is paid as silent loss of the report, so the sweep takes one repository-wide walk
-    over `--branches` — `qb-doctor`'s own call — and asks per worktree only about the
-    branches whose tip that walk actually named."""
-    fleet.worktree("feat/a")
-    fleet.worktree("feat/b")
-    fleet.stub_git_that_records()
-
-    done = fleet.run()
-    assert done.returncode == 0, done.stderr
-    assert len(fleet.git_ran("rev-list --branches --not --remotes")) == 1, (
-        fleet.git_calls.read_text())
-    assert fleet.git_ran("log --format=%ct") == [], (
-        "nothing is stranded anywhere, so no worktree should have been walked")
-
-
-def test_only_the_worktrees_the_wide_walk_named_are_walked_again(fleet):
-    """A branch carries stranded commits if and only if its own TIP is stranded —
-    anything reachable from a tip some remote ref reaches is reached by that ref too. So
-    the wide walk names the candidates and the second walk is paid only for them, which
-    is what keeps the count proportional to the problem rather than to the machine."""
+def test_every_worktree_is_asked_for_itself_and_not_against_a_repository_snapshot(fleet):
+    """A repository-wide `rev-list --branches --not --remotes` taken once above the loop
+    names every stranded tip in one walk, and it was tried — but it is a SNAPSHOT, and
+    each worktree's tip is resolved fresh as the loop reaches it. A worktree that takes
+    a local-only commit in between has a tip the stale set never named, falls through to
+    `none`, and the sweep prints the safety claim that nothing is missing: the exact
+    false negative this question exists to prevent, in the state an actively worked
+    fleet is normally in. The walk it saved costs ~4ms against a 25s hook budget."""
     fleet.worktree("feat/a")
     mine = fleet.worktree("feat/mine")
     commit(mine, "only-here", days_ago=19)
@@ -1121,10 +1106,30 @@ def test_only_the_worktrees_the_wide_walk_named_are_walked_again(fleet):
 
     done = fleet.run()
     assert done.returncode == 0, done.stderr
-    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+    assert fleet.git_ran("rev-list --branches --not --remotes") == [], (
+        "a repository-wide snapshot ages while the loop runs; ask per worktree instead")
     walked = fleet.git_ran("log --format=%ct")
-    assert len(walked) == 1, walked
-    assert "feat/mine" in walked[0], walked
+    assert len(walked) == 3, walked
+    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+
+
+def test_a_tag_sharing_a_branchs_name_does_not_get_measured_instead_of_the_branch(fleet):
+    """`gitrevisions` resolves a bare `feat/x` as `refs/feat/x`, then `refs/tags/feat/x`,
+    then `refs/heads/feat/x` — so a TAG WINS over the branch of the same name. Asking the
+    walk about the bare name therefore measures the tag's history: point the tag at
+    something the remote already has and the answer is 0, the state becomes `none`, and
+    the sweep says it is finished with a directory holding the only copy of the work. The
+    branch is resolved through `refs/heads/` and the walk is given the SHA."""
+    mine = fleet.worktree("feat/shadowed")
+    commit(mine, "only-here", days_ago=19)
+    # A tag of the same name, pointing at a commit every remote already has.
+    git(fleet.main, "tag", "feat/shadowed", "origin/main")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "1 commit on it is on no remote ref" in done.stdout, (
+        "the tag's history was measured, not the branch's")
+    assert "so this worktree is finished with" not in done.stdout, done.stdout
 
 
 def test_the_ordinary_fetching_path_reaches_the_same_verdict(fleet):
