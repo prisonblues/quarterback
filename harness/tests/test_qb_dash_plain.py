@@ -36,12 +36,19 @@ from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
-from rich.console import Console
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
 pytest.importorskip("rich", reason="the printed renderer needs rich")
+
+# AFTER the importorskip, and that is the whole of why it is down here rather than
+# with the others. This module is meant to SKIP on an interpreter without rich —
+# CI runs the harness once with no dashboard extras precisely to prove the rest of
+# it needs none — and a module-scope `from rich...` above the guard turns that skip
+# into a collection ERROR, which is a red job about a dependency nobody claimed to
+# have. It cost exactly that on the first push of #589.
+from rich.console import Console                            # noqa: E402
 
 #: The clickable renderer imports textual at module scope, so `_tui()` cannot even
 #: be loaded without it. A bare ImportError here would be an ERROR rather than a

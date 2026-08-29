@@ -30,7 +30,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
-from textual.coordinate import Coordinate
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 
@@ -184,6 +183,14 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
     # scrolled would turn them green against the defect they exist for. The live
     # drivers pass it, because a table holding the whole plan legitimately has the
     # row they want below the fold and a reader would scroll to it.
+    # IMPORTED HERE, not at module scope. This module is meant to SKIP without
+    # textual — `_why_no_tui` decides that below the imports — and a top-level
+    # `from textual...` turns the skip into a collection ERROR on the CI job that
+    # runs the harness with no dashboard extras. That job exists to prove the rest
+    # of the harness needs neither textual nor rich, so breaking it is a red build
+    # about a claim nobody made.
+    from textual.coordinate import Coordinate
+
     if isinstance(index, str):
         # Resolved HERE and not by the caller, so it is resolved as late as
         # possible — after every pause above this line has already happened.
