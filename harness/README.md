@@ -2134,6 +2134,16 @@ it is handed, so posting an unchanged order would write "a human chose this posi
 nobody touched (#183). And a second move while one is in flight is refused rather than stacked,
 which is `dial_writing`'s rule (#577) for its reason.
 
+**The moved row stays under the cursor, and the marks stay set**, so pressing `j` four times
+moves one thing four places. Both halves are the same rule and neither is housekeeping: a move
+rewrites the whole table and a DataTable's cursor is an *index*, so without following the row
+KEY the thing being moved slides out from under the person and the next press moves whatever
+took its place. Dropping the marks does the same by another route — the block comes back, the
+cursor lands on its head, and the next key moves one row while the person believes they are
+still moving three. Silently changing what a key acts on is the mistake they cannot see; a
+selection left set is one they can, because every marked row wears a `▪` and every message
+names the count.
+
 The keys are letters because the arrows are the DataTable's cursor and always will be. The
 printed renderer has no input loop, so this is the clickable one's alone — as `s` already is.
 

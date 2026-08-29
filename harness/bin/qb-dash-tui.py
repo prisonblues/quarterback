@@ -1164,6 +1164,13 @@ class Dash(App):
         #: worker is `exclusive`, so pressing again would cancel the write that was
         #: about to report and seeing nothing is what makes a person press again.
         self.reordering = False
+        #: The row key WORK puts the cursor back on after its next rebuild, or None.
+        #: A move rewrites the table, and a DataTable's cursor is an INDEX — so
+        #: without this the row a person just moved slides out from under them and
+        #: the next press moves whatever has taken its place. Pressing `j` four
+        #: times should move one thing four places, which is the whole point of
+        #: having a key rather than a modal.
+        self.follow: str | None = None
 
     # ---- layout ---------------------------------------------------------
 
@@ -2023,6 +2030,19 @@ class Dash(App):
                           Text("nothing is waiting on a person" if self.waiting else
                                ((self.queue or {}).get("idle") or "nothing in flight"),
                                style="grey50"), Text(""), key="work:idle")
+
+        # THE ROW A MOVE JUST MOVED, back under the cursor. `move_cursor` takes an
+        # index and the indices have all just changed, so this is resolved from the
+        # key — the one identifier a rebuild does not invalidate. Scrolled into
+        # view as well, because a row sent to the bottom of a forty-item plan has
+        # gone somewhere the person cannot see and "where did it go" is the next
+        # question either way.
+        if self.follow:
+            for i, rk in enumerate(table.rows):
+                if str(rk.value) == self.follow:
+                    table.move_cursor(row=i, animate=False)
+                    table._scroll_cursor_into_view(animate=False)
+                    break
 
         # The heading is one line and clips at the pane edge, so it is given the
         # room it has — none of which is known before the first layout, where the
@@ -3087,6 +3107,10 @@ class Dash(App):
             self.say("already there — nothing to move")
             return
         self.reordering = True
+        # The FIRST of the moved rows in the plan's order, so a block comes back
+        # under the cursor at its head — which is where the next nudge measures
+        # from (`nudge_index`).
+        self.follow = f"plan:{moving[0]}"
         self.say(f"moving {len(moving)} in {scope or 'the fleet-wide plan'}…")
         self.run_reorder(scope, order, len(moving))
 
@@ -3103,6 +3127,11 @@ class Dash(App):
         try:
             got = self.human.post("/plan/reorder", {"repo": scope, "order": order})
             said = f"moved {moved} — {got.get('reordered')} placed by {got.get('by')}"
+            if moved > 1:
+                # Named because it is state a person is now carrying: the next key
+                # moves these rows again, which is what makes a block worth
+                # marking, and it should not be a surprise.
+                said += " · still marked, m to unmark"
             # WHAT THE BOARD CARRIED ALONG. Items the pane did not list keep their
             # relative order and follow the listed ones, and the endpoint names
             # them rather than assuming: on a stale plan that is the difference
@@ -3125,21 +3154,21 @@ class Dash(App):
         self.call_from_thread(self.refresh_plan)
 
     def clear_reordering(self, moved: bool = True) -> None:
-        """Released, and the marks dropped only if the move actually happened.
+        """Released, and the selection kept either way.
 
-        The marks go on success because the move they were for has happened —
-        carrying them into the next one is how a person moves three rows twice by
-        accident. **They stay on failure**, which is the half that was wrong: a
-        write refused by the board is the moment a person most wants to press the
-        key again, and clearing the selection first makes them mark three rows a
-        second time to do it.
+        **THE MARKS SURVIVE THE MOVE, and that reverses this method's first
+        instinct.** Clearing them looked like housekeeping — carry them into the
+        next move and somebody moves three rows twice by accident — but it makes
+        the block a one-shot: the rows come back, the cursor lands on the head of
+        them, and the next `j` moves that ONE row while the person believes they
+        are still moving three. Silently changing what a key acts on is the worse
+        of the two mistakes, and it is the one they cannot see. The marks they can:
+        every marked row wears a ▪ and every message names the count.
 
-        The signature goes either way, because a failed write still leaves this
-        table drawn from a plan the board may have moved on from.
+        The signature goes either way, because a write that failed still leaves
+        this table drawn from a plan the board may have moved on from.
         """
         self.reordering = False
-        if moved:
-            self.marked.clear()
         self.plan_sig = None
 
     def action_toggle_waiting(self) -> None:

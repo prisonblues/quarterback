@@ -1802,7 +1802,7 @@ def test_the_box_asks_for_a_position_and_says_which_one_it_is_now():
         _, _, _, looked = await _drive_reorder(
             keys=("g",),
             before=lambda a, t, by: t.move_cursor(row=by["plan:b"], animate=False),
-            inside=lambda a, t, p: (type(a.screen).__name__,
+            inside=lambda a, t, _p: (type(a.screen).__name__,
                                     getattr(a.screen, "here", None),
                                     getattr(a.screen, "total", None),
                                     getattr(a.screen, "scope", "?")))
@@ -1901,24 +1901,78 @@ def test_a_mark_on_work_that_is_no_longer_open_refuses_the_whole_move():
     assert "no longer open" in said, said
 
 
-def test_a_refused_move_keeps_the_marks():
-    """A write the board refused is the moment a person most wants to press the key
-    again, and clearing the selection first makes them mark three rows to do it."""
+def test_the_selection_survives_a_move_so_a_block_can_be_moved_again():
+    """Clearing the marks after a move looked like housekeeping and made the block
+    a one-shot: the rows come back, the cursor lands on the head of them, and the
+    next `j` moves that ONE row while the person believes they are still moving
+    three. Silently changing what a key acts on is the worse mistake and the one
+    they cannot see; the marks they can, because every marked row wears a ▪."""
+    async def drive():
+        app_module, app = _quiet_dash()
+        # No pilot: this asserts on state a keypress does not reach, so there is
+        # nothing to drive — the app only has to be alive for `query_one`.
+        async with app.run_test(size=(110, 46)):
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.marked = {"plan:a", "plan:b"}
+            app.clear_reordering(moved=False)
+            after_failure = set(app.marked)
+            app.clear_reordering(moved=True)
+            return after_failure, set(app.marked)
+
+    after_failure, after_success = asyncio.run(drive())
+    assert after_failure == {"plan:a", "plan:b"}, \
+        "a failed move threw the selection away — the moment a person most wants " \
+        "to press the key again"
+    assert after_success == {"plan:a", "plan:b"}, \
+        "a move that landed dropped the marks, so the next key moved one row " \
+        "while the person believed they were still moving the block"
+
+
+def test_a_moved_row_stays_under_the_cursor():
+    """Press `j` four times and one thing moves four places.
+
+    A move rewrites the whole table and a DataTable's cursor is an INDEX, so
+    without following the key the row slides out from under the person and the
+    next press moves whatever has taken its place — which is the same wrong thing
+    the mark rules guard against, arriving through the redraw instead.
+    """
     async def drive():
         app_module, app = _quiet_dash()
         async with app.run_test(size=(110, 46)) as pilot:
             app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
                                                  agent="host")
-            app.marked = {"plan:a", "plan:b"}
-            app.clear_reordering(moved=False)
-            kept = set(app.marked)
-            app.marked = {"plan:a", "plan:b"}
-            app.clear_reordering(moved=True)
-            return kept, set(app.marked)
+            app.human = SimpleNamespace(why_not=lambda: None, NO_KEY="no key")
+            items = {i["item_id"]: i for i in REORDER_PLAN["items"]}
+            seen: list = []
 
-    kept, cleared = asyncio.run(drive())
-    assert kept == {"plan:a", "plan:b"}, "a failed move threw the selection away"
-    assert cleared == set(), "a move that landed left its marks behind"
+            def board_applies(scope, order, moved):
+                """What the board does: renumber the scope and answer with it."""
+                seen.append(list(order))
+                app.plan = {**REORDER_PLAN,
+                            "items": [{**items[i], "rank": n + 1}
+                                      for n, i in enumerate(order)]}
+                app.clear_reordering(True)
+                app.render_work()
+
+            app.run_reorder = board_applies
+            app.render_plan(REORDER_PLAN, None)
+            await pilot.pause(0.2)
+            table = app.query_one("#work")
+            table.move_cursor(row=0, animate=False)
+            await pilot.pause(0.1)
+            under = [app.selected_work()["title"]]
+            for _ in range(2):
+                await pilot.press("j")
+                await pilot.pause(0.3)
+                under.append(app.selected_work()["title"])
+            return under, seen
+
+    under, seen = asyncio.run(drive())
+    assert under == ["first", "first", "first"], \
+        f"the row moved out from under the cursor: {under}"
+    assert seen == [["b", "a", "c"], ["b", "c", "a"]], \
+        f"two presses did not move one row two places: {seen}"
 
 
 def _quiet_dash():
