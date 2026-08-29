@@ -241,6 +241,15 @@ class Check:
     #: one: a `Check` built anywhere but the registry announces per machine, which costs
     #: a duplicate post and can never suppress another box's news.
     scope: str = "host"
+    #: Which class of judgement a failing row is, in #279's closed vocabulary.
+    #: Copied off the registration by `run_checks`, like `group` and `scope`.
+    #:
+    #: The default is `environment` and it is the fail-safe one for a reason worth
+    #: stating: #578 added `chore`, which asserts that NOBODY has to judge this row.
+    #: A `Check` built anywhere but the registry must not be able to mint that
+    #: assertion by defaulting into it — the quiet direction has to be the one that
+    #: still asks for a person, never the one that says none is needed.
+    needs_human: str = "environment"
     #: Why this row matters, in prose — copied off the registration by `run_checks`,
     #: for the same reason `group` is. Per-ROW and not per-verdict: the paragraph is
     #: the same however the row came out, because it is about the mechanism rather
@@ -261,7 +270,7 @@ class Check:
 
     def as_dict(self) -> dict:
         return {"name": self.name, "group": self.group, "scope": self.scope,
-                "subject": self.subject,
+                "needs_human": self.needs_human, "subject": self.subject,
                 "detail": self.detail, "verdict": self.verdict, "manual": self.manual,
                 "fix": self.fix, "explanation": self.explanation, "prompt": self.prompt,
                 "prompt_for": self.prompt_for, "no_prompt": self.no_prompt or None,
@@ -393,11 +402,26 @@ class CheckSpec:
     #: registered without its author deciding, which is the only way the answer stays
     #: correct as rows are added.
     scope: str
+    #: Which class of judgement this row's FAILURE is, in #279's closed vocabulary.
+    #: No default, on exactly the terms `scope` has none: until #578 this tool sent
+    #: one class for all twenty rows, and the result was ten `stuck` posts over two
+    #: days that all said `environment` — including "4 pull requests ready to land
+    #: and the tip of main was committed 2h 21m ago", where no judgement was owed at
+    #: all. A default here would have let that come back one row at a time.
+    #:
+    #: Not validated against the vocabulary in this file: the door is imported at
+    #: call time by design (see `announce_failures`), so there is nothing to check
+    #: against at import. `tests/test_needs_human_drift.py` reads these literals out
+    #: of this source and compares them with `app/needs_human.py`, which is the same
+    #: way `preland` and `epic`'s literals are kept honest.
+    needs_human: str
     briefs: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         assert self.explanation.strip(), f"{self.name} has no explanation"
         assert self.scope in SCOPES, f"{self.name}: {self.scope!r} is not one of {SCOPES}"
+        assert re.fullmatch(r"[a-z]+", self.needs_human or ""), (
+            f"{self.name}: {self.needs_human!r} is not a needs-human class")
         for verdict, brief in self.briefs.items():
             assert verdict in VERDICTS, f"{self.name}: {verdict!r} is not a verdict"
             assert isinstance(brief, Brief), f"{self.name}: {verdict} is not a Brief"
@@ -3987,6 +4011,7 @@ GROUPS = {
 CHECKS = (
     CheckSpec(
         "checkout", "host", check_checkout, scope="host",
+        needs_human="chore",
         explanation=(
             "Every row below that compares something against *this checkout* is only as "
             "current as the checkout is. `git status` says a branch is up to date with "
@@ -4013,6 +4038,7 @@ CHECKS = (
         }),
     CheckSpec(
         "board", "host", check_board, scope="host",
+        needs_human="chore",
         explanation=(
             "The board, the harness and the client are versioned independently and none "
             "of them can see the other two, so skew surfaces as somebody else's error: "
@@ -4034,6 +4060,7 @@ CHECKS = (
         }),
     CheckSpec(
         "harness", "host", check_harness, scope="host",
+        needs_human="environment",
         explanation=(
             "The harness on PATH is a nix store path built from a pinned rev, and no "
             "script inside it can tell you it is stale because each one knows only its "
@@ -4075,6 +4102,7 @@ CHECKS = (
         }),
     CheckSpec(
         "client", "host", check_client, scope="host",
+        needs_human="chore",
         explanation=(
             "`qb-mcp` execs `$QUARTERBACK_REPO/mcp/.venv/bin/python`, so the venv that "
             "matters is the CONFIGURED checkout's and not whichever directory you happen "
@@ -4084,6 +4112,7 @@ CHECKS = (
         briefs={}),
     CheckSpec(
         "token", "host", check_token, scope="host",
+        needs_human="auth",
         explanation=(
             "A token is what makes a post on the board attributable to a machine, and "
             "every claim, lease and escalation this fleet coordinates through depends on "
@@ -4105,6 +4134,7 @@ CHECKS = (
         }),
     CheckSpec(
         "hooks", "host", check_hooks, scope="host",
+        needs_human="chore",
         explanation=(
             "The guards live in `harness/githooks/` in git, and `ls` on that directory "
             "succeeds on a machine where not one of them is installed — which is exactly "
@@ -4137,6 +4167,7 @@ CHECKS = (
         }),
     CheckSpec(
         "stash", "host", check_stash, scope="host",
+        needs_human="decision",
         explanation=(
             "Every worktree of a repository shares one `refs/stash` — it lives in the "
             "common git dir — so `stash@{{0}}` means whatever the last pusher meant, "
@@ -4160,6 +4191,7 @@ CHECKS = (
         }),
     CheckSpec(
         "reconcile", "host", check_reconcile, scope="host",
+        needs_human="chore",
         explanation=(
             "The board's plan is what a cold agent reads to find out what to do next, and "
             "`qb-reconcile` is what keeps it honest by noticing that an item's issue has "
@@ -4188,6 +4220,7 @@ CHECKS = (
         }),
     CheckSpec(
         "edge", "host", check_edge, scope="host",
+        needs_human="auth",
         explanation=(
             "`HUMAN_EDGE_SECRET` is what lets the browser vhost vouch for a person, and it "
             "was documented in DEPLOY.md with a checklist and deployed nowhere — so every "
@@ -4224,6 +4257,7 @@ CHECKS = (
         }),
     CheckSpec(
         "tools", "host", check_tools, scope="host",
+        needs_human="environment",
         explanation=(
             "Half the rows in this report are a subprocess, and a missing `gh` or an "
             "unauthenticated one turns them into unknowns rather than answers. This row "
@@ -4232,6 +4266,7 @@ CHECKS = (
         briefs={}),
     CheckSpec(
         "merges", "landing", check_merges, scope="host",
+        needs_human="decision",
         explanation=(
             "If something reserves a release number at push time and the repository "
             "squashes or rebases on merge, the commit the tag was reserved against stops "
@@ -4260,6 +4295,7 @@ CHECKS = (
         }),
     CheckSpec(
         "queue", "landing", check_queue, scope="repo",
+        needs_human="chore",
         explanation=(
             "`queued > 0 && ready == 0` is the ordinary state of a queue that is working, "
             "for as long as a landing takes. Past that it means the head of the line is "
@@ -4294,6 +4330,7 @@ CHECKS = (
         }),
     CheckSpec(
         "unpushed", "landing", check_unpushed, scope="host",
+        needs_human="decision",
         explanation=(
             "On the machine this row was written for, eleven branches carried twenty-eight "
             "commits that existed on no remote anywhere, the oldest nineteen days old — "
@@ -4338,6 +4375,7 @@ CHECKS = (
         }),
     CheckSpec(
         "landed", "landing", check_landed, scope="repo",
+        needs_human="chore",
         explanation=(
             "A pull request GitHub calls CLEAN can land, so if one has been CLEAN while "
             "the tip of the integration branch has not moved for hours, something between "
@@ -4366,6 +4404,7 @@ CHECKS = (
         }),
     CheckSpec(
         "escalations", "landing", check_escalations, scope="repo",
+        needs_human="chore",
         explanation=(
             "Three times now this fleet has built a place for work that is stuck to be "
             "recorded, and three times nothing wrote to it: the `stuck` post type "
@@ -4397,6 +4436,7 @@ CHECKS = (
         }),
     CheckSpec(
         "tags", "landing", check_tags, scope="host",
+        needs_human="decision",
         explanation=(
             "A release tag is the durable claim that a version number means one specific "
             "commit. When one points off the history it names, the claim is false for "
@@ -4423,6 +4463,7 @@ CHECKS = (
         }),
     CheckSpec(
         "generated", "landing", check_generated, scope="host",
+        needs_human="chore",
         explanation=(
             "`CHANGELOG.md` is output: the release job writes it and nothing else does. "
             "Every branch that shipped anything used to edit the same lines at the top of "
@@ -4457,6 +4498,7 @@ CHECKS = (
         }),
     CheckSpec(
         "stamper", "landing", check_stamper, scope="host",
+        needs_human="chore",
         explanation=(
             "#122 removed branch-side release stamping: a branch names no version, because "
             "the number belongs to the commit that lands on `main` and a branch cannot "
@@ -4483,6 +4525,7 @@ CHECKS = (
         }),
     CheckSpec(
         "briefs", "landing", check_briefs, scope="host",
+        needs_human="chore",
         explanation=(
             "A brief is what an agent DOES. #122 removed branch-side release stamping from "
             "the code, and on the night of 2026-08-23 five agents stamped anyway — every "
@@ -4535,6 +4578,7 @@ CHECKS = (
         }),
     CheckSpec(
         "instructions", "semantic", check_instructions, scope="host",
+        needs_human="taste",
         explanation=(
             "The deterministic `briefs` row reads fenced code blocks, and it is right to: a "
             "predicate can tell whether a document RUNS a removed command. What it cannot "
@@ -4636,6 +4680,7 @@ def run_checks(host: Host, only: set[str] | None = None) -> list[Check]:
                           f"the check itself raised {type(exc).__name__}: {exc}", "unknown")
         check.group = spec.group
         check.scope = spec.scope
+        check.needs_human = spec.needs_human
         check.explanation = spec.explanation
         # The brief is composed HERE, from the registration, for the same reason the
         # group is assigned here: a check function that could write its own brief
@@ -4831,14 +4876,23 @@ def exit_code(checks: list[Check]) -> int:
 # --announce — the half of #405 that runs when nobody is watching
 # --------------------------------------------------------------------------- #
 
-#: What class of judgement a failing row is, in #279's closed vocabulary. One
-#: class for every row rather than a per-check mapping, because every question this
-#: tool can raise is the same kind of question: some piece of shared machinery — a
-#: hook, a token, a repository setting, a line to land in — is not working, and the
-#: fix is an act rather than a taste. `environment` is spelled "does it work on the
-#: box it has to work on", which is exact for the `host` group and the nearest true
-#: word for the `landing` one; `other` would be less informative and #279's list is
-#: closed on purpose.
+#: The class a row falls back to when nothing said otherwise — #578 replaced the
+#: single module-wide class with :attr:`CheckSpec.needs_human`, one decision per
+#: registration.
+#:
+#: The paragraph that used to live here argued that every question this tool can
+#: raise is the same kind of question — "some piece of shared machinery is not
+#: working, and the fix is an act rather than a taste" — and it was wrong in a way
+#: that only showed up once the posts were counted. Ten `stuck` posts over two days
+#: all said `environment`, and one of them was *"4 pull requests ready to land and
+#: the tip of main was committed 2h 21m ago"*: nothing unclear, nothing to weigh,
+#: and the whole remedy `gh pr merge` four times. "The fix is an act rather than a
+#: taste" is exactly right and is precisely why `environment` was wrong — an act
+#: nobody has to judge is #578's `chore`, and there was no word for it.
+#:
+#: Kept as the fallback on :class:`Check` rather than deleted, and it is deliberately
+#: NOT `chore`: a row that reaches the door without a registration behind it must
+#: still ask for a person.
 NEEDS_HUMAN_CLASS = "environment"
 
 #: What `--announce` puts on the board. `fail` only, and the omission is deliberate
@@ -5227,7 +5281,7 @@ def _peer_that_said_it(check: Check, slug: str, peers: dict[str, str],
     """
     if check.scope != "repo" or not peers:
         return ""
-    prefix = door.headline(cls=NEEDS_HUMAN_CLASS, repo=slug,
+    prefix = door.headline(cls=check.needs_human, repo=slug,
                            summary=f"{_headline_of(check)}: ")
     return next((who for summary, who in peers.items() if summary.startswith(prefix)), "")
 
@@ -5323,7 +5377,7 @@ def announce_failures(checks: list[Check], host: Host, script: str) -> list[str]
                  if takes_condition else {})
         try:
             line = needs_human.announce(
-                cls=NEEDS_HUMAN_CLASS,
+                cls=check.needs_human,
                 reason=check.manual or check.detail,
                 summary=summary,
                 repo=slug,

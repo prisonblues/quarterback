@@ -24,6 +24,31 @@ this*. Collapsing them puts a grep-able question and a design decision in one
 bucket, and the whole design of that column is that two states which look alike
 must not collapse.
 
+**``chore`` says nobody has to judge this, and grants nothing.** The other six
+name a kind of judgement a person owes. There was no word for the case where no
+judgement is owed at all and the fleet merely is not permitted to act, so those
+escalations filed themselves under ``environment`` — measured, ten ``stuck``
+posts over two days, every one of them ``environment``, including *"4 pull
+requests ready to land and the tip of main was committed 2h 21m ago"*. Nothing
+about that was unclear and nobody had to weigh anything; the whole remedy was
+``gh pr merge`` four times. It landed in ``environment`` because that was the
+least-wrong of six wrong options, and the cost is that the one surface a person
+opens fills with things nobody needs to think about — which is how a surface
+stops being opened, by the same fleet that has spent a week closing defects
+whose shape is *a signal that is present and unread*.
+
+The name is an assertion about the ITEM, not an instruction about what happens
+next: *this contains no judgement*. It is deliberately not ``permission``,
+``approve`` or ``ready``, all of which were considered and all of which name the
+act rather than the item, and so read as arguing for the very thing that is not
+decided here. **What the fleet may DO with this class is not settled by this
+module and must not be read out of it.** #85, #86, #78 and #335 each settled the
+same point from a different direction: the party that classifies must not also
+be the party that acts on the classification. A producer says "no judgement is
+owed"; nothing in this repo lets that sentence merge, land, deploy or retry
+anything. Landing the vocabulary first, and any policy separately and
+deliberately, is what keeps those two hands apart.
+
 **A flag costs a reason.** ``#67`` is explicit that an agent must not escalate to
 end a cycle it finds tedious, so the rate at which each seat reaches for this is
 exactly the thing to measure — which means a bare flag, a confident assertion
@@ -40,10 +65,27 @@ from __future__ import annotations
 #: counting as coverage.
 #:
 #: ``other`` is the escape hatch and is deliberately last. It is how the
-#: vocabulary GROWS — a class that keeps turning up under ``other`` with the same
-#: reason is the evidence for adding a word — and it is not a place to file a
-#: judgement one of the five above already names.
-NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "other")
+#: vocabulary GROWS — a class that keeps turning up under a word that does not fit,
+#: with the same reason, is the evidence for adding one — and it is not a place to
+#: file a judgement one of the classes above already names.
+#:
+#: That rule used to say "under ``other``", and #578 is why it no longer does.
+#: ``chore``'s evidence arrived under ``environment``: ten ``stuck`` posts over two
+#: days, none of them owing anybody a judgement, all filed as the least-wrong of
+#: six. A producer reaching for the nearest real word rather than the hatch is the
+#: ORDINARY way a missing class hides, and a growth rule that only watches ``other``
+#: watches the quieter half. #328 proposed ``authorisation`` and was refused under
+#: the old wording for want of evidence; the refusal was right, and it was right
+#: because nothing had turned up anywhere — not because nothing had turned up here.
+#:
+#: **The bar did not move with it, and this sentence is here because widening an
+#: admission rule in the same change that admits a member is how a bar quietly
+#: stops being one.** Evidence is still COUNTED rows, named: which escalations, over
+#: what period, and why each of the existing classes was wrong for them rather than
+#: merely worse. An author who can only say that a current class "does not fit" has
+#: an opinion, which is what ``other`` and its reason line are for.
+NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "chore",
+                       "other")
 
 #: What each class means, as the question a diff cannot answer. Published by the
 #: API so a producer can discover the vocabulary rather than hardcode a copy of
@@ -54,7 +96,8 @@ NEEDS_HUMAN_CLASS_HELP = {
     "ui": "does it actually look and behave right on a real screen",
     "environment": "does it work on the box it has to work on",
     "auth": "does the credential path actually work, end to end",
-    "other": "a human judgement none of the five above names — say which in the reason",
+    "chore": "no judgement is owed — a person may still be needed, but not to decide",
+    "other": "a human judgement none of the named classes above — say which in the reason",
 }
 
 if set(NEEDS_HUMAN_CLASS_HELP) != set(NEEDS_HUMAN_CLASSES):  # pragma: no cover - import guard
@@ -86,13 +129,17 @@ NEEDS_HUMAN_LABELS = {c: label_for(c) for c in NEEDS_HUMAN_CLASSES}
 #: Label colours, six digits and no leading ``#`` (what ``gh label create`` wants).
 #: Warm for the two a person answers at a desk, cool for the three that need a
 #: real screen or a real box, grey for the escape hatch — so a label list sorts
-#: into "think about it" and "go and look at it" at a glance on a phone.
+#: into "think about it" and "go and look at it" at a glance on a phone. Amber for
+#: ``chore``, which is neither: it is the pile a person clears without thinking,
+#: and it wants to be told apart from the six that cost attention rather than
+#: ranked among them.
 LABEL_COLOURS = {
     "decision": "b60205",
     "taste": "d93f0b",
     "ui": "1d76db",
     "environment": "0e8a16",
     "auth": "5319e7",
+    "chore": "fbca04",
     "other": "586069",
 }
 

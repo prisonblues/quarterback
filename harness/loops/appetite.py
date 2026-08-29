@@ -65,12 +65,12 @@ reviewer that had *declared it could not assess the condition*, and it raised
 them anyway. So: a label a person applied, same reasoning as human triage.
 
 The default skip list is `needs-human/*`, which is #279's closed vocabulary
-(`decision | taste | ui | environment | auth | other`) rather than a second,
-parallel set of words for the same idea. #86 proposed `design`/`ui`/
-`decision-owed`/`needs-scoping`, written when this repo had no labels at all;
-those six exist now and a producer already writes the class into the board, so
-the gate reads the labels that exist instead of asking anyone to maintain two
-vocabularies that mean the same thing.
+(`decision | taste | ui | environment | auth | chore | other`, the last of them
+from #578) rather than a second, parallel set of words for the same idea. #86
+proposed `design`/`ui`/`decision-owed`/`needs-scoping`, written when this repo
+had no labels at all; those seven exist now and a producer already writes the
+class into the board, so the gate reads the labels that exist instead of asking
+anyone to maintain two vocabularies that mean the same thing.
 
 Usage:
     python3 appetite.py pickup 85 --repo quarterback      # may I work this?

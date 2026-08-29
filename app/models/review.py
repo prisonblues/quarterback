@@ -22,6 +22,14 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
+from app.needs_human import NEEDS_HUMAN_CLASSES
+
+#: #279's vocabulary, rendered for a CHECK. Built from the tuple rather than
+#: spelled out, which is the whole point of that module having no imports: these
+#: two constraints were written as literals and #578 found them still naming six
+#: classes after the vocabulary had grown to seven — the exact drift
+#: `app/models/blocker.py` avoids by composing its own list the same way.
+_NH_CLASS_LIST = ", ".join(f"'{c}'" for c in NEEDS_HUMAN_CLASSES)
 
 
 class ReviewRun(Base):
@@ -724,8 +732,7 @@ class ReviewFinding(Base):
         Index("ix_review_findings_needs_human", "needs_human_class",
               postgresql_where=text("needs_human")),
         CheckConstraint(
-            "needs_human_class IS NULL OR needs_human_class IN "
-            "('decision', 'taste', 'ui', 'environment', 'auth', 'other')",
+            f"needs_human_class IS NULL OR needs_human_class IN ({_NH_CLASS_LIST})",
             name="ck_review_findings_needs_human_class",
         ),
         # The evidence rule, both ways round, at the boundary rather than only in
@@ -844,8 +851,7 @@ class ReviewFindingReport(Base):
         # THESE rows — so a bare flag arriving here lands directly in a published
         # per-reviewer figure.
         CheckConstraint(
-            "needs_human_class IS NULL OR needs_human_class IN "
-            "('decision', 'taste', 'ui', 'environment', 'auth', 'other')",
+            f"needs_human_class IS NULL OR needs_human_class IN ({_NH_CLASS_LIST})",
             name="ck_review_finding_reports_needs_human_class",
         ),
         CheckConstraint(

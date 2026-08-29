@@ -64,7 +64,8 @@ CANONICAL = Path(__file__).resolve().parents[2] / "app" / "needs_human.py"
 #: the source and compares it against the imported module — a test that runs in
 #: the app suite, where both halves exist. A fifth spelling of this tuple would
 #: drift exactly as the four before it did, so there must never be a sixth.
-_FALLBACK_CLASSES = ("decision", "taste", "ui", "environment", "auth", "other")
+_FALLBACK_CLASSES = ("decision", "taste", "ui", "environment", "auth", "chore",
+                     "other")
 
 #: Same rule, same test. Only the two functions below read it.
 _FALLBACK_REASON_MAX = 4000
@@ -98,7 +99,15 @@ def _canonical(path: Path = CANONICAL):
 
 _CANON = _canonical()
 
-#: ``decision | taste | ui | environment | auth | other``, from #279.
+#: ``decision | taste | ui | environment | auth | chore | other`` — #279, and
+#: ``chore`` from #578.
+#:
+#: A harness older than #578 resolves ``chore`` through :func:`class_or_none`,
+#: does not recognise it, and :func:`announce` files it under ``other`` with
+#: ``(unrecognised class 'chore')`` on the line it returns. That is the right
+#: way round: the escalation still happens, still carries its reason, and says
+#: in plain words that this box's vocabulary is behind — rather than a stale
+#: producer quietly minting a class the board has never heard of.
 NEEDS_HUMAN_CLASSES: tuple[str, ...] = (
     tuple(_CANON.NEEDS_HUMAN_CLASSES) if _CANON else _FALLBACK_CLASSES)
 

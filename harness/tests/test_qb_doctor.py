@@ -978,10 +978,11 @@ def test_a_check_that_raises_becomes_an_unknown_naming_the_exception(monkeypatch
         raise RuntimeError("the host is very odd")
 
     monkeypatch.setattr(qd, "CHECKS", (
-        qd.CheckSpec("boom", "host", boom, scope="host",
+        qd.CheckSpec("boom", "host", boom, scope="host", needs_human="environment",
                      explanation="a check that explodes"),
         qd.CheckSpec("fine", "host", lambda _h: qd.Check("fine", "-", "", "ok"),
-                     scope="host", explanation="a check that does not")))
+                     scope="host", needs_human="environment",
+                     explanation="a check that does not")))
     out = qd.run_checks(host_for(repo))
     assert [c.verdict for c in out] == ["unknown", "ok"]
     assert "RuntimeError: the host is very odd" in out[0].detail
@@ -1708,6 +1709,103 @@ def test_every_check_belongs_to_a_group_this_file_declares():
             f"{spec.name} is filed under {spec.group!r}, which is not a group")
 
 
+# --------------------------------------------------------------------------- #
+# needs-human class — one decision per registration, #578
+# --------------------------------------------------------------------------- #
+
+def test_every_check_declares_which_judgement_its_failure_is():
+    """No default on `CheckSpec.needs_human`, so this cannot silently regress.
+
+    The dataclass already refuses a malformed value; what this adds is that the
+    literals are the vocabulary's, which `tests/test_needs_human_drift.py` proves
+    against `app/needs_human.py` from the app suite where both halves are readable.
+    """
+    for spec in qd.CHECKS:
+        assert spec.needs_human in _REAL_DOOR.NEEDS_HUMAN_CLASSES, (
+            f"{spec.name} is classed {spec.needs_human!r}, which is not a class")
+
+
+def test_the_rows_are_not_all_one_class_any_more():
+    """The defect #578 was filed about, pinned as a property rather than a list.
+
+    This tool sent `environment` for all twenty rows, and the visible result was
+    ten `stuck` posts over two days that all said the same word — including "4
+    pull requests ready to land and the tip of main was committed 2h 21m ago",
+    where nobody owed anybody a judgement. A single-class regression would restore
+    exactly that, and would do it without failing anything else here.
+    """
+    classes = {spec.needs_human for spec in qd.CHECKS}
+    assert len(classes) > 1, "every row is one class again — this is #578"
+    by_name = {spec.name: spec.needs_human for spec in qd.CHECKS}
+    # The three the issue argued explicitly, and they are the three that show the
+    # boundary: nothing to judge / a judgement per branch / the fleet may not even
+    # know the remedy.
+    assert by_name["landed"] == "chore"
+    assert by_name["unpushed"] == "decision"
+    assert by_name["harness"] == "environment"
+
+
+def test_no_chore_row_hands_an_announced_failure_to_a_human():
+    """The boundary `chore` actually asserts, defended structurally.
+
+    `AUDIENCES` in qb-doctor already draws this line and says so: an `agent` brief
+    is "a piece of work with constraints and a finish line", a `human` brief is
+    "an escalation — a judgement, a password, a deploy, something nothing here may
+    decide", and "#279's `needs_human` draws the same line one layer up". So a row
+    that classes itself `chore` — nobody has to judge this — while handing its
+    announced failure to a HUMAN is contradicting itself, and one of the two is
+    wrong.
+
+    Only the verdicts in `ANNOUNCED` are checked, because those are the only ones
+    that reach a person: a `warn` brief is read by whoever ran the tool.
+
+    Deliberately NOT the stronger rule a reviewer proposed — that a `chore` brief
+    must contain an executable remedy. `chore` asserts that no JUDGEMENT is owed,
+    not that the remedy is already determined; a row can need an agent to work out
+    which of three mechanical causes applies and still owe nobody a decision. The
+    stronger rule would put `landed` back on the human surface, which is the defect
+    #578 was filed about.
+    """
+    for spec in qd.CHECKS:
+        for verdict in qd.ANNOUNCED:
+            brief = spec.briefs.get(verdict)
+            if brief is None:
+                continue
+            if brief.audience == "human":
+                assert spec.needs_human != "chore", (
+                    f"{spec.name} is classed `chore` but hands its {verdict} to a "
+                    "human — a chore is work, not a question")
+
+
+def test_every_row_that_asks_a_human_names_the_judgement_it_wants():
+    """The same invariant from the other side, which is the half that rots.
+
+    A row can drift to `chore` later without anyone noticing it still escalates to
+    a person; this is what notices. Every announced failure addressed to a human
+    must carry one of the classes that names a judgement — never `chore`, and
+    never the `other` hatch, which #279 keeps for a judgement none of the named
+    ones covers and which nothing in this tool has ever needed.
+    """
+    judgements = tuple(c for c in _REAL_DOOR.NEEDS_HUMAN_CLASSES if c != "chore")
+    for spec in qd.CHECKS:
+        for verdict in qd.ANNOUNCED:
+            brief = spec.briefs.get(verdict)
+            if brief is not None and brief.audience == "human":
+                assert spec.needs_human in judgements, spec.name
+
+
+def test_a_check_built_outside_the_registry_still_asks_for_a_person():
+    """The `Check` default is the fail-safe direction and must never be `chore`.
+
+    `chore` asserts that NOBODY has to judge this. A row that reached the door
+    without a registration behind it and defaulted into that assertion would be
+    the one way this change could quietly say "no judgement needed" about
+    something nobody ever classified.
+    """
+    assert qd.Check("stray", "-", "", "fail").needs_human == "environment"
+    assert qd.Check("stray", "-", "", "fail").needs_human != "chore"
+
+
 def test_only_accepts_a_group_name_and_expands_it_to_its_rows(monkeypatch):
     """`--only landing` names a question rather than a list of rows, which is what made
     #407 an extension of a category instead of a retrofit around a single check."""
@@ -1736,7 +1834,7 @@ def test_a_rows_group_comes_from_the_registration_not_from_the_check(monkeypatch
         raise RuntimeError("boom")
 
     monkeypatch.setattr(qd, "CHECKS", (qd.CheckSpec("merges", "landing", boom,
-                                                    scope="repo",
+                                                    scope="repo", needs_human="environment",
                                                     explanation="it explodes"),))
     rows = qd.run_checks(host_for(repo))
 
@@ -3219,7 +3317,13 @@ class _FakeNeedsHuman:
     other way round while putting the fleet's escalations somewhere nobody watches.
     """
 
-    NEEDS_HUMAN_CLASSES = ("decision", "taste", "ui", "environment", "auth", "other")
+    # Taken off the real module rather than restated, for the reason the comment
+    # below gives about `headline`. This was a literal six-tuple until #578 added a
+    # seventh class and nothing here noticed: `tests/test_needs_human_drift.py` pins
+    # the two shipped spellings of the vocabulary and never scanned this one, so the
+    # copy that would have gone stale was the one inside the test that exists to
+    # catch staleness.
+    NEEDS_HUMAN_CLASSES = _REAL_DOOR.NEEDS_HUMAN_CLASSES
 
     # Taken off the real module rather than restated. #569's peer gate matches a post
     # this format wrote, so a fake that spelled the headline itself could pass every
@@ -3821,7 +3925,7 @@ def test_a_rows_explanation_comes_from_the_registration_not_from_the_check(monke
     reach."""
     monkeypatch.setattr(qd, "CHECKS", (
         qd.CheckSpec("merges", "landing", lambda _h: qd.Check("merges", "-", "x", "ok"),
-                     scope="repo",
+                     scope="repo", needs_human="environment",
                      explanation="the registration's paragraph, not the function's"),))
 
     rows = qd.run_checks(host_for(repo))
@@ -3835,6 +3939,7 @@ def test_an_ok_row_gets_no_brief_and_the_report_says_why(repo):
     be is silence: a caller that got `None` and no reason could not tell "nothing to
     dispatch here" from "the brief broke", and those are opposite facts."""
     spec = qd.CheckSpec("queue", "landing", lambda _h: None, scope="repo",
+                        needs_human="environment",
                         explanation="x" * 200,
                         briefs={"fail": qd.Brief(audience="agent", task="do the thing")})
     check = qd.Check("queue", "-", "nothing is queued", "ok")
@@ -3882,6 +3987,7 @@ def test_an_empty_list_is_an_absent_fact_not_an_established_one(repo):
 def test_a_template_naming_a_fact_nothing_supplies_is_a_missing_brief(repo):
     """A typo in a registration is a missing brief, not a brief containing `{holder}`."""
     spec = qd.CheckSpec("queue", "landing", lambda _h: None, scope="repo",
+                        needs_human="environment",
                         explanation="x" * 200,
                         briefs={"fail": qd.Brief(audience="agent",
                                                  task="ask {holdr} about it")})
@@ -4395,7 +4501,8 @@ def test_the_semantic_group_does_not_run_unless_it_is_asked_for(monkeypatch, rep
     ran: list[str] = []
     spec = qd.CheckSpec("costly", "semantic",
                         lambda _h: (ran.append("asked"), qd.Check("costly", "-", "", "ok"))[1],
-                        scope="host", explanation="x " * 50)
+                        scope="host", needs_human="environment",
+                        explanation="x " * 50)
     monkeypatch.setattr(qd, "CHECKS", (spec,))
 
     assert qd.run_checks(host_for(repo)) == []

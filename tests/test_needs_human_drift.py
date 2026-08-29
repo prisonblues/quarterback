@@ -110,12 +110,33 @@ def test_every_class_a_producer_names_is_in_the_vocabulary():
     for path, pattern in (
         ("harness/loops/preland.py", r'hold_for_human\(\s*\n?\s*"([a-z]+)"'),
         ("harness/loops/epic.py", r'^(?:UNTRIAGED|RULING)_CLASS = "([a-z]+)"'),
+        # #578 made this one per REGISTRATION rather than per file: `qb-doctor`
+        # sent a single class for all twenty of its rows and every escalation it
+        # made said `environment`. Twenty literals is exactly the case this scan
+        # is for — `CheckSpec` cannot check them itself, because the door is
+        # imported at call time and there is no vocabulary in that file to check
+        # against.
+        ("harness/bin/qb-doctor", r'^\s*needs_human="([a-z]+)",$'),
+        ("harness/bin/qb-bump", r'^NEEDS_HUMAN_CLASS = "([a-z]+)"'),
     ):
         src = (REPO_ROOT / path).read_text(encoding="utf-8")
         found = set(re.findall(pattern, src, re.M))
         assert found, f"no hardcoded needs-human class found in {path}"
         literals |= found
     assert literals <= set(NEEDS_HUMAN_CLASSES), sorted(literals - set(NEEDS_HUMAN_CLASSES))
+
+
+def test_the_qb_doctor_scan_sees_every_registration():
+    """`assert found` above proves the scan saw ONE literal, not all twenty. A
+    registration whose class is formatted differently — no trailing comma, or
+    sharing a line — is skipped silently and never checked against the
+    vocabulary, which is the guard going half-blind rather than red."""
+    import re
+
+    src = (REPO_ROOT / "harness" / "bin" / "qb-doctor").read_text(encoding="utf-8")
+    specs = len(re.findall(r"^    CheckSpec\(", src, re.M))
+    seen = len(re.findall(r'^\s*needs_human="[a-z]+",$', src, re.M))
+    assert seen == specs, f"{specs} registrations but the scan sees {seen}"
 
 
 def test_the_seat_prompt_teaches_the_whole_vocabulary():
