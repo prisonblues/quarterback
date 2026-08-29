@@ -154,7 +154,7 @@ import panel_timing               # noqa: F401
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
 # the two saying it differently is how the three checks in #96 came to disagree.
-from preland import board_get, mergeability   # noqa: E402
+from preland import board_get, board_request, mergeability   # noqa: E402
 # #274's one door, and #279's escalation list read back through it.
 from needs_human import announce, digest as nh_digest   # noqa: E402
 
@@ -215,6 +215,89 @@ def board_escalations(gh_repo: str, pr_number: int) -> tuple[list[str], str]:
                     f"{type(keys).__name__}, not a list")
     return [str(k) for k in keys], ""
 
+
+#: What `GET /review/next-door` calls the hint list (#508). Named for the reason
+#: :data:`NEEDS_HUMAN_KEYS` is: two things read it, the fetch below and the note
+#: it writes when a board is too old to publish it.
+NEXT_DOOR_KEY = "hints"
+
+#: What a board that does not serve #508 answers, and why it is not one code.
+#:
+#: **404** is the obvious one — no such route. **422 is the one nobody predicts,
+#: and it is what the live board actually returned** the day this was written:
+#: `GET /review/{run_id}` is declared on the same prefix, so on a board predating
+#: this endpoint the path falls through to it, `next-door` fails the `int`
+#: validation, and FastAPI answers 422. It reads like "your request was
+#: malformed" and means "this board is older than the feature".
+#:
+#: Both are CAPABILITY answers and neither is a fault to report — the same
+#: distinction `preland.check_queue` draws on its own 404, and the reason
+#: `board_request` returns the status at all. A round is not less correct without
+#: hints, so a board that cannot serve them must be silent: a note on every round
+#: of every PR is a note that gets trained away, and the one that fires when
+#: something is genuinely wrong has to still be readable.
+#:
+#: A 422 from a board that DOES have the route would mean the parameters were
+#: refused, and the only parameter this sends that could be is `days` — clamped
+#: to `NEXT_DOOR_DAYS_MAX` before it leaves, precisely so this branch cannot
+#: swallow a real one.
+NEXT_DOOR_ABSENT = (404, 422)
+
+
+def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict], str]:
+    """`(defects confirmed next door, why there are none)` for this PR (#508).
+
+    The read half of #508. `finding_recurrence` chains a finding to earlier rounds
+    of its own PR; this asks the board the question that measurement cannot reach —
+    *what did a panel confirm on ANOTHER pull request, this week, in a file this
+    diff touches?* — and hands the answer to the seats as context.
+
+    `days == 0` is the dial's off position and returns "" as the reason, not an
+    error: a round that was told not to look has not failed to find anything. It
+    makes no board call at all, so switching the dial off costs nothing and cannot
+    fail.
+
+    **An error returns no hints and SAYS SO, and the difference from
+    :func:`board_escalations` is worth stating because it looks like the same
+    shape and is not.** There, a silent empty list lets a round count an escalated
+    finding as clearable, so absence is dangerous. Here absence is merely a round
+    that reviews the way every round did before #508 — the hints are a hint, and
+    nothing downstream is less correct without them. The note is still reported,
+    because a repo that switched this on and sees nothing in its prompts is owed
+    the reason, and because "the board is unreachable" is worth knowing on a round
+    that is about to make several other board calls. It must never become a
+    veto, a coverage gap, or anything a stop rule reads.
+    """
+    if days <= 0:
+        return [], ""
+    body, err, code = board_request("review/next-door",
+                                    {"repo": gh_repo, "pr": pr_number, "days": days,
+                                     "limit": NEXT_DOOR_MAX})
+    if code in NEXT_DOOR_ABSENT:
+        # Silent, deliberately. See `NEXT_DOOR_ABSENT`: this is a board older than
+        # the feature, which is the ordinary state of a fleet mid-rollout and not
+        # a fault anybody can act on.
+        return [], ""
+    if err:
+        return [], (f"next-door context: {err} — this round's reviewers were not "
+                    "told what was confirmed in these files on other PRs")
+    if not isinstance(body, dict):
+        return [], ("next-door context: the board answered /review/next-door "
+                    f"with a {type(body).__name__}, not an object")
+    hints = body.get(NEXT_DOOR_KEY)
+    if hints is None:
+        # A CAPABILITY answer and not a failure, and — unlike `board_escalations`
+        # — not one worth naming two causes for. A board older than #508 has no
+        # such endpoint and answers 404, which `board_get` already reported above
+        # as an error; reaching HERE means the endpoint answered and omitted the
+        # field, which no shipped version does. Reported plainly rather than
+        # guessed at.
+        return [], ("next-door context: the board answered /review/next-door "
+                    f"with no `{NEXT_DOOR_KEY}`")
+    if not isinstance(hints, list):
+        return [], (f"next-door context: `{NEXT_DOOR_KEY}` came back as a "
+                    f"{type(hints).__name__}, not a list")
+    return [h for h in hints if isinstance(h, dict)], ""
 
 def announce_escalations(payload: dict, cfg: dict) -> list[str]:
     """Tell the board about every finding this round says a human has to settle.
@@ -2052,6 +2135,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     brief_blind = (MOVE_MANIFEST_PROMPT if pre.verdict == "manifest"
                    else reviewer_brief(dials.reviewer_scope, reads_code=False))
 
+    # #508's next-door hints, fetched once for the round and rendered once. A
+    # MANIFEST round asks for none and is given none: its whole instruction is
+    # "do not review the moved code", and a list of defects confirmed in these
+    # files is an invitation to do exactly that. `MOVE_MANIFEST_PROMPT` carries no
+    # `NEXT_DOOR_SLOT` either, so the swap below is a no-op there twice over —
+    # belt and braces, because the two templates are selected by one ternary and
+    # the next slot added here will be added by somebody reading this line.
+    next_door: str = ""
+    if pre.verdict != "manifest":
+        hints, next_door_why = board_next_door(gh_repo, pr_number,
+                                               dials.next_door_days)
+        if next_door_why:
+            notes.append(next_door_why)
+        next_door = next_door_brief(hints)
+
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
         # `fit_argv_budget` takes this as a single-arg render, and antigravity is
@@ -2066,10 +2164,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # applies to the PROMPT, and antigravity is both the seat this text is for
         # and the one seat the kernel can veto. Adding it in `antigravity_args`
         # would put ~1,100 bytes past the clamp that just measured the prompt.
+        # `.format` FIRST, then the slot swap — the ordering `panel_rounds` uses
+        # for `JUDGE_CODE_SLOT`, and here it is load-bearing rather than tidy.
+        # `next_door` is built from model-authored finding titles, so a reviewer
+        # who once wrote a brace into a title would make `.format` raise KeyError
+        # on an unrelated round months later. Substituted after the render, that
+        # text is never scanned for fields. The token survives the `.format`
+        # untouched because it contains no braces of its own.
         return (brief if reads_code else brief_blind).format(
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text, diff=review.material(budget)[0],
-                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF)
+                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
+                        ).replace(NEXT_DOOR_SLOT, next_door)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say

@@ -838,6 +838,22 @@ DEFAULTS: dict = {
         # to switch this off; there is no `null` spelling for the same thing, because
         # one written value with two meanings is worse than one.
         "unrefereed_line_weight": 2,
+        # #508: how many days back a defect confirmed on ANOTHER pull request may be
+        # carried in front of this round's reviewers as context. `0` is off.
+        #
+        # 7, and short deliberately, because the signal decays fast and the decay is
+        # the whole reason it is worth reading at all. The measured case is an hour:
+        # a panel confirmed the dev bypass being consulted before the credential
+        # check in `app.auth.delegated()`, and the identical shape shipped in
+        # `app.auth.human()` sixty minutes later, copied out of the same source
+        # function. A confirmed finding from six weeks ago, in a file that has since
+        # been rewritten, is noise wearing the same clothes — and it is noise that
+        # costs prompt budget on every round of every PR.
+        #
+        # A window rather than a count, because what makes a hint worth its line is
+        # that it is RECENT, not that it is one of the last N. A repo with a quiet
+        # week should send nothing rather than reach further back to fill a quota.
+        "next_door_days": 7,
         # A fix pass that MULTIPLIES the diff has written a second change, not a
         # fix. If what a round reviews has grown by more than this multiple of what
         # the FIRST round of the cycle reviewed, the cycle stops and says the change
@@ -2617,6 +2633,11 @@ BOARD_DIALS: dict[str, Dial] = {
     # `null` distinct.
     "review_panel.unrefereed_line_weight": Dial("number", False, "either",
         'what a churned line of test or prose costs that budget, against production code at 1'),
+    # #508's window. NOT nullable, on `unrefereed_line_weight`'s rule and for the
+    # same reason: `0` already means "send none", so a `null` spelling for the same
+    # thing would be one written value with two meanings.
+    "review_panel.next_door_days": Dial("number", False, "either",
+        'how many days back a defect confirmed on another PR may be shown to the reviewers'),
     "review_panel.max_fix_growth": Dial("number", True, "either",
         'how many times its round-1 size the change may grow before the cycle stops'),
     # #492's absolute half of that ceiling. Settable on its own and nullable on its

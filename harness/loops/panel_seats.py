@@ -1595,6 +1595,75 @@ def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     return n
 
 
+
+def next_door_days(panel: dict, notes: list[str]) -> int:
+    """`next_door_days` — whole days >= 0, how far back #508's hints may reach.
+
+    `0` is OFF and is the one value with a second meaning: no board call is made,
+    the slot is filled with nothing, and the reviewer prompt is byte-identical to
+    the one this panel sent before #508 existed. That is a real switch and not a
+    degenerate window — "look back zero days" and "do not look" would otherwise be
+    two spellings of one behaviour, and a repo that wrote `0` meant the switch.
+
+    Negative is refused rather than clamped, on :func:`unrefereed_line_weight`'s
+    rule: a repo that wrote `-1` meant something, and nothing here can tell which
+    of two opposite things it was.
+
+    A bool is rejected before the integer read, and for the sharper of the two
+    reasons this codebase keeps writing down. ``isinstance(True, int)`` is True, so
+    `next_door_days: false` — which is exactly how a hand writes "off" — would
+    otherwise read as `0`, land on the OFF branch, and be **right by accident**.
+    `true` would read as `1` and silently narrow the window to a day. One of those
+    is harmless and one is not, and a reader that cannot tell them apart is a
+    reader that will get the second one wrong later.
+    """
+    raw = panel.get("next_door_days", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        return DEFAULT_NEXT_DOOR_DAYS
+
+    def refuse(what: str) -> int:
+        _refuse_value("next_door_days", raw,
+                      f"{what} — how many days back a confirmed finding on another "
+                      "PR may be carried in front of the reviewers as context, or "
+                      "0 to send none")
+        return DEFAULT_NEXT_DOOR_DAYS            # unreachable; `_refuse_value` raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number of days")
+    if n < 0:
+        return refuse("0 or more")
+    if n > NEXT_DOOR_DAYS_MAX:
+        # CLAMPED, not refused, and this is the one place in this block where that
+        # is the right answer rather than the lazy one. Everything else here refuses
+        # because the written value could mean two opposite things and nothing can
+        # tell which. `5000` means one thing only — "reach back as far as you can" —
+        # and the board's own ceiling is 3650, so honouring it as far as the board
+        # allows delivers what was asked for. Refusing would hard-exit a whole panel
+        # over an advisory hint, and passing it through unchanged would send a
+        # `days` the board answers with HTTP 422: a note, no hints, and an operator
+        # who widened the window and silently got none.
+        #
+        # Said out loud, because `Dials` records what was APPLIED and a payload
+        # reading 3650 under a rules file reading 5000 is otherwise unexplained.
+        notes.append(
+            f"`review_panel.next_door_days` is {n} and the board accepts at most "
+            f"{NEXT_DOOR_DAYS_MAX}; this round used {NEXT_DOOR_DAYS_MAX} days of "
+            "next-door context (#508)")
+        return NEXT_DOOR_DAYS_MAX
+    return n
+
 def distant_merge_lines(panel: dict, notes: list[str]) -> int | None:
     """`distant_merge_lines` — whole lines >= 0, or ``None`` for "never distant".
 
@@ -1984,7 +2053,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The eleven #165/#297/#492/#482/#554 settings as this round applied them.
+    """The twelve #165/#297/#492/#482/#554/#508 settings as this round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -2001,6 +2070,7 @@ class Dials:
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
+    next_door_days: int = DEFAULT_NEXT_DOOR_DAYS
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
     max_rounds: int = DEFAULT_MAX_ROUNDS
 
@@ -2016,6 +2086,7 @@ class Dials:
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
                 "reviewer_scope": self.reviewer_scope,
+                "next_door_days": self.next_door_days,
                 "require_failing_test": self.require_failing_test,
                 "max_rounds": self.max_rounds}
 
@@ -2186,7 +2257,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all eleven at once.
+    """Read, validate and report all twelve at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2212,6 +2283,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
+        next_door_days=next_door_days(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
                                         DEFAULT_REQUIRE_FAILING_TEST, notes),
         max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes, round_ceiling),
@@ -4331,6 +4403,7 @@ __all__ = [
     "_next_block",
     "_STRING_PREFIXES", "_COMMENTED_LIKE_PY", "_unescaped_find", "_fence_at_start", "_next_fence",
     "_referee_kind_lines", "referee_split", "unrefereed_line_weight",
+    "next_door_days",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
