@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+from textual.coordinate import Coordinate
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
 
@@ -108,7 +109,125 @@ def _need_rows(table, what: str, err: str | None) -> None:
     pytest.skip(f"no open {what} on the repo — nothing to click")
 
 
-async def _click_row(pilot, table, offset) -> None:
+async def _settle_table(pilot, table, tries: int = 40) -> None:
+    """Wait until `table`'s rows stop changing, or give up and let the assertion talk.
+
+    Stubbing the workers is not enough on its own: one already in flight when the
+    stub goes in still lands, and rebuilds the table after it. That is invisible
+    with one table per source, which is what these drivers were written against —
+    a live `gh` tick rewrote OPEN PRs while the driver was clicking ISSUES. WORK
+    is rebuilt by all three (#589), so the late arrival lands on the very table
+    under the pointer.
+
+    On the CONTENTS and not on the region: `_click_row` already waits for the
+    geometry to hold still, and the failure this one is for is a table that has
+    not moved a pixel and is holding different work.
+    """
+    previous, still = None, 0
+    for _ in range(tries):
+        now = tuple(str(rk.value) for rk in table.rows)
+        still = still + 1 if now and now == previous else 0
+        if still >= 2:
+            return
+        previous = now
+        await pilot.pause(0.1)
+
+
+def _find_row(app, table, prefix: str) -> int:
+    """The index of the first row whose key names a `prefix` kind, else -1.
+
+    WORK holds four kinds of row where there were four tables (#589), so a driver
+    that wants a PR can no longer take row 0 and know what it got — the review
+    queue is drawn above the plan, and the plan is mostly issues. Asking by kind
+    is what those drivers used to get for free by naming a table.
+    """
+    for i, rk in enumerate(table.rows):
+        if str(rk.value).startswith(prefix):
+            return i
+    return -1
+
+
+async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
+                           scroll: bool = False, column: int | None = None) -> str:
+    """Click a row of `table`, wherever on screen that row has ended up.
+
+    `index` is a row number or a ROW KEY, and a key is what the live drivers pass.
+    WORK is rebuilt by three workers (#589), so an index is only as good as the
+    tick it was computed on — a rebuild between reading `wanted[0]` and clicking
+    it hands the click a different piece of work, which showed up as a `/fix-issue`
+    launched for the wrong number and, once, as a plan row where an issue row had
+    been. A key is stable across a rebuild because it names the thing, not the
+    place: `issue:owner/repo#12` is the same row wherever it has moved to.
+
+    The offset-arithmetic version of this — "the ＋ is at `len(seats) + 1`" —
+    counted the header and nothing else, and stopped being true when SEATS became
+    a share of the pane instead of its own content-sized panel (#589): the same
+    click then landed a row high, on the last seat, and reported closing it.
+
+    `column` asks for a CELL rather than a column of pixels, and is what the verb
+    clicks want. `VERB_COLUMN + 2` was a fair guess at where column 1 begins while
+    every table started with a one-character glyph; WORK's cells are sized to their
+    content, so the guess is a guess. Scanning for the cell the compositor says is
+    there cannot be off by a character.
+
+    Still a CLICK, and still the claim the ＋ tests make: the row has to be on
+    screen and under the mouse. What it stops asserting is where the table chose
+    to put it, which was never the point.
+
+    Returns the key of the row it clicked, so a caller can assert against THAT
+    rather than against an index it read a moment earlier — WORK is rebuilt by
+    three workers, so an index is only as good as the tick it was computed on.
+    """
+    # `scroll` is OFF by default and that is the point of the ＋ tests: their claim
+    # is that the row is reachable WITHOUT scrolling, so a helper that quietly
+    # scrolled would turn them green against the defect they exist for. The live
+    # drivers pass it, because a table holding the whole plan legitimately has the
+    # row they want below the fold and a reader would scroll to it.
+    if isinstance(index, str):
+        # Resolved HERE and not by the caller, so it is resolved as late as
+        # possible — after every pause above this line has already happened.
+        wanted = index
+        index = next((i for i, rk in enumerate(table.rows)
+                      if str(rk.value) == wanted), -1)
+        if index < 0:
+            raise AssertionError(f"row {wanted!r} is not in {table.id} any more")
+    if scroll:
+        table.move_cursor(row=index, animate=False)
+        # `_scroll_cursor_into_view` is private and is called by name on purpose:
+        # `move_cursor` alone leaves the cursor on a row below the fold, and the
+        # public `scroll_to` takes lines rather than rows, which is a second
+        # arithmetic to keep in step with the header. If a Textual release renames
+        # it this raises AttributeError here rather than clicking the wrong row.
+        table._scroll_cursor_into_view(animate=False)
+
+    # SCANNED UNTIL IT IS THERE, not judged on one read. `get_style_at` reads the
+    # compositor, and a scroll that has not repainted yet answers with the layout
+    # as it was — so a single pass either found no `y` at all (and raised about a
+    # row that was on screen by the time anybody looked) or found one from the old
+    # positions and handed the click whatever the new ones put there. Both were
+    # seen on this suite, a few runs apart, which is the signature of a paint that
+    # has not caught up rather than of anything the dashboard did.
+    for _ in range(40):
+        for y in range(1, table.region.height):
+            for dx in (range(table.region.width) if column is not None else (x,)):
+                meta = table.screen.get_style_at(table.region.offset.x + dx,
+                                                 table.region.offset.y + y).meta
+                if meta.get("row") != index:
+                    continue
+                if column is not None and meta.get("column") != column:
+                    continue
+                key = str(table.coordinate_to_cell_key(
+                    Coordinate(index, 0)).row_key.value)
+                await _click_row(pilot, table, (dx, y), row=index)
+                return key
+        await pilot.pause(0.1)
+    raise AssertionError(
+        f"row {index}{'' if column is None else f' column {column}'} of {table.id} "
+        f"is not on screen — a click cannot reach it "
+        f"(region {table.region}, {table.row_count} rows)")
+
+
+async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     """Click `table` at `offset`, once the pane has stopped moving under it.
 
     `row_count` says the rows are IN the table; it does not say the pane has
@@ -135,11 +254,27 @@ async def _click_row(pilot, table, offset) -> None:
     drew should fail on the assertion that names it, not time out in here — and
     it costs 0.1s when nothing is moving, which is the normal case.
     """
+    # A MOUSE MOVE FIRST, because the very first Click into a freshly mounted pane
+    # is swallowed: no dispatch fires for it, and the same click a moment later
+    # works. It cost the first assertion of `_drive_seats` on every run after the
+    # panels merged — the driver clicks four times and only the first was lost,
+    # which is the signature of a first-event problem rather than a layout one.
+    # Harmless where it is not needed: a hover is what a real hand does on its way
+    # to a click, and `on_click` still reads the cell off the CLICK rather than off
+    # whatever the hover left behind.
+    await pilot.hover(table, offset=offset)
     previous, still = None, 0
     for _ in range(60):
         region = table.region
         x, y = region.offset.x + offset[0], region.offset.y + offset[1]
-        on_a_row = table.screen.get_style_at(x, y).meta.get("row", -1) >= 0
+        under = table.screen.get_style_at(x, y).meta.get("row", -1)
+        # THE ROW, not merely A row, when the caller named one. `get_style_at`
+        # reads the compositor, and a scroll that has not repainted yet answers
+        # with the layout as it was — so a scan for "where is row 12" found a `y`
+        # from the old positions and the click landed on whatever the new ones put
+        # there. Twice in a row with the RIGHT row under the pointer is the only
+        # reading that says the paint has caught up with the scroll.
+        on_a_row = under >= 0 and (row is None or under == row)
         still = still + 1 if on_a_row and region == previous else 0
         if still >= 2:
             break
@@ -231,38 +366,52 @@ async def _drive() -> list[str]:
     # died on a TypeError from inside the lambda rather than on anything it
     # asserts. It takes a session id now (#540) and takes only that.
     app.jump_to_agent = lambda session: (jumped.append(session), True)[1]
+    # WITH THE BACKLOG SHOWING. `render_queue` is stubbed above, so the only PR
+    # rows this table can have are the ones review has finished with — and a PR
+    # row is what this driver clicks (#589).
+    app.backlog = True
 
     failures: list[str] = []
     async with app.run_test(size=(80, 44)) as pilot:
         for _ in range(40):                        # the first fetch is a network call
             await pilot.pause(0.25)
-            if app.query_one("#prs").row_count and app.query_one("#fleet").row_count:
+            if app.query_one("#work").row_count and app.query_one("#agents").row_count:
                 break
 
-        prs = app.query_one("#prs")
-        fleet = app.query_one("#fleet")
-        claims = app.query_one("#claims")
-        _need_rows(prs, "PRs", app.pr_err)
+        # FROZEN NOW THAT THE DATA IS IN. The workers are left running above
+        # because these drivers want real rows; they cannot stay running below,
+        # because WORK rebuilds from all three of them and a rebuild between
+        # reading a row's number and clicking that row's index hands the click a
+        # different issue. That was one table per source before #589, so a driver
+        # could leave the two it did not care about alone.
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues"):
+            setattr(app, name, lambda: None)
+        work = app.query_one("#work")
+        agents = app.query_one("#agents")
+        await _settle_table(pilot, work)
+        _need_rows(work, "work", app.pr_err)
 
         # ONE click, on a row that is not the cursor's, is the whole point.
-        # x=30 is the title column: the first columns are the CI glyph and the
-        # ⚖, which mean something else and are covered by the test below.
-        await _click_row(pilot, prs, (30, 1))
+        # x=30 is the title column: the first columns are the state glyph and the
+        # verb, which mean something else and are covered by the test below.
+        row = _find_row(app, work, "pr:")
+        if row < 0:
+            pytest.skip("no PR row on the board today — nothing to open")
+        key = str(list(work.rows)[row].value)
+        await _click_row_index(pilot, work, key, x=30, scroll=True)
         await pilot.pause(0.2)
         if not opened:
             failures.append("a click on a PR row did not open it")
 
-        await _click_row(pilot, fleet, (4, 1))
+        await _click_row(pilot, agents, (4, 1))
         await pilot.pause(0.2)
         if not app.detail_text or app.detail_text.startswith("click a row"):
             failures.append("a click on an agent row changed nothing")
 
-        if claims.row_count:
-            await _click_row(pilot, claims, (4, 1))
-            await pilot.pause(0.2)
-
         opened.clear()                             # and the keyboard path still works
-        prs.focus()
+        work.focus()
+        work.move_cursor(row=_find_row(app, work, "pr:"))
         await pilot.press("o")
         await pilot.pause(0.2)
         if not opened:
@@ -295,15 +444,39 @@ async def _drive_issues() -> list[str]:
     app.run_spawn = lambda name, argv: started.append((name, argv))
     app.run_in_window = lambda name, command: started.append((name, [command]))
     app.open_issue = lambda issue: opened.append(issue.get("number"))
+    # An issue nobody has planned is a backlog row since #589, and an issue row is
+    # what this driver is about.
+    app.backlog = True
 
     failures: list[str] = []
     async with app.run_test(size=(90, 50)) as pilot:
         for _ in range(40):
             await pilot.pause(0.25)
             if (app.held is not None and app.issues is not None
-                    and app.query_one("#issues").row_count):
+                    and app.query_one("#work").row_count):
                 break
-        issues = app.query_one("#issues")
+        # FROZEN NOW THAT THE DATA IS IN. The workers are left running above
+        # because these drivers want real rows; they cannot stay running below,
+        # because WORK rebuilds from all three of them and a rebuild between
+        # reading a row's number and clicking that row's index hands the click a
+        # different issue. That was one table per source before #589, so a driver
+        # could leave the two it did not care about alone.
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues"):
+            setattr(app, name, lambda: None)
+        issues = app.query_one("#work")
+        await _settle_table(pilot, issues)
+        # AN ISSUE ROW, found by kind rather than taken from the top: WORK draws
+        # the review queue first and then the plan, so row 0 is whatever the fleet
+        # has in flight today (#589). The plan's own rows are mostly issue-backed
+        # too, but the ⚒ on one goes through `fix_plan_item`; this driver is about
+        # the issue row's own verb.
+        # NOT A BLOCKED ONE. The ⚒ is grey on a row a person owes an answer about
+        # (#328/#522), which is the behaviour its own test asserts — this driver is
+        # about the verb working where it is offered.
+        wanted = [str(rk.value) for rk in issues.rows
+                  if str(rk.value).startswith("issue:")
+                  and not app.rows.get(str(rk.value), {}).get("blocked")]
         # #433 GAVE AN EMPTY TABLE A THIRD MEANING and `_need_rows` knows two:
         # nothing open, or `gh` refusing. "The board has not answered, so nothing
         # has been painted yet" is neither, and it reaches `_need_rows` as an
@@ -321,10 +494,16 @@ async def _drive_issues() -> list[str]:
         # by its "#" rather than by column index — the panels grew a repo column
         # between the issue number and the icons, and a hardcoded index made this
         # fail with `int('quarterback')` rather than saying what moved.
-        top = int(_numbered_cell(issues.get_row_at(0)))
+        if not wanted:
+            pytest.skip("every open issue is on the plan today — no backlog row")
 
-        # The ⚒ column asks first, the same as the ⚖ does.
-        await _click_row(pilot, issues, (app_module.Dash.FIX_COLUMN + 2, 1))
+        # The ⚒ column asks first, the same as the ⚖ does. `top` comes off the row
+        # the click actually landed on rather than off the index read above: a
+        # worker already in flight when the freeze went in can still rebuild the
+        # table once, and then the index names a different issue.
+        key = await _click_row_index(pilot, issues, wanted[0], scroll=True,
+                                     column=app_module.Dash.VERB_COLUMN)
+        top = app.rows[key]["issue"]["number"]
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a fix with no confirmation")
@@ -342,7 +521,7 @@ async def _drive_issues() -> list[str]:
 
         # A click anywhere else on the row still means "open it on GitHub".
         started.clear()
-        await _click_row(pilot, issues, (30, 1))
+        await _click_row_index(pilot, issues, wanted[0], x=30, scroll=True)
         await pilot.pause(0.3)
         if opened != [top]:
             failures.append(f"clicking the title opened {opened}, expected [{top}]")
@@ -351,6 +530,7 @@ async def _drive_issues() -> list[str]:
 
         # And the keyboard route to the same verb.
         issues.focus()
+        issues.move_cursor(row=_find_row(app, issues, "issue:"), animate=False)
         await pilot.press("f")
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
@@ -385,51 +565,58 @@ async def _drive_plan() -> list[str]:
     async with app.run_test(size=(100, 50)) as pilot:
         for _ in range(40):
             await pilot.pause(0.25)
-            if app.query_one("#plan").row_count:
+            if app.query_one("#work").row_count:
                 break
-        plan = app.query_one("#plan")
+        plan = app.query_one("#work")
+        # FROZEN NOW THAT THE DATA IS IN, and settled before anything is read off
+        # it. The workers are left running above because this driver wants a real
+        # plan; they cannot stay running below, because WORK is rebuilt by all of
+        # them (#589) and a rebuild between resolving a row key to an index and
+        # clicking that index hands the click a different piece of work — which is
+        # exactly what it did, clicking #589 while the assertion read the row it
+        # had asked for.
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues"):
+            setattr(app, name, lambda: None)
+        await _settle_table(pilot, plan)
         _need_rows(plan, "plan items", app.plan_err)
 
-        # Anywhere but the ⚒: the detail line, and it must name the row clicked.
-        await _click_row(pilot, plan, (40, 1))
-        await pilot.pause(0.3)
-        # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
-        # `scope.column` (#261), so column 4 is the title on a wide pane and the
-        # holder on a narrow one — and a narrow pane is now the default. The `? `
-        # mark on an unattributable row is part of the cell but not of the title.
-        title_at = 5 if app.scope.column else 4
-        title = str(plan.get_row_at(plan.scroll_offset.y)[title_at]).removeprefix("? ") \
-            .rstrip("…")
-        if title and title not in app.detail_text:
-            failures.append(f"the detail line does not describe the row clicked: "
-                            f"{app.detail_text[:80]!r}")
-
-        # The ⚒, on a row that actually has an issue behind it. Which row that is
-        # depends on today's plan, so it is found rather than assumed — and what
-        # it should do is read off the row the table actually scrolled to, not
-        # off the index asked for: scrolling near the end of a list stops short.
+        # A PLAN ROW, found in the table rather than re-derived from the plan.
+        # WORK draws the review queue and the questions a person owes ABOVE the
+        # plan (#589/#328), so the plan's own index stopped being the table's the
+        # day this stopped being the PLANS panel. Free and issue-backed, because
+        # the ⚒ below is what it is here to press — and not one a person owes an
+        # answer about, where that icon is grey by design (#522) and has its own
+        # test.
         import qbdata as qd
-        # The board's order, narrowed the way the panel narrows it — the panel no
-        # longer re-derives an order of its own, so neither may this.
-        ordered, _ = qd.in_scope(qd.plan_items(app.plan), app.scope)
-        wanted = next((n for n, i in enumerate(ordered)
-                       if qd.plan_issue(i) and not i.get("claim")), None)
+        wanted = next(
+            (str(rk.value) for rk in plan.rows
+             if str(rk.value).startswith("plan:")
+             and (record := app.rows.get(str(rk.value)))
+             and qd.plan_issue(record["item"]) and not record["item"].get("claim")
+             and not record.get("blocked")), None)
         if wanted is None:
             pytest.skip("no free issue-backed item on the plan today — nothing to take")
-        plan.scroll_to(y=wanted, animate=False)
-        await pilot.pause(0.3)
-        landed = ordered[plan.scroll_offset.y]
+        landed = app.rows[wanted]["item"]
 
-        await _click_row(pilot, plan, (app_module.Dash.FIX_COLUMN + 2, 1))
+        # Anywhere but the ⚒: the detail line, and it must name the row clicked.
+        await _click_row_index(pilot, plan, wanted, x=40, scroll=True)
+        await pilot.pause(0.3)
+        # BY THE SCOPE, not by a fixed index: the repo cell comes and goes with
+        # `scope.column` (#261). The `? ` mark on an unattributable row is part of
+        # the cell but not of the title.
+        title_at = 6 if app.scope.column else 5
+        title = str(plan.get_row(wanted)[title_at]).removeprefix("? ").rstrip("…")
+        if title and title not in app.detail_text:
+            failures.append(f"the detail line does not describe the row clicked: "
+                            f"{title!r} is not in {app.detail_text[:100]!r}")
+
+        await _click_row_index(pilot, plan, wanted, scroll=True,
+                               column=app_module.Dash.VERB_COLUMN)
         await pilot.pause(0.3)
         issue = qd.plan_issue(landed)
         if started:
             failures.append("the icon started a fix with no confirmation")
-        elif issue is None or landed.get("claim"):
-            # A line of plan with no issue, or somebody's current work: the icon
-            # has to SAY so. Doing nothing is indistinguishable from being broken.
-            if not app.detail_text:
-                failures.append("the icon on an unfixable row said nothing")
         elif not isinstance(app.screen, app_module.Confirm):
             failures.append("the icon did not raise the confirmation")
         else:
@@ -474,16 +661,32 @@ async def _drive_panel() -> list[str]:
     # to a window shows up here as a failure rather than as a passing test.
     app.run_in_pane = lambda name, command: started.append((name, command))
     app.run_in_window = lambda name, command: windowed.append((name, command))
+    app.backlog = True                    # `render_queue` is stubbed: see _drive
     app.open_pr = lambda pr: opened.append(pr.get("number"))
 
     failures: list[str] = []
     async with app.run_test(size=(90, 44)) as pilot:
         for _ in range(40):
             await pilot.pause(0.25)
-            if app.query_one("#prs").row_count:
+            if app.query_one("#work").row_count:
                 break
-        prs = app.query_one("#prs")
-        _need_rows(prs, "PRs", app.pr_err)
+        # FROZEN NOW THAT THE DATA IS IN. The workers are left running above
+        # because these drivers want real rows; they cannot stay running below,
+        # because WORK rebuilds from all three of them and a rebuild between
+        # reading a row's number and clicking that row's index hands the click a
+        # different issue. That was one table per source before #589, so a driver
+        # could leave the two it did not care about alone.
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues"):
+            setattr(app, name, lambda: None)
+        prs = app.query_one("#work")
+        await _settle_table(pilot, prs)
+        _need_rows(prs, "work", app.pr_err)
+        rows = [str(rk.value) for rk in prs.rows
+                if str(rk.value).startswith("pr:")
+                and not app.rows.get(str(rk.value), {}).get("blocked")]
+        if not rows:
+            pytest.skip("no reviewable PR row on the board today")
 
         # This test is about the ⚖ MECHANICS — confirm, cancel, pane not window
         # — on whatever PR happens to be newest. The cross-repo refusal has its
@@ -496,7 +699,8 @@ async def _drive_panel() -> list[str]:
         app.wrong_repo = lambda repo, what: None
 
         # The ⚖ column asks first and starts nothing by itself.
-        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, 1))
+        await _click_row_index(pilot, prs, rows[0], scroll=True,
+                               column=app_module.Dash.VERB_COLUMN)
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a review with no confirmation")
@@ -526,8 +730,9 @@ async def _drive_panel() -> list[str]:
         # otherwise: cancelling is worth testing on any day, and the row it happens
         # on is not what is under test.
         started.clear()
-        cancel_on = 2 if prs.row_count >= 2 else 1
-        await _click_row(pilot, prs, (app_module.Dash.PANEL_COLUMN + 2, cancel_on))
+        cancel_on = rows[1] if len(rows) >= 2 else rows[0]
+        await _click_row_index(pilot, prs, cancel_on, scroll=True,
+                               column=app_module.Dash.VERB_COLUMN)
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
             failures.append(f"the ⚖ on row {cancel_on} raised no confirmation to cancel")
@@ -538,7 +743,7 @@ async def _drive_panel() -> list[str]:
                 failures.append("cancelling still started a review")
 
         # A click anywhere else on the row still means "open on GitHub".
-        await _click_row(pilot, prs, (30, 1))
+        await _click_row_index(pilot, prs, rows[0], x=30, scroll=True)
         await pilot.pause(0.3)
         if not opened:
             failures.append("clicking the title did not open the PR")
@@ -547,6 +752,7 @@ async def _drive_panel() -> list[str]:
 
         # And the keyboard route to the same verb.
         prs.focus()
+        prs.move_cursor(row=_find_row(app, prs, "pr:"), animate=False)
         await pilot.press("p")
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
@@ -583,6 +789,13 @@ async def _drive_seats() -> list[str]:
     # on mount AND on a timer, so a fixture that only re-rendered would race it
     # and the panel under the pointer would be the developer's own seats.
     app.refresh_seats = lambda: None
+    # AND EVERYTHING ELSE, which since #589 all draws into this one pane: the
+    # fleet shares this very table, so a live agent arriving moves the ＋ down a
+    # row; and the caps line appears the moment the queue answers, which moves the
+    # whole table down one. Both land a click aimed at one row on the row above
+    # it. Same class of race as the DIALS one below, and neither is hypothetical.
+    for name in ("refresh_board", "refresh_plan", "refresh_prs", "refresh_issues"):
+        setattr(app, name, lambda: None)
     # And DIALS, which sits DIRECTLY ABOVE this panel and is `height: auto` (#477).
     # It grows from nothing to two rows when the board answers, on `refresh_plan`'s
     # clock, and every row of SEATS moves down with it — mid-click, since this
@@ -594,7 +807,7 @@ async def _drive_seats() -> list[str]:
     async with app.run_test(size=(90, 50)) as pilot:
         app.render_seats(fake)
         await pilot.pause(0.2)
-        seats = app.query_one("#seats")
+        seats = app.query_one("#agents")
 
         # Two seats plus the ＋ row. The ＋ has to be a row, not a key, or the
         # panel cannot be driven by the mouse alone.
@@ -602,7 +815,11 @@ async def _drive_seats() -> list[str]:
             failures.append(f"expected {len(fake) + 1} rows, got {seats.row_count}")
 
         # The ✕ column asks first and closes nothing by itself.
-        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 1))
+        # THROUGH `_click_row`, which the ＋ and the jump below also now need:
+        # SEATS was `height: auto` at the top of the pane and settled instantly,
+        # and AGENTS is an `fr` share that settles after everything above it has
+        # (#589). A click aimed while the table is still moving lands a row high.
+        await _click_row(pilot, seats, (app_module.Dash.VERB_COLUMN + 2, 1))
         await pilot.pause(0.3)
         if clicked:
             failures.append("the ✕ closed a seat with no confirmation")
@@ -616,7 +833,7 @@ async def _drive_seats() -> list[str]:
 
         # Cancelling closes nothing.
         clicked.clear()
-        await pilot.click(seats, offset=(app_module.Dash.KILL_COLUMN + 2, 2))
+        await _click_row(pilot, seats, (app_module.Dash.VERB_COLUMN + 2, 2))
         await pilot.pause(0.3)
         await pilot.press("escape")
         await pilot.pause(0.3)
@@ -624,7 +841,7 @@ async def _drive_seats() -> list[str]:
             failures.append("cancelling still closed a seat")
 
         # The ＋ row adds one, to the session the SEATS came from.
-        await pilot.click(seats, offset=(4, len(fake) + 1))
+        await _click_row_index(pilot, seats, len(fake))
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
             failures.append("the ＋ did not raise the confirmation")
@@ -636,7 +853,7 @@ async def _drive_seats() -> list[str]:
 
         # Anywhere else on a seat row is still "take me to that pane".
         clicked.clear()
-        await pilot.click(seats, offset=(20, 1))
+        await _click_row(pilot, seats, (20, 1))
         await pilot.pause(0.3)
         if jumped != ["%7"]:
             failures.append(f"clicking a seat row jumped to {jumped}")
@@ -672,8 +889,17 @@ def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
     async def drive() -> list:
         app_module = _load_app()
         app = app_module.Dash(interval=3600, gh_interval=3600)
-        app.refresh_limits = lambda: None
-        app.refresh_seats = lambda: None
+        # EVERY WORKER OFF, not just the seats'. The convention `_click_row`'s
+        # docstring states — stub whatever grows or appears mid-run, so the layout
+        # is settled before the first click rather than settling around it — and
+        # the merge gave it two more things to reach: the fleet shares this table
+        # (#589), so a live agent arriving moves the ＋ down a row; and the caps
+        # line appears the moment the queue answers, which moves the whole table
+        # down one and lands a click aimed at the ＋ on the last seat instead.
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        app.render_dials = lambda *a, **k: None
         clicked: list = []
         app.run_seat_click = lambda tag, session: clicked.append((tag, session))
         app.jump_pane = lambda seat: clicked.append(("jump", seat["pane"]))
@@ -685,9 +911,9 @@ def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
         async with app.run_test(size=(90, 50)) as pilot:
             app.render_seats(full)
             await pilot.pause(0.2)
-            seats = app.query_one("#seats")
+            seats = app.query_one("#agents")
             assert seats.row_count == len(full) + 1, seats.row_count
-            await pilot.click(seats, offset=(4, len(full) + 1))
+            await _click_row_index(pilot, seats, len(full))
             await pilot.pause(0.3)
             if isinstance(app.screen, app_module.Confirm):
                 await pilot.press("enter")
@@ -711,8 +937,7 @@ def test_the_add_row_is_still_clickable_on_a_screen_that_is_full():
 def _panels(app) -> dict:
     """Every panel's region, by id. Position and size, which is the whole claim."""
     return {pid: app.query_one("#" + pid).region
-            for pid in ("p_dials", "p_seats", "p_fleet", "p_claims", "p_plan",
-                        "p_prs", "p_queue", "p_issues")}
+            for pid in ("p_dials", "p_agents", "p_work")}
 
 
 def _stub_fetches(app) -> None:
@@ -756,45 +981,39 @@ def test_a_narrow_pane_is_one_column_and_a_wide_one_is_two():
 def test_two_columns_is_bought_for_height_not_for_width():
     """The point of the second column, asserted as the thing it is for.
 
-    Every panel but SEATS — which is its content in both layouts, and spans both
-    columns for that reason — has to come out TALLER wide than narrow. If it
-    does not, the grid is drawing two columns and the rows are still being cut
-    into sevenths, which looks like a success and fixes nothing.
+    Both tables have to come out TALLER wide than narrow. If they do not, the grid
+    is drawing two columns and the rows are still being divided, which looks like
+    a success and fixes nothing. DIALS is exempt because it is its content in both
+    layouts, which is also why it spans: a column of its own would buy it nothing
+    and cost the table beside it half its width.
     """
     narrow = asyncio.run(_laid_out(90))["panels"]
     wide = asyncio.run(_laid_out(200))["panels"]
     shorter = {pid: (narrow[pid].height, wide[pid].height)
-               for pid in narrow if pid not in ("p_seats", "p_dials")
+               for pid in narrow if pid != "p_dials"
                and wide[pid].height <= narrow[pid].height}
     assert not shorter, f"no taller in two columns (narrow, wide): {shorter}"
-    assert wide["p_seats"].width > narrow["p_seats"].width, \
-        "SEATS did not span both columns — the ＋ is in half a pane"
-    # DIALS spans for the same reason and is asserted the same way: it is the
-    # other content-sized panel, so a column of its own would buy it nothing and
-    # cost the panel beside it half its width.
     assert wide["p_dials"].width > narrow["p_dials"].width, \
         "DIALS did not span both columns"
 
 
-def test_the_review_queue_stays_with_the_prs_it_reviews():
-    """#273's arrangement survives the second column, by moving with it.
+def test_the_two_tables_sit_side_by_side_when_there_is_room():
+    """What the second column is FOR, now that there is no pairing to arrange.
 
-    Narrow, the queue is directly UNDER OPEN PRs: that one says a PR exists and
-    CI is green, this one says whether anybody has reviewed it, and they are
-    read together. A grid fills row by row in DOM order, so leaving the order
-    alone would have put the queue in the row below PLANS and a column away from
-    the panel it exists to answer. Wide, `under` becomes `beside` — same row,
-    next column — which is `relayout`'s one job that CSS could not do.
+    Seven panels over a two-column grid had to be re-paired by hand — a grid fills
+    row by row in DOM order — and #273's "the queue sits directly under the PRs"
+    was one of the arrangements that took. With AGENTS and WORK there is one row
+    of tables and DOM order is already right, so `relayout` is the class and
+    nothing else (#589); this is what it has to produce.
     """
     narrow = asyncio.run(_laid_out(90))["panels"]
-    assert narrow["p_queue"].y == narrow["p_prs"].y + narrow["p_prs"].height, \
-        "narrow: REVIEW QUEUE is not directly under OPEN PRs"
+    assert narrow["p_work"].y == narrow["p_agents"].y + narrow["p_agents"].height, \
+        "narrow: WORK is not directly under AGENTS"
 
     wide = asyncio.run(_laid_out(200))["panels"]
-    assert wide["p_queue"].y == wide["p_prs"].y, \
-        "wide: REVIEW QUEUE is not in OPEN PRs' row"
-    assert wide["p_queue"].x > wide["p_prs"].x, \
-        "wide: REVIEW QUEUE is not beside OPEN PRs"
+    assert wide["p_work"].y == wide["p_agents"].y, "wide: WORK is not in AGENTS' row"
+    assert wide["p_work"].x > wide["p_agents"].x, "wide: WORK is not beside AGENTS"
+    assert wide["p_dials"].y < wide["p_agents"].y, "DIALS is not above both"
 
 
 def test_crossing_the_threshold_and_coming_back_restores_the_narrow_order():
@@ -837,8 +1056,17 @@ def test_the_add_row_is_still_clickable_in_two_columns():
     async def drive() -> list:
         app_module = _load_app()
         app = app_module.Dash(interval=3600, gh_interval=3600)
-        app.refresh_limits = lambda: None
-        app.refresh_seats = lambda: None
+        # EVERY WORKER OFF, not just the seats'. The convention `_click_row`'s
+        # docstring states — stub whatever grows or appears mid-run, so the layout
+        # is settled before the first click rather than settling around it — and
+        # the merge gave it two more things to reach: the fleet shares this table
+        # (#589), so a live agent arriving moves the ＋ down a row; and the caps
+        # line appears the moment the queue answers, which moves the whole table
+        # down one and lands a click aimed at the ＋ on the last seat instead.
+        for name in ("refresh_limits", "refresh_seats", "refresh_board",
+                     "refresh_plan", "refresh_prs", "refresh_issues"):
+            setattr(app, name, lambda: None)
+        app.render_dials = lambda *a, **k: None
         clicked: list = []
         app.run_seat_click = lambda tag, session: clicked.append((tag, session))
         app.jump_pane = lambda seat: clicked.append(("jump", seat["pane"]))
@@ -849,8 +1077,8 @@ def test_the_add_row_is_still_clickable_in_two_columns():
             assert app.wide is True, "200 columns did not reach the wide layout"
             app.render_seats(full)
             await pilot.pause(0.2)
-            seats = app.query_one("#seats")
-            await pilot.click(seats, offset=(4, len(full) + 1))
+            seats = app.query_one("#agents")
+            await _click_row_index(pilot, seats, len(full))
             await pilot.pause(0.3)
             if isinstance(app.screen, app_module.Confirm):
                 await pilot.press("enter")
@@ -911,8 +1139,8 @@ def _text(widget) -> str:
 
 
 def _titles(app) -> dict[str, str]:
-    """The panel headings, which are where a narrowed panel admits it narrowed."""
-    return {name: _text(app.query_one(f"#t_{name}")) for name in ("fleet", "claims", "plan")}
+    """The table headings, which are where a narrowed table admits it narrowed."""
+    return {name: _text(app.query_one(f"#t_{name}")) for name in ("agents", "work")}
 
 
 def _cells(table, row: int) -> list[str]:
@@ -935,6 +1163,11 @@ async def _drive_scope() -> list[str]:
     app.refresh_issues = lambda: None
 
     failures: list[str] = []
+
+    def agent_rows(table):
+        """Every row but the ＋, which is a control and not an agent."""
+        return [_cells(table, i) for i in range(table.row_count - 1)]
+
     async with app.run_test(size=(80, 44)) as pilot:
         # on_mount sets cfg from the board when there is one; there need not be.
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
@@ -942,63 +1175,62 @@ async def _drive_scope() -> list[str]:
         app.render_plan(SCOPED_PLAN, None)
         await pilot.pause()
 
-        fleet, claims, plan = (app.query_one(f"#{n}") for n in ("fleet", "claims", "plan"))
+        agents, work = app.query_one("#agents"), app.query_one("#work")
         titles = _titles(app)
 
         # NARROW: this project's rows, the unattributable row kept, no repo cell.
         # Asserted on the `what` cell, which is the one the dropped column widened.
-        # who state stage what ttl — `what` is index 3 since the stage column (#262).
-        shown = sorted(_cells(fleet, i)[3] for i in range(fleet.row_count))
-        if shown != ["? nowhere", "here"]:
-            failures.append(f"narrow FLEET holds {shown}, not this repo's row and the "
+        # dot ✕ who state stage what ttl — `what` is index 5.
+        shown = sorted(row[5] for row in agent_rows(agents))
+        if shown != ["#261 ours", "? nowhere", "here"]:
+            failures.append(f"narrow AGENTS holds {shown}, not this repo's row, the "
                             "one the board could not attribute — marked, because the "
-                            "cell that used to say so is the cell this view drops")
-        if len(fleet.columns) != 5:
-            failures.append(f"narrow FLEET has {len(fleet.columns)} columns, not 5")
-        if "1 elsewhere" not in titles["fleet"]:
-            failures.append(f"narrow FLEET does not say what it hid: {titles['fleet']!r}")
-        if "1 elsewhere" not in titles["claims"]:
-            failures.append(f"narrow CLAIMED does not say what it hid: {titles['claims']!r}")
-        if "1 elsewhere" not in titles["plan"]:
-            failures.append(f"narrow PLANS does not say what it hid: {titles['plan']!r}")
-        if claims.row_count and _cells(claims, 0)[1] != "#261":
-            failures.append(f"the claim key still carries its repo: {_cells(claims, 0)}")
+                            "cell that used to say so is the cell this view drops — "
+                            "and the claim nobody answers for")
+        if len(agents.columns) != 7:
+            failures.append(f"narrow AGENTS has {len(agents.columns)} columns, not 7")
+        if "1 elsewhere" not in titles["agents"]:
+            failures.append(f"narrow AGENTS does not say what it hid: {titles['agents']!r}")
+        if "1 elsewhere" not in titles["work"]:
+            failures.append(f"narrow WORK does not say what it hid: {titles['work']!r}")
         if "quarterback" not in _text(app.query_one("#head")):
             failures.append("the header does not name the scope it is showing")
 
-        # The icons a click acts on must not have moved with the column that went.
-        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
-            failures.append(f"the ⚒ moved out of column {app.FIX_COLUMN}: {_cells(plan, 0)}")
+        # The icon a click acts on must not have moved with the column that went.
+        if work.row_count and _cells(work, 0)[app.VERB_COLUMN] != "⚒":
+            failures.append(f"the ⚒ moved out of column {app.VERB_COLUMN}: "
+                            f"{_cells(work, 0)}")
 
         await pilot.press("s")
         await pilot.pause()
 
-        fleet, claims = app.query_one("#fleet"), app.query_one("#claims")
+        agents, work = app.query_one("#agents"), app.query_one("#work")
         titles = _titles(app)
-        if fleet.row_count != 3:
-            failures.append(f"the wide view holds {fleet.row_count} agents, not 3")
-        if len(fleet.columns) != 6:
-            failures.append(f"the wide view has {len(fleet.columns)} columns, not 6")
-        if "elsewhere" in titles["fleet"] or "elsewhere" in titles["plan"]:
+        # Three agents and the two claims neither of them answers for.
+        if len(agent_rows(agents)) != 5:
+            failures.append(f"the wide view holds {len(agent_rows(agents))} rows, not 5")
+        if len(agents.columns) != 8:
+            failures.append(f"the wide view has {len(agents.columns)} columns, not 8")
+        if "elsewhere" in titles["agents"] or "elsewhere" in titles["work"]:
             failures.append(f"the wide view still claims to hide rows: {titles}")
-        if claims.row_count != 2 or _cells(claims, 0)[1] != "quarterback#261":
-            failures.append(f"the wide view's claims read {[_cells(claims, i) for i in range(claims.row_count)]}")
+        # The claim keeps its repo where two watched repos could share a number.
+        keys = [row[6] for row in agent_rows(agents)]
+        if "quarterback#261 ours" not in keys:
+            failures.append(f"the wide view's claim rows read {keys}")
         if "all repos" not in _text(app.query_one("#head")):
             failures.append("the header does not say the pane went wide")
-        wide_rows = [_cells(fleet, i) for i in range(fleet.row_count)]
-        if any(cell.startswith("? ") for row in wide_rows for cell in row):
-            failures.append(f"the wide view still marks an unattributed row: {wide_rows}")
-        if plan.row_count and _cells(plan, 0)[app.FIX_COLUMN] != "⚒":
-            failures.append(f"the ⚒ moved when the column came back: {_cells(plan, 0)}")
+        if any(cell.startswith("? ") for row in agent_rows(agents) for cell in row):
+            failures.append(f"the wide view still marks an unattributed row: "
+                            f"{agent_rows(agents)}")
+        if work.row_count and _cells(work, 0)[app.VERB_COLUMN] != "⚒":
+            failures.append(f"the ⚒ moved when the column came back: {_cells(work, 0)}")
 
         await pilot.press("s")                     # and back, from cache
         await pilot.pause()
-        if app.query_one("#fleet").row_count != 2:
-            failures.append("narrowing again did not redraw from what the client had")
+        if len(agent_rows(app.query_one("#agents"))) != 3:
+            failures.append("`s` did not narrow again from the cached answer")
 
     return failures
-
-
 async def _drive_stage() -> list[str]:
     """FLEET's stage cells, with the two shapes that matter side by side."""
     app_module = _load_app()
@@ -1019,8 +1251,10 @@ async def _drive_stage() -> list[str]:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.render_board(board)
         await pilot.pause()
-        fleet = app.query_one("#fleet")
-        return [_cells(fleet, i)[2] for i in range(fleet.row_count)]
+        agents = app.query_one("#agents")
+        # dot ✕ who state stage … — and minus the ＋, which is a control rather
+        # than an agent and has no stage to report.
+        return [_cells(agents, i)[4] for i in range(agents.row_count - 1)]
 
 
 #: A queue with one of each shape that matters: a row review can act on, and a
@@ -1061,9 +1295,9 @@ async def _drive_queue(offset) -> tuple[list[list[str]], str, list, str]:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.render_queue(QUEUE)
         await pilot.pause()
-        table = app.query_one("#queue")
+        table = app.query_one("#work")
         rows = [_cells(table, i) for i in range(table.row_count)]
-        title = str(app.query_one("#t_queue").content)
+        title = str(app.query_one("#t_work").content)
         await pilot.click(table, offset=offset)
         await pilot.pause(0.3)
         return rows, title, started, app.detail_text
@@ -1083,18 +1317,22 @@ def test_the_review_queue_keeps_the_rows_nothing_can_act_on():
     to prevent.
     """
     rows, title, _, _ = asyncio.run(_drive_queue(offset=(60, 1)))
-    assert [r[2] for r in rows] == ["#264", "#270"], rows
-    # Column 3 is the verb on a narrow pane: state, ⚖, pr, verb, age, title.
-    assert rows[0][3] == "panel", rows[0]
-    assert rows[1][3] == "conflicting", rows[1]
+    # Narrow: state, ⚖, kind, rank, ref, title, why.
+    assert [r[4] for r in rows] == ["#264", "#270"], rows
+    assert [r[2] for r in rows] == ["pr", "pr"], rows
+    # The verb and the wait share the `why` cell, which is the column every row in
+    # this table gives to why it is where it is — a plan item's holder, a PR's
+    # round. Four panels had four shapes of that column and now there is one.
+    assert rows[0][6].startswith("panel"), rows[0]
+    assert rows[1][6].startswith("conflicting"), rows[1]
     # The board's own word, abbreviated for the column: `integrate` is what a
     # DRAINABLE row would show, and this row is not one.
-    assert "integrate" not in rows[1][3]
+    assert "integrate" not in rows[1][6]
     # `~` on an age that is the longest the wait could have been — nothing
     # records when a branch started conflicting.
-    assert rows[1][4].startswith("~"), rows[1]
-    assert not rows[0][4].startswith("~"), rows[0]
-    assert "1 waiting" in title and "1 held" in title, title
+    assert "~" in rows[1][6], rows[1]
+    assert "~" not in rows[0][6], rows[0]
+    assert "1 waiting" not in title, "the depth moved to the header line"
 
 
 def test_the_queues_scales_icon_is_live_only_where_a_round_is_what_is_wanted():
@@ -1106,7 +1344,7 @@ def test_the_queues_scales_icon_is_live_only_where_a_round_is_what_is_wanted():
     uses one panel over, so "grey means not offered" is one habit and not two.
     """
     rows, _, started, detail = asyncio.run(
-        _drive_queue(offset=(_load_app().Dash.PANEL_COLUMN + 2, 2)))
+        _drive_queue(offset=(_load_app().Dash.VERB_COLUMN + 2, 2)))
     assert rows[1][1] == "⚖", rows[1]
     assert not started, "the ⚖ started a round on a row it cannot drain"
     assert "conflicting" in detail, detail
@@ -1212,7 +1450,7 @@ def test_a_queue_that_could_not_be_fetched_says_so_in_a_row():
     rows, title, _, _ = asyncio.run(
         _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": err}))
     assert len(rows) == 1, rows
-    assert "board unreachable" in rows[0][-1], rows[0]
+    assert "board unreachable" in rows[0][-2], rows[0]
     # The message is in the row now, so the title is back to being a count.
     assert "HTTPConnectionPool" not in title, title
 
@@ -1229,16 +1467,21 @@ def test_a_drained_queue_says_it_is_drained_rather_than_going_blank():
         _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": None,
                             "idle": "every open PR has had a round"}))
     assert len(rows) == 1, rows
-    assert "every open PR has had a round" in rows[0][-1], rows[0]
+    assert "every open PR has had a round" in rows[0][-2], rows[0]
 
 
 def test_a_queue_with_neither_entries_nor_a_board_falls_back_to_words():
-    """A board too old to send `idle` still gets a sentence, not a blank."""
+    """A board too old to send `idle` still gets a sentence, not a blank.
+
+    The sentence is the merged table's rather than the queue's — with the plan and
+    the PRs in here too, "nothing waiting on review" would be answering for four
+    sources on the strength of one.
+    """
     rows, _, _, _ = asyncio.run(
         _drive_queue_state({**QUEUE, "entries": [], "depth": 0, "error": None,
                             "idle": None}))
     assert len(rows) == 1, rows
-    assert "nothing waiting on review" in rows[0][-1], rows[0]
+    assert "nothing in flight" in rows[0][-2], rows[0]
 
 
 async def _drive_queue_state(queue) -> tuple[list[list[str]], str, list, str]:
@@ -1253,9 +1496,9 @@ async def _drive_queue_state(queue) -> tuple[list[list[str]], str, list, str]:
     async with app.run_test(size=(100, 50)) as pilot:
         app.render_queue(queue)
         await pilot.pause()
-        table = app.query_one("#queue")
+        table = app.query_one("#work")
         return ([_cells(table, i) for i in range(table.row_count)],
-                str(app.query_one("#t_queue").content), [], app.detail_text)
+                str(app.query_one("#t_work").content), [], app.detail_text)
 
 
 async def _drive_held_race() -> tuple[list[str], list[str]]:
@@ -1274,6 +1517,7 @@ async def _drive_held_race() -> tuple[list[str], list[str]]:
                  "refresh_plan", "refresh_prs", "refresh_issues"):
         setattr(app, name, lambda: None)
 
+    app.backlog = True                       # the issue rows are behind `b` (#589)
     issues = [{"number": n, "title": f"issue {n}", "repo": qd.REPO,
                "updatedAt": "2026-08-25T00:00:00Z"} for n in (427, 426, 422)]
     # The newest issue is the held one, so a sort that knows about claims puts it
@@ -1286,12 +1530,129 @@ async def _drive_held_race() -> tuple[list[str], list[str]]:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.render_issues(issues, None)
         await pilot.pause()
-        table = app.query_one("#issues")
+        table = app.query_one("#work")
         first = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
         app.render_board({"agents": [], "claims": claims})
         await pilot.pause()
         after = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
         return first, after
+
+
+#: The same four shapes the printed suite uses: one riding a subject this table
+#: draws, two on a subject it does not (#576 made several per subject possible on
+#: purpose), and one on another repo.
+BLOCKERS = [
+    {"id": "b1", "repo": "prisonblues/quarterback",
+     "subject": {"kind": "issue", "value": "427"}, "kind": "taste", "condition": "",
+     "question": "which shade of blue?", "owner": "human/rich",
+     "raised_by": "zeus/one", "raised_at": "2026-08-27T00:00:00+00:00"},
+    {"id": "b2", "repo": "prisonblues/quarterback",
+     "subject": {"kind": "repo", "value": "prisonblues/quarterback"},
+     "kind": "environment", "condition": "landed", "question": "4 PRs ready to land",
+     "owner": None, "raised_by": "zeus/doctor",
+     "raised_at": "2026-08-27T00:00:00+00:00"},
+    {"id": "b3", "repo": "prisonblues/quarterback",
+     "subject": {"kind": "repo", "value": "prisonblues/quarterback"},
+     "kind": "environment", "condition": "harness", "question": "8 scripts not on zeus",
+     "owner": None, "raised_by": "zeus/doctor",
+     "raised_at": "2026-08-27T00:00:00+00:00"},
+]
+
+
+async def _drive_waiting(press_w: bool = False) -> tuple[list[list[str]], str, str, str]:
+    """Render the questions a person owes, optionally filter to them, and click one."""
+    app_module, app = _quiet_dash()
+    async with app.run_test(size=(110, 46)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.render_issues(_issues_for(427, 426), None)
+        app.render_board({"agents": [], "claims": []})
+        app.render_blockers({"blockers": BLOCKERS, "counts": {}, "error": None})
+        await pilot.pause()
+        if press_w:
+            await pilot.press("w")
+            await pilot.pause(0.3)
+        table = app.query_one("#work")
+        rows = [_cells(table, i) for i in range(table.row_count)]
+        blocked = next((str(rk.value) for rk in table.rows
+                        if str(rk.value).startswith("blocker:")), None)
+        if blocked:
+            app.dispatch_row(blocked, column=99)
+            await pilot.pause(0.2)
+        return (rows, str(app.query_one("#t_work", app_module.Static).content),
+                str(app.query_one("#limits").content), app.detail_text)
+
+
+def test_the_questions_a_person_owes_reach_the_terminal():
+    """#328's row, on the surface it never had one.
+
+    The board has held a blocker as a first-class row since #274, and the web
+    board and the plan page have both drawn it. The terminal never did: `/plan`
+    served `waiting_on_a_human` on every item and `qbdata` referenced it zero
+    times, so the field was being served and dropped.
+    """
+    rows, title, limits, detail = asyncio.run(_drive_waiting())
+    assert any(r[0] == "⚑" for r in rows), f"nothing is marked as waiting: {rows}"
+    # The repo's two questions have no work to ride, so they get a row — the half
+    # that would otherwise be counted by the header and drawn nowhere (#274).
+    repo_rows = [r for r in rows if "＋1" in r[-1]]
+    assert len(repo_rows) == 1, f"the repo's questions reached no row: {rows}"
+    assert "3 waiting on a human" in title, title
+    assert "WAITING 3" in limits, limits
+    # The question itself is the payload: a person reads it and answers it.
+    assert "4 PRs ready to land" in detail and "unowned" in detail, detail
+
+
+def test_nothing_is_offered_on_a_row_a_person_owes_an_answer_about():
+    """Two rules, and the second is the one worth having.
+
+    A row that is ONLY a question gets no icon: the state cell already wears the
+    ⚑, and a second beside it says the same thing twice.
+
+    A row that is a piece of work AND a question keeps its icon and goes grey.
+    Taking an issue whose shape is still being decided is work done before the
+    answer that governs it — the waste #522 is about, arriving through a button —
+    and an icon that vanished would stop saying what the row would otherwise be.
+    """
+    async def drive() -> tuple[list, list]:
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.repo_slug = app_module.qd.REPO
+            app.render_issues(_issues_for(427, 426), None)
+            app.render_board({"agents": [], "claims": []})
+            app.render_blockers({"blockers": BLOCKERS, "counts": {}, "error": None})
+            await pilot.pause()
+            table = app.query_one("#work")
+            out = []
+            for i in range(table.row_count):
+                cells = table.get_row_at(i)
+                out.append((str(cells[0]), str(cells[1]),
+                            str(getattr(cells[1], "style", ""))))
+            return out, [app.work_action(app.rows[str(rk.value)])
+                         for rk in table.rows
+                         if app.rows.get(str(rk.value), {}).get("blocked")]
+
+    rows, actions = asyncio.run(drive())
+    only_questions = [r for r in rows if r[0] == "⚑" and r[1] == ""]
+    assert only_questions, f"a row that is only a question drew an icon: {rows}"
+    both = [r for r in rows if r[0] == "⚑" and r[1] != ""]
+    assert both, f"a blocked issue lost the icon that says what it is: {rows}"
+    assert all("cyan" not in r[2] for r in both), \
+        f"a blocked row still offers to start work on it: {both}"
+    assert actions and all(verb is None for _, verb in actions), actions
+
+
+def test_w_shows_only_what_is_waiting_on_a_person():
+    """The one door, in the terminal. Separate from `b`: the backlog is work nobody
+    has started and this is work nobody CAN start, and a reader looking for one is
+    not looking for the other."""
+    rows, title, _, _ = asyncio.run(_drive_waiting(press_w=True))
+    assert rows and all(r[0] == "⚑" for r in rows), rows
+    assert title.startswith("WAITING · "), title
+    # The plan's own counts describe a list the reader has just filtered away.
+    assert "open" not in title and "next" not in title, title
 
 
 def _quiet_dash():
@@ -1308,6 +1669,9 @@ def _quiet_dash():
     for name in ("refresh_limits", "refresh_seats", "refresh_board",
                  "refresh_plan", "refresh_prs", "refresh_issues"):
         setattr(app, name, lambda: None)
+    # The issue rows are behind `b` since #589 — they are a catalogue rather than
+    # state — and these tests are ABOUT the issue rows, so they ask for them.
+    app.backlog = True
     return app_module, app
 
 
@@ -1348,11 +1712,11 @@ def test_a_board_outage_does_not_turn_every_held_issue_free():
             await pilot.pause()
             app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
             await pilot.pause()
-            table = app.query_one("#issues")
+            table = app.query_one("#work")
             rows = [_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)]
             app.fix_issue({"number": 426, "repo": qd.REPO})
             await pilot.pause()
-            return (rows, str(app.query_one("#t_issues", app_module.Static).content),
+            return (rows, str(app.query_one("#t_work", app_module.Static).content),
                     isinstance(app.screen, app_module.Confirm), started)
 
     rows, title, confirmed, started = asyncio.run(drive())
@@ -1378,9 +1742,9 @@ def test_a_board_that_is_down_from_the_start_still_releases_the_panel():
             await pilot.pause()
             app.render_board({"agents": [], "claims": [], "error": "HTTPError: 502"})
             await pilot.pause()
-            table = app.query_one("#issues")
+            table = app.query_one("#work")
             return ([_numbered_cell(table.get_row_at(i)) for i in range(table.row_count)],
-                    str(app.query_one("#t_issues", app_module.Static).content))
+                    str(app.query_one("#t_work", app_module.Static).content))
 
     rows, title = asyncio.run(drive())
     assert rows == ["427", "426"], f"a board outage left the panel waiting: {rows}"
@@ -1408,38 +1772,41 @@ def test_the_issue_panel_does_not_count_issues_gh_has_not_listed_yet():
                                                  agent="host")
             app.render_board({"agents": [], "claims": []})
             await pilot.pause()
-            return str(app.query_one("#t_issues", app_module.Static).content)
+            return str(app.query_one("#t_work", app_module.Static).content)
 
     title = asyncio.run(drive())
     assert "waiting for gh" in title, title
-    assert "0" not in title, f"a count painted before gh answered: {title!r}"
+    # The plan's own `0 open` is a different number and is legitimately there —
+    # what must not appear is a count of the list nobody has answered about.
+    assert "free" not in title and "issues" not in title.lower(), \
+        f"a count painted before gh answered: {title!r}"
 
 
 def test_the_wait_for_the_board_does_not_swallow_a_gh_failure():
-    """`gh` failing while the board is slow must still say `gh` failed.
+    """Two things can be wrong at once, and the wait has to report both.
 
-    The error is stored before the gate and the gate writes its own title, so the
-    one thing a reader needs — which end is broken — was the thing dropped. A
-    panel that blames the board for `gh`'s failure sends them to the wrong end of
-    it, and this is the window in which somebody is most likely to be looking at
-    a stalled panel and wondering.
-
-    `gh` answering with an empty list AND an error is an answer, so only the
-    board is outstanding here: the title names the board as what it waits for and
-    carries the `gh` error beside it.
+    The `gh` failure is a ROW now rather than a title suffix clipped to 24
+    characters (#589), for the reason the queue's error became one: a table whose
+    job is saying why something is missing must not truncate the one message that
+    says why it cannot tell you. The title still names what is OUTSTANDING, which
+    is a different fact from what failed — and naming the board for a `gh` failure
+    it already knows about would send a reader to the wrong end of the problem.
     """
-    async def drive() -> str:
+    async def drive() -> tuple[str, list]:
         app_module, app = _quiet_dash()
         async with app.run_test(size=(100, 50)) as pilot:
             app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
                                                  agent="host")
             app.render_issues([], "HTTPError: 502")
             await pilot.pause()
-            return str(app.query_one("#t_issues", app_module.Static).content)
+            table = app.query_one("#work")
+            return (str(app.query_one("#t_work", app_module.Static).content),
+                    [_cells(table, i) for i in range(table.row_count)])
 
-    title = asyncio.run(drive())
+    title, rows = asyncio.run(drive())
     assert "waiting for the board" in title, title
-    assert "HTTPError" in title, f"the gh failure was dropped: {title!r}"
+    assert any("HTTPError" in c for row in rows for c in row), \
+        f"the gh failure was dropped: {rows}"
 
 
 def test_the_hammer_refuses_while_the_board_has_not_said_what_is_claimed():
@@ -1532,7 +1899,7 @@ def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
                                                  agent="host")
             app.render_issues(issues, None)
             await pilot.pause()
-            table = app.query_one("#issues")
+            table = app.query_one("#work")
             before = table.row_count
             app.render_board({"agents": [], "claims": []})
             await pilot.pause()
@@ -1550,7 +1917,7 @@ def test_the_first_board_answer_paints_the_issues_even_when_nothing_is_held():
 
 
 def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
-    """#262: `who state stage what ttl`, and the stage cell is column 2.
+    """#262: the stage cell, beside `state` in the merged AGENTS table.
 
     `state` says whether the pane is moving; this says where it has got to. The
     agent that reported nothing gets the fleet's glyph for an unsaid value, which
@@ -1596,7 +1963,15 @@ def test_a_guard_that_cannot_tell_which_repo_it_is_in_refuses(monkeypatch):
 
 
 async def _drive_icons() -> list[str]:
-    """The ⚖ and the ⚒ on a row this dashboard cannot act on."""
+    """The verb column on rows this dashboard cannot act on.
+
+    One table now, so one pass: the ⚖ a PR row wears and the ⚒ an issue row wears
+    are the same column, and `work_action` is the single answer both the renderer
+    and `dispatch_row` read. That is the property worth pinning — an icon drawn
+    live and then refused is the "drawn takeable, refused one by one" the scope
+    work exists to end, and it is now unreachable by construction rather than by
+    four panels agreeing.
+    """
     app_module = _load_app()
     qd = app_module.qd
     app = app_module.Dash(interval=3600, gh_interval=3600, plan_interval=3600,
@@ -1604,14 +1979,17 @@ async def _drive_icons() -> list[str]:
     for name in ("refresh_limits", "refresh_seats", "refresh_board",
                  "refresh_plan", "refresh_prs", "refresh_issues"):
         setattr(app, name, lambda: None)
+    # Reviewed PRs and unplanned issues are backlog rows since #589, and they are
+    # what this test is about.
+    app.backlog = True
 
     failures: list[str] = []
     async with app.run_test(size=(90, 44)) as pilot:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid", agent="host")
         app.repo_slug = qd.REPO                            # what this checkout is
         # The board has answered and nothing is held. Said rather than assumed:
-        # `held` is None until it answers and ISSUES deliberately paints nothing
-        # then (#433), so a driver that renders the table by hand has to stand in
+        # `held` is None until it answers and the backlog deliberately draws
+        # nothing then (#433), so a driver that renders by hand has to stand in
         # for the board as well.
         app.held = {}
         app.render_prs([{"number": 1, "title": "ours", "repo": qd.REPO,
@@ -1622,19 +2000,17 @@ async def _drive_icons() -> list[str]:
                            {"number": 4, "title": "theirs", "repo": "someone/else"}], None)
         await pilot.pause()
 
-        for table_id, column in (("#prs", app.PANEL_COLUMN), ("#issues", app.FIX_COLUMN)):
-            table = app.query_one(table_id)
-            styles = {}
-            for row in range(table.row_count):
-                cells = table.get_row_at(row)
-                number = next(str(c).lstrip("#") for c in cells
-                              if str(c).startswith("#"))
-                styles[number] = str(getattr(cells[column], "style", ""))
-            ours, theirs = ("1", "2") if table_id == "#prs" else ("3", "4")
+        table = app.query_one("#work")
+        styles = {}
+        for row in range(table.row_count):
+            cells = table.get_row_at(row)
+            number = next(str(c).lstrip("#") for c in cells if str(c).startswith("#"))
+            styles[number] = str(getattr(cells[app.VERB_COLUMN], "style", ""))
+        for ours, theirs, what in (("1", "2", "the ⚖"), ("3", "4", "the ⚒")):
             if "cyan" not in styles.get(ours, ""):
-                failures.append(f"{table_id}: this repo's icon is not live ({styles})")
+                failures.append(f"{what}: this repo's icon is not live ({styles})")
             if "cyan" in styles.get(theirs, ""):
-                failures.append(f"{table_id}: another repo's icon still looks "
+                failures.append(f"{what}: another repo's icon still looks "
                                 f"clickable ({styles})")
     return failures
 
@@ -1769,7 +2145,7 @@ def _seat_labels(app, seats):
             written.append([str(getattr(c, "plain", c)) for c in cells])
             return SimpleNamespace(value=key)
 
-    app.query_one = lambda sel, *a, **k: Table() if sel == "#seats" else _Sink()
+    app.query_one = lambda sel, *a, **k: Table() if sel == "#agents" else _Sink()
     app.render_seats(seats)
     # Minus the ＋, which render_seats appends as a row of its own so the panel can
     # be driven by the mouse alone. It is not a seat and has no label to assert on.
@@ -1872,20 +2248,31 @@ def test_the_fleet_table_stashes_every_agent_under_its_session():
 
 
 def test_the_seat_count_is_the_agents_sitting_in_a_pane_on_this_box():
-    """"3 live · 1 seats" is about panes a click can reach.
+    """"2 live · 1 seat · 1 idle" is about panes a click can reach.
 
     It counted holders whose NAME parsed as a seat, so an agent called
     `seat-lexray-1` on another machine counted towards this box's total and
     highlighted a row no click could land on.
+
+    It is counted in ONE place now (#589). The head line stated a live count and a
+    seat count worked out from its own join while the table below stated the same
+    two off the rows it had drawn, and on the first frame with a seat in it they
+    disagreed — "4 live · 1 seats" over a table headed "5 live · 3 seats". The
+    pane with no agent in it gets a number of its own rather than being folded
+    into either: those are the seats free to be given something to do.
     """
     app = _dash()
     said: list[str] = []
     app.query_one = lambda *a, **k: _Sink(said)
     app.cfg = SimpleNamespace(base_url="https://board.example", agent="zeus")
-    app.seats = [{"pane": "%0", "seat": "1", "agent": "sess-zeus/thorn-sumac"},
-                 {"pane": "%1", "seat": "2", "agent": ""}]
+    app.seats = [{"pane": "%0", "seat": "1", "agent": "sess-zeus/thorn-sumac",
+                  "command": "claude", "path": "/x"},
+                 {"pane": "%1", "seat": "2", "agent": "", "command": "bash",
+                  "path": "/y"}]
     app.render_board(_agents("zeus/thorn-sumac", "laptop/cedar-flint"))
-    assert any("2 live · 1 seats" in t for t in said), said
+    assert any("2 live · 1 seat · 1 idle" in t for t in said), said
+    assert not any("live" in t and t.startswith("● ") for t in said), \
+        "the head line is still counting, and the two answers can disagree"
 
 
 class _Sink:
@@ -1897,6 +2284,11 @@ class _Sink:
     bare `_Sink()` it was."""
 
     row_count = 0
+    #: The title Statics are measured for the room their tally has left, so a
+    #: stand-in for one has to have a size. Zero is the honest answer for a widget
+    #: that was never laid out, and the renderer treats anything under 20 as "no
+    #: room known yet" rather than as "no room" (render_work).
+    size = SimpleNamespace(width=0)
 
     def __init__(self, said: list | None = None) -> None:
         self.said = said
@@ -2015,23 +2407,29 @@ _TWO_REPOS_ISSUES = [
 
 
 async def _drive_two_repos() -> list[str]:
-    """Render both multi-repo panels with a colliding number, then click each row.
+    """Two repos' rows with a colliding number, in one table, clicked one by one.
 
     The render is wrapped rather than left to propagate: a test that dies of
     DuplicateKey reports an ERROR and names no assertion, and this suite's own
     convention — every `_drive_*` returns the failures it found — is what turns
     the crash into a statement about the defect.
+
+    ONE TABLE MAKES THE COLLISION WORSE, not better, which is why this test is
+    kept whole through the merge: a PR and an issue that share a number now share
+    a table as well, and the key has to carry the repo AND the kind or four rows
+    render as two.
     """
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)
-    # Every background fetch off: these panels are being driven by hand, and a
-    # live `gh` tick landing mid-test would rewrite the rows under the clicks.
+    # Every background fetch off: this table is being driven by hand, and a live
+    # `gh` tick landing mid-test would rewrite the rows under the clicks.
     app.refresh_limits = lambda: None
     app.refresh_seats = lambda: None
     app.refresh_board = lambda: None
     app.refresh_plan = lambda: None
     app.refresh_prs = lambda: None
     app.refresh_issues = lambda: None
+    app.backlog = True                    # reviewed PRs and free issues (#589)
 
     # As above: the board answered, nothing is held (#433).
     app.held = {}
@@ -2042,52 +2440,43 @@ async def _drive_two_repos() -> list[str]:
 
     failures: list[str] = []
     async with app.run_test(size=(100, 44)):
-        for label, render, rows, table_id, prefix in (
-            ("PRS", app.render_prs, _TWO_REPOS_PRS, "#prs", "pr:"),
-            ("ISSUES", app.render_issues, _TWO_REPOS_ISSUES, "#issues", "issue:"),
-        ):
-            try:
-                render(rows, None)
-            except Exception as exc:               # noqa: BLE001 — the defect itself
-                failures.append(
-                    f"{label}: two repos sharing a number took the dashboard down with "
-                    f"{type(exc).__name__} — a duplicate row must degrade, not crash")
-                continue
+        try:
+            app.render_prs(_TWO_REPOS_PRS, None)
+            app.render_issues(_TWO_REPOS_ISSUES, None)
+        except Exception as exc:                   # noqa: BLE001 — the defect itself
+            return [f"two repos sharing a number took the dashboard down with "
+                    f"{type(exc).__name__} — a duplicate row must degrade, not crash"]
 
-            table = app.query_one(table_id)
-            if table.row_count != len(rows):
-                failures.append(
-                    f"{label}: {len(rows)} rows from two repos rendered as "
-                    f"{table.row_count} — one repo's row was dropped")
-                continue
+        table = app.query_one("#work")
+        want = _TWO_REPOS_PRS + _TWO_REPOS_ISSUES
+        if table.row_count != len(want):
+            return [f"{len(want)} rows from two repos rendered as {table.row_count}"
+                    " — a row was dropped"]
 
-            # The PANEL's own key, not the one it was rescued into. Asserted
-            # exactly, and this is the assertion that makes the test about the
-            # defect: ClickTable.add_row suffixes a repeat rather than raising,
-            # so with the bare-number keys restored these rows STILL render as
-            # two, still carry distinct keys (`pr:42` and `pr:42~2`) and still
-            # click through to their own records — everything below passes and
-            # the bug is untouched. Only the key itself tells the two fixes
-            # apart, so only the key can pin the one this test is named for.
-            keys = [rk.value for rk in table.rows]
-            want_keys = sorted(f"{prefix}{r['repo']}#{r['number']}" for r in rows)
-            if sorted(keys) != want_keys:
-                failures.append(
-                    f"{label}: row keys are {sorted(keys)}, not {want_keys} — the "
-                    "panel is not keying on the repo, whatever the backstop did after")
+        # The TABLE's own key, not the one it was rescued into. Asserted exactly,
+        # and this is the assertion that makes the test about the defect:
+        # ClickTable.add_row suffixes a repeat rather than raising, so with the
+        # bare-number keys restored these rows STILL render as four, still carry
+        # distinct keys (`pr:42` and `pr:42~2`) and still click through to their
+        # own records — everything below passes and the bug is untouched. Only the
+        # key itself tells the two fixes apart.
+        keys = [rk.value for rk in table.rows]
+        want_keys = sorted([f"pr:{r['repo']}#{r['number']}" for r in _TWO_REPOS_PRS]
+                           + [f"issue:{r['repo']}#{r['number']}"
+                              for r in _TWO_REPOS_ISSUES])
+        if sorted(keys) != want_keys:
+            failures.append(
+                f"row keys are {sorted(keys)}, not {want_keys} — the table is not "
+                "keying on the repo, whatever the backstop did after")
 
-            # The click half. Each row must reach the record it displays; a
-            # shared key means the second write wins and both rows open it.
-            opened.clear()
-            if len(set(keys)) != len(keys):
-                failures.append(f"{label}: two rows share the row key {keys!r}")
-            for key in keys:
-                app.dispatch_row(key, column=None)
-            want = sorted(f"{r['repo']}#{r['number']}" for r in rows)
-            if sorted(opened) != want:
-                failures.append(
-                    f"{label}: clicking each row opened {sorted(opened)}, not {want} — "
-                    "a row is pointing at the other repo's record")
+        # The click half. Each row must reach the record it displays; a shared key
+        # means the second write wins and both rows open it.
+        if len(set(keys)) != len(keys):
+            failures.append(f"two rows share the row key {keys!r}")
+        for key in keys:
+            app.dispatch_row(key, column=None)
+        if sorted(opened) != sorted(f"{r['repo']}#{r['number']}" for r in want):
+            failures.append(f"clicking each row opened {sorted(opened)}")
     return failures
 
 
@@ -2149,7 +2538,7 @@ async def _drive_duplicate_keys() -> list[str]:
             except Exception as exc:               # noqa: BLE001 — the defect itself
                 return [f"PLAN: two items with no item_id took the dashboard down with "
                         f"{type(exc).__name__} — an unforeseen duplicate must degrade"]
-            table = app.query_one("#plan")
+            table = app.query_one("#work")
             if table.row_count != 2:
                 failures.append(
                     f"PLAN: two rows rendered as {table.row_count} — one was swallowed "
@@ -2213,22 +2602,28 @@ async def _drive_plan_fields() -> list[str]:
         app.build_columns()
         app.plan_sig = None
         app.render_plan(plan, None)
-        table = app.query_one("#plan")
+        table = app.query_one("#work")
         rows = [_cells(table, i) for i in range(table.row_count)]
-        if [r[3] for r in rows] != ["1", "~2", "~3"]:
-            failures.append(f"PLAN: the rank cells read {[r[3] for r in rows]} — the "
+        # Wide: glyph ⚒ kind repo rank ref title who — the `kind` cell is what
+        # four panels used to say by being four panels (#589/#272).
+        if [r[2] for r in rows] != ["iss", "pr", "plan"]:
+            failures.append(f"PLAN: the kind cells read {[r[2] for r in rows]} — an "
+                            "item takes the kind of what it references, and one with "
+                            "no ref at all is a line of plan and nothing else")
+        if [r[4] for r in rows] != ["1", "~2", "~3"]:
+            failures.append(f"PLAN: the rank cells read {[r[4] for r in rows]} — the "
                             "human's order reaches the pane as row position alone, "
                             "with nothing saying which positions anybody chose")
-        if [r[4] for r in rows] != ["#394", "PR#397", ""]:
-            failures.append(f"PLAN: the ref cells read {[r[4] for r in rows]} — a PR "
+        if [r[5] for r in rows] != ["#394", "PR#397", ""]:
+            failures.append(f"PLAN: the ref cells read {[r[5] for r in rows]} — a PR "
                             "and an issue render the same, so nothing on the row says "
                             "why one ⚒ works and the other does not")
         if rows[0][0] != "◉":
             failures.append(f"PLAN: the board's own `next` is not marked: {rows[0]}")
-        if rows[2][6] != "⊘zeus/jasper-moss":
-            failures.append(f"PLAN: the who cell reads {rows[2][6]!r} — the machine or "
+        if rows[2][7] != "⊘zeus/jasper-moss":
+            failures.append(f"PLAN: the who cell reads {rows[2][7]!r} — the machine or "
                             "the wait is missing, and both are facts about the row")
-        title = _text(app.query_one("#t_plan"))
+        title = _text(app.query_one("#t_work"))
         for wanted in ("40 open", "1 running", "2 covered", "1 blocked", "4 stale",
                        "~2 unchosen", "next #394", "truncated"):
             if wanted not in title:
@@ -2248,16 +2643,26 @@ async def _drive_plan_fields() -> list[str]:
 
         # A board that came back has to stop being reported as down. The redraw is
         # skipped when nothing changed, and "nothing changed" was true of a plan
-        # whose rows did not move across the outage — so the error text outlived
-        # the error, in the one case where nothing else would ever clear it.
+        # whose rows did not move across the outage — so the report outlived the
+        # error, in the one case where nothing else would ever clear it.
+        #
+        # It is a ROW rather than a title suffix since #589, for the reason the
+        # queue's error became one: the title is bounded by the pane and was
+        # clipping the message to 24 characters. The property under test is the
+        # same either way — it has to go away when the board comes back.
+        def down(app) -> bool:
+            table = app.query_one("#work")
+            return any("HTTPError" in str(c)
+                       for i in range(table.row_count) for c in table.get_row_at(i))
+
         empty = {**plan, "items": [], "counts": {}, "next": None, "truncated": False}
         app.render_plan(empty, "HTTPError: 502")
-        if "board:" not in _text(app.query_one("#t_plan")):
-            failures.append("PLAN: a dead board is not reported in the title")
+        if not down(app):
+            failures.append("PLAN: a dead board is not reported at all")
         app.render_plan(empty, None)
-        if "board:" in _text(app.query_one("#t_plan")):
-            failures.append("PLAN: the board came back and the title still says it "
-                            "is down — the error outlived the error")
+        if down(app):
+            failures.append("PLAN: the board came back and the table still says it "
+                            "is down — the report outlived the error")
     return failures
 
 
@@ -2300,6 +2705,7 @@ async def _drive_a_watched_repos_pr() -> list[str]:
     # human being asked to approve the mistake.
     app.confirm = False
     app.repo_slug = "prisonblues/quarterback"
+    app.backlog = True                    # a reviewed PR is a backlog row (#589)
 
     started: list[tuple[str, str]] = []
     app.run_in_pane = lambda name, command: started.append((name, command))
@@ -2308,24 +2714,25 @@ async def _drive_a_watched_repos_pr() -> list[str]:
     failures: list[str] = []
     async with app.run_test(size=(100, 44)):
         app.render_prs(_TWO_REPOS_PRS, None)
-        for rk in list(app.query_one("#prs").rows):
-            pr = app.rows[str(rk.value)]
+        for rk in list(app.query_one("#work").rows):
+            row = app.rows[str(rk.value)]
+            named = f"{row['repo']}{row['ref']}"
             started.clear()
             app.detail_text = ""
-            app.dispatch_row(str(rk.value), column=app_module.Dash.PANEL_COLUMN)
-            if pr["repo"] == app.repo_slug:
+            app.dispatch_row(str(rk.value), column=app_module.Dash.VERB_COLUMN)
+            if row["repo"] == app.repo_slug:
                 if not started:
                     failures.append(
                         "⚖ on this dashboard's OWN PR started nothing — the guard "
                         f"is refusing everything, not just another repo's ({app.detail_text})")
             elif started:
                 failures.append(
-                    f"⚖ on {pr['repo']}#{pr['number']} launched {started[0][1]!r} — a paid "
-                    f"review, in {app.repo_slug}, of whatever wears that number there")
-            elif pr["repo"] not in app.detail_text:
+                    f"⚖ on {named} launched {started[0][1]!r} — a paid review, in "
+                    f"{app.repo_slug}, of whatever wears that number there")
+            elif row["repo"] not in app.detail_text:
                 failures.append(
-                    f"⚖ on {pr['repo']}#{pr['number']} refused but said {app.detail_text!r} — "
-                    "a dim icon that swallows the click is indistinguishable from a broken one")
+                    f"⚖ on {named} refused but said {app.detail_text!r} — a dim icon "
+                    "that swallows the click is indistinguishable from a broken one")
     return failures
 
 
@@ -2681,7 +3088,7 @@ def test_with_no_session_the_pencil_is_the_door_it_always_was():
     they started."""
     module = _load_app()
     _, _, opened, detail, _ = asyncio.run(
-        _drive_dials(offset=(module.Dash.EDIT_COLUMN + 2, 1)))
+        _drive_dials(offset=(module.Dash.VERB_COLUMN + 2, 1)))
     assert opened and "/dials/view" in opened[0], opened
     assert "no session here" in detail, detail
 
@@ -2714,7 +3121,7 @@ def test_with_a_session_the_pencil_opens_the_editor_on_that_dial():
             app.render_dials(DIALS)
             await pilot.pause()
             await _click_row(pilot, app.query_one("#dials"),
-                             (module.Dash.EDIT_COLUMN + 2, 1))
+                             (module.Dash.VERB_COLUMN + 2, 1))
             await pilot.pause(0.3)
             screen = app.screen
             return (type(screen).__name__,
@@ -3017,7 +3424,7 @@ def test_ctrl_s_in_the_editor_is_what_sends_it():
             app.render_dials(DIALS)
             await pilot.pause()
             await _click_row(pilot, app.query_one("#dials"),
-                             (module.Dash.EDIT_COLUMN + 2, 1))
+                             (module.Dash.VERB_COLUMN + 2, 1))
             await pilot.pause(0.3)
             # The value box holds the focus on an existing dial, so what is typed
             # replaces it only after it is cleared — `ctrl+a` is not a Textual

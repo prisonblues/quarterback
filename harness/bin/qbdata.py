@@ -2535,6 +2535,944 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
     return clip(" · ".join(bits), 400)
 
 
+# ---- what a person owes an answer to -----------------------------------------
+#
+# #328's row, on the surface a person actually has open. The board has held this
+# as a first-class row since #274 — subject, class, question, owner, and a
+# resolution required to close it — and the web board and the plan page have both
+# drawn it since. The terminal never has: `/plan` serves `waiting_on_a_human` on
+# every item and `qbdata` referenced it **zero times**, so the field was being
+# served and dropped.
+#
+# ONE GLYPH, AND IT IS ONE THAT IS ALREADY THERE. `⚑` magenta is what a PR wears
+# when its checks are gated — "a run exists, will NOT execute without a human, and
+# so will never report" (#324). A plan item waiting on a decision is the same
+# sentence about a different subject: nothing moves until a person acts. Reusing
+# it unifies the vocabulary rather than growing it, which matters more here than
+# anywhere, because the merged table's state cell already means two things
+# depending on the row and a third would need a legend nobody has yet (#603).
+
+#: How the `why` column names the class. The board's own vocabulary
+#: (`app.needs_human.NEEDS_HUMAN_CLASSES`) is NOT copied here — this file renders
+#: what the board sent and asserts nothing about what it means, which is the rule
+#: the dials half of this module keeps for the same reason (#56, #305). Anything
+#: unknown falls through as itself rather than being dropped, so a class added
+#: server-side shows up on the pane the day it is added.
+BLOCKED = ("⚑", "magenta")
+
+
+def fetch_blockers(client) -> dict:
+    """Every open question a human owes an answer to. Never raises.
+
+    A dead board is a state, not an exception — `fetch_board`'s contract, and this
+    one is on the board clock with it: a blocker is raised and answered by people
+    and agents acting now, and a surface that lagged it by ninety seconds would
+    show work as stuck that somebody has just unstuck.
+
+    **Asked for separately rather than read off the plan**, even though `/plan`
+    carries `waiting_on_a_human` per item. A blocker's subject is one of `item`,
+    `issue`, `pr` or `repo` (`app.models.blocker.SUBJECT_KINDS`), and the plan
+    payload can only carry the first: `qb-doctor` raises `landed`, `harness` and
+    `unpushed` against the REPO, and those are precisely the "the fleet is stuck"
+    ones. Reading only the plan would have shown the questions attached to work
+    and hidden the ones attached to everything.
+    """
+    out: dict = {"blockers": [], "counts": {}, "error": None}
+    try:
+        answer = client.get("/blockers", {"open": "true"})
+        if not isinstance(answer, dict) or "blockers" not in answer:
+            # A truncated response, a proxy's contentless 502 or a board mid-deploy
+            # arrives as `{}` and would render as "nothing is blocked" — which is
+            # the one reading this panel exists to prevent (#244).
+            out["error"] = "empty answer"
+            return out
+        out["blockers"] = answer.get("blockers") or []
+        out["counts"] = answer.get("counts") or answer.get("by_class") or {}
+    except Exception as exc:                      # noqa: BLE001 — display it, don't die
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def blocker_key(blocker: dict) -> str | None:
+    """The row a blocker belongs to: ``item:<uuid>``, ``owner/repo#12``, ``repo:<slug>``.
+
+    Three shapes because a blocker's subject has four kinds and two of them —
+    `issue` and `pr` — address the same number space per repository, so they key
+    the same way and cannot collide (GitHub numbers both from one sequence).
+    """
+    subject = blocker.get("subject") or {}
+    kind, value = subject.get("kind"), str(subject.get("value") or "")
+    if not kind or not value:
+        return None
+    if kind == "item":
+        return f"item:{value}"
+    if kind == "repo":
+        return f"repo:{value}"
+    repo = blocker.get("repo")
+    return f"{repo}#{value}" if repo else None
+
+
+def blockers_by_subject(blockers: list[dict] | None) -> dict[str, list[dict]]:
+    """{the key :func:`blocker_key` builds → the open blockers on it}.
+
+    A list per key and not one row: `condition` is part of the uniqueness key
+    since #576 precisely so that one producer can ask several different things
+    about one subject, and a join that kept the first would undercount by design —
+    which is the defect that issue exists to have fixed.
+    """
+    out: dict[str, list[dict]] = {}
+    for blocker in blockers or []:
+        key = blocker_key(blocker)
+        if key:
+            out.setdefault(key, []).append(blocker)
+    return out
+
+
+def blocker_cell(blockers: list[dict], width: int = 17) -> tuple[str, str]:
+    """``⚑decision rich`` — the class, and who owes the answer or how long it has waited.
+
+    THE OWNER WHERE THERE IS ONE, because that is the actionable half: an unowned
+    blocker is everyone's to answer and nobody's to be asked about, which is the
+    distinction `board.html` already draws. Without one the age stands in, for the
+    reason the board sorts this queue by age — the oldest unanswered question is
+    the one most likely to have been forgotten, and it is the only signal here
+    nobody has to maintain.
+
+    It WINS the cell from the holder, and that is deliberate: an item waiting on a
+    person is waiting whoever holds it, so the holder is the less useful of the
+    two facts. The detail line still has both.
+
+    **WHAT GOES FIRST WHEN IT DOES NOT ALL FIT**, and the order is the point: the
+    class, then `＋N`, then the owner or the age. #576 made several questions per
+    subject possible on purpose, so `＋1` is the difference between one question
+    and two — and a cell that spent its last characters on a name and clipped the
+    count would undercount the very surface that issue exists to have counting
+    right. Composed rather than clipped from one string for the same reason.
+    """
+    first = blockers[0]
+    text = f"⚑{first.get('kind') or '?'}"
+    if len(blockers) > 1:
+        text += f" ＋{len(blockers) - 1}"
+    who = (first.get("owner") or "").split("/", 1)[-1] or ago(first.get("raised_at"))
+    if who and len(text) + 1 + len(who) <= width:
+        text += f" {who}"
+    return clip(text, width), "magenta"
+
+
+# ---- the two tables ----------------------------------------------------------
+#
+# ONE ROW PER THING THAT EXISTS, which is what eight panels could not manage
+# (#589). Measured on 2026-08-28: one frame of the printed dashboard spent 61
+# rows on eight panels answering two questions, and `#578` was on the pane four
+# times — a claim in CLAIMED, rank 2 in PLANS, and twice more as its PR `#587`,
+# once in OPEN PRs and again in REVIEW QUEUE. Those last two printed the SAME
+# THREE PRs in ten lines, which is not a coincidence of that frame: the queue is
+# derived from the PR list (:func:`fetch_review_queue`), so it is a subset by
+# construction, and the PR panel's only unique contribution was the CI glyph.
+#
+# The two questions the eight panels were answering:
+#
+#   AGENTS — who is here, and how are they doing.
+#            Was SEATS + FLEET + CLAIMED.
+#   WORK   — what is in flight, and where has it got to.
+#            Was PLANS + REVIEW QUEUE + OPEN PRs + ISSUES.
+#
+# THE ROW MODELS LIVE HERE and not in either renderer, because there are two
+# renderers and they have to agree about what a merged row means. They already
+# shared every cell helper — `agent_state`, `stage_cell`, `plan_state`,
+# `plan_who`, `claim_label`, `ci_state` — and the row is the one thing they did
+# not, which is how `qb-dash.py` and `qb-dash-tui.py` came to hold six pairs of
+# panel functions that drifted a word at a time (#280 is the residue).
+#
+# They return PLAIN DICTS carrying `(text, style)` pairs, and no Rich object
+# anywhere. Textual wants `Text`, the printed renderer wants `Text` clipped to
+# different widths, and a test that has to build a `Console` to find out what a
+# row says is a test nobody writes. This decides what a row IS; the renderers
+# decide what it looks like.
+
+#: What a claim's row says in the `state` cell when no agent row carries it.
+#: THREE WORDS AND NOT ONE, because they are three different facts and only one of
+#: them is a loose end:
+#:
+#: * ``machine`` — the claim is recorded against a bare machine name (``hermes``)
+#:   while the agents on that box are ``hermes/scarlet-velvet`` and friends, so
+#:   nothing can say WHICH of them holds it. That is #444, and this row is where
+#:   it costs something: a merged table either says so or invents an attribution.
+#: * ``gone`` — the claim names a full ``machine/name`` that presence no longer
+#:   lists. The agent finished and the claim outlived it, which is by some way
+#:   the most actionable row on this dashboard — work somebody holds that nobody
+#:   is doing — and under separate panels it read exactly like a live one.
+#: * ``elsewhere`` — the holder IS live and this pane's scope hid it. The claim is
+#:   in scope and its holder is not, which CLAIMED and FLEET each answered half of
+#:   and the merged table would otherwise drop entirely: the claim is not unheld,
+#:   so it earns no row of its own, and its holder has no row to ride. Nothing is
+#:   wrong here and the row says so — but it has to BE there, because a claim that
+#:   vanishes when a pane is narrowed is the panel-that-filtered-silently defect
+#:   (#176) applied to the one fact that stops duplicated work.
+CLAIM_ONLY_STATE = {"machine": ("machine", "yellow"), "gone": ("gone", "bold red"),
+                    "elsewhere": ("elsewhere", "grey50")}
+
+#: What the rank cell says on a row the plan does not carry. Not :data:`STAGE_UNREPORTED`'s
+#: meaning even though it is the same glyph: that one is "nobody said", this one is
+#: "there is nothing to say" — the board deliberately refuses to rank the review
+#: queue (#232 owns the order), so a number here would be this file inventing one.
+UNRANKED = "—"
+
+
+def plan_index(items: list[dict] | None, repos: list[str] | None = None) -> dict[str, dict]:
+    """``{'owner/repo#12': the plan item that references it}``.
+
+    The join WORK dedupes on, and the lookup :func:`claim_summary` uses to put
+    words beside a bare issue number.
+
+    Only items whose ref resolves to a repo are in it. :func:`plan_repo` refuses
+    to put an owner on a bare name it cannot match, and a key built on a guess
+    would merge two projects' #12 into one row.
+
+    An issue and a PR cannot collide here: GitHub numbers both out of one
+    sequence per repository, so ``owner/repo#12`` is either one or the other and
+    never both.
+    """
+    out: dict[str, dict] = {}
+    watched = resolve_repos() if repos is None else repos
+    for item in items or []:
+        value = str((item.get("ref") or {}).get("value") or "")
+        repo = plan_repo(item, watched)
+        if not value or not repo:
+            continue
+        out.setdefault(f"{repo}#{value}", item)
+    return out
+
+
+def claim_summary(claim: dict, items: list[dict] | None = None,
+                  scope: "Scope | None" = None,
+                  index: dict[str, dict] | None = None) -> str:
+    """What a claim is on, in one cell: ``#554 The panel prices a fix by cost…``.
+
+    :func:`claim_label` alone answers ``#554``, which was the whole of what
+    CLAIMED could say — and the reason a reader had to join three panels by eye
+    to find out what an agent was doing.
+
+    The words come from the plan item behind the key when there is one, and from
+    the claim's own note when there is not. The note is what the claiming agent
+    said it was doing, which is the same sentence the plan item carries whenever
+    the claim wrote the item (#427).
+    """
+    key = claim.get("key") or "?"
+    label = claim_label(key, items, scope)
+    # `claim_label` already resolves an `item:`/`plan:` key to the item's title
+    # or the plan's label, so appending words there would say it twice.
+    if label.startswith("plan "):
+        return label
+    item = (index or {}).get(key)
+    words = (item.get("title") if item else None) or claim.get("note") or ""
+    return f"{label} {words}".strip()
+
+
+def _claim_only_state(holder: str, live: set[str]) -> tuple[str, str]:
+    """Which of :data:`CLAIM_ONLY_STATE` a holder with no agent row earns.
+
+    Presence is asked first, because "alive and off this pane" is a different
+    answer from either of the others and is the only one that is not a loose end.
+    After that the holder's SHAPE decides, and it is the right test: a claim
+    recorded as ``machine/name`` names an agent, so presence not listing it means
+    that agent has finished; a claim recorded as a bare ``machine`` never named
+    one, so no amount of presence can say who holds it.
+    """
+    if holder in live:
+        return CLAIM_ONLY_STATE["elsewhere"]
+    return CLAIM_ONLY_STATE["gone" if "/" in holder else "machine"]
+
+
+def _seat_label(seat: dict, screens: int) -> str:
+    """``seat 3``, or ``quarterback 1`` where more than one screen is open.
+
+    Lifted verbatim from the SEATS panel this merged into, including the
+    ``seats-`` trim: every screen on a box shares that prefix, so it
+    distinguishes none of them and spends seven of the thirteen columns the cell
+    has.
+    """
+    name = seat.get("session") or ""
+    if name.startswith("seats-") and len(name) > 6:
+        name = name[6:]
+    return f"{name} {seat.get('seat')}" if screens > 1 else f"seat {seat.get('seat')}"
+
+
+def _agent_row(agent: dict, mine: list[dict], items, scope, index) -> dict:
+    """The cells an agent contributes, whether or not it is sitting in a pane."""
+    word, style = agent_state(agent)
+    if mine:
+        what = (claim_summary(mine[0], items, scope, index), "white")
+    else:
+        # No claim: what the agent SAID it was doing, which is what FLEET showed.
+        # A claim is the better answer when there is one — it is the fleet's own
+        # record rather than a prompt summary — and the TUI's detail line still
+        # has both.
+        what = (agent.get("title") or agent.get("branch") or "—", "grey70")
+    return {"who": (agent.get("holder") or "?").split("/", 1)[-1],
+            "repo": agent.get("repo"),
+            "state": (word or "—", style),
+            "stage": stage_cell(agent),
+            "what": what,
+            "extra": max(0, len(mine) - 1),
+            "ttl": until(agent.get("expires"))}
+
+
+def agent_rows(data: dict, scope: "Scope | None" = None,
+               items: list[dict] | None = None,
+               seats: list[dict] | None = None) -> tuple[list[dict], int]:
+    """Who is here and how they are doing — SEATS, FLEET and CLAIMED as one table.
+
+    Returns ``(rows, hidden)``, `hidden` being the scope's count for the title.
+
+    THREE PANELS WERE THREE VIEWS OF ONE SUBJECT. A seat is an agent with a pane
+    in front of you; a claim is what an agent is holding. `panel_claims` already
+    re-derived its holder by splitting ``holder`` on ``/`` exactly the way
+    `panel_agents` did — the two were keyed on the same thing, and the border
+    between them was the only reason the join was never drawn.
+
+    The order is a READING order, not a work order:
+
+    1. the panes on this screen, because they are the rows a click can act on;
+    2. the rest of the fleet;
+    3. the claims no live agent answers for — see :data:`CLAIM_ONLY_STATE`.
+
+    **Seats are not scoped and must not be.** ``tmux_seats()`` lists the panes on
+    the screen in front of you; a pane belonging to another project's screen is
+    still a pane you can close, and narrowing it away would leave the ✕ missing
+    for the seat most worth closing. FLEET was scoped, SEATS was not, and this
+    keeps both answers.
+
+    **`live` is computed over every agent, not the scoped ones.** An agent the
+    scope hid is still alive, and calling its claim ``gone`` because this pane is
+    narrow would be the panel-that-filtered-silently defect (#176) told as a fact
+    about somebody's work.
+    """
+    every = sorted(data.get("agents") or [],
+                   key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
+    agents, hidden = in_scope(every, scope)
+    claims = sorted(data.get("claims") or [], key=lambda c: c.get("expires") or "")
+    claims, _ = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), items))
+    index = plan_index(items)
+    live = {a.get("holder") for a in every if a.get("holder")}
+    mine: dict[str, list[dict]] = {}
+    for claim in claims:
+        mine.setdefault(claim.get("holder") or "?", []).append(claim)
+
+    by_session = {s: a for a in every if (s := a.get("session"))}
+    rows: list[dict] = []
+    seated: set[str] = set()
+    screens = len({s.get("session") for s in (seats or [])})
+    for seat in seats or []:
+        agent = by_session.get(seat.get("agent") or "\0")
+        # A pane running a shell is a pane with no agent in it, which is exactly
+        # the seat worth giving something to do.
+        running = seat.get("command") not in ("bash", "sh", "zsh", "fish", "", None)
+        row = {"key": f"seat:{seat.get('pane')}", "kind": "seat", "seat": seat,
+               "agent": agent, "claim": None, "live": running,
+               "label": _seat_label(seat, screens)}
+        if agent is not None:
+            seated.add(agent.get("holder") or "")
+            row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
+                                  items, scope, index))
+        else:
+            row.update({"who": _seat_label(seat, screens),
+                        # The pane's DIRECTORY, which is what the SEATS panel's
+                        # `where` column showed and is the only thing this row
+                        # knows about location: a pane with no agent in it has no
+                        # board record to name a repo from.
+                        "repo": os.path.basename(seat.get("path") or "") or None,
+                        "state": ("—", "grey50"),
+                        "stage": (STAGE_UNREPORTED, "grey50"), "extra": 0, "ttl": "",
+                        "what": (seat.get("command") or "—",
+                                 "white" if running else "grey50")})
+        rows.append(row)
+
+    for i, agent in enumerate(agents):
+        if (agent.get("holder") or "") in seated:
+            continue
+        row = {"key": f"agent:{i}", "kind": "agent", "agent": agent,
+               "claim": None, "seat": None, "live": True, "label": ""}
+        row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
+                              items, scope, index))
+        rows.append(row)
+
+    drawn = {r["agent"].get("holder") for r in rows if r.get("agent") is not None}
+    for i, claim in enumerate(claims):
+        holder = claim.get("holder") or "?"
+        # A ROW FOR EVERY CLAIM THAT IS NOT ALREADY ON ONE, which is not the same
+        # test as "its holder is not live": an agent this pane's scope hid is alive
+        # and has no row here, so keying on presence dropped its claim from the
+        # table altogether. `_claim_only_state` tells the three cases apart.
+        if holder in drawn:
+            continue
+        left = minutes_left(claim.get("expires"))
+        rows.append({"key": f"claim:{i}", "kind": "claim", "claim": claim,
+                     "agent": None, "seat": None, "live": False, "label": "",
+                     "who": holder, "repo": claim_repo(claim.get("key"), items),
+                     "state": _claim_only_state(holder, live),
+                     "stage": (STAGE_UNREPORTED, "grey50"),
+                     "what": (claim_summary(claim, items, scope, index), "yellow"),
+                     "extra": 0, "ttl": until(claim.get("expires")),
+                     "expiring": left is not None and left < 10})
+    return rows, hidden
+
+
+def agent_tally(rows: list[dict]) -> str:
+    """``5 live · 2 seats · 1 idle · 3 unheld`` — what the AGENTS title counts.
+
+    FOUR NUMBERS AND EACH IS A DIFFERENT FACT, which is why none of them is folded
+    into another:
+
+    * ``live``   — rows with an agent behind them. A pane with an agent in it is
+      one row and is counted once, which is the whole point of the merge.
+    * ``seats``  — how many of those are in a pane on the screen in front of you,
+      and so are one click from being looked at.
+    * ``idle``   — panes with no agent in them. Exactly the seats free to be given
+      something to do, which is what SEATS' grey dot marked.
+    * ``unheld`` — claims no live agent answers for. The opposite of live, and
+      never folded into it: this is the row a reader is being asked to act on.
+
+    It is the only place these are counted. The head line used to state a live
+    count and a seat count of its own, worked out from a different join, and the
+    two disagreed on the first frame that had a seat in it — "4 live · 1 seats"
+    over a table headed "5 live · 3 seats". One fact, one place.
+    """
+    seated = [r for r in rows if r.get("kind") == "seat"]
+    live = sum(1 for r in rows if r.get("agent") is not None)
+    seats = sum(1 for r in seated if r.get("agent") is not None)
+    idle = len(seated) - seats
+    bits = [f"{live} live"]
+    for count, word in ((seats, "seat"), (idle, "idle"),
+                        (sum(1 for r in rows if r.get("kind") == "claim"
+                             and r["state"] != CLAIM_ONLY_STATE["elsewhere"]),
+                         "unheld")):
+        if count:
+            bits.append(f"{count} {word}{'s' if word == 'seat' and count != 1 else ''}")
+    return " · ".join(bits)
+
+
+#: What the `why` column says about an open PR the review queue did not return.
+#: `fetch_review_queue` sends back every entry it judged, drainable or held with
+#: a reason, so a PR absent from `entries` is one the board took out of the queue
+#: altogether — review is finished with it. It only ever appears with `backlog`.
+REVIEWED = ("reviewed", "grey50")
+
+
+def _queue_why(entry: dict) -> tuple[str, str]:
+    """``panel 1h29m`` — the verb the queue is waiting on, and how long it has.
+
+    A held entry says why it is held instead of a verb, in the same cell and in
+    grey: a queue that hid its blocked entries would report a depth of zero for a
+    repo where everything is stuck (#244).
+    """
+    state = entry.get("state") or ""
+    colour = QUEUE_COLOUR.get(state, "grey50")
+    drains = bool(entry.get("drainable"))
+    holds = entry.get("holds") or []
+    hold = holds[0].get("code") if holds else state
+    action = entry.get("next_action")
+    verb = (QUEUE_VERB.get(action, action or "") if drains
+            else QUEUE_HOLD.get(hold, hold))
+    # A `~` on an age that is the longest the wait COULD have been: nothing
+    # records when a head moved or when a branch started conflicting, and a
+    # number nobody can rely on should say so.
+    age = ("~" if entry.get("age_is_upper_bound") else "") + waited(entry.get("age_seconds"))
+    return f"{verb} {age}".strip(), (colour if drains else "grey50")
+
+
+def _merge_blockers(found: list[dict], on_the_item: list[dict] | None) -> list[dict]:
+    """The `/blockers` rows for a subject, plus any the plan carried and they did not.
+
+    `/plan` spells a blocker differently — `blocker_id`/`class` where `/blockers`
+    says `id`/`kind` — so the plan's are translated rather than merged raw. They
+    are normally the same rows twice; the case worth keeping is a `/blockers` read
+    that failed, where the plan's copy is all there is.
+    """
+    seen = {b.get("id") for b in found}
+    out = list(found)
+    for w in on_the_item or []:
+        if w.get("blocker_id") in seen:
+            continue
+        out.append({"id": w.get("blocker_id"), "kind": w.get("class"),
+                    "question": w.get("question"), "owner": w.get("owner"),
+                    "raised_by": w.get("raised_by"), "raised_at": w.get("raised"),
+                    "subject": {"kind": "item", "value": ""}})
+    return out
+
+
+def _block(row: dict, blockers: list[dict], used: set | None = None) -> dict:
+    """Mark a row as waiting on a person, or leave it exactly as it was.
+
+    The glyph WINS over the row's own state, and the `why` cell over its holder,
+    because both of those describe a thing that is not going to happen until
+    somebody answers. What it does not do is throw the old state away — `blocked`
+    carries the rows, `dispatch` reads them, and the detail line says all of it.
+    """
+    if not blockers:
+        return row
+    if used is not None:
+        used.update(b.get("id") for b in blockers)
+    row["blocked"] = blockers
+    row["glyph"] = BLOCKED
+    row["why"] = blocker_cell(blockers)
+    return row
+
+
+def work_rows(plan: dict | None, prs: list[dict] | None, queue: dict | None,
+              issues: list[dict] | None, held: dict | None = None,
+              scope: "Scope | None" = None, backlog: bool = False,
+              repos: list[str] | None = None, blockers: list[dict] | None = None,
+              waiting_only: bool = False) -> tuple[list[dict], int]:
+    """What is in flight, in the board's order — PLANS, REVIEW QUEUE, PRs, ISSUES.
+
+    Returns ``(rows, hidden)``.
+
+    **The order is the plan's and is not re-derived.** A plan is an ordered list,
+    that order is a human decision, and re-banding it locally is a second answer
+    about the plan computed against the plan's own — the defect `panel_plan`
+    already had removed. Work the plan does not carry is APPENDED below it, in
+    the order the board sent it, and wears :data:`UNRANKED` rather than a
+    position: the board deliberately refuses to rank the review queue (#232 owns
+    the order), so a number there would be this file inventing one.
+
+    **An unplanned PR keeps a row, and that is the point.** REVIEW QUEUE exists
+    because on 2026-08-20 six of eight open PRs had never been panelled and no
+    surface said so (#273). A merged table that drew only plan items would open
+    that hole again the moment somebody pushed a dependabot branch — most PRs are
+    NOT plan items, because a plan item references its issue.
+
+    **A PR is not merged with the issue it closes**, and cannot be: the plan item
+    knows its issue and nothing anywhere records which PR implements it (#396).
+    So `#578` goes from four rows to two rather than to one, and the missing edge
+    is a fact about the board rather than a shortcut taken here.
+
+    `backlog` adds the two lists that are not in flight — open PRs review has
+    finished with, and open issues nobody has planned or taken. They are off by
+    default because they are a catalogue rather than state: 30 issues and 12 of
+    them drawn was the single biggest consumer of rows on the old frame, and
+    `next` on the plan answers "what do I pick up" better than a free-issues-first
+    sort does.
+    """
+    watched = resolve_repos() if repos is None else repos
+    held = held or {}
+    waiting = blockers_by_subject(blockers)
+    #: Which blockers found a row to ride. Everything left over gets one of its
+    #: own below — see the loop that reads it for why that is not optional.
+    used: set = set()
+    items, hidden = in_scope(plan_items(plan), scope)
+    next_id = plan_next_id(plan)
+    planned: list[dict] = []
+    flight: list[dict] = []
+    backlogged: list[dict] = []
+    by_ref: dict[str, dict] = {}
+
+    for item in items:
+        value = str((item.get("ref") or {}).get("value") or "")
+        repo = plan_repo(item, watched)
+        row = {"key": f"plan:{item.get('item_id')}", "kind": "plan",
+               # `owner/repo#n`, or None for a line of plan with no ref. The join
+               # every dedupe and every tally below is made on, carried ON the row
+               # so that nothing has to rebuild it and get it subtly different.
+               "ref_key": f"{repo}#{value}" if repo and value else None,
+               "item": item, "pr": None, "issue": None, "entry": None,
+               "glyph": plan_state(item, next_id), "rank": plan_rank(item),
+               "ref": plan_ref(item), "repo": item.get("repo"),
+               "title": item.get("title") or "", "why": plan_who(item),
+               "section": "plan",
+               "dim": plan_state(item, next_id)[1] == "grey50"}
+        # BY THE ITEM AND BY WHAT IT REFERENCES, because both are real subjects:
+        # `preland` and `panel` raise against the PR, `issue_watch` against the
+        # issue, and an agent working a plan line raises against the item.
+        #
+        # AND FROM THE PLAN'S OWN PAYLOAD, which carries `waiting_on_a_human` per
+        # item and was the field this dashboard referenced zero times (#328). It
+        # is mostly redundant with `/blockers` and is kept for the case where it is
+        # not: a `/blockers` read that fails leaves the item-level questions still
+        # answerable, on a surface whose whole claim is that a person can trust it.
+        # Deduped on the id, because two sources for one row is how a table comes
+        # to say `＋1` about one question.
+        _block(row, _merge_blockers(
+            waiting.get(f"item:{item.get('item_id')}", [])
+            + (waiting.get(f"{repo}#{value}", []) if repo and value else []),
+            item.get("waiting_on_a_human")), used)
+        planned.append(row)
+        if repo and value:
+            by_ref.setdefault(f"{repo}#{value}", row)
+
+    prs_by_ref = {repo_ref(p): p for p in (prs or [])}
+    queued: set[str] = set()
+    for entry in (queue or {}).get("entries") or []:
+        ref = f"{entry.get('repo') or REPO}#{entry.get('pr')}"
+        queued.add(ref)
+        why = _queue_why(entry)
+        pr = prs_by_ref.get(ref)
+        row = by_ref.get(ref)
+        if row is not None:
+            # A PR-backed plan item. Its place in the order is the plan's; what it
+            # is waiting for is the queue's, and that is the cell the queue owns.
+            row["entry"], row["pr"] = entry, pr
+            # The queue owns this cell — unless a person owes an answer about the
+            # same PR, which outranks a round nobody can usefully spend until they
+            # give it.
+            if not row.get("blocked"):
+                row["why"] = why
+            continue
+        flight.append({"key": f"pr:{ref}", "kind": "pr", "ref_key": ref,
+                     "section": "flight",
+                     "item": None, "pr": pr, "issue": None, "entry": entry,
+                     # A PR's state is its CI rollup, because that is the fact a
+                     # PR row is read for. Absent the `gh` row — a queue entry can
+                     # outlive one refresh of the PR list — it is unknown rather
+                     # than green.
+                     "glyph": ci_state(pr or {}), "rank": (UNRANKED, "grey42"),
+                     "ref": f"#{entry.get('pr')}", "repo": entry.get("repo"),
+                     "title": (pr or entry).get("title") or "", "why": why,
+                     "dim": not entry.get("drainable")})
+        _block(flight[-1], waiting.get(ref, []), used)
+
+    if backlog:
+        for pr in sorted(prs or [], key=lambda p: -(p.get("number") or 0)):
+            ref = repo_ref(pr)
+            if ref in queued or ref in by_ref:
+                continue
+            backlogged.append({"key": f"pr:{ref}", "kind": "pr", "ref_key": ref,
+                         "section": "backlog",
+                         "item": None, "pr": pr,
+                         "issue": None, "entry": None, "glyph": ci_state(pr),
+                         "rank": (UNRANKED, "grey42"), "ref": f"#{pr.get('number')}",
+                         "repo": pr.get("repo"), "title": pr.get("title") or "",
+                         "why": REVIEWED, "dim": bool(pr.get("isDraft"))})
+            _block(backlogged[-1], waiting.get(ref, []), used)
+        for issue in sort_issues(issues or [], held):
+            ref = issue_key(issue)
+            if ref in by_ref:
+                continue
+            claim = held.get(ref)
+            holder = (claim.get("holder") or "?") if claim else None
+            backlogged.append({"key": f"issue:{ref}", "kind": "issue", "ref_key": ref,
+                         "section": "backlog",
+                         "item": None, "pr": None, "issue": issue, "entry": None,
+                         "glyph": ("·", "grey50") if holder else ("○", "green"),
+                         "rank": (UNRANKED, "grey42"),
+                         "ref": f"#{issue.get('number')}", "repo": issue.get("repo"),
+                         "title": issue.get("title") or "",
+                         "why": ((holder, "yellow") if holder
+                                 else (ago(issue.get("updatedAt")), "grey50")),
+                         "dim": bool(holder)})
+            _block(backlogged[-1], waiting.get(ref, []), used)
+    # EVERY QUESTION GETS A ROW, and the ones that ride an existing row are the
+    # lucky half. A blocker's subject is one of item, issue, pr or repo, and three
+    # of those can name something this table is not otherwise drawing: `qb-doctor`
+    # raises `landed`, `harness` and `unpushed` against the REPO, and `preland`
+    # raises against a PR that need never have been a plan item.
+    #
+    # Left out, they are counted by the header and drawn nowhere, which is the
+    # failure this whole feature is against: the header said `WAITING 4` over a
+    # table holding one, and a number that disagrees with the rows under it is the
+    # one thing a surface a person is asked to trust cannot do. So the leftovers
+    # get rows — at the TOP, with the review queue, because they are the same kind
+    # of fact: work that a person is standing in front of.
+    for key, group in sorted(waiting.items()):
+        rest = [b for b in group if b.get("id") not in used]
+        if not rest:
+            continue
+        repo = rest[0].get("repo")
+        if scope is not None and not scope.keeps(repo):
+            hidden += 1
+            continue
+        subject = rest[0].get("subject") or {}
+        kind = subject.get("kind")
+        value = str(subject.get("value") or "")
+        flight.append({"key": f"blocker:{key}", "kind": "blocker", "ref_key": None,
+                       "section": "flight", "item": None, "pr": None, "issue": None,
+                       "entry": None, "blocked": rest, "glyph": BLOCKED,
+                       "rank": (UNRANKED, "grey42"),
+                       # The subject's own ref where it has one, so a row about
+                       # PR #1708 says #1708 rather than making a reader read the
+                       # question to find out what it is about.
+                       "ref": f"#{value}" if kind in ("issue", "pr") else "",
+                       "subject": subject,
+                       "repo": repo, "title": rest[0].get("question") or "",
+                       "why": blocker_cell(rest), "dim": False})
+
+    if waiting_only:
+        # THE FILTER IS HERE and not in either renderer, for the reason the row
+        # model is: two renderers that each decided what "blocked" meant would
+        # answer the same question differently within a release.
+        flight = [r for r in flight if r.get("blocked")]
+        planned = [r for r in planned if r.get("blocked")]
+        backlogged = [r for r in backlogged if r.get("blocked")]
+        # AND `elsewhere` COUNTS THE RIGHT THING. `hidden` is plan items the scope
+        # dropped, which in this view is forty rows the FILTER would have dropped
+        # anyway — a number about a list the reader has just asked not to see,
+        # sitting next to one about the list they asked for. Here it is the only
+        # thing that can be elsewhere: a question on another project's work.
+        hidden = sum(1 for b in (blockers or [])
+                     if scope is not None and not scope.keeps(b.get("repo")))
+
+    # THE SECTIONS ARE ORDERED BY STAGE OF LIFE, and the plan's order governs the
+    # middle one untouched. A PR waiting on a review is finished work that needs
+    # somebody, so it goes above forty items nobody has started — and putting it
+    # there overrules nothing: the board's order is an order over plan ITEMS, and
+    # it says nothing about where a PR sits among them because PRs are not in it.
+    # That is the same silence the queue's own oldest-first reading order fills
+    # (#232), filled the same way and for the same reason.
+    #
+    # Appending instead was the first cut and it read badly on real data: forty-two
+    # plan rows above five review rows, in a table showing twenty, is a review
+    # queue that is technically present and practically invisible — which is the
+    # shape of the defect #273 was filed about.
+    return flight + planned + backlogged, hidden
+
+
+def work_sig(rows: list[dict]) -> tuple:
+    """A signature over what a WORK row MEANS, ignoring how long it has been that way.
+
+    The clickable renderer rebuilds its table only when this changes, and #433 is
+    why: a reader picks a row by looking at it, and a rebuild between the mouse
+    going down and the click arriving moves that row out from under the pointer.
+
+    **The rendered age is deliberately not in it.** `plan_who` and the queue's
+    wait both end in an elapsed time that ticks over every minute, so a signature
+    taken off the drawn cells would rebuild the table a minute at a time forever
+    — which is the guard doing nothing at exactly the cost of having it. The raw
+    stamps go in instead, exactly as `render_plan`'s own signature used them.
+
+    It replaces one guard with one guard rather than three: PLANS had this and
+    OPEN PRs, REVIEW QUEUE and ISSUES each cleared and rebuilt on every tick, so
+    the merged table is steadier than three of the four panels it came from.
+    """
+    out = []
+    for row in rows:
+        item = row.get("item") or {}
+        entry = row.get("entry") or {}
+        holds = entry.get("holds") or []
+        out.append((
+            row.get("key"), row.get("ref"), row.get("title"), row.get("dim"),
+            row["glyph"][0], row["rank"][0],
+            # The plan's half: who holds it, what it waits on, where it sits.
+            (item.get("claim") or {}).get("holder"),
+            (item.get("covered_by") or {}).get("holder"),
+            len(item.get("blocked_by") or []), item.get("rank"),
+            item.get("rank_source"), item.get("updated"),
+            # The queue's half: the verb, and whether anything may act on it.
+            entry.get("next_action"), entry.get("drainable"),
+            holds[0].get("code") if holds else None,
+            # And the issue's. The HOLDER by name, not merely the fact of one:
+            # `why[1]` alone is yellow for any holder, so a claim passing from one
+            # agent to another left the old name on the row indefinitely. Only for
+            # a held row — a free one's `why` is an age that ticks over every
+            # minute, and putting that in here is the guard doing nothing at
+            # exactly the cost of having it.
+            row["why"][0] if row.get("kind") == "issue" and row.get("dim") else None,
+            row["why"][1],
+            # And the questions a person owes: raised or answered, the row means
+            # something different and the table has to redraw. On the ids, so a
+            # blocker whose age ticks over does not count as a change.
+            tuple(sorted(b.get("id") or "" for b in (row.get("blocked") or []))),
+        ))
+    return tuple(out)
+
+
+def work_fold(rows: list[dict], cap: int) -> list[tuple[list[dict], int]]:
+    """Which rows a printed panel draws when it cannot draw them all.
+
+    Returns one ``(shown, dropped)`` pair per section, in the order the sections
+    are drawn — so a caller writes the "…and N more" line where the rows actually
+    went rather than all of them at the bottom.
+
+    **A cap that always eats the same section is a section that is never drawn.**
+    A straight `rows[:cap]` looks right and is not: this repo's plan is forty-odd
+    items long, so under a simple slice the panel said `5 in review` in its title
+    and showed none of them. That is #273's hole reopened by a display limit
+    rather than by a data model, which is worse, because nothing about the code
+    would look wrong.
+
+    So the review section takes what it needs up to a third, the plan takes the
+    rest, and the backlog — which is only ever on because somebody asked for it —
+    takes whatever is left. A third rather than half because the plan is what the
+    table is ordered by and is what a reader came for; a third rather than nothing
+    because a PR waiting on a review is the row somebody can act on today.
+
+    Every count comes back rather than being dropped, for `elsewhere`'s reason one
+    function over: a panel that stopped listing without saying how many it left
+    out is a panel quietly understating the work.
+    """
+    out = []
+    room = cap
+    sections = [[r for r in rows if r.get("section") == name]
+                for name in ("flight", "plan", "backlog")]
+    shares = [min(len(sections[0]), max(cap // 3, cap - len(sections[1]))), None, None]
+    for section, share in zip(sections, shares):
+        take = max(0, min(len(section), room if share is None else share))
+        out.append((section[:take], len(section) - take))
+        room -= take
+    return out
+
+
+#: What the `kind` cell says for each row, in four characters. Explicit rather
+#: than a sigil on the ref, per #272: a reader should not have to know that `PR#4`
+#: and `#4` differ by two characters at the front of a right-aligned cell.
+WORK_KIND = {"plan": "plan", "pr": "pr", "issue": "iss"}
+#: And what a row that is ONLY a question calls itself, by what the question is
+#: about. `repo` is the one with nowhere else to go; the other two are subjects
+#: this table would have drawn if the work were on the plan or in the backlog.
+BLOCKER_KIND = {"repo": "repo", "pr": "pr", "issue": "iss", "item": "plan"}
+
+
+def work_kind(row: dict) -> str:
+    """``iss`` / ``pr`` / ``plan`` — what sort of thing this row is.
+
+    A plan item takes the kind of whatever it REFERENCES, because that is what a
+    reader is being asked about: an item pointing at an issue is an issue you can
+    take, and one pointing at a PR is a PR you can review. Only an item with no
+    ref at all is a line of plan and nothing else.
+    """
+    # `repo` for a blocker row, because that is what its subject IS — a question
+    # about the project rather than about any piece of work in it. Naming it for
+    # the blocker would say what the ⚑ already says twice.
+    if row.get("kind") == "blocker":
+        return BLOCKER_KIND.get((row.get("subject") or {}).get("kind"), "?")
+    if row.get("kind") != "plan":
+        return WORK_KIND.get(row.get("kind"), "?")
+    kind = ((row.get("item") or {}).get("ref") or {}).get("kind")
+    return {"issue": "iss", "pr": "pr"}.get(kind, "plan")
+
+
+def work_tally(rows: list[dict], prs: list[dict] | None,
+               issues: list[dict] | None, held: dict | None,
+               backlog: bool, claims_known: bool = True,
+               waiting_only: bool = False) -> list[str]:
+    """What the WORK title adds to the plan's own counts, and what it is hiding.
+
+    The plan half of that title is :func:`plan_head_bits` and is not restated
+    here — the board's counts are the board's. These are the two facts the merge
+    introduced: how much of the table is a review waiting to happen, and how many
+    rows the backlog toggle is holding back.
+
+    A HIDDEN LIST STILL GETS A NUMBER. A panel that simply stopped mentioning the
+    backlog would be the silent narrowing `elsewhere` exists to prevent one panel
+    over: "nothing to pick up" and "nothing to pick up among the rows I am showing
+    you" are different facts, and only the second one is true here.
+    """
+    bits = []
+    reviewing = sum(1 for r in rows if r.get("entry") is not None)
+    if reviewing:
+        bits.append(f"{reviewing} in review")
+    # NAMED ON THE TABLE AS WELL AS ON THE HEADER LINE, because it is the one
+    # number here that is somebody's to act on rather than the fleet's: #274's
+    # whole argument is that a question owed to a person needs one place it is
+    # always visible, and a reader who has filtered to something else should
+    # still be told it is there.
+    # QUESTIONS, not rows, because that is the unit the header line counts and two
+    # numbers about one thing in two units is how a reader learns to trust neither.
+    # `＋N` on a row is what reconciles them by eye.
+    blocked = sum(len(r["blocked"]) for r in rows if r.get("blocked"))
+    if blocked:
+        bits.append(f"{blocked} waiting on a human")
+    # A FILTERED TABLE'S TITLE IS ABOUT WHAT IT IS SHOWING. `+20 free hidden` over
+    # two rows a person owes an answer about is true and useless: they are hidden
+    # by the filter the reader just applied, not by a toggle they might want. The
+    # plan's own counts go with them — see the caller, which stops asking for them.
+    if backlog or waiting_only:
+        return bits
+    held = held or {}
+    # WHAT IS NOT ON A ROW, which is not the same as what is unclaimed. Most open
+    # issues are on the plan and are drawn as plan items, so counting free ones
+    # would report two dozen hidden rows that are in fact the ten above it.
+    shown = {r.get("ref_key") for r in rows if r.get("ref_key")}
+    # NOT "N free" WHILE THE BOARD IS UNREACHABLE. `free` is counted off claims
+    # that are stale or were never fetched, and a count taken from no claims at all
+    # is how a seat is sent into work somebody already holds — the same collapse
+    # the ISSUES panel's title refused, kept here rather than lost in the merge.
+    free = (sum(1 for i in (issues or [])
+                if issue_key(i) not in shown and issue_key(i) not in held)
+            if claims_known else 0)
+    quiet = sum(1 for p in (prs or []) if repo_ref(p) not in shown)
+    more = [f"{quiet} pr{'s' if quiet != 1 else ''}" if quiet else "",
+            f"{free} free" if free else ""]
+    more = [m for m in more if m]
+    if more:
+        bits.append("+" + " · ".join(more) + " hidden")
+    return bits
+
+
+def blocker_detail(blockers: list[dict]) -> str:
+    """Every question on one row, for the detail line under the tables.
+
+    ALL of them, not the first: `condition` is part of the uniqueness key since
+    #576 precisely so one producer can ask several different things about one
+    subject, and a detail line that showed the first would be that issue's
+    undercount reintroduced one surface further on.
+
+    The `question` is the payload — a person reads it and answers it — and the
+    class, the owner and the age are what decide whether it is theirs and whether
+    it has been forgotten.
+    """
+    out = []
+    for b in blockers:
+        bits = [b.get("kind") or "?"]
+        if b.get("condition"):
+            bits.append(f"[{b['condition']}]")
+        bits.append(b.get("question") or "(no question)")
+        if b.get("owner"):
+            bits.append(f"→ {b['owner']}")
+        else:
+            bits.append("→ unowned")
+        bits.append(f"raised by {b.get('raised_by') or '?'} {ago(b.get('raised_at'))}")
+        if b.get("detail"):
+            bits.append(b["detail"])
+        out.append(" · ".join(bits))
+    return clip("  ⚑  ".join(out), 400)
+
+
+def blocker_tally(blockers: dict | None,
+                  scope: "Scope | None" = None) -> tuple[str, str] | None:
+    """``('WAITING 7', 'magenta')`` — what the header line says about the one door.
+
+    `None` before the board has answered, and a **zero still draws** once it has:
+    "nobody is waiting on you" is exactly the answer somebody opens this to get,
+    and a cell that vanished when it was true could not be told from a dashboard
+    that never asked (#244). An error reports as `?` for the same reason the queue
+    depth does — a count built on a read that failed is not a count.
+
+    **SCOPED, like every other tally on that line.** Fleet-wide was the first cut
+    and it read as a fault: the header said `WAITING 7` over a table holding one,
+    because six were another project's, and the `N elsewhere` that would have
+    explained it is on the table's title where the pane had already clipped it. A
+    number and the rows under it disagreeing is the one thing a surface a person
+    is asked to trust cannot do — #274's argument is that they open it at all.
+    """
+    if blockers is None:
+        return None
+    if blockers.get("error"):
+        return "WAITING ?", "red"
+    rows = blockers.get("blockers") or []
+    if scope is not None:
+        rows = [b for b in rows if scope.keeps(b.get("repo"))]
+    return f"WAITING {len(rows)}", ("magenta" if rows else "green")
+
+
+def pr_tally(prs: list[dict] | None) -> list[tuple[str, str]]:
+    """``[('1 red', 'red')]`` — every open PR state worth looking at, none silent.
+
+    Moved to the header line from the OPEN PRs panel title, which is the half of
+    that panel worth keeping: a PR can be green and unreviewed or red and already
+    signed off, so the CI tally is not derivable from the review queue that
+    replaced the rows. `none` and `unknown` are in it for #324's reason — a branch
+    whose runs were gated used to contribute to no number on the screen at all.
+    """
+    counts = ci_counts(prs or [])
+    return [(f"{counts[state]} {word}", colour)
+            for state, word, colour in (("red", "red", "red"),
+                                        ("blocked", "blocked", "magenta"),
+                                        ("pending", "running", "yellow"),
+                                        ("none", "untested", "grey62"),
+                                        ("unknown", "unread", "yellow"))
+            if counts.get(state)]
+
+
 # ---- the dials in force ------------------------------------------------------
 #
 # A dial is a setting: the repo supplies a default, the BOARD states the value in

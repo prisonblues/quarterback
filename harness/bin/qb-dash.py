@@ -9,26 +9,58 @@ waiting to land. State, not events.
   qb-dash --once       one frame and exit (what the tests and a pipe want)
   qb-dash --width 72   force a width instead of taking the terminal's
   qb-dash --scope all  every repo the BOARD knows, not just this screen's
+  qb-dash --waiting    only what a person owes an answer about
+  qb-dash --backlog    also the work nothing is waiting on
   qb-dash --repo ~/src/nix-fleet    point it at a project other than the cwd's
+
+TWO TABLES, because there are two questions (#589):
+
+  AGENTS  who is here, and how are they doing — live agents, what each holds,
+          and the claims no live agent answers for.  Was FLEET + CLAIMED, and
+          in the clickable renderer SEATS as well.
+  WORK    what is in flight, and where has it got to — the board's plan in the
+          board's order, with the review queue folded into the rows it is about
+          and anything else that is open appended below.  Was PLANS + OPEN PRs +
+          REVIEW QUEUE + ISSUES.
+
+They were eight panels, and the split cost more than the borders. On the frame
+this was measured against, `#578` was on the pane four times — a claim, a plan
+rank, and twice more as its PR — and OPEN PRs and REVIEW QUEUE printed the same
+three PRs in ten lines. That pair was never going to be two panels honestly: the
+queue is DERIVED from the open-PR list (`qbdata.fetch_review_queue`), so it is a
+subset by construction, and all the PR panel added was the CI glyph — which is
+now the WORK table's state cell for a PR row.
+
+WHAT IS NOT MERGED, and why: a plan item names its ISSUE and nothing anywhere
+records which PR implements it (#396). So an issue and the PR that closes it are
+two rows, `#578` goes from four rows to two rather than to one, and the missing
+edge is a fact about the board rather than a shortcut taken here.
+
+WHAT A PERSON OWES AN ANSWER TO IS ON THE TABLE (#328): a blocked row wears `⚑`
+magenta — the glyph a gated PR already wore, because "nothing moves until somebody
+acts" is the same sentence about a different subject — and `--waiting` shows only
+those. Questions with no work to ride, which is what `qb-doctor` raises against a
+repo, get rows of their own rather than being counted by the header and drawn
+nowhere.
+
+The two lists nothing is waiting on — open PRs review has finished with, and open
+issues nobody has planned or taken — are behind `--backlog`. Their counts stay on
+the header line either way: a toggled list that left no number behind would be a
+way of forgetting the work exists.
 
 By default it shows ONE project's rows — the repos of the checkout it was started
 in — and drops the repo column, because a screen built for one project spends
-eleven columns of a narrow pane restating its name (#261). `--scope all` widens the
-three panels that come off the BOARD (FLEET, CLAIMED, PLANS); OPEN PRs, REVIEW
-QUEUE and ISSUES cannot widen, because `gh` is only ever asked about the repos
-this dashboard watches. The clickable renderer toggles with `s`, which this one
-has no keyboard for.
-
-REVIEW QUEUE is the one panel that is neither board state nor `gh` state but a
-join of the two (#273): every open PR that review is not finished with, what it
-is waiting for, and how long it has waited. Its depth and oldest age also sit on
-the caps line, beside the budget they would be spent out of.
+eleven columns of a narrow pane restating its name (#261). `--scope all` widens
+what comes off the BOARD (AGENTS, and the plan half of WORK); the `gh` rows
+cannot widen, because `gh` is only ever asked about the repos this dashboard
+watches. The clickable renderer toggles with `s`, which this one has no keyboard
+for.
 
 Board data comes from the same client the MCP server uses; PRs and issues come
 from `gh`, on a slower clock because that is a network call per refresh and
 neither moves every three seconds. The line across the top is Claude Code's own
 usage caps — the ceiling every seat below it is working towards, on a slower
-clock again.
+clock again — and the line under it is what is waiting to be spent on.
 """
 
 from __future__ import annotations
@@ -48,21 +80,25 @@ from rich.text import Text
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qbdata import (  # noqa: E402
-    LIMITS_EVERY, PR_ROWS, QUEUE_COLOUR, QUEUE_HOLD, QUEUE_VERB, Scope, agent_state, ago, board_client, ci_counts, ci_state,
-    claim_label, claim_repo, clip, dial_life, dial_value, dial_where, dials_url, elsewhere,
+    LIMITS_EVERY, Scope, agent_rows, agent_tally, ago, board_client,
+    clip, dial_life, dial_value, dial_where, dials_url, elsewhere,
     fetch_board, fetch_dials, fetch_issues, fetch_limits, fetch_plan,
-    fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key, limit_cells,
-    plan_head_bits, plan_items, plan_next_id, plan_rank, plan_ref, plan_state, plan_who,
-    queue_cell, queue_oldest, repo_arg, repo_colour,
-    resolve_scope, scope_mark, set_repos, short_repo, sort_issues, stage_cell, tempo_cell,
-    until, waited,
+    blocker_tally, fetch_blockers,
+    fetch_prs, fetch_review_queue, claims_by_issue, in_scope, issue_key,
+    limit_cells, plan_head_bits, plan_items, pr_tally,
+    queue_cell, repo_arg, repo_colour,
+    resolve_scope, scope_mark, set_repos, short_repo, tempo_cell,
+    work_fold, work_kind, work_rows, work_tally,
 )
 
 BOARD_EVERY = 4.0       # seconds; presence changes on this order
 GH_EVERY = 90.0         # gh is a network round trip, and PRs/issues are not live data
-ISSUE_ROWS = 12         # a printed panel cannot scroll; the rest is a count
-PLAN_ROWS = 10          # the same, for the plan: running items first, then a count
-QUEUE_ROWS = 8          # the same again, for the review queue: oldest first
+# A printed panel cannot scroll, so past this it stops listing and says how many
+# it left out. ONE CAP WHERE THERE WERE FOUR (ISSUE_ROWS, PLAN_ROWS, QUEUE_ROWS
+# and PR_ROWS), and it is bigger than any of them because it is now the only one:
+# the plan, the review queue and whatever else is open share these rows instead of
+# each holding a reservation against a pane none of them could see.
+WORK_ROWS = 16
 # The same again for the dials. Two lines each — the value and the argument for it
 # — so this is a shorter cap than the panels above: a fleet with more than five
 # dials in force has a config question, not a dashboard question.
@@ -72,11 +108,27 @@ DIAL_ROWS = 5
 # ---- panels ------------------------------------------------------------------
 
 
-def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
-    agents = sorted(data.get("agents", []), key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
-    agents, hidden = in_scope(agents, scope)
-    seats = [a for a in agents if "/seat-" in (a.get("holder") or "")]
+def panel_agents(data: dict, width: int, scope: Scope | None = None,
+                 items: list[dict] | None = None) -> Panel:
+    """Who is here and how they are doing — FLEET and CLAIMED as one table (#589).
+
+    Two panels drew one subject. FLEET said who was live and CLAIMED said what
+    they held, keyed on the same holder and split apart by nothing but a border,
+    so a reader asking "what is jasper-moss doing" joined them by eye — and on
+    the frame this change was measured against, jasper-moss was on the pane five
+    times across three panels.
+
+    The rows this could not draw before are the ones worth drawing: a claim whose
+    holder no live agent answers for is work somebody holds that nobody is doing,
+    and in CLAIMED it looked exactly like a live one (:data:`qbdata.CLAIM_ONLY_STATE`).
+
+    No seats here. `tmux_seats()` is the clickable renderer's, because a pane you
+    cannot click is a pane you cannot do anything about — this renderer has no
+    keyboard at all, which is the whole of what `--once` and the printed panels
+    are.
+    """
     show_repo = scope is None or scope.column
+    rows, hidden = agent_rows(data, scope, items)
 
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=13, no_wrap=True)          # who
@@ -91,78 +143,39 @@ def panel_agents(data: dict, width: int, scope: Scope | None = None) -> Panel:
     t.add_column(ratio=1, no_wrap=True)           # what
     t.add_column(width=5, justify="right", no_wrap=True)   # ttl
 
-    # The cell's width plus its padding goes back to `what`, which is the column
-    # a reader is actually reading: what the agent in this seat is doing.
-    # The stage column costs `what` its width plus padding. That is a real cost on
-    # a narrow pane and it is paid deliberately: `what` is already clipped on every
-    # row and reads the same at every stage of a PR's life, so eight characters of
-    # title buy the one column that changes as the work progresses.
     body = max(18, width - (53 if show_repo else 41))
-    for a in agents:
-        who = (a.get("holder") or "?").split("/", 1)[-1]
-        repo = a.get("repo") or "—"
-        title = a.get("title") or a.get("branch") or "—"
-        is_seat = "/seat-" in (a.get("holder") or "")
-        word, style = agent_state(a)
-        cells = [
-            Text(clip(who, 13), style="bold white on dark_green" if is_seat else "bold"),
-            Text(word or "—", style=style),
-            Text(*stage_cell(a)),
-        ]
+    for row in rows:
+        what, what_style = row["what"]
+        # `＋1` rather than a second line: a row is one agent, and an agent
+        # holding two things is one agent holding two things. The rest is a
+        # click away in the other renderer and on the board either way.
+        if row.get("extra"):
+            what = f"{what}  ＋{row['extra']}"
+        cells = [Text(clip(row["who"], 13), style="bold"),
+                 Text(*row["state"]),
+                 Text(*row["stage"])]
         if show_repo:
+            repo = row["repo"] or "—"
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
         cells += [
             # The mark rides on the cell the dropped column widened: with no repo
             # cell, an agent working outside any checkout otherwise reads as one
             # working here (qbdata.scope_mark).
-            Text(scope_mark(scope, a.get("repo")) + clip(title, body),
-                 style="white" if is_seat else "grey70"),
-            Text(until(a.get("expires")), style="grey50"),
+            Text(scope_mark(scope, row["repo"]) + clip(what, body), style=what_style),
+            Text(row["ttl"],
+                 style="red" if row.get("expiring") else "grey50"),
         ]
         t.add_row(*cells)
-    if not agents:
+    if not rows:
         t.add_row(Text("nobody home", style="grey50"), *[""] * (5 if show_repo else 4))
 
     subs = len(data.get("subagents") or [])
-    head = f"[bold]FLEET[/] [grey50]{len(agents)} live"
-    if seats:
-        head += f" · [green]{len(seats)} seat{'s' if len(seats) != 1 else ''}[/]"
+    head = f"[bold]AGENTS[/] [grey50]{agent_tally(rows)}"
     if subs:
         head += f" · {subs} sub"
     head += elsewhere(hidden)
-    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35", padding=(0, 1))
-
-
-def panel_claims(data: dict, width: int, scope: Scope | None = None) -> Panel:
-    claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
-    # A claim's repo is in its KEY, not in a field of its own, and a `plan:<uuid>`
-    # key names an item rather than a repo — so the plan goes in with it, and a
-    # claim neither can attribute stays (see qbdata.claim_repo).
-    plan = plan_items(data.get("plan"))
-    claims, hidden = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), plan))
-    t = Table.grid(padding=(0, 1), expand=True)
-    t.add_column(width=13, no_wrap=True)
-    t.add_column(ratio=1, no_wrap=True)
-    t.add_column(width=5, justify="right", no_wrap=True)
-
-    for c in claims:
-        who = (c.get("holder") or "?").split("/", 1)[-1]
-        key = claim_label(c.get("key") or "?", plan, scope)
-        kind = c.get("kind") or ""
-        left = until(c.get("expires"))
-        t.add_row(
-            Text(clip(who, 13), style="bold"),
-            Text(clip(f"{key}", max(10, width - 27)),
-                 style="yellow" if kind == "issue" else "grey70"),
-            Text(left, style="red" if left.endswith("m") and left[:-1].isdigit()
-                 and int(left[:-1]) < 10 else "grey50"),
-        )
-    if not claims:
-        # In the WIDE column, not the 13-wide holder one, which rendered this as
-        # "nothing clai…" — a panel whose empty state is itself truncated.
-        t.add_row("", Text("nothing claimed", style="grey50"), "")
-    return Panel(t, title=f"[bold]CLAIMED[/] [grey50]{len(claims)}{elsewhere(hidden)}[/]",
-                 title_align="left", border_style="grey35", padding=(0, 1))
+    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
+                 padding=(0, 1))
 
 
 def _title_room(width: int, show_repo: bool, show_rank: bool, who_width: int) -> int:
@@ -171,45 +184,58 @@ def _title_room(width: int, show_repo: bool, show_rank: bool, who_width: int) ->
     The panel's border and padding cost 4, and `Table.grid(padding=(0, 1))` puts a
     space after every column but the last.
     """
-    fixed = [1] + ([11] if show_repo else []) + ([4] if show_rank else []) + [6, who_width]
+    fixed = [1, 4] + ([11] if show_repo else []) + ([4] if show_rank else []) + [6, who_width]
     return width - 4 - sum(fixed) - len(fixed)
 
 
-def panel_plan(plan: dict, err: str | None, width: int,
-               scope: Scope | None = None) -> Panel:
-    """What the fleet agreed to do next, in the board's own order.
+def panel_work(plan: dict, err: str | None, gh: dict, held: dict, width: int,
+               scope: Scope | None = None, backlog: bool = False,
+               claims_known: bool = True, blockers: dict | None = None,
+               waiting_only: bool = False) -> Panel:
+    """What is in flight, in the board's order — the plan, the review queue, and
+    whatever else is open (#589).
 
-    FLEET says who is here and CLAIMED says what they hold; neither says what
-    the work is FOR. This is the board's plan — one ordered list per repo, plus
-    the fleet-wide one.
+    Four panels answered "what work is there" from four sources, and the same
+    unit of work appeared on up to four of them at once. Worse, two of them were
+    the same rows: the review queue is derived FROM the open-PR list, so OPEN PRs
+    and REVIEW QUEUE printed an identical row set in ten lines of pane, and all
+    the PR panel added was the CI glyph — which is now this table's state column,
+    per #272.
 
-    **The order is the board's and is not re-derived here.** A plan is an ordered
-    list, that order is a human decision, and this panel used to re-band it
-    locally — taken, then free, then blocked — which is a second answer about the
-    plan computed against the plan's own answer, and the reason the two surfaces
-    disagreed about what was next. What the banding was FOR was finding the row a
-    seat can pick up, and the board answers that outright: `next` is in the title
-    and wears the ◉ on its row.
+    **The order is the board's and is not re-derived here.** Work the plan does
+    not carry is appended below it, unranked, because the board refuses to rank
+    the queue (#232) and inventing a position is exactly the second answer this
+    file has spent three issues removing.
 
-    Printed, so it does not scroll: past PLAN_ROWS it says how many it left out
+    Printed, so it does not scroll: past WORK_ROWS it says how many it left out
     rather than pushing the panels above it off the screen.
     """
     show_repo = scope is None or scope.column
+    # THE `gh` HALF ARRIVES AS ONE DICT, which is what `fetch_gh` returns and what
+    # this panel needs all of: four lists and three ways for them to have failed.
+    # Threaded one at a time the signature ran to ten arguments and two of them —
+    # the errors — were simply forgotten, which is Codex's finding on this change.
+    prs, pr_err = gh.get("prs") or [], gh.get("pr_err")
+    issues, issue_err = gh.get("issues") or [], gh.get("issue_err")
+    queue = gh.get("queue") or {}
     # WHAT A NARROW PANE GIVES UP, AND IN WHICH ORDER. Every column but the title
     # is fixed, so the title cell pays for all of them, and below a dozen
     # characters a title says nothing at all. Two give way rather than squeezing
     # it to nothing: the holder's machine first — back to the 13 columns it had
-    # before this panel showed one, so a narrow pane is no worse off than it was
-    # yesterday — and then the rank, whose headline (`~N unchosen`) stays in the
-    # title either way. Squeezing instead is not a smaller version of this: rich
-    # takes the room out of the fixed columns from the left, and at 45 columns the
-    # state glyph itself came out blank.
+    # before this panel showed one — and then the rank, whose headline
+    # (`~N unchosen`) stays in the title either way. Squeezing instead is not a
+    # smaller version of this: rich takes the room out of the fixed columns from
+    # the left, and at 45 columns the state glyph itself came out blank.
     who_width = 17 if width >= 60 else 13
     show_rank = _title_room(width, show_repo, True, who_width) >= 12
     room = max(6, _title_room(width, show_repo, show_rank, who_width))
 
     t = Table.grid(padding=(0, 1), expand=True)
     t.add_column(width=1, no_wrap=True)                     # state
+    # The kind, explicit rather than a sigil on the ref (#272): `PR#4` and `#4`
+    # differ by two characters at the front of a right-aligned cell, which is not
+    # a distinction a reader should have to make out.
+    t.add_column(width=4, no_wrap=True)                     # kind
     if show_repo:
         t.add_column(width=11, no_wrap=True)                # repo
     if show_rank:
@@ -220,236 +246,97 @@ def panel_plan(plan: dict, err: str | None, width: int,
 
     # Narrowed BEFORE the print limit, not after: this panel does not scroll, and
     # the whole point of a scoped screen is that another repo's items cannot push
-    # this one's past PLAN_ROWS and into the "…and N more" line.
-    items, hidden = in_scope(plan_items(plan), scope)
-    next_id = plan_next_id(plan)
-    filler = [""] * (2 + int(show_repo) + int(show_rank))
-    for item in items[:PLAN_ROWS]:
-        glyph, colour = plan_state(item, next_id)
-        who, who_colour = plan_who(item)
-        rank, rank_colour = plan_rank(item)
-        repo = short_repo(item.get("repo") or "fleet")
-        cells = [Text(glyph, style=colour)]
+    # this one's past WORK_ROWS and into the "…and N more" line.
+    rows, hidden = work_rows(plan, prs, queue, issues, held, scope, backlog,
+                             blockers=(blockers or {}).get("blockers"),
+                             waiting_only=waiting_only)
+    # The plan's own counts are the plan's own rows, not the merged table's:
+    # `plan_head_bits` reports what the BOARD said about the list, and handing
+    # it a row set with three PRs in it would have it count them as plan items.
+    items, _ = in_scope(plan_items(plan), scope)
+    filler = [""] * (3 + int(show_repo) + int(show_rank))
+    folded = work_fold(rows, WORK_ROWS)
+
+    def draw(row: dict) -> None:
+        glyph, colour = row["glyph"]
+        why, why_colour = row["why"]
+        rank, rank_colour = row["rank"]
+        cells = [Text(glyph, style=colour), Text(work_kind(row), style="grey50")]
         if show_repo:
+            repo = short_repo(row["repo"] or "fleet")
             cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
         if show_rank:
             cells.append(Text(rank, style=rank_colour))
         cells += [
-            Text(plan_ref(item), style="bold grey70"),
+            Text(row["ref"], style="bold grey70"),
             # A fleet-wide item names no repo, and with the column gone it would
             # read as one of this project's (qbdata.scope_mark).
-            Text(scope_mark(scope, item.get("repo")) + clip(item.get("title"), room),
-                 style="white" if colour != "grey50" else "grey50"),
-            Text(clip(who, who_width), style=who_colour),
+            Text(scope_mark(scope, row["repo"]) + clip(row["title"], room),
+                 style="grey50" if row["dim"] else "white"),
+            Text(clip(why, who_width), style=why_colour),
         ]
         t.add_row(*cells)
-    if len(items) > PLAN_ROWS:
-        t.add_row(*filler, Text(f"…and {len(items) - PLAN_ROWS} more", style="grey50"), "")
-    if err:
-        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 16), style="red"), "")
-    if not items and not err:
-        t.add_row(*filler, Text("nothing on the plan", style="grey50"), "")
 
-    # The room the title actually has: the panel's own width, less its border, the
-    # word PLANS, and whatever `elsewhere` is about to add.
-    room = max(20, width - 12 - len(elsewhere(hidden)))
-    head = "[bold]PLANS[/] [grey50]" + " · ".join(
-        f"[{colour}]{text}[/]" if colour else text
-        for text, colour in plan_head_bits(plan, items, hidden, room))
-    head += elsewhere(hidden)
-    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
-                 padding=(0, 1))
+    # Each section says what it left out WHERE IT LEFT IT, rather than one count
+    # at the bottom: the plan is what usually gets cut, and a count under the
+    # backlog would read as a statement about the backlog.
+    for (section, dropped), more in zip(folded, ("more waiting on review",
+                                                 "more on the plan",
+                                                 "more not on the plan")):
+        for row in section:
+            draw(row)
+        if dropped:
+            t.add_row(*filler, Text(f"…and {dropped} {more}", style="grey50"), "")
 
-
-#: How each non-green check state is called and coloured in the OPEN PRs title.
-#: `none` and `unknown` are in here and are the reason this exists: before #324 the
-#: title counted reds and said nothing at all about the PRs whose checks were absent,
-#: so a branch whose runs were gated contributed to no number on the screen.
-CI_TALLY = (("red", "red", "red"), ("blocked", "blocked", "magenta"),
-            ("pending", "running", "yellow"), ("none", "untested", "grey62"),
-            ("unknown", "unread", "yellow"))
-
-
-def ci_tally(prs: list[dict]) -> str:
-    """" · 2 red · 1 blocked" — every state worth looking at, none of them silent."""
-    counts = ci_counts(prs)
-    return "".join(f" · [{colour}]{counts[state]} {word}[/]"
-                   for state, word, colour in CI_TALLY if counts.get(state))
-
-
-def panel_prs(prs: list[dict], err: str | None, width: int,
-              scope: Scope | None = None) -> Panel:
-    """The watched repos' open PRs.
-
-    Not narrowed, and it cannot be: `gh` was only ever asked about the repos this
-    dashboard watches, so there is no other repo's PR here to hide and widening
-    the scope cannot produce one. Only the repo cell answers to the scope — and
-    for the same reason as everywhere else, which is that one repo makes it the
-    same word on every row.
-    """
-    show_repo = scope is None or scope.column
-    t = Table.grid(padding=(0, 1), expand=True)
-    t.add_column(width=1, no_wrap=True)           # ci
-    if show_repo:
-        t.add_column(width=11, no_wrap=True)      # repo
-    t.add_column(width=4, justify="right", no_wrap=True)   # number
-    t.add_column(ratio=1, no_wrap=True)           # title
-    t.add_column(width=5, justify="right", no_wrap=True)   # age
-
-    filler = [""] * (3 if show_repo else 2)
-    ordered = sorted(prs, key=lambda p: -p.get("number", 0))
-    for pr in ordered[:PR_ROWS]:
-        glyph, colour = ci_state(pr)
-        title = pr.get("title") or ""
-        repo = short_repo(pr.get("repo") or "")
-        cells = [Text(glyph, style=colour)]
-        if show_repo:
-            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
-        cells += [
-            Text(f"#{pr.get('number')}", style="bold grey70"),
-            Text(clip(title, max(12, width - (32 if show_repo else 20))),
-                 style="grey50" if pr.get("isDraft") else "white"),
-            Text(ago(pr.get("updatedAt")), style="grey50"),
-        ]
-        t.add_row(*cells)
-    if err:
-        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 12), style="red"), "")
-    if not prs and not err:
-        t.add_row(*filler, Text("no open PRs", style="grey50"), "")
-
-    # `ci_tally` counts over `prs` — every open PR, not the rows drawn above.
-    # That is the property the truncated row list would otherwise have broken:
-    # a count taken off the visible rows would say "2 red" for a repo with five.
-    head = f"[bold]OPEN PRs[/] [grey50]{len(prs)}" + ci_tally(prs)
-    if len(ordered) > PR_ROWS:
-        head += f" · +{len(ordered) - PR_ROWS} more"
-    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
-                 padding=(0, 1))
-
-
-def panel_review_queue(queue: dict, width: int, scope: Scope | None = None) -> Panel:
-    """What review is waiting on, and how long it has waited — #273.
-
-    The panel this dashboard was missing. OPEN PRs above says a PR exists and CI
-    is green; nothing said whether anybody had ever reviewed it, and on
-    2026-08-20 six of eight open PRs had never been panelled while the newest
-    round on the board was two and a half days old. Neither number was readable
-    anywhere.
-
-    Rows are oldest-drainable first, which is a READING order for a panel that
-    cannot scroll and not a work order — the board refuses to rank the queue, and
-    so does this. An entry nothing may act on keeps its place in the list and
-    goes grey with the reason in its verb column, because a queue that hid its
-    blocked entries would report a depth of zero for a repo where everything is
-    stuck (#244).
-    """
-    show_repo = scope is None or scope.column
-    entries = queue.get("entries") or []
-    err = queue.get("error")
-    t = Table.grid(padding=(0, 1), expand=True)
-    t.add_column(width=1, no_wrap=True)                     # state
-    if show_repo:
-        t.add_column(width=11, no_wrap=True)                # repo
-    t.add_column(width=4, justify="right", no_wrap=True)    # number
-    t.add_column(width=11, no_wrap=True)                    # verb, or why not
-    t.add_column(width=6, justify="right", no_wrap=True)    # age
-    t.add_column(ratio=1, no_wrap=True)                     # title
-
-    filler = [""] * (4 if show_repo else 3)
-    for e in entries[:QUEUE_ROWS]:
-        state = e.get("state") or ""
-        colour = QUEUE_COLOUR.get(state, "grey50")
-        drains = bool(e.get("drainable"))
-        holds = e.get("holds") or []
-        hold = holds[0].get("code") if holds else state
-        verb = (QUEUE_VERB.get(e.get("next_action"), e.get("next_action") or "")
-                if drains else QUEUE_HOLD.get(hold, hold))
-        repo = short_repo(e.get("repo") or "")
-        cells = [Text("\u25cf", style=colour)]
-        if show_repo:
-            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
-        cells += [
-            Text(f"#{e.get('pr')}", style="bold grey70"),
-            Text(clip(verb, 11), style=colour if drains else "grey50"),
-            # An age that is the longest the wait COULD have been wears a `~`,
-            # because nothing records when a head moved or when a branch started
-            # conflicting, and a number nobody can rely on should say so.
-            Text(("~" if e.get("age_is_upper_bound") else "")
-                 + waited(e.get("age_seconds")), style="grey50"),
-            Text(clip(e.get("title") or "", max(12, width - (43 if show_repo else 31))),
-                 style="white" if drains else "grey50"),
-        ]
-        t.add_row(*cells)
-    if err:
+    # THE STATES THAT ARE NOT ROWS, and every source that can fail gets one. The
+    # message goes in the TITLE cell — the widest one — rather than in the title
+    # of the panel, which is bounded by the pane: a table whose job is saying why
+    # something is missing must not truncate the message that says why it cannot
+    # tell you.
+    # EVERY SOURCE THAT CAN FAIL, named separately. `panel_prs` and `panel_issues`
+    # each drew their own error row before the merge, and a table that reported the
+    # board and the queue but not `gh` would have lost the two that fail most.
+    troubles = [(name, message) for name, message in
+                (("board", err), ("queue", (queue or {}).get("error")),
+                 ("blockers", (blockers or {}).get("error")),
+                 ("prs", pr_err), ("issues", issue_err)) if message]
+    for name, message in troubles:
         t.add_row(Text("!", style="red"), *filler[1:],
-                  Text(clip(err, width - 12), style="red"), "")
-    if not entries and not err:
-        t.add_row(*filler, Text(queue.get("idle") or "nothing waiting on review",
+                  Text(clip(f"{name}: {message}", width - 16), style="red"), "")
+    # "Nothing is in flight" and "nothing could be FETCHED" are different answers,
+    # and the board supplies its own wording for a drained queue. Only when nothing
+    # failed: a table that said both would be answering its own error message with
+    # a claim it has no grounds for (#244).
+    if not rows and not troubles:
+        t.add_row(*filler, Text("nothing is waiting on a person" if waiting_only
+                                else ((queue or {}).get("idle") or "nothing in flight"),
                                 style="grey50"), "")
 
-    depth = queue.get("depth") or 0
-    held = max(0, (queue.get("open") or 0) - depth)
-    head = f"[bold]REVIEW QUEUE[/] [grey50]{depth} waiting"
-    if held:
-        head += f" \u00b7 {held} held"
-    age, oldest_held = queue_oldest(queue)
-    if age:
-        head += f" \u00b7 {'held' if oldest_held else 'oldest'} {age}"
-    if len(entries) > QUEUE_ROWS:
-        head += f" \u00b7 +{len(entries) - QUEUE_ROWS} more"
-    return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
-                 padding=(0, 1))
-
-
-def panel_issues(issues: list[dict], held: dict[int, dict], err: str | None,
-                 width: int, scope: Scope | None = None) -> Panel:
-    """Open issues, with the ones somebody already holds marked as such.
-
-    The free ones are the point — an unheld issue is what the next seat takes —
-    so they sort to the top, and a held one stays in the list but goes grey and
-    gives its right-hand column over to the holder instead of its age.
-
-    This panel is printed, not scrolled, and it is the last one on a pane that
-    the others already share: past ISSUE_ROWS it stops listing and says how many
-    it did not, rather than pushing the fleet off the top of the screen.
-    """
-    show_repo = scope is None or scope.column
-    t = Table.grid(padding=(0, 1), expand=True)
-    t.add_column(width=1, no_wrap=True)                     # held marker
-    if show_repo:
-        t.add_column(width=11, no_wrap=True)                # repo
-    t.add_column(width=4, justify="right", no_wrap=True)    # number
-    t.add_column(ratio=1, no_wrap=True)                     # title
-    t.add_column(width=9, justify="right", no_wrap=True)    # holder, or age
-
-    ordered = sort_issues(issues, held)
-    free = sum(1 for i in issues if issue_key(i) not in held)
-    filler = [""] * (3 if show_repo else 2)
-    for issue in ordered[:ISSUE_ROWS]:
-        claim = held.get(issue_key(issue))
-        who = (claim.get("holder") or "?").split("/", 1)[-1] if claim else ""
-        repo = short_repo(issue.get("repo") or "")
-        cells = [Text("·" if claim else "○", style="grey50" if claim else "green")]
-        if show_repo:
-            cells.append(Text(clip(repo, 11), style=repo_colour(repo)))
-        cells += [
-            Text(f"#{issue.get('number')}", style="bold grey70"),
-            Text(clip(issue.get("title"), max(12, width - (36 if show_repo else 24))),
-                 style="grey50" if claim else "white"),
-            Text(clip(who, 9) if claim else ago(issue.get("updatedAt")),
-                 style="yellow" if claim else "grey50"),
-        ]
-        t.add_row(*cells)
-    if len(ordered) > ISSUE_ROWS:
-        t.add_row(*filler, Text(f"…and {len(ordered) - ISSUE_ROWS} more", style="grey50"), "")
-    if err:
-        t.add_row(Text("!", style="red"), *filler[1:], Text(clip(err, width - 16), style="red"), "")
-    if not issues and not err:
-        t.add_row(*filler, Text("no open issues", style="grey50"), "")
-
-    head = f"[bold]ISSUES[/] [grey50]{len(issues)}"
-    if issues:
-        head += f" · [green]{free} free[/]"
+    # The room the title actually has: the panel's own width, less its border, the
+    # word WORK, whatever `elsewhere` is about to add — and the tally bits, which
+    # are measured FIRST because `plan_head_bits` is the only part of this title
+    # that knows how to give something up. Sizing the elastic half for a line the
+    # fixed half has already taken its room out of is how `+24 free h─` came to be
+    # clipped by the panel border rather than by anything that could choose.
+    # `claims_known` is what stops the hidden-backlog count being taken off claims
+    # the board never sent: `fetch_board` reports an outage as `{"claims": []}`,
+    # which counts every open issue as free — and "27 free hidden" over an
+    # unreachable board is how a seat is sent into work somebody already holds.
+    tally = work_tally(rows, prs, issues, held, backlog, claims_known, waiting_only)
+    spent = sum(len(bit) + 3 for bit in tally)
+    # `head_room` and not `room`: the title's room and the title CELL's room are
+    # two different measurements, and `draw` above closes over the second one.
+    # Reusing the name worked only because every `draw` call happens before this
+    # line, which is not a property anybody should have to notice.
+    head_room = max(20, width - 11 - spent - len(elsewhere(hidden)))
+    # The plan's counts are about the PLAN, so a filtered view does not claim them:
+    # `39 open · next #1620` over two rows a person owes an answer about is a title
+    # describing a list the reader has just asked not to see.
+    head = ("[bold]WAITING[/] [grey50]" if waiting_only else "[bold]WORK[/] [grey50]") + " · ".join(
+        ([] if waiting_only else
+         [f"[{colour}]{text}[/]" if colour else text
+          for text, colour in plan_head_bits(plan, items, hidden, head_room)]) + tally)
+    head += elsewhere(hidden)
     return Panel(t, title=head + "[/]", title_align="left", border_style="grey35",
                  padding=(0, 1))
 
@@ -614,6 +501,83 @@ def queue_line(queue: dict) -> Text:
     return out
 
 
+def waiting_line(blockers: dict | None, scope: Scope | None = None) -> Text:
+    """`WAITING 3` — how many questions are sitting unanswered, on the top line.
+
+    FIRST OF THE TALLIES, ahead of the review depth and the caps. Every other
+    number on that line is about what the fleet is doing to itself; this one is
+    the only thing on the pane that is somebody's to act on, and #274's whole
+    argument is that it needs one place a person always sees it. Ten correct
+    escalations went unread for two days on this repo (#569) — not because nobody
+    looked, but because looking meant opening something.
+    """
+    out = Text()
+    cell = blocker_tally(blockers, scope)
+    if cell is None:
+        return out
+    text, colour = cell
+    label, _, count = text.partition(" ")
+    out.append(label, style="bold grey70")
+    out.append(f" {count}", style=f"bold {colour}")
+    return out
+
+
+def prs_line(prs: list[dict] | None, err: str | None) -> Text:
+    """`PRs 3 · 1 red` — the open-PR count and every check state worth looking at.
+
+    THE HALF OF THE OPEN PRs PANEL WORTH KEEPING (#589). Its rows were the review
+    queue's rows — the queue is derived from this very list, so it was a subset by
+    construction — but its TALLY is not derivable from the queue at all: a PR can
+    be green and unreviewed, or red and already signed off. Dropping the panel
+    without moving this number would have lost "is CI red right now", which is the
+    one thing on that panel nothing else said.
+
+    Counted over every open PR rather than over the rows drawn below, which is the
+    property the row cap would otherwise break: a count taken off the visible rows
+    says "2 red" for a repo with five (#324).
+    """
+    out = Text()
+    if prs is None and not err:
+        return out
+    out.append("PRs", style="bold grey70")
+    if err:
+        out.append(" ?", style="bold red")
+        return out
+    out.append(f" {len(prs or [])}", style="bold grey70")
+    for text, colour in pr_tally(prs):
+        out.append(" · ", style="grey50")
+        out.append(text, style=colour)
+    return out
+
+
+def issues_line(issues: list[dict] | None, held: dict | None, err: str | None,
+                claims_known: bool = True) -> Text:
+    """`ISSUES 30 · 25 free` — the backlog, as the number rather than the list.
+
+    Twelve rows of catalogue was the biggest single consumer of the old frame, and
+    the plan's `next` answers "what should I pick up" better than a
+    free-issues-first sort does. What the panel was actually READ for is the two
+    numbers, so they ride the header and the rows go behind `--backlog`.
+
+    `free` is not stated while the board is unreachable: it is counted off claims
+    that are stale or were never fetched, and a "25 free" computed from no claims
+    at all is how a seat gets sent into work somebody already holds.
+    """
+    out = Text()
+    if issues is None and not err:
+        return out
+    out.append("ISSUES", style="bold grey70")
+    if err:
+        out.append(" ?", style="bold red")
+        return out
+    out.append(f" {len(issues or [])}", style="bold grey70")
+    if held is not None and claims_known and issues:
+        free = sum(1 for i in issues if issue_key(i) not in held)
+        out.append(" · ", style="grey50")
+        out.append(f"{free} free", style="green")
+    return out
+
+
 def tempo_line(dials: dict | None) -> Text:
     """`TEMPO eager 40m` — how hard the fleet is meant to be working, in one cell.
 
@@ -641,7 +605,23 @@ def tempo_line(dials: dict | None) -> Text:
 
 def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
            stale: bool = False, scope: Scope | None = None,
-           queue: dict | None = None, dials: dict | None = None) -> Panel:
+           queue: dict | None = None, dials: dict | None = None,
+           gh: dict | None = None, held: dict | None = None) -> Panel:
+    """The caps, the tallies, and where this pane is pointed.
+
+    FOUR TALLY CELLS ON A LINE OF THEIR OWN, under the bars rather than beside
+    them. Two of them are new — the open-PR count with its check states, and the
+    issue backlog — because those are what the two panels that went behind
+    `--backlog` were actually read for, and a toggled list has to leave its
+    number behind or the toggle is a way of forgetting the work exists (#589).
+
+    Beside the caps was where the review depth lived and the argument for it still
+    holds — the caps say what the seats may spend, these say what is waiting to be
+    spent on — but four cells and a pair of bars do not fit in 78 columns, and a
+    line whose contents move to another line depending on the width is a line
+    nobody learns to read. Directly underneath keeps the glance and drops the
+    guesswork.
+    """
     host = (cfg.agent or "?").split("/", 1)[0]
     now = datetime.now().strftime("%H:%M:%S")
     state = Text("● board up", style="green")
@@ -657,25 +637,28 @@ def header(cfg, data: dict, width: int, limits: list[dict] | None = None,
     where = f"   {scope.label()}" if scope is not None else ""
     sub = Text(f"{cfg.base_url}   {now}{where}", style="grey50")
     parts = [line, Align.left(sub)]
-    # The queue cell shares the caps line because it is the same kind of number:
-    # the caps say what the seats may spend, this says what is waiting to be
-    # spent on. Measured first so the bars are sized for the room that is left.
-    review = queue_line(queue or {})
-    # The throttle rides the same line as the budget it protects (#477). Measured
-    # with the queue and BEFORE the bars, for the same reason: the caps are the
-    # only elastic thing here, so everything that is not elastic takes its room
-    # first or the bars are sized for a line they do not fit on.
-    tempo = tempo_line(dials)
-    room = width - 4 - sum(len(cell.plain) + 3 for cell in (review, tempo) if cell.plain)
-    caps = limits_line(limits or [], room, stale)
-    for cell in (review, tempo):
+
+    gh = gh or {}
+    tallies = Text()
+    for cell in (waiting_line(data.get("blockers"), scope),
+                 queue_line(queue or {}),
+                 prs_line(gh.get("prs"), gh.get("pr_err")),
+                 issues_line(gh.get("issues"), held, gh.get("issue_err"),
+                             claims_known=not data.get("error")),
+                 # The throttle rides with the budget it protects (#477): the caps
+                 # say what the seats MAY spend and this says whether they are
+                 # supposed to be spending it at all.
+                 tempo_line(dials)):
         if not cell.plain:
             continue
-        if caps.plain:
-            caps.append("   ")
-        caps.append_text(cell)
-    if caps.plain:
-        parts.insert(0, Align.left(caps))
+        if tallies.plain:
+            tallies.append("   ")
+        tallies.append_text(cell)
+
+    caps = limits_line(limits or [], width - 4, stale)
+    for row in (tallies, caps):
+        if row.plain:
+            parts.insert(0, Align.left(row))
     return Panel(Group(*parts), border_style="grey35", padding=(0, 1))
 
 
@@ -697,6 +680,11 @@ def fetch_state(client) -> dict:
     # the moment it is made, and a throttle a screen would not show for ninety
     # seconds is a throttle nobody watching that screen can trust.
     data["dials"] = fetch_dials(client)
+    # On the board clock too, and for a sharper version of the dial's reason: a
+    # blocker is raised and answered by people acting now, and a surface that
+    # lagged it by ninety seconds would show work as stuck that somebody has just
+    # unstuck — on the one surface #274 asks a person to trust.
+    data["blockers"] = fetch_blockers(client)
     return data
 
 
@@ -734,7 +722,14 @@ def fetch_gh(client=None) -> dict:
 
 
 def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
-          scope: Scope | None = None) -> Group:
+          scope: Scope | None = None, backlog: bool = False,
+          waiting: bool = False) -> Group:
+    """Two tables, the dials above them, and the numbers above those.
+
+    It was eight panels answering two questions, and 61 rows into the 38-row pane
+    #269 measured — after that issue's per-panel caps, which is what makes 61 the
+    floor rather than the excess (#589).
+    """
     caps = caps or {}
     # From the UNFILTERED claims, always: an issue this screen can see, held by an
     # agent working out of another repo's checkout, is still held. Narrowing this
@@ -742,15 +737,18 @@ def frame(cfg, data: dict, gh: dict, width: int, caps: dict | None = None,
     held = claims_by_issue(data.get("claims", []))
     queue = gh.get("queue") or {}
     dials = data.get("dials") or {}
+    # The plan's items, for the two joins that need them: a claim key like
+    # `item:<uuid>` says nothing without the item behind it, and an issue number
+    # in a `what` cell is a number until the plan supplies the words.
+    items = plan_items(data.get("plan"))
     parts = [header(cfg, data, width, caps.get("limits"), bool(caps.get("error")), scope,
-                    queue, dials),
+                    queue, dials, gh, held),
              panel_dials(dials, width, cfg, scope),
-             panel_agents(data, width, scope),
-             panel_claims(data, width, scope),
-             panel_plan(data.get("plan") or {}, data.get("plan_err"), width, scope),
-             panel_prs(gh["prs"], gh["pr_err"], width, scope),
-             panel_review_queue(queue, width, scope),
-             panel_issues(gh["issues"], held, gh["issue_err"], width, scope)]
+             panel_agents(data, width, scope, items),
+             panel_work(data.get("plan") or {}, data.get("plan_err"), gh, held,
+                        width, scope, backlog,
+                        claims_known=not data.get("error"),
+                        blockers=data.get("blockers"), waiting_only=waiting)]
     if data.get("error"):
         parts.append(Panel(Text(clip(data["error"], width * 2), style="red"),
                            title="[red]ERROR[/]", title_align="left", border_style="red"))
@@ -773,13 +771,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--interval", type=float, default=BOARD_EVERY, help="board refresh seconds")
     ap.add_argument("--scope", choices=("repo", "all"), default=None,
                     help="repo (default): only this screen's repos, and no repo column; "
-                         "all: every repo the board knows, in FLEET/CLAIMED/PLANS — "
-                         "PRs and issues stay the watched repos' either way. "
-                         "Overrides QB_DASH_SCOPE")
+                         "all: every repo the board knows, in AGENTS and in the plan "
+                         "half of WORK — PRs and issues stay the watched repos' "
+                         "either way. Overrides QB_DASH_SCOPE")
     ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
                     help="the project this screen is for — a checkout or an owner/name "
                          "slug, repeatable. Overrides QB_DASH_REPOS, QB_DASH_REPO "
                          "and the cwd")
+    ap.add_argument("--waiting", action="store_true",
+                    help="only the rows a person owes an answer about — the "
+                         "terminal half of the one door (#274). The count is on "
+                         "the header line either way")
+    ap.add_argument("--backlog", action="store_true",
+                    help="also list the work nothing is waiting on: open PRs review "
+                         "has finished with, and open issues nobody has planned or "
+                         "taken. Their counts are on the header line either way")
     args = ap.parse_args(argv)
 
     console = Console(width=args.width) if args.width else Console()
@@ -807,11 +813,13 @@ def main(argv: list[str] | None = None) -> int:
     caps = refresh_limits({"limits": [], "error": None})
 
     if args.once:
-        console.print(frame(cfg, data, gh, width, caps, scope))
+        console.print(frame(cfg, data, gh, width, caps, scope, args.backlog,
+                            args.waiting))
         return 0
 
     last_gh = last_caps = time.monotonic()
-    with Live(frame(cfg, data, gh, width, caps, scope), console=console,
+    with Live(frame(cfg, data, gh, width, caps, scope, args.backlog, args.waiting),
+              console=console,
               screen=True, refresh_per_second=4) as live:
         while True:
             time.sleep(args.interval)
@@ -823,7 +831,8 @@ def main(argv: list[str] | None = None) -> int:
                 refresh_limits(caps)
                 last_caps = time.monotonic()
             width = console.width          # the pane can be resized under us
-            live.update(frame(cfg, data, gh, width, caps, scope))
+            live.update(frame(cfg, data, gh, width, caps, scope, args.backlog,
+                              args.waiting))
 
 
 if __name__ == "__main__":

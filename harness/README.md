@@ -2022,24 +2022,101 @@ would close a seat and leave the board holding its lease for the rest of a TTL.
 #### The dash — WORK IN PROGRESS
 
 `qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
-along the bottom (the **tape**) is the event stream. Who is alive and on what, who holds
-which claim and for how long, what the fleet agreed to do next, every open PR with its CI
-verdict, and every open issue with whoever has claimed it. Rows are clickable — a seat jumps
-the tmux cursor to that seat's pane, a claim shows its note, a plan item explains why it is
-where it is, a PR or an issue opens on GitHub, a review-queue row says every
-reason it is still waiting, and a dial row says why it is set (its `✎` opens the one surface
-that can change it). `qb-dash` is the same views rendered without
-interaction, for a box that cannot import `textual` — which is the whole of what
-it is for since #426. It is not a lesser default any more; it is the fallback.
+along the bottom (the **tape**) is the event stream. `qb-dash` is the same views rendered
+without interaction, for a box that cannot import `textual` — which is the whole of what it
+is for since #426. It is not a lesser default any more; it is the fallback.
 
-**ISSUES waits before it paints, and says what it is waiting for.** The rows come from
-`gh issue list` and their order comes from the board's claims — free issues above held
-ones — and the two arrive on separate workers with nothing sequencing them. Painting on
+**TWO TABLES, because there are two questions** ([#589](https://github.com/prisonblues/quarterback/issues/589)):
+
+  **AGENTS** — who is here and how they are doing. Live agents, what each holds, the seat
+  panes on the screen in front of you, and the claims no live agent answers for. Was SEATS +
+  FLEET + CLAIMED, which were three renderings of one subject: a seat is an agent with a pane
+  in front of you, and a claim is what an agent holds.
+
+  **WORK** — what is in flight and where it has got to. The board's plan in the board's own
+  order, with the review queue folded into the rows it is about and anything else that is
+  open appended. Was PLANS + OPEN PRs + REVIEW QUEUE + ISSUES.
+
+They were eight panels, and one measured frame spent **61 rows** on them — into the 38-row
+pane #269 measured, and after that issue's per-panel caps. `#578` was on it four times, and
+OPEN PRs and REVIEW QUEUE printed the same three PRs in ten lines. That pair was never going
+to be two panels honestly: the queue is DERIVED from the open-PR list, so it is a subset by
+construction, and all the PR panel added was the CI glyph — which is now the WORK table's
+state cell for a PR row.
+
+**What is deliberately still two rows:** a plan item names its ISSUE, and nothing records
+which PR implements it (#396). So an issue and the PR that closes it are two rows, and the
+missing edge is a fact about the board rather than a shortcut taken in the renderer.
+
+Rows are clickable — a seat jumps the tmux cursor to that seat's pane and its `✕` closes it,
+an agent row says where it is, a claim row shows the note the claiming agent left, a work row
+explains why it is where it is (a plan item's reasoning, or what review is waiting for) and
+its verb column takes the issue (`⚒`) or starts the round (`⚖`), and a dial row says why it
+is set (its `✎` opens the one surface that can change it).
+
+**A claim nobody answers for gets a row, and says which kind of nobody.** `machine` — the
+claim names a bare machine name while that box's agents are `machine/name`, so nothing can
+say which of them holds it (#444). `gone` — it names an agent presence no longer lists, so
+that agent finished and its claim outlived it; this is the most actionable row on the
+dashboard and it read exactly like a live one under CLAIMED. `elsewhere` — the holder is
+live and this pane's scope hid it, which is not a loose end and is not counted as one.
+
+**WHAT A PERSON OWES AN ANSWER TO IS ON IT, AND `w` SHOWS ONLY THAT**
+([#328](https://github.com/prisonblues/quarterback/issues/328)). The board has held a blocker
+as a first-class row since #274 — subject, class, question, owner, and a resolution required
+to close it — and the web board and the plan page have both drawn one since. The terminal
+never had: `/plan` serves `waiting_on_a_human` on every item and `qbdata` referenced it
+**zero times**, so an item nobody could proceed on rendered `○`, in the cyan this panel uses
+for *free to take*.
+
+A blocked row wears **`⚑` magenta**, and that glyph is not a new one: it is what a PR wears
+when its checks are gated — *"a run exists, will NOT execute without a human, and so will
+never report"* (#324). A plan item waiting on a decision is the same sentence about a
+different subject, so reusing it unifies the vocabulary rather than growing it. The `why`
+cell says the class and then who owes the answer, or how long it has waited when nobody does
+— `⚑taste rich`, `⚑environment ＋2`. **The count goes before the owner** when both will not
+fit: #576 made several questions per subject possible on purpose, and a cell that spent its
+last characters on a name would be that issue's undercount one surface further on.
+
+**Every question gets a row, including the ones with no work to ride.** A blocker's subject
+is one of item, issue, pr or repo, and `qb-doctor` raises `landed`, `harness` and `unpushed`
+against the **repo** — the "the fleet is stuck" ones, which no piece of work on this table
+can carry. They are drawn at the top with the review queue, because they are the same kind of
+fact: work a person is standing in front of. Left out they would be counted by the header and
+drawn nowhere, and a number that disagrees with the rows under it is the one thing a surface
+a person is asked to trust cannot do.
+
+**Nothing is offered on a blocked row.** The `⚒` and the `⚖` keep their shape and go grey:
+taking an issue whose shape is still being decided, or spending a panel round on a PR
+somebody has been asked whether to revert, is work done before the answer that governs it
+(#522). A row that is *only* a question gets no icon at all — the state cell already says it.
+
+`WAITING n` leads the header line, ahead of the review depth and the caps, and it is scoped
+like every other tally there. Every other number on that line is about what the fleet is
+doing to itself; this is the only one that is somebody's to act on. A zero still draws —
+"nobody is waiting on you" is exactly the answer somebody opens this to get — and a read that
+failed reports `?` rather than a confident nothing (#244). `w` in the clickable renderer,
+`--waiting` in the printed one, `QB_DASH_WAITING=1` to open that way.
+
+**The backlog is behind `b`** — open PRs review has finished with, and open issues nobody has
+planned or taken. They are a catalogue rather than state, and twelve rows of issue list was
+the biggest single consumer of the old frame. `--backlog` in the printed renderer, which has
+no keyboard; `QB_DASH_BACKLOG=1` to open that way. **Their counts stay on the header line
+either way** — `PRs 3 · 1 red`, `ISSUES 30 · 25 free` — because a toggled list that left no
+number behind would be a way of forgetting the work exists.
+
+**THE BACKLOG waits before it paints, and says what it is waiting for.** Its issue rows come
+from `gh issue list` and their order comes from the board's claims — free issues above held
+ones — and the two arrive on separate workers with nothing sequencing them. Only that half
+waits: the plan and the review queue are not sorted on claims, so they paint as soon as they
+arrive, which is strictly better than the panel managed. Painting on
 whichever lands first draws an order the panel is then about to rearrange, and a row that
 moves is a row somebody clicks by mistake ([#433](https://github.com/prisonblues/quarterback/issues/433)).
-So until both have answered the panel says `ISSUES · waiting for the board`, `· waiting for
-gh`, or names both — with any `gh` error carried beside it, since the one thing worth
-knowing about a stalled panel is which end is stalled. It cannot hang — a board that is down
+So until both have answered the title says `WORK · … · backlog waiting for the board`, `…
+for gh`, or names both — with any `gh` error carried as a ROW rather than a title suffix
+clipped to 24 characters, for the reason the queue's error is one: a table whose job is
+saying why something is missing must not truncate the message that says why it cannot tell
+you. It cannot hang — a board that is down
 and a `gh` that fails both count as answers — but "cannot hang" is not "is quick": a board on
 a black-holed network answers by timing out, and `fetch_board` makes two sequential calls at
 30s each, so the worst case is a caption on screen for about a minute. The usual case is a
@@ -2070,23 +2147,40 @@ only endpoint a gated run is visible from:
 | `·` grey | `none` | no run was created for this head. Reached only by asking, never by finding the rollup empty |
 | `?` yellow | `unknown` | the state could not be determined. Not a synonym for `none` |
 
-The OPEN PRs title counts every one of those that is not green. Before this it counted reds
-and nothing else, so a PR whose runs were gated contributed to no number on the screen.
+The header line counts every one of those that is not green. Before this it counted reds and
+nothing else, so a PR whose runs were gated contributed to no number on the screen. It is on
+the header rather than a panel title since #589, and it is the one thing the OPEN PRs panel
+said that the review queue replacing its rows cannot: a PR can be green and unreviewed, or
+red and already signed off.
 
-**REVIEW QUEUE** sits directly under OPEN PRs in both renderers. It was the plain
-one's alone until #426, which is what made flipping the seat pane's default a port
-rather than a one-line change: the panel would have come off the screen, and a
-number nobody reads is how #273 happened in the first place. OPEN PRs above it
-says a PR exists and CI is green; it never said whether anybody
-had reviewed it, and on 2026-08-20 six of eight open PRs had never been panelled while the
-newest round on the board was two and a half days old — neither number readable anywhere.
+**THE REVIEW QUEUE is the top of WORK**, drawn above the plan in both renderers. It was the
+plain one's alone until #426, which is what made flipping the seat pane's default a port
+rather than a one-line change: the panel would have come off the screen, and a number nobody
+reads is how #273 happened in the first place. The OPEN PRs panel it used to sit under said a
+PR exists and CI is green; it never said whether anybody had reviewed it, and on 2026-08-20
+six of eight open PRs had never been panelled while the newest round on the board was two and
+a half days old — neither number readable anywhere.
+
+Above the plan and not below it, which overrules nothing: the board's order is an order over
+plan ITEMS and says nothing about where a PR sits among them, because PRs are not in it —
+the same silence the queue's own oldest-first reading order fills. Appending was the first
+cut and it read badly on real data: forty-two plan rows above five review rows, in a table
+showing twenty, is a review queue that is technically present and practically invisible.
 The panel is `POST /review-queue`: every open PR joined to every panel run, plan item, work
 claim and landing-queue entry the board holds, so each row carries the state it is in, the
 verb that state implies (`panel`, `re-panel`, `fix`, `rebase`, `land`) and how long it has
 waited. Rows nothing may act on keep their place and show the reason instead of the verb,
 because a panel that hid them would report an empty queue for a repo where everything is
-stuck. The depth and the oldest wait also sit on the caps line at the top, beside the budget
-they would be spent out of.
+stuck. The depth and the oldest wait also sit on the header line at the top, beside the
+budget they would be spent out of.
+
+**The printed renderer has one row cap where it had four, and it is split by section rather
+than sliced off the top.** A cap that always eats the same section is a section that is never
+drawn: under a straight `rows[:cap]` the panel said `5 in review` in its title and showed
+none of them — #273's hole reopened by a display limit rather than by a data model, which is
+worse, because nothing about the code would look wrong. The review section takes what it
+needs up to a third, the plan takes the rest, and each says how many it left out where the
+rows went.
 
 An age prefixed `~` is the longest the wait could have been rather than the length it was:
 nothing records when a head moved or when a branch started conflicting, so those are
@@ -2094,9 +2188,9 @@ measured from the round or from the PR's opening. Nothing here starts a review �
 is a reader, and the thing that would act on it is #53.
 
 **Above 157 columns the panels go TWO ACROSS, and what that buys is height.** Seven
-panels dividing one column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a
-50-row screen while four others get five each; the same seven over four grid rows are
-between two and five times that, and no panel's share was taken from another's. The
+panels dividing one column's rows was why CLAIMED and REVIEW QUEUE were two rows tall on a
+50-row screen while four others got five each. With two tables it buys a great deal more:
+AGENTS and WORK side by side each get the pane's whole height. The
 threshold is quoted rather than chosen: 78 columns is what one of these tables wants
 before it wraps — `QB_SEATS_DASH_SIZE`'s default, from `qb-seats` — so two side by side
 plus the gutter is the narrowest pane on which the second column is not paid for out of
@@ -2105,17 +2199,25 @@ splits off is 78 columns and must come out exactly as it did before this existed
 `QB_DASH_WIDE` moves it, and a value that is not a positive number of columns is ignored
 rather than fatal.
 
-SEATS spans both columns — it is its content in either layout, and a second column would
-only move the ＋, which is the one widget here that has already fallen off a screen once.
-The other placement is the part CSS could not do. **A grid fills row by row in DOM
-order**, so the order that puts REVIEW QUEUE directly under OPEN PRs above lays them into
-different rows the moment there are two of them, and the pairing #273 asked for is gone.
-So `Dash.relayout` moves PLANS down one when it goes wide: `under` becomes `beside`, and
-PLANS pairs with the ISSUES its items point at. It moves back on the way down, exactly —
-`>` and `<` nudge by eight columns, so crossing the threshold twice in a minute is
-ordinary. The reorder is `move_child` and never a remount: a DataTable carries a cursor, a
-scroll offset and the row keys every click resolves through, and a pane getting wider is
-not news worth losing your place over.
+DIALS spans both columns — it is its content in either layout, so a column of its own would
+buy it nothing and cost the table beside it half its width, and it keeps its place at the top
+because it is the configuration every row below it is running under.
+
+**There is no reordering left to do, and that is new.** A grid fills row by row in DOM order,
+so seven panels had to be re-paired by hand — `Dash.relayout` moved PLANS down one when the
+pane went wide, because the narrow order that put REVIEW QUEUE directly under OPEN PRs laid
+them into different rows the moment there were two columns. Two tables and a spanning DIALS
+need none of it: `relayout` is the class and nothing else (#589). Losing that `move_child`
+is worth saying out loud, because it was load bearing in the other direction too — it ran
+BEFORE `build_columns` in `on_mount`, so when it raised on a panel the merge had removed, the
+tables were never given their columns at all and every row failed with "More values provided
+than there are columns", four functions away from the layout call that caused it.
+
+**AGENTS is not content-sized, and SEATS' exemption does not survive into it.** SEATS could
+be `height: auto` because it was bounded — MAX_SEATS panes plus the ＋ — and AGENTS also
+holds the fleet and every unattributed claim, which is as long as the board is. That is the
+exact unboundedness that once put a table off the bottom of the pane, where its rows could
+not be clicked.
 
 **Take the width off the resize EVENT, never off `self.size`.** Measured on textual 8.2:
 `on_resize` runs before the app's own size is updated, so a `self.size.width` read in
@@ -2139,8 +2241,8 @@ change, which this screen makes constantly — `select-layout -E` when a seat is
 the `window-resized` hook reasserting `@qb_dash_width` on every client attach. A dash zoomed
 to read would pop back to 78 columns the moment somebody attached a phone, with nothing on
 screen to say why. It is also not a `display-popup` running a second dashboard: that is a
-second board poll, a second `gh` poll, and a cold start whose ISSUES panel says "waiting for
-gh" for up to a minute. `break-pane` moves the pane the process is already in.
+second board poll, a second `gh` poll, and a cold start whose WORK title says "backlog
+waiting for gh" for up to a minute. `break-pane` moves the pane the process is already in.
 
 It is the same move `d` makes, minus the `-d` that leaves the pane parked where nobody is
 looking — so it inherits everything that was hard about that one, including the rule that
@@ -2195,14 +2297,14 @@ What the dash does with the room is its own business and is not arranged here: i
 Textual app that lays out to the width it is given, so a window-wide pane simply crosses the
 threshold above and goes two columns across. This verb moves a pane.
 
-**It opens on ONE project, and that is the interesting default.** Every panel here is
-fleet-wide by construction — FLEET is every live agent on the board, CLAIMED every claim,
-PLANS every repo's list — while a screen is built for one repository. So most rows were
-somebody else's, and the repo cell was then the same word, eleven columns wide, on every
-line of a 78-column pane (#261). The scope narrows the three board-derived panels to the
-repos this screen watches and drops the column outright; the eleven columns go back to
-`what` an agent is doing and to a plan item's title, and `quarterback#209` in CLAIMED
-becomes `#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
+**It opens on ONE project, and that is the interesting default.** What the board serves is
+fleet-wide by construction — every live agent, every claim, every repo's plan — while a
+screen is built for one repository. So most rows were somebody else's, and the repo cell was
+then the same word, eleven columns wide, on every line of a 78-column pane (#261). The scope
+narrows what comes off the BOARD — AGENTS, and the plan half of WORK — to the repos this
+screen watches, and drops the column outright; the eleven columns go back to `what` an agent
+is doing and to a plan item's title, and `quarterback#209` on an agent's row becomes
+`#209`. The repos are the ones the dashboard already resolved for its `gh` calls:
 `--repo` (a checkout or an `owner/name` slug, repeatable), else `QB_DASH_REPOS`, else the
 origin of `QB_DASH_REPO`, else of the directory it was started in.
 
@@ -2232,7 +2334,7 @@ bare name they share — and so does the wide view, which is the whole reason to
 toggles between them in the TUI, redrawing from what the client already has rather than
 re-fetching; the plain renderer has no keyboard, so it takes `--scope all` or
 `QB_DASH_SCOPE=all`. **A narrowed panel always says what it
-hid** — `FLEET · 3 · 2 elsewhere` — because a filtered pane that reads like the whole fleet
+hid** — `AGENTS · 3 live · 2 elsewhere` — because a filtered pane that reads like the whole fleet
 is worse than an unfiltered one: it is the same picture with fewer facts, and "nothing
 claimed" and "nothing claimed *here*" are different claims about the world.
 
@@ -2241,14 +2343,18 @@ outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process h
 resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
 live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
 the only thing that ever said so and the narrow view is exactly the view that drops it.
-The SEATS panel's `state` column reads every agent the board reports rather than the scoped
-ones: `tmux_seats()` lists every seat pane on the whole tmux server, so another screen's
-seat is on that panel either way, and narrowing would leave the cell that says which seat
-is waiting on you reading `—`. The held-issue
-markers come from *every* claim, so an issue held by an agent working out of another repo's
-checkout is still shown as held rather than offered to the next seat. And OPEN PRs and
-ISSUES cannot narrow at all: `gh` was only ever asked about the watched repos, so there is
-no other repo's row there to hide — only their column answers to the scope.
+The SEAT ROWS of AGENTS are not scoped: `tmux_seats()` lists every seat pane on the whole
+tmux server, so another screen's seat is a pane you can still close, and narrowing it away
+would take the `✕` with it. Nor is the liveness a claim row is judged against — an agent the
+scope hid is still alive, and calling its claim `gone` because this pane is narrow would be
+stating a fact about somebody's work on the strength of a filter. A claim whose holder the
+scope hid keeps a row of its own, marked `elsewhere`, because it is in scope and its holder
+is not, and dropping it is the panel-that-filtered-silently defect applied to the one fact
+that prevents duplicated work. The held-issue markers come from *every* claim, so an issue
+held by an agent working out of another repo's checkout is still shown as held rather than
+offered to the next seat. And the `gh` rows cannot narrow at all: `gh` was only ever asked
+about the watched repos, so there is no other repo's row there to hide — only their column
+answers to the scope.
 
 **The top line is the ceiling every pane below it works towards.** The seats spend one
 Claude subscription between them, so the five-hour and weekly caps are a fleet-wide number
@@ -2537,8 +2643,8 @@ oversight: a panel review lands in a *pane of the seat row*, beside the work it 
 `qb-start` makes windows. Teaching it where to put a session is a bigger change than #371,
 and the `⚒` is where the loop needed a beginning.
 
-**The plans panel is the one that says what the work is FOR.** FLEET says who is here and
-CLAIMED says what they hold; neither answers why. `PLANS` is the board's plan — every repo's
+**The plan is what says what the work is FOR.** AGENTS says who is here and what they hold;
+it does not answer why. The plan is the board's — every repo's
 ordered list, plus the fleet-wide one — **in the board's own order**, which is the point of a
 plan and a human decision. The panel used to re-band it locally (running, then free, then
 blocked) and that was a second answer about an ordered list computed against that list's own
@@ -2583,7 +2689,7 @@ reason**, and it is the one with more at stake — a panel review spends money, 
 public PR and pushes a fix commit to it. That click only became reachable with #209: two
 repos sharing a PR number used to crash the panel before either row rendered. A plan claim
 is keyed `plan:<uuid>` and an item claim `item:<uuid>`, which is right for a lock and
-unreadable on a pane, so CLAIMED resolves each against the board and shows the plan's label
+unreadable on a pane, so an agent's row resolves each against the board and shows the plan's label
 or the item's title instead.
 
 **The issues panel is the one that feeds the fleet.** A seat picks unclaimed work off the
