@@ -167,6 +167,16 @@ fi
 NL=$'\n'
 ASK_STRANDED=1
 ASK_WHY=""
+# THE QUESTION DOES NOT ARISE, which is not the same as "could not be answered". A
+# repository with no remote has no elsewhere for a commit to be, so there is nothing
+# to hedge about and nothing to say; every other refusal below leaves a claim
+# unestablished and has to say so per worktree.
+STRANDED_MOOT=0
+# WHERE EVERY CONFIGURED REMOTE ACTUALLY WRITES — the destination half of every fetch
+# refspec, wildcard and all. The namespace audit further down asks whether a ref under
+# `refs/remotes/` is one that some remote refreshes, and the only thing that can answer
+# that is a refspec DESTINATION. See the comment on that loop.
+COVERED=()
 if [ "$FETCH_FAILED" = 1 ]; then
   ASK_STRANDED=0
   ASK_WHY="the fetch did not complete, and what exists only on this disk is measured against the refs it would have refreshed, so it was not asked"
@@ -175,9 +185,30 @@ elif ! REMOTES=$(git -C "$DIR" remote 2>/dev/null); then
   ASK_WHY="git would not list this repository's remotes, so what exists only on this disk was not asked"
 elif [ -z "$REMOTES" ]; then
   ASK_STRANDED=0
+  STRANDED_MOOT=1
 else
   while IFS= read -r rem; do
     [ -n "$rem" ] || continue
+    # READ INTO A VARIABLE AND KEEP THE EXIT STATUS, where this used to feed the loop
+    # from a process substitution. `pipefail` does not cover process substitution and
+    # nothing observed its status, so a `git config` that died halfway through was a
+    # short read that looked exactly like a remote configured with fewer refspecs —
+    # and an inspection that did not happen was reported as one that found nothing.
+    #
+    # EXIT 1 IS "no such key" and is a FACT about the configuration; anything else is
+    # a read that failed. They get different sentences because they call for different
+    # things: one is a remote to configure, the other is a git that would not answer.
+    if specs=$(git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null); then rc=0; else rc=$?; fi
+    if [ "$rc" != 0 ] && [ "$rc" != 1 ]; then
+      ASK_STRANDED=0
+      ASK_WHY="git would not read \`remote.$rem.fetch\` (exit $rc), so what \`$rem\` brings back was never inspected and what exists only on this disk was not asked"
+      break
+    fi
+    if [ -z "$specs" ]; then
+      ASK_STRANDED=0
+      ASK_WHY="\`$rem\` has no fetch refspec at all, so nothing here can say which branches it would bring back and what exists only on this disk was not asked"
+      break
+    fi
     # PARAMETER EXPANSION AND NOT `sed … | grep -q`, because `set -o pipefail` is on
     # and `grep -q` exits the moment it matches: with enough refspec lines to fill a
     # pipe buffer the `sed` upstream dies of SIGPIPE, the pipeline reports 141, and a
@@ -188,23 +219,37 @@ else
     exclude_why=""      # disqualifying on its own
     dest_why=""         # only if nothing else established coverage
     while IFS= read -r spec; do
+      [ -n "$spec" ] || continue
       spec=${spec#+}          # a leading + is "force", not part of the source ref
       # A NEGATIVE REFSPEC EXCLUDES, and a positive one elsewhere does not undo it:
       # `^refs/heads/private/*` alongside `refs/heads/*` fetches everything except
       # those, and the branches it holds back are exactly the ones this would then
       # call work that exists nowhere else. Codex's finding.
+      #
+      # AND IT DISQUALIFIES THE WHOLE REPOSITORY, NOT JUST THIS REMOTE, deliberately. A
+      # second remote fetching `refs/heads/*` is a second SERVER, and nothing here can
+      # establish that it holds the branches this one holds back — those branches are
+      # precisely the ones this checkout has no record of, so the question is not
+      # answerable rather than merely unanswered. Reading another remote's coverage as
+      # covering this one's exclusion is the fail-open direction this block exists to
+      # close, and it would be reasoning from a URL comparison that proves nothing.
       case "$spec" in ^*)
         exclude_why="\`$rem\` excludes \`${spec#^}\` from what it fetches, so some branches on the server have no ref here"
         continue ;;
       esac
+      dst=${spec#*:}
+      # No colon at all: `remote.x.fetch = refs/heads/*` fetches into FETCH_HEAD and
+      # writes no tracking ref, so it establishes neither coverage nor ownership.
+      [ "$dst" = "$spec" ] && continue
+      COVERED+=("$dst")
+      [ "${spec%%:*}" = 'refs/heads/*' ] || continue
       # THE DESTINATION AS WELL AS THE SOURCE. `refs/heads/*:refs/cache/*` brings back
       # every head and puts none of it where `--remotes` looks, which the source check
       # alone reads as full coverage. Also Codex's.
-      [ "${spec%%:*}" = 'refs/heads/*' ] || continue
-      case "${spec#*:}" in refs/remotes/*) maps_every_head=1 ;;
-        *) dest_why="\`$rem\` fetches \`refs/heads/*\` into \`${spec#*:}\`, which is not under \`refs/remotes/\` and so is not what this question subtracts" ;;
+      case "$dst" in refs/remotes/*) maps_every_head=1 ;;
+        *) dest_why="\`$rem\` fetches \`refs/heads/*\` into \`$dst\`, which is not under \`refs/remotes/\` and so is not what this question subtracts" ;;
       esac
-    done < <(git -C "$DIR" config --get-all "remote.$rem.fetch" 2>/dev/null)
+    done <<< "$specs"
     # THE TWO ARE NOT THE SAME KIND OF FAULT. An exclusion holds branches back no
     # matter what else is configured, so it disqualifies on its own. A destination
     # outside `refs/remotes/` only matters if nothing ELSE brought the heads to where
@@ -222,30 +267,77 @@ else
     fi
   done <<< "$REMOTES"
   # THE MIRROR IMAGE OF THE REFSPEC CHECK, and Codex found this one too. The query
-  # trusts every ref under `refs/remotes/`; only CONFIGURED remotes are refreshed. A
-  # namespace left by a remote somebody removed, or one written there by hand, is
-  # therefore a permanent licence for whatever it reaches to read as safely
-  # elsewhere — and unlike a stale ref it never self-corrects, because nothing is
-  # ever going to fetch it again.
+  # trusts every ref under `refs/remotes/`; only what a CONFIGURED REFSPEC WRITES is
+  # ever refreshed. A ref left behind by a remote somebody removed, or written there by
+  # hand, is therefore a permanent licence for whatever it reaches to read as safely
+  # elsewhere — and unlike a stale ref it never self-corrects, because nothing is ever
+  # going to fetch it again.
+  #
+  # OWNERSHIP IS A DESTINATION AND NEVER A NAME. The first cut of this compared the
+  # top path segment under `refs/remotes/` with the list of configured remote NAMES,
+  # which answers a different question and fails open in two ways at once. A remote
+  # whose refspec writes to `refs/remotes/origin/branches/*` passes the coverage check
+  # above and does not own `refs/remotes/origin/old` — but the name `origin` is
+  # configured, so a stray ref there was trusted. And the fallback for remote names
+  # containing a slash was looser still: with `team/alice` configured, a whole orphaned
+  # `refs/remotes/team/bob/` namespace read as covered because some remote's name began
+  # with `team/`. Both let local-only commits hide behind a `--not --remotes` that had
+  # no business trusting that ref, which is the quiet direction and the one that loses
+  # work. Asking the refspecs where they write answers the question that was meant, and
+  # it also reaches the ref written DIRECTLY at `refs/remotes/<name>` that a
+  # segment-counting enumeration dropped on the floor.
   if [ "$ASK_STRANDED" = 1 ]; then
-    while IFS= read -r ns; do
-      [ -n "$ns" ] || continue
-      case "$NL$REMOTES$NL" in *"$NL$ns$NL"*) continue ;; esac
-      # A remote name may itself contain a slash, in which case the first segment
-      # under `refs/remotes/` is only part of it and the plain match above misses.
-      slashed=0
-      while IFS= read -r rem; do
-        case "$rem" in "$ns"/*) slashed=1; break ;; esac
-      done <<< "$REMOTES"
-      [ "$slashed" = 1 ] && continue
+    # AND THE INVENTORY ITSELF FAILS CLOSED. This was a process substitution whose exit
+    # status nothing observed and `pipefail` does not reach: a `for-each-ref` that died
+    # on a corrupt ref or a permission yielded no lines, the audit became a silent
+    # no-op, and the one guard in this block that exists to refuse would have passed.
+    if ! remote_refs=$(git -C "$DIR" for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null); then
       ASK_STRANDED=0
-      ASK_WHY="\`refs/remotes/$ns/\` belongs to no configured remote, so this question trusts refs that nothing here refreshes, and it was not asked"
-      break
-    done < <(git -C "$DIR" for-each-ref --format='%(refname)' refs/remotes/ 2>/dev/null \
-             | awk -F/ 'NF>3 { print $3 }' | sort -u)
+      ASK_WHY="git would not list the refs under \`refs/remotes/\`, so whether they all belong to a configured remote could not be established and what exists only on this disk was not asked"
+    else
+      while IFS= read -r ref; do
+        [ -n "$ref" ] || continue
+        owned=0
+        for dst in "${COVERED[@]}"; do
+          case "$dst" in
+            # A fetch refspec takes at most one `*`, and it is a suffix wildcard: the
+            # destination is a prefix and everything under it.
+            *'*') pfx=${dst%\*}
+                  [ "${ref#"$pfx"}" != "$ref" ] && { owned=1; break; } ;;
+            *)    [ "$ref" = "$dst" ] && { owned=1; break; } ;;
+          esac
+        done
+        [ "$owned" = 1 ] && continue
+        ASK_STRANDED=0
+        ASK_WHY="\`$ref\` is under \`refs/remotes/\` and no remote's fetch refspec writes there, so this question trusts a ref that nothing here refreshes, and it was not asked"
+        break
+      done <<< "$remote_refs"
+    fi
   fi
 fi
 [ -n "$ASK_WHY" ] && say "  ! $ASK_WHY"
+
+# ONE WALK FOR THE SWEEP, NOT ONE PER WORKTREE. `--not --remotes` has to load every
+# remote-tracking ref there is and mark it uninteresting before it can answer, and this
+# runs inside a hook that `qb-hook` wraps in `timeout 25` and drops entirely on
+# overrun — so ninety worktrees each paying for that walk is paid as silent loss of the
+# whole report, not as latency somebody notices. `refs/heads/` lives in the common git
+# dir and is shared between worktrees, so `--branches` from here is every branch in
+# every one of them: the same call `qb-doctor` makes exactly once for the repository.
+#
+# WHAT MAKES ONE WALK ENOUGH is that a branch carries stranded commits if and only if
+# its own TIP is stranded — anything reachable from a tip that some remote ref reaches
+# is reached by that ref too. So this set names the worktrees worth a second walk, and
+# on a machine where nothing is stranded there is no second walk at all.
+STRANDED_ALL=""
+STRANDED_ASKED=0
+if [ "$ASK_STRANDED" = 1 ]; then
+  if STRANDED_ALL=$(git -C "$DIR" rev-list --branches --not --remotes -- 2>/dev/null); then
+    STRANDED_ASKED=1
+  else
+    STRANDED_ALL=""
+  fi
+fi
 
 # `_spell_since` in qb-doctor, in shell and for the same reason: the reader has to
 # feel a fortnight at a glance, and "27360 minutes" reads as a number rather than
@@ -332,49 +424,102 @@ while IFS= read -r wt; do
   #
   # `--` terminates the revision list: a branch sharing a name with a path in the
   # working tree must not turn this into a question about a file.
+  #
+  # AND IT IS CARRIED ON EVERY EXIT PATH BELOW, not on the ones that happen to be
+  # convenient. The measurement is already taken by the time any of them print, and a
+  # worktree with uncommitted changes AND weeks-old commits on no remote ref is exactly
+  # the directory most likely to hold the only copy of something — an actively-edited or
+  # agent-held checkout is this fleet's normal state for work in flight. Printing only
+  # "uncommitted changes, left alone" there silences the new signal where it matters most.
   stranded_state=unknown
   stranded_note=""
-  if [ "$ASK_STRANDED" = 1 ]; then
-    if dates=$(git -C "$wt" log --format=%ct "$branch" --not --remotes -- 2>/dev/null); then
-      stranded_n=0; oldest=""
-      # Newest first, so the last line is the oldest and the age this turns on.
-      while IFS= read -r ts; do
-        [ -n "$ts" ] || continue
-        stranded_n=$((stranded_n + 1)); oldest=$ts
-      done <<< "$dates"
-      if [ "$stranded_n" = 0 ]; then
-        stranded_state=none
-      else
-        stranded_state=some
-        if [ "$stranded_n" = 1 ]; then
-          noun="1 commit"; verb=is
-        else
-          noun="$stranded_n commits"; verb=are
-        fi
-        now=$(date +%s 2>/dev/null) || now=""
-        if [ -z "$now" ] || [ -n "${now//[0-9]/}" ] || [ -n "${oldest//[0-9]/}" ]; then
-          # `set -u` and no `set -e`: an arithmetic expansion over an empty or
-          # non-numeric operand fails, `age_m` stays unset, and the very next test
-          # reads an unbound variable — which under `set -u` ABORTS, taking the rest
-          # of the sweep with it. An unattended tool must not die of a clock.
-          age_m=""
-        else
-          age_m=$(( (now - oldest) / 60 ))
-        fi
-        if [ -z "$age_m" ]; then
-          stranded_note=" — $noun on it $verb on no remote ref, and how old could not be read from this clock"
-        elif [ "$age_m" -lt 0 ]; then
-          # A committer date in the future is clock skew or a rewritten history, and
-          # either way the age this turns on is not a measurement. Report the count
-          # and refuse the verdict rather than picking whichever side the skew lands.
-          stranded_note=" — $noun on it $verb on no remote ref, dated ahead of this clock, which is not an age this can measure"
-        elif [ "$age_m" -lt $((STRANDED_GRACE_HOURS * 60)) ]; then
-          stranded_note=" — $noun on it $verb not on any remote yet, the oldest $(spell_age "$age_m") old: work in flight, which is the ordinary state"
-        else
-          stranded_note=" — $noun on it $verb on no remote ref, the oldest $(spell_age "$age_m") old: if this disk failed that work is gone"
-        fi
-      fi
+  if [ "$STRANDED_MOOT" = 1 ]; then
+    # No remote at all: there is no elsewhere for a commit to be, so this says nothing
+    # rather than hedging about a question that does not arise.
+    stranded_state=moot
+  elif [ "$STRANDED_ASKED" = 1 ]; then
+    if [ -z "$STRANDED_ALL" ]; then
+      stranded_state=none
+    elif ! tip=$(git -C "$wt" rev-parse --verify --quiet "refs/heads/$branch" 2>/dev/null); then
+      stranded_state=unknown
+    else
+      case "$NL$STRANDED_ALL$NL" in
+        *"$NL$tip$NL"*)
+          # COUNT AND MINIMUM IN ONE PASS, in awk rather than in the shell. The
+          # shell form kept the whole `git log` output in a variable and read the
+          # LAST line as the oldest, on the assumption that git emits in descending
+          # committer-date order. It does not: the walk guarantees only that a child
+          # is emitted before its parent, which is monotone in date only when the
+          # dates are. A rebase, a `git am`, an explicit `GIT_COMMITTER_DATE` — all
+          # of which this fleet does routinely — can date a child before its parent,
+          # and the last line is then NEWER than the true oldest. Age is what the
+          # verdict turns on, so that reads weeks-old work as work in flight: a false
+          # green in exactly the direction this exists to prevent. `qb-doctor` takes
+          # `min(when …)` over the whole set for the same reason; tracking the
+          # minimum makes the answer independent of emission order altogether, and
+          # streaming it keeps a large local-only history out of a shell variable.
+          if summary=$(git -C "$wt" log --format=%ct "$branch" --not --remotes -- 2>/dev/null \
+                       | awk 'NF { n++; if (m == "" || $1 + 0 < m + 0) m = $1 }
+                              END { printf "%d %s\n", n, m }'); then
+            stranded_n=${summary%% *}
+            oldest=${summary#* }
+          else
+            stranded_n=""; oldest=""
+          fi
+          if [ -z "$stranded_n" ]; then
+            stranded_state=unknown
+          elif [ "$stranded_n" = 0 ]; then
+            stranded_state=none
+          else
+            stranded_state=some
+            if [ "$stranded_n" = 1 ]; then
+              noun="1 commit"; verb=is
+            else
+              noun="$stranded_n commits"; verb=are
+            fi
+            now=$(date +%s 2>/dev/null) || now=""
+            if [ -z "$now" ] || [ -n "${now//[0-9]/}" ] || [ -z "$oldest" ] || [ -n "${oldest//[0-9]/}" ]; then
+              # `set -u` and no `set -e`: an arithmetic expansion over an empty or
+              # non-numeric operand fails, `age_s` stays unset, and the very next test
+              # reads an unbound variable — which under `set -u` ABORTS, taking the rest
+              # of the sweep with it. An unattended tool must not die of a clock.
+              age_s=""
+            else
+              # THE SIGN IS TAKEN IN SECONDS, BEFORE THE DIVISION. Bash truncates
+              # toward zero, so dividing first turns a commit dated 1 to 59 seconds
+              # ahead of this clock into `age_m=0` — which is not `< 0`, falls into
+              # the grace window, and reports skew as fresh work in flight. Sub-minute
+              # skew is the ordinary size of skew.
+              age_s=$(( now - oldest ))
+            fi
+            if [ -z "$age_s" ]; then
+              stranded_note=" — $noun on it $verb on no remote ref, and how old could not be read from this clock"
+            elif [ "$age_s" -lt 0 ]; then
+              # A committer date in the future is clock skew or a rewritten history, and
+              # either way the age this turns on is not a measurement. Report the count
+              # and refuse the verdict rather than picking whichever side the skew lands.
+              stranded_note=" — $noun on it $verb on no remote ref, dated ahead of this clock, which is not an age this can measure"
+            else
+              age_m=$(( age_s / 60 ))
+              if [ "$age_m" -lt $((STRANDED_GRACE_HOURS * 60)) ]; then
+                stranded_note=" — $noun on it $verb not on any remote yet, the oldest $(spell_age "$age_m") old: work in flight, which is the ordinary state"
+              else
+                stranded_note=" — $noun on it $verb on no remote ref, the oldest $(spell_age "$age_m") old: if this disk failed that work is gone"
+              fi
+            fi
+          fi ;;
+        *) stranded_state=none ;;
+      esac
     fi
+  fi
+  # AN UNANSWERED QUESTION SAYS SO, ON EVERY LINE THAT WOULD OTHERWISE READ AS AN
+  # ANSWER. An empty note is indistinguishable from a clean result, so in a run where
+  # the question was refused — a failed fetch, a partial refspec, a ref nothing
+  # refreshes — "already current" and "3 ahead of origin/x, left alone" were quietly
+  # making a safety claim that had never been established. Only the deleted-upstream
+  # branch hedged, and it is not the only place the claim gets read.
+  if [ "$stranded_state" = unknown ]; then
+    stranded_note=" — whether anything on it exists only on this disk was not established"
   fi
 
   # THE EXIT STATUS, NOT THE OUTPUT, and the difference is a whole second case.
@@ -411,7 +556,7 @@ while IFS= read -r wt; do
       case "$stranded_state" in
         none) say "  · $name ($branch) — its upstream is gone: the branch was probably merged and deleted, so this worktree is finished with" ;;
         some) say "  · $name ($branch) — its upstream is gone, but this worktree is not finished with$stranded_note" ;;
-        *)    say "  · $name ($branch) — its upstream is gone, so the branch was probably merged and deleted — but whether anything on it exists only on this disk was not established" ;;
+        *)    say "  · $name ($branch) — its upstream is gone, so the branch was probably merged and deleted$stranded_note" ;;
       esac
     else
       say "  · $name ($branch) — no upstream, nothing to catch up to$stranded_note"
@@ -440,11 +585,11 @@ while IFS= read -r wt; do
   case $? in
     0) ;;
     3) who=$(holder_name)
-       say "  · $name ($branch) — held by ${who:-another live agent}, left alone"
+       say "  · $name ($branch) — held by ${who:-another live agent}, left alone$stranded_note"
        SKIPPED=$((SKIPPED + 1)); continue ;;
-    4) say "  · $name ($branch) — cannot tell who is in it, left alone"
+    4) say "  · $name ($branch) — cannot tell who is in it, left alone$stranded_note"
        SKIPPED=$((SKIPPED + 1)); continue ;;
-    *) say "  · $name ($branch) — the holder check itself failed ($?), left alone"
+    *) say "  · $name ($branch) — the holder check itself failed ($?), left alone$stranded_note"
        SKIPPED=$((SKIPPED + 1)); continue ;;
   esac
 
@@ -454,11 +599,11 @@ while IFS= read -r wt; do
   # would have been read as safe to rewrite, which is the one direction this must
   # never fail in.
   if ! dirty=$(git -C "$wt" status --porcelain 2>/dev/null); then
-    say "  · $name ($branch) — git would not say whether it is clean, left alone"
+    say "  · $name ($branch) — git would not say whether it is clean, left alone$stranded_note"
     SKIPPED=$((SKIPPED + 1)); continue
   fi
   if [ -n "$dirty" ]; then
-    say "  · $name ($branch) — uncommitted changes, left alone"
+    say "  · $name ($branch) — uncommitted changes, left alone$stranded_note"
     SKIPPED=$((SKIPPED + 1)); continue
   fi
 
@@ -513,7 +658,7 @@ while IFS= read -r wt; do
     say "  ✓ $name ($branch) — fast-forwarded $behind commit(s) to $up$stranded_note"
     MOVED=$((MOVED + 1))
   else
-    say "  ✗ $name ($branch) — fast-forward refused: $(printf '%s' "$err" | head -1)"
+    say "  ✗ $name ($branch) — fast-forward refused: $(printf '%s' "$err" | head -1)$stranded_note"
     SKIPPED=$((SKIPPED + 1))
     RC=1
   fi

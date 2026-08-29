@@ -1539,10 +1539,45 @@ because the branch happened to be pushed: luck, not design.
 | a live holder (`worktree-holder` exit 3) | left alone, holder **named** |
 | "could not tell" (exit 4) | left alone |
 | uncommitted changes | left alone |
-| unpushed commits | left alone, **loudly** |
+| commits on **no remote ref**, older than the grace window | left alone — *"if this disk failed that work is gone"* |
+| commits on no remote ref, inside the window | left alone — *"work in flight, which is the ordinary state"* |
+| the stranded question could not be asked | left alone, and every line **says so** rather than reading as clean |
 | diverged from upstream | left alone — "that is a rebase, not a fast-forward" |
-| its upstream was deleted | left alone — *"the branch was probably merged and deleted"* |
+| its upstream was deleted, nothing stranded on it | left alone — *"probably merged and deleted, so this worktree is finished with"* |
+| its upstream was deleted, something stranded on it | left alone — *"not finished with"*, with the count and the age |
 | detached, or no upstream | left alone |
+
+**The loud line asks `git rev-list <branch> --not --remotes` and never `<branch>
+^origin/<branch>`** ([#573]). Those are different questions and the second is wrong in
+both directions at once: on zeus it called six worktrees endangered that were ancestors
+of `origin/main` in their entirety, and said nothing whatever about the five that really
+were carrying work no remote had — a branch nobody ever pushed has no `origin/` ref to
+be compared against, so the largest hoards on the machine were the ones it could not
+see. The row above used to read *"unpushed commits — left alone, loudly"*, and neither
+half of that was the question being answered.
+
+**AGE IS THE VERDICT, NOT THE COUNT.** This sweep fires on every merge, and a line that
+says the same alarming number every time is wallpaper inside a week — there is no count a
+working fleet reaches that would be green, because something is always mid-flight. Under
+`STRANDED_GRACE_HOURS` (24, and it is `qb-doctor`'s `UNPUSHED_GRACE_HOURS`, with a test
+that fails when the two drift) a commit on no remote ref is work in flight; beyond it, it
+is the only copy of something.
+
+**A question it cannot answer is refused once, out loud, and then hedged on every line.**
+A fetch that failed, a remote whose refspec does not bring back `refs/heads/*`, a
+negative refspec, a destination outside `refs/remotes/`, a ref under `refs/remotes/` that
+no remote's refspec writes to — each means the tracking refs this is measured against are
+not the set it trusts, so the sweep prints one `!` line saying which, and no worktree line
+claims anything about stranded work. An empty note would be indistinguishable from a clean
+answer, which is how a safety claim gets made by accident.
+
+**It sweeps WORKTREES, which is a real limit and not an oversight.** A branch checked out
+nowhere is outside it by construction — on zeus that was six of the eleven branches
+carrying commits no remote had — and a detached worktree is invisible for the same reason:
+there is no branch to ask about. `qb-doctor`'s `unpushed` row asks the same question of
+`--branches`, which is every branch in the repository, and is where the whole picture
+lives. This one is here because it is what the reader is looking at after a merge, about
+directories they can act on now.
 
 **Ask git for the exit status, not the output.** `rev-parse --abbrev-ref --symbolic-full-name
 '@{u}'` on a branch whose upstream ref is *gone* — the ordinary state of a worktree left lying
@@ -1606,6 +1641,7 @@ directly, and it is the true positive this must never drop.
 [#45]: https://github.com/prisonblues/quarterback/issues/45
 [#80]: https://github.com/prisonblues/quarterback/issues/80
 [#422]: https://github.com/prisonblues/quarterback/issues/422
+[#573]: https://github.com/prisonblues/quarterback/issues/573
 
 ### `qb-seat` — retired (#540)
 

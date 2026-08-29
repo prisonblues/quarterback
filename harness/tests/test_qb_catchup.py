@@ -19,17 +19,22 @@ including exit 4, "could not tell", which this tool must treat as a refusal wher
 Run: pytest harness/tests
 """
 
+import importlib.machinery
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 BIN = Path(__file__).resolve().parent.parent / "bin"
+HARNESS = Path(__file__).resolve().parent.parent
 CATCHUP = BIN / "qb-catchup"
+sys.path.insert(0, str(BIN))
 
 
 def git(where, *args, check=True):
@@ -37,19 +42,26 @@ def git(where, *args, check=True):
                           capture_output=True, text=True, check=check)
 
 
-def commit(where, name, text="x", days_ago=0):
-    """A commit, optionally dated into the past.
+def commit(where, name, text="x", days_ago=0, seconds_ahead=0):
+    """A commit, optionally dated into the past — or into the future.
 
     `days_ago` exists because the verdict this tool now reaches turns on AGE and not
     on count (#573): the same two commits are the ordinary state of work this morning
     and a single point of failure a fortnight later, and only a dated fixture can tell
     those two apart.
+
+    `seconds_ahead` is the other end of the same axis and it is deliberately in SECONDS.
+    Clock skew between a fleet's machines is ordinarily a handful of them, and an age
+    computed as `(now - committed) / 60` truncates toward zero — so the whole
+    sub-minute band came out as an age of 0, which is not negative, sits inside the
+    grace window, and reads as work from this morning.
     """
     (Path(where) / name).write_text(text)
     git(where, "add", name)
     env = None
-    if days_ago:
-        when = (datetime.now(UTC) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    if days_ago or seconds_ahead:
+        when = (datetime.now(UTC) - timedelta(days=days_ago, seconds=-seconds_ahead)
+                ).strftime("%Y-%m-%dT%H:%M:%S%z")
         env = {**os.environ, "GIT_AUTHOR_DATE": when, "GIT_COMMITTER_DATE": when}
     subprocess.run(["git", "-C", str(where), "-c", "user.email=t@e", "-c", "user.name=T",
                     "commit", "-qm", name],
@@ -94,6 +106,7 @@ def fleet(tmp_path):
             self.holder_rc = 0
             self.holder_name = "zeus/ember-marten"
             self.holder_calls = tmp_path / "holder.calls"
+            self.git_calls = tmp_path / "git.calls"
 
         def worktree(self, branch, at=None):
             d = tmp_path / f"proj-{branch.replace('/', '-')}"
@@ -147,6 +160,37 @@ def fleet(tmp_path):
             next test of it — an unattended sweep dying of a clock."""
             (stub_dir / "date").write_text("#!/bin/sh\nexit 1\n")
             (stub_dir / "date").chmod(0o755)
+
+        def stub_date_that_lies(self):
+            """A `date` that exits 0 and answers with something that is not a number.
+
+            The other half of the pair above, and the half that used to ABORT rather
+            than mislead: a non-numeric operand is an arithmetic syntax error, which
+            under `set -u` and without `set -e` leaves the variable unset and kills the
+            shell on the next test of it — an unattended sweep dying of a clock."""
+            (stub_dir / "date").write_text("#!/bin/sh\necho not-a-number\n")
+            (stub_dir / "date").chmod(0o755)
+
+        def stub_git_that_records(self, refuse=""):
+            """A `git` on PATH that records every invocation, then behaves normally.
+
+            `refuse` names a subcommand it fails instead, so a test can ask what the
+            sweep does when one specific query cannot be answered."""
+            real = shutil.which("git")
+            refusal = (f'for a in "$@"; do [ "$a" = "{refuse}" ] && exit 128; done\n'
+                       if refuse else "")
+            (stub_dir / "git").write_text(
+                "#!/bin/sh\n"
+                f'printf "%s\\n" "$*" >> {self.git_calls}\n'
+                + refusal
+                + f'exec {real} "$@"\n')
+            (stub_dir / "git").chmod(0o755)
+
+        def git_ran(self, needle):
+            """Every recorded `git` invocation whose argv contains `needle`."""
+            if not self.git_calls.exists():
+                return []
+            return [c for c in self.git_calls.read_text().splitlines() if needle in c]
 
         def run(self, *args, fetch=False, cwd=None):
             env = dict(os.environ)
@@ -266,12 +310,19 @@ def test_work_on_no_remote_is_left_alone_and_said_loudly(fleet):
     """The state #45 was actually in, and the one thing here that cannot be
     reconstructed from the remote — now asked as `--not --remotes` and dated."""
     commit(fleet.main, "mine-only", days_ago=19)
+    # CAPTURED BEFORE THE RUN, which is the whole of what the assertion below is worth.
+    # It used to compare `fleet.head(...)` with `git rev-parse HEAD` in the same
+    # directory — and `Fleet.head` IS that call, so the one line guarding the "left
+    # alone" half of this test's name was an expression compared with itself and could
+    # not fail. Every other "nothing happened" test in this file captures first.
+    before = fleet.head(fleet.main)
+
     done = fleet.run()
     assert done.returncode == 0, done.stderr
     assert "on no remote ref" in done.stdout, done.stdout
     assert "19 days old" in done.stdout, done.stdout
     assert "if this disk failed that work is gone" in done.stdout, "the loud part is the point"
-    assert fleet.head(fleet.main) == git(fleet.main, "rev-parse", "HEAD").stdout.strip()
+    assert fleet.head(fleet.main) == before, "a worktree carrying the only copy was moved"
 
 
 def test_a_diverged_branch_is_a_rebase_and_is_refused(fleet):
@@ -622,10 +673,17 @@ def test_a_remote_with_several_refspecs_still_counts_as_covering_every_head(flee
     this test does NOT go red against that form — it pins the behaviour, and the
     expansion removes the dependency on how much output happened to fit.
     """
-    git(fleet.main, "config", "--add", "remote.origin.fetch",
-        "+refs/heads/*:refs/remotes/origin/*")
+    # THE FIXTURE ALREADY CONFIGURES `refs/heads/*` AS THE FIRST FETCH LINE, so adding
+    # more after it left it at index 0 and the test passed whether the loop read every
+    # line or only the first — which is the one thing its name promises to distinguish.
+    # Rebuilt here with the line that matters LAST.
+    git(fleet.main, "config", "--unset-all", "remote.origin.fetch")
     git(fleet.main, "config", "--add", "remote.origin.fetch",
         "+refs/notes/*:refs/notes/origin/*")
+    git(fleet.main, "config", "--add", "remote.origin.fetch",
+        "+refs/tags/*:refs/tags/origin/*")
+    git(fleet.main, "config", "--add", "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*")
     commit(fleet.main, "mine-only", days_ago=19)
 
     done = fleet.run()
@@ -701,14 +759,121 @@ def test_a_fetch_that_failed_refuses_the_question_rather_than_answering_from_sta
 
 def test_a_namespace_under_refs_remotes_that_is_not_a_remote_refuses_the_question(fleet):
     """The mirror image of the refspec check. The query trusts everything under
-    `refs/remotes/`; only configured remotes are refreshed. A namespace left by a
-    removed remote never self-corrects, because nothing will ever fetch it again."""
+    `refs/remotes/`; only what a configured refspec writes is ever refreshed. A ref left
+    by a removed remote never self-corrects, because nothing will ever fetch it again."""
     git(fleet.main, "update-ref", "refs/remotes/ghost/main", "HEAD")
     commit(fleet.main, "mine-only", days_ago=19)
 
     done = fleet.run()
     assert done.returncode == 0, done.stderr
-    assert "`refs/remotes/ghost/` belongs to no configured remote" in done.stdout, done.stdout
+    assert "`refs/remotes/ghost/main` is under `refs/remotes/`" in done.stdout, done.stdout
+    assert "no remote's fetch refspec writes there" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_ref_written_directly_at_refs_remotes_is_not_missed(fleet):
+    """`git update-ref refs/remotes/ghost <sha>` is a legal ref layout with no
+    `<remote>/<branch>` shape to it at all, and `--not --remotes` trusts it exactly like
+    any other ref under `refs/remotes/`. The enumeration used to require four
+    slash-separated fields (`awk -F/ 'NF>3'`) and dropped this one on the floor — a
+    permanent, self-never-correcting place for local-only commits to hide."""
+    git(fleet.main, "update-ref", "refs/remotes/ghost", "HEAD")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "`refs/remotes/ghost` is under `refs/remotes/`" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_ref_no_refspec_writes_to_is_not_trusted_because_the_remote_name_matches(fleet):
+    """OWNERSHIP IS A REFSPEC DESTINATION AND NEVER A REMOTE NAME.
+
+    `origin` here fetches every head into `refs/remotes/origin/branches/*` — legal, and
+    still under `refs/remotes/`, so the coverage check above is satisfied and the
+    question is not refused for that reason. It does not write `refs/remotes/origin/old`
+    and nothing here ever will. Inferring ownership from the top path segment matching a
+    configured NAME trusted that ref anyway, and `--not --remotes` then subtracted a ref
+    nothing refreshes — the quiet direction, and the one that loses work.
+    """
+    git(fleet.main, "config", "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/branches/*")
+    git(fleet.main, "fetch", "-q", "origin")
+    git(fleet.main, "symbolic-ref", "-d", "refs/remotes/origin/HEAD", check=False)
+    git(fleet.main, "update-ref", "-d", "refs/remotes/origin/main")
+    git(fleet.main, "update-ref", "refs/remotes/origin/old", "HEAD")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "`refs/remotes/origin/old` is under `refs/remotes/`" in done.stdout, done.stdout
+    assert "no remote's fetch refspec writes there" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, "it trusted a ref nothing refreshes"
+
+
+def test_an_orphaned_namespace_that_merely_shares_a_prefix_is_not_trusted(fleet):
+    """The looser half of the same fault. A remote name may itself contain a slash, and
+    the guard used to accept any namespace some configured name merely BEGAN with: with
+    `team/alice` configured, an orphaned `refs/remotes/team/bob/` — left by a removed
+    remote, or written there by hand — read as covered because `team/alice` starts with
+    `team/`. Nothing will ever refresh it, and asking the refspecs where they write is
+    what tells the two apart."""
+    git(fleet.main, "remote", "add", "team/alice", str(fleet.remote))
+    git(fleet.main, "fetch", "-q", "team/alice")
+    git(fleet.main, "update-ref", "refs/remotes/team/bob/main", "HEAD")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "`refs/remotes/team/bob/main` is under `refs/remotes/`" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, "a prefix match hid an unrefreshed namespace"
+
+
+def test_an_inventory_of_refs_that_failed_refuses_rather_than_finding_nothing(fleet):
+    """The one guard in this block that used to fail OPEN. It read its refs from a
+    process substitution, which `pipefail` does not reach and whose exit status nothing
+    observed — so a `for-each-ref` that died on a corrupt ref or a permission yielded no
+    lines, the audit became a silent no-op, and the question was answered out of refs
+    that had never been checked."""
+    fleet.stub_git_that_records(refuse="for-each-ref")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "would not list the refs under `refs/remotes/`" in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, "a failed inventory became a clean bill"
+
+
+def test_a_refspec_read_that_failed_is_not_a_remote_that_maps_nothing(fleet):
+    """An inspection that did not happen must not be reported as one that found nothing.
+    This too read from a process substitution: a `git config` that failed left
+    `maps_every_head` at 0 and came out as "`origin` does not fetch `refs/heads/*`",
+    which names a configuration fault that may not exist and sends the reader to fix
+    the wrong thing."""
+    real = shutil.which("git")
+    (fleet.stub_dir / "git").write_text(
+        "#!/bin/sh\n"
+        'case " $* " in *" --get-all "*) exit 4 ;; esac\n'
+        f'exec {real} "$@"\n')
+    (fleet.stub_dir / "git").chmod(0o755)
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "would not read `remote.origin.fetch` (exit 4)" in done.stdout, done.stdout
+    assert "does not fetch" not in done.stdout, "it named a fault it had not established"
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+def test_a_remote_with_no_fetch_refspec_at_all_says_which_fault_it_is(fleet):
+    """The clean-but-empty answer, told apart from the failed read above. Both used to
+    print the same sentence about `refs/heads/*`, and only one of them is true."""
+    git(fleet.main, "config", "--unset-all", "remote.origin.fetch")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "`origin` has no fetch refspec at all" in done.stdout, done.stdout
     assert "on no remote ref" not in done.stdout, done.stdout
 
 
@@ -786,3 +951,255 @@ def test_a_clock_that_will_not_answer_does_not_kill_the_sweep(fleet):
     assert "how old could not be read from this clock" in done.stdout, done.stdout
     assert "feat/after-the-clock" in done.stdout, "the sweep died where the clock did"
     assert "left alone, of 2 worktree(s)" in done.stdout, done.stdout
+
+
+# ---------------------------------- the note is carried, not dropped (#573, round 2)
+#
+# `$stranded_note` is measured once per worktree, before the holder and dirty checks,
+# and it used to be printed on only eight of the loop's fourteen exit paths. The six it
+# was dropped on include the two states this fleet is in most of the time — a checkout
+# somebody is editing, and one an agent is holding — which is to say it went silent in
+# exactly the directories likeliest to hold the only copy of something.
+
+
+@pytest.mark.parametrize("state,setup,line", [
+    ("dirty", lambda f: (f.main / "scratch.txt").write_text("half an idea"),
+     "uncommitted changes, left alone"),
+    ("held", lambda f: f.stub_holder(rc=3, holder="zeus/amber-otter"),
+     "held by zeus/amber-otter, left alone"),
+    ("cannot tell", lambda f: f.stub_holder(rc=4),
+     "cannot tell who is in it, left alone"),
+])
+def test_a_worktree_that_is_left_alone_still_says_what_exists_only_on_this_disk(
+        fleet, state, setup, line):
+    commit(fleet.main, "mine-only", days_ago=19)
+    setup(fleet)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert line in done.stdout, done.stdout
+    assert "if this disk failed that work is gone" in done.stdout, (
+        f"the new signal was silenced in a {state} worktree, which is where it matters most")
+
+
+def test_a_refused_question_hedges_rather_than_reading_as_a_clean_answer(fleet):
+    """An empty note is indistinguishable from a note saying nothing was found. In a run
+    where the question was refused for every worktree, "already current" and "N ahead of
+    origin/x, left alone" were quietly making a safety claim nothing had established —
+    and an ahead-of-upstream branch said strictly LESS than the tool used to, since the
+    old line at least told you to push. Only the deleted-upstream branch hedged."""
+    git(fleet.main, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    ahead = fleet.worktree("feat/ahead")
+    git(ahead, "push", "-q", "-u", "origin", "feat/ahead")
+    commit(ahead, "unshared")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "already current" in done.stdout, done.stdout
+    assert "1 ahead of" in done.stdout, done.stdout
+    hedge = "whether anything on it exists only on this disk was not established"
+    assert done.stdout.count(hedge) == 2, done.stdout
+
+
+def test_a_per_worktree_walk_that_failed_hedges_too(fleet):
+    """The other half of the same fault, and the one that is per DIRECTORY rather than
+    per run: when the second walk itself fails the state is unknown, the note was empty,
+    and the line printed as though the question had been asked and answered cleanly."""
+    commit(fleet.main, "mine-only", days_ago=19)
+    fleet.stub_git_that_records(refuse="log")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "whether anything on it exists only on this disk was not established" in done.stdout, (
+        done.stdout)
+    assert "if this disk failed" not in done.stdout, done.stdout
+
+
+def test_a_repository_with_no_remote_hedges_about_nothing(fleet):
+    """The refusal that is NOT an unanswered question: with no remote there is no
+    elsewhere for a commit to be, so the question does not arise and hedging about it
+    would be noise on every line of every sweep in a scratch repo."""
+    git(fleet.main, "remote", "remove", "origin")
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "was not established" not in done.stdout, done.stdout
+    assert "on no remote ref" not in done.stdout, done.stdout
+
+
+# ------------------------------------------ the oldest, and the cost of asking (#573)
+
+
+def test_the_oldest_stranded_commit_is_the_oldest_and_not_the_last_line(fleet):
+    """RED/GREEN, and the reason no other age fixture here can catch it: with a single
+    stranded commit the first line and the last line of `git log` are the same line.
+
+    Git's walk guarantees only that a child is emitted before its parent. Descending
+    committer date is not promised, and it is not what a rebase, a `git am` or an
+    explicit `GIT_COMMITTER_DATE` leaves behind — all of which this fleet does, and
+    which this file's own `commit(..., days_ago=…)` helper does too. Here the PARENT is
+    dated yesterday and its CHILD nineteen days ago, so emission is child-then-parent
+    and the LAST line is the NEWER of the two. Taking it under-measures the age, and
+    under-measuring reads a fortnight-old only copy as work in flight: a false green in
+    the one direction this feature exists to prevent.
+    """
+    commit(fleet.main, "parent", days_ago=1)
+    commit(fleet.main, "child", days_ago=19)
+
+    order = git(fleet.main, "log", "--format=%ct", "main", "--not", "--remotes", "--"
+                ).stdout.split()
+    assert len(order) == 2 and int(order[-1]) > int(order[0]), (
+        "the fixture must emit the NEWER commit last, or it cannot tell a minimum from "
+        f"a last line: {order}")
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "2 commits on it are on no remote ref" in done.stdout, done.stdout
+    assert "19 days old" in done.stdout, done.stdout
+    assert "work in flight" not in done.stdout, done.stdout
+
+
+def test_a_commit_dated_seconds_ahead_of_this_clock_is_skew_and_not_fresh_work(fleet):
+    """`(now - oldest) / 60` truncates toward zero, so the whole sub-minute band of
+    future skew came out as an age of 0 — which is not `< 0`, sits inside the grace
+    window, and reports a clock this tool could not trust as work from this morning.
+    Sub-minute is the ordinary size of skew between machines."""
+    commit(fleet.main, "from-the-future", seconds_ahead=45)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "dated ahead of this clock" in done.stdout, done.stdout
+    assert "work in flight" not in done.stdout, done.stdout
+
+
+def test_a_clock_that_answers_with_nonsense_does_not_kill_the_sweep(fleet):
+    """The other half of `stub_date_that_fails`'s docstring, and the half that ABORTS
+    rather than misleads: a `date` that exits 0 and prints something non-numeric is an
+    arithmetic syntax error, which under `set -u` without `set -e` leaves the variable
+    unset and dies on the very next test of it, taking the rest of the sweep with it.
+    The stub above only ever exercised the empty-output path."""
+    commit(fleet.main, "mine-only", days_ago=19)
+    fleet.worktree("feat/after-the-clock")
+    fleet.stub_date_that_lies()
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "how old could not be read from this clock" in done.stdout, done.stdout
+    assert "feat/after-the-clock" in done.stdout, "the sweep died where the clock did"
+    assert "left alone, of 2 worktree(s)" in done.stdout, done.stdout
+
+
+def test_the_stranded_walk_is_taken_once_for_the_sweep_and_not_once_per_worktree(fleet):
+    """`--not --remotes` has to load and mark uninteresting every remote-tracking ref
+    there is before it can answer, and this runs inside a hook `qb-hook` wraps in
+    `timeout 25` and drops WHOLE on overrun. Ninety worktrees each paying for that walk
+    is paid as silent loss of the report, so the sweep takes one repository-wide walk
+    over `--branches` — `qb-doctor`'s own call — and asks per worktree only about the
+    branches whose tip that walk actually named."""
+    fleet.worktree("feat/a")
+    fleet.worktree("feat/b")
+    fleet.stub_git_that_records()
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert len(fleet.git_ran("rev-list --branches --not --remotes")) == 1, (
+        fleet.git_calls.read_text())
+    assert fleet.git_ran("log --format=%ct") == [], (
+        "nothing is stranded anywhere, so no worktree should have been walked")
+
+
+def test_only_the_worktrees_the_wide_walk_named_are_walked_again(fleet):
+    """A branch carries stranded commits if and only if its own TIP is stranded —
+    anything reachable from a tip some remote ref reaches is reached by that ref too. So
+    the wide walk names the candidates and the second walk is paid only for them, which
+    is what keeps the count proportional to the problem rather than to the machine."""
+    fleet.worktree("feat/a")
+    mine = fleet.worktree("feat/mine")
+    commit(mine, "only-here", days_ago=19)
+    fleet.stub_git_that_records()
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+    walked = fleet.git_ran("log --format=%ct")
+    assert len(walked) == 1, walked
+    assert "feat/mine" in walked[0], walked
+
+
+def test_the_ordinary_fetching_path_reaches_the_same_verdict(fleet):
+    """Every other test here runs `--no-fetch`, and the only one that fetches points at
+    a URL that cannot be reached. So the path the hook uses WITHOUT `--no-fetch` — a
+    fetch that succeeds, then the refspec guard, then the stranded measurement — had no
+    green-path coverage at all: a fetch that wrongly set the failed flag, or a guard
+    passing only because nothing had been refreshed, would both have gone unnoticed."""
+    fleet.land_upstream()
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run(fetch=True)
+    assert done.returncode == 0, done.stderr
+    assert "the fetch did not complete" not in done.stdout, done.stdout
+    assert "1 commit on it is on no remote ref" in done.stdout, done.stdout
+    assert "19 days old" in done.stdout, done.stdout
+
+
+# --------------------------------- the two tools have to agree, EXECUTED (#573)
+
+
+def _doctor():
+    """`qb-doctor` has no `.py`, so it is loaded by path exactly as its own suite does."""
+    loader = importlib.machinery.SourceFileLoader("qb_doctor", str(BIN / "qb-doctor"))
+    spec = importlib.util.spec_from_loader("qb_doctor", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["qb_doctor"] = module
+    loader.exec_module(module)
+    return module
+
+
+def _doctor_unpushed(repo):
+    qd = _doctor()
+    common = Path(git(repo, "rev-parse", "--path-format=absolute",
+                      "--git-common-dir").stdout.strip())
+    host = qd.Host(repo=Path(repo), common_git_dir=common, base_url=None, token=None,
+                   human_url=None, harness_bin=None, source_harness=HARNESS,
+                   githooks=None, client_repo=Path(repo))
+    return qd.check_unpushed(host)
+
+
+@pytest.mark.parametrize("days_ago,verdict,loud", [(19, "fail", True), (0, "ok", False)])
+def test_the_two_tools_reach_the_same_verdict_about_the_same_repository(
+        fleet, days_ago, verdict, loud):
+    """EXECUTING BOTH, where the two tests above only match strings in the two sources.
+
+    A grep proves a literal is present in a file, never that it is on the live code
+    path: a dead query, a branch that cannot be reached, or a second constant hardcoded
+    somewhere further down would all leave those green while the tools said different
+    things about the same branch in front of a user. Two tools disagreeing about "does
+    this work exist elsewhere" is worse than either being wrong on its own, so this runs
+    each of them against one checkout and compares the answers rather than the text.
+    """
+    commit(fleet.main, "mine-only", days_ago=days_ago)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    check = _doctor_unpushed(fleet.main)
+
+    assert check.verdict == verdict, check.detail
+    assert ("if this disk failed that work is gone" in done.stdout) is loud, done.stdout
+    assert ("work in flight, which is the ordinary state" in done.stdout) is not loud, done.stdout
+    assert ("work in flight, which is the ordinary state" in check.detail) is not loud, check.detail
+
+
+@pytest.mark.parametrize("kw,verdict", [
+    (dict(days_ago=1, seconds_ahead=90), "work in flight, which is the ordinary state"),
+    (dict(days_ago=1), "if this disk failed that work is gone"),
+])
+def test_the_grace_window_bites_at_its_own_boundary(fleet, kw, verdict):
+    """The age fixtures elsewhere are this morning and nineteen days, either side of a
+    window neither of them is near. `-lt` drifting to `-le`, or the minute truncation in
+    `age_m` drifting by a unit, would move the boundary without a single one noticing."""
+    commit(fleet.main, "mine-only", **kw)
+
+    done = fleet.run()
+    assert done.returncode == 0, done.stderr
+    assert verdict in done.stdout, done.stdout
