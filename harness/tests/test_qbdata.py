@@ -2016,3 +2016,53 @@ def test_a_truncated_plan_is_refused_rather_than_reordered_from():
     why = qd.reorder_refusal({**REORDER_PLAN, "truncated": True},
                              [{"kind": "plan", "item": {"repo": "acme/one"}}])
     assert why and "truncated" in why and "board page" in why
+
+
+OPTIMISTIC_PLAN = {"items": [
+    {"item_id": "a", "repo": "acme/one", "state": "open", "rank": 1,
+     "rank_source": "ordered", "title": "A"},
+    {"item_id": "z1", "repo": "acme/two", "state": "open", "rank": 1,
+     "rank_source": "ordered", "title": "Z1"},
+    {"item_id": "b", "repo": "acme/one", "state": "open", "rank": 3,
+     "rank_source": "appended", "title": "B"},
+    {"item_id": "z2", "repo": "acme/two", "state": "open", "rank": 2,
+     "rank_source": "ordered", "title": "Z2"},
+    {"item_id": "c", "repo": "acme/one", "state": "open", "rank": 9,
+     "rank_source": "appended", "title": "C"},
+], "next": {"item_id": "a"}, "counts": {"open": 5}, "truncated": False}
+
+
+def test_an_optimistic_reorder_renumbers_the_way_the_endpoint_will():
+    """A row drawn in its new place still carrying its old rank is a table
+    disagreeing with itself, so the local guess renumbers `1..n` and stamps
+    `ordered` exactly as `POST /plan/reorder` does."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    ours = [i for i in out["items"] if i["repo"] == "acme/one"]
+    assert [(i["item_id"], i["rank"]) for i in ours] == [("c", 1), ("a", 2), ("b", 3)]
+    assert {i["rank_source"] for i in ours} == {"ordered"}
+
+
+def test_reordering_one_scope_leaves_every_other_row_where_it_was():
+    """Sorting the whole list by "is this the scope being reordered" put every one
+    of that scope's rows above every other scope's — so reordering one project
+    silently hoisted all of it over another's in the wide view, which is a change
+    to rows the caller never named. The permutation happens inside the positions
+    the scope already occupies."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    where = {i["item_id"]: n for n, i in enumerate(out["items"])}
+    assert where["z1"] == 1 and where["z2"] == 3, \
+        f"another scope's rows moved: {[i['item_id'] for i in out['items']]}"
+    assert [i["item_id"] for i in out["items"] if i["repo"] == "acme/two"] == ["z1", "z2"]
+
+
+def test_an_optimistic_reorder_drops_next_rather_than_guessing_it():
+    """`next` is the board's answer to "what should somebody take", worked out from
+    ranks, claims, blocks and cover. A pane that computed its own would be the
+    second-answer-about-the-plan defect this module has spent three issues
+    removing — and a ◉ left on a row that has just moved is not honest either."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    assert out["next"] is None
+    # Everything the board did not have to recompute is carried through: a reorder
+    # does not change which items are open.
+    assert out["counts"] == {"open": 5}
+    assert out["truncated"] is False

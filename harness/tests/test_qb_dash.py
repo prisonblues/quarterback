@@ -24,6 +24,7 @@ import asyncio
 import importlib.machinery
 import importlib.util
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1973,6 +1974,99 @@ def test_a_moved_row_stays_under_the_cursor():
         f"the row moved out from under the cursor: {under}"
     assert seen == [["b", "a", "c"], ["b", "c", "a"]], \
         f"two presses did not move one row two places: {seen}"
+
+
+async def _drive_optimistic(answer):
+    """Press `j` and look at the table BEFORE and AFTER the board answers.
+
+    `answer` is what the write does: a dict to return, or an exception to raise.
+    It sleeps first, so the paint that happens before the round trip is
+    observable — which is the whole of what "optimistic" means and the only way
+    to tell it from a fast one.
+    """
+    app_module, app = _quiet_dash()
+    items = {i["item_id"]: i for i in REORDER_PLAN["items"]}
+
+    def write(path, body):
+        time.sleep(0.6)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def titles(app):
+        table = app.query_one("#work")
+        return [str(table.get_row_at(i)[5]) for i in range(table.row_count)]
+
+    async with app.run_test(size=(110, 46)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.human = SimpleNamespace(why_not=lambda: None, post=write, NO_KEY="no key")
+        app.render_plan(REORDER_PLAN, None)
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+        table.move_cursor(row=0, animate=False)
+        await pilot.pause(0.1)
+        before = titles(app)
+        await pilot.press("j")
+        during = titles(app)                      # the board has not answered yet
+        await pilot.pause(1.4)
+        return before, during, titles(app), app.detail_text
+
+
+def test_a_move_is_painted_before_it_is_posted():
+    """A key press should move the row NOW. The write is a board call over the
+    network, and a pane that sat still for the length of it would be pressed
+    again — which is a second move, not a repeat of the first."""
+    before, during, after, said = asyncio.run(_drive_optimistic(
+        {"reordered": 1, "by": "human/rich", "appended": []}))
+    assert before == ["first", "second", "third"], before
+    assert during == ["second", "first", "third"], \
+        f"the row did not move until the board answered: {during}"
+    assert after == during, f"the confirmed order bounced: {after}"
+    assert "moved 1" in said, said
+
+
+def test_a_refused_move_puts_the_rows_back():
+    """The optimistic paint is a guess at what the board will say, and a refusal is
+    the board saying otherwise — so the guess is dropped whole rather than left on
+    screen for somebody to act on."""
+    before, during, after, said = asyncio.run(_drive_optimistic(
+        RuntimeError("board says no")))
+    assert during == ["second", "first", "third"], during
+    assert after == before, f"a refused move was left on screen: {after}"
+    assert "could not move" in said and "board says no" in said, said
+
+
+def test_a_poll_does_not_repaint_over_a_move_that_has_not_landed():
+    """The plan rides a fifteen-second clock and a reorder takes a round trip, so a
+    tick arriving in between carries the order the board still has — the one
+    WITHOUT the move. Applied, it puts the row back and then moves it again when
+    the write answers: two jumps for one keypress. The web board keeps the same
+    guard and calls it `busy`."""
+    async def drive():
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.human = SimpleNamespace(why_not=lambda: None,
+                                        post=lambda p, b: time.sleep(0.6) or
+                                        {"reordered": 1, "by": "human/rich",
+                                         "appended": []}, NO_KEY="k")
+            app.render_plan(REORDER_PLAN, None)
+            await pilot.pause(0.2)
+            table = app.query_one("#work")
+            table.move_cursor(row=0, animate=False)
+            await pilot.pause(0.1)
+            await pilot.press("j")
+            # The 15s tick lands mid-write, carrying the board's pre-move order.
+            app.render_plan(REORDER_PLAN, None)
+            during = [str(table.get_row_at(i)[5]) for i in range(table.row_count)]
+            await pilot.pause(1.4)
+            return during
+
+    during = asyncio.run(drive())
+    assert during == ["second", "first", "third"], \
+        f"a poll repainted the move away before it had landed: {during}"
 
 
 def _quiet_dash():

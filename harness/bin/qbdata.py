@@ -2636,6 +2636,49 @@ def nudge_index(ids: list[str], moving: list[str], how: str) -> int:
             "up5": here - REORDER_JUMP, "down5": here + REORDER_JUMP}.get(how, here)
 
 
+def plan_reordered(plan: dict | None, scope: str | None,
+                   order: list[str]) -> dict:
+    """The plan envelope as it will be once the board applies `order` to `scope`.
+
+    THE OPTIMISTIC HALF, and it exists so a key press moves a row NOW rather than
+    after a round trip to the board. The web page does this only for its drag —
+    *"what the buttons do not mind: they changed nothing on screen"* — because
+    there the DOM has already moved under the pointer. Here every verb is a
+    keypress, so every verb needs it or the pane sits still for the length of a
+    POST and the person presses again.
+
+    **It renumbers the way the endpoint renumbers**, `1..n` over the scope's open
+    items with `rank_source` set to `ordered`, because a row drawn in its new
+    place still carrying its old rank is a table disagreeing with itself. That is
+    also why this returns a NEW envelope rather than mutating: the caller keeps the
+    old one to put back if the write is refused.
+
+    Items outside the scope are carried through untouched — this is one exact
+    scope's order and nothing else's, the same rule the endpoint keeps.
+    """
+    at = {item_id: n for n, item_id in enumerate(order)}
+    out = list(plan_items(plan))
+    # THE SCOPE'S OWN SLOTS, AND ONLY THOSE. Sorting the whole list by "is this
+    # the scope being reordered" put every one of that scope's rows above every
+    # other scope's — so reordering one project silently hoisted all of it over
+    # another's in the wide view, which is a change to rows the caller never
+    # named. The permutation happens INSIDE the positions this scope already
+    # occupies, so every other row stays exactly where it was.
+    slots = [n for n, item in enumerate(out)
+             if item.get("repo") == scope and item.get("item_id") in at]
+    moved = sorted((out[n] for n in slots), key=lambda i: at[i["item_id"]])
+    for slot, item in zip(slots, moved):
+        out[slot] = {**item, "rank": at[item["item_id"]] + 1,
+                     "rank_source": "ordered"}
+    # `next` GOES, rather than being recomputed. It is the board's answer to "what
+    # should somebody take", worked out from ranks, claims, blocks and cover — and
+    # a pane that computed its own would be the second-answer-about-the-plan
+    # defect this file has spent three issues removing (`plan_state`, `panel_plan`).
+    # The board sends it back a moment later; until then no row wears the ◉, which
+    # is honest, where a ◉ left on a row that has just moved is not.
+    return {**(plan or {}), "items": out, "next": None}
+
+
 def reorder_refusal(plan: dict | None, rows: list[dict]) -> str | None:
     """Why these rows cannot be reordered together, or None if they can.
 

@@ -2134,6 +2134,16 @@ it is handed, so posting an unchanged order would write "a human chose this posi
 nobody touched (#183). And a second move while one is in flight is refused rather than stacked,
 which is `dial_writing`'s rule (#577) for its reason.
 
+**A move is painted before it is posted.** The write is a board call over the network, and a
+pane that sat still for the length of it would be pressed again — which is a second move, not a
+repeat of the first. So the row moves now and the board's answer confirms it; a refusal puts
+the rows back whole rather than leaving an order nobody agreed to on screen. The plan's
+fifteen-second poll is held off while a move is in flight, because a tick arriving in between
+carries the order the board still has and would move the row back and then forward again —
+two jumps for one keypress. The web board keeps the same guard and calls it `busy`; it makes
+only its *drag* optimistic, because there the DOM has already moved under the pointer, and
+every verb here is a keypress.
+
 **The moved row stays under the cursor, and the marks stay set**, so pressing `j` four times
 moves one thing four places. Both halves are the same rule and neither is housekeeping: a move
 rewrites the whole table and a DataTable's cursor is an *index*, so without following the row

@@ -1171,6 +1171,9 @@ class Dash(App):
         #: times should move one thing four places, which is the whole point of
         #: having a key rather than a modal.
         self.follow: str | None = None
+        #: The plan as the board last stated it, kept while a move is in flight so
+        #: a refusal can put the rows back. `None` when nothing is optimistic.
+        self.rollback: dict | None = None
 
     # ---- layout ---------------------------------------------------------
 
@@ -1623,6 +1626,16 @@ class Dash(App):
         without the item behind it, and an issue number is a number without the
         words (`qbdata.claim_summary`).
         """
+        # A POLL MUST NOT REPAINT OVER A MOVE THAT HAS NOT LANDED. The plan rides
+        # a fifteen-second clock and a reorder takes a round trip, so a tick
+        # arriving in between carries the order the board still has — the one
+        # WITHOUT the move — and would put the row back where it was, then move it
+        # again when the write answered. Two jumps for one keypress reads as a
+        # dashboard that cannot make up its mind. The web board keeps the same
+        # guard and calls it `busy`.
+        if self.reordering:
+            self.plan_err = err
+            return
         self.plan, self.plan_err = plan, err
         self.render_agents()
         self.render_work()
@@ -3111,6 +3124,14 @@ class Dash(App):
         # under the cursor at its head — which is where the next nudge measures
         # from (`nudge_index`).
         self.follow = f"plan:{moving[0]}"
+        # PAINTED BEFORE IT IS POSTED. A key press should move the row now: the
+        # round trip is a board call over the network, and a pane that sat still
+        # for the length of it would be pressed again. The board's answer then
+        # confirms — or, refused, `undo_reorder` puts these rows back.
+        self.rollback = self.plan
+        self.plan = qd.plan_reordered(self.plan, scope, order)
+        self.plan_sig = None
+        self.render_work()
         self.say(f"moving {len(moving)} in {scope or 'the fleet-wide plan'}…")
         self.run_reorder(scope, order, len(moving))
 
@@ -3142,6 +3163,12 @@ class Dash(App):
         except Exception as exc:                  # noqa: BLE001 — show it, don't die
             failed = True
             said = f"could not move — {exc}"
+            # The rows go back before the sentence arrives, so the pane never sits
+            # showing an order the board refused.
+            try:
+                self.call_from_thread(self.undo_reorder)
+            except Exception:                     # noqa: BLE001 — the app is going away
+                pass
         finally:
             try:
                 self.call_from_thread(self.clear_reordering, not failed)
@@ -3152,6 +3179,19 @@ class Dash(App):
         # person is looking at the row they just moved, and a table that showed the
         # old order for fifteen seconds would be read as a move that failed.
         self.call_from_thread(self.refresh_plan)
+
+    def undo_reorder(self) -> None:
+        """Put the rows back where the board still has them.
+
+        The optimistic paint is a guess at what the board will say, and a refusal
+        is the board saying otherwise — so the guess is dropped whole rather than
+        patched. Nothing else is touched: the marks stay, because the write a
+        person wants to retry is the one that just failed.
+        """
+        if self.rollback is not None:
+            self.plan = self.rollback
+            self.plan_sig = None
+            self.render_work()
 
     def clear_reordering(self, moved: bool = True) -> None:
         """Released, and the selection kept either way.
@@ -3169,6 +3209,7 @@ class Dash(App):
         this table drawn from a plan the board may have moved on from.
         """
         self.reordering = False
+        self.rollback = None
         self.plan_sig = None
 
     def action_toggle_waiting(self) -> None:
