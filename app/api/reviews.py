@@ -291,7 +291,7 @@ the ``needs-decision`` label #63's watcher reads had never existed in any repo
 here (``gh label list`` returned the nine GitHub defaults, unmodified).
 
 A finding now carries ``needs_human`` with a ``needs_human_class`` — one of
-``decision | taste | ui | environment | auth | other``, defined once in
+``decision | taste | ui | environment | auth | chore | other``, defined once in
 :mod:`app.needs_human` and constrained in the database — and a required
 ``needs_human_reason``. Per reporter as well as per finding
 (:class:`~app.models.review.ReviewFindingReport`), and counted per seat

@@ -126,6 +126,19 @@ def test_every_class_a_producer_names_is_in_the_vocabulary():
     assert literals <= set(NEEDS_HUMAN_CLASSES), sorted(literals - set(NEEDS_HUMAN_CLASSES))
 
 
+def test_the_qb_doctor_scan_sees_every_registration():
+    """`assert found` above proves the scan saw ONE literal, not all twenty. A
+    registration whose class is formatted differently — no trailing comma, or
+    sharing a line — is skipped silently and never checked against the
+    vocabulary, which is the guard going half-blind rather than red."""
+    import re
+
+    src = (REPO_ROOT / "harness" / "bin" / "qb-doctor").read_text(encoding="utf-8")
+    specs = len(re.findall(r"^    CheckSpec\(", src, re.M))
+    seen = len(re.findall(r'^\s*needs_human="[a-z]+",$', src, re.M))
+    assert seen == specs, f"{specs} registrations but the scan sees {seen}"
+
+
 def test_the_seat_prompt_teaches_the_whole_vocabulary():
     """A class the panel seats are never shown is a class they cannot emit, and
     the counts #279 built would be short by exactly that kind of judgement."""
