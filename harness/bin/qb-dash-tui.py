@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """qb-dash-tui — the fleet dashboard, clickable.
 
-Same five views as qb-dash (fleet / claims / plan / PRs / issues), but as a
-Textual app, so rows respond to the mouse. What a click does depends on what
-you clicked:
+The same two tables as qb-dash — AGENTS and WORK — but as a Textual app, so rows
+respond to the mouse. What a click does depends on what you clicked:
 
   a seat        jump the tmux cursor to that seat's pane — the dashboard is a
                 switcher, which is the whole reason to have it beside the seats.
-                Its ✕ closes the pane; the ＋ row under the last seat adds one.
-                Both go through qb-seat-click, so they mean exactly what the
-                same widgets on the tmux seat bar mean
+                Its ✕ closes the pane; the ＋ under the last row adds one. Both
+                go through qb-seat-click, so they mean exactly what the same
+                widgets on the tmux seat bar mean
   an agent      its cwd, branch, model and session id, in the detail line
-  a claim       the claim note, which is where an agent says what it is doing
-  a plan item   its plan, its note and what it waits on — the reasoning behind
-                its place in the order, which lives on the board and nowhere
-                else — or its ⚒, to start /fix-issue on the issue behind it
-  a PR          open it on GitHub — or its ⚖, to start /panel-review-pr on it
-                in a new pane of the seat row, beside the work it is about
-  an issue      open it on GitHub — or its ⚒, to start /fix-issue on it
+  a claim       the note the claiming agent left, which for a claim whose agent
+                has gone is the only record of it left
+  a work row    why it is where it is — a plan item's note and what it waits on,
+                or what review is waiting for, or the issue on GitHub — and its
+                verb column takes the issue (⚒) or starts the round (⚖)
+  a dial        why it is set, or its ✎ to set or clear it
 
-The ⚒ goes through `qb-start` (#371), so what it starts is counted by
-`qb-admit`, holds a claim taken before the process exists, is endable by session
-id from the moment the pane appears, and is recorded on the board as `via dash`.
-It therefore also inherits `qb-start`'s gate: on a machine that has not opted in
-— which is every machine by default — the ⚒ refuses and names the one line of
-nix that turns it on. It does not fall back to starting an uncounted session;
+TWO TABLES WHERE THERE WERE SEVEN (#589). SEATS, FLEET and CLAIMED were three
+views of one subject — a seat is an agent with a pane in front of you, a claim is
+what an agent holds — and PLANS, OPEN PRs, REVIEW QUEUE and ISSUES were four
+answers to one question, two of which printed the same rows: the review queue is
+DERIVED from the open-PR list, so it was a subset by construction. `qb-dash.py`'s
+module docstring has the measurement and what is deliberately still not merged.
+
+The ⚒ goes through `qb-start` (#371), so what it starts is counted by `qb-admit`,
+holds a claim taken before the process exists, is endable by session id from the
+moment the pane appears, and is recorded on the board as `via dash`. It therefore
+also inherits `qb-start`'s gate: on a machine that has not opted in — which is
+every machine by default — the ⚒ refuses and names the one line of nix that turns
+it on. It does not fall back to starting an uncounted session;
 `Dash.spawn_refusal` is where that decision is argued.
 
 The ⚖ still starts its review directly, and that is not an oversight: a panel
@@ -32,19 +37,35 @@ review lands in a PANE of the seat row, beside the work it is about, and
 `qb-start` makes windows. Giving it a placement argument is a bigger change than
 #371, and the ⚒ is where the loop needed a beginning.
 
-Keys: r refresh now, o open the selected PR, s widen or narrow the scope, q quit.
+Keys: r refresh now, o open the selected row, p panel-review it, f take its
+issue, w only what a person owes an answer about, b the backlog nothing is
+waiting on, s widen or narrow the scope, q quit.
+
+IT ALSO PUTS THE PLAN IN ORDER (#443), which until now could be done from a
+browser and nowhere else — and the person the plan belongs to works in a
+terminal. `m` marks a row, `k`/`j` move one place, `K`/`J` move five, `[`/`]` go
+to the ends, and `g` asks for a position. Marked rows move together, keeping the
+order you see them in.
+
+The credential is the one the `✎` already uses: `POST /plan/reorder` depends on
+`app.auth.delegated`, which accepts a person's own `X-Human-Key`. A move from
+here is stamped `ordered`, exactly as the browser's ▲▼ are, because it is the
+same person deciding.
 
 It opens NARROW: the rows of the project this screen is for (`--repo`, else
 QB_DASH_REPOS, else the cwd's origin), with the repo column dropped, because on a
 one-project screen that column is the same word on every row and the pane is
 78 columns wide (#261). `s` widens it to the whole fleet and brings the column
-back; QB_DASH_SCOPE=all opens that way.
+back; QB_DASH_SCOPE=all opens that way. It also opens with the backlog HIDDEN —
+the open PRs review has finished with, and the issues nobody has taken — because
+those are a catalogue rather than state; `b` shows them and QB_DASH_BACKLOG=1
+opens that way, and their counts are on the header line regardless.
 
 It also opens in ONE COLUMN, and lays the panels out in two above 157 of them —
 which is two of the 78 a table wants before it wraps, plus the gutter. What the
-second column buys is height: seven panels dividing one column's rows is why
-CLAIMED and REVIEW QUEUE are two rows tall on a screen nobody would call short.
-`QB_DASH_WIDE` moves the threshold; below it nothing about the layout changes.
+second column buys is height, and with two tables it buys a great deal more of it
+than it did with seven. `QB_DASH_WIDE` moves the threshold; below it nothing
+about the layout changes.
 
 Textual requests mouse tracking from the terminal, and tmux forwards events to
 a pane that asks for them — so this needs no tmux configuration beyond the
@@ -171,6 +192,92 @@ class Confirm(ModalScreen[bool]):
 
     def action_no(self) -> None:
         self.dismiss(False)
+
+
+class MoveTo(ModalScreen[int | None]):
+    """Where in the plan should this go — a POSITION, not the rank on the row.
+
+    THE DISTINCTION IS NOT PEDANTRY AND THE PANE HAS TO STATE IT. Ranks go
+    non-contiguous as work finishes: `prisonblues/quarterback` was on
+    `1, 3, 4, 5, 10, 11, …` with 37 open items when this was written, so "move it
+    to 10" means two different rows depending on which number a person meant. A
+    position is unambiguous and is what `POST /plan/reorder` takes — it is handed
+    a sequence, and the rank falls out of where a thing sits in it.
+
+    It heals itself after one use: the endpoint renumbers the whole scope `1..n`,
+    so the first reorder makes rank and position the same number and they stay
+    that way until something is finished or dropped.
+
+    So the box says where the row is NOW and how long the list is, and the number
+    typed is read against that. `enter` applies, `esc` cancels — the shape
+    `Confirm` uses, because this is the same kind of decision and a second habit
+    would be one too many.
+    """
+
+    # NO `enter` BINDING, and its absence is the point: an `Input` with focus
+    # consumes Enter and turns it into `Input.Submitted`, so a screen-level
+    # binding for it never fires — the first cut of this box would not close.
+    # `DialEdit` reaches for `ctrl+s` to sidestep exactly this; here the submit
+    # event is the more natural door, because there is one field and pressing
+    # Enter in it means "that is my answer".
+    BINDINGS = [("escape", "cancel", "cancel")]
+
+    CSS = """
+    MoveTo { align: center middle; }
+    #box { width: 90%; max-width: 64; height: auto; padding: 1 2;
+           background: $panel; border: thick $accent; }
+    #where { color: $text-muted; padding: 0 0 1 0; }
+    #why { color: $error; height: auto; }
+    """
+
+    def __init__(self, what: str, scope: str | None, here: int, total: int) -> None:
+        super().__init__()
+        self.what, self.scope = what, scope
+        #: 1-based, because that is what the box shows and what a person types.
+        self.here, self.total = here, total
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Static(Text(f"move {self.what}", style="bold"))
+            yield Static(Text(f"now at {self.here} of {self.total} "
+                              f"in {self.scope or 'the fleet-wide plan'}", style="dim"),
+                         id="where")
+            yield Input(placeholder=f"position 1–{self.total}", id="to")
+            yield Static("", id="why")
+            yield Static(Text("enter — move     esc — cancel", style="bold $accent"))
+
+    def on_mount(self) -> None:
+        self.query_one("#to", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the field — the only field — is the answer."""
+        self.action_save()
+
+    def action_save(self) -> None:
+        """Refuse HERE rather than at the write, because this is where the typing is.
+
+        A number nobody can parse and a number outside the list are both mistakes a
+        person makes mid-keystroke, and the box has a line to say so on. Sending
+        either would spend a round trip to be told something this screen already
+        knows.
+        """
+        typed = self.query_one("#to", Input).value.strip()
+        try:
+            at = int(typed)
+        except ValueError:
+            self.query_one("#why", Static).update(
+                Text(f"{typed!r} is not a position — type a number between 1 "
+                     f"and {self.total}", style="bold $error"))
+            return
+        if not 1 <= at <= self.total:
+            self.query_one("#why", Static).update(
+                Text(f"{at} is outside this plan — it holds {self.total} open "
+                     f"item{'s' if self.total != 1 else ''}", style="bold $error"))
+            return
+        self.dismiss(at - 1)                      # 0-based, which is what splices
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class DialEdit(ModalScreen[dict | None]):
@@ -784,14 +891,14 @@ class ClickTable(DataTable):
 
 
 class Dash(App):
-    """Five tables and a detail line."""
+    """Two tables, the dials above them, and a detail line."""
 
     CSS = """
     Screen { background: $surface; }
     /* Hidden until the first fetch says there is something to show — and since
-       #426 "something" is the caps OR the review-queue cell that rides beside
-       them, so an install with no subscription token still gets the queue depth
-       rather than losing the row it sits on. See render_limits. */
+       #426 "something" is the caps OR the tallies that ride beside them, so an
+       install with no subscription token still gets the queue depth rather than
+       losing the row it sits on. See render_limits. */
     #limits { height: 1; padding: 0 1; background: $panel; color: $text;
               display: none; }
     #head { height: 1; padding: 0 1; background: $panel; color: $text; }
@@ -802,52 +909,44 @@ class Dash(App):
     /* THE SHARE IS ON THE PANEL, NOT ON THE TABLE. Each title and its table are
        one `.panel` so that the wide layout has something to place: a grid puts
        CELLS in columns, and a title in one column with its table in the other is
-       what happens if the seven pairs are left loose in the container. The table
-       then takes `1fr` of its own panel — everything the title left — so the
-       shares below still read as shares of the pane. */
+       what happens if the pairs are left loose in the container. The table then
+       takes `1fr` of its own panel — everything the title left — so the shares
+       below still read as shares of the pane. */
     #body { layout: vertical; }
     .panel { layout: vertical; }
     .panel > DataTable { height: 1fr; }
 
     /* A share of the pane each, and each scrolls inside its share. With
-       `height: auto` the four tables simply stack past the bottom of a 42-row
-       pane: the PRs then cannot be clicked, because they are not on screen —
-       which is how the click test caught it. */
-    /* SEATS sizes to its CONTENT, and it is the only panel here that may.
-       Every other one is unbounded — the fleet, the plan and the issue list are
-       as long as the board is — so `height: auto` on those is what put the PR
-       table off the bottom of the pane and made its rows unclickable. This one
-       is bounded by the seats in the row plus the ＋, so an fr share buys it
-       nothing and costs it the ＋ the moment another panel appears: adding
-       REVIEW QUEUE took the denominator from 10fr to 11fr and the ＋ row, the
-       only way to add a seat with the mouse, fell off a 50-row screen.
+       `height: auto` the tables simply stack past the bottom of a 42-row pane:
+       the rows at the end then cannot be clicked, because they are not on
+       screen — which is how the click test caught it.
 
-       12 IS NOT A ROUND NUMBER, it is the tallest this table can be: the header,
-       MAX_SEATS=10 from qb-seats, and the ＋. A smaller cap would scroll the
-       ＋ out of view on a full screen and reintroduce the bug above four seats
-       below the ceiling the script already enforces — a cap and a maximum have to
-       be quoted from the same place or one of them silently wins. */
-    #p_seats  { height: auto; }
-    #seats    { height: auto; max-height: 12; }
-    /* Sized to its CONTENT like SEATS, and for SEATS' reason: a fleet with nothing
-       set is two rows, and an fr share would spend the rest on blank space that
-       comes straight off ISSUES — already the panel that falls below the fold
-       (#269). The cap is where it stops growing and starts scrolling, which is the
-       right way round here: the printed renderer has to stop listing and count the
-       rest (DIAL_ROWS), and this one does not, so nothing is hidden by it. 7 is
-       four dials and the row that says where to turn one; a fleet with more than
-       that in force has a configuration question rather than a layout one. */
+       TWO TABLES WHERE THERE WERE SEVEN (#589). SEATS, FLEET and CLAIMED were
+       three views of one subject and are now AGENTS; PLANS, OPEN PRs, REVIEW
+       QUEUE and ISSUES were four answers to one question and are now WORK. The
+       shares are the old ones added up: AGENTS carries what SEATS, FLEET (2fr)
+       and CLAIMED (1fr) carried, and WORK what the other four did.
+
+       AGENTS IS NOT CONTENT-SIZED, and SEATS' exemption does not survive into
+       it. SEATS could be `auto` because it was bounded — MAX_SEATS panes plus
+       the ＋ — and this table also holds the fleet and every claim nobody
+       answers for, which is as long as the board is. That is the exact
+       unboundedness that put a table off the bottom of the pane the last time
+       something here was sized to its content. */
+    /* Sized to its CONTENT, which SEATS was and for SEATS' reason: a fleet with
+       nothing set is two rows, and an fr share would spend the rest on blank
+       space that comes straight off WORK. The cap is where it stops growing and
+       starts scrolling, which is the right way round here: the printed renderer
+       has to stop listing and count the rest (DIAL_ROWS), and this one does not,
+       so nothing is hidden by it. 7 is four dials and the row that says where to
+       turn one; a fleet with more than that in force has a configuration
+       question rather than a layout one. */
     #p_dials  { height: auto; }
     #dials    { height: auto; max-height: 7; }
-    #p_fleet  { height: 2fr; }
-    #p_claims { height: 1fr; }
-    #p_plan   { height: 2fr; }
-    #p_prs    { height: 2fr; }
-    /* 1fr, not 2: the queue is at most as deep as OPEN PRs above it and is
-       usually shorter, and every row it takes here comes off ISSUES — which is
-       already the panel that falls below the fold (#269). */
-    #p_queue  { height: 1fr; }
-    #p_issues { height: 2fr; }
+    #p_agents { height: 2fr; }
+    /* The longer of the two and by some way: the plan is every repo's list, and
+       with the backlog on it carries every open issue as well. */
+    #p_work   { height: 3fr; }
 
     /* ---- and the same panels in two columns, when there are columns to spare.
        Textual has no media query, so the class is set from `on_resize` and the
@@ -856,33 +955,23 @@ class Dash(App):
        rather than leaning on the default: the two rules have to be able to
        disagree.
 
-       WHAT TWO COLUMNS BUY IS HEIGHT, not width. Seven panels sharing one
-       column's rows is why CLAIMED and REVIEW QUEUE are two rows tall on a pane
-       nobody would call short; the same seven over four grid rows are three to
-       five times that, and no panel's share had to be taken from another's.
+       WHAT TWO COLUMNS BUY IS HEIGHT, not width — and with two tables instead of
+       seven it buys a great deal more of it. Seven panels dividing one column's
+       rows is why CLAIMED and REVIEW QUEUE were two rows tall on a pane nobody
+       would call short; AGENTS and WORK side by side each get the pane's whole
+       height, which is three to five times what any of their parts had.
 
-       DIALS AND SEATS SPAN BOTH, and for one reason said twice: they are the two
-       panels whose height is their CONTENT, so a column of their own would buy
-       them nothing and cost the panel beside them half its width. DIALS keeps
-       its place at the top for the reason it was put there — it is the
-       configuration every panel below is running under — and SEATS keeps the ＋
-       findable, which is the one thing that panel has to do (see the cap above).
-       They are also the only `auto` rows: the three under them divide what is
-       left.
+       DIALS SPANS BOTH and keeps its place at the top, for the reason it was put
+       there: it is the configuration every row below it is running under. It is
+       also the only `auto` row, so the two tables divide everything left.
 
-       THE WEIGHTS ARE THE NARROW ONES, PAIRED. A row is as tall as the taller of
-       the two panels in it wants to be, and narrow that is 2fr for all three
-       pairs — (FLEET, CLAIMED), (OPEN PRs, REVIEW QUEUE), (PLANS, ISSUES) — so
-       equal thirds is the faithful translation. PLANS and ISSUES get the extra
-       because they are the two panels that are always long: the plan is every
-       repo's list and the issue list is every open issue, while OPEN PRs is
-       usually under ten and is often zero. Both short panels ride with a long
-       one rather than with each other, so no row is dead space on a quiet day. */
-    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto auto 2fr 2fr 3fr;
+       ONE GRID ROW OF TABLES, not three. The narrow weights were paired to stop a
+       short panel riding with another short one and leaving a row of dead space;
+       with two panels there is no pairing left to do, and both of them are long. */
+    #body.-wide { layout: grid; grid-size: 2; grid-rows: auto 1fr;
                   grid-gutter: 0 1; }
     #body.-wide .panel { height: 100%; }
     #body.-wide #p_dials { column-span: 2; height: auto; }
-    #body.-wide #p_seats { column-span: 2; height: auto; }
     """
 
     BINDINGS = [
@@ -897,6 +986,29 @@ class Dash(App):
         # shows the screen's own, and a person who wants to compare two projects
         # wants the page. The ✎ on a row is the control; this is the map.
         ("d", "open_dials", "dials"),
+        # The two lists nothing is waiting on. Off by default because they are a
+        # catalogue rather than state — twelve rows of issue list was the single
+        # biggest consumer of the old frame — and one key rather than two because
+        # they are the same kind of thing: work nobody has started and work nobody
+        # is waiting on. Their counts stay on the header line either way.
+        ("b", "toggle_backlog", "backlog"),
+        # The one door, in the terminal. Not folded into `b`: the backlog is work
+        # nobody has started and this is work nobody can start, and a reader
+        # looking for one is not looking for the other.
+        ("w", "toggle_waiting", "waiting"),
+        # PUTTING THE PLAN IN ORDER (#443). Lower case moves one, upper case moves
+        # five, the brackets go to the ends, `g` asks for a position and `m` marks
+        # a row to take with it. Letters rather than arrows because the arrows are
+        # the DataTable's cursor and always will be — a reorder key that fought
+        # the cursor would make the pane unnavigable to fix one thing.
+        ("m", "mark", "mark"),
+        ("k", "move_up", "up"),
+        ("j", "move_down", "down"),
+        ("K", "move_up5", "up 5"),
+        ("J", "move_down5", "down 5"),
+        ("left_square_bracket", "move_top", "to top"),
+        ("right_square_bracket", "move_bottom", "to bottom"),
+        ("g", "move_to", "move to…"),
         ("z", "expand", "expand"),
         ("question_mark", "help", "keys"),
     ]
@@ -909,24 +1021,13 @@ class Dash(App):
     # font makes 157 columns comfortable can have the wide layout sooner.
     WIDE_COLUMNS = 157
 
-    # The ⚖ lives in its own column so that clicking it means something
-    # different from clicking the row. Column 1 of the PR table.
-    PANEL_COLUMN = 1
-    # And column 1 of the SEATS table is the ✕ that closes one. Same column
-    # everywhere on purpose: the action icon is always the second cell, so
-    # "click the icon, not the row" is one habit rather than five.
-    KILL_COLUMN = 1
-    # The same trick on the issue table: column 1 is the ⚒ that takes the issue.
-    # The plan table puts its ⚒ in the same column, for the same reason and with
-    # the same meaning — a plan item that points at an issue is an issue you can
-    # take, and having it in one place means one thing to learn.
-    FIX_COLUMN = 1
-    # And column 1 of the DIALS table is the ✎ that opens the page where a dial
-    # can actually be turned. Same column as the other three, because "the action
-    # icon is always the second cell" is one habit rather than four — and the same
-    # meaning as the ⚒ next door: this is the verb, the rest of the row is the
-    # explanation.
-    EDIT_COLUMN = 1
+    # WHERE THE VERB LIVES. One constant where there were four — PANEL_COLUMN,
+    # KILL_COLUMN, FIX_COLUMN and EDIT_COLUMN, every one of them 1 and every one
+    # of them documented as "the same column everywhere on purpose". With two
+    # tables instead of seven that is no longer a convention four places have to
+    # keep: it is one column per table, carrying whatever verb the row under it
+    # wants, and "click the icon, not the row" is one habit rather than five.
+    VERB_COLUMN = 1
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
                  plan_interval: float = 15.0, scope: "qd.Scope | None" = None,
@@ -1040,6 +1141,39 @@ class Dash(App):
         # screen — costs a comparison and no reflow.
         self.wide = False
         self.wide_at = env_columns("QB_DASH_WIDE", self.WIDE_COLUMNS)
+        # Whether WORK also lists the open PRs review has finished with and the
+        # open issues nobody has planned or taken. `b` toggles it; the printed
+        # renderer takes `--backlog`, which is the same decision made once at
+        # launch because that one has no keyboard.
+        self.backlog = os.environ.get("QB_DASH_BACKLOG", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        # Only the rows a person owes an answer about — the terminal half of
+        # #274's one door. `None` until the board has answered, so the header cell
+        # can tell "nobody is waiting" from "nobody has been asked" (#244).
+        self.blockers: dict | None = None
+        self.waiting = os.environ.get("QB_DASH_WAITING", "").strip().lower() in (
+            "1", "true", "yes", "on")
+        #: Plan rows the next move takes together, by row key. A SET and not an
+        #: ordered list on purpose: the moved rows keep the order they are shown
+        #: in, so marking three and sending them to position 9 means "these three,
+        #: as you see them, starting there" — a mark that also recorded a sequence
+        #: would be a second order to keep in step with the board's.
+        self.marked: set[str] = set()
+        #: Whether a reorder is in flight, so a second press is refused rather than
+        #: superseding it — `dial_writing`'s rule (#577), and for its reason: the
+        #: worker is `exclusive`, so pressing again would cancel the write that was
+        #: about to report and seeing nothing is what makes a person press again.
+        self.reordering = False
+        #: The row key WORK puts the cursor back on after its next rebuild, or None.
+        #: A move rewrites the table, and a DataTable's cursor is an INDEX — so
+        #: without this the row a person just moved slides out from under them and
+        #: the next press moves whatever has taken its place. Pressing `j` four
+        #: times should move one thing four places, which is the whole point of
+        #: having a key rather than a modal.
+        self.follow: str | None = None
+        #: The plan as the board last stated it, kept while a move is in flight so
+        #: a refusal can put the rows back. `None` when nothing is optimistic.
+        self.rollback: dict | None = None
 
     # ---- layout ---------------------------------------------------------
 
@@ -1064,34 +1198,24 @@ class Dash(App):
             with Vertical(classes="panel", id="p_dials"):
                 yield Static("DIALS", classes="title", id="t_dials")
                 yield ClickTable(id="dials", cursor_type="row")
-            with Vertical(classes="panel", id="p_seats"):
-                yield Static("SEATS", classes="title", id="t_seats")
-                yield ClickTable(id="seats", cursor_type="row")
-            with Vertical(classes="panel", id="p_fleet"):
-                yield Static("FLEET", classes="title", id="t_fleet")
-                yield ClickTable(id="fleet", cursor_type="row", zebra_stripes=False)
-            with Vertical(classes="panel", id="p_claims"):
-                yield Static("CLAIMED", classes="title", id="t_claims")
-                yield ClickTable(id="claims", cursor_type="row")
-            with Vertical(classes="panel", id="p_plan"):
-                yield Static("PLANS", classes="title", id="t_plan")
-                yield ClickTable(id="plan", cursor_type="row")
-            with Vertical(classes="panel", id="p_prs"):
-                yield Static("OPEN PRs", classes="title", id="t_prs")
-                yield ClickTable(id="prs", cursor_type="row")
-            # Directly under OPEN PRs, which is where it answers the question that
-            # panel raises and cannot: that one says a PR exists and CI is green,
-            # this one says whether anybody has reviewed it (#273).
-            with Vertical(classes="panel", id="p_queue"):
-                yield Static("REVIEW QUEUE", classes="title", id="t_queue")
-                yield ClickTable(id="queue", cursor_type="row")
-            with Vertical(classes="panel", id="p_issues"):
-                yield Static("ISSUES", classes="title", id="t_issues")
-                yield ClickTable(id="issues", cursor_type="row")
-        yield Static("click: seat→pane, ✕→close it, ＋→add one, PR→GitHub, "
-                     "plan row→why, queue row→what it waits on, dial row→why it is "
-                     "set, ⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
-                     "   ? for keys",
+            with Vertical(classes="panel", id="p_agents"):
+                yield Static("AGENTS", classes="title", id="t_agents")
+                yield ClickTable(id="agents", cursor_type="row", zebra_stripes=False)
+            with Vertical(classes="panel", id="p_work"):
+                yield Static("WORK", classes="title", id="t_work")
+                yield ClickTable(id="work", cursor_type="row")
+        yield Static("click: seat→pane, ✕→close it, ＋→add one, agent→where it "
+                     "is, claim→its note, work row→why it is where it is, "
+                     "⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
+                     # NO SQUARE BRACKETS IN THIS STRING. `#detail` is a Static
+                     # that parses markup, and `[/]` — the obvious way to write
+                     # the two keys that send a row to the ends — is a closing
+                     # tag with nothing to close, which takes the first render
+                     # down with a MarkupError. The keys are named in words here
+                     # and shown as themselves by `?`, which goes through `say`
+                     # and is wrapped in a Text.
+                     "   m mark · k j move · K J five · brackets to the ends · "
+                     "g move to · ? for keys",
                      id="detail")
         yield Footer()
 
@@ -1101,8 +1225,6 @@ class Dash(App):
         # `return` above this would leave a wide pane in the narrow layout for as
         # long as it stayed exactly that wide.
         self.relayout()
-        self.query_one("#seats", DataTable).add_columns("", "✕", "seat", "state", "running", "where")
-        self.query_one("#claims", DataTable).add_columns("who", "key", "left")
         # NOT in build_columns, and that is the one table here for which that is
         # right: its scope cell names the LAYER a value came from — fleet or this
         # repo — rather than a project, and that is half of what a dial's answer
@@ -1135,7 +1257,7 @@ class Dash(App):
         self.set_interval(self.gh_interval, self.refresh_issues)
 
     def build_columns(self) -> None:
-        """Give the four repo-bearing tables their columns, per the current scope.
+        """Give the two tables their columns, per the current scope.
 
         Called on mount and again on every `s`, because the repo cell is not a
         setting on a row — it is a whole column, and adding or removing one means
@@ -1143,26 +1265,23 @@ class Dash(App):
         call appends a duplicate set and every row is drawn against the wrong
         headers.
 
-        THE ACTION ICONS STAY IN COLUMN 1. `PANEL_COLUMN`, `FIX_COLUMN` and
-        `KILL_COLUMN` are indices into these tables, so the column that comes and
-        goes has to be the one AFTER them — click the ⚖ with the repo cell hidden
-        and it must still mean review, not open.
+        THE ACTION ICON STAYS IN COLUMN 1, and with two tables that rule finally
+        means what it always said. There were four constants for it — PANEL,
+        FIX, KILL, EDIT — all equal to 1 and all documented as "the same column
+        everywhere on purpose"; there is now one column per table carrying
+        whatever verb the row under it wants, so the toggling repo cell still has
+        to sit after it, and nothing else indexes past.
         """
         repo = ("repo",) if self.scope.column else ()
         for table_id, columns in (
             # `stage` goes between `state` and the toggling repo cell: it is a
             # fixed column, so it must sit ABOVE the one that comes and goes for
-            # the same reason the action icons do (#262). `rank` goes after the
-            # repo cell for the opposite reason: it is the plan's own column and
-            # nothing indexes past it.
-            ("#fleet", ("who", "state", "stage", *repo, "what", "ttl")),
-            ("#plan", ("", "⚒", *repo, "rank", "ref", "title", "who")),
-            ("#prs", ("", "⚖", *repo, "pr", "title", "age")),
-            # `waiting for` before `age` and both before the title: the whole
-            # point of the panel is the verb and the wait, and a title long
-            # enough to be useful would push them off a 78-column pane.
-            ("#queue", ("", "⚖", *repo, "pr", "waiting for", "age", "title")),
-            ("#issues", ("", "⚒", *repo, "issue", "title", "who")),
+            # the same reason the action icon does (#262).
+            ("#agents", ("", "✕", "who", "state", "stage", *repo, "what", "ttl")),
+            # `kind` before the repo cell for the same reason, and it is the
+            # column that makes one table legible where four panels needed none:
+            # `iss` and `pr` were the panel you were looking at (#272).
+            ("#work", ("", "⚒", "kind", *repo, "rank", "ref", "title", "who")),
         ):
             table = self.query_one(table_id, DataTable)
             table.clear(columns=True)
@@ -1192,8 +1311,16 @@ class Dash(App):
 
     @work(thread=True, exclusive=True, group="board")
     def refresh_board(self) -> None:
+        """Presence, claims and the open questions, on one clock.
+
+        A blocker is raised and answered by people and agents acting NOW, so it
+        belongs on the fast clock beside presence rather than the ninety-second
+        `gh` one: a surface that lagged it would show work as stuck that somebody
+        has just unstuck, on the one surface #274 asks a person to trust.
+        """
         data = qd.fetch_board(self.client)
         self.call_from_thread(self.render_board, data)
+        self.call_from_thread(self.render_blockers, qd.fetch_blockers(self.client))
 
     @work(thread=True, exclusive=True, group="plan")
     def refresh_plan(self) -> None:
@@ -1241,73 +1368,15 @@ class Dash(App):
     def render_seats(self, seats: list[dict]) -> None:
         """The panes of the screen this dashboard is sitting in.
 
-        Deliberately not the same list as FLEET. FLEET is the board's answer to
-        "which agents are live anywhere on the fleet"; this is tmux's answer to
-        "which panes are on the screen in front of you", and only the second can
-        be closed by clicking. A seat whose agent has exited still has a pane,
-        shows here, and is exactly the one worth closing.
+        They are rows of AGENTS now rather than a panel of their own, and the
+        merge is what SEATS was always half of: tmux knows which panes exist and
+        only the board knows what the agent in one is doing, and the join between
+        them was drawn by eye across a border. A seat whose agent has exited still
+        has a pane, still shows, and is still exactly the one worth closing.
         """
         self.seats = seats
-        table = self.query_one("#seats", DataTable)
-        table.clear()
-        # More than one screen on this server means more than one seat 1, so the
-        # number stops being a name. Said only when it is true: on the ordinary
-        # single-screen box "seat 1" is what the pane border and the seat bar both
-        # call it, and renaming it here would be three spellings for one thing.
-        screens = {s.get("session") for s in seats}
-        for s in seats:
-            # By PANE ID, not by seat number. Two screens each with a seat 1 gave
-            # this table the same row key twice, and a DataTable raises DuplicateKey
-            # rather than tolerating it — so the panel that exists to show the
-            # second screen was the thing that could not survive one (#208).
-            key = f"seat:{s['pane']}"
-            live = s.get("command") not in ("bash", "sh", "zsh", "fish", "")
-            # A pane can be running an agent and still be doing nothing you want
-            # to know about, or be waiting on you and look identical. `running`
-            # is tmux's answer (is a process there); `state` is the agent's own.
-            agent = self.seat_state(s)
-            word, style = qd.agent_state(agent)
-            # WHICH SCREEN, when there is more than one — off the tmux session
-            # name, which is what tmux calls that screen and what `qb-seats
-            # resume` takes. It was the seat's board SCOPE, which had to be
-            # derived from two pane options that existed to carry it; the screen
-            # itself has always known its own name (#540).
-            #
-            # Minus the `seats-` that `qb-seats` puts on the front of its default
-            # name, which every screen on a box shares and so distinguishes none
-            # of them — dropping it is what keeps this cell reading `quarterback 1`
-            # rather than `seats-qu…` in the thirteen columns it has.
-            screen_name = s["session"]
-            if screen_name.startswith("seats-") and len(screen_name) > 6:
-                screen_name = screen_name[6:]
-            label = f"{screen_name} {s['seat']}" if len(screens) > 1 \
-                else f"seat {s['seat']}"
-            key = table.add_row(
-                Text("●" if live else "·", style="green" if live else "grey50"),
-                Text("✕", style="bold red"),                 # click to close it
-                Text(qd.clip(label, 13), style="bold"),
-                Text(word or "—", style=style),
-                Text(qd.clip(s.get("command") or "—", 12),
-                     style="white" if live else "grey50"),
-                Text(qd.clip(os.path.basename(s.get("path") or "") or "—", 22),
-                     style="grey50"),
-                key=key,
-            ).value
-            self.rows[str(key)] = s
-        # The ＋ is a ROW rather than a key, because the whole point of this
-        # panel is that the mouse can do it. It carries a record of its own so
-        # dispatch_row has something to look up — a row key with nothing behind
-        # it is dropped on the floor. Filed under the key add_row RETURNS like
-        # every other row here: `seat:add` cannot collide with a `seat:%12`
-        # today, but "this one call site is the exception" is how the rule
-        # above stops being a rule.
-        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
-                                Text("add seat", style="cyan"),
-                                Text(""), Text(""), Text(""),
-                                key="seat:add").value
-        self.rows[str(add_key)] = {"add": True}
-        title = f"SEATS · {len(seats)}" if seats else "SEATS · none on this screen"
-        self.query_one("#t_seats", Static).update(title)
+        self.render_agents()
+
 
     def render_limits(self, limits: list[dict], err: str | None,
                       width: int | None = None) -> None:
@@ -1337,8 +1406,11 @@ class Dash(App):
         pane = self.size.width if width is None else width
         cells = qd.limit_cells(self.limits, max(20, pane - 2))
         tempo = qd.tempo_cell(self.dials)
-        bar.display = bool(cells or self.queue or tempo)
-        if not (cells or self.queue or tempo):
+        anything = bool(cells or self.queue or tempo or self.prs or self.pr_err
+                        or self.issues is not None or self.issue_err
+                        or self.blockers is not None)
+        bar.display = anything
+        if not anything:
             return
         text = Text()
         for i, (label, glyphs, pct, reset, colour) in enumerate(cells):
@@ -1369,6 +1441,59 @@ class Dash(App):
             text.append(f" {depth}", style=f"bold {colour}")
             if age:
                 text.append(f" {age}", style="grey50")
+        # THE ONE DOOR, and it goes FIRST. Every other number on this line is
+        # about what the fleet is doing to itself; this one is the only thing on
+        # the pane that is somebody's to act on, and #274's argument is that it
+        # needs one place a person always sees it. Ten correct escalations went
+        # unread for two days on this repo (#569) — not because nobody looked, but
+        # because looking meant opening something.
+        cell = qd.blocker_tally(self.blockers, self.scope)
+        if cell is not None:
+            word, colour = cell
+            label, _, count = word.partition(" ")
+            if text.plain:
+                text.append("   ")
+            text.append(label, style="bold grey70")
+            text.append(f" {count}", style=f"bold {colour}")
+        # THE TWO TALLIES THE TOGGLED LISTS LEFT BEHIND (#589). OPEN PRs and
+        # ISSUES were read for their headline numbers as much as for their rows,
+        # and the CI tally is the one thing on that pair which the review queue
+        # cannot supply: a PR can be green and unreviewed, or red and already
+        # signed off. A `b` that took the number away with the list would be a way
+        # of forgetting the work exists.
+        if self.prs or self.pr_err:
+            if text.plain:
+                text.append("   ")
+            text.append("PRs", style="bold grey70")
+            if self.pr_err:
+                text.append(" ?", style="bold red")
+            else:
+                text.append(f" {len(self.prs)}", style="bold grey70")
+                for word, colour in qd.pr_tally(self.prs):
+                    text.append(" · ", style="grey50")
+                    text.append(word, style=colour)
+        if self.issues is not None or self.issue_err:
+            if text.plain:
+                text.append("   ")
+            text.append("ISSUES", style="bold grey70")
+            if self.issue_err:
+                text.append(" ?", style="bold red")
+            else:
+                text.append(f" {len(self.issues or [])}", style="bold grey70")
+                # Not "N free" while the board is unreachable: `free` is counted off
+                # claims that are stale or were never fetched, and a count taken from
+                # no claims at all is how a seat gets sent into work somebody holds.
+                # `claims_err` as well as `held is None`: the first means the
+                # board has not answered yet and the second that its last answer
+                # failed, and a free count taken from either is a count taken from
+                # no claims at all — which is how a seat is sent into work somebody
+                # already holds. The table's title has kept this guard since #433;
+                # the header line was counting without it.
+                if self.held is not None and not self.claims_err and self.issues:
+                    free = sum(1 for i in self.issues
+                               if qd.issue_key(i) not in self.held)
+                    text.append(" · ", style="grey50")
+                    text.append(f"{free} free", style="green")
         # And the throttle beside the budget it protects (#477). The caps say what
         # the seats MAY spend; this says whether they are supposed to be spending
         # it at all, and a reader glancing at one is asking about the other. Every
@@ -1412,270 +1537,109 @@ class Dash(App):
         `C-q >`, a zoom — and the class it sets is the whole of what `#body.-wide`
         keys off.
 
-        THE ORDER IS NOT THE SAME IN BOTH LAYOUTS, and that is the only part of
-        this that is not CSS. A grid fills row by row in DOM order, so the narrow
-        order lays OPEN PRs and REVIEW QUEUE into different rows — and "the queue
-        sits directly under the PRs" is the arrangement #273 asked for, not a
-        coincidence of the order they were added in. Wide, `directly under`
-        becomes `directly beside`: PLANS moves down one, which pairs PRs with the
-        queue that reviews them and PLANS with the issues its items point at.
+        THE ORDER IS THE SAME IN BOTH LAYOUTS, and that is new. Seven panels over
+        a two-column grid had to be re-paired by hand — a grid fills row by row in
+        DOM order, so the narrow order put OPEN PRs and REVIEW QUEUE in different
+        rows, and "the queue sits directly under the PRs" was the arrangement #273
+        asked for rather than a coincidence of the order they were added in. With
+        DIALS spanning both columns and AGENTS and WORK beside each other there is
+        no pairing left to arrange, so this is the class and nothing else (#589).
 
-        `move_child` and not a remount, because the panels hold DataTables with a
-        cursor, a scroll offset and the row keys every click resolves through —
-        all of which a remove-and-mount would throw away, and the width crossing
-        the threshold is not news the panel should lose its place over.
+        Losing the `move_child` is worth saying out loud, because it was load
+        bearing in the other direction too: it ran BEFORE `build_columns` in
+        `on_mount`, so when it raised on a panel this change had removed, the
+        tables were never given their columns at all and every row after it failed
+        with "More values provided than there are columns" — a layout call taking
+        down the data path four functions away.
         """
         wide = (self.size.width if width is None else width) >= self.wide_at
         if wide == self.wide:
             return
         self.wide = wide
-        body = self.query_one("#body", Vertical)
-        body.set_class(wide, "-wide")
-        plan = self.query_one("#p_plan", Vertical)
-        if wide:
-            body.move_child(plan, after=self.query_one("#p_queue", Vertical))
-        else:
-            body.move_child(plan, before=self.query_one("#p_prs", Vertical))
+        self.query_one("#body", Vertical).set_class(wide, "-wide")
 
     def render_board(self, data: dict) -> None:
+        """Presence and claims: the AGENTS table, and what WORK needs from claims."""
         self.board = data
-        every = sorted(data.get("agents", []),
-                       key=lambda a: (a.get("repo") or "", a.get("holder") or ""))
-        agents, elsewhere = qd.in_scope(every, self.scope)
-
-        # WHICH OF THESE ARE IN A PANE IN FRONT OF YOU. It marks the rows a click
-        # can jump to and counts them beside the fleet's total, and it is the same
-        # `@qb_session` join the SEATS panel makes — an agent is a seat here if its
-        # conversation is in one of this box's seat panes.
-        #
-        # That reads slightly differently from the seat NAME it replaces, and more
-        # honestly: `seat-lexray-1` on another machine used to count towards this
-        # box's "3 seats" and highlight a row no click could reach (#540).
-        #
-        # `self.seats` is filled by the SEATS worker on its own clock, so on the
-        # first board tick of a fresh dashboard this is empty and nothing is marked.
-        # It fills within seconds, and it is the same trade `seat_states` makes below
-        # for the same reason: two panels, two workers, one join between them.
-        here = {s.get("agent") for s in getattr(self, "seats", []) if s.get("agent")}
+        every = data.get("agents", [])
         head = self.query_one("#head", Static)
         if data.get("error"):
             head.update(Text(f"● board unreachable — {qd.clip(data['error'], 60)}",
                              style="bold red"))
         else:
-            # COUNTED OVER THE ROWS BELOW, not over the whole board, and the scope
-            # is named beside them so the number cannot be read as the fleet's.
-            # "7 live · quarterback" next to a table holding two would be the one
-            # place on this pane where the scope makes something read falsely — and
-            # what is hidden is on FLEET's own title, which is where it belongs.
-            seats = sum(1 for a in agents if a.get("session") in here)
-            head.update(Text(f"● {self.cfg.base_url}   {len(agents)} live · {seats} seats"
-                             f"   {self.scope.label()}", style="green"))
+            # NO COUNTS HERE. This line stated a live count and a seat count worked
+            # out from its own join, while the table below stated the same two off
+            # the rows it had actually drawn — and on the first frame with a seat
+            # in it they disagreed: "4 live · 1 seats" over a table headed "5 live
+            # · 3 seats". `qbdata.agent_tally` is the one place they are counted
+            # now, and this line says what it alone knows: which board, and which
+            # slice of it.
+            head.update(Text(f"● {self.cfg.base_url}   {self.scope.label()}",
+                             style="green"))
 
-        table = self.query_one("#fleet", DataTable)
-        table.clear()
-        for i, a in enumerate(agents):
-            key = f"agent:{i}"
-            # Not "is this agent a seat" — that is not a property of an agent any
-            # more. It is "is this row in a pane in front of you", which is what
-            # the styling is actually for: these are the rows a click can jump to.
-            in_pane = a.get("session") in here
-            who = (a.get("holder") or "?").split("/", 1)[-1]
-            word, style = qd.agent_state(a)
-            key = table.add_row(
-                Text(qd.clip(who, 13), style="bold green" if in_pane else "bold"),
-                Text(word or "—", style=style),
-                # What `state` cannot say: `working` reads the same writing the
-                # first cut and coming out of the third review round, and so do
-                # repo, branch and title. This is the cell that moves (#262).
-                Text(*qd.stage_cell(a)),
-                *self.repo_cell(a.get("repo") or "—"),
-                # The mark goes on the cell the dropped column widened, and marks
-                # the row the scope KEPT without being able to attribute it: with
-                # the repo cell gone, an agent outside any checkout otherwise reads
-                # as one working here (qbdata.scope_mark).
-                Text(qd.scope_mark(self.scope, a.get("repo"))
-                     + qd.clip(a.get("title") or a.get("branch") or "—",
-                               40 if self.scope.column else 50),
-                     style="white" if in_pane else "grey70"),
-                Text(qd.until(a.get("expires")), style="grey50"),
-                key=key,
-            ).value
-            self.rows[str(key)] = a
-        self.query_one("#t_fleet", Static).update(
-            f"FLEET · {len(agents)}{qd.elsewhere(elsewhere)}")
-        # Keep what the board said about each SEAT, keyed by seat number, so the
-        # panel below can say what a pane is doing. The two panels answer
-        # different questions from different sources — tmux knows which panes
-        # exist, only the board knows what the agent in one is doing — and this
-        # is the single point where they meet.
-        # Stashed, not rendered: SEATS has its own refresh worker and re-entering
-        # its table from this one raises DuplicateKey mid-rebuild. The state
-        # appears on the next seats tick, which is seconds, and it is a state a
-        # human is reading rather than a countdown.
-        # FROM EVERY AGENT, not the ones this scope shows. SEATS is deliberately not
-        # FLEET: `tmux_seats()` lists every seat pane on the whole tmux server, so a
-        # pane belonging to another project's screen is on that panel either way, and
-        # narrowing here would leave its `state` cell reading `—` — which is how a
-        # reader sees which seat is waiting on them.
         # Keyed on the SESSION id, which is what the pane carries. An agent with no
         # session is dropped rather than filed under "": a pane with no agent looks
         # up the empty string, and a bucket there would answer it with somebody.
-        self.seat_states = {
-            s: a for a in every if (s := a.get("session"))}
+        # FROM EVERY AGENT, not the ones this scope shows — a seat pane belonging
+        # to another project's screen is still a pane in front of you.
+        self.seat_states = {s: a for a in every if (s := a.get("session"))}
+        self.render_agents()
 
-        claims = sorted(data.get("claims", []), key=lambda c: c.get("expires") or "")
-        ctable = self.query_one("#claims", DataTable)
-        ctable.clear()
-        # A claim's repo is in its KEY and nowhere else, and `plan:<uuid>` names an
-        # item rather than a repo — hence the plan alongside it, and hence a claim
-        # neither can attribute staying put (see qbdata.claim_repo).
-        shown, claims_elsewhere = qd.in_scope(
-            claims, self.scope,
-            lambda c: qd.claim_repo(c.get("key"), qd.plan_items(self.plan)))
-        for i, c in enumerate(shown):
-            key = f"claim:{i}"
-            left = qd.minutes_left(c.get("expires"))
-            key = ctable.add_row(
-                Text(qd.clip((c.get("holder") or "?").split("/", 1)[-1], 13), style="bold"),
-                Text(qd.clip(qd.claim_label(c.get("key") or "?",
-                                            qd.plan_items(self.plan), self.scope), 34),
-                     style="yellow" if c.get("kind") == "issue" else "grey70"),
-                Text(qd.until(c.get("expires")),
-                     style="red" if left is not None and left < 10 else "grey50"),
-                key=key,
-            ).value
-            self.rows[str(key)] = c
-        self.query_one("#t_claims", Static).update(
-            f"CLAIMED · {len(shown)}{qd.elsewhere(claims_elsewhere)}")
-
-        # Who holds which issue comes off the same claims, and only the holder
-        # is displayed — so compare on that, not on the whole claim. A claim
-        # renewing changes its expiry every time, and rebuilding the issue table
-        # for that would move the cursor out from under a click.
-        # From every claim, NOT the ones this scope shows: an issue on this screen,
-        # held by an agent working out of another repo's checkout, is still held.
-        # Narrowing here would draw it as free and send the next seat into it.
-        held = qd.claims_by_issue(claims)
+        # Who holds which issue comes off the same claims, and only the holder is
+        # displayed — so compare on that, not on the whole claim. A claim renewing
+        # changes its expiry every time, and rebuilding for that would move a row
+        # out from under a click.
+        # From every claim, NOT the ones this scope shows: an issue on this screen
+        # held by an agent working out of another repo's checkout is still held.
+        held = qd.claims_by_issue(data.get("claims", []))
         # A FAILED POLL ANSWERS NOTHING ABOUT CLAIMS, and it arrives shaped exactly
         # like an answer: `fetch_board` reports an outage as `{"claims": [],
         # "error": …}`, which is indistinguishable here from "nobody holds
         # anything". Taking it as one overwrites a real prior answer with `{}`,
-        # repaints every issue as free, and defeats the ⚒'s guard below — which
-        # reads `held` and cannot see WHY it is empty. `● board unreachable` is on
-        # the head line, but that is a different widget from the row being clicked.
+        # repaints every issue as free, and defeats the ⚒'s guard — which reads
+        # `held` and cannot see WHY it is empty.
         stale, self.claims_err = self.claims_err, data.get("error")
         if self.claims_err:
             # The last good answer stands; only its freshness changed. Except when
             # there is no last good answer — then this is the first one, and the
-            # panel has to be released rather than left waiting on a board that is
-            # down. `{}` is the only order available then, and `claims_err` is what
-            # stops it being read as knowledge: the title says so and the ⚒ refuses.
+            # backlog has to be released rather than left waiting on a board that
+            # is down. `{}` is the only order available then, and `claims_err` is
+            # what stops it being read as knowledge: the title says so and the ⚒
+            # refuses.
             if self.held is None:
                 self.held = {}
-            self.render_issues(self.issues, self.issue_err)
+            self.render_work()
             return
-        # `self.held is None` is its own reason to render: the FIRST answer has
-        # to reach the table even when it is empty, and comparing holders alone
-        # cannot see that transition — {} and {} are equal. That is the case the
-        # renewal guard above was never written for. A board that has just COME
-        # BACK is the same shape of transition — the rows are unchanged and what
-        # they are worth is not — hence `stale` here. `render_issues` decides
-        # whether that answer is enough to paint on; it is not, on its own.
+        # `self.held is None` is its own reason to render: the FIRST answer has to
+        # reach the table even when it is empty, and comparing holders alone cannot
+        # see that transition — {} and {} are equal. A board that has just COME
+        # BACK is the same shape of transition, hence `stale`.
         if self.held is None or stale or holders(held) != holders(self.held):
             self.held = held
-            self.render_issues(self.issues, self.issue_err)
+        self.render_work()
 
     def render_plan(self, plan: dict, err: str | None) -> None:
-        """The board's plan — every repo's list — in the board's own order.
+        """The board's plan — every repo's list, in the board's own order.
 
-        Rebuilt only when the plan actually changed. The other tables can be
-        redrawn on a clock because their rows carry a countdown, but this one is
-        the panel a reader dwells on, and a rebuild between the mouse going down
-        and the click arriving moves the row out from under the pointer.
-
-        The rows arrive ranked and are drawn ranked. Re-banding them here — taken,
-        free, blocked — was a second answer about an ordered list, computed
-        against that list's own order; `next` is what the banding was reaching for
-        and the board sends it outright.
+        Both tables, not one: WORK is ordered by it, and AGENTS needs it to say
+        what a claim is ON. A claim keyed `item:<uuid>` is 36 hex characters
+        without the item behind it, and an issue number is a number without the
+        words (`qbdata.claim_summary`).
         """
-        # The WHOLE envelope is kept, and the scope applied after: `self.plan` is
-        # what resolves a `plan:<uuid>` claim to a title and a repo, and a claim
-        # from another project must still resolve — otherwise widening the scope
-        # would show rows this client can no longer explain.
-        self.plan, self.plan_err = plan, err
-        repos = qd.resolve_repos()
-        items, hidden = qd.in_scope(qd.plan_items(plan), self.scope)
-        next_id = qd.plan_next_id(plan)
-        # THE HIDDEN COUNT IS PART OF THE SIGNATURE, because it is part of the title.
-        # Computed from the visible rows alone, the signature cannot see another
-        # repo's items being added or removed, and the early return then leaves a
-        # stale "N elsewhere" on a panel whose own rows really are unchanged — the
-        # same defect `action_toggle_scope` drops `plan_sig` to avoid, on the poll
-        # path rather than the keypress one.
-        #
-        # The covering holder is in it as well as the item's own: a plan claim
-        # landing changes the glyph, the band and the whole right-hand column of
-        # every item in that plan, and a signature blind to it would leave those
-        # rows advertising free work until something else moved.
-        #
-        # So is everything the title now reports that no row carries — `next`, the
-        # counts, the unchosen tally — for the same reason the hidden count is:
-        # the board's answer about what to pick up can move while every row on the
-        # pane stays exactly as it was.
-        #
-        # And the ERROR is in it rather than being an exemption from it. The guard
-        # used to read "unchanged and no error", which redraws while a board is
-        # down and then, on the refresh that succeeds, returns early and leaves
-        # `board: …` in the title of a panel that is no longer failing. It only
-        # shows on a plan whose rows did not change across the outage — an empty
-        # one, or a quiet minute — which is the case where nothing else will ever
-        # move to clear it.
-        sig = (hidden, next_id, err, tuple(sorted((plan.get("counts") or {}).items())),
-               (plan.get("order_trust") or {}).get("unchosen"), plan.get("truncated"),
-               tuple((i.get("item_id"), (i.get("claim") or {}).get("holder"),
-                      (i.get("covered_by") or {}).get("holder"),
-                      len(i.get("blocked_by") or []), i.get("rank"),
-                      i.get("rank_source"), i.get("updated"))
-                     for i in items))
-        if sig == self.plan_sig:
+        # A POLL MUST NOT REPAINT OVER A MOVE THAT HAS NOT LANDED. The plan rides
+        # a fifteen-second clock and a reorder takes a round trip, so a tick
+        # arriving in between carries the order the board still has — the one
+        # WITHOUT the move — and would put the row back where it was, then move it
+        # again when the write answered. Two jumps for one keypress reads as a
+        # dashboard that cannot make up its mind. The web board keeps the same
+        # guard and calls it `busy`.
+        if self.reordering:
+            self.plan_err = err
             return
-        self.plan_sig = sig
+        self.plan, self.plan_err = plan, err
+        self.render_agents()
+        self.render_work()
 
-        table = self.query_one("#plan", DataTable)
-        table.clear()
-        for item in items:
-            glyph, colour = qd.plan_state(item, next_id)
-            who, who_colour = qd.plan_who(item)
-            rank, rank_colour = qd.plan_rank(item)
-            issue = qd.plan_issue(item, repos)
-            takeable = (issue is not None and not qd.plan_holder(item)
-                        and self.wrong_repo(issue.get("repo"), "") is None)
-            key = table.add_row(
-                Text(glyph, style=colour),
-                Text("⚒", style="bold cyan" if takeable else "grey30"),
-                *self.repo_cell(qd.short_repo(item.get("repo") or "fleet")),
-                Text(rank, style=rank_colour),
-                Text(qd.plan_ref(item), style="bold grey70"),
-                # A fleet-wide item has no repo to name, and with the column gone
-                # it would read as one of this project's (qbdata.scope_mark).
-                Text(qd.scope_mark(self.scope, item.get("repo"))
-                     + qd.clip(item.get("title"), 42 if self.scope.column else 52),
-                     style="grey50" if colour == "grey50" else "white"),
-                Text(qd.clip(who, 17), style=who_colour),
-                key=f"plan:{item.get('item_id')}",
-            ).value
-            self.rows[str(key)] = item
-        # The heading is one line and clips at the pane edge, so it is given the
-        # room it has — none of which is known before the first layout, where the
-        # width reads 0 and "no room" would drop every segment there is.
-        room = self.query_one("#t_plan", Static).size.width - 12 - len(qd.elsewhere(hidden))
-        title = "PLANS · " + " · ".join(
-            text for text, _ in qd.plan_head_bits(plan, items, hidden,
-                                                  room if room > 20 else None))
-        title += qd.elsewhere(hidden)
-        if err:
-            title += f" · board: {qd.clip(err, 24)}"
-        self.query_one("#t_plan", Static).update(title)
 
     def render_dials(self, dials: dict) -> None:
         """Which dials are in force, which layer answered, why, and for how long — #477.
@@ -1779,218 +1743,350 @@ class Dash(App):
         self.render_limits(self.limits, self.limits_err)
 
     def render_prs(self, prs: list[dict], err: str | None) -> None:
+        """`gh`'s open PRs, kept for WORK to draw and for the header to count."""
         self.prs, self.pr_err = prs, err
-        table = self.query_one("#prs", DataTable)
-        table.clear()
-        for pr in sorted(prs, key=lambda p: -p.get("number", 0)):
-            glyph, colour = qd.ci_state(pr)
-            # By repo AND number. Two watched repos both reach #42 eventually,
-            # and the bare number handed this table the same row key twice (#209).
-            key = f"pr:{qd.repo_ref(pr)}"
-            # Dimmed where the guard would refuse it: an icon that looks clickable
-            # and then explains itself is the "drawn takeable, refused one by one"
-            # this scope work exists to end, one panel over.
-            reachable = self.wrong_repo(pr.get("repo"), "") is None
-            key = table.add_row(
-                Text(glyph, style=colour),
-                Text("⚖", style="bold cyan" if reachable else "grey30"),
-                *self.repo_cell(qd.short_repo(pr.get("repo") or qd.REPO)),
-                Text(f"#{pr.get('number')}", style="bold grey70"),
-                Text(qd.clip(pr.get("title"), 44 if self.scope.column else 56),
-                     style="grey50" if pr.get("isDraft") else "white"),
-                Text(qd.ago(pr.get("updatedAt")), style="grey50"),
-                key=key,
-            ).value
-            self.rows[str(key)] = pr
-        # Every non-green state, not just red. A PR whose runs are gated used to
-        # contribute to no number here at all, which is #324's whole complaint:
-        # the screen said "12 open PRs, 0 red" while one of them had failed and
-        # been buried under an approval gate.
-        counts = qd.ci_counts(prs)
-        tally = "".join(f" · {counts[s]} {w}" for s, w in
-                        (("red", "red"), ("blocked", "blocked"), ("pending", "running"),
-                         ("none", "untested"), ("unknown", "unread")) if counts.get(s))
-        title = f"OPEN PRs · {len(prs)}" + tally
-        if err:
-            title += f" · gh: {qd.clip(err, 24)}"
-        self.query_one("#t_prs", Static).update(title)
+        self.render_work()
+        # The header carries this list's count and CI tally, and it is drawn on the
+        # limits clock — three minutes. Without this the cell up there would keep
+        # the last refresh's numbers while the rows down here showed this one's.
+        self.render_limits(self.limits, self.limits_err)
 
     def render_queue(self, queue: dict) -> None:
-        """What review is waiting on, and how long it has waited — #273.
+        """The derived review queue — the rows of WORK that are about a PR (#273).
 
-        The panel OPEN PRs cannot be: that one says a PR exists and CI is green,
-        and never said whether anybody had reviewed it. On 2026-08-20 six of
-        eight open PRs had never been panelled while the newest round on the
-        board was two and a half days old, and neither number was readable
-        anywhere.
-
-        Rows arrive oldest-drainable first and are drawn in that order. It is a
-        READING order and not a work order — the board refuses to rank the queue
-        (#232 owns that) — so this panel refuses too, and simply shows the top of
-        the list it was handed.
-
-        An entry nothing may act on KEEPS ITS PLACE, greyed, with the reason in
-        its verb column instead of a verb. A queue that hid its blocked entries
-        would report a depth of zero for a repo where everything is stuck (#244),
-        which is the one reading this panel exists to prevent.
+        It has no panel of its own any more and it did not need one: OPEN PRs and
+        REVIEW QUEUE printed the same PRs, because this is derived from that list.
+        What it contributes to a row is the verb and the wait, which is what the
+        queue was ever read for.
         """
         self.queue = queue
-        table = self.query_one("#queue", DataTable)
-        table.clear()
-        entries = queue.get("entries") or []
-        for e in entries:
-            state = e.get("state") or ""
-            colour = qd.QUEUE_COLOUR.get(state, "grey50")
-            drains = bool(e.get("drainable"))
-            holds = e.get("holds") or []
-            hold = holds[0].get("code") if holds else state
-            action = e.get("next_action")
-            verb = (qd.QUEUE_VERB.get(action, action or "")
-                    if drains else qd.QUEUE_HOLD.get(hold, hold))
-            repo = e.get("repo") or qd.REPO
-            # By repo AND number, like every other table here: two watched repos
-            # both reach #42 eventually, and the bare number is what handed a
-            # table the same row key twice (#209).
-            key = f"queue:{qd.short_repo(repo)}#{e.get('pr')}"
-            # The ⚖ is offered ONLY where a panel round is the thing this entry
-            # is waiting for. `fix`, `rebase` and `land` are real next actions
-            # with no button on this dashboard, and `answer` is owed by a human —
-            # drawing a live ⚖ on any of them would start the wrong work, so they
-            # get the same grey the unreachable-repo guard uses one panel over.
-            offers_panel = drains and action in ("review", "re-review")
-            reachable = offers_panel and self.wrong_repo(e.get("repo"), "") is None
-            key = table.add_row(
-                Text("●", style=colour),
-                Text("⚖", style="bold cyan" if reachable else "grey30"),
-                *self.repo_cell(qd.short_repo(repo)),
-                Text(f"#{e.get('pr')}", style="bold grey70"),
-                Text(qd.clip(verb, 11), style=colour if drains else "grey50"),
-                # A `~` on an age that is the longest the wait COULD have been.
-                # Nothing records when a head moved or when a branch started
-                # conflicting, and a number nobody can rely on should say so.
-                Text(("~" if e.get("age_is_upper_bound") else "")
-                     + qd.waited(e.get("age_seconds")), style="grey50"),
-                Text(qd.clip(e.get("title") or "", 30 if self.scope.column else 42),
-                     style="white" if drains else "grey50"),
-                key=key,
-            ).value
-            self.rows[str(key)] = e
-
-        # THE TWO STATES THAT ARE NOT ENTRIES, both of which the plain renderer
-        # draws as rows (qb-dash.py:377-382) and the first cut of this port did
-        # not. Neither is registered in `self.rows`: a key with nothing behind it
-        # is dropped by dispatch_row, which is what a row with no verb wants.
-        #
-        # An error is a ROW and no longer a suffix on the title. The title is
-        # bounded by the pane's width and was clipping the message to 24
-        # characters — a panel whose job is saying WHY something is waiting must
-        # not truncate the one message that says why it cannot tell you.
-        err = queue.get("error")
-        blank = [Text("")] * (1 if self.scope.column else 0)
-        if err:
-            table.add_row(Text("!", style="red"), Text(""), *blank,
-                          Text(""), Text(""), Text(""),
-                          Text(qd.clip(err, 30 if self.scope.column else 42),
-                               style="red"),
-                          key="queue:error")
-        # "Nothing is waiting" and "nothing could be fetched" are different
-        # answers and the board supplies its own wording for the first, so the
-        # fallback here is only for a board too old to send one.
-        if not entries and not err:
-            table.add_row(Text(""), Text(""), *blank,
-                          Text(""), Text(""), Text(""),
-                          Text(queue.get("idle") or "nothing waiting on review",
-                               style="grey50"),
-                          key="queue:idle")
-
-        depth = queue.get("depth") or 0
-        held = max(0, (queue.get("open") or 0) - depth)
-        title = f"REVIEW QUEUE · {depth} waiting"
-        if held:
-            title += f" · {held} held"
-        age, oldest_held = qd.queue_oldest(queue)
-        if age:
-            title += f" · {'held' if oldest_held else 'oldest'} {age}"
-        self.query_one("#t_queue", Static).update(title)
+        self.render_work()
         # The caps line carries this same depth, and it is drawn on the limits
         # clock — an hour long. Without this the cell up there would keep last
-        # hour's number while the panel down here showed this minute's.
+        # hour's number while the rows down here showed this minute's.
         self.render_limits(self.limits, self.limits_err)
 
     def render_issues(self, issues: list[dict] | None, err: str | None) -> None:
-        """Open issues, free ones first, the held ones greyed and named.
-
-        A free issue is the one a seat should take next, so it is what this
-        panel is for: the ⚒ on its row starts /fix-issue on it.
-
-        NOTHING IS PAINTED UNTIL BOTH ANSWERS ARE IN — `gh`'s issues and the
-        board's claims — because either alone draws a table this panel is then
-        about to rearrange, and the rearrangement is #433: a reader picks a row
-        by looking at it, and it has to still be there when the click lands.
-
-        WHAT THIS DOES NOT DO, since the title of the change reads wider than the
-        code: it protects the FIRST paint. A claim taken or dropped later is a
-        real change in the answer and still re-sorts the table, exactly as the
-        renewal guard in `render_board` was written to allow. Holding an order
-        that has gone stale would be the opposite mistake.
-
-        Neither wait can hang. `fetch_board` returns a state rather than raising,
-        so a board that is DOWN still arrives here and releases the paint, and a
-        `gh` that fails answers with an empty list and an error — which is an
-        answer, and is counted and shown as one.
-        """
+        """`gh`'s open issues — the backlog half of WORK, behind `b`."""
         self.issues, self.issue_err = issues, err
-        if self.held is None or self.issues is None:
-            # WHICH answer is missing, and the `gh` error if there is one: the
-            # title is the only place a stalled panel explains itself, and
-            # blaming the board for a `gh` failure it already knows about would
-            # send a reader to the wrong end of the problem.
-            waiting = " and ".join(w for w, missing in
-                                   (("the board", self.held is None),
-                                    ("gh", self.issues is None)) if missing)
-            title = f"ISSUES · waiting for {waiting}"
-            if err:
-                title += f" · gh: {qd.clip(err, 24)}"
-            # Text(), not str: `gh`'s stderr goes in here and a bracketed token
-            # in it — `ConnectionRefusedError: [Errno 111] …`, which survives the
-            # clip — is a Rich style tag to a Static that parses markup. The panel
-            # that exists to explain a stalled state would raise MarkupError from
-            # inside a call_from_thread instead.
-            self.query_one("#t_issues", Static).update(Text(title))
-            return
-        table = self.query_one("#issues", DataTable)
+        self.render_work()
+        self.render_limits(self.limits, self.limits_err)   # the count on the header
+
+
+    def render_agents(self) -> None:
+        """Who is here and how they are doing — SEATS, FLEET and CLAIMED as one
+        table (#589).
+
+        Three panels drew one subject. A seat is an agent with a pane in front of
+        you; a claim is what an agent is holding; `render_board`'s claims half
+        already re-derived its holder by splitting `holder` on `/` exactly the way
+        its fleet half did. The border between them was the only reason the join
+        was never drawn, and a reader asking "what is jasper-moss doing" joined
+        three tables by eye.
+
+        The rows this could not draw before are the ones worth drawing. A claim
+        whose holder no live agent answers for is work somebody holds that nobody
+        is doing, and in CLAIMED it looked exactly like a live one — see
+        `qbdata.CLAIM_ONLY_STATE` for the two ways that happens and why they are
+        told apart rather than collapsed.
+
+        Rebuilt on every tick, which is what FLEET and CLAIMED both did: every row
+        here carries a countdown, so there is nothing for a signature to protect
+        (that argument belongs to WORK, and lives in `qbdata.work_sig`).
+        """
+        rows, hidden = qd.agent_rows(self.board, self.scope,
+                                     qd.plan_items(self.plan), self.seats)
+        table = self.query_one("#agents", DataTable)
         table.clear()
-        free = 0
-        for issue in qd.sort_issues(issues, self.held):
-            number = issue.get("number")
-            claim = self.held.get(qd.issue_key(issue))
-            holder = (claim.get("holder") or "?") if claim else None
-            free += holder is None
-            key = f"issue:{qd.repo_ref(issue)}"     # repo AND number (#209)
-            reachable = self.wrong_repo(issue.get("repo"), "") is None
+        for row in rows:
+            what, what_style = row["what"]
+            # `＋1` rather than a second line: a row is one agent, and an agent
+            # holding two things is one agent holding two things. The rest is one
+            # click away, in the detail line.
+            if row.get("extra"):
+                what = f"{what}  ＋{row['extra']}"
+            seat = row["kind"] == "seat"
             key = table.add_row(
-                Text("·" if holder else "○", style="grey50" if holder else "green"),
-                Text("⚒", style="bold cyan" if reachable and not holder else "grey30"),
-                *self.repo_cell(qd.short_repo(issue.get("repo") or qd.REPO)),
-                Text(f"#{number}", style="bold grey70"),
-                Text(qd.clip(issue.get("title"), 44 if self.scope.column else 56),
-                     style="grey50" if holder else "white"),
-                Text(qd.clip(holder.split("/", 1)[-1], 13) if holder
-                     else qd.ago(issue.get("updatedAt")),
-                     style="yellow" if holder else "grey50"),
-                key=key,
+                Text("●" if row["live"] else "·", style="green" if row["live"] else "grey50")
+                if seat else Text(""),
+                # Only a PANE can be closed. An agent on another machine and a
+                # claim nobody answers for have nothing here to shut, and a live-
+                # looking ✕ on either would be the "drawn takeable, refused one by
+                # one" this dashboard has spent three issues removing.
+                Text("✕", style="bold red") if seat else Text("✕", style="grey30"),
+                Text(qd.clip(row["who"], 13),
+                     style="bold green" if seat else
+                     ("bold" if row["agent"] is not None else "yellow")),
+                Text(*row["state"]),
+                # What `state` cannot say: `working` reads the same writing the
+                # first cut and coming out of the third review round, and so do
+                # repo, branch and title. This is the cell that moves (#262).
+                Text(*row["stage"]),
+                *self.repo_cell(row["repo"] or "—"),
+                # The mark goes on the cell the dropped column widened, and marks
+                # the row the scope KEPT without being able to attribute it: with
+                # the repo cell gone, an agent outside any checkout otherwise reads
+                # as one working here (qbdata.scope_mark).
+                Text(qd.scope_mark(self.scope, row["repo"])
+                     + qd.clip(what, 40 if self.scope.column else 50),
+                     style=what_style),
+                Text(row["ttl"], style="red" if row.get("expiring") else "grey50"),
+                key=row["key"],
             ).value
-            self.rows[str(key)] = issue
-        title = f"ISSUES · {len(issues)}"
-        # Not "N free" while the board is unreachable: `free` is counted off claims
-        # that are stale or were never fetched, and stating it would be the same
-        # collapse this change exists to undo, one panel up from the rows.
-        if issues:
-            title += (f" · claims unknown: {qd.clip(self.claims_err, 20)}"
-                      if self.claims_err else f" · {free} free")
-        if err:
-            title += f" · gh: {qd.clip(err, 24)}"
-        self.query_one("#t_issues", Static).update(Text(title))   # markup: see above
+            self.rows[str(key)] = row
+        # The ＋ is a ROW rather than a key, because the whole point of this panel
+        # is that the mouse can do it. It carries a record of its own so
+        # dispatch_row has something to look up — a row key with nothing behind it
+        # is dropped on the floor.
+        blank = [Text("")] * (1 if self.scope.column else 0)
+        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
+                                Text("add seat", style="cyan"),
+                                Text(""), Text(""), *blank, Text(""), Text(""),
+                                key="seat:add").value
+        self.rows[str(add_key)] = {"kind": "add", "add": True}
+        self.query_one("#t_agents", Static).update(
+            f"AGENTS · {qd.agent_tally(rows)}{qd.elsewhere(hidden)}")
+
+    def work_action(self, row: dict) -> tuple[str, str | None]:
+        """``('⚖', 'panel')`` — the icon this row's verb column wears, and what a
+        click on it does. `None` for the verb means the icon is dim.
+
+        ASKED ONCE, BY BOTH SIDES. The renderer draws what this returns and
+        `dispatch_row` runs what it returns, so an icon that looks live and then
+        explains itself is not reachable from here. Four panels each decided this
+        for themselves and each got a slightly different answer — the queue offered
+        its ⚖ only for `review`/`re-review` while OPEN PRs offered one for any
+        reachable PR, and the same PR could be on both.
+
+        That disagreement is now a rule with one home: a PR the queue is waiting on
+        offers the round the queue is waiting FOR, and nothing else. `fix`,
+        `rebase` and `land` are real next actions with no button on this dashboard,
+        and `answer` is owed by a human — a live ⚖ on any of them starts a round
+        that is spent on the wrong thing, and a conflicting branch burns a whole
+        panel round to tell you it is conflicting (#271).
+        """
+        # A question owed to a person is not something this dashboard can start.
+        # The remedy is the person, and the row says which one.
+        # NO GLYPH AT ALL on a row that is only a question. The state cell already
+        # wears the ⚑ and a second beside it says the same thing twice; an empty
+        # verb cell says the true thing, which is that there is no verb here — the
+        # remedy is the person the row names.
+        if row["kind"] == "blocker":
+            return "", None
+        # AND NOTHING IS OFFERED ON A ROW A PERSON OWES AN ANSWER ABOUT, whatever
+        # else it is. Taking an issue whose shape is still being decided, or
+        # spending a panel round on a PR somebody has been asked whether to revert,
+        # is work done before the answer that governs it — which is the waste #522
+        # is about, arriving through a button. The icon keeps its shape and goes
+        # grey, so the row still says what it WOULD be, and the click explains.
+        if row.get("blocked"):
+            return ("⚖" if self.work_pr(row) else "⚒"), None
+        target = self.work_pr(row)
+        if target is not None:
+            entry = row.get("entry") or {}
+            wanted = (not entry) or entry.get("next_action") in ("review", "re-review")
+            live = wanted and self.wrong_repo(target.get("repo"), "") is None
+            return "⚖", ("panel" if live else None)
+        issue = self.work_issue(row)
+        if issue is None:
+            return "⚒", None
+        taken = (qd.plan_holder(row["item"]) if row.get("item")
+                 else (self.held or {}).get(qd.issue_key(issue)))
+        live = not taken and self.wrong_repo(issue.get("repo"), "") is None
+        return "⚒", ("fix" if live else None)
+
+    def work_pr(self, row: dict) -> dict | None:
+        """``{repo, number}`` for a row that is about a pull request, else None.
+
+        A row is about a PR three ways — it came off the review queue, it came off
+        the open-PR list, or it is a plan item whose ref is a `pr` — and only the
+        first two carry a `gh` row. The launcher wants a repo and a number and
+        nothing else, so this hands it those rather than whichever dict happened
+        to be available.
+        """
+        if row.get("pr"):
+            return {"repo": row["pr"].get("repo"), "number": row["pr"].get("number")}
+        if row.get("entry"):
+            return {"repo": row["entry"].get("repo"), "number": row["entry"].get("pr")}
+        item = row.get("item") or {}
+        ref = item.get("ref") or {}
+        if ref.get("kind") == "pr" and str(ref.get("value") or "").isdigit():
+            return {"repo": qd.plan_repo(item), "number": int(ref["value"])}
+        # A question ABOUT a pull request still names one, and `o` should reach it:
+        # the row exists because the PR is not otherwise on this table, which makes
+        # it the row least likely to be findable any other way.
+        subject = row.get("subject") or {}
+        if subject.get("kind") == "pr" and str(subject.get("value") or "").isdigit():
+            return {"repo": row.get("repo"), "number": int(subject["value"])}
+        return None
+
+    def work_issue(self, row: dict) -> dict | None:
+        """The issue behind a row — its own, or the one its plan item points at."""
+        if row.get("issue"):
+            return row["issue"]
+        return qd.plan_issue(row["item"]) if row.get("item") else None
+
+    def render_work(self) -> None:
+        """What is in flight, in the board's order — PLANS, REVIEW QUEUE, OPEN PRs
+        and ISSUES as one table (#589).
+
+        Four panels answered "what work is there" from four sources, and the same
+        unit of work appeared on up to four of them at once. Two were the same rows
+        outright: the review queue is derived FROM the open-PR list, so it is a
+        subset by construction and all the PR panel added was the CI glyph — which
+        is this table's state cell for a PR row, per #272.
+
+        **The order is the board's and is not re-derived.** Work the plan does not
+        carry is appended below it, unranked: the board deliberately refuses to
+        rank the queue (#232 owns the order), and inventing a position here is the
+        second-answer-about-the-plan defect `render_plan` already had removed.
+
+        NOTHING FROM `gh`'s ISSUE LIST IS PAINTED UNTIL THE BOARD HAS SAID WHAT IS
+        CLAIMED — #433, and the same rule the ISSUES panel kept: an issue list
+        sorted before the claims are in is a list this table is about to rearrange,
+        and a reader picks a row by looking at it. The plan and the queue do not
+        wait, because neither is sorted on claims; that is a strictly better answer
+        than the panel gave, where a slow board held back rows it had no bearing on.
+        """
+        # `issues=None` until the board has answered: `work_rows` then appends no
+        # issue rows at all, which is the wait above expressed where it belongs.
+        rows, hidden = qd.work_rows(
+            self.plan, self.prs, self.queue,
+            self.issues if self.held is not None else None,
+            self.held, self.scope, self.backlog,
+            blockers=(self.blockers or {}).get("blockers"),
+            waiting_only=self.waiting)
+        # ONE SIGNATURE WHERE THERE WAS ONE AND THREE REBUILDS. PLANS had a guard
+        # and OPEN PRs, REVIEW QUEUE and ISSUES each cleared and rebuilt on every
+        # tick of their worker, so this table is steadier than three of the four it
+        # replaces. Everything the TITLE reports that no row carries is in it, for
+        # the reason the hidden count is: the board's answer about what to pick up
+        # can move while every row on the pane stays exactly as it was.
+        sig = (hidden, self.backlog, self.waiting, self.plan_err, self.pr_err,
+               (self.blockers or {}).get("error"), self.issue_err,
+               self.claims_err, self.held is None, qd.plan_next_id(self.plan),
+               tuple(sorted((self.plan.get("counts") or {}).items())),
+               (self.plan.get("order_trust") or {}).get("unchosen"),
+               self.plan.get("truncated"), qd.work_sig(rows))
+        if sig == self.plan_sig:
+            return
+        self.plan_sig = sig
+
+        table = self.query_one("#work", DataTable)
+        table.clear()
+        for row in rows:
+            glyph, colour = row["glyph"]
+            why, why_colour = row["why"]
+            rank, rank_colour = row["rank"]
+            icon, verb = self.work_action(row)
+            key = table.add_row(
+                Text(glyph, style=colour),
+                Text(icon, style="bold cyan" if verb else "grey30"),
+                Text(qd.work_kind(row), style="grey50"),
+                *self.repo_cell(qd.short_repo(row["repo"] or "fleet")),
+                # THE MARK GOES ON THE RANK CELL, which is the column marking is
+                # about: a row is marked so that the next move takes it, and the
+                # rank is where a move shows up. It costs the cell one of its four
+                # characters and `~12` is the longest thing it ever holds.
+                Text(("▪" if row["key"] in self.marked else "") + rank,
+                     style="bold magenta" if row["key"] in self.marked
+                     else rank_colour),
+                Text(row["ref"], style="bold grey70"),
+                # A fleet-wide item has no repo to name, and with the column gone
+                # it would read as one of this project's (qbdata.scope_mark).
+                Text(qd.scope_mark(self.scope, row["repo"])
+                     + qd.clip(row["title"], 38 if self.scope.column else 48),
+                     style="grey50" if row["dim"] else "white"),
+                Text(qd.clip(why, 17), style=why_colour),
+                key=row["key"],
+            ).value
+            self.rows[str(key)] = row
+
+        # THE STATES THAT ARE NOT ROWS. An error is a ROW and not a suffix on the
+        # title: the title is bounded by the pane's width and was clipping these to
+        # 24 characters, and a table whose job is saying WHY something is waiting
+        # must not truncate the one message that says why it cannot tell you.
+        # None is registered in `self.rows` — a key with nothing behind it is
+        # dropped by dispatch_row, which is what a row with no verb wants.
+        blank = [Text("")] * (1 if self.scope.column else 0)
+        # FOUR SOURCES, FOUR NAMES. Both `gh` failures were called `gh` and the row
+        # key carried the first 24 characters of the message, so two `gh` calls
+        # failing the same way — which is the usual way for them to fail — keyed
+        # two rows identically. `ClickTable.add_row` degrades that rather than
+        # raising, but it also logs it as a panel whose keys are not unique, which
+        # would be a true complaint about a fixable name.
+        troubles = [(name, err) for name, err in
+                    (("board", self.plan_err), ("queue", (self.queue or {}).get("error")),
+                     ("blockers", (self.blockers or {}).get("error")),
+                     ("prs", self.pr_err), ("issues", self.issue_err)) if err]
+        for name, err in troubles:
+            table.add_row(Text("!", style="red"), Text(""), Text(""), *blank,
+                          Text(""), Text(""),
+                          Text(qd.clip(f"{name}: {err}", 38 if self.scope.column else 48),
+                               style="red"), Text(""), key=f"err:{name}:{err[:24]}")
+        # WHICH ANSWER IS STILL OUT, and only where it costs a row: the backlog is
+        # the half of this table sorted on claims, so it is the half that waits for
+        # them (#433). Named rather than said generically — blaming the board for a
+        # `gh` failure it already knows about sends a reader to the wrong end of the
+        # problem, which is the ISSUES title's own argument kept through the merge.
+        waiting = [w for w, missing in (("the board", self.held is None),
+                                        ("gh", self.issues is None))
+                   if missing] if self.backlog else []
+        # "Nothing is in flight" and "nothing could be FETCHED" are different
+        # answers, and the board supplies its own wording for a drained queue. Only
+        # when nothing failed and nothing is outstanding: a table that said both
+        # would be answering its own error message with a claim it has no grounds
+        # for, and one that said it while an answer was in flight would be stating
+        # a fact it is about to replace (#244).
+        if not rows and not troubles and not waiting:
+            table.add_row(Text(""), Text(""), Text(""), *blank, Text(""), Text(""),
+                          Text("nothing is waiting on a person" if self.waiting else
+                               ((self.queue or {}).get("idle") or "nothing in flight"),
+                               style="grey50"), Text(""), key="work:idle")
+
+        # THE ROW A MOVE JUST MOVED, back under the cursor. `move_cursor` takes an
+        # index and the indices have all just changed, so this is resolved from the
+        # key — the one identifier a rebuild does not invalidate. Scrolled into
+        # view as well, because a row sent to the bottom of a forty-item plan has
+        # gone somewhere the person cannot see and "where did it go" is the next
+        # question either way.
+        if self.follow:
+            for i, rk in enumerate(table.rows):
+                if str(rk.value) == self.follow:
+                    table.move_cursor(row=i, animate=False)
+                    table._scroll_cursor_into_view(animate=False)
+                    break
+
+        # The heading is one line and clips at the pane edge, so it is given the
+        # room it has — none of which is known before the first layout, where the
+        # width reads 0 and "no room" would drop every segment there is.
+        items, _ = qd.in_scope(qd.plan_items(self.plan), self.scope)
+        # `held is None` as well as `claims_err`: the first means the board has not
+        # answered YET and the second that its last answer failed, and a free count
+        # taken from either is a count taken from no claims at all — which is how a
+        # seat gets sent into work somebody already holds.
+        tally = qd.work_tally(rows, self.prs, self.issues, self.held, self.backlog,
+                              claims_known=self.held is not None and not self.claims_err,
+                              waiting_only=self.waiting)
+        room = (self.query_one("#t_work", Static).size.width - 11
+                - sum(len(bit) + 3 for bit in tally) - len(qd.elsewhere(hidden)))
+        # The plan's counts describe the PLAN, so a filtered view does not claim
+        # them: `39 open · next #1620` over two rows a person owes an answer about
+        # is a title about a list the reader has just asked not to see.
+        title = ("WAITING · " if self.waiting else "WORK · ") + " · ".join(
+            ([] if self.waiting else
+             [text for text, _ in qd.plan_head_bits(self.plan, items, hidden,
+                                                    room if room > 20 else None)]) + tally)
+        title += qd.elsewhere(hidden)
+        if waiting:
+            title += f" · backlog waiting for {' and '.join(waiting)}"
+        elif self.claims_err:
+            title += f" · claims unknown: {qd.clip(self.claims_err, 20)}"
+        # Text(), not str: `gh`'s stderr reaches this line through the tally and a
+        # bracketed token in it — `ConnectionRefusedError: [Errno 111] …` — is a
+        # Rich style tag to a Static that parses markup, and the panel that exists
+        # to explain a stalled state would raise MarkupError instead.
+        self.query_one("#t_work", Static).update(Text(title))
 
     def say(self, text: str) -> None:
         # Kept on the app as well as in the widget: a Static does not hand back
@@ -2028,62 +2124,95 @@ class Dash(App):
         self.dispatch_row(key)
 
     def dispatch_row(self, key: str, column: int | None = None) -> None:
+        """What a click does, by what the row IS rather than by which table it is in.
+
+        There were six branches keyed on a table name and four constants all equal
+        to 1 saying where the verb column was. With two tables the rule is what it
+        always claimed to be: column 1 is the verb, everything else on the row is
+        the explanation — and what the verb DOES is asked of `work_action`, which
+        is the same call the renderer made when it decided whether to draw the icon
+        live. An icon that looks clickable and then explains itself is not
+        reachable from here.
+        """
         record = self.rows.get(key)
         if record is None:
             return
         self.last_dispatch = (key, time.monotonic())
-        kind = key.split(":", 1)[0]
-        if kind == "seat":
-            if record.get("add"):
-                self.add_seat()
-            elif column == self.KILL_COLUMN:
-                self.close_seat(record)
-            else:
-                self.jump_pane(record)
-        elif kind == "agent":
-            self.click_agent(record)
-        elif kind == "claim":
-            self.say(qd.clip(record.get("note") or "(no note on this claim)", 400))
-        elif kind == "pr":
-            if column == self.PANEL_COLUMN:
-                self.panel_pr(record)
-            else:
-                self.open_pr(record)
-        elif kind == "plan":
-            if column == self.FIX_COLUMN:
-                self.fix_plan_item(record)
-            else:
-                # With the envelope, so the row the board named `next` can show the
-                # caveat the board attached to that recommendation.
-                self.say(qd.plan_detail(record, self.plan))
-        elif kind == "queue":
-            if column == self.PANEL_COLUMN:
-                # Only where the row drew a live ⚖. Everything else says what it
-                # is actually waiting for rather than starting a round that would
-                # be spent on the wrong thing — a conflicting branch burns a whole
-                # panel round to tell you it is conflicting (#271).
-                action = record.get("next_action")
-                if action in ("review", "re-review"):
-                    self.panel_pr({"repo": record.get("repo"),
-                                   "number": record.get("pr")})
-                else:
-                    self.say(qd.queue_detail(record))
-            else:
-                self.say(qd.queue_detail(record))
+        kind = record.get("kind") or key.split(":", 1)[0]
+        if kind == "add":
+            self.add_seat()
+        elif kind in ("seat", "agent", "claim"):
+            self.dispatch_agent(record, kind, column)
         elif kind == "dial":
             # The ✎ edits; anything else on the row says what the board said, in
             # full. With no credential on this host the ✎ is the door it always
             # was — the browser — and says so rather than opening a modal whose
             # save could only fail.
-            if column == self.EDIT_COLUMN or record.get("page"):
+            if column == self.VERB_COLUMN or record.get("page"):
                 self.edit_dial(None if record.get("page") else record)
             else:
                 self.say(qd.dial_detail(record))
-        elif kind == "issue":
-            if column == self.FIX_COLUMN:
-                self.fix_issue(record)
-            else:
-                self.open_issue(record)
+        else:
+            self.dispatch_work(record, column)
+
+    def dispatch_agent(self, row: dict, kind: str, column: int | None) -> None:
+        """A seat, an agent, or a claim nobody answers for.
+
+        The ✕ closes a PANE and only a pane, which is why it is dim on the other
+        two: an agent on another machine and an unheld claim have nothing here to
+        shut. Everything else on the row explains it — where the agent is, or what
+        the claiming agent said it was doing, which for a `gone` claim is the only
+        record of it left.
+        """
+        if kind == "claim":
+            claim = row["claim"]
+            self.say(f"{qd.clip(claim.get('key'), 60)} — "
+                     + qd.clip(claim.get("note") or "(no note on this claim)", 340))
+            return
+        if kind == "seat" and column == self.VERB_COLUMN:
+            self.close_seat(row["seat"])
+            return
+        if row.get("agent") is not None:
+            self.click_agent(row["agent"])
+        elif row.get("seat") is not None:
+            self.jump_pane(row["seat"])
+
+    def dispatch_work(self, row: dict, column: int | None) -> None:
+        """A plan item, a PR under review, or an issue nobody has taken.
+
+        The verb column starts the round or takes the issue; the rest of the row
+        says why it is where it is. A PR the queue is waiting on explains the WAIT
+        rather than opening GitHub — that is what the queue row did and it is the
+        more useful of the two answers — and `o` opens it either way.
+        """
+        if column == self.VERB_COLUMN:
+            verb = self.work_action(row)[1]
+            if verb == "panel":
+                self.panel_pr(self.work_pr(row))
+                return
+            if verb == "fix":
+                if row.get("item"):
+                    self.fix_plan_item(row["item"])
+                else:
+                    self.fix_issue(self.work_issue(row))
+                return
+            # A dim icon that swallows the click is indistinguishable from a broken
+            # one, so it falls through and says what the row is instead.
+        # THE QUESTION FIRST, whatever else the row is. A row that is waiting on a
+        # person is waiting whoever holds it and whatever review is owed on it, so
+        # the queue's verb and the plan's note are both the less useful answer.
+        if row.get("blocked"):
+            self.say(qd.blocker_detail(row["blocked"]))
+        elif row.get("entry"):
+            self.say(qd.queue_detail(row["entry"]))
+        elif row.get("item"):
+            # With the envelope, so the row the board named `next` can show the
+            # caveat the board attached to that recommendation.
+            self.say(qd.plan_detail(row["item"], self.plan))
+        elif row.get("pr"):
+            self.open_pr(row["pr"])
+        elif row.get("issue"):
+            self.open_issue(row["issue"])
 
     # ---- the seats ---------------------------------------------------------
     #
@@ -2852,6 +2981,268 @@ class Dash(App):
         self.refresh_issues()
         self.say("refreshing…")
 
+    def render_blockers(self, blockers: dict) -> None:
+        """The open questions a person owes an answer to (#328, #274).
+
+        Kept whole rather than joined here: `work_rows` does the join, because a
+        blocker's subject is one of four kinds and three of them can name
+        something this table is not otherwise drawing — and deciding that twice,
+        once per renderer, is how two surfaces come to disagree about how many
+        questions are outstanding.
+        """
+        self.blockers = blockers
+        self.render_work()
+        # The header carries the count and is drawn on the limits clock, which is
+        # three minutes long. Without this the cell up there would keep the last
+        # refresh's number while the rows down here showed this one's.
+        self.render_limits(self.limits, self.limits_err)
+
+    # ---- putting the plan in order (#443) ----------------------------------
+
+    def moving_rows(self) -> list[dict]:
+        """The rows the next move takes: everything marked, else the one selected.
+
+        MARKS WIN over the cursor, and silently. A person who has marked three
+        rows and then moved the cursor to read a fourth has not unmarked anything,
+        and a move that took the row under the cursor instead would be the pane
+        answering a question nobody asked. Every refusal and every report below
+        names the count, so "three moved" is never a surprise.
+        """
+        if self.marked:
+            # FROM EVERY ROW THIS CLIENT KNOWS, not from the rows on screen. Reading
+            # the table meant a mark the `w` filter or the `s` scope had since hidden
+            # was silently left out, so a person who marked three rows and pressed a
+            # key was told "moved 2" — the silent-narrowing defect, arriving at the
+            # one control that rewrites the fleet's shared intent. `reorder` checks
+            # every mark against the scope's open items and refuses a partial move;
+            # the ORDER they keep is the plan's, which is the order they are shown
+            # in whenever they are all shown.
+            return [self.rows[key] for key in self.marked if key in self.rows]
+        row = self.selected_work()
+        return [row] if row else []
+
+    def action_mark(self) -> None:
+        """`m` — take this row along on the next move, or stop taking it."""
+        row = self.selected_work()
+        if row is None:
+            return
+        if row.get("kind") != "plan":
+            self.say("only the plan has an order — nothing to mark on this row")
+            return
+        key = row["key"]
+        self.marked.symmetric_difference_update({key})
+        # The rank cell is what changes, so the table has to be redrawn — and the
+        # signature cannot see a mark, which is this client's state rather than
+        # the board's.
+        self.plan_sig = None
+        self.render_work()
+        self.say(f"{len(self.marked)} marked — k/j to move them, g for a position"
+                 if self.marked else "nothing marked")
+
+    def action_move_up(self) -> None: self.reorder("up")
+
+    def action_move_down(self) -> None: self.reorder("down")
+
+    def action_move_up5(self) -> None: self.reorder("up5")
+
+    def action_move_down5(self) -> None: self.reorder("down5")
+
+    def action_move_top(self) -> None: self.reorder("top")
+
+    def action_move_bottom(self) -> None: self.reorder("bottom")
+
+    def action_move_to(self) -> None:
+        """`g` — ask for a position, then move there.
+
+        The count in the box is the SCOPE's open items, not the rows on screen:
+        WORK draws the review queue above the plan and the backlog below it, and
+        narrows to this screen's repos, so the table's row numbers are not the
+        plan's positions and never were.
+        """
+        rows = self.moving_rows()
+        why = qd.reorder_refusal(self.plan, rows)
+        if why:
+            self.say(why)
+            return
+        scope = (rows[0].get("item") or {}).get("repo")
+        ids = [i.get("item_id") for i in qd.plan_scope_items(self.plan, scope)]
+        marked = {(r.get("item") or {}).get("item_id") for r in rows}
+        moving = [i for i in ids if i in marked]
+        here = min((ids.index(i) for i in moving if i in ids), default=0)
+        what = (f"{len(rows)} items" if len(rows) > 1
+                else qd.clip(rows[0].get("title") or "", 46))
+        self.push_screen(MoveTo(what, scope, here + 1, len(ids)),
+                         lambda at: None if at is None else self.reorder(at=at))
+
+    def reorder(self, how: str | None = None, at: int | None = None) -> None:
+        """Work out the new order and send it, or say why not.
+
+        ONE PLACE COMPUTES THE ARRAY, whatever asked for it. `POST /plan/reorder`
+        takes the whole sequence for one exact scope rather than a move
+        instruction, so up-one, jump-five, to-the-top and go-to-position differ
+        only in the index they hand `reorder_ids` — which is #388's finding on the
+        web board, and the reason multi-select costs nothing extra at the wire.
+        """
+        if self.reordering:
+            self.say("a move is already going — waiting for the board to answer")
+            return
+        rows = self.moving_rows()
+        why = qd.reorder_refusal(self.plan, rows)
+        if why:
+            self.say(why)
+            return
+        if self.human is None or self.human.why_not():
+            # The same door the ✎ has, refused the same way and for the same
+            # reason: a control that greys out has room for a sentence.
+            self.say(qd.HumanClient.NO_KEY if self.human is None
+                     else self.human.why_not())
+            return
+        scope = (rows[0].get("item") or {}).get("repo")
+        ids = [i.get("item_id") for i in qd.plan_scope_items(self.plan, scope)]
+        marked = {(r.get("item") or {}).get("item_id") for r in rows}
+        # EVERY MARK OR NONE. A mark on an item the board no longer lists as open —
+        # somebody finished it, or dropped it — cannot be placed, and moving the
+        # rest would quietly do less than was asked while reporting success.
+        lost = len(marked) - sum(1 for i in ids if i in marked)
+        if lost:
+            self.say(f"{lost} of {len(marked)} marked are no longer open in "
+                     f"{scope or 'the fleet-wide plan'} — m to unmark, r to refresh")
+            return
+        # In the PLAN's order, which is the order they are shown in whenever they
+        # are all on screen, and the only defined one when they are not.
+        moving = [i for i in ids if i in marked]
+        index = at if at is not None else qd.nudge_index(ids, moving, how)
+        order = qd.reorder_ids(ids, moving, index)
+        if order is None:
+            # NOT SENT, and that is not tidiness: the endpoint stamps `rank_source`
+            # on every item it is handed, so posting an unchanged order would write
+            # "a human chose this position" onto rows nobody moved (#183).
+            self.say("already there — nothing to move")
+            return
+        self.reordering = True
+        # The FIRST of the moved rows in the plan's order, so a block comes back
+        # under the cursor at its head — which is where the next nudge measures
+        # from (`nudge_index`).
+        self.follow = f"plan:{moving[0]}"
+        # PAINTED BEFORE IT IS POSTED. A key press should move the row now: the
+        # round trip is a board call over the network, and a pane that sat still
+        # for the length of it would be pressed again. The board's answer then
+        # confirms — or, refused, `undo_reorder` puts these rows back.
+        self.rollback = self.plan
+        self.plan = qd.plan_reordered(self.plan, scope, order)
+        self.plan_sig = None
+        self.render_work()
+        self.say(f"moving {len(moving)} in {scope or 'the fleet-wide plan'}…")
+        self.run_reorder(scope, order, len(moving))
+
+    @work(thread=True, exclusive=True, group="reorder")
+    def run_reorder(self, scope: str | None, order: list[str], moved: int) -> None:
+        """The write itself, off the UI thread. Never raises into Textual.
+
+        `run_dial_write`'s shape, because it is the same act through the same
+        credential: a person's key, a sentence a panel can show verbatim, and the
+        in-flight flag cleared in a `finally` so a write that dies cannot wedge
+        every later press against the refusal above.
+        """
+        failed = False
+        try:
+            got = self.human.post("/plan/reorder", {"repo": scope, "order": order})
+            said = f"moved {moved} — {got.get('reordered')} placed by {got.get('by')}"
+            if moved > 1:
+                # Named because it is state a person is now carrying: the next key
+                # moves these rows again, which is what makes a block worth
+                # marking, and it should not be a surprise.
+                said += " · still marked, m to unmark"
+            # WHAT THE BOARD CARRIED ALONG. Items the pane did not list keep their
+            # relative order and follow the listed ones, and the endpoint names
+            # them rather than assuming: on a stale plan that is the difference
+            # between a move and a silent reshuffle of work somebody else added.
+            carried = len(got.get("appended") or [])
+            if carried:
+                said += f", {carried} carried along that this pane had not seen"
+        except Exception as exc:                  # noqa: BLE001 — show it, don't die
+            failed = True
+            said = f"could not move — {exc}"
+            # The rows go back before the sentence arrives, so the pane never sits
+            # showing an order the board refused.
+            try:
+                self.call_from_thread(self.undo_reorder)
+            except Exception:                     # noqa: BLE001 — the app is going away
+                pass
+        finally:
+            try:
+                self.call_from_thread(self.clear_reordering, not failed)
+            except Exception:                     # noqa: BLE001 — the app is going away
+                pass
+        self.call_from_thread(self.alarm if failed else self.say, qd.clip(said, 400))
+        # Straight back to the board rather than waiting out the plan clock: the
+        # person is looking at the row they just moved, and a table that showed the
+        # old order for fifteen seconds would be read as a move that failed.
+        self.call_from_thread(self.refresh_plan)
+
+    def undo_reorder(self) -> None:
+        """Put the rows back where the board still has them.
+
+        The optimistic paint is a guess at what the board will say, and a refusal
+        is the board saying otherwise — so the guess is dropped whole rather than
+        patched. Nothing else is touched: the marks stay, because the write a
+        person wants to retry is the one that just failed.
+        """
+        if self.rollback is not None:
+            self.plan = self.rollback
+            self.plan_sig = None
+            self.render_work()
+
+    def clear_reordering(self, moved: bool = True) -> None:
+        """Released, and the selection kept either way.
+
+        **THE MARKS SURVIVE THE MOVE, and that reverses this method's first
+        instinct.** Clearing them looked like housekeeping — carry them into the
+        next move and somebody moves three rows twice by accident — but it makes
+        the block a one-shot: the rows come back, the cursor lands on the head of
+        them, and the next `j` moves that ONE row while the person believes they
+        are still moving three. Silently changing what a key acts on is the worse
+        of the two mistakes, and it is the one they cannot see. The marks they can:
+        every marked row wears a ▪ and every message names the count.
+
+        The signature goes either way, because a write that failed still leaves
+        this table drawn from a plan the board may have moved on from.
+        """
+        self.reordering = False
+        self.rollback = None
+        self.plan_sig = None
+
+    def action_toggle_waiting(self) -> None:
+        """`w` — only the rows a person owes an answer about, or everything.
+
+        Redrawn from what the client already has, like `s` and `b`: the board
+        answered four seconds ago and this is a decision about how to READ that
+        answer. The signature goes with it — the rows really are different and
+        nothing else about them moved, so WORK would otherwise return early and
+        leave the table exactly as it was.
+        """
+        self.waiting = not self.waiting
+        self.plan_sig = None
+        self.render_work()
+        self.say("waiting: only what a person owes an answer about — w for all of it"
+                 if self.waiting else "showing everything — w for what is waiting on you")
+
+    def action_toggle_backlog(self) -> None:
+        """`b` — also the work nothing is waiting on, or just what is in flight.
+
+        Redrawn from what the client already has, like `s` and for the same
+        reason: `gh` answered within the last ninety seconds and this is a
+        decision about how to READ that answer. The signature has to be dropped
+        with it — the rows really are different and nothing else about them moved,
+        so WORK would otherwise return early and leave the table exactly as it was.
+        """
+        self.backlog = not self.backlog
+        self.plan_sig = None
+        self.render_work()
+        self.say("backlog: showing open PRs review has finished with, and issues "
+                 "nobody has taken — b to hide them" if self.backlog
+                 else "backlog hidden — b to show it")
+
     def action_toggle_scope(self) -> None:
         """`s` — this project's rows, or the whole fleet's.
 
@@ -2864,39 +3255,63 @@ class Dash(App):
         """
         self.scope = self.scope.toggled()
         self.build_columns()
+        # Dropped because WORK redraws only when its contents changed, and a scope
+        # toggle changes which rows there are without changing any of them — so the
+        # one table already on screen would be left exactly as it was.
         self.plan_sig = None
         if self.board:
             self.render_board(self.board)
-        self.render_plan(self.plan, self.plan_err)
-        self.render_prs(self.prs, self.pr_err)
-        self.render_issues(self.issues, self.issue_err)
+        self.render_agents()
+        self.render_work()
         self.say(f"scope: {self.scope.label()}"
                  + ("" if self.scope.on else " — s to narrow to this screen's"))
 
     def action_panel_pr(self) -> None:
-        record = self.selected_pr()
-        if record:
-            self.panel_pr(record)
+        """`p` reviews the selected row, if a round is what it is waiting for."""
+        row = self.selected_work()
+        if row and self.work_action(row)[1] == "panel":
+            self.panel_pr(self.work_pr(row))
+        elif row:
+            self.say("nothing here for a panel round — "
+                     + qd.clip(row.get("title") or "", 60))
 
     def action_fix_issue(self) -> None:
-        """`f` takes whatever the table you are in offers: an issue, or the issue
-        behind a plan item."""
-        if getattr(self.focused, "id", None) == "plan":
-            record = self.selected_row("#plan")
-            if record:
-                self.fix_plan_item(record)
+        """`f` takes the issue the selected row is about, its own or its item's.
+
+        THROUGH `work_action`, like `p` and like a click. It did not, and that made
+        the keyboard the one route on this dashboard where the icon and the act
+        could disagree: a row whose ⚒ was grey — another repo, already held, or a
+        question a person owes an answer about — still started a session on `f`.
+        The whole argument for asking once is that an icon which looks live and
+        then refuses is unreachable; a second caller deciding for itself puts it
+        straight back, out of sight of the thing that draws it.
+        """
+        row = self.selected_work()
+        if not row:
             return
-        record = self.selected_row("#issues")
-        if record:
-            self.fix_issue(record)
+        if self.work_action(row)[1] != "fix":
+            self.say("nothing to take here — " + (
+                qd.blocker_detail(row["blocked"]) if row.get("blocked")
+                else qd.clip(row.get("title") or "", 60)))
+            return
+        if row.get("item"):
+            self.fix_plan_item(row["item"])
+            return
+        issue = self.work_issue(row)
+        if issue:
+            self.fix_issue(issue)
 
     def action_help(self) -> None:
-        self.say("o open on GitHub · p panel-review · f fix the selected issue or "
-                 "plan item · d the board's dials page · z this pane full screen "
-                 "and back · s this project's rows or the "
-                 "whole fleet's · r refresh · q quit · click ⚖ to review, ⚒ to fix, "
-                 "✎ to set or clear a dial (ctrl+s saves, ctrl+x clears), a plan row "
-                 "for why it is there, a seat to jump to its pane")
+        self.say("o open the selected row on GitHub · p panel-review it · f take "
+                 "its issue · m mark a plan row · k/j move it one · K/J five · "
+                 "[ ] to the ends · g move it to a position · "
+                 "w only what a person owes an answer about · b the "
+                 "backlog nothing is waiting on · d the board's "
+                 "dials page · z this pane full screen and back · s this project's "
+                 "rows or the whole fleet's · r refresh · q quit · click ⚖ to "
+                 "review, ⚒ to fix, ✎ to set or clear a dial (ctrl+s saves, ctrl+x "
+                 "clears), a work row for why it is where it is, a seat to jump to "
+                 "its pane, ✕ to close one")
 
     def selected_row(self, table_id: str) -> dict | None:
         table = self.query_one(table_id, DataTable)
@@ -2905,19 +3320,35 @@ class Dash(App):
         row = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         return self.rows.get(str(row.value))
 
+    def selected_work(self) -> dict | None:
+        """The WORK row under the cursor — the one row every key below acts on.
+
+        `o`, `p` and `f` each used to ask a different table and guess which one you
+        meant from what had focus. There is one table now, so they ask it.
+        """
+        return self.selected_row("#work")
+
     def selected_pr(self) -> dict | None:
-        return self.selected_row("#prs")
+        """`{repo, number}` for the selected row, if it is about a PR."""
+        row = self.selected_work()
+        return self.work_pr(row) if row else None
 
     def action_open_pr(self) -> None:
-        """`o` opens whatever is selected in the table you are in."""
-        if getattr(self.focused, "id", None) == "issues":
-            record = self.selected_row("#issues")
-            if record:
-                self.open_issue(record)
+        """`o` opens the selected row on GitHub — the PR, or the issue."""
+        row = self.selected_work()
+        if not row:
             return
-        record = self.selected_pr()
-        if record:
-            self.open_pr(record)
+        pr = row.get("pr")
+        if pr:
+            self.open_pr(pr)
+        elif row.get("issue"):
+            self.open_issue(row["issue"])
+        elif self.work_pr(row):
+            self.open_pr(self.work_pr(row))
+        else:
+            issue = self.work_issue(row)
+            if issue:
+                self.open_issue(issue)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2931,9 +3362,10 @@ def main(argv: list[str] | None = None) -> int:
                                  description="the fleet dashboard, clickable")
     ap.add_argument("--scope", choices=("repo", "all"), default=None,
                     help="repo (default): only this screen's repos, and no repo column; "
-                         "all: every repo the board knows, in FLEET/CLAIMED/PLANS — "
-                         "PRs and issues stay the watched repos' either way. "
-                         "`s` toggles it live; QB_DASH_SCOPE sets the opening view")
+                         "all: every repo the board knows, in AGENTS and in the plan "
+                         "half of WORK — PRs and issues stay the watched repos' "
+                         "either way. `s` toggles it live; QB_DASH_SCOPE sets the "
+                         "opening view")
     ap.add_argument("--repo", action="append", metavar="PATH|OWNER/NAME",
                     help="the project this screen is for — a checkout, which also "
                          "becomes where the ⚒ and ⚖ start work, or an owner/name "

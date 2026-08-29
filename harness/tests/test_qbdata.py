@@ -1918,3 +1918,151 @@ def test_the_cache_does_not_grow_without_bound(monkeypatch):
     for n in range(20):
         qd.ci_report(_pr(headRefOid=f"{n:040d}"), "o/r")
     assert len(qd._ci_cache) <= 4
+
+
+# ---- putting the plan in order (#443) ----------------------------------------
+#
+# The arithmetic only, here: what a move DOES to a list. The keys, the modal and
+# the write are `test_qb_dash.py`'s, because those need a running app and this
+# does not — and the array is the half both renderers and every verb share.
+
+REORDER_PLAN = {"items": [
+    {"item_id": "a", "repo": "acme/one", "state": "open", "title": "first"},
+    {"item_id": "b", "repo": "acme/one", "state": "open", "title": "second"},
+    {"item_id": "c", "repo": "acme/one", "state": "open", "title": "third"},
+    {"item_id": "d", "repo": "acme/two", "state": "open", "title": "another plan"},
+    {"item_id": "e", "repo": None, "state": "open", "title": "fleet-wide"},
+    {"item_id": "f", "repo": "acme/one", "state": "dropped", "title": "gone"},
+], "truncated": False}
+
+
+def test_a_scope_is_exact_and_a_null_one_is_a_real_scope():
+    """`POST /plan/reorder` renumbers ONE exact scope, so the list handed to it has
+    to be that scope and nothing else — a loose match would renumber another
+    plan's items behind the caller's back.
+
+    Not `plan_repo`: that resolves a free-text repo to an `owner/name` a `gh`
+    command can use, and answers None for a fleet-wide item and a `project:` scope
+    alike — so grouping by it would put three scopes in one bucket.
+    """
+    assert [i["item_id"] for i in qd.plan_scope_items(REORDER_PLAN, "acme/one")] \
+        == ["a", "b", "c"], "the exact scope picked up another plan's items"
+    assert [i["item_id"] for i in qd.plan_scope_items(REORDER_PLAN, None)] == ["e"], \
+        "the fleet-wide scope is a real scope, not a missing one"
+    assert [i["item_id"] for i in qd.plan_scope_items(REORDER_PLAN, "acme/two")] == ["d"]
+
+
+def test_only_open_items_have_a_place():
+    """A dropped item is not in the order and the endpoint refuses it by id: `order
+    is for open work: finished and dropped items keep no place`."""
+    assert "f" not in [i["item_id"] for i in qd.plan_scope_items(REORDER_PLAN, "acme/one")]
+
+
+@pytest.mark.parametrize("how,expected", [
+    ("up",     ["a", "c", "b", "d"]),
+    ("down",   ["a", "b", "d", "c"]),
+    ("top",    ["c", "a", "b", "d"]),
+    ("bottom", ["a", "b", "d", "c"]),
+    # Clamped and never wrapped, which is the web board's rule kept identical: a
+    # jump past the end lands on the end rather than reappearing at the other one.
+    ("up5",    ["c", "a", "b", "d"]),
+    ("down5",  ["a", "b", "d", "c"]),
+])
+def test_a_verb_is_an_index_and_the_ends_clamp(how, expected):
+    ids = ["a", "b", "c", "d"]
+    assert qd.reorder_ids(ids, ["c"], qd.nudge_index(ids, ["c"], how)) == expected
+
+
+def test_a_move_that_changes_nothing_is_not_a_move():
+    """It must not be SENT, and that is not tidiness: the endpoint stamps
+    `rank_source` on every item it is handed, so posting an unchanged order would
+    write "a human chose this position" onto rows nobody touched (#183)."""
+    ids = ["a", "b", "c"]
+    assert qd.reorder_ids(ids, ["a"], 0) is None
+    assert qd.reorder_ids(ids, ["a"], qd.nudge_index(ids, ["a"], "up")) is None
+    assert qd.reorder_ids(ids, ["c"], qd.nudge_index(ids, ["c"], "bottom")) is None
+    assert qd.reorder_ids(ids, ["zz"], 0) is None, "an id not in the list moved nothing"
+
+
+def test_marked_rows_move_together_and_keep_their_order():
+    """"These three, as you see them, starting there" — any other answer would mean
+    the mark had also to record a sequence, which is a second order to keep in step
+    with the board's."""
+    ids = list("abcdef")
+    assert qd.reorder_ids(ids, ["b", "d"], 3) == ["a", "c", "e", "b", "d", "f"]
+    # And a block nudge measures from where the block STARTS, against the list it
+    # is being put back into — measuring against one that still contains the moved
+    # rows is how a one-place nudge becomes a no-op.
+    assert qd.reorder_ids(ids, ["b", "c"], qd.nudge_index(ids, ["b", "c"], "down")) \
+        == ["a", "d", "b", "c", "e", "f"]
+
+
+def test_a_reorder_that_cannot_be_computed_says_why():
+    """Every refusal names the remedy: the alternative on a 78-column pane is a
+    control that does nothing and a person who cannot tell a rule from a bug."""
+    plan_row = {"kind": "plan", "item": {"repo": "acme/one"}}
+    other = {"kind": "plan", "item": {"repo": "acme/two"}}
+    assert "nothing selected" in qd.reorder_refusal(REORDER_PLAN, [])
+    assert "only the plan has an order" in qd.reorder_refusal(
+        REORDER_PLAN, [{"kind": "pr"}])
+    assert "different plans" in qd.reorder_refusal(REORDER_PLAN, [plan_row, other])
+    assert qd.reorder_refusal(REORDER_PLAN, [plan_row]) is None
+
+
+def test_a_truncated_plan_is_refused_rather_than_reordered_from():
+    """The endpoint renumbers every open item in the scope and appends the ones the
+    caller did not list. An order computed from a partial list would therefore move
+    everything the pane was never sent — silently, and in one request."""
+    why = qd.reorder_refusal({**REORDER_PLAN, "truncated": True},
+                             [{"kind": "plan", "item": {"repo": "acme/one"}}])
+    assert why and "truncated" in why and "board page" in why
+
+
+OPTIMISTIC_PLAN = {"items": [
+    {"item_id": "a", "repo": "acme/one", "state": "open", "rank": 1,
+     "rank_source": "ordered", "title": "A"},
+    {"item_id": "z1", "repo": "acme/two", "state": "open", "rank": 1,
+     "rank_source": "ordered", "title": "Z1"},
+    {"item_id": "b", "repo": "acme/one", "state": "open", "rank": 3,
+     "rank_source": "appended", "title": "B"},
+    {"item_id": "z2", "repo": "acme/two", "state": "open", "rank": 2,
+     "rank_source": "ordered", "title": "Z2"},
+    {"item_id": "c", "repo": "acme/one", "state": "open", "rank": 9,
+     "rank_source": "appended", "title": "C"},
+], "next": {"item_id": "a"}, "counts": {"open": 5}, "truncated": False}
+
+
+def test_an_optimistic_reorder_renumbers_the_way_the_endpoint_will():
+    """A row drawn in its new place still carrying its old rank is a table
+    disagreeing with itself, so the local guess renumbers `1..n` and stamps
+    `ordered` exactly as `POST /plan/reorder` does."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    ours = [i for i in out["items"] if i["repo"] == "acme/one"]
+    assert [(i["item_id"], i["rank"]) for i in ours] == [("c", 1), ("a", 2), ("b", 3)]
+    assert {i["rank_source"] for i in ours} == {"ordered"}
+
+
+def test_reordering_one_scope_leaves_every_other_row_where_it_was():
+    """Sorting the whole list by "is this the scope being reordered" put every one
+    of that scope's rows above every other scope's — so reordering one project
+    silently hoisted all of it over another's in the wide view, which is a change
+    to rows the caller never named. The permutation happens inside the positions
+    the scope already occupies."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    where = {i["item_id"]: n for n, i in enumerate(out["items"])}
+    assert where["z1"] == 1 and where["z2"] == 3, \
+        f"another scope's rows moved: {[i['item_id'] for i in out['items']]}"
+    assert [i["item_id"] for i in out["items"] if i["repo"] == "acme/two"] == ["z1", "z2"]
+
+
+def test_an_optimistic_reorder_drops_next_rather_than_guessing_it():
+    """`next` is the board's answer to "what should somebody take", worked out from
+    ranks, claims, blocks and cover. A pane that computed its own would be the
+    second-answer-about-the-plan defect this module has spent three issues
+    removing — and a ◉ left on a row that has just moved is not honest either."""
+    out = qd.plan_reordered(OPTIMISTIC_PLAN, "acme/one", ["c", "a", "b"])
+    assert out["next"] is None
+    # Everything the board did not have to recompute is carried through: a reorder
+    # does not change which items are open.
+    assert out["counts"] == {"open": 5}
+    assert out["truncated"] is False
