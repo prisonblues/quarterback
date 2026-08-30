@@ -171,7 +171,12 @@ def test_browsing_shows_the_description_and_choosing_shows_the_rest(tui, vocabul
         await pilot.pause()
         said = text_of(screen, "#spec")
         assert said.startswith(vocabulary["review_panel.max_rounds"]["what"])
-        assert "default 2" in said and "in force" in said
+        # The default is read from the harness's own table rather than typed here:
+        # it is a dial and dials move (#621 took this one from 2 to 6), and a
+        # number written out in the assertion makes the test fail on the tuning
+        # instead of on the line going missing, which is what it is for.
+        assert f"default {vocabulary['review_panel.max_rounds']['default']}" in said
+        assert "in force" in said
 
     drive(tui, modal(tui, vocabulary), steps)
 
@@ -266,7 +271,8 @@ def test_the_spec_line_says_the_default_and_what_is_in_force(tui, vocabulary):
         field(screen, "#f_dial").value = "review_panel.max_rounds"
         await pilot.pause()
         said = text_of(screen, "#spec")
-        assert "default 2" in said and "in force" in said and "this repo" in said
+        assert f"default {vocabulary['review_panel.max_rounds']['default']}" in said
+        assert "in force" in said and "this repo" in said
 
     drive(tui, modal(tui, vocabulary), steps)
 

@@ -71,20 +71,27 @@ def test_a_repo_that_never_heard_of_the_key_gets_the_default():
     assert panel_rounds.not_falling_limit({}, []) == 1
 
 
-def test_the_default_is_ONE_round_because_two_could_never_fire_on_the_shipped_cap():
-    """`fix_injection`'s own argument, one level across. A new-finding count can only
-    be compared against a predecessor, so round 1 is never a not-falling round and a
-    window of 2 cannot fire before round 3 — while `max_rounds` ships at 2. A rung that
-    is off wherever it was not configured is the `require_failing_test` failure with
-    the honesty removed, so the number that makes it armed on the shipped defaults is
-    the number it ships at."""
-    assert DEFAULT_BLOCK["max_rounds"] == 2
-    two = panel_rounds.not_falling_state([(1, 9), (2, 9), (3, 9)], 2)
-    assert two["streak"] == 2 and two["over"] is True
-    # ...but that streak needs three rounds to exist at all, and the cap ends the cycle
-    # at two. At the shipped window the same cycle is stopped on round 2.
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9)], 2)["over"] is False
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9)], 1)["over"] is True
+def test_the_shipped_window_can_fire_before_the_shipped_cap_ends_the_cycle():
+    """`fix_injection`'s own argument, one level across, and the pair it is really
+    about is the window and the cap TOGETHER. A new-finding count can only be compared
+    against a predecessor, so a window of N cannot fire before round N+1 — and a rung
+    that cannot reach its own threshold before the cap ends the cycle is off wherever
+    nobody configured it, which is the `require_failing_test` failure with the honesty
+    removed. The cap was 2 when this dial shipped and is 6 now (#621), so what has to
+    hold is not the literal 1 but that the two numbers still admit each other."""
+    limit = panel_rounds.not_falling_limit(DEFAULT_BLOCK, [])
+    cap = DEFAULT_BLOCK["max_rounds"]
+    # The shortest cycle the shipped window can fire on: one round to set the count and
+    # `limit` more that fail to fall below it.
+    series = [(r, 9) for r in range(1, limit + 2)]
+    fires = panel_rounds.not_falling_state(series, limit)
+    assert fires["streak"] == limit and fires["over"] is True
+    assert len(series) <= cap, (
+        f"a window of {limit} needs {len(series)} rounds to fire and the cap ends the "
+        f"cycle at {cap} — the rung is off on every repo that configured nothing")
+    # One round short of that is NOT over, which is what says the streak is doing the
+    # work above rather than the series merely being long enough.
+    assert panel_rounds.not_falling_state(series[:-1], limit)["over"] is False
 
 
 def test_null_switches_the_brake_off():
@@ -411,7 +418,7 @@ def test_a_below_floor_policy_stop_keeps_its_own_reason_and_its_confidence():
     monopoly on ending the loop."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   not_falling=_flat())
     assert got["stop"] is True and got["confident"] is True
     assert "round trigger floor" in got["reason"]
@@ -427,7 +434,7 @@ def test_a_round_going_again_for_an_unrelated_P1_is_not_cancelled_by_the_series(
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     blocker = _finding("P1", key_from="the mirror never closes")
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], [*quiet, blocker], [],
-                                  trigger_floor="P2", fix_floor="P3",
+                                  trigger_floor="P2", cleared_floor="P3",
                                   not_falling=_flat())
     assert got["new_findings_not_falling"]["over"] is True
     assert got["new_findings_not_falling"]["fired"] is False

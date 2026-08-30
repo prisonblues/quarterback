@@ -1,7 +1,7 @@
 # Panel Review and Fix PR
 
-@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge + SonarCloud hard gate) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. It ends by running the pre-land gate and offering to land only on READY; merging stays opt-in.
-@arguments $ARGS: [pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 2 rounds)
+@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge, plus the SonarCloud hard gate where the repo enables that seat) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. It ends by running the pre-land gate and offering to land only on READY; merging stays opt-in.
+@arguments $ARGS: [pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 6 rounds)
 
 You are the **ORCHESTRATOR**. This is `/review-pr` with the panel as the
 finding engine: the panel finds, an autonomous sub-agent fixes everything to the
@@ -13,8 +13,8 @@ fixer's own commit read by nobody: the panel saw the diff as it was BEFORE the
 fix, and structural fixes beget new interactions that did not exist until the fix
 was written — a mirror added in one file creating dual-keyed nodes that an early
 `return` in another leaves half-stale is not a defect any earlier round could
-have found. Round 2 is the default and is not optional; `--rounds N` / `--loop`
-buys more.
+have found. Round 2 is not optional; the default cap is **6** and `--rounds N` /
+`--loop` moves it.
 
 ## 1. Ensure a PR exists (the panel diffs via `gh pr diff`, so a PR is required)
 
@@ -27,10 +27,22 @@ buys more.
   the repo. Order matters, and doing it the other way round is wrong for every
   flag, not just one: `--rounds 3` reviews PR #3, and `--reviewers codex` eats
   `codex` as the repo name.
-- **Rounds:** `--rounds N` caps the panel/fix cycles (default **2**); `--loop` is
-  `--rounds 5`. `--rounds 1` restores the old fix-and-don't-look behaviour and
-  should be used only when someone explicitly asks for it — say in the relay that
-  the fix went unreviewed.
+- **Rounds:** `--rounds N` caps the panel/fix cycles. The default is
+  `review_panel.max_rounds`, which is **6**; `--loop` is `--rounds 10`. `--rounds 1`
+  restores the old fix-and-don't-look behaviour and should be used only when someone
+  explicitly asks for it — say in the relay that the fix went unreviewed.
+
+  **6 is a backstop against running forever, not a convergence mechanism**, and the
+  difference matters to how you read a stop. At 2 the cap ended most cycles, so "stopped
+  at the cap" was the ordinary ending and `confident: false` was the ordinary verdict. At
+  6 a cycle that is converging converges well before the cap, and what actually ends the
+  ones that are not is **`escalate_on.fix_injection`** — more than half a round's new
+  outstanding findings attributed to the fix pass before them, which is the loop being
+  fed by its own output (§5). **A stop on that rung is a stop and never convergence.** It
+  takes a veto line and `confident: false`, it means the last fix pass was generating the
+  work rather than clearing it, and relaying it as "the panel finished" is a claim the
+  round explicitly refused to make. Reaching the cap at 6 says the same thing more
+  expensively.
 - **PR number(s) given** → use them, in the order given.
 - **No PR number** → resolve the current branch's open PR
   (`gh pr view --json number,baseRefName,headRefName`).
@@ -91,17 +103,23 @@ with these parallel-mode overrides:
   makes its own `mktemp -d` directory for them (§3), so concurrent agents cannot
   read or clobber each other's baseline.
 - A `--reviewers` list from `$ARGS` applies to **every** PR in the run.
-- Each sub-agent returns its own panel summary (findings, SonarCloud gate,
-  skipped reviewers, coverage declared) **and** the §4 fixer summary table for
+- Each sub-agent returns its own panel summary (findings, the SonarCloud gate where
+  that seat ran, skipped reviewers, coverage declared) **and** the §4 fixer summary table for
   its PR **and** its §5 round log: rounds run, what each found that the last had
   not, what stopped it, and whether that stop was earned.
 - **One PR failing does not stop the others.** A sub-agent that cannot resolve
   its PR, or whose panel or verification fails, reports that and returns; the
   remaining agents run to completion regardless.
+- **`--new-cycle` is not a sub-agent's to decide (§3).** A PR whose board record holds a
+  terminal verdict is refused, and starting a fresh cycle over it is a judgement about
+  whether the thing that ended the last one has been answered — which the agent holding
+  one PR's context is not the reader for. Brief each sub-agent to **report the refusal
+  and return**, not to pass the flag; you relay it and the user chooses. Pass it only on
+  a re-launch, and only for the PRs it was chosen for.
 
 Then relay per §6: one table per PR, plus a one-line-per-PR roll-up (PR ·
-findings · all fixed? · rounds and what stopped them · SonarCloud gate ·
-pushed?) so the batch is readable at a glance. A PR whose cycle stopped
+findings · all fixed? · rounds and what stopped them · SonarCloud gate, or `n/a` where
+the seat did not run · pushed?) so the batch is readable at a glance. A PR whose cycle stopped
 unearned is marked as such in the roll-up, not only in its own table. Report
 each failed or partial PR explicitly — never let a roll-up imply a PR was
 handled when its agent stopped early.
@@ -173,6 +191,37 @@ payload is marked `reviewed: false`), so exit 0 always means the file is there.
   (§6), and keep it out of "reviewed and clean": its correctness is carried over
   from when it landed on the base branch.
 
+**One refusal is not about the diff at all, and its remedy is a different flag (#617).**
+Before anything else, the panel reads the board for a **terminal verdict already recorded
+on this PR**. If the last round it can find stopped the cycle, this run is refused — the
+verdict is printed, `preflight.prior_cycle` carries the record, and it exits 0. Read
+`prior_cycle` as well as `verdict`, because the remedies in the `refuse` bullet above are
+every one of them wrong here: rebasing does not undo a stop, no size ceiling was
+consulted, and **`--force` cannot move this gate** — deliberately, since `--force` says
+*this diff is worth reading anyway*, which is not an answer to *an earlier round already
+ended this cycle*. The refusal notice says all of that itself; relay it rather than
+working around it.
+
+**A refusal here is the board answering, not a broken tool**, and it is what
+lexray#1780's rounds 3-5 would have hit: three standalone workflows that ran on after
+round 2 stopped the cycle on `fix_injection`, each of them round 1 of its own cycle with
+none of the convergence guards connected. **`--new-cycle`** is the opt-in that starts a
+genuinely new cycle — it mints a fresh cycle rather than continuing one that was told to
+stop, resets the round counter and every guard, and puts a banner at the top of the report
+naming the round that stopped, its reason, how long ago, whether that stop was convergence
+and whether the branch has moved since.
+
+Three legitimate runs meet this refusal, and all three take `--new-cycle`:
+
+- **a genuinely new cycle** on a PR whose earlier cycle stopped — the intended case, and
+  the flag belongs there **once the thing that ended the last cycle has been answered**.
+  A terminal verdict names something a fix pass cannot clear; passing the flag without
+  answering it just buys the same stop again, more expensively;
+- **§5's verification pass on the final capped fix (#629)** — that pass follows a stop by
+  construction, so it is refused without the flag. See §5;
+- **a re-review after the branch has moved on** from the head the stop was recorded at.
+  The banner says the branch moved, which is the fact that makes the re-read worth doing.
+
 **Not** a fixed `/tmp/panel-<pr>-r<n>.json`. Two reasons, both real on a shared
 host: the panel writes that path with `Path.write_text`, which follows symlinks,
 so a pre-planted `/tmp/panel-34-r1.json → ~/.ssh/authorized_keys` is a write
@@ -212,9 +261,30 @@ From its output collect:
   floor, marked 🔽. Present only where the floor left something under it. These are
   recorded and relayed and **never pasted into the fixer's brief**; §4b says what
   becomes of them.
-- **SonarCloud** — the hard-gate issues (these MUST end up resolved).
-- **Skipped reviewers** — note them; a skipped Codex/Sonar means thinner
-  coverage, surface it.
+- **SonarCloud** — the hard-gate issues, **if the `sonarqube` seat ran**. Where it did,
+  they MUST end up resolved: that is what "hard gate" means, and it is the one part of a
+  round that is not a judgement. **Where it did not, there is no gate on this round and
+  you must not write as though there were.** The seat is `enabled: false` in this repo's
+  `.harness-rules.sample` and off in the harness defaults, and it is currently being
+  switched off across the fleet while the convergence work is proven — so "no SonarCloud
+  block" is the ordinary case right now, not an anomaly. Read `reviewers_ran` rather than
+  inferring it from an empty list: an empty **SonarCloud issues** block and an absent one
+  are different claims, and only the first says a gate looked and found nothing.
+
+  Everything downstream of this bullet is conditional on the same fact. Where a later
+  section says a Sonar issue must be resolved, or that `round_stop` counts one, or that
+  the gate is clear, it is describing a round where the seat ran. **A fixer briefed on a
+  hard gate that does not exist is being told to resolve an empty list**, which reads to
+  it as a gate it has passed.
+- **Skipped reviewers** — and the word covers two different facts, so say which. A seat
+  the repo has **configured off** is a decision somebody took, not a gap: it is not
+  thinner coverage than the review this repo asked for, and warning about it every round
+  trains a reader to skip the line where the other kind appears. `sonarqube` is that case
+  today, fleet-wide. A seat that was **configured on and did not run** — a missing CLI, a
+  dead login, an auth failure, a crash — IS a coverage gap: the review is thinner than
+  the one that was asked for and nobody chose that, so surface it in §6 with what it
+  cost. Report the first as configuration when it is worth stating at all; report the
+  second every time.
 - **Coverage declared** — per reviewer, what it said it could not assess, plus
   any reviewer the panel reports as truncated. These are what separate "clean"
   from "I could not tell"; carry them to §6 rather than dropping them.
@@ -233,6 +303,26 @@ From its output collect:
   says so on the line. Absent on round 1 and on a round with no readable fix range,
   because there was then no pass to measure and a line of zeroes would claim one
   wrote nothing.
+- **Fix surface** — `round_stop.fix_surface` in the JSON (#619): `files`, the files the
+  last fix pass touched; `new_files` and `count`, the subset no earlier round had read;
+  `prior_files`, what the rounds before it had. Like Guard-to-guarded it is REPORTED and
+  **gates nothing** (#67) — there is no threshold to apply and none to invent, and unlike
+  its siblings in that block it has no `fired` field, because there is no verdict to
+  have. Carry the count into §6.
+
+  What makes it worth reading is that it measures a different quantity from everything
+  else downstream of a fix pass: `max_fix_growth`, `max_fix_growth_chars` and
+  `fix_injection` all count lines or findings, and fifteen lines added to two nginx
+  templates nobody had reviewed is small by all three. On lexray#1780 round 3's pass
+  touched 12 files, 7 of them never reviewed, and both of the cycle's later P1s were in
+  that new surface. The fixer brief carries the corresponding rule — a fix stays inside
+  the files the change already touches, and going outside them is declared in the fix
+  summary.
+
+  **It is `null` where it could not be measured, and null is not zero.** Round 1 has no
+  fix pass to read and a rewritten branch has no readable range; a `0` there would be the
+  claim that a pass opened no new files, when what happened is that nobody looked. Relay
+  the two differently.
 - **Rounds** — the `**Rounds:**` line (also `round_stop` in the JSON): whether
   the cycle should go again and whether stopping would be convergence.
 
@@ -245,9 +335,9 @@ unconfigured prints one line and changes nothing about the review.
 
 Show the user this panel summary before launching the fixer.
 
-> First run may need `op signin` once (SonarCloud token caches afterwards) and
-> `codex login` for the Codex reviewer. Missing reviewers are reported as
-> skipped, not fatal.
+> First run may need `op signin` once where the `sonarqube` seat is enabled (its token
+> caches afterwards), and `codex login` for the Codex reviewer. Missing reviewers are
+> reported as skipped, not fatal.
 
 ## 4. Launch the fixer sub-agent
 
@@ -268,15 +358,21 @@ with these overrides:
 
 - **Replace step 2 "Deep review" (self-discovery) with the supplied panel
   findings.** They are already exhaustively reviewed and judged — the sub-agent
-  does NOT re-derive them. Paste the full **To fix** list and the **SonarCloud**
-  issues into the brief as the findings to resolve.
+  does NOT re-derive them. Paste the full **To fix** list, and the **SonarCloud**
+  issues **where that seat ran**, into the brief as the findings to resolve.
 - Its job is to resolve **every panel-confirmed finding the round asked it to
   clear** — the **To fix** list, which is already filtered to the round's
-  `fix_severity_floor` — plus every SonarCloud issue, to the "nothing left to
-  improve" standard. Paste the **To fix** list and the SonarCloud issues, and
+  `fix_severity_floor` — plus every SonarCloud issue **on a round the `sonarqube` seat
+  ran**, to the "nothing left to
+  improve" standard. Paste the **To fix** list and those Sonar issues, and
   **not** the 🔽 *Reported, not this round's work* list: a fix pass that takes those
   on is the growth the floor exists to stop, and the floor has already made that
   judgement (#165).
+- **On a round with no `sonarqube` seat, say nothing about a hard gate at all** — do not
+  paste an empty SonarCloud block, and do not tell the fixer the gate is clear. An empty
+  list under a heading reads as a gate that looked and found nothing, and the fixer has
+  no way to tell that from a gate that never ran. With the seat off across the fleet
+  today (§3), this is the ordinary case: the brief is the **To fix** list and that is all.
 - **An additional defect the sub-agent trips over while fixing is subject to the same
   floor and the same scope as a panel finding.** At or above the round's
   `fix_severity_floor` *and* inside the change under review, it gets fixed — a P1 the
@@ -358,19 +454,24 @@ records is the gap this whole feature exists to close.
 
 **Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
 fixer reports the ID it was given (`236-F01`, exactly as the report prints it in
-square brackets) in its `Deferred` and `Escalated` blocks, because the ID is the only
+square brackets) in its `Narrowed`, `Deferred` and `Escalated` blocks, because the ID is
+the only
 identifier it ever saw: the report carries no keys, on purpose (see below). You hold
 the payload, so the ID → key mapping is yours, and every `key` in the JSON below and
-every `--escalated` argument in §5 comes out of it. The one-liner prints both columns:
+every `--escalated` and `--narrowed` argument in §5 comes out of it. The one-liner prints
+both columns:
 
 ```bash
 # id, key, and what each finding actually was — the left column is what the fixer
-# quotes back at you, the second is what the board and --escalated take
+# quotes back at you, the second is what the board, --escalated and --narrowed take
 jq -r '.to_fix[] | "\(.id)\t\(.key)\t\(.severity)\t\(.synthesis)"' r<r>.json
 
 cat <<'JSON' | qb record-outcome
 {"repo": "<owner/name>", "pr": <pr>, "outcomes": [
   {"key": "<key of a finding the fixer resolved>", "outcome": "fixed"},
+  {"key": "<key of one fixed where it was raised, general form not taken>",
+   "outcome": "narrowed",
+   "note": "gzip on the /api/ location block; server-level gzip is a separate change"},
   {"key": "<key of one that was not a defect>", "outcome": "refuted",
    "note": "installPhase does `install -m 0755 bin/*` — it globs, the script IS installed"},
   {"key": "<key of one left for later, at or above the issue gate>",
@@ -391,9 +492,36 @@ renders only finding IDs and why the fixer is asked for one rather than a key: t
 report is posted as a PR comment, and rendering keys into it would trade a mapping
 step you can do with `jq` for a secret-scanner hit on every panelled PR.)
 
-One of four per finding:
+One of five per finding:
 
 - **`fixed`** — the fixer changed the code and the finding is answered.
+- **`narrowed`** (#615) — the fixer changed the code and the finding is answered **at the
+  point it was raised**, with the general form left unwritten. It **clears**, exactly as
+  `fixed` does: `round_stop` counts it answered, not outstanding, and a cycle may
+  converge with narrowed findings in it. **Requires a `note`, and the note is the general
+  form** — what fixing the class would have taken — lifted from the fixer's `Narrowed`
+  block, because that sentence is the entire reason the outcome exists. A bare `narrowed`
+  is a `fixed` that has lost the only thing distinguishing it.
+
+  **It gets a GitHub issue only where the general form is itself a claim-miss** — where
+  the class-wide gap means the change does not do what it set out to do, which is a work
+  item somebody has to pick up. Every other general form is an observation and the row is
+  the whole record. This does **not** read `file_deferral_issues`: that dial gates
+  **deferrals**, a narrowed finding is not one, and the question here is what the general
+  form IS rather than what the instance was. (Both tests happen to be about shape rather
+  than severity now — see the next section — but they are separate tests and only one of
+  them is a dial.) Do not round a narrowed
+  finding up to `fixed` because it looks like one — "I fixed this" and "I fixed the
+  instance of this" are different facts, and the leaderboard and the round-stop rules
+  read them differently.
+
+  **Recording the row is half of it — the key also goes to the next round, as
+  `--narrowed`.** The board row is the record; the flag is what makes the finding clear.
+  Record it here and pass it there, in §5. Do one without the other and the fourth
+  outcome reaches nothing: the fixer declares `narrowed`, you record it, and the next
+  round still counts the finding as outstanding and goes again — which is the same
+  pressure to write the class-wide fix, arriving through the cycle instead of through the
+  brief.
 - **`refuted`** — it was not a defect. **Requires a `note`, and the note is the
   point**: you are already writing the refutation into the PR comment and the fix
   commit, in prose nothing can count. A bare `refuted` is the same
@@ -407,7 +535,8 @@ One of four per finding:
   budget ran out before it, which is the same row for the same reason (#297). (3) An
   **escalated** finding (the brief's step 3a): the defect is
   real and the fix is what is in dispute, so `refuted` would be a lie about the
-  finding and `fixed` a lie about the code, and there is no fifth outcome to
+  finding, `fixed` a lie about the code, and `narrowed` a lie about both — no patch was
+  written at all, narrow or otherwise. There is no sixth outcome to
   invent — the vocabulary is a database constraint, not a convention. Recording it
   does **not** settle the question or take the finding off §5's outstanding list:
   that list is computed from the round's own payload, never from this table, and the
@@ -428,9 +557,17 @@ One of four per finding:
 
 **Every deferral gets a board row. Only some of them get a GitHub issue**, and this
 setting is which. The report's dial line says the answer for the round you are
-recording, in words, so read it there rather than opening the rules file: *"deferrals
-at/above P2 get a GitHub issue, below it a board row only"*. `always` is the pre-#482
-behaviour (an issue for every one) and `never` files none.
+recording, in words, so read it there rather than opening the rules file.
+
+**It is no longer a severity gate. The shipped value is `shape` (#620), and the question
+it asks is what the ticket would BE**, not how bad the finding was. A **category** or a
+substantive **single named item** may become an issue; a **batch** gets board rows and
+never one, whatever its severity mix. The two ends and the old bands are all still legal:
+`always` is the pre-#482 behaviour (an issue for every deferral), `never` files none, and
+any of `P1`..`P4` restores the severity cut this dial ran under from #482 until
+2026-08-30 — at or above the band an issue, below it a row. The bands are the documented
+way back, so a repo that wants the old behaviour says so in one word rather than working
+around this one.
 
 The two records were being conflated. The **board row** is the durable one — it
 chains by finding key across rounds, it feeds `/panel`, and it is what stops the
@@ -442,14 +579,25 @@ else (#66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237 #285
 #288 #300), and #283 is a rescue *from* one of them — three live defects that had been
 sitting inside a deferred-findings dump nobody read.
 
-So, per finding:
+So, per finding — under `shape`, which is the default:
 
-- **At or above the gate** — open the issue and name it in `deferred_to`, exactly as
-  before. One issue for a batch is still fine and usually right.
-- **Below the gate** — open nothing. Record the row with **no `deferred_to`** (the
+- **A category** — "the retry paths in this module have no jitter anywhere", "these four
+  readers were never made exhaustive". It has a subject, and somebody picking it up knows
+  when they are done. **Open the issue and name it in `deferred_to`.**
+- **A substantive single named item** — one real defect, stated once, with its file and
+  its consequence. **Open the issue and name it in `deferred_to`.**
+- **A batch, or anything you cannot classify** — open nothing. Record the row with **no
+  `deferred_to`** (the
   field is nullable, the API accepts a `deferred` outcome without one, and `/panel`
   renders such a row with no target rather than as broken) and **a one-line `note`
   saying what the defect is and why it was not fixed this round.**
+
+  **Unclassified falls through to `batch`, and that direction is deliberate.** The gate
+  tests whether a deferral IS a category or a single item, so no shape given, an empty
+  one, or a word the panel does not know all land here and file nothing. Under the old
+  severity bands the fall-through went the other way — an unreadable severity filed the
+  issue, because a spare line on a tracker was the cheap error. Under `shape` that spare
+  line is precisely the failure being fixed, so the cheap error is now the row.
 
   **The note is not optional here and it is the whole difference between a record and
   a dumping ground.** With an issue, the issue's title and body are what somebody
@@ -464,11 +612,35 @@ So, per finding:
 - **An unverifiable claim is exempt too, for the same reason** (#547) — see the next
   section, which is where the fourth road arrives.
 
+**Why a batch may not, whatever its severity mix.** Nine sub-floor findings from one
+round get nine board rows, each with the one-line note above, and no issue. Twenty P3s in
+one issue is not a deferral, it is a **transfer**: the findings leave this cycle for
+somewhere with no owner and no next action, and the note that made each row readable is
+flattened into a list. Measured on this repo: twenty issues existed only because a
+panel round found something and the cycle did not clear it (#66 #69 #72 #74 #95 #104
+#111 #119 #120 #126 #132 #133 #140 #223 #237 #283 #285 #286 #288 #300), carrying 345
+findings between them by their own titles, created over six days, and **not one has
+ever been closed** — in either sense, worked or abandoned. #283 is a rescue *from* one
+of them: three live defects sitting inside a deferred-findings dump nobody read. That is
+the measurement the dial's default was changed on.
+
+**This knowingly amends #42.** That rule said a capped round's findings must be handed to
+somebody rather than to nobody, and it is still in force — what changes is who somebody
+is. For a batch it is the **board**: a row per finding, each with its note, queryable by
+PR at `GET /review/findings?repo=<owner/name>&pr=<n>`. An issue that nobody opens is not
+a better answer than a row somebody can query; it is the same findings filed twice and
+read never, which is what the measurement above is.
+
+If a batch contains something that IS a category or a real single item — and it usually
+does — lift that one out and file it on its own terms. What is forbidden is the
+issue-shaped dump, not the issue.
+
 **If `qb record-outcome` fails, file the issue whatever the gate says**, and say in
-the relay that you did and why. Below the gate the row is the *only* record, so a
+the relay that you did and why. For a batch the row is the *only* record, so a
 board that refused the write and a gate that suppressed the issue between them lose
 the finding outright — which is the one outcome this setting must never produce. The
-tracker is the fallback, not the default.
+tracker is the fallback, not the default, and this is the one case where an
+issue-shaped dump beats losing the findings.
 
 **Do not mark your own findings `refuted` unattended.** That is a self-grading
 loop and #40's constraint applies for the same reason. The board cannot tell a
@@ -773,7 +945,47 @@ compare range rather than the reconstruction.
 Two things this deliberately does **not** do, so you are not waiting for them:
 revert-and-re-run as an automatic mode, and re-running the fixer with a narrower
 brief instead of reverting. Both are open on #506 and both are decisions a human
-takes today.
+takes today. The next subsection is not an exception to that — it undoes **one fix**,
+never a pass.
+
+### When a SUB-FLOOR fix caused the finding, excise it rather than repairing it (#627)
+
+**The rule.** When a round attributes a new finding to a fix that answered a finding
+**below `round_trigger_floor`** — a P3 or P4, one of the 💸 items the budget paid for —
+the response is to **revert that fix**. One fix, its own hunk, which is why the fixer
+brief asks for each budgeted fix to be landed as its own hunk or commit. Then:
+
+- the sub-floor finding it answered **returns to the board as reported-and-not-fixed**,
+  exactly as an unpaid budget item does — a `deferred` row with its one-line note (§4b);
+- the finding it caused **disappears with it** and is not handed to a fixer, because
+  there is no longer anything for a fixer to be briefed about;
+- **the cycle continues.** This is not an escalation, not a stop, and not a decision you
+  take to a human. It is the cheap correction that lets the round carry on, and treating
+  it as a stop is the expensive reading of a cheap fact.
+
+**Why this is safe here and not in general.** Automatic backtracking over a whole fix
+pass was considered and refused, and `round_stop.revert` above is that refusal: a pass is
+**mixed**, and reverting one that cleared three P2s to remove five P3s puts the P2s back.
+Nothing in the loop can tell which half is which without asking, which is why that
+proposal is priced and handed to you rather than executed. **A single sub-floor fix is
+not a mixed pass.** It answered one finding that was, by definition, not blocking the
+close, so the entire cost of removing it is one P3 or P4 returning to a state this repo's
+own policy already calls reportable and non-blocking. There is nothing to weigh, and
+where there is nothing to weigh there is no decision to take upstairs.
+
+**The one case where it does not apply: a sub-floor fix a later blocking fix has built
+on.** Reverting it then is not a clean excision — it takes lines a P1 or P2 fix depends
+on, and undoing a blocking fix is exactly the mixed revert this rule is careful not to
+be. **Report it instead of forcing it**: name the sub-floor fix, the finding attributed
+to it, and the blocking fix that now rests on it, and let the round proceed normally with
+the caused finding handed to a fixer like any other. A forced excision that breaks a P1
+fix has converted the cheapest correction in the loop into the most expensive one.
+
+**And it needs attribution at the granularity of the fix, not the pass.** `_provenance`
+attributes a finding to the fix *pass*; this needs the individual fix. Where the pass
+landed its budgeted fixes as separate hunks or commits, naming the finding each answers,
+you have it. Where it did not, say so and do not guess — an excision aimed at the wrong
+hunk removes work nobody asked to remove.
 
 ### When the range between the rounds is an integration (#278)
 
@@ -807,6 +1019,33 @@ A range with **no** merge commit in it is never distant, whatever its size: that
 a push, not an integration, and unreviewed work of this PR's own kind holds at any
 size. So does a range that could not be measured at all.
 
+### What may BLOCK, as against what may be touched (#623)
+
+Before you read the verdict, know what a finding has to BE to hold the cycle open. Three
+kinds, and the fixer brief's step 2 is where they are defined and where a fixer assigns
+them:
+
+- **claim-miss** — the change does not do what it set out to do;
+- **regression** — something that worked no longer works, and it has been
+  **demonstrated**: a failing command, a diff of outputs, an assertion that goes red;
+- **observation** — everything else, including everything that would be equally true of
+  this code before the change.
+
+**An observation is recorded, relayed, and blocks nothing**, at every severity — a P1
+somebody ranked an observation at is still an observation. **Reclassifying one as a
+regression takes a demonstrated observable failure, not an argument that one is
+possible**; "this could break if X" is an observation with a story attached, and it is
+the story that fix passes spend their lines on.
+
+This is a different question from the floors and it does not overrule them: **the floors
+(`fix_severity_floor`, `low_severity_fix_lines`) decide what may be TOUCHED, this decides
+what may BLOCK.** An observation above the floor still gets fixed if the round asks for
+it and the budget reaches it. What it may not do is keep the cycle running, hold a
+landing, or turn a dry round into an open one on its own. On lexray#1780 the P1 that cost
+a whole extra round was a claim-miss the issue had stated before a line was written —
+that is the class this distinction exists to keep visible, against a round's worth of
+observations priced identically to it.
+
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
 whether another round is needed (that asks a model to predict findings it has not
@@ -816,7 +1055,8 @@ no with complete confidence):
 - **`stop: false`** — there is work outstanding: findings no earlier round raised,
   a P1/P2 still outstanding, or a finding an earlier round already raised that is
   *still* outstanding at any severity (the fixer was told and it is still there —
-  and SonarCloud's hard-gate issues count here exactly like the judged ones). Fix
+  and on a round the `sonarqube` seat ran, its hard-gate issues count here exactly like
+  the judged ones; on a round it did not, there are none to count). Fix
   them (§4 again, with only this round's findings in the brief), then run the
   panel again as round `r+1`. Repeat until `stop` is true or the cap is reached.
 - **`stop: true`** — **no further PANEL runs.** That is the whole of what it says,
@@ -833,8 +1073,9 @@ no with complete confidence):
 
 `stop` answers *should another panel run*: a question about cost, the cap and
 convergence. It is not the answer to *should these findings be fixed*, which by this
-command's own bar is always yes — every confirmed finding, every SonarCloud hard-gate
-issue. The cap is where the two come apart, and it is the common case: the last
+command's own bar is always yes — every confirmed finding, and every SonarCloud hard-gate
+issue on a round that had a `sonarqube` seat to raise one. The cap is where the two come
+apart, and it is the common case: the last
 round's P1/P2s, the repeats whose fix did not land, the gate issues and everything
 that round newly found are all outstanding at the moment the loop is told to end.
 
@@ -842,15 +1083,55 @@ that round newly found are all outstanding at the moment the loop is told to end
 judgement here either — it is computed from which rule stopped the cycle.
 
 - **`handed_to: "fixer"`** — run **one** final fix pass (§4, with `fixable` as the
-  brief) and then **stop**. Do not run a panel over it: the cycle has ended and there
-  is no round left to read the result.
+  brief), then **one verification pass over its commit**, and then **stop**. Do not run
+  a panel over it: the cycle has ended and there is no round left to read the result.
 
-  **Say in the relay, in these words, that the commit is unreviewed** — "the round-N
-  fix commit was not itself re-reviewed". This is the honest end state and it is not
-  a footnote: a cycle that ends with clearable work left ends with either unfixed
-  findings or an unreviewed fix, there is no third option, and the user is entitled
-  to know which one they got. Do not run "one more round to check it" — that is the
-  cap being raised by the agent it was there to bound.
+  **The verification pass is unconditional (#629).** This path ends with a commit
+  nobody reviews — that is a structural hole in the middle of a review loop, and with
+  the cap at 6 it is the commit most likely to be the last thing touched before a
+  hands-off merge. So it always gets one cheap read, and *cheap enough to be
+  unconditional* is the requirement: anything that costs a round will be skipped, and
+  then the hole stays.
+
+  ```bash
+  qb-stage V                                       # a verification pass, not a round
+  ```
+
+  - **One seat, the fix commit's own diff, one question.** Launch a single
+    `general-purpose` sub-agent over `git show <the fix commit>` and ask it exactly
+    that: **does this commit do what it was briefed to do, and does it break anything it
+    touches.** Give it the brief the fix pass was given — the `fixable` findings it was
+    sent to clear — and the commit's diff, and nothing else. No worktree, no fixing, no
+    push; it reads and reports.
+  - **It is explicitly NOT another round, and must not be run as one.** Do not invoke
+    `panel.py` here with `--round`/`--max-rounds`/`--baseline`. A panel over the final
+    fix restarts the cycle the cap just ended and would find new work by construction —
+    that is the cap being raised by the agent it was there to bound. Nothing about this
+    pass is recorded as a round, and it does not feed `round_stop`.
+  - **If you run it through `panel.py` at all — a single seat with `--reviewers <one>`
+    is a legitimate way to do it — it will be REFUSED without `--new-cycle`.** This pass
+    follows a terminal verdict by construction: the cycle has just stopped, that is the
+    whole reason the pass exists, and #617's gate reads the board for exactly that at
+    launch (§3). So pass `--new-cycle`, and **never `--force`** — it cannot move this
+    gate, and reaching for it here means the refusal was read as an obstacle rather than
+    as the board correctly saying the cycle ended. The banner it prints naming the stop
+    is the right header for this pass's report: it says what ended the cycle, which is
+    the context the seat's answer has to be read in. The sub-agent route above touches
+    `panel.py` not at all and so meets no refusal — that is a difference in mechanism,
+    not a way around the gate.
+  - **Its findings are not a new round's work.** A **regression** it finds — a
+    demonstrated observable failure, per the block above — **blocks the landing**: it
+    goes to a human or to a targeted fix at that one defect, and §7 does not offer.
+    Everything else is an **observation**: it goes to the board as a row and nothing
+    else, and it does not reopen the cycle.
+
+  **Say in the relay what the commit got.** The old sentence was "the round-N fix commit
+  was not itself re-reviewed", and it was honest when nothing read it. Now say that it
+  was **reviewed by a verification pass, not by a round** — which is a weaker claim than
+  a round and a much stronger one than nothing, and the user is entitled to know which
+  of the three they got. If the verification pass could not run at all, the old sentence
+  is the true one and it is the one to use. Do not run "one more round to check it"
+  instead: that is the cap being raised by the agent it was there to bound.
 
   **It is a proposal and not an order.** If the user has said they would rather ship
   with the findings unfixed and triage them separately, that is theirs to choose —
@@ -1000,6 +1281,7 @@ else:
 python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
     --escalated <the key the fixer's escalated ID maps to> \
     --escalated-from-board \
+    --narrowed <the key each of the fixer's NARROWED IDs maps to> \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
     --json-file /tmp/tmp.AbC123/r<r>.json
 ```
@@ -1042,6 +1324,41 @@ work, it reaches a fixer with no ⛔ mark, and the cycle runs to the cap on a
 finding no fixer may patch. Escalating by premise is yours; the loop only knows
 keys.
 
+**`--narrowed` is the same argument and the opposite meaning (#615).** It takes finding
+keys, in the same shape (8-64 hex, repeatable, duplicates deduplicated), mapped the same
+way — the fixer's `Narrowed` block gives IDs, §4b's `jq` gives the keys. **Everything
+about the flag's SHAPE is `--escalated`'s; everything about its MEANING is `fixed`'s**,
+and conflating those is the one misreading it can produce. An escalated finding is work
+no fix pass may do and a human owes an answer on. A narrowed finding is real, was
+**fixed** at the point it was raised, and only the general form was declined.
+
+So it **CLEARS**, where an escalation merely stops counting. The key is subtracted before
+the round's four rules, so the finding is not outstanding, rule 3 does not hold the cycle
+open on it, and no veto line is owed for it — `round_stop.narrowed` publishes the keys
+that were actually honoured. **Without the flag, the fourth outcome reaches nothing**: the
+fixer declares `narrowed`, you record the row, and the round still counts the finding as
+outstanding and goes again — which puts back the whole pressure to write the class-wide
+fix, wearing the cycle instead of the brief. Three things about it that are NOT
+`--escalated`'s:
+
+- **It is NOT inherited through `--baseline`, so pass it on the round that follows the
+  fix pass that declared it — and only that round.** An escalation is open until a person
+  closes it, so forgetting it between rounds puts the work straight back; a narrowing is
+  **discharged the moment it is honoured**, because the finding it names was fixed. There
+  is nothing for a later round to carry, and a register of it would be a record of
+  decisions already spent. Do not chase a narrowed key into later rounds the way you
+  chase a premise.
+- **A SonarCloud hard-gate issue cannot be narrowed**, at any severity. `round_stop`
+  subtracts the exempt set before honouring anything you pass, so naming one is a no-op
+  rather than an error. Narrowing is a judgement about how far to fix a judged finding; a
+  red quality gate is not a judgement, and it keeps the PR unmergeable whatever anybody
+  says about the general form.
+- **A malformed key fails SAFE but quietly — read `config_notes`.** An ignored narrowing
+  leaves the finding outstanding and the cycle goes again, which is the harmless
+  direction; what it does not do is announce itself, so a caller who believes it declared
+  a narrowing watches the round it meant to end run anyway with nothing on screen saying
+  why. The note is there. An ID or a title in place of a key is the usual cause.
+
 **A stop that is HOLDING an escalation is never convergence — and that is
 narrower than "the cycle can never converge with a question open".** When the
 round that stops still raises the escalated finding, the stop takes a veto line,
@@ -1079,8 +1396,8 @@ which key it dropped; pass it again on the next round that runs.
 
 - **Never re-brief an escalated finding to a fixer.** Not this round, not a later
   one. It goes to the human with the write-up the fixer produced (§6). The ⛔ mark
-  in the panel's own **To fix** and **SonarCloud issues** lists is there so a
-  brief built from either cannot include it by accident.
+  in the panel's own **To fix** list — and in its **SonarCloud issues** list where that
+  seat ran — is there so a brief built from either cannot include it by accident.
 - **Match it by premise, not by key.** The next round is a fresh panel over the
   same code, so it will very likely report the same premise defect again — with a
   **new** `finding_key`, at a different line, in different words, and nothing
@@ -1118,9 +1435,12 @@ Two things this must NOT do:
   anything and no round read it, say so in the relay: "the round-N fix commit was
   not itself re-reviewed". This used to be written for the cap alone and assumed a
   fix pass had happened at round N — at the cap, none had, which is how #42's hole
-  stayed invisible. It now covers both: the round-N pass that no round followed,
-  **and** the final pass `outstanding.handed_to: "fixer"` asks for, which is
-  unreviewed by construction.
+  stayed invisible. It covers the round-N pass that no round followed, and it is the
+  sentence to use whenever nothing at all read a fix. The final pass
+  `outstanding.handed_to: "fixer"` asks for is the one case that now has an answer:
+  it gets the verification pass above, so the honest line there is that the commit was
+  **reviewed by a verification pass, not by a round** — say that, not this, and never
+  the other way round.
 - **Never re-run a round to get a nicer answer.** Each panel run is recorded on
   the board as an observation; re-rolling one corrupts the record it exists to be.
 - **Never `--force` past a refusal to keep the cycle moving.** A refused round is
@@ -1132,23 +1452,44 @@ Two things this must NOT do:
 
 Show the sub-agent's summary table verbatim. Then state plainly: that the panel
 summary was posted as a PR comment, the branch it pushed to, whether the
-**SonarCloud hard gate** is now clear, whether all checks passed, anything flagged
+**SonarCloud hard gate** is now clear **or that there was no such gate on this cycle**,
+whether all checks passed, anything flagged
 **unverified**, and any reviewers the panel skipped. If the panel ran on a
 hand-picked set rather than the repo's configured one, say which reviewers ran —
 the fixer's bar is only as good as the review that fed it. If the sub-agent
 stopped early, report exactly where and why.
+
+**"The gate is clear" and "there was no gate" are different sentences and only one of
+them may be said.** With `sonarqube` off — this repo's setting, and the fleet's while the
+convergence work is proven — the second is the true one, and reporting a clear gate off
+an empty list is a claim about a check nobody ran. Say it once and without alarm: a seat
+the repo configured off is a decision, not a coverage gap (§3). A seat that was
+configured on and failed to run is the other thing, and that one belongs in the
+**Coverage** item below with what it cost.
 
 Then the part that is new, and is the point of running more than one round:
 
 - **Rounds:** how many panel/fix cycles ran, what each round found that the last
   had not, and **what stopped it** — a dry round or the round cap. One line per
   round.
+- **Whether this cycle stepped past an earlier one (#617):** if the run was refused
+  because the board held a terminal verdict on this PR, say so and stop — that refusal is
+  the answer, not an obstacle. If it went ahead on `--new-cycle`, lead with what the
+  banner said: which round stopped the last cycle, its reason, how long ago, whether it
+  was convergence, and whether the branch has moved since. **"The tool chose to run" and
+  "a caller overrode the tool" must never read alike**, which is the same rule
+  `preflight.would_have` keeps for `--force` — and here it matters more, because the
+  thing being stepped past is a verdict about this very PR.
 - **Was the stop earned?** If `confident` is false, say so in those words and
   list the vetoes. A reader must never have to infer that a "no new findings"
   round had a reviewer reading half the diff. This is not only a line in the
   relay: §7 blocks the offer to land on it.
-- **Coverage:** per reviewer, anything it declared it could not assess, and any
-  reviewer the panel truncated (with the budget that cut it). If reviewers
+- **Coverage:** per reviewer, anything it declared it could not assess, any
+  reviewer the panel truncated (with the budget that cut it), and **any seat the repo
+  configured ON that did not run** — a missing CLI, a dead login, a crash — with what its
+  absence cost the round. A seat configured OFF does not belong here: it is
+  configuration, it was reported once above, and repeating it every round as a coverage
+  gap is how a reader learns to skim the line that matters. If reviewers
   disagreed — one clean, one "could not assess X" — say so, and give the master's
   `coverage_note` if it ruled on the split. That disagreement is more informative
   than either verdict on its own.
@@ -1168,11 +1509,29 @@ Then the part that is new, and is the point of running more than one round:
 - **What the cycle left behind, and who got it (#42):** `round_stop.outstanding`,
   every time the cycle ended — **including when the answer is nothing**. Say
   `handed_to`, the counts in `fixable` / `escalated` / `below_floor`, and what you
-  then did about it: a final fix pass ran (and **its commit was not reviewed**), or
-  the remainder went to a human, or nothing was owed. This is the one line that
+  then did about it: a final fix pass ran and **what read its commit** — the
+  verification pass (§5), with what it found, or nothing at all if it could not run —
+  or the remainder went to a human, or nothing was owed. This is the one line that
   distinguishes "the panel converged" from "the panel ran out of rounds with eleven
   findings still open", and until #42 the relay could not tell a reader which had
   happened.
+- **Narrowed (#615):** every finding the fixer answered at the point it was raised, with
+  **the general form it did not write**, in the fixer's own line. Give the count and the
+  lines; do not fold them into the fixed count. It is a fix, so the temptation to relay
+  it as one is real, and the sentence that gets lost in the rounding is the only reason
+  the outcome exists. Say `Narrowed: none` when there were none.
+- **Fix surface (#619):** `fix_surface` from the last round — how many files the fix
+  passes touched that no earlier round had read, and which ones. Say it even when it is
+  zero, and pair it with whatever the fixer declared in its summary's **Surface** line;
+  the two should agree, and a disagreement is worth a sentence of its own. It gates
+  nothing, so this is a report and not a verdict — but a P1 in a file that entered the PR
+  through a fix pass is the shape both halves of this exist to make visible.
+- **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
+  answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
+  fix, which finding it answered (now back on the board as reported-and-not-fixed), and
+  which finding went away with it. Say it too when the excision was **declined** because
+  a blocking fix had built on it — that is the case where a caused finding is still in
+  the cycle and a reader needs to know why.
 - **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
   a decision the user has to take, not as a footnote — the commit range, what
   reverting it would remove, what it would cost, and that nothing has run it. If the
@@ -1232,6 +1591,14 @@ round **as the board recorded it**, and a board that never took the round, or an
 API too old to store the field, leaves `stop_confident` null rather than false;
 null is not a stop that was earned, it is a question nobody answered. Two sources
 disagreeing is itself worth a line in the report.
+
+**And cross-check the verification pass, if this cycle ran one (§5).** A **regression**
+it found — a demonstrated observable failure, not an argument that one is possible —
+**blocks the landing**, whatever preland says: the gate reads rounds, and the
+verification pass is deliberately not one, so it is invisible there and this is the only
+place it can be applied. Report it and do not offer; the repair is a targeted fix at that
+one defect, or a human. Anything else the pass found is an observation, goes to the board
+as a row, and does not block.
 
 ### READY — offer, and say what the offer rests on
 

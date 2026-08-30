@@ -152,22 +152,28 @@ def test_a_ceiling_this_harness_cannot_read_dies_before_the_pr_is_fetched(
     assert calls == [], f"the PR was fetched before the ceiling was validated: {calls}"
 
 
-def test_every_ceiling_ships_absent_and_the_repo_sets_none_of_them():
+def test_only_the_per_pr_token_ceiling_ships_set_and_the_repo_agrees_with_it():
     """Two halves of the same claim, and both have to hold to make it true.
 
-    The built-in default is no ceiling — so a repo with no rules file inherits
-    none — and this repo's own tracked policy sets none either, so landing the
-    feature here changes nothing here. A number written into `DEFAULTS` by a later
-    change would put every repo on the fleet under a ceiling nobody chose.
+    Every ceiling shipped absent until #621 raised `max_rounds` from 2 to 6, which
+    makes a cycle up to three times the spend it used to be — so `tokens_per_pr` ships
+    at a number rather than at nothing, and it is the ONLY one that does. The rest stay
+    absent, because a number written into `DEFAULTS` puts every repo on the fleet under
+    a ceiling nobody chose, and that is a decision per key rather than a habit. The
+    repo's own tracked policy has to say the same number: a sample that disagreed with
+    the built-in would govern this repo differently from a repo with no rules file at
+    all, silently.
     """
     built_in = harness_rules.DEFAULTS["review_panel"]["budget"]
     assert set(built_in) == set(panel_caps.CEILINGS)
-    assert all(v is None for v in built_in.values()), built_in
+    assert built_in["tokens_per_pr"] == 20_000_000, built_in
+    assert all(v is None for k, v in built_in.items()
+               if k != "tokens_per_pr"), built_in
 
     root = Path(__file__).resolve().parents[3]
     sample = json.loads((root / ".harness-rules.sample").read_text())
     written = harness_rules.strip_comments(sample)["review_panel"].get("budget", {})
-    assert all(v is None for v in written.values()), written
+    assert written == built_in, written
 
 
 def test_a_dormant_budget_says_nothing_and_a_live_one_says_so():

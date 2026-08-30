@@ -2159,7 +2159,8 @@ def review_sonarqube(sonar: dict, pr: dict,
     return "no-pr-analysis", [], soft, note
 
 
-def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
+def ci_brief(status: str, failing: list[str], skip: str | None = None,
+             unrunnable: dict | None = None) -> str:
     """The CI result, in words, for both prompts (#91).
 
     The panel has always computed this on every run and thrown it away before
@@ -2194,6 +2195,17 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
       argument is that a passing signal is the dangerous kind.
     * **It never adds a fetch.** If `review_ci` was skipped or unreadable the
       brief says so, rather than retrying to make the prompt tidier.
+
+    `unrunnable` is :func:`ci_unrunnable`'s record, and it corrects exactly one
+    factual claim in the `none` body: "a fact about the commit rather than about the
+    repo". On a PR whose base is in no workflow's trigger list that sentence is
+    precisely false — the absence IS about the repo — and a seat told otherwise
+    reasons that a run is coming when nothing the author can do will produce one.
+    It is the same defect #628 fixes for the operator, arriving at the seat. Only
+    the claim changes: the state is still `none`, the brief still says in as many
+    words that this is not a pass, and nothing is added about what the reviewer
+    should conclude from it. `None` leaves the body byte-identical to what it has
+    always been, which is every round on a repo whose CI can run.
     """
     # One header for all nine states, and the WORDS that follow it are what say
     # which channel answered. A header that varied ("CI:" / "Local suite:") would
@@ -2230,7 +2242,13 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None) -> str:
     elif status == "none":
         body = ("NO RUN EXISTS for this commit, so there is no suite result either way. "
                 "This is not a pass. It means nothing mechanical has looked at this "
-                "code, which is a fact about the commit rather than about the repo.")
+                "code, "
+                + (f"and none can: this pull request's base branch "
+                   f"(`{unrunnable.get('base') or '?'}`) appears in no workflow's "
+                   "trigger list in this repository, so no run will be created for "
+                   "this commit however long anyone waits."
+                   if unrunnable else
+                   "which is a fact about the commit rather than about the repo."))
     elif status == LOCAL_PASS:
         # #548. Everything `PASS` says, plus the sentence that keeps the two apart.
         # A seat told "the suite passed" and left to assume it was CI's would draw a
@@ -2349,6 +2367,377 @@ def review_ci(gh_repo: str, pr_number: int) -> tuple[str, list[str], str | None]
     if "pending" in buckets:
         return "PENDING", failing, None
     return "PASS", failing, None
+
+
+# ------------------------------------------- #628: CI that CANNOT run, which is
+# not CI that has not run
+
+#: The events that put a run against a PR's commits without anybody clicking.
+#: `workflow_dispatch`, `schedule` and `workflow_call` are deliberately absent —
+#: each of them can produce runs on this repo all day and none of them produces
+#: one for THIS commit, so counting them would answer "does this repo have CI"
+#: when the question is "can a run exist for this pull request".
+#:
+#: The two halves take their branch filter from different ends of the PR, and that
+#: is the whole subtlety here. A `pull_request` filter is matched against the BASE
+#: — the branch being merged INTO — while a `push` filter is matched against the
+#: branch the commits are on, which for a PR is the HEAD. `prisonblues/lexray#1780`
+#: is the push case: `test.yml` fires on pushes to `main` and `test`, the PR's head
+#: was neither, its base `fca` was neither, and no run could ever exist.
+_PR_TRIGGERS = ("pull_request", "pull_request_target")
+_PUSH_TRIGGERS = ("push",)
+
+#: How many workflow files to read before giving up. A repo with more than this
+#: many is not one this check can afford to be exhaustive about, and an answer
+#: taken over a prefix of the set would be a confident "no workflow can run" made
+#: from a fraction of the workflows — the one wrong answer this whole check must
+#: not produce. Over the cap it declines instead.
+WORKFLOW_FILE_CAP = 30
+
+#: Per-file read timeout, and the same discipline `review_ci` uses: a hung API is
+#: an unanswered question, never a verdict.
+WORKFLOW_READ_TIMEOUT = 30
+
+#: What a trigger EVENT may be spelled as — a bare YAML identifier and nothing else.
+#:
+#: It exists because the scanner reads NAMES out of text, and a reader that takes
+#: whatever it finds as a name turns a shape it cannot parse into an event nobody
+#: has, which matches no trigger and reports the repo as having no runnable
+#: workflow. `on: {pull_request: {branches: [fca]}}` did exactly that: the whole flow
+#: mapping came back as one "event name", `workflow_can_run` said no, and the panel
+#: told an operator that `fca` was in no trigger list while handing them a remedy to
+#: add a branch the workflow already lists. A confident falsehood with an
+#: unperformable instruction under it, which is the failure #628 exists to remove
+#: rather than to commit.
+#:
+#: So an item that is not an identifier WITHDRAWS THE WHOLE READ. Not "an unknown
+#: event", which is what the bug was: this parser's one design constraint is that
+#: every ambiguity resolves to "a run may exist", and the only way to honour that on
+#: a shape it cannot read is to stop reading.
+_EVENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
+
+
+def _yaml_comment_stripped(line: str) -> str:
+    """A workflow line with its trailing comment removed.
+
+    Deliberately crude and deliberately conservative: a `#` inside a quoted
+    string would be cut too, which in this parser can only ever turn a branch
+    pattern into a shorter one and so can only ever produce a WIDER match — the
+    fail-open direction. Branch names carrying a `#` do not exist in practice
+    (git allows it; refs conventions and every CI example do not), and the
+    alternative is a quote-tracking scanner written to be right about a case
+    nobody has.
+    """
+    if line.lstrip().startswith("#"):
+        return ""
+    return re.sub(r"\s+#.*$", "", line).rstrip()
+
+
+def _yaml_list(rest: str, block: list[str], indent: int) -> list[str] | None:
+    """The items of a YAML sequence written either inline (`[a, b]`) or as `- a`
+    lines under `indent`. ``None`` when neither shape is present, which is the
+    answer that matters: an absent `branches:` key means "every branch", and a
+    caller that read it as an empty list would refuse every workflow in the repo.
+    """
+    rest = rest.strip()
+    if rest.startswith("[") and rest.endswith("]"):
+        return [i.strip().strip("'\"") for i in rest[1:-1].split(",") if i.strip()]
+    if rest:
+        return [rest.strip("'\"")]
+    out = []
+    for line in block:
+        if not line.strip():
+            continue
+        # `<` and not `<=`: a sequence may be written at the SAME indent as the key
+        # that owns it, which is valid YAML and is how several repos write
+        # `branches:`. A sibling key at that indent still ends the list, because it
+        # does not open with `- `.
+        if len(line) - len(line.lstrip()) < indent:
+            break
+        item = line.strip()
+        if not item.startswith("- "):
+            break
+        out.append(item[2:].strip().strip("'\""))
+    return out or None
+
+
+def workflow_triggers(text: str) -> dict[str, dict] | None:
+    """``{event: {"branches": [...] | None, "branches-ignore": [...] | None}}`` for
+    one workflow file, or ``None`` when the ``on:`` block could not be found.
+
+    A hand-written scanner rather than a YAML parse, because there is no YAML
+    parser on this host — and the shape being read is small enough that the honest
+    trade is stating what it does NOT handle rather than pretending to a general
+    reader:
+
+    * anchors, aliases, merge keys and multi-line flow collections are not read, and
+      neither is `on` written as a flow mapping (`on: {push: {...}}`, and its
+      sequence spelling). Every one of them comes back ``None`` — the read is
+      WITHDRAWN — and the caller reports that it could not be established rather
+      than that no run can exist.
+
+      That is the whole of the fix for the defect this bullet used to describe. It
+      claimed those shapes yielded "an event with no filters", which fails open;
+      what actually happened is that the flow mapping came back as one long string
+      and was taken as an EVENT NAME, matching no trigger, so a workflow that
+      triggers on `pull_request: {branches: [fca]}` was reported as one that cannot
+      run for `fca`. An unreadable shape must not become a name — see
+      :data:`_EVENT_NAME`.
+    * a flow mapping as the VALUE of a recognised event (`push: {branches: [main]}`)
+      is a different case and does still fail open: the event name was read
+      normally, and only its filter is unread, which :func:`_event_filter` reports
+      as "not stated" — i.e. every branch.
+    * ``on`` is a YAML 1.1 boolean, so a real parser hands it back under the key
+      ``True``. This one matches the text and does not have that problem, which is
+      the one place the crude reader is the more reliable of the two.
+
+    Failing open is the whole design constraint. The output of this feeds a
+    sentence telling an operator that **no run can ever exist** for their PR, and a
+    parser that misreads a trigger it has never seen would print that about a repo
+    whose CI is working. Every ambiguity here therefore resolves to "a run may
+    exist", which costs nothing but the old wording.
+    """
+    lines = [_yaml_comment_stripped(ln) for ln in text.splitlines()]
+    head = next((i for i, ln in enumerate(lines)
+                 if re.match(r"""^['"]?on['"]?\s*:""", ln)), None)
+    if head is None:
+        return None
+    rest = lines[head].split(":", 1)[1]
+    # `on: [push, pull_request]` and `on: push` — every event, no branch filter.
+    # A flow MAPPING (`on: {push: {...}}`) arrives here as one long item and is not
+    # an identifier, so `_named` withdraws rather than minting an event out of it.
+    inline = _yaml_list(rest, [], 0) if rest.strip() else None
+    if inline is not None:
+        return _named(inline)
+    # The block form. It ends at the next key in column 0, which is what keeps a
+    # `jobs:` block below from being read as a list of trigger events.
+    body = []
+    for ln in lines[head + 1:]:
+        if ln.strip() and not ln.startswith((" ", "\t")):
+            break
+        body.append(ln)
+    at = next((len(ln) - len(ln.lstrip()) for ln in body if ln.strip()), None)
+    if at is None:
+        return None
+    out: dict[str, dict] = {}
+    for i, ln in enumerate(body):
+        if not ln.strip() or len(ln) - len(ln.lstrip()) != at:
+            continue
+        if ln.strip().startswith("- "):
+            # `- {push: {...}}` is the sequence spelling of the same unreadable
+            # shape, and takes the same answer as the inline one.
+            listed = _named([ln.strip()[2:].strip().strip("'\"")])
+            if listed is None:
+                return None
+            out.update(listed)
+            continue
+        if ":" not in ln:
+            continue
+        event, tail = ln.strip().split(":", 1)
+        event = event.strip().strip("'\"")
+        # A key that is not an identifier is a shape this reader does not
+        # understand sitting where an event belongs — `? [a, b]` , a quoted
+        # sentence, an anchor. Withdraw, for the reason `_EVENT_NAME` gives: the
+        # alternative is an event name nothing can match, which reads downstream as
+        # a workflow that cannot fire.
+        if not _EVENT_NAME.match(event):
+            return None
+        sub = body[i + 1:]
+        out[event] = {
+            "branches": _event_filter(sub, at, tail, "branches"),
+            "branches-ignore": _event_filter(sub, at, tail, "branches-ignore"),
+        }
+    return out or None
+
+
+def _named(items: list[str]) -> dict[str, dict] | None:
+    """``items`` as filterless trigger events, or ``None`` if any of them is not a
+    bare identifier.
+
+    All or nothing, deliberately. Dropping the unreadable item and keeping the rest
+    would answer "can a run exist" from a subset of the triggers — the same
+    partial-population answer :func:`ci_unrunnable` refuses when there are more
+    workflow files than it reads."""
+    if not all(_EVENT_NAME.match(i) for i in items):
+        return None
+    return {i: {"branches": None, "branches-ignore": None} for i in items}
+
+
+def _event_filter(sub: list[str], at: int, tail: str, key: str) -> list[str] | None:
+    """One event's ``branches`` / ``branches-ignore`` list, or ``None`` for "not
+    stated", which GitHub reads as *every* branch. ``tail`` is whatever followed the
+    event's own colon: non-empty means a flow mapping this reader does not parse, so
+    it declines rather than guessing — see :func:`workflow_triggers`."""
+    if tail.strip():
+        return None
+    keys_at = None
+    for j, ln in enumerate(sub):
+        if not ln.strip():
+            continue
+        deeper = len(ln) - len(ln.lstrip())
+        if deeper <= at:
+            break
+        # The event's own keys are whatever indent its first line sits at.
+        # Anything deeper belongs to one of them (`types:`, a `paths:` list) and
+        # must not be read as a sibling: a `branches:` nested inside another key
+        # is not this event's filter.
+        keys_at = deeper if keys_at is None else keys_at
+        if deeper != keys_at:
+            continue
+        name, sep, rest = ln.strip().partition(":")
+        if sep and name.strip().strip("'\"") == key:
+            return _yaml_list(rest, sub[j + 1:], deeper)
+    return None
+
+
+def _branch_matches(branch: str, pattern: str) -> bool:
+    """GitHub's branch-filter glob, narrowly: ``**`` crosses ``/``, ``*`` does not,
+    ``?`` is one character, everything else is literal. Written out rather than
+    handed to :mod:`fnmatch`, whose ``*`` crosses ``/`` — which would make
+    ``release/*`` match ``release/1/hotfix`` and quietly turn an unrunnable PR into
+    a runnable-looking one."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            out.append(".*" if pattern[i:i + 2] == "**" else "[^/]*")
+            i += 2 if pattern[i:i + 2] == "**" else 1
+            continue
+        out.append("." if c == "?" else re.escape(c))
+        i += 1
+    return re.fullmatch("".join(out), branch) is not None
+
+
+def _filter_admits(branch: str, f: dict) -> bool:
+    """Does one event's branch filter admit ``branch``? An absent list is "every
+    branch", which is why the two are read with ``is None`` rather than for
+    truthiness."""
+    allow, deny = f.get("branches"), f.get("branches-ignore")
+    if deny is not None and any(_branch_matches(branch, p) for p in deny):
+        return False
+    if allow is None:
+        return True
+    # A leading `!` is GitHub's exclusion inside `branches:`, and a list that is
+    # nothing BUT exclusions admits everything else.
+    no = [p[1:] for p in allow if p.startswith("!")]
+    yes = [p for p in allow if not p.startswith("!")]
+    if any(_branch_matches(branch, p) for p in no):
+        return False
+    return not yes or any(_branch_matches(branch, p) for p in yes)
+
+
+def workflow_can_run(triggers: dict[str, dict], base: str, head_branch: str) -> bool:
+    """Could this workflow produce a run for a PR from ``head_branch`` into
+    ``base``? A `pull_request` filter is read against the BASE and a `push` filter
+    against the HEAD — see :data:`_PR_TRIGGERS`."""
+    for event, f in triggers.items():
+        if event in _PR_TRIGGERS and _filter_admits(base, f):
+            return True
+        if event in _PUSH_TRIGGERS and _filter_admits(head_branch, f):
+            return True
+    return False
+
+
+def _gh_api(path: str, raw: bool = False) -> tuple[str, str]:
+    """``(body, why-not)`` for one `gh api` read. Never raises: this whole check is
+    additive, and an unreadable workflow directory must degrade to "could not be
+    checked" rather than take a review down."""
+    argv = ["gh", "api", path]
+    if raw:
+        argv += ["-H", "Accept: application/vnd.github.raw"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL,
+                              timeout=WORKFLOW_READ_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return "", f"{e.__class__.__name__}"
+    if proc.returncode:
+        tail = (proc.stderr or "").strip().splitlines()
+        return "", (tail[-1][:120] if tail else f"gh api exited {proc.returncode}")
+    return proc.stdout or "", ""
+
+
+def ci_unrunnable(gh_repo: str, base: str, head_branch: str,
+                  read=None) -> tuple[dict | None, str]:
+    """``(what makes a run impossible, why this could not be established)`` for a PR
+    whose CI status is ``none``.
+
+    #628. `prisonblues/lexray#1780` was based on `fca`; that repo's `test.yml`
+    triggers on `main` and `test` alone, so no run could ever exist for it, and the
+    panel printed *"🚫 no run exists for this commit — do not merge, even if the
+    review below is clean"* on all five rounds. That instruction is unsatisfiable by
+    anything the author can do, so it was waived — and a hard gate that gets waived
+    teaches everyone that hard gates are waivable. "CI has not run" and "CI cannot
+    run" have completely different remedies and had one sentence between them.
+
+    **It adds no value to `ci_status` and is not allowed to.** `app/ordering.py`
+    compares that field against `PASS`/`FAIL` for equality and matches
+    `CI_SETTLED`/`CI_NOT_APPLICABLE` as sets; a new member of it ripples into
+    consumers this module does not own. So this rides BESIDE the status as its own
+    record, and unrunnable stays not-a-pass exactly as `none` already is.
+
+    Read at the BASE ref rather than at the head, because the base is where the
+    remedy has to land: a `pull_request` trigger is taken from the base branch's
+    copy of the workflow, and a PR that adds a trigger to its own copy still gets no
+    run. That does mean a PR which fixes this is reported as unrunnable until it
+    merges, which is the truth about it.
+
+    Three answers, and the middle one is the one worth being careful about:
+
+    * a dict — every workflow was read and none of them can fire for this PR;
+    * ``(None, "")`` — some workflow can fire, so the absent run is an absent run;
+    * ``(None, why)`` — the question could not be put. NOT reported as runnable and
+      not reported as unrunnable: the caller says it could not be checked, on the
+      same rule `board_escalations` keeps, because "no workflow can run here" is a
+      strong claim and a failed API read is no evidence for it.
+    """
+    read = read or _gh_api
+    listing, why = read(f"repos/{gh_repo}/contents/.github/workflows?ref={base}")
+    if why:
+        return None, f"the repo's workflow directory could not be read ({why})"
+    try:
+        entries = json.loads(listing or "[]")
+    except json.JSONDecodeError:
+        return None, "the repo's workflow directory came back unparseable"
+    paths = [str(e.get("path") or "") for e in entries if isinstance(e, dict)
+             and str(e.get("name") or "").endswith((".yml", ".yaml"))]
+    if not paths:
+        # A repo with no workflows at all is not a trigger-list mistake, and the
+        # remedy this function prints ("add the base to the triggers") would name a
+        # file that does not exist. `none` says it already: nothing mechanical has
+        # looked at this code.
+        return None, ""
+    if len(paths) > WORKFLOW_FILE_CAP:
+        return None, (f"{len(paths)} workflow files is over the {WORKFLOW_FILE_CAP} "
+                      "this check reads")
+    blocked = []
+    for path in sorted(paths):
+        text, why = read(f"repos/{gh_repo}/contents/{path}?ref={base}", True)
+        if why:
+            return None, f"`{path}` could not be read ({why})"
+        triggers = workflow_triggers(text)
+        if triggers is None:
+            # An `on:` block this reader could not find is a workflow it knows
+            # nothing about, and one unknown workflow is enough to withdraw the
+            # claim — the claim is about ALL of them.
+            return None, f"the `on:` block of `{path}` could not be read"
+        if workflow_can_run(triggers, base, head_branch):
+            return None, ""
+        blocked.append({"path": path, "events": sorted(triggers)})
+    return {
+        "base": base,
+        "head": head_branch,
+        "ref": base,
+        "reason": (f"no workflow in this repo can produce a run for a pull request "
+                   f"into `{base}`: {len(blocked)} workflow file(s) were read at "
+                   f"`{base}` and none of them triggers on it"),
+        "remedy": (f"add `{base}` to the trigger list of the workflow that should "
+                   f"gate it — `on.pull_request.branches` (matched against the "
+                   f"base) or `on.push.branches` (matched against the PR's own "
+                   f"branch). Waiting cannot fix this and neither can re-running: "
+                   f"no run is scheduled to wait for."),
+        "workflows": blocked,
+    }, ""
 
 
 #: How long a round may wait for a PENDING CI to settle before dispatching the
@@ -2808,6 +3197,8 @@ __all__ = [
     "_is_commitish", "_is_ref", "_same_commit",
     "_prior_round", "PR_SCOPE_HEADER", "INCREMENT_BRIEF", "JUDGE_INCREMENT_BRIEF",
     "CI_STATE_WORDS", "_settle_no_checks",
+    "WORKFLOW_FILE_CAP", "WORKFLOW_READ_TIMEOUT", "workflow_triggers",
+    "workflow_can_run", "ci_unrunnable",
     "ReviewScope", "_cut_note", "_cut_note_reserve", "_SONAR_SEV",
     "_sonar_findings", "_try", "review_sonarqube", "ci_brief",
     "review_ci",

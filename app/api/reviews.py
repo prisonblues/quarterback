@@ -189,12 +189,13 @@ object has", refuted by a transcript carrying it in all 801 assistant usage
 blocks — and that refutation is recorded nowhere.
 
 ``POST /review/outcomes`` records the terminal state whoever ACTED on the finding
-puts on it: ``fixed | refuted | deferred | superseded``. ``refuted`` is what pays
+puts on it: ``fixed | narrowed | refuted | deferred | superseded``. ``refuted`` is what pays
 for the release and is the cheapest to capture, because the refutation is already
 being written in the PR comment and the fix commit's message, in prose that
 nothing can count. ``deferred`` gives the parked backlogs a state instead of a
 markdown list; ``superseded`` is what a later round marks a finding as when it
-re-derives it.
+re-derives it; ``narrowed`` (#615) is the one that is a FIX — real, repaired at
+the point it was raised, general form left unwritten and named in the note.
 
 Three properties hold the thing up:
 
@@ -666,13 +667,42 @@ del _no_column
 #: ``deferred`` gives the parked backlogs (#66, #69, #72, #74 and the ones after
 #: them) a state instead of a markdown list. ``superseded`` is what a later round
 #: marks a finding as when it re-derives it.
-OUTCOMES = ("fixed", "refuted", "deferred", "superseded")
+#:
+#: ``narrowed`` is #615, and it is a FIX rather than a way out of one: the finding
+#: is real, this pass fixed it **at the point it was raised**, and the general
+#: form is not this pass's work. The other three all answer *whether* to act and
+#: none of them answered *how far*, so a fixer that could not answer a finding
+#: partially answered it maximally — measured on lexray#1780, rounds 3-5: one
+#: finding about one nginx location block became server-level ``gzip``, and the
+#: next round's P1 was that it had weakened ETags on an unrelated endpoint. The
+#: maximal answer is what makes a pass edit files the finding never named, and
+#: those files are where the next round's findings come from. So it sits with
+#: ``fixed`` and never with ``deferred`` wherever the two are read apart: it
+#: CLEARS (:data:`app.review_queue.CLEARING_OUTCOMES`, and ``round_stop``'s own
+#: filter one directory over), and it owes a note the way ``refuted`` does — the
+#: general form the fix did not take, which is the entire reason the word exists.
+#: A bare ``narrowed`` is a ``fixed`` that has lost the only thing telling the two
+#: apart.
+OUTCOMES = ("fixed", "narrowed", "refuted", "deferred", "superseded")
 
 #: The two outcomes that are a judgement about whether the finding was RIGHT, and
 #: therefore the only two in the precision-after-the-fact ratio. ``deferred`` and
 #: ``superseded`` are decisions about what to do next and say nothing about
 #: correctness — counting either as a success would make "we did not get to it"
 #: read as "it was real", which is the direction that flatters.
+#:
+#: ``narrowed`` is the value that rule does NOT settle, and it is held out anyway
+#: (#615). It IS a judgement that the finding was right — the fixer says the
+#: defect is real and repaired where it was raised — so on the sentence above it
+#: belongs here, and holding it out means a reviewer whose real findings were all
+#: narrowly fixed has no ``precision_after`` at all. What decides it is which way
+#: the error runs. Folding ``narrowed`` in moves the numerator and the
+#: denominator together and RAISES every ratio it touches: 1 fixed, 1 refuted and
+#: 8 narrowed reads 50% held out and 90% folded in. An unsettled measurement is
+#: taken on the unflattering side here, so the word is published as its own bucket
+#: in ``by_outcome``, where a reader can see it and count it, and is not yet spent
+#: on a headline percentage. Widening this tuple is a decision about a published
+#: figure and wants its own one; it is not a consequence of adding the word.
 OUTCOMES_SCORED = ("fixed", "refuted")
 
 #: The longest note this endpoint stores. Long enough for the refutation itself —
@@ -2801,7 +2831,8 @@ class OutcomeIn(BaseModel):
     key: str = Field(min_length=1, max_length=MAX_REF_CHARS,
                      validation_alias=AliasChoices("key", "finding_key"))
     outcome: str = Field(min_length=1, max_length=MAX_REF_CHARS)
-    #: Why. Required for ``refuted`` — see :func:`record_outcomes`.
+    #: Why. Required for ``refuted`` and for ``narrowed`` — see
+    #: :func:`record_outcomes`.
     note: str | None = None
     deferred_to: str | None = None
     superseded_by: str | None = None
@@ -2959,6 +2990,13 @@ def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutco
 
     if item.outcome == "refuted" and not item.note and not inherits("note"):
         return "refuted needs a note: the refutation is the evidence for it"
+    # ...and `narrowed` owes one at the same cost for a different reason (#615):
+    # the note IS the general form — what fixing the class would have taken — and
+    # a `narrowed` with nothing in it is a `fixed` wearing another word. The two
+    # lines are the price of not writing the class-wide change; a `narrowed` that
+    # costs nothing is the maximal-fix habit back with a label on it.
+    if item.outcome == "narrowed" and not item.note and not inherits("note"):
+        return "narrowed needs a note: the general form this fix did not take"
     # ...and the same rule for `superseded`, which was asymmetric: the key of the
     # finding that replaced this one is the entire content of that outcome, and
     # it was optional, so `superseded` alone recorded "replaced by something".
@@ -4312,9 +4350,13 @@ async def review_stats(
         outcomes_recorded, confirmed_defects = (og["recorded"], og["defects"]) if og else (0, 0)
         # Fixed against refuted, and nothing else: `deferred` and `superseded` are
         # decisions about what to do next, so counting either would let "we never
-        # got to it" read as "it was real". None where nobody has scored one of
-        # this member's findings yet — the same rule as `precision`, where "the
-        # judge never ruled" must not render as "everything it raised was wrong".
+        # got to it" read as "it was real". `narrowed` is a judgement about
+        # correctness and is still out, on the unflattering side of a question
+        # #615 did not settle — see `OUTCOMES_SCORED`, which is where the argument
+        # is written and where the change goes if it is made. None where nobody
+        # has scored one of this member's findings yet — the same rule as
+        # `precision`, where "the judge never ruled" must not render as
+        # "everything it raised was wrong".
         #
         # Published as `outcomes_scored`, because it is the population
         # `precision_after` is actually over and `outcomes_recorded` is NOT: a
@@ -4430,7 +4472,7 @@ async def review_stats(
             # --- what happened afterwards (v2.37). Read these against
             # `outcomes_recorded` / `confirmed_defects` for the same reason
             # provenance is read against `provenance_runs`: nobody has to record
-            # an outcome, so a group with none reports four honest zeros.
+            # an outcome, so a group with none reports five honest zeros.
             #
             # PER DEFECT — every other count in this row is per observation. A
             # defect this member raised in three rounds is three `confirmed` and
@@ -4583,7 +4625,7 @@ async def review_stats(
     by_outcome = dict.fromkeys(OUTCOMES, 0)
     by_outcome_attested = dict.fromkeys(OUTCOMES, 0)
     # Confirmed defects nobody has ruled on yet. Under its own name, and reported
-    # rather than omitted, because the four buckets are a small part of the window
+    # rather than omitted, because the five buckets are a small part of the window
     # until the fix passes start recording — and a page that showed only them
     # would present today's handful as the whole picture.
     by_outcome["not_recorded"] = 0
@@ -4628,11 +4670,13 @@ async def review_stats(
         "by_premise": by_premise,
         # What became of this window's confirmed findings once somebody acted on
         # them, per DEFECT — `fixed` and `refuted` are the judgement about whether
-        # the finding was right, `deferred` and `superseded` are decisions about
-        # what to do next, and `not_recorded` is every confirmed defect nobody has
-        # ruled on. The gap between `fixed / (fixed + refuted)` here and the
-        # `precision` figures above is what a reviewer's confidence is actually
-        # worth.
+        # the finding was right, `narrowed` says it was right and was fixed only
+        # where it was raised (#615), `deferred` and `superseded` are decisions
+        # about what to do next, and `not_recorded` is every confirmed defect
+        # nobody has ruled on. The gap between `fixed / (fixed + refuted)` here
+        # and the `precision` figures above is what a reviewer's confidence is
+        # actually worth — and `narrowed` is deliberately outside that ratio while
+        # being counted in its own right, for the reason `OUTCOMES_SCORED` gives.
         "by_outcome": by_outcome,
         # The subset a human signed off, so an unattended agent's refutations
         # cannot be read as adjudicated without the reader choosing to.
@@ -4682,8 +4726,8 @@ async def pr_finding_history(
     * ``open`` — still raised in the most recent run.
 
     ``outcome`` is the other thing entirely (v2.37): what somebody found out by
-    acting on the finding — ``fixed`` / ``refuted`` / ``deferred`` /
-    ``superseded`` — recorded by the fixer or a human through
+    acting on the finding — ``fixed`` / ``narrowed`` / ``refuted`` / ``deferred``
+    / ``superseded`` — recorded by the fixer or a human through
     ``POST /review/outcomes``. It sits beside ``status`` and is never folded into
     it, because they answer different questions and are allowed to disagree: a
     chain reading ``gone`` (the reviewer that raised it did not run again) with an

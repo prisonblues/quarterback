@@ -777,7 +777,7 @@ def test_a_below_floor_policy_stop_keeps_its_own_reason_and_its_confidence():
     the cap back its monopoly on ending the loop."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   unrefereed=_unrefereed())
     assert got["stop"] is True and got["confident"] is True
     assert "round trigger floor" in got["reason"]

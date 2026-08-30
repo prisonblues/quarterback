@@ -272,7 +272,7 @@ def test_a_below_floor_policy_stop_keeps_its_own_reason_and_its_confidence():
     its monopoly on ending the loop, which is the failure #165 exists to remove."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_state(9, 1))
     assert got["stop"] is True and got["confident"] is True
     assert "round trigger floor" in got["reason"]
@@ -301,7 +301,7 @@ def test_over_and_fired_are_different_questions_and_the_payload_keeps_them_apart
     round, which is the misreporting `round_stop` is organised against."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_state(9, 1))
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False
@@ -322,7 +322,7 @@ def test_a_round_going_again_for_an_unrelated_P1_is_not_cancelled_by_the_rate():
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     blocker = _finding("P1", key_from="the mirror never closes")
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], [*quiet, blocker], [],
-                                  trigger_floor="P2", fix_floor="P3",
+                                  trigger_floor="P2", cleared_floor="P3",
                                   injection=_state(3, 1))
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False

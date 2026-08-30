@@ -16,8 +16,6 @@ import pytest
 
 from .conftest import LAPTOP, PINNED_SETTINGS, SERVER
 
-pytestmark = pytest.mark.anyio
-
 HUMAN = {"Remote-User": "rich", "X-Edge-Auth": PINNED_SETTINGS["HUMAN_EDGE_SECRET"]}
 REPO = "acme/blockers"
 

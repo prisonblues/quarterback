@@ -237,7 +237,7 @@ def test_the_payload_records_every_dial_as_applied(monkeypatch, capsys, tmp_path
 #: severity either.
 BAD_VALUES = [
     ("fixer_may_defer", "maybe", "true or false"),
-    ("file_deferral_issues", "P-2", "P1, P2, P3, P4, always or never"),
+    ("file_deferral_issues", "P-2", "P1, P2, P3, P4, shape, always or never"),
     ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
     ("low_severity_fix_lines", "a few", "a whole number"),
@@ -307,7 +307,7 @@ def test_an_unknown_key_is_still_warned_about_and_dropped():
     assert unknown == {"review_panel": ["fix_severity_floor_typo"]}
     # And the resolver never sees it: an unknown name is dropped before the dials are
     # read, so it cannot reach `resolve_dials` and be refused as a bad value.
-    assert panel_seats.resolve_dials({}, None, []).fix_severity_floor == "P3"
+    assert panel_seats.resolve_dials({}, None, []).fix_severity_floor == "P4"
 
 
 # ------------------------------------------------------------------- 1. fixer_may_defer
@@ -323,9 +323,12 @@ def test_fixer_may_defer_is_on_by_default_and_the_brief_says_what_that_permits()
     flat = " ".join(brief.split())
     assert "Three things may leave a finding unfixed" in flat
     assert "fixer_may_defer" in flat
-    # The outcome it maps to already exists; a fifth value costs the row and records
-    # nothing, so the brief must name the one the database accepts.
-    assert "`fixed | refuted | deferred | superseded`" in flat
+    # The outcome it maps to already exists; a word the database does not accept costs
+    # the row and records nothing, so the brief must name the ones it does. `narrowed`
+    # joined them in #615 — a fifth word and a fourth OUTCOME — so the list is asserted
+    # whole rather than for the three exits this dial is about: a brief naming a
+    # vocabulary the constraint refuses is worse than one naming too few.
+    assert "`fixed | narrowed | refuted | deferred | superseded`" in flat
     # And it is not a way out of work: the justification and the record are both
     # required, and the orchestrator is the one who files.
     assert 'A deferral is not "not now" as a way out of work' in flat
@@ -387,15 +390,21 @@ def test_a_bad_fixer_may_defer_is_refused_and_never_read_as_truthy(bad):
 
 # ---------------------------------------------------------------- 2. fix_severity_floor
 
-def test_by_default_a_p4_is_reported_and_is_not_the_fix_rounds_work(monkeypatch, capsys,
-                                                                    tmp_path):
-    """The default floor is **P3**, so P4 is the tier held back — 31.3% of findings per
-    #165, and the tier that actually ballooned PR #236 (a 54-line README rewrite and a
-    decode-path rework, both P4). Reported, recorded, marked — and out of the list a fix
-    brief is built from, which is the half that matters, since the fix pass is where the
-    damage comes from."""
+def test_a_finding_under_the_floor_is_reported_and_is_not_the_fix_rounds_work(
+        monkeypatch, capsys, tmp_path):
+    """The tier a floor holds back — 31.3% of findings per #165, and the tier that
+    actually ballooned PR #236 (a 54-line README rewrite and a decode-path rework, both
+    P4). Reported, recorded, marked — and out of the list a fix brief is built from,
+    which is the half that matters, since the fix pass is where the damage comes from.
+
+    Driven at `P3` rather than at the default, because the default is now **P4** (#621,
+    which moved the P3/P4 tail inside `low_severity_fix_lines`' budget rather than
+    outside every rule). There is no severity below P4, so at the shipped floor this
+    band cannot exist at all and the mechanism only has a case where a repo RAISES the
+    floor. What the default does instead is the test below."""
     report, payload, _ = run(monkeypatch, capsys, tmp_path,
-                             [finding("P4", "docstring could mention __vNEXT__")])
+                             [finding("P4", "docstring could mention __vNEXT__")],
+                             config=cfg(fix_severity_floor="P3"))
     assert "### To fix (0)" in report
     assert "### Reported, not this round's work (1) — below the `P3` fix floor" in report
     assert "🔽" in report
@@ -406,6 +415,20 @@ def test_by_default_a_p4_is_reported_and_is_not_the_fix_rounds_work(monkeypatch,
     assert "Do not build a fix brief from this list" in report
     assert payload["to_fix"][0]["below_fix_floor"] is True
     assert payload["review_panel"]["fix_severity_floor"] == "P3"
+
+
+def test_by_default_a_p4_is_now_the_fix_rounds_work(monkeypatch, capsys, tmp_path):
+    """What the shipped floor does since #621, stated on its own so the move is a
+    tested fact rather than a literal that drifted. `P4` is the lowest severity this
+    panel has, so at the default NOTHING is below the floor: the whole P3/P4 tail is
+    the fix round's work, priced by `low_severity_fix_lines` instead of excluded by a
+    floor, and the report grows no held-back section at all."""
+    report, payload, _ = run(monkeypatch, capsys, tmp_path,
+                             [finding("P4", "docstring could mention __vNEXT__")])
+    assert payload["review_panel"]["fix_severity_floor"] == "P4"
+    assert "### To fix (1)" in report
+    assert "Reported, not this round's work" not in report and "🔽" not in report
+    assert payload["to_fix"][0]["below_fix_floor"] is False
 
 
 def test_a_p3_is_the_fix_rounds_work(monkeypatch, capsys, tmp_path):
@@ -475,7 +498,7 @@ def test_an_unset_floor_is_silent(monkeypatch, capsys, tmp_path):
         _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
                             config=cfg(**unset))
         assert not notes_about(payload, "fix_severity_floor")
-        assert payload["review_panel"]["fix_severity_floor"] == "P3"
+        assert payload["review_panel"]["fix_severity_floor"] == "P4"
 
 
 # --------------------------------------------------------------- 3. round_trigger_floor
@@ -517,23 +540,29 @@ def test_a_below_floor_finding_the_fixer_never_had_does_not_repeat_the_cycle_to_
     `fix_severity_floor` is one no fix round was asked to clear, so it is outstanding
     every round by construction — and rule 3 ("an earlier round already raised it and
     it is still there") would go again on it until the cap, which is the
-    non-convergence this whole change exists to remove. P4 findings, because the fix
-    floor defaults to P3 now and a P3 IS work the fix round was asked to clear.
+    non-convergence this whole change exists to remove. P4 findings against a floor of
+    `P3`, stated rather than inherited: the fix floor now defaults to P4 (#621) and
+    there is no severity under it, so the band only exists where a repo raises the
+    floor.
 
     `low_severity_fix_lines: null` here, which is what makes the round's REQUIRED
     floor the fix floor: under the shipped budget a P3 is work the round was asked to
     clear only while the budget lasts, and `Dials.cleared_floor` raises the bound to
     the cut for that (#297, and the test below it). Null is the pre-#297 reading and
     the one this test was written against."""
-    conf = cfg(low_severity_fix_lines=None)
+    conf = cfg(low_severity_fix_lines=None, fix_severity_floor="P3")
     _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=1,
                    max_rounds=3, config=conf)
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")], round_no=2,
                         baseline=[r1], max_rounds=3, scope="pr", config=conf)
     stop = payload["round_stop"]
     assert stop["stop"] is True, stop["reason"]
-    assert "already raised" not in stop["reason"]
-    assert stop["fix_floor"] == "P3" and stop["trigger_floor"] == "P2"
+    # Named, not merely absent from the go-again reasons: since #621 a repeat under the
+    # trigger floor is REPORTED rather than folded into "dry", so the payload has to
+    # carry the key as well as the stop.
+    assert "reported, not fixed here" in stop["reason"]
+    assert len(stop["repeated_below_trigger_floor"]) == 1
+    assert stop["cleared_floor"] == "P3" and stop["trigger_floor"] == "P2"
 
 
 def test_a_bad_trigger_floor_refuses_the_run(monkeypatch, capsys, tmp_path):
@@ -542,6 +571,126 @@ def test_a_bad_trigger_floor_refuses_the_run(monkeypatch, capsys, tmp_path):
         panel.run("board", 34, post=False, record=False)
     assert "`review_panel.round_trigger_floor`='P5'" in str(refusal.value)
     assert "P1, P2, P3, P4" in str(refusal.value)
+
+
+# ------------------------------------- 3b. rule 3 asks the TRIGGER floor now (#621)
+#
+# `round_stop`'s rule 3 — "an earlier round already raised it and it is still
+# outstanding" — used to be bounded by the fix floor: anything the fix pass was ASKED
+# to clear and did not. That was sound while the two floors sat a tier apart, and it
+# stops being sound the moment the fix floor drops far enough for a budget to reach the
+# P3/P4 tail, which is exactly what #621's `fix_severity_floor: P4` does. One unpaid
+# sub-trigger finding is then outstanding every round by construction, and the only
+# move that closes it is the fixer writing lines — which is what authors the next
+# round's findings.
+#
+# The decided rule: a repeated finding keeps the cycle going only if it would have
+# bought a round in the first place. These are the unit view, where the two floors can
+# be moved independently of the dials that set them.
+
+
+def test_a_repeated_finding_under_the_trigger_floor_does_not_buy_another_round():
+    """#621's change, stated at the smallest scale it has. The P3 is at the cleared
+    floor — work the fix pass WAS asked to clear, and did not — and it is still not
+    worth another panel, another fix pass and another panel, because it was not worth
+    one when it was new."""
+    c = judged("P3")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True, d["reason"]
+    assert "none at or above the P2 round trigger floor" in d["reason"]
+    # Work a fix pass may still take — the cleared floor decides that, and it is a
+    # different question from whether to spend another round.
+    assert d["outstanding"]["fixable"] == [c.key]
+
+
+def test_that_repeat_is_NAMED_rather_than_folded_into_a_dry_round():
+    """The reporting half, which is not optional. A round holding a judge-confirmed
+    defect the fixer was told about is not dry, and letting it fall through to the dry
+    branch would put that defect behind the one word this whole payload is organised
+    against. #165's below-floor branch for NEW findings already settled the shape: a
+    policy stop names what it left, keeps its confidence, and takes no veto line."""
+    c = judged("P3")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["repeated_below_trigger_floor"] == [c.key]
+    assert "dry" not in d["reason"]
+    # A POLICY stop: the repo said which findings are worth a round and the round
+    # obeyed, so it is not vetoed and it does not lose its confidence.
+    assert d["veto"] == [] and d["confident"] is True
+
+
+def test_a_repeated_finding_AT_the_trigger_floor_still_buys_one():
+    """Rule 3 itself, isolated. The trigger floor is raised to `P3` so a P3 is at it,
+    and the finding is not a P1/P2 — so rule 2 cannot be what answers this and the
+    `reason` says which rule did. Without this the test above passes on a rule 3 that
+    was deleted rather than re-bounded."""
+    c = judged("P3")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key],
+                         trigger_floor="P3", cleared_floor="P4")
+    assert d["stop"] is False
+    assert "1 finding(s) an earlier round already raised" in d["reason"]
+    assert d["repeated_below_trigger_floor"] == []
+
+
+def test_a_repeated_p2_still_goes_again_at_the_shipped_floors():
+    """Said explicitly because it is the thing a reader assumes went with the change.
+    A P1/P2 is at or above any trigger floor a repo can set, so #621 cannot reach it —
+    and rule 2 answers first, which is why the reason names a blocker rather than a
+    repeat."""
+    c = judged("P2")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is False
+    assert "P1/P2 still outstanding after the fix" in d["reason"]
+
+
+def test_a_repeated_sonar_gate_issue_goes_again_where_a_judged_P4_does_not():
+    """The exemption is a property of the KEY and not of one rule, so #621 moving rule
+    3's floor cannot re-filter a red quality gate — and P4 is where that has to be
+    shown, since it is under every floor a repo can set. The judged half is the
+    discriminator: same severity, same floors, same round, and the only difference is
+    `verdict`."""
+    gate = sonar_canonical("P4")
+    went = panel.round_stop(2, 5, [], [gate], [], repeated=[gate.key],
+                            trigger_floor="P2", cleared_floor="P4")
+    assert went["stop"] is False, went["reason"]
+    assert "SonarCloud gate issue" in went["reason"]
+    assert went["repeated_below_trigger_floor"] == []
+
+    c = judged("P4")
+    stopped = panel.round_stop(2, 5, [], [c], [], repeated=[c.key],
+                               trigger_floor="P2", cleared_floor="P4")
+    assert stopped["stop"] is True
+    assert stopped["repeated_below_trigger_floor"] == [c.key]
+
+
+def test_a_new_below_floor_finding_wins_the_reason_over_a_repeated_one():
+    """Both branches are stops and both are true of this round, so the one that says
+    MORE gets the sentence: "this round found something new" is a stronger statement
+    than "this round still carries something old". Both counts are in the payload
+    either way, which is what makes the ordering a wording decision rather than a
+    dropped fact."""
+    old, new = judged("P3"), judged("P3", "a second nit", file="b.py")
+    d = panel.round_stop(2, 5, [new.key], [old, new], [], repeated=[old.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True
+    assert "new finding(s), none at or above the P2 round trigger floor" in d["reason"]
+    assert d["new_below_trigger_floor"] == [new.key]
+    assert d["repeated_below_trigger_floor"] == [old.key]
+
+
+def test_an_escalated_repeat_is_subtracted_before_the_floor_is_asked():
+    """The filters run once, in front of all four rules, and #621 changed neither. An
+    escalated key is work no fix round may do, so it is not a repeat that stood down at
+    a floor — it is not a repeat at all, and reporting it as one would tell an
+    aggregator the trigger floor is where that finding went."""
+    c = judged("P3")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key], escalated=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["repeated_below_trigger_floor"] == []
+    assert d["escalated_outstanding"] == [c.key]
+    assert d["stop"] is True
 
 
 # -------------------------------------------------------------------- 4. max_fix_growth
@@ -1212,22 +1361,25 @@ def test_a_bad_require_failing_test_refuses_the_run(monkeypatch, capsys, tmp_pat
 
 # ------------------------------------------------------------------------- 7. max_rounds
 
-def test_the_cap_defaults_to_two(monkeypatch, capsys, tmp_path):
-    """#165 proposes 1 and this deliberately keeps 2: round 2 is what caught a serious
-    defect CREATED by round 1's fix on #236, so the problem is not that round 2 exists
-    — it is that round 1's fix was allowed to be 900 lines. The three settings above
-    attack the growth instead, which makes round 2 cheap."""
+def test_the_cap_defaults_to_six(monkeypatch, capsys, tmp_path):
+    """A BACKSTOP against running forever rather than a convergence mechanism, which is
+    the whole of why it moved from 2 to 6 (#621). At 2 the cap was what ended nearly
+    every cycle — seven panels in one night, every one of them terminating on the
+    counter and saying "a stop, not convergence" in its own output — so the number that
+    was meant to be the last resort was the only rule doing any work. #621 gives the
+    rules that CAN converge room to fire first, and that makes
+    `escalate_on.fix_injection` load-bearing where the cap used to arrive before it."""
     # `--max-rounds` is left off throughout: what is under test is the cap `run()`
     # applies when nobody named one. Round 2 with a baseline, because naming a cap is
     # one of the three things that says a run is part of a cycle and the Rounds block
     # only exists for a cycle — a repo SETTING deliberately is not one of the three,
     # since a standing policy is not a caller's declaration that a loop is running.
     _, first, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], max_rounds=None)
-    assert first["review_panel"]["max_rounds"] == 2
+    assert first["review_panel"]["max_rounds"] == 6
     report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
                              round_no=2, baseline=[r1], max_rounds=None, scope="pr")
-    assert "round 2 of at most 2" in report
-    assert payload["round_stop"]["max_rounds"] == 2
+    assert "round 2 of at most 6" in report
+    assert payload["round_stop"]["max_rounds"] == 6
 
 
 def test_the_setting_raises_the_cap_over_the_constant(monkeypatch, capsys, tmp_path):
@@ -1416,7 +1568,12 @@ def test_a_budgeted_finding_the_budget_may_not_have_reached_does_not_run_to_the_
     ledger, so it cannot tell a repeated budgeted finding the fixer paid for from one
     it never reached. Left unbounded that runs every budgeted cycle to the cap.
 
-    So while a budget is in force the REQUIRED floor is the cut."""
+    So while a budget is in force the REQUIRED floor is the cut, and what that decides
+    since #621 is the DISPOSAL rather than the stop: rule 3 now asks the trigger floor,
+    so the repeat stands down either way, and the cleared floor is what says whether the
+    finding left behind is work a fix pass may still take. Under a budget it is not —
+    the round was never asked to clear it unconditionally — so it is reported below the
+    floor and handed to nobody. The test below is the same round with the budget off."""
     _, _, r1 = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
                         max_rounds=3)
     _, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
@@ -1424,15 +1581,27 @@ def test_a_budgeted_finding_the_budget_may_not_have_reached_does_not_run_to_the_
     stop = payload["round_stop"]
     assert stop["stop"] is True, stop["reason"]
     assert "already raised" not in stop["reason"]
-    assert stop["fix_floor"] == "P2"
+    assert stop["cleared_floor"] == "P2"
+    assert stop["outstanding"]["fixable"] == []
+    assert len(stop["outstanding"]["below_floor"]) == 1
+    assert stop["outstanding"]["handed_to"] == "nobody"
 
 
-def test_and_with_no_budget_that_same_repeat_still_buys_a_round(
+def test_and_with_no_budget_that_same_repeat_is_still_work_a_fix_pass_may_take(
         monkeypatch, capsys, tmp_path):
     """The other half of the test above, and what says it is the BUDGET doing it rather
     than the trigger floor. With no budget the round WAS asked to clear that P3
-    unconditionally, so a repeat of it is a fixer that did not do what it was told, and
-    rule 3's justification holds word for word."""
+    unconditionally, so the finding it leaves behind is a fixer's — it is `fixable` and
+    the disposal names one, where the budgeted round above left it below the floor and
+    handed it to nobody. Same finding, same floors, same stop; the only difference is
+    the budget.
+
+    It does NOT buy another round, and that is #621: rule 3 asks the TRIGGER floor now
+    rather than the cleared one, so a P3 that never bought a round when it was new does
+    not start buying them by being raised twice. Bounded by the cleared floor it did —
+    and the only move that closed it was the fixer writing lines, which is what authors
+    the next round's findings. The finding is reported rather than folded into "dry":
+    `repeated_below_trigger_floor` carries it and the reason says so."""
     off = {"low_severity_fix_lines": None}
     _, _, r1 = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
                         max_rounds=3, dials=off)
@@ -1440,9 +1609,13 @@ def test_and_with_no_budget_that_same_repeat_still_buys_a_round(
                              round_no=2, baseline=[r1], max_rounds=3, scope="pr",
                              dials=off)
     stop = payload["round_stop"]
-    assert stop["stop"] is False
-    assert "already raised" in stop["reason"]
-    assert stop["fix_floor"] == "P3"
+    assert stop["stop"] is True, stop["reason"]
+    assert stop["cleared_floor"] == "P3"
+    assert "none at or above the P2 round trigger floor" in stop["reason"]
+    assert len(stop["repeated_below_trigger_floor"]) == 1
+    assert stop["outstanding"]["below_floor"] == []
+    assert len(stop["outstanding"]["fixable"]) == 1
+    assert stop["outstanding"]["handed_to"] == "fixer"
 
 
 def test_the_budget_is_inert_where_the_two_floors_meet(monkeypatch, capsys, tmp_path):
@@ -1557,8 +1730,12 @@ def test_the_fixers_brief_carries_the_spend_rule_and_not_a_judgement_call():
     assert "If the whole list fits, the whole list gets fixed" in flat
     assert 'never ask yourself whether a fix "risks ballooning"' in flat
     # And the unpaid remainder has somewhere to go, or the budget reads as a licence
-    # to drop findings.
-    assert "recorded `deferred` against the issue you open for the batch" in flat
+    # to drop findings. A board row and NOT an issue since #620: a round's unpaid
+    # remainder is a BATCH, and a batch on a tracker with no drain is the twenty issues
+    # carrying 345 findings that ended the severity cut.
+    assert ("recorded `deferred` by the orchestrator as a board row with its one-line "
+            "note") in flat
+    assert "a batch of sub-floor findings gets" in flat
 
 
 def test_the_orchestrator_relays_the_marks_with_the_list():
@@ -1590,14 +1767,24 @@ def gate(value=None):
         {} if value is None else {"file_deferral_issues": value}, None, [])
 
 
-def test_the_default_keeps_the_p3_p4_tail_off_the_tracker():
-    """P2: at or above it a deferral is a work item somebody will pick up, and the row
-    and the issue coincide. Below it they do not, and below it is where the volume is —
-    P3 and P4 are 67.4% of findings by #165's own severity split."""
+def test_the_default_asks_what_shape_the_ticket_is_and_not_how_severe():
+    """`shape` since #620, and it is not a floor. The question is no longer how severe
+    the deferral is but what the TICKET would be, because severity is a property of a
+    finding and batchness is a property of the ticket — so a cut anywhere on P1..P4
+    files some batches and blocks some single items. The count that ended the severity
+    cut: twenty open issues on this repo were panel deferred-finding exhaust carrying
+    345 findings, every one of them a batch, and not one had ever been closed.
+
+    So severity stops deciding, at BOTH ends: a P1 swept into a batch files nothing and
+    a P4 named on its own files an issue."""
     d = gate()
-    assert d.file_deferral_issues == "P2"
-    assert d.files_issue("P1") and d.files_issue("P2")
-    assert not d.files_issue("P3") and not d.files_issue("P4")
+    assert d.file_deferral_issues == "shape"
+    assert d.files_issue("P4", shape="category")
+    assert d.files_issue("P4", shape="item")
+    assert not d.files_issue("P1", shape="batch")
+    # And with no shape stated the severity says nothing either way — the band's own
+    # answer would have filed both of these.
+    assert not d.files_issue("P1") and not d.files_issue("P4")
 
 
 def test_the_row_is_never_in_question_only_the_issue():
@@ -1660,19 +1847,123 @@ def test_an_escalation_is_exempt_at_every_setting(value):
 
 
 @pytest.mark.parametrize("severity", ["", None, "blocker", "critical"])
-def test_an_unreadable_severity_files_the_issue(severity):
-    """The safe direction, and there is only one. An issue nobody needed costs a line on
-    a tracker; withholding one because the severity could not be read leaves the finding
-    in a row whose severity nothing can sort by — which is the dumping ground this dial
-    exists to prevent, arriving through the back door."""
-    assert gate().files_issue(severity)
+def test_an_unreadable_severity_files_the_issue_under_a_band(severity):
+    """The safe direction UNDER A BAND, and there it is the only one. An issue nobody
+    needed costs a line on a tracker; withholding one because the severity could not be
+    read leaves the finding in a row whose severity nothing can sort by — which is the
+    dumping ground this dial exists to prevent, arriving through the back door.
+
+    Asked of `P2` rather than of the default, because the default is `shape` now and
+    the same reasoning points the other way there: severity is not the question, and
+    the cost of a mistake is a ticket nobody reads rather than a row nobody can sort.
+    The shape half of this is `test_a_deferral_nobody_classified_is_a_batch`."""
+    assert gate("P2").files_issue(severity)
     # `never` is a decision somebody made about every deferral, so it still holds: the
     # fallback is for an unreadable BAND, not an override of the dial.
     assert not gate("never").files_issue(severity)
 
 
+# ---------------------------------- the shipped gate reads the SHAPE of the ticket
+#
+# #620. The bands were a cut on severity and the thing being decided is not a
+# severity: a batch of twenty P3s is not a deferral, it is a transfer of the problem
+# to a human, and one named P4 with substance behind it is a work item somebody will
+# pick up. So a cut anywhere on P1..P4 files some batches and blocks some single
+# items, which is backwards in both directions at once. The bands still work and are
+# the documented way back.
+
+
+@pytest.mark.parametrize("shape", ["category", "item"])
+def test_a_category_or_one_named_item_earns_an_issue_at_any_severity(shape):
+    """The two shapes that file. A CATEGORY is one standing item for a recurring class
+    ("the ingest layer's error paths are untested"), which a human can work as a batch
+    on purpose; an ITEM is one named defect, decision owed or piece of complexity with
+    real substance. Both at `P4`, because the whole of #620 is that severity has
+    stopped being the question — under any band this would have filed nothing."""
+    d = gate()
+    assert d.files_issue("P4", shape=shape)
+    assert d.files_issue("P1", shape=shape)
+
+
+def test_a_batch_of_leftovers_gets_rows_and_never_an_issue():
+    """The measurement that ended the severity cut: twenty open issues on this repo
+    were panel deferred-finding exhaust carrying 345 findings, every one of them a
+    batch, and not one had ever been closed. A P1 in the pile does not change it —
+    twenty findings in one ticket is the shape that does not get worked, whatever the
+    worst of them is graded."""
+    d = gate()
+    assert not d.files_issue("P4", shape="batch")
+    assert not d.files_issue("P1", shape="batch")
+    # And the row is still written — this dial has never been able to turn a finding
+    # into no record at all.
+    assert "board rows" in d.deferral_gist()
+
+
+@pytest.mark.parametrize("shape", ["", None, "   ", "BATCH-ish", "misc", "other"])
+def test_a_deferral_nobody_classified_is_a_batch(shape):
+    """The safe direction, INVERTED from the one a band takes, and that inversion is
+    the whole direction of the rule. Under a band an unreadable severity files, because
+    the cost of an issue nobody needed is a line on a tracker. Here that cost IS the
+    failure, so the answer that cannot mint a ticket nobody reads is the default —
+    reached by testing membership of the two shapes that DO file, so every spelling
+    this panel does not know arrives at it without a case of its own."""
+    assert not gate().files_issue("P1", shape=shape)
+
+
+@pytest.mark.parametrize("shape", ["category", "item"])
+def test_the_shape_is_read_the_way_a_severity_is(shape):
+    """Written by an orchestrator out of a fixer's prose, so it arrives padded and
+    cased however the model wrote it — the same reason every severity that enters this
+    panel is stripped and upper-cased. One written value must not mean two things."""
+    assert gate().files_issue("P4", shape=f"  {shape.upper()}  ")
+
+
+def test_the_two_exemptions_outrank_the_shape_as_they_outrank_a_band():
+    """An escalation and an unverifiable claim are not work items at all — what their
+    issue carries is a QUESTION, past the end of this session, to whoever can answer
+    it. Withholding one because the deferral was swept into a batch would drop the
+    question rather than save a ticket, which is the same argument that exempts them
+    from `never`."""
+    d = gate()
+    assert d.files_issue("P4", escalated=True, shape="batch")
+    assert d.files_issue("P4", unresolvable=True, shape="batch")
+
+
+@pytest.mark.parametrize("value,filed", [("always", True), ("never", False)])
+def test_the_two_ends_ignore_the_shape_exactly_as_they_ignore_severity(value, filed):
+    """Both arguments are taken because both settings are legal, and each is ignored by
+    the setting it is not the question for. A repo that said `always` or `never` said
+    something about every deferral, and a shape that overrode it would make the word
+    mean "usually"."""
+    d = gate(value)
+    assert d.files_issue("P4", shape="batch") is filed
+    assert d.files_issue("P4", shape="item") is filed
+
+
+@pytest.mark.parametrize("shape", ["category", "item", "batch", "", "nonsense"])
+def test_a_band_ignores_the_shape_and_keeps_answering_on_severity(shape):
+    """The other half of the sentence above, and the reason the bands are still a
+    documented way back rather than a deprecated one: a repo that set `P2` gets the
+    pre-#620 answer whatever an orchestrator says about the ticket."""
+    d = gate("P2")
+    assert d.files_issue("P1", shape=shape)
+    assert not d.files_issue("P3", shape=shape)
+
+
+def test_the_report_line_says_which_way_to_act_rather_than_the_dials_own_word():
+    """The orchestrator acts on this AFTER the round, and "shape" on its own tells it
+    nothing about which way to act. The batch clause carries "at any severity" because
+    that is the half a reader schooled on the bands supplies wrongly from memory."""
+    line = gate().deferral_gist()
+    assert "a category or one substantive item gets a GitHub issue" in line
+    assert "a batch of leftovers gets board rows and no issue at any severity" in line
+    assert "a deferral nobody classified" in line
+    assert "an escalation and an unverifiable claim always get one" in line
+
+
 @pytest.mark.parametrize("written,applied", [
-    (" p2 ", "P2"), ("P4", "P4"), (" ALWAYS ", "always"), ("Never", "never")])
+    (" p2 ", "P2"), ("P4", "P4"), (" ALWAYS ", "always"), ("Never", "never"),
+    (" SHAPE ", "shape")])
 def test_the_gate_is_read_case_insensitively(written, applied):
     """Both halves, each normalised to the spelling its own vocabulary uses everywhere
     else — a band upper-cased like every severity that enters the panel, a word
@@ -1686,9 +1977,16 @@ def test_the_report_says_a_below_floor_finding_is_a_board_row_at_the_default(
     """This list IS §4b's road 2, so the orchestrator reading it is about to decide
     issue-or-row for exactly these findings. The answer belongs on the artifact, not in
     whoever remembers the repo's config — the same argument the dial line already makes
-    for the fix floor."""
-    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")])
-    assert "`review_panel.file_deferral_issues` is `P2`" in report
+    for the fix floor.
+
+    A `P3` fix floor is stated so that the list EXISTS: the fix floor defaults to `P4`
+    now (#621) and nothing is below it, so the section this line lives in is absent at
+    the shipped defaults. The gate itself is left at its own default, which is what the
+    test is about — and at `shape` a round's held-back tier is a batch, so the answer is
+    rows and no issue."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")],
+                       config=cfg(fix_severity_floor="P3"))
+    assert "`review_panel.file_deferral_issues` is `shape`" in report
     assert ("the board row is the whole record — no GitHub issue, so the `deferred` "
             "row carries a one-line `note` instead") in report
 
@@ -1696,9 +1994,11 @@ def test_the_report_says_a_below_floor_finding_is_a_board_row_at_the_default(
 def test_the_report_says_each_gets_an_issue_when_the_gate_is_always(
         monkeypatch, capsys, tmp_path):
     """The non-default half of the same line, so the test above is not passing on a
-    sentence that is printed whatever the dial says."""
+    sentence that is printed whatever the dial says. Same `P3` floor, for the same
+    reason: without it there is no held-back list and no line at all."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P4")],
-                       config=cfg(file_deferral_issues="always"))
+                       config=cfg(fix_severity_floor="P3",
+                                  file_deferral_issues="always"))
     assert "`review_panel.file_deferral_issues` is `always`" in report
     assert "each also gets a GitHub issue" in report
 
@@ -1810,13 +2110,14 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     from whoever remembers the repo's config. Printed at the defaults too: a reader
     weighing a quiet round needs to know whether the quiet was measured or configured."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
-    assert ("**Panel dials** (`review_panel`): fix at/above P3 · below-P2 fix budget "
+    assert ("**Panel dials** (`review_panel`): fix at/above P4 · below-P2 fix budget "
             "40 lines, unrefereed x2 · another round at/above P2 · reviewer scope diff "
             "· fix growth "
             "cap 3x or +30,000 chars · fixer may defer yes · failing test "
-            "required no · deferrals at/above P2 get a GitHub issue, below it a "
-            "board row only (an escalation and an unverifiable claim always get "
-            "one)") in report
+            "required no · a deferral naming a category or one substantive item gets "
+            "a GitHub issue; a batch of leftovers gets board rows and no issue at any "
+            "severity, and so does a deferral nobody classified (an escalation and an "
+            "unverifiable claim always get one)") in report
 
 
 def _release_pr(monkeypatch, config):
@@ -1870,7 +2171,7 @@ def test_a_new_p3_sonar_gate_issue_still_buys_a_round_under_the_default_floors()
     quality gate reported as convergence, on a PR that cannot merge."""
     gate = sonar_canonical("P3")
     d = panel.round_stop(2, 5, [gate.key], [gate], [],
-                         trigger_floor="P2", fix_floor="P3")
+                         trigger_floor="P2", cleared_floor="P3")
     assert d["stop"] is False, d["reason"]
     assert d["new_below_trigger_floor"] == []
 
@@ -1882,7 +2183,7 @@ def test_a_still_open_p3_sonar_gate_issue_keeps_the_cycle_going():
     however red the gate — so the exemption has to be there too."""
     gate = sonar_canonical("P3")
     d = panel.round_stop(2, 5, [], [gate], [], repeated={gate.key},
-                         trigger_floor="P2", fix_floor="P3")
+                         trigger_floor="P2", cleared_floor="P3")
     assert d["stop"] is False, d["reason"]
     # The reason names what it counted. "1 P1/P2 still outstanding" would be a false
     # sentence about a P3 `python:S1128`, and this stop is the one a reader is most
@@ -1900,7 +2201,7 @@ def test_a_new_p3_JUDGED_finding_under_the_same_floors_still_stops_the_cycle():
     again". Same severity, same floors, same round — the only difference is
     `verdict`."""
     c = judged("P3")
-    d = panel.round_stop(2, 5, [c.key], [c], [], trigger_floor="P2", fix_floor="P3")
+    d = panel.round_stop(2, 5, [c.key], [c], [], trigger_floor="P2", cleared_floor="P3")
     assert d["stop"] is True
     assert "none at or above the P2 round trigger floor" in d["reason"]
     assert d["new_below_trigger_floor"] == [c.key]
@@ -1911,7 +2212,7 @@ def test_a_p4_sonar_issue_is_exempt_too_because_the_gate_does_not_grade_on_sever
     floor" — it is that a red gate is not a severity judgement at all."""
     gate = sonar_canonical("P4")
     assert panel.round_stop(2, 5, [gate.key], [gate], [], trigger_floor="P2",
-                            fix_floor="P3")["stop"] is False
+                            cleared_floor="P3")["stop"] is False
 
 
 def test_a_whole_run_with_only_a_p3_gate_issue_does_not_report_convergence(

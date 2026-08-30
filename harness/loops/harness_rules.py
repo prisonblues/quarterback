@@ -620,8 +620,8 @@ DEFAULTS: dict = {
         # ORCHESTRATOR opens the issue — #223 and #237 are what a good deferral
         # record looks like. False restores today's two exits.
         "fixer_may_defer": True,
-        # WHERE THE DEFERRAL GOES — a board row always, a GitHub issue only at or
-        # above this severity (#482).
+        # WHERE THE DEFERRAL GOES — a board row always, a GitHub issue only for the
+        # SHAPES of deferral an issue is the right record for (#482, amended by #620).
         #
         # `panel-review-pr.md` §4b used to open an issue for every finding that
         # lands on `deferred`, and its reason was sound as far as it went:
@@ -630,113 +630,168 @@ DEFAULTS: dict = {
         # only sometimes the same one. The **board row** is the durable one — it
         # chains by finding key across rounds, it feeds `/panel`, and it is what
         # stops the leaderboard rewarding a reviewer for being confident rather than
-        # right. The **GitHub issue** is a work item on a human's tracker. For a P1
-        # or P2 deferral those coincide. For the P3/P4 tail they do not, and the tail
-        # is where the volume is.
+        # right. The **GitHub issue** is a work item on a human's tracker, and it is
+        # worth minting only where somebody could pick it up and finish it.
         #
-        # THE MEASUREMENT, taken on this repo on 2026-08-26. Roughly twenty open
-        # issues are the panel's own deferred-finding exhaust and nothing else —
-        # #66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133 #140 #223 #237
-        # #285 #286 #288 #300 — every one of them a capped or below-floor round with
-        # nowhere to put what was left. #283 is a rescue FROM one of them: three live
-        # defects that had been sitting inside a deferred-findings dump nobody read.
-        # That is the failure mode: at that volume the tracker stops being a queue
-        # and starts being a place findings go to not be found, and every one of
-        # those issues dilutes the ranking #435's queue and the drainer are for. The
-        # same complaint arrived independently from another repo in the fleet — "i
-        # don't want this issue creation spam like i had in quarterback" — which is
-        # the floor working (a P4 kept out of the fix pass) and the bookkeeping one
-        # step downstream filing it as a ticket anyway.
+        # **`"shape"`, as of 2026-08-30, replacing the severity cut `"P2"` — Rich's
+        # decision on #621, filed as #620.** In his words: "we should allow category
+        # and true important issues with complexity to be deferred, as single items,
+        # but not 'here are 20 P3 and P4s' which is just transferring a problem to
+        # me." So the gate no longer asks *how severe is this* but *what shape is it*:
         #
-        # P2, NOT `"always"`, and the issue that proposed this suggested `"always"`
-        # on the usual preserve-today's-behaviour grounds. Taken at P2 instead
-        # because "anyone not opting in" is the wrong side of this particular
-        # default: the behaviour being preserved is a bookkeeping step that produces
-        # tracker spam at a measured rate of about one issue per capped round, on
-        # every repo the harness reaches, and a repo only discovers it needs the dial
-        # after twenty issues have accumulated. A P1/P2 deferral still gets its issue
-        # — those are the ones where the row and the work item genuinely coincide.
+        #   - a **CATEGORY** — one standing item for a recurring class ("the ingest
+        #     layer's error paths are untested"), which is #620's own proposal 1 and
+        #     is the form a human can work as a batch — gets an ISSUE;
+        #   - a **SINGLE NAMED ITEM** with real substance behind it — one defect, one
+        #     decision owed, one piece of complexity somebody has to sit down with —
+        #     gets an ISSUE, whatever severity it carries;
+        #   - a **BATCH** — a round's leftovers swept into one ticket, "here are 20 P3
+        #     and P4s" — gets BOARD ROWS AND NEVER AN ISSUE, whatever its severity
+        #     mix, a P1 in the pile included. A batch is not a work item; it is a
+        #     round's remainder wearing one, and the P1 inside it is better served by
+        #     the row that chains across rounds and gets read than by being the fourth
+        #     bullet of a dump.
         #
-        # NOTHING IS DROPPED, and that is the whole difference between this and a
-        # backlog. Below this floor the finding still gets its `deferred` row, still
-        # carries a one-line `note` saying what it is and why it was not fixed —
-        # required by the brief precisely so the row is READABLE later rather than
-        # merely present — and is still relayed to the human in the summary. What it
-        # does not get is a second copy on the tracker. `deferred_to` is nullable
-        # (`app/models/review.py`), the API accepts a `deferred` outcome without one,
-        # and `/panel` renders such a row with no target rather than as broken — the
-        # open question this issue could not settle from outside, settled here and
-        # guarded by a test.
+        # **THE MEASUREMENT THAT ENDED THE SEVERITY CUT**, taken on this repo on
+        # 2026-08-26 and re-counted under the `panel/deferred-findings` label on
+        # 2026-08-30. Twenty open issues are the panel's own deferred-finding exhaust
+        # and nothing else — #66 #69 #72 #74 #95 #104 #111 #119 #120 #126 #132 #133
+        # #140 #223 #237 #283 #285 #286 #288 #300 — created between 2026-08-15 and
+        # 2026-08-21, carrying 345 findings by their own titles, and **not one of them
+        # has ever been closed: zero drain in fifteen days.** #283 is a rescue FROM one
+        # of them — three live defects that had been sitting inside a deferred-findings
+        # dump nobody read. At that volume the tracker stops being a queue and becomes
+        # where findings go to not be found, and every one of those issues dilutes the
+        # ranking #435's queue and the drainer (#476) exist to produce.
         #
-        # DESIGNED TO BE READ, not just written. A row nothing queries is the
-        # markdown list again under a new name, so the read side is named at the same
-        # time as the write: `GET /review/findings?repo=&pr=` returns each chain with
-        # its outcome, which is how a fiddly finding on a PR is found again, and it is
-        # what #500's repeat-finding chain and the cross-PR signal both want to read
-        # from. No cross-PR query is built here (that is its own issue) — what this key
-        # must not do is foreclose one, which is why the record is a row with a note
-        # and not a bullet in a closed issue's body.
+        # **AND NOTE WHERE THE VOLUME SITS: every one of the twenty is a BATCH.** That
+        # is what a severity cut cannot see, because severity is a property of a
+        # finding and batchness is a property of the ticket — so a cut anywhere on
+        # P1..P4 files some batches and blocks some single items, which is exactly
+        # backwards. The same complaint arrived independently from another repo in the
+        # fleet — "i don't want this issue creation spam like i had in quarterback" —
+        # and Rich, on the day of the measurement: "the board itself should hold the
+        # dumping ground of fiddly P3 and P4 issues we have left lying around."
         #
-        # AN ESCALATION IS EXEMPT at every setting, including `"never"`. §4b has
-        # three roads to `deferred` and only two of them are work items: a fixer
-        # deferral and a below-floor or unpaid finding, which is what the twenty
-        # issues above were. The third — the fixer escalating the change's premise —
-        # produces an issue that ASKS a question rather than filing a task, it is what
-        # carries that question past the end of the session, and the cycle is not
-        # finished until a human answers it. Suppressing it would drop the question,
-        # not save a ticket. Same exemption a Sonar hard-gate issue gets from both
-        # severity floors, for the same reason: it is not a severity judgement.
+        # **THIS KNOWINGLY AMENDS #42's REMEDY.** #42 was right, and its rule stands: a
+        # capped round's findings must be handed to SOMEBODY and must not evaporate.
+        # It is also what created most of the twenty. What changes here is the
+        # DESTINATION for a batch — the board, not GitHub — and nothing else. NOTHING
+        # IS DROPPED: a finding the gate keeps off the tracker still gets its
+        # `deferred` row, still carries the one-line `note` saying what it is and why
+        # it was not fixed (required by the brief precisely so the row is READABLE
+        # later rather than merely present), and is still relayed to the human in the
+        # summary. What it does not get is a second copy on a backlog with no drain.
+        # `deferred_to` is nullable (`app/models/review.py`), the API accepts a
+        # `deferred` outcome without one, and `/panel` renders such a row with no
+        # target rather than as broken — #482's open question, settled with a test.
         #
-        # `"always"` restores the pre-#482 behaviour exactly — an issue for every
-        # deferral, whatever its severity. `"never"` files none at all, which is the
-        # right answer for a repo whose tracker is not where its work is queued
-        # (`mode: jungle`), and is NOT the same as discarding them: the rows are
-        # still there and still relayed. Severities are case-insensitive, like every
-        # other floor here.
-        "file_deferral_issues": "P2",
+        # DESIGNED TO BE READ, not just written, and under a shape rule that stops
+        # being a nicety and becomes the whole case: for a batch the board row is now
+        # the ONLY record. `GET /review/findings?repo=&pr=` returns each chain with its
+        # outcome, which is how a fiddly finding on a PR is found again, and it is what
+        # #500's repeat-finding chain and the cross-PR signal both want to read from.
+        # No cross-PR query is built here (#508) — what this key must not do is
+        # foreclose one, which is why the record is a row with a note and not a bullet
+        # in a closed issue's body.
+        #
+        # AN ESCALATION IS EXEMPT at every setting, `"never"` included. §4b has three
+        # roads to `deferred` and only two of them are work items: a fixer deferral,
+        # and a below-floor or unpaid finding, which is what the twenty above were.
+        # The third — the fixer escalating the change's premise — produces an issue
+        # that ASKS a question rather than filing a task, it is what carries that
+        # question past the end of the session, and the cycle is not finished until a
+        # human answers it. Suppressing it would drop the question, not save a ticket.
+        # Same exemption a Sonar hard-gate issue gets from both severity floors, for
+        # the same reason: it is not a severity judgement.
+        #
+        # THE WAY BACK IS ONE KEY, and the old vocabulary is kept rather than deleted.
+        # `"P2"` restores the severity cut exactly as it ran from #482 until
+        # 2026-08-30 — at or above the band an issue, below it a row — and any of
+        # `P1`..`P4` states that cut at another band. `"always"` restores the pre-#482
+        # behaviour, an issue for every deferral. `"never"` files none at all, which is
+        # the right answer for a repo whose tracker is not where its work is queued
+        # (`mode: jungle`), and is NOT the same as discarding them: the rows are still
+        # there and still relayed. Every value here is case-insensitive, `shape`
+        # included, like every other floor in this block.
+        #
+        # A SCALAR STRING AND NOT AN OBJECT, which is the shape question this key had
+        # to answer about itself. `BOARD_DIALS` types this dial and the board's column
+        # stores one JSON value per dial, so `{"category": true, "batch": false}` would
+        # need a new value shape at both ends, a form that cannot render it, and an
+        # answer about what happens to the bands already written into repos. One more
+        # word in a vocabulary that already had two costs none of that — the same
+        # argument `max_fix_growth_chars` makes for being a second key rather than a
+        # pair. WHO CLASSIFIES THE SHAPE is §4b's problem and not this key's: the gate
+        # states the rule, the orchestrator applies it when it opens (or does not open)
+        # the issue, and a deferral it cannot classify is a batch, because that is the
+        # answer that cannot mint a ticket nobody reads.
+        "file_deferral_issues": "shape",
         # What a fix round is asked to CLEAR. At or above this severity a finding
         # gets fixed; below it, it is reported and recorded and not fixed. The
         # panel already computes a calibrated severity and the prompts then throw
         # it away — `review-pr.md` ranks findings "for the summary table only. All
         # of them get fixed."
         #
-        # P3, NOT P2, and this is the one place the measured cut is deliberately not
-        # taken at its own line. The measurement is real — applied to the seven PRs
-        # above, a P2 cut discards 99 of 147 findings (67.3%) and loses ZERO P1s, all
-        # six in the kept tier — and #223 and #237 already apply exactly that rule by
-        # hand ("fix P1/P2 correctness only, defer the rest"), though only AT the cap,
-        # after three fix passes have already grown the change. What the P2 default
-        # under-weighted is two things:
+        # **P4, as of 2026-08-30, from P3 — Rich's rule, taken on #621.** In his
+        # words: "we should fix what needs fixing (P1s and P2s) ... [no] budget for
+        # anything that would block us closing, and limited budget for things that
+        # wouldn't block us closing (generally P3 and P4) — that's the point, we try
+        # to pick them up, but don't want to let it cause a ballooning of issues."
         #
-        # 1. **Severity is model-authored and wrong sometimes.** The defect class a P2
-        #    floor systematically misses is correctness expressed as craft — a missing
-        #    regression test on a parser or an auth boundary, a missing timeout or
-        #    cleanup, a migration rollback or idempotency gap. Every one of those is a
-        #    correctness defect that a reviewer may reasonably label P3, and the floor
-        #    cannot tell a mislabelled P2 from a genuine P3.
-        # 2. **The costs are wildly asymmetric.** Fixing a P3 inside a pass that is
-        #    ALREADY open and already being verified costs one more edit in a diff a
-        #    human is going to read anyway. Letting a P3 buy a whole new round costs a
-        #    full panel run plus another fix pass — and the fix pass is where the
-        #    63.7% comes from. So: fix P3s, do not let a P3 trigger another round.
-        #    That is why this key sits at P3 while `round_trigger_floor` stays at P2;
-        #    the two questions were split into two keys for exactly this answer.
+        # **THIS KEY IS NOT THE BLOCKING BAND AND HAS NOT BEEN SINCE #297.** What
+        # blocks is `round_trigger_floor`, which stays at P2 and is unbudgeted (#614).
+        # This one says how far DOWN a fix pass may reach while it is already open,
+        # and `low_severity_fix_lines` — 40 churned lines, priced by
+        # `unrefereed_line_weight` — is all it may spend down there. So admitting P4
+        # adds no obligation: it puts P3 AND P4 inside the BUDGETED band, where before
+        # P3 was the whole of that band and P4 was outside the pass altogether. Which
+        # of them actually get taken is decided cheapest-first by a count, which is
+        # the mechanical answer "limited budget" asks for and the one #297 refuses to
+        # hand back to the fixer's own judgement.
         #
-        # The convergence win is mostly kept, because P4 — 31.3% of findings per #165,
-        # and the tier that actually ballooned PR #236, where a 54-line README rewrite
-        # and a decode-path rework were both P4 — stays excluded.
+        # The rest of the old argument is why the reach is worth having and survives
+        # intact. **Severity is model-authored and wrong sometimes**: the defect class
+        # a high floor systematically misses is correctness expressed as craft — a
+        # missing regression test on a parser or an auth boundary, a missing timeout
+        # or cleanup, a migration rollback or idempotency gap — every one of which a
+        # reviewer may reasonably label a tier low, and no floor can tell a
+        # mislabelled P2 from a genuine P3. **And the costs are wildly asymmetric**:
+        # fixing one inside a pass that is ALREADY open and already being verified is
+        # one more edit in a diff a human will read anyway, while letting it buy a
+        # whole new round is a full panel run plus another fix pass.
+        #
+        # **THE RISK, PLAINLY.** A LOWER FLOOR IS A WIDER LICENCE TO TOUCH. P4 is
+        # 31.3% of findings in #165's measurement and it is the tier that ballooned PR
+        # #236 — a 54-line README rewrite and a decode-path rework, both P4 — and that
+        # argument has not been refuted, it has been priced. THE BUDGET IS NOW THE
+        # ONLY CONTROL ON THAT BAND: at `low_severity_fix_lines: null` this setting
+        # reads "fix everything", which is the pre-#165 behaviour the whole
+        # convergence effort exists to undo. Watch the budget first and this key
+        # second — #297 says the budget is the first number to move — and watch
+        # `max_fix_growth`/`max_fix_growth_chars`, which verify the total afterwards.
         #
         # Below-floor findings are not discarded: the report gives them their own
         # heading and their own mark so a brief built from it cannot pick them up by
-        # accident, and the payload marks each one, the same way an escalated
-        # finding is marked ⛔. `"P4"` restores the pre-#165 fix list — everything gets
-        # fixed — and note the exact reach of that: it restores `round_stop`'s rules 1
-        # and 3, and for rule 2 there is nothing to restore. Rule 2's bar is the
-        # hardcoded `("P1", "P2")` tuple, so a fix floor can only ever RAISE it and
-        # only `"P1"` moves it at all. A Sonar hard-gate issue is exempt from both
-        # floors at every rule, whatever severity Sonar gave it — a red quality gate
-        # is not a severity judgement (`round_stop`'s docstring).
-        "fix_severity_floor": "P3",
+        # accident, and the payload marks each one, the same way an escalated finding
+        # is marked ⛔. **At P4 that tier is EMPTY**, since P1..P4 is the whole ladder
+        # and `P0` is deliberately not a severity here — so the machinery is dormant
+        # at the shipped default and lives for the repos that raise the floor back,
+        # and an UNPAID finding (the budget ran out) is now the only road to a
+        # deferral that a severity used to carry. Note also the exact reach of P4 in
+        # `round_stop`: it is the pre-#165 fix list for rules 1 and 3, and for rule 2
+        # there is nothing to restore, because rule 2's bar is the hardcoded
+        # `("P1", "P2")` tuple — a fix floor can only ever RAISE it and only `"P1"`
+        # moves it at all. A Sonar hard-gate issue is exempt from both floors at every
+        # rule, whatever severity Sonar gave it: a red quality gate is not a severity
+        # judgement (`round_stop`'s docstring).
+        #
+        # THE WAY BACK IS ONE KEY. `"P3"` restores the 2026-08-22 setting; `"P2"`
+        # restores the measured cut, which across the seven PRs panelled on 2026-08-16
+        # discards 99 of 147 findings (67.3%) and loses ZERO P1s, all six of them in
+        # the kept tier. Both arguments are kept in full in `.harness-rules.sample`
+        # (`_165_floors`) rather than deleted.
+        "fix_severity_floor": "P4",
         # What buys another ROUND. Only findings no earlier round raised AND at or
         # above this severity make the cycle go again. A new finding below the floor
         # is still reported and still recorded; it just does not by itself purchase
@@ -749,17 +804,17 @@ DEFAULTS: dict = {
         # theory about the code; it is what all seven panels did.
         #
         # P2 on the measured cut, and it STAYS at P2 while `fix_severity_floor` sits
-        # at P3 — the two are separate keys on purpose and the defaults are what that
+        # at P4 — the two are separate keys on purpose and the defaults are what that
         # buys. "Worth fixing while we are in here" and "worth another round of
         # everything" are different questions with wildly different prices: one more
         # edit in a pass already open and already being verified, against a full panel
-        # run plus another fix pass. So the shipped default fixes P3s in the round it
-        # is already running and refuses to let one buy a fourth. `"P4"` restores
-        # today's behaviour.
+        # run plus another fix pass. So the shipped default fixes what the budget
+        # affords of the P3/P4 band in the round it is already running, and lets none
+        # of it buy another round. `"P4"` restores today's behaviour.
         "round_trigger_floor": "P2",
         # How many CHURNED LINES the whole round may spend on findings the fix floor
         # admits and `round_trigger_floor` does not — the band between the two, which
-        # at the shipped defaults is exactly the P3s.
+        # at the shipped defaults (P4 / P2) is the P3s and the P4s together.
         #
         # The measurement this answers (#297, 2026-08-21). PR #188's feature was 185
         # churned lines; two fix passes turned it into 721, so **74% of that PR was
@@ -772,10 +827,13 @@ DEFAULTS: dict = {
         #
         # **A budget, not a per-fix cap, and not a higher floor.** #188's round 1 was
         # not one balloon; it was 408 lines of individually reasonable small fixes,
-        # each of which any per-fix cap would have waved through. And the floor stays
-        # at P3 on purpose (`fix_severity_floor` carries that argument): a genuinely
+        # each of which any per-fix cap would have waved through. And the floor sits
+        # at P4 on purpose (`fix_severity_floor` carries that argument): a genuinely
         # cheap correctness-adjacent fix is worth taking while the pass is open. What
         # a budget stops is the ACCUMULATION, which is the thing that was measured.
+        # Since 2026-08-30 this budget is ALSO the only control on how far down the
+        # fix pass reaches, because the floor is now at the bottom band — so it is the
+        # first number to move if the band starts accumulating again, before the floor.
         #
         # **Mechanical, not discretionary.** The spend is COUNTED — `git diff
         # --numstat` after each fix, cheapest first, stop when the budget is gone —
@@ -783,13 +841,30 @@ DEFAULTS: dict = {
         # ballooning?". That question is a judgement by the actor whose judgement the
         # 85% impugns. `max_fix_growth` verifies the total afterwards.
         #
+        # **WHAT IS ON THIS BUDGET AND WHAT IS NOT — the sentence 848 lines walked
+        # past (#618, 2026-08-30).** The blocking band is unbudgeted by decision
+        # (#614), and unbudgeted is not the same as unaccounted. THE ASSERTION THAT
+        # DEMONSTRATES A FIX IS PART OF THAT FIX, at any severity: the test that goes
+        # red without the change and green with it is the fix's own evidence, it is
+        # what #114 requires of it, and it is never charged here. ADDITIONAL test work
+        # is a different thing — strengthening a neighbouring assertion, coverage the
+        # finding did not ask for, prose nobody's finding named — and it is an
+        # OBSERVATION: charged to this budget at `unrefereed_line_weight`, and where
+        # the budget will not pay for it, recorded rather than written. Without that
+        # line drawn, "the blocking band is unbudgeted" reads as a licence, and the
+        # licence has been measured: on lexray#1780 the fix passes after round 1 wrote
+        # 1,313 lines of which 848 were test and doc, nearly all of it under a
+        # blocking finding's cover where no budget could see it.
+        #
         # 40 lines: enough for a handful of the genuinely cheap ones (a missing
         # timeout, a guard, a stale docstring) and nowhere near 408. Unpaid findings
         # are not dropped — they are reported and recorded exactly like a below-floor
-        # finding and are what the next round or an issue picks up. `null` is no
-        # budget at all, the pre-#297 behaviour where every finding at or above the
-        # fix floor is unconditional work; `0` fixes none of the band, which is
-        # `fix_severity_floor` raised to the cut without saying so twice.
+        # finding and are what the next round or an issue picks up, and with the floor
+        # at P4 that is the ONLY way a finding is now deferred, since no band is left
+        # below the floor. `null` is no budget at all, the pre-#297 behaviour where
+        # every finding at or above the fix floor is unconditional work; `0` fixes
+        # none of the band, which is `fix_severity_floor` raised to the cut without
+        # saying so twice.
         "low_severity_fix_lines": 40,
         # What one UNREFEREED churned line costs that budget, against a production
         # line's 1 (#554). The budget above prices work by LENGTH; this makes its
@@ -831,8 +906,9 @@ DEFAULTS: dict = {
         # strictly fewer of them, and 2 is the smallest weight that says so. Against a
         # larger number: this bounds a round's spend and is not a tax meant to stop
         # fixers writing tests — at 40 lines a weight of 2 still affords a 20-line
-        # regression test inside the band, and the band is only the P3 tier, since a
-        # P1/P2 fix and its test are not on the budget at all.
+        # regression test inside the band, and the band is the P3/P4 tier, since a
+        # P1/P2 fix and the assertion that demonstrates it are not on the budget at
+        # all — see `low_severity_fix_lines` on what beyond that assertion is.
         #
         # `1` prices every line alike, which is the pre-#554 behaviour and is the way
         # to switch this off; there is no `null` spelling for the same thing, because
@@ -892,7 +968,9 @@ DEFAULTS: dict = {
         # growth of 1,954 (~129,000). Both stop, with margin. The 113-line cycle in
         # #492 grew ~122 lines and does NOT stop here, correctly — that is the "binds a
         # round late" half of the report, which no absolute floor can reach, and
-        # `guard_ratio` is the earlier signal filed for it.
+        # `guard_ratio` is the earlier signal filed for it. That signal REPORTS and is
+        # never going to become a ceiling: the decision, and the measurement behind it,
+        # are recorded under `escalate_on.unrefereed_fix` below.
         #
         # **It can only ever TIGHTEN — and that is the narrow claim, not a wider one.**
         # Crossed-first means both numbers are ceilings, so no value of this key lets
@@ -958,16 +1036,56 @@ DEFAULTS: dict = {
         # `/panel-review-pr` drives a loop — and this wins over the constant, the
         # same order `round_scope` resolves in.
         #
-        # #165 proposes 1 and this deliberately keeps 2. Round 2 is the round that
-        # caught a serious defect CREATED by round 1's fix on #236 — the unbounded
-        # FIFO read — so the problem is not that round 2 exists, it is that round
-        # 1's fix was allowed to be 900 lines. `fix_severity_floor`,
-        # `round_trigger_floor` and `max_fix_growth` attack the growth instead,
-        # which makes round 2 cheap: a re-read of a small fix rather than a damage
-        # survey of a change that tripled. Set 1 for a repo that would rather not
-        # have the fix commit read at all, and remember what that buys — round 2 is
-        # the only pass that ever reads the fixer's own work (#24).
-        "max_rounds": 2,
+        # **6, as of 2026-08-30, up from 2 — Rich's decision on #621, per PR review
+        # (#626).** THE CAP IS A BACKSTOP AGAINST RUNNING FOREVER AND NOT A
+        # CONVERGENCE MECHANISM, and 2 was being asked to be both. #165 proposed 1,
+        # the key was cut to 1 on 2026-08-20 and restored to 2 on 2026-08-22, and both
+        # numbers were argued from cycles that DIVERGED — which is a reason to fix the
+        # divergence rather than to stop early on it. The
+        # metric this epic is judged on is the share of cycles ending in a CONFIDENT
+        # DRY ROUND, and a cycle that ends on the cap has not produced one — it has
+        # produced a fix nobody read and a remainder handed to somebody. 6 is high
+        # enough that reaching it is evidence about the cycle rather than about the
+        # number.
+        #
+        # THE EVIDENCE IS lexray#1780: five rounds, to-fix counts 5 -> 7 -> 12 at a P2
+        # floor, both remaining P1s caused by the fix pass before them, the PR growing
+        # from +1529/18 files to +2891/27 files, and 1,313 lines written by fix passes
+        # after round 1 of which 848 were test and doc. Nothing in that cycle was
+        # converging, and a cap of 2 would not have converged it — it would have
+        # shipped round 1's fix unread. The cap is not where that is fixed.
+        #
+        # **WHAT CARRIES THE LOAD NOW: `escalate_on.fix_injection`.** Its own
+        # docstring already says it bites when a caller raises the cap, and this
+        # raises it for everyone: at 2 the only round it could fire on was the round
+        # the cap was ending anyway, so what it bought was a better `reason`. At 6 it
+        # is the brake that actually decides when a cycle stops. The same sentence
+        # appears in `new_findings_not_falling` and `unrefereed_fix` beside it — each
+        # argues its default-on is nearly free because the cap would have ended that
+        # round regardless — and that half of all three arguments is spent here. Those
+        # rungs end cycles now. Read them as brakes, not as annotations.
+        #
+        # **AND `fix_injection`'s 0.5 IS UNCALIBRATED FOR THE POPULATION IT NOW
+        # COUNTS**, which is the honest cost of this change and is stated here rather
+        # than left for somebody to discover. That threshold was measured over rounds
+        # whose outstanding findings were P3/P4-heavy. With observations no longer
+        # counted as outstanding work (#623), the findings it divides are a SMALLER
+        # AND MORE SERIOUS SET — a rate over a smaller denominator is noisier, and it
+        # is a rate over a different population, so neither the threshold nor the
+        # false-positive rate transfers. Nobody has measured where a healthy cycle
+        # sits on it. **THE FIRST CYCLES RUN UNDER 6 ARE THAT MEASUREMENT**: they are
+        # not a validation of 0.5, they are the data that will set it, and #626 is
+        # where the marginal-findings-per-round count they feed belongs.
+        #
+        # The way back is one key. `2` restores the 2026-08-22 setting and `1` the
+        # 2026-08-20 one; both arguments are kept in `.harness-rules.sample`
+        # (`_165_max_rounds`) rather than deleted. Note what `1` also does — it
+        # switches `escalate_on.premise_repeated` off, because there is no second fix
+        # pass for it to refuse, and it stops the fix commit being read at all, since
+        # round 2 is the only pass that ever reads the fixer's own work (#24). And note
+        # what any cap below 3 does to the three rungs BELOW this key: it returns them
+        # to annotations on a round that was ending anyway.
+        "max_rounds": 6,
         # #78's reserved matters — the decisions the process must not take on its
         # own — of which exactly one is implemented: `premise_repeated` (#84).
         #
@@ -1061,10 +1179,24 @@ DEFAULTS: dict = {
         # filed from, over a PR whose actual change was 113 lines. Every one of those
         # is far above 0.5 and every one of those cycles ran to its cap.
         #
-        # What is still NOT calibrated is where a HEALTHY cycle sits, which is the
-        # number that decides the false-positive rate. So the rule is built so that
-        # a false positive costs as little as it can — see the three properties under
-        # "on by default" — and `null` switches it off in one line.
+        # **What is still NOT calibrated is where a HEALTHY cycle sits**, which is the
+        # number that decides the false-positive rate, and the answer is now owed
+        # sooner than it was. Every measurement above was taken on rounds whose
+        # outstanding findings were P3/P4-heavy. The population this rate divides is
+        # about to be smaller and more serious than that: observations no longer count
+        # as outstanding work (#623), a `narrowed` outcome clears rather than
+        # accumulates (#615), and the floors moved under it on the same day. A rate
+        # over a smaller, more serious denominator is noisier AND differently
+        # distributed, so neither 0.5 nor the false-positive rate that went with it
+        # carries over.
+        #
+        # **SO TREAT THE FIRST CYCLES UNDER `max_rounds: 6` AS THE RECALIBRATION, AND
+        # EXPECT THIS NUMBER TO MOVE.** They are the measurement, not a confirmation
+        # of the number they run under; #626 is where the per-round counts that will
+        # move it belong. What made a false positive cheap while the cap was 2 was the
+        # cap, not this rule — see the properties under "on by default" below, where
+        # that is now said plainly — and `null` switches the rung off in one line
+        # while the number is being learned.
         #
         # **0.5, read strictly: MORE than half.** Not a percentile off a curve nobody
         # has; the defence of the number is that it is the point where the fix pass is
@@ -1079,24 +1211,30 @@ DEFAULTS: dict = {
         # **ONE round, not two consecutive.** The field report proposed "two
         # consecutive rounds over the threshold" and it cannot work: provenance is
         # only attributable from round 2 (round 1 has no preceding fix), so a
-        # two-round rule cannot fire before round 3, and `max_rounds` above defaults
-        # to 2. Two-consecutive would ship switched off for every repo on the shipped
-        # defaults and fire only for the ones running `--loop`. A brake that is off
-        # wherever it was not configured is the `require_failing_test` failure with
-        # the honesty removed.
+        # two-round rule cannot fire before round 3, and `max_rounds` above defaulted
+        # to 2 when this shipped. Two-consecutive would ship switched off for every
+        # repo on those defaults and fire only for the ones running `--loop`. A brake
+        # that is off wherever it was not configured is the `require_failing_test`
+        # failure with the honesty removed.
         #
         # **On by default, like `premise_repeated` and unlike #78's other switches**,
-        # and three properties earn it:
+        # and three properties earned it — of which, as of 2026-08-30, only two still
+        # hold. `max_rounds` went to 6 that day and the middle one was spent on it:
         #   - it can only ever turn a `go again` into a STOP, never the reverse, so
         #     no value of it can make a review look cleaner than it is;
-        #   - under the shipped `max_rounds: 2` the only round it can fire on is the
-        #     one the cap would have ended anyway. What a default-on costs a repo on
-        #     the defaults is therefore a better `reason` and one more veto line, not
-        #     an earlier finish — and it bites where the loop actually runs away, in
-        #     a repo that raised the cap or drives `--loop`;
+        #   - **IT IS LOAD-BEARING NOW, AND THIS IS WHERE THE CHEAPNESS WENT.** Under
+        #     the old `max_rounds: 2` the only round it could fire on was the one the
+        #     cap would have ended anyway, so a default-on bought a better `reason`
+        #     and one more veto line rather than an earlier finish, and the sentence
+        #     ended "it bites where the loop actually runs away, in a repo that raised
+        #     the cap". THIS REPO RAISED THE CAP. At 6 this is one of the rules that
+        #     actually decides when a cycle stops, so a false positive costs A REAL
+        #     ROUND OF REVIEW — one of the rounds that read the fixer's own work — and
+        #     not nothing. The cap is not standing behind this number any more;
         #   - a false positive costs one printed question, which is #67's own
         #     required output and the cheap failure; a false negative is #299's
-        #     five-round cycle, which nothing stopped.
+        #     five-round cycle, which nothing stopped. That trade is still the right
+        #     way round. It is now a trade rather than a freebie.
         #
         # `panel_rounds.FIX_INJECTION_MIN_NEW` is the other half of the rule and is a
         # constant rather than a dial: a rate over two findings is not a rate, and a
@@ -1124,28 +1262,48 @@ DEFAULTS: dict = {
         # the structure of the argument is identical.** A new-finding count can only
         # be compared against a predecessor, so round 1 can never be a not-falling
         # round and a value of 2 could not fire before round 3 — while `max_rounds`
-        # above defaults to 2. Shipped at 2 this rung would be OFF for every repo that
-        # did not configure it and armed only for the ones driving `--loop`, which is
-        # the `require_failing_test` failure with the honesty removed. At 1 the
-        # earliest round it can fire on is round 2, and on the shipped cap that is the
-        # round the cycle was ending on anyway.
+        # above defaulted to 2 when this shipped. At 2 this rung would have been OFF
+        # for every repo that did not configure it and armed only for the ones driving
+        # `--loop`, which is the `require_failing_test` failure with the honesty
+        # removed. At 1 the earliest round it can fire on is round 2, which under that
+        # cap was the round the cycle was ending on anyway and under the cap of 6 is
+        # four rounds before it.
         #
         # 1 is also exactly the rule as it was stated: 44 -> 15 falls and buys round
         # 3; 15 -> 18 does not fall and ends the cycle there, which is where the human
         # ended it.
         #
-        # **The same three properties earn it the same default-on**, and they are the
-        # test a rung has to pass rather than a form of words:
+        # **The same three properties earned it the same default-on**, and they are
+        # the test a rung has to pass rather than a form of words — but as of
+        # 2026-08-30 only two of the three still hold, for `fix_injection`'s reason
+        # and in the same words:
         #   - it can only ever turn a `go again` into a STOP, never the reverse, and
         #     `round_stop` checks that condition rather than merely obeying it — so no
         #     value of it can make a review look cleaner than it is;
-        #   - under the shipped `max_rounds: 2` the only round it can fire on is round
-        #     2, which is the round the cap would have ended anyway. What a default-on
-        #     costs a repo on the defaults is a better `reason` and one more veto line,
-        #     not an earlier finish;
+        #   - **IT IS LOAD-BEARING NOW.** Under the old `max_rounds: 2` the only round
+        #     it could fire on was round 2, the round the cap would have ended anyway,
+        #     so a default-on bought a better `reason` and one more veto line rather
+        #     than an earlier finish. At 6 it is one of the rules that ACTUALLY ENDS
+        #     CYCLES, and on the rung's own evidence it is the one that ends them
+        #     earliest: 44 -> 15 -> 18 stops at round 3 of a possible 6, so the three
+        #     rounds it forgoes are real rounds of review and not a formality the cap
+        #     was about to perform. That is the trade this default now makes;
         #   - a false positive costs one printed question — the stop is vetoed and
         #     `confident` is false, so the answer a human gives is "go again", not a
-        #     merge nobody looked at.
+        #     merge nobody looked at. Cheap, but no longer free: the answer has to be
+        #     given before the cycle continues, where under the old cap there was
+        #     nothing left to continue to.
+        #
+        # **AND THE COUNT IT WATCHES IS ABOUT TO CHANGE UNDER IT**, which is
+        # `fix_injection`'s recalibration arriving here as well. `1` was read off a
+        # cycle counted in NEW FINDINGS of every kind — 44, then 15, then 18. With
+        # observations no longer counted as outstanding work (#623) and a `narrowed`
+        # outcome clearing rather than accumulating (#615), the counts this compares
+        # are smaller and more serious, and a small count is where "did not fall" is
+        # most easily noise: 2 -> 2 is not divergence. `panel_rounds.NOT_FALLING_MIN_NEW`
+        # is the floor that stands between this rung and that, it is a constant rather
+        # than a dial, and it is the number to look at first if the first cycles under
+        # `max_rounds: 6` stop early on counts nobody would have called a trend.
         #
         # **And one property `fix_injection` cannot claim.** This is computed from the
         # ROUNDS' OWN COUNTS and never from provenance, so #500 — rebasing between
@@ -1189,6 +1347,30 @@ DEFAULTS: dict = {
         # threshold over a few dozen cycles or not at all, and it is why `guard_ratio`
         # ships report-only: nobody has measured what test-to-source ratio is too
         # much, so any number would be a ceiling with its argument written afterwards.
+        #
+        # **`guard_ratio` STAYS REPORT-ONLY, PERMANENTLY — Rich's decision of
+        # 2026-08-30, answering #618's second question, and it is a DECISION and not
+        # another deferral.** #67 asked for the instrument before the gate. The
+        # instrument has now run, and the answer is that there is no gate to build: a
+        # ratio of test lines to source lines is not a demonstrated observable
+        # failure, and only a demonstrated observable failure may block (#623). An
+        # instrument that cannot produce one has nothing to escalate on, however many
+        # cycles it accumulates.
+        #
+        # The measurement agrees from the other side. On lexray#1780 the ratio read
+        # 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 across five rounds while both of its
+        # halves nearly doubled — it FELL MONOTONICALLY THROUGH THE RUNAWAY IT WAS
+        # WATCHING, because a proportion cannot tell "this change is well guarded"
+        # from "this change and its guards are both running away". A ceiling on a
+        # number that moves the wrong way under the failure it is for would fire on
+        # well-guarded changes and stay quiet on the one shape it exists to catch.
+        #
+        # **So there is no `max_guard_ratio` key, and there is not going to be one.**
+        # What the column is for is a human reading it BESIDE the churn counts, which
+        # is what #618's third part asks the round table to print. Everything in this
+        # block that can stop a cycle rests on a fact rather than on a proportion, and
+        # the rung below is the clearest case of it.
+        #
         # THERE IS NO SUCH NUMBER HERE. The rule is a predicate — the pass contains
         # zero refereed lines — and a predicate has nothing to calibrate. A fraction,
         # by contrast, would need one and would be wrong: a 5-line production fix
@@ -1287,12 +1469,19 @@ DEFAULTS: dict = {
         # `config_notes` when it escalates — a repo that declined this must not be
         # indistinguishable from one where the pass silently did not run.
         "propose_on_escalation": True,
-        # #55's spend ceiling. EVERY ONE IS `None`, and that is the feature rather
-        # than a placeholder: `None` means "no ceiling", the panel makes no board
-        # call at all when every one of them is `None`, and a fleet that installs
-        # this release spends exactly what it spent before until a human writes a
-        # number. A cap that arrived switched on at a number nobody chose would be
-        # the same mistake as a review nobody configured (`review_refusal`).
+        # #55's spend ceiling. FOUR OF THE FIVE ARE `None`, and that is the feature
+        # rather than a placeholder: `None` means "no ceiling", so a fleet that
+        # installs this release spends exactly what it spent before on every ceiling
+        # a human has not written. A cap that arrived switched on at a number nobody
+        # chose would be the same mistake as a review nobody configured
+        # (`review_refusal`) — which is why the fifth value, `tokens_per_pr`, is
+        # dated, attributed and argued on its own line below rather than inherited.
+        #
+        # ONE CONSEQUENCE OF THAT FIFTH VALUE, recorded here because it is a property
+        # of the block rather than of the key: the panel made NO board call at all
+        # while every one of these was `None`, and from 2026-08-30 it makes one on
+        # every run. That buys a request, not a refusal — the other four still mean
+        # no ceiling — and `tokens_per_pr: null` restores the cheap path.
         #
         # UNITS. Tokens are input + output, which is `/review/stats`' own
         # `billable` — cached input is a slice OF input and reasoning sits inside
@@ -1320,7 +1509,39 @@ DEFAULTS: dict = {
             "tokens_per_day": None,
             "runs_per_day": None,
             # This PR's whole life, across every cycle and every head it has had.
-            "tokens_per_pr": None,
+            #
+            # **20,000,000, as of 2026-08-30 — Rich's number, taken on #621 beside
+            # `max_rounds: 6` so that the later rounds can be afforded (#483, #626).**
+            #
+            # BE CLEAR WHAT IT DOES: IT TIGHTENS, IT DOES NOT RAISE. There is no
+            # per-PR ceiling in force anywhere today — no fleet dial, no repo dial,
+            # and lexray's own `review_panel` block is empty — so the 3,000,000 that
+            # refused a round in #483 is not a current setting on anything, and this
+            # is a ceiling arriving where there was none. Anyone reading it as a
+            # raise is reading it against a number that is not there.
+            #
+            # **The shape complaint in #483 is unfixed and this does not fix it.** A
+            # per-PR ceiling binds latest and hardest on the LAST rounds of a cycle:
+            # it spends itself on rounds 1 and 2, which were happening anyway, and
+            # refuses round 3 — which is precisely the band of rounds `max_rounds: 6`
+            # was raised to buy, and precisely the rounds that read the fixer's own
+            # work. The fix is a per-ROUND allowance with the per-PR total derived
+            # from it (#483's proposals 1 and 2) and it is not built.
+            #
+            # So the number is chosen LARGE ENOUGH NOT TO BIND while that is
+            # outstanding. #483's own measurement is 1.2M-1.7M tokens per round at
+            # four seats on a ~350-line PR, so six rounds is 7.2M-10.2M and this is
+            # about twice the top of that range; the two rounds that spent 3,369,350
+            # there fit under it nearly six times over. It is a runaway stop — a PR
+            # that has spent twenty million tokens has gone wrong in a way no round
+            # rule caught — and it is not a policy about how much review a change
+            # deserves. Read it as the backstop `max_rounds` used to be asked to be.
+            #
+            # `null` is the one-key way back and restores what every deployment is
+            # running today, which is no ceiling. A board dial of the same name still
+            # beats this, and that is the point of `BOARD_DIALS`: the repo under
+            # review cannot raise a ceiling the board has stated.
+            "tokens_per_pr": 20_000_000,
             "runs_per_pr": None,
             # Every watched repo combined, over the same rolling window. Meant for
             # the fleet scope (`POST /dials` with no `repo`); set per repo it still
@@ -2601,12 +2822,15 @@ BOARD_DIALS: dict[str, Dial] = {
         'the lowest severity a fix pass may act on; under it is deferred, not fixed'),
     "review_panel.round_trigger_floor": Dial("severity", False, "either",
         'the lowest severity that buys another round; under it never extends the cycle'),
-    # #482's third floor: which deferrals get a GitHub issue as well as their board
-    # row. A `deferral_gate` and not a `severity` because its two ends are words —
-    # `always` and `never` — which no severity band can spell: "below P4" has no band
-    # and `P0` is deliberately not a severity this panel has.
+    # #482's third floor, and as of 2026-08-30 it is not a floor at all: which
+    # deferrals get a GitHub issue as well as the board row every deferral gets. A
+    # `deferral_gate` and not a `severity` because its vocabulary is WORDS as well as
+    # bands — `shape` (the default, #620: an issue for a category or a single item,
+    # rows for a batch), plus `always` and `never` — and no severity band can spell
+    # any of the three: "below P4" has no band and `P0` is deliberately not a severity
+    # this panel has. The bands remain legal as the way back to the severity cut.
     "review_panel.file_deferral_issues": Dial("deferral_gate", False, "either",
-        'how severe a deferral must be to open a GitHub issue as well as its board row'),
+        'which deferrals also get a GitHub issue: a category or a single item, never a batch'),
     # #297's budget for the band between them, and #298's growth ceiling.
     "review_panel.low_severity_fix_lines": Dial("number", False, "either",
         'churned lines a round may spend on findings over the fix floor and under the round floor'),
@@ -2757,10 +2981,25 @@ BOARD_DIALS: dict[str, Dial] = {
 _SEVERITY_BANDS = ("P1", "P2", "P3", "P4")
 _SEVERITY_RE = re.compile(f"^[Pp][{''.join(b[1] for b in _SEVERITY_BANDS)}]$")
 
-#: The two ends of `file_deferral_issues`, beside the P1..P4 bands (#482). Lower-cased
-#: on the way in for `_SEVERITY_RE`'s reason: one written value must not mean two
-#: things depending on which layer carried it.
+#: The words `file_deferral_issues` takes beside the P1..P4 bands. `always` and
+#: `never` are its two ENDS (#482). `shape` is the rule it has RUN BY since
+#: 2026-08-30 (#620) and is the default: an issue for a category or for a single
+#: substantive item, board rows for a batch. That is a question about the ticket and
+#: not about any finding's severity, so there is no band that could spell it — which
+#: is the same reason the two ends are words. The bands stay legal as the documented
+#: way back to the severity cut this dial ran under until #620.
+#:
+#: Lower-cased on the way in for `_SEVERITY_RE`'s reason: one written value must not
+#: mean two things depending on which layer carried it.
+#:
+#: TWO TUPLES AND NOT ONE, because they are not the same kind of word — the ends are
+#: the off and on extremes, `shape` is a policy — and one JOINED tuple is what the
+#: validator, the hint and `dial_choices` all read, so a word added to either reaches
+#: every one of them without a second edit. Same rule `_SEVERITY_BANDS` follows with
+#: `_SEVERITY_RE` built from it.
 _DEFERRAL_GATE_ENDS = ("always", "never")
+_DEFERRAL_GATE_SHAPE = "shape"
+_DEFERRAL_GATE_WORDS = (_DEFERRAL_GATE_SHAPE,) + _DEFERRAL_GATE_ENDS
 
 #: What `reviewer_scope` accepts: defects in the change (`diff`), or in the change
 #: and everything it touches (`repo`, the pre-#165 posture). Two words, and a third
@@ -3024,10 +3263,10 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
             f"`{path}` must be a severity band P1-P4, not {value!r}")
     if dial.kind == "deferral_gate":
         ok = _is_band(value) or (isinstance(value, str)
-                                 and value.strip().lower() in _DEFERRAL_GATE_ENDS)
+                                 and value.strip().lower() in _DEFERRAL_GATE_WORDS)
         return "" if ok else (
             f"`{path}` must be a severity band P1-P4 or one of "
-            f"{', '.join(_DEFERRAL_GATE_ENDS)}, not {value!r}")
+            f"{', '.join(_DEFERRAL_GATE_WORDS)}, not {value!r}")
     if dial.kind == "scope":
         return "" if isinstance(value, str) and value.strip().lower() in _SCOPES else (
             f"`{path}` must be one of {', '.join(_SCOPES)}, not {value!r}")
@@ -3063,7 +3302,7 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
 _KIND_HINTS = {
     "severity": f"a severity band — {', '.join(_SEVERITY_BANDS)}",
     "deferral_gate": (f"a severity band ({', '.join(_SEVERITY_BANDS)}) "
-                      f"or {' / '.join(_DEFERRAL_GATE_ENDS)}"),
+                      f"or {' / '.join(_DEFERRAL_GATE_WORDS)}"),
     "scope": " or ".join(_SCOPES),
     "flag": "true or false, unquoted",
     "number": "a number",
@@ -3107,7 +3346,7 @@ def dial_choices(path: str) -> tuple[str, ...]:
     if dial.kind == "severity":
         return _SEVERITY_BANDS
     if dial.kind == "deferral_gate":
-        return _SEVERITY_BANDS + _DEFERRAL_GATE_ENDS
+        return _SEVERITY_BANDS + _DEFERRAL_GATE_WORDS
     if dial.kind == "scope":
         return _SCOPES
     if dial.kind == "flag":

@@ -1091,14 +1091,16 @@ def test_the_brief_is_inside_what_the_argv_clamp_measured(monkeypatch, tmp_path,
     work rather than passing everything through, and asserted on the argv element
     the seat would actually be handed.
     """
-    # Derived, not picked: the ceiling has to sit ABOVE the template and brief —
-    # `fit_argv_budget` can only cut the diff, and a cap under the template's own
-    # length starves the prompt to nothing and fails for that reason instead of
-    # this one — and far enough below the whole prompt that the clamp does real
-    # work. Recomputed from the prose so an edit to the brief cannot silently turn
-    # this into a test that never clamps.
+    # Derived, not picked: the ceiling has to sit ABOVE the template, the brief and
+    # the PR's own claim — `fit_argv_budget` can only cut the diff, and a cap under
+    # the uncuttable frame starves the prompt to nothing and fails for that reason
+    # instead of this one — and far enough below the whole prompt that the clamp does
+    # real work. Recomputed from the prose so an edit to either cannot silently turn
+    # this into a test that never clamps. The claim block (#550) rides in the `{diff}`
+    # slot ahead of the material, so it is part of the frame rather than of the diff.
     empty = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
-                                       code=panel_core.NO_TOOLS_BRIEF, diff="")
+                                       code=panel_core.NO_TOOLS_BRIEF,
+                                       diff=panel.pr_claim("feat: x", ""))
     cap = len(empty.encode()) + 2_000
     monkeypatch.setattr(panel_core, "ARGV_PROMPT_MAX_BYTES", cap)
     monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", cap)

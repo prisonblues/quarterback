@@ -709,6 +709,16 @@ def _cfg(**budgets) -> dict:
             "review_panel": {**CFG.get("review_panel", {}),
                              "refuse_over_cap_multiple": 0,
                              "manifest_moves": False},
+            #
+            # Each budget is stated as DIFF CHARS and reaches the seat as exactly that
+            # many, which is worth saying because #550 puts a claim block in the same
+            # slot and charges it to the same budget. It costs nothing HERE: the block
+            # may take at most a quarter of the tightest budget in the panel and is
+            # dropped whole below the floor, and every budget in this file is a
+            # truncation device far under it. So these rounds send no claim, the cut
+            # arithmetic below is measured against the diff alone, and a change that
+            # made the claim bite would show up as a `config_notes` line rather than as
+            # silently shorter material.
             "reviewers": {
                 name: {"enabled": True, "model": "sonnet",
                        **({} if budget is None else {"max_diff_chars": budget})}

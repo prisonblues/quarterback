@@ -37,9 +37,6 @@ from app.models.dial import DialSetting
 
 from .conftest import DESKTOP, LAPTOP, LAPTOP_ELEVATED, PINNED_SETTINGS, SERVER
 
-pytestmark = pytest.mark.anyio
-
-
 #: Every item this module created, so the teardown closes those and only those.
 MINE: set[str] = set()
 
