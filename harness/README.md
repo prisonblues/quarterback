@@ -2102,8 +2102,9 @@ missing edge is a fact about the board rather than a shortcut taken in the rende
 Rows are clickable — a seat jumps the tmux cursor to that seat's pane and its `✕` closes it,
 an agent row says where it is, a claim row shows the note the claiming agent left, a work row
 explains why it is where it is (a plan item's reasoning, or what review is waiting for) and
-its verb column takes the issue (`⚒`) or starts the round (`⚖`), and a dial row says why it
-is set (its `✎` opens the one surface that can change it).
+its verb column takes the issue (`⚒`) or starts the round (`⚖`), the `▥` beside it reads the
+item in a pane of the seat row, and a dial row says why it is set (its `✎` opens the one
+surface that can change it).
 
 **A claim nobody answers for gets a row, and says which kind of nobody.** `machine` — the
 claim names a bare machine name while that box's agents are `machine/name`, so nothing can
@@ -2727,9 +2728,75 @@ naming a default, and a dial no harness recognises is stored, returned and ignor
 **Clicking starts work, not just navigation.** Each PR row carries a `⚖` and each issue row
 a `⚒`; clicking one opens a confirmation showing the exact command, and confirming starts a
 real session you can attach to, read and interrupt. Clicking anywhere else on the row still
-opens the thing on GitHub. The keys are `o` open, `p` panel-review, `f` fix the selected
-issue or plan item, `d` the board's dials page, `s` this project's rows or the whole
-fleet's, `r` refresh, `?` the list, `q` quit.
+opens the thing on GitHub. The keys are `o` open, `v` read it here, `p` panel-review, `f` fix
+the selected issue or plan item, `d` the board's dials page, `s` this project's rows or the
+whole fleet's, `r` refresh, `?` the list, `q` quit.
+
+### The `▥` reads a row here instead of in a browser ([#250](https://github.com/prisonblues/quarterback/issues/250))
+
+`open_pr` and `open_issue` went to `xdg-open`, which made the row click the one action on
+this dashboard that left the terminal — and it left it to show something a terminal renders
+well. `gh-dash` has a full detail view for both: Overview / Activity / Commits / Checks /
+Files Changed for a PR, body and comments for an issue. The `▥` opens that in a pane of the
+seat row, on `run_in_pane`'s own argument: a thing you switch windows for is a thing you go
+and look at later.
+
+**A column of its own, and the row click is unchanged.** The alternative was to give the row
+click to `gh-dash` and demote the browser to the existing `o`, which costs no width. A column
+was chosen instead: `o` and the row click are what a reader already has in their fingers, and
+GitHub still reaches things a terminal cannot render. `v` is the key, beside `o`.
+
+**`gh-dash` cannot be told to open item N.** Measured on 4.24.1, its entire CLI surface is
+`--config`, `--debug` and `--cpuprofile` — no repo flag, no number, no subcommand but `help`
+and `sponsors`. So the handle is a generated throwaway config whose single section is narrow
+enough that the item is the only row in it, with `preview.open: true` so the sidebar is
+already rendered. It lands in `$XDG_RUNTIME_DIR/qb-dash/` (`/tmp` if that is unset), named for
+the item so a second click on the same PR rewrites one file rather than accumulating them.
+
+**The pin is the head branch for a PR and the exact title for an issue**, and the number —
+which is what every caller has — is the one thing that cannot be used: GitHub search has no
+`number:` qualifier, and a bare `is:issue 827` matches nothing at all. `head:<headRefName>` is
+exact and free, because `fetch_prs` already asks for that field. `in:title "<title>"` is exact
+enough on this repo's titles, colons, backticks, apostrophes and em-dashes included — a quoted
+phrase is matched over tokens, so punctuation needs no handling. Two items sharing a title
+give a two-row section with the sidebar on the first, which is degraded rather than broken —
+and the section is titled with the number, so a reader can see which of the two they wanted.
+
+**A PR with no `gh` row of its own is looked up in the open-PR list first.** `work_rows` hangs
+a `gh` row off a PR only when the review queue named it, so a plan item whose ref is a `pr`
+carries none even while the branch that would pin it exactly is sitting in the PR list on the
+same screen. Only after that does it fall back to a title — and only to a title that is the
+PR's own, off its `gh` row or its queue entry. **A plan item's title is never used**: it is the
+plan's wording for the work rather than what the PR is called, so a pin built from it matches
+nothing, and an empty `gh-dash` reads exactly like a fetch that failed. A dim `▥` is the better
+answer to "this cannot be pinned" than a pane that looks broken.
+
+The generated YAML **quotes both the filter and the section title**, and the title is not
+decoration: `#` opens a comment in YAML wherever a space precedes it, so a bare
+`title: PR #247` parses as the string `PR` and drops the number from the one field a reader
+checks to confirm the pin landed on the right row.
+
+**It is cross-repo, unlike the `⚒` and the `⚖`.** Those refuse a row from a repo this checkout
+is not, because `/fix-issue` and `/panel-review-pr` take a bare number and resolve the
+repository from where they run. The generated filter carries `repo:` explicitly, so there is
+nothing here to get wrong. And there is no confirmation: that dialog exists because a panel
+round spends money, comments on a public PR and pushes a commit, and a read-only click that
+asks first is a click you learn to double-tap.
+
+**A trap for anyone testing this.** `gh-dash`'s detail view **panics** when the terminal is
+not real — `markdown.GetMarkdownRenderer` nil-derefs at `markdownRenderer.go:24` and takes the
+whole program down. Reproduced under tmux with no attached client, `script -qec`, a bare
+`pty.fork()`, and a `pty.fork()` that answers the OSC 11 background-colour query; the table
+view alone (`preview.open: false`) survives all four. It is nothing to do with the generated
+config and nothing to do with this repo. So the tests assert on what quarterback controls —
+the config written and the `tmux split-window` invoked — and never by running `gh-dash`.
+
+**With no `gh-dash` on the machine the column greys and the click says so.** That is the one
+place this table breaks its own falls-through-and-explains rule: everywhere else a dim icon
+means "there is no verb here" and the row's own explanation is the better answer, but a
+missing binary is a fact about the machine that nothing else on this dashboard reports. The
+`PATH` is asked on every render rather than cached at mount, so a `gh-dash` installed while
+the dashboard was up lights the column on the next tick.
 
 **The `⚒` goes through `qb-start` (#371), and therefore inherits its gate.** It used to
 compose `claude -- /fix-issue <n>` and hand it to tmux, and what that started was a session

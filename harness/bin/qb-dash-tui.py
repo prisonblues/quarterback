@@ -79,6 +79,7 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -978,6 +979,12 @@ class Dash(App):
         ("q", "quit", "quit"),
         ("r", "refresh_now", "refresh"),
         ("o", "open_pr", "open"),
+        # THE SAME ROW, WITHOUT LEAVING THE TERMINAL. `o` and `v` are two answers
+        # to "show me this thing" and both are worth a key: `o` reaches everything
+        # GitHub can render and nothing else can — a project board, a rendered
+        # diagram, a review conversation with images in it — and `v` reaches the
+        # rest without the context switch, which is most of it most days.
+        ("v", "read_here", "view"),
         ("p", "panel_pr", "panel"),
         ("f", "fix_issue", "fix"),
         ("s", "toggle_scope", "scope"),
@@ -1028,6 +1035,18 @@ class Dash(App):
     # keep: it is one column per table, carrying whatever verb the row under it
     # wants, and "click the icon, not the row" is one habit rather than five.
     VERB_COLUMN = 1
+
+    # AND THE ONE BESIDE IT, on WORK only. A row's verb is what this dashboard can
+    # DO about the item; this is the item itself, and the two are different enough
+    # to be worth a column apiece — a ⚒ spends money and takes a claim, and the ▥
+    # is a read.
+    #
+    # It sits next to the verb rather than at the far end because that is where the
+    # habit already points: "the action icons are at the front of the row" is one
+    # thing to learn, and an icon stranded past the title would be a second. The
+    # other two tables have nothing to open, so the column is WORK's alone and
+    # `dispatch_agent` never sees this number.
+    READ_COLUMN = 2
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
                  plan_interval: float = 15.0, scope: "qd.Scope | None" = None,
@@ -1206,7 +1225,8 @@ class Dash(App):
                 yield ClickTable(id="work", cursor_type="row")
         yield Static("click: seat→pane, ✕→close it, ＋→add one, agent→where it "
                      "is, claim→its note, work row→why it is where it is, "
-                     "⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
+                     "⚖→panel review, ⚒→fix issue, ▥→read it here, ✎→set or clear "
+                     "a dial"
                      # NO SQUARE BRACKETS IN THIS STRING. `#detail` is a Static
                      # that parses markup, and `[/]` — the obvious way to write
                      # the two keys that send a row to the ends — is a closing
@@ -1271,6 +1291,13 @@ class Dash(App):
         everywhere on purpose"; there is now one column per table carrying
         whatever verb the row under it wants, so the toggling repo cell still has
         to sit after it, and nothing else indexes past.
+
+        WORK ADDS A SECOND FIXED COLUMN AFTER IT — the ▥ that reads the row here
+        (READ_COLUMN, #250) — and it goes before the repo cell for the same reason
+        the verb does: a column that comes and goes cannot sit above one addressed
+        by number. AGENTS and DIALS do not get one, because a seat and a dial are
+        not things `gh-dash` can be pointed at, which is why READ_COLUMN is only
+        ever compared inside `dispatch_work`.
         """
         repo = ("repo",) if self.scope.column else ()
         for table_id, columns in (
@@ -1281,7 +1308,7 @@ class Dash(App):
             # `kind` before the repo cell for the same reason, and it is the
             # column that makes one table legible where four panels needed none:
             # `iss` and `pr` were the panel you were looking at (#272).
-            ("#work", ("", "⚒", "kind", *repo, "rank", "ref", "title", "who")),
+            ("#work", ("", "⚒", "▥", "kind", *repo, "rank", "ref", "title", "who")),
         ):
             table = self.query_one(table_id, DataTable)
             table.clear(columns=True)
@@ -1895,6 +1922,28 @@ class Dash(App):
         live = not taken and self.wrong_repo(issue.get("repo"), "") is None
         return "⚒", ("fix" if live else None)
 
+    def read_action(self, row: dict, installed: bool) -> tuple[str, dict | None]:
+        """``('▥', pin)`` — the read icon, and the `gh-dash` pin behind it.
+
+        `None` for the pin means the icon is dim, and `work_action`'s rule applies
+        for the same reason: THE RENDERER AND THE CLICK ASK THE SAME QUESTION, so
+        an icon drawn live cannot then explain itself.
+
+        Two things dim it, and they are different facts about the same click. A row
+        that names neither a PR nor an issue has nothing to open — a line of plan,
+        a repo-level question, the row that says the queue is idle. And a box with
+        no `gh-dash` on it cannot open anything at all.
+
+        `installed` is passed in rather than asked here because THIS RUNS PER ROW
+        and the answer is per machine: a forty-item plan would otherwise walk
+        `PATH` forty times to reach one verdict. It is still asked on every render
+        — see the signature in `render_work` — rather than cached at mount, which
+        is the lesson #582 left about `qb-start`'s gate: a dashboard is left up for
+        days, and a binary installed while it was running would otherwise stay
+        greyed out until somebody restarted it.
+        """
+        return "▥", (qd.gh_dash_pin(row, prs=self.prs) if installed else None)
+
     def work_pr(self, row: dict) -> dict | None:
         """``{repo, number}`` for a row that is about a pull request, else None.
 
@@ -1956,13 +2005,18 @@ class Dash(App):
             self.held, self.scope, self.backlog,
             blockers=(self.blockers or {}).get("blockers"),
             waiting_only=self.waiting)
+        # ASKED ONCE FOR THE WHOLE TABLE and carried into the signature, so a
+        # `gh-dash` installed while this was running lights its column up on the
+        # next tick rather than at the next restart — and forty rows cost one walk
+        # of `PATH` between them rather than forty.
+        gh_dash = shutil.which("gh-dash") is not None
         # ONE SIGNATURE WHERE THERE WAS ONE AND THREE REBUILDS. PLANS had a guard
         # and OPEN PRs, REVIEW QUEUE and ISSUES each cleared and rebuilt on every
         # tick of their worker, so this table is steadier than three of the four it
         # replaces. Everything the TITLE reports that no row carries is in it, for
         # the reason the hidden count is: the board's answer about what to pick up
         # can move while every row on the pane stays exactly as it was.
-        sig = (hidden, self.backlog, self.waiting, self.plan_err, self.pr_err,
+        sig = (gh_dash, hidden, self.backlog, self.waiting, self.plan_err, self.pr_err,
                (self.blockers or {}).get("error"), self.issue_err,
                self.claims_err, self.held is None, qd.plan_next_id(self.plan),
                tuple(sorted((self.plan.get("counts") or {}).items())),
@@ -1979,9 +2033,16 @@ class Dash(App):
             why, why_colour = row["why"]
             rank, rank_colour = row["rank"]
             icon, verb = self.work_action(row)
+            read, pin = self.read_action(row, gh_dash)
             key = table.add_row(
                 Text(glyph, style=colour),
                 Text(icon, style="bold cyan" if verb else "grey30"),
+                # NOT CYAN, and the difference is the point of having two icons:
+                # cyan is what this dashboard will SPEND on the row — a claim, a
+                # panel round — and the ▥ spends nothing. Same dim grey when it is
+                # not offered, because "grey means not offered" is the one habit
+                # every icon here keeps.
+                Text(read, style="bold green" if pin else "grey30"),
                 Text(qd.work_kind(row), style="grey50"),
                 *self.repo_cell(qd.short_repo(row["repo"] or "fleet")),
                 # THE MARK GOES ON THE RANK CELL, which is the column marking is
@@ -2020,7 +2081,7 @@ class Dash(App):
                      ("blockers", (self.blockers or {}).get("error")),
                      ("prs", self.pr_err), ("issues", self.issue_err)) if err]
         for name, err in troubles:
-            table.add_row(Text("!", style="red"), Text(""), Text(""), *blank,
+            table.add_row(Text("!", style="red"), Text(""), Text(""), Text(""), *blank,
                           Text(""), Text(""),
                           Text(qd.clip(f"{name}: {err}", 38 if self.scope.column else 48),
                                style="red"), Text(""), key=f"err:{name}:{err[:24]}")
@@ -2039,7 +2100,8 @@ class Dash(App):
         # for, and one that said it while an answer was in flight would be stating
         # a fact it is about to replace (#244).
         if not rows and not troubles and not waiting:
-            table.add_row(Text(""), Text(""), Text(""), *blank, Text(""), Text(""),
+            table.add_row(Text(""), Text(""), Text(""), Text(""), *blank,
+                          Text(""), Text(""),
                           Text("nothing is waiting on a person" if self.waiting else
                                ((self.queue or {}).get("idle") or "nothing in flight"),
                                style="grey50"), Text(""), key="work:idle")
@@ -2180,11 +2242,23 @@ class Dash(App):
     def dispatch_work(self, row: dict, column: int | None) -> None:
         """A plan item, a PR under review, or an issue nobody has taken.
 
-        The verb column starts the round or takes the issue; the rest of the row
-        says why it is where it is. A PR the queue is waiting on explains the WAIT
-        rather than opening GitHub — that is what the queue row did and it is the
-        more useful of the two answers — and `o` opens it either way.
+        The verb column starts the round or takes the issue, the ▥ beside it reads
+        the item here, and the rest of the row says why it is where it is. A PR the
+        queue is waiting on explains the WAIT rather than opening GitHub — that is
+        what the queue row did and it is the more useful of the two answers — and
+        `o` opens it in a browser either way.
+
+        THE ▥ ALWAYS ANSWERS, dim or not, which is the one place this table breaks
+        its own falls-through-and-explains rule. Everywhere else a dim icon means
+        "there is no verb here" and the row's own explanation is the better answer.
+        Here one of the two reasons is `gh-dash` not being installed, and that is a
+        fact about the machine that nothing else on this dashboard can report — a
+        click that quietly explained the row instead would leave a reader clicking
+        a button they have no way to find out is unbuilt.
         """
+        if column == self.READ_COLUMN:
+            self.read_in_pane(row)
+            return
         if column == self.VERB_COLUMN:
             verb = self.work_action(row)[1]
             if verb == "panel":
@@ -2703,6 +2777,62 @@ class Dash(App):
         subprocess.run(["tmux", "select-layout", "-t", pane, "-E"],
                        capture_output=True, timeout=5)
         self.say(f"'{name}' is in the seat row — Ctrl-b x closes it")
+
+    def read_in_pane(self, row: dict) -> None:
+        """The ▥: this row's `gh-dash` detail view, in a pane of the seat row.
+
+        The one click on this dashboard that used to leave the terminal was the
+        one that had least reason to — a PR and an issue are both things a
+        terminal renders well, and `gh-dash` has a full detail view for each:
+        Overview / Activity / Commits / Checks / Files Changed for a PR, body and
+        comments for an issue. `run_in_pane`'s own argument applies unchanged: a
+        thing you have to switch windows for is a thing you go and look at later.
+
+        **No `Confirm`, unlike the ⚖ and the ⚒.** That dialog exists because a
+        panel round spends money, comments on a public PR and pushes a commit.
+        This reads. A read-only click that asks first is a click you learn to
+        double-tap, and then the dialog is protecting nothing and costing a
+        keystroke on every use.
+
+        **And no repo guard, also unlike them.** `/fix-issue` and
+        `/panel-review-pr` take a bare number and resolve the repository from the
+        checkout they run in, which is why both refuse a row from a repo this
+        screen only WATCHES. The generated filter carries `repo:` explicitly, so
+        there is nothing here to get wrong and a row from any watched repo opens
+        correctly.
+
+        Degrades rather than guards: a row with nothing to pin and a box with no
+        `gh-dash` both say so, the way `run_seat_click` reports a refused
+        `qb-seat-click`.
+        """
+        if not shutil.which("gh-dash"):
+            self.say("gh-dash is not installed on this machine — `o` opens this "
+                     "row in a browser instead")
+            return
+        # `self.prs` is handed over for the reason `gh_dash_pin` gives: a plan item
+        # whose ref is a PR carries no `gh` row, and the branch that pins it exactly
+        # is sitting in the open-PR list this same screen already fetched.
+        pin = qd.gh_dash_pin(row, prs=self.prs)
+        if pin is None:
+            # Every row that names neither: a line of plan with no ref, a question
+            # about the repo itself, the row that says the queue is idle — and a PR
+            # carrying neither a head branch nor a title to pin it by.
+            self.say("nothing to open here — this row names no PR and no issue "
+                     f"gh-dash could be pointed at: {qd.clip(row.get('title'), 60)}")
+            return
+        path = qd.gh_dash_config_path(pin["slug"])
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as handle:
+                handle.write(qd.gh_dash_config(pin))
+        except OSError as exc:
+            self.say(f"could not write gh-dash's config ({type(exc).__name__}): {path}")
+            return
+        # THE BARE NAME, not the path `which` just resolved. The pane runs under
+        # the person's own shell and their `PATH` is the one that should decide,
+        # which matters on a box where `gh-dash` comes and goes with a nix profile
+        # generation; the scan above is a check, not a resolution.
+        self.run_in_pane(pin["name"], f"gh-dash --config {shlex.quote(path)}")
 
     def click_agent(self, agent: dict) -> None:
         if self.jump_to_agent(agent.get("session")):
@@ -3302,14 +3432,16 @@ class Dash(App):
             self.fix_issue(issue)
 
     def action_help(self) -> None:
-        self.say("o open the selected row on GitHub · p panel-review it · f take "
+        self.say("o open the selected row on GitHub · v read it here, in a pane · "
+                 "p panel-review it · f take "
                  "its issue · m mark a plan row · k/j move it one · K/J five · "
                  "[ ] to the ends · g move it to a position · "
                  "w only what a person owes an answer about · b the "
                  "backlog nothing is waiting on · d the board's "
                  "dials page · z this pane full screen and back · s this project's "
                  "rows or the whole fleet's · r refresh · q quit · click ⚖ to "
-                 "review, ⚒ to fix, ✎ to set or clear a dial (ctrl+s saves, ctrl+x "
+                 "review, ⚒ to fix, ▥ to read it in the seat row, ✎ to set or clear "
+                 "a dial (ctrl+s saves, ctrl+x "
                  "clears), a work row for why it is where it is, a seat to jump to "
                  "its pane, ✕ to close one")
 
@@ -3332,6 +3464,17 @@ class Dash(App):
         """`{repo, number}` for the selected row, if it is about a PR."""
         row = self.selected_work()
         return self.work_pr(row) if row else None
+
+    def action_read_here(self) -> None:
+        """`v` opens the selected row's gh-dash detail view in the seat row.
+
+        The keyboard half of the ▥, and it asks the row nothing the icon does not:
+        `read_in_pane` answers a row with nothing to open, so a `v` on a line of
+        plan says so rather than doing nothing quietly.
+        """
+        row = self.selected_work()
+        if row:
+            self.read_in_pane(row)
 
     def action_open_pr(self) -> None:
         """`o` opens the selected row on GitHub — the PR, or the issue."""

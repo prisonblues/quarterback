@@ -14,6 +14,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -3510,6 +3511,233 @@ def work_kind(row: dict) -> str:
         return WORK_KIND.get(row.get("kind"), "?")
     kind = ((row.get("item") or {}).get("ref") or {}).get("kind")
     return {"issue": "iss", "pr": "pr"}.get(kind, "plan")
+
+
+#: How wide the `gh-dash` sidebar opens, in columns. It is the detail view that
+#: makes this worth a button at all — Overview / Activity / Commits / Checks /
+#: Files Changed for a PR, body and comments for an issue — so the config asks
+#: for it open rather than leaving a reader a keystroke away from the point.
+GH_DASH_PREVIEW = 90
+
+#: The longest search string worth sending. GitHub's search API refuses a query
+#: over 256 characters, and the titles in this repo are long enough to reach it:
+#: a 190-character title plus `repo:owner/name in:title ""` is over. The pin is
+#: clipped to fit rather than refused, because a PHRASE PREFIX still matches the
+#: title it was cut from — `in:title "a b c"` matches a title containing that
+#: run of words — so a clipped pin is a wider net and not a broken one.
+GH_DASH_QUERY = 256
+
+
+def _title_pin(title: str | None, room: int) -> str | None:
+    """``in:title "…"`` for an exact-ish title match, or None if there is none.
+
+    **Double quotes come out.** The pin is a quoted phrase and GitHub's search
+    has no escape inside one, so a title carrying `"` cannot be expressed with
+    it left in. Dropping it is safe where escaping is not available: the phrase
+    is matched over TOKENS and punctuation is not one, which is also why the
+    colons, backticks, apostrophes and em-dashes that fill this repo's titles
+    need no handling at all.
+
+    Clipped on a word boundary, for the reason `GH_DASH_QUERY` gives — half a
+    word is a token that appears in no title, and that is the one way a clip
+    turns a wide net into an empty one.
+    """
+    text = " ".join((title or "").replace('"', " ").split())
+    if not text:
+        return None
+    if len(text) > room:
+        text = text[:room].rsplit(" ", 1)[0].strip()
+        if not text:
+            return None
+    return f'in:title "{text}"'
+
+
+def gh_dash_pin(row: dict, repos: list[str] | None = None,
+                prs: list[dict] | None = None) -> dict | None:
+    """The one-item `gh-dash` section for a WORK row — or None if it names nothing.
+
+    Returns ``{view, filters, label, name, slug}``: which of `gh-dash`'s two views
+    to open on, the section filter that can only match this row's item, what to
+    call the section, what to label the pane, and a filename-safe name for the
+    generated config.
+
+    `label` and `name` are not one field because they are read in two places at
+    two widths: `label` is the section tab inside `gh-dash` and can afford a space
+    and a `#`, while `name` becomes the tmux `@qb_label` on the pane border beside
+    `panel-42` and `dash`, where it should read as one token.
+
+    **`gh-dash` cannot be told to open item N.** Its entire CLI on 4.24.1 is
+    `--config`, `--debug` and `--cpuprofile` — no repo flag, no number, no
+    subcommand but `help` and `sponsors` — so the handle is a throwaway config
+    holding a section narrow enough that the item is the only row in it, with the
+    sidebar already open. The filter is that narrowing, and this is where it is
+    built.
+
+    **A PR is pinned by its head branch and an issue by its title**, because
+    those are the two exact pins GitHub search offers. There is no `number:`
+    qualifier — `is:issue 827` matches nothing at all — so the number, which is
+    the obvious pin and the one every caller has, is the one that cannot be used.
+    `head:` is exact and free: `fetch_prs` already asks for `headRefName`, so the
+    row on the dash carries it.
+
+    **A PR with no `gh` row of its own is looked up in `prs` before anything
+    else**, and that is where most of them are: `work_rows` attaches a `gh` row
+    only to a PR the review queue named, so a plan item whose ref is a `pr` has
+    none even when the open-PR list on the same screen is holding its branch.
+
+    Only then does it fall back to the PR's title, and ONLY to a title that is the
+    PR's own — the one on its `gh` row or on its queue entry. **A plan item's title
+    is not a candidate**: it is the plan's wording for the work and need not be
+    what the PR is called, so pinning on it produces a section matching nothing,
+    and an empty `gh-dash` reads exactly like a fetch that failed. A dim icon is
+    the better answer to "this cannot be pinned" than a pane that looks broken.
+
+    Two issues sharing a title give a two-row section with the sidebar on the
+    first — degraded, not broken, and the section is titled with the number so a
+    reader can see which of the two they wanted.
+
+    `is:pr` / `is:issue` are NOT in the filter: `gh-dash` prepends the one its
+    section belongs to, and a second copy is a term that narrows nothing and
+    spends characters `GH_DASH_QUERY` is counting.
+    """
+    pr, entry = row.get("pr") or {}, row.get("entry") or {}
+    item = row.get("item") or {}
+    ref = item.get("ref") or {}
+    subject = row.get("subject") or {}
+    # PR FIRST, and by the same precedence `Dash.work_pr` reads: a row is about a
+    # PR three ways and about the PR either way when it is about both. What this
+    # needs beyond `work_pr`'s `{repo, number}` is the head branch and the title,
+    # so it goes back to the records rather than to that answer.
+    number, repo, title = None, None, None
+    if pr:
+        number, repo, title = pr.get("number"), pr.get("repo"), pr.get("title")
+    elif entry:
+        number, repo, title = entry.get("pr"), entry.get("repo"), entry.get("title")
+    elif ref.get("kind") == "pr" and str(ref.get("value") or "").isdigit():
+        # NO TITLE from either of these two. A plan item's title is the plan's
+        # wording and a blocker row's is the question's, and neither is promised to
+        # be what the PR is called — see the docstring. `prs` answers both when it
+        # can, and a dim ▥ is the honest answer when it cannot.
+        number, repo = int(ref["value"]), plan_repo(item, repos)
+    elif subject.get("kind") == "pr" and str(subject.get("value") or "").isdigit():
+        # A question ABOUT a pull request still names one, and it is the row least
+        # likely to be findable any other way — the PR is on this table only
+        # because somebody owes an answer about it.
+        number, repo = int(subject["value"]), row.get("repo")
+    if number is not None:
+        repo = repo or REPO
+        # THE OPEN-PR LIST IS THE SECOND PLACE TO LOOK, and for a plan item it is
+        # the first that can answer: `work_rows` hangs a `gh` row off a PR only
+        # when the review queue named it, so the branch is routinely on this
+        # screen and not on this row.
+        head = pr.get("headRefName") or _head_of(prs, repo, number)
+        scope = f"repo:{repo}"
+        pin = (f"head:{head}" if head else
+               _title_pin(title, GH_DASH_QUERY - len(scope) - len('  in:title ""')))
+        if pin is None:
+            return None
+        return {"view": "prs", "filters": f"{scope} {pin}",
+                "label": f"PR #{number}", "name": f"pr-{number}",
+                "slug": _gh_dash_slug("pr", repo, number)}
+
+    issue = row.get("issue") or (plan_issue(item, repos) if item else None)
+    if not issue:
+        # A blocker row whose subject is an issue is still about that issue, and
+        # `work_issue` misses it for the same reason `work_pr` has the `subject`
+        # branch above: the row exists because of the question, not the work.
+        if subject.get("kind") == "issue" and str(subject.get("value") or "").isdigit():
+            issue = {"number": int(subject["value"]), "repo": row.get("repo"),
+                     "title": row.get("title")}
+        else:
+            return None
+    repo = issue.get("repo") or REPO
+    scope = f"repo:{repo}"
+    pin = _title_pin(issue.get("title"),
+                     GH_DASH_QUERY - len(scope) - len('  in:title ""'))
+    if pin is None:
+        return None
+    return {"view": "issues", "filters": f"{scope} {pin}",
+            "label": f"issue #{issue.get('number')}",
+            "name": f"issue-{issue.get('number')}",
+            "slug": _gh_dash_slug("issue", repo, issue.get("number"))}
+
+
+def _head_of(prs: list[dict] | None, repo: str, number) -> str | None:
+    """The head branch of `repo#number` in an open-PR list, or None.
+
+    On the same `owner/name#n` key `repo_ref` builds, so the two sides of the join
+    cannot spell it differently — which is the defect that key exists to prevent.
+    """
+    wanted = f"{repo}#{number}"
+    return next((pr.get("headRefName") for pr in (prs or [])
+                 if repo_ref(pr) == wanted and pr.get("headRefName")), None)
+
+
+def _gh_dash_slug(kind: str, repo: str, number) -> str:
+    """A filename for this item's config — the same one every time it is clicked.
+
+    Named for the ITEM so a second click on the same PR rewrites one file rather
+    than leaving a directory of them behind; `$XDG_RUNTIME_DIR` is cleared at
+    logout and `/tmp` is not, so the accumulating version would be permanent on
+    the fallback path.
+    """
+    safe = re.sub(r"[^A-Za-z0-9]+", "-", f"{kind}-{repo}-{number}").strip("-")
+    return safe.lower()
+
+
+def _yaml_single(text: str) -> str:
+    """`text` as a YAML single-quoted scalar — doubling any quote of its own.
+
+    That doubling is the whole of YAML's single-quoted escaping, and single quotes
+    are the form to reach for here because the strings involved carry `"`, `:` and
+    `#`, all of which mean something else unquoted.
+    """
+    return "'" + text.replace("'", "''") + "'"
+
+
+def gh_dash_config(pin: dict) -> str:
+    """The throwaway `gh-dash` config that opens on one item, as YAML text.
+
+    Hand-written rather than dumped, because the dependency is not worth one
+    six-line document and the one hard part is small: the filter carries `"` and
+    `:` and would be a mapping to a YAML parser unquoted, so it goes in single
+    quotes with its own doubled, which is the whole of YAML's single-quoted
+    escaping.
+
+    The view it does not open on is `[]` rather than absent: `gh-dash` reads a
+    missing key as "use the defaults" and would draw its own five sections beside
+    the one asked for, which is the opposite of a pin.
+    """
+    quoted = _yaml_single(pin["filters"])
+    # THE TITLE IS QUOTED TOO, and it is not decoration: `#` opens a comment in
+    # YAML wherever a space precedes it, so a bare `title: PR #247` parses as the
+    # string `PR` and the section tab loses the number that says which item you
+    # are looking at — silently, in the one field a reader checks to see that the
+    # pin landed on the right row.
+    section = f"  - title: {_yaml_single(pin['label'])}\n    filters: {quoted}\n"
+    prs = section if pin["view"] == "prs" else None
+    issues = section if pin["view"] == "issues" else None
+    return (
+        (f"prSections:\n{prs}" if prs else "prSections: []\n")
+        + (f"issuesSections:\n{issues}" if issues else "issuesSections: []\n")
+        + "defaults:\n"
+        + f"  view: {pin['view']}\n"
+        + "  preview:\n"
+        + "    open: true\n"
+        + f"    width: {GH_DASH_PREVIEW}\n"
+    )
+
+
+def gh_dash_config_path(slug: str) -> str:
+    """Where this item's generated config lives — somewhere COLLECTABLE.
+
+    `$XDG_RUNTIME_DIR` first, because it is cleared when the session ends and a
+    config for a PR that merged last week is litter with a plausible name. `/tmp`
+    is the fallback and only that: it survives, which is why the filename is the
+    item's rather than a fresh one per click.
+    """
+    root = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    return os.path.join(root, "qb-dash", f"{slug}.yml")
 
 
 def work_tally(rows: list[dict], prs: list[dict] | None,

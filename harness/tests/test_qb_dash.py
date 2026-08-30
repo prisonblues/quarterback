@@ -1325,21 +1325,23 @@ def test_the_review_queue_keeps_the_rows_nothing_can_act_on():
     to prevent.
     """
     rows, title, _, _ = asyncio.run(_drive_queue(offset=(60, 1)))
-    # Narrow: state, ⚖, kind, rank, ref, title, why.
-    assert [r[4] for r in rows] == ["#264", "#270"], rows
-    assert [r[2] for r in rows] == ["pr", "pr"], rows
+    # Narrow: state, ⚖, ▥, kind, rank, ref, title, why. The ▥ arrived after this
+    # test did (#250) and moved every cell below it along one, which is the cost
+    # the issue weighed against the row click it chose not to take over.
+    assert [r[5] for r in rows] == ["#264", "#270"], rows
+    assert [r[3] for r in rows] == ["pr", "pr"], rows
     # The verb and the wait share the `why` cell, which is the column every row in
     # this table gives to why it is where it is — a plan item's holder, a PR's
     # round. Four panels had four shapes of that column and now there is one.
-    assert rows[0][6].startswith("panel"), rows[0]
-    assert rows[1][6].startswith("conflicting"), rows[1]
+    assert rows[0][7].startswith("panel"), rows[0]
+    assert rows[1][7].startswith("conflicting"), rows[1]
     # The board's own word, abbreviated for the column: `integrate` is what a
     # DRAINABLE row would show, and this row is not one.
-    assert "integrate" not in rows[1][6]
+    assert "integrate" not in rows[1][7]
     # `~` on an age that is the longest the wait could have been — nothing
     # records when a branch started conflicting.
-    assert "~" in rows[1][6], rows[1]
-    assert "~" not in rows[0][6], rows[0]
+    assert "~" in rows[1][7], rows[1]
+    assert "~" not in rows[0][7], rows[0]
     assert "1 waiting" not in title, "the depth moved to the header line"
 
 
@@ -1742,8 +1744,8 @@ def test_marked_rows_move_together_and_the_rank_cell_says_so():
     is marked so the next move takes it, and the rank is where a move shows up."""
     async def drive():
         app, sent, table, _ = await _drive_reorder(mark_rows=("a", "b"))
-        # Narrow: glyph verb kind rank ref title why.
-        ranks = [str(table.get_row_at(i)[3]) for i in range(table.row_count)]
+        # Narrow: glyph verb read kind rank ref title why.
+        ranks = [str(table.get_row_at(i)[4]) for i in range(table.row_count)]
         return app, sent, ranks
 
     app, sent, ranks = asyncio.run(drive())
@@ -2002,7 +2004,7 @@ async def _drive_optimistic(answer):
 
     def titles(app):
         table = app.query_one("#work")
-        return [str(table.get_row_at(i)[5]) for i in range(table.row_count)]
+        return [str(table.get_row_at(i)[6]) for i in range(table.row_count)]
 
     async with app.run_test(size=(110, 46)) as pilot:
         app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
@@ -2067,7 +2069,7 @@ def test_a_poll_does_not_repaint_over_a_move_that_has_not_landed():
             await pilot.press("j")
             # The 15s tick lands mid-write, carrying the board's pre-move order.
             app.render_plan(REORDER_PLAN, None)
-            during = [str(table.get_row_at(i)[5]) for i in range(table.row_count)]
+            during = [str(table.get_row_at(i)[6]) for i in range(table.row_count)]
             await pilot.pause(1.4)
             return during
 
@@ -3025,24 +3027,25 @@ async def _drive_plan_fields() -> list[str]:
         app.render_plan(plan, None)
         table = app.query_one("#work")
         rows = [_cells(table, i) for i in range(table.row_count)]
-        # Wide: glyph ⚒ kind repo rank ref title who — the `kind` cell is what
-        # four panels used to say by being four panels (#589/#272).
-        if [r[2] for r in rows] != ["iss", "pr", "plan"]:
-            failures.append(f"PLAN: the kind cells read {[r[2] for r in rows]} — an "
+        # Wide: glyph ⚒ ▥ kind repo rank ref title who — the `kind` cell is what
+        # four panels used to say by being four panels (#589/#272), and the ▥ came
+        # in beside the verb with #250.
+        if [r[3] for r in rows] != ["iss", "pr", "plan"]:
+            failures.append(f"PLAN: the kind cells read {[r[3] for r in rows]} — an "
                             "item takes the kind of what it references, and one with "
                             "no ref at all is a line of plan and nothing else")
-        if [r[4] for r in rows] != ["1", "~2", "~3"]:
-            failures.append(f"PLAN: the rank cells read {[r[4] for r in rows]} — the "
+        if [r[5] for r in rows] != ["1", "~2", "~3"]:
+            failures.append(f"PLAN: the rank cells read {[r[5] for r in rows]} — the "
                             "human's order reaches the pane as row position alone, "
                             "with nothing saying which positions anybody chose")
-        if [r[5] for r in rows] != ["#394", "PR#397", ""]:
-            failures.append(f"PLAN: the ref cells read {[r[5] for r in rows]} — a PR "
+        if [r[6] for r in rows] != ["#394", "PR#397", ""]:
+            failures.append(f"PLAN: the ref cells read {[r[6] for r in rows]} — a PR "
                             "and an issue render the same, so nothing on the row says "
                             "why one ⚒ works and the other does not")
         if rows[0][0] != "◉":
             failures.append(f"PLAN: the board's own `next` is not marked: {rows[0]}")
-        if rows[2][7] != "⊘zeus/jasper-moss":
-            failures.append(f"PLAN: the who cell reads {rows[2][7]!r} — the machine or "
+        if rows[2][8] != "⊘zeus/jasper-moss":
+            failures.append(f"PLAN: the who cell reads {rows[2][8]!r} — the machine or "
                             "the wait is missing, and both are facts about the row")
         title = _text(app.query_one("#t_work"))
         for wanted in ("40 open", "1 running", "2 covered", "1 blocked", "4 stale",
@@ -3917,3 +3920,230 @@ def test_a_duration_that_would_overflow_is_answered_not_raised():
          "expiry": "99999999999999999999d", "repo": None}))
     assert human.set == []
     assert "not a duration" in said, said
+
+
+# ---- reading a row here instead of in a browser (#250) ----------------------
+#
+# NOTHING BELOW RUNS `gh-dash`, and the reason is a trap rather than a preference:
+# its detail view nil-derefs in `markdown.GetMarkdownRenderer` whenever the
+# terminal is not real — under tmux with no client attached, under `script -qec`,
+# and under a bare `pty.fork()` — so the whole program dies with `Caught panic:
+# invalid memory address`. A test that asserted on the sidebar by running it would
+# be red on every machine with nobody watching, which is all of them in CI. What
+# quarterback controls is the generated config and the `tmux split-window` it
+# invokes, so those are what these assert on. The sidebar itself was checked by
+# hand in a real pane of `seats-qb-dev`.
+
+#: One issue-backed plan item, and one line of plan that references nothing. The
+#: pair is the whole claim about the ▥: it is live where there is something to
+#: open and grey where there is not.
+READ_PLAN = {
+    "items": [
+        {"item_id": "a", "repo": "prisonblues/quarterback", "state": "open",
+         "title": "git and the board should work without a forge", "rank": 1,
+         "rank_source": "ordered", "ref": {"kind": "issue", "value": "327"},
+         "blocked_by": [], "claim": None},
+        {"item_id": "b", "repo": "prisonblues/quarterback", "state": "open",
+         "title": "a line of plan that is not an issue", "rank": 2,
+         "rank_source": "ordered", "ref": None, "blocked_by": [], "claim": None},
+    ],
+    "counts": {"open": 2}, "order_trust": {}, "next": None, "truncated": False,
+}
+
+
+async def _drive_read(click=None, key=None, installed=True, home=None, real_click=False):
+    """Render two plan rows, then reach the ▥ by mouse or by key.
+
+    `installed` answers the `PATH` scan for `gh-dash` — the dashboard asks it per
+    render, so a box without one is a rendering difference and not only a refusal.
+    """
+    app_module, app = _quiet_dash()
+    panes: list[tuple[str, str]] = []
+    app.run_in_pane = lambda name, command: panes.append((name, command))
+    opened: list[str] = []
+    app.open_url = lambda url: opened.append(url)
+
+    real_shutil = app_module.shutil
+    # The module's REFERENCE is swapped rather than the stdlib function patched, so
+    # nothing here can leak into a later test that expects a real `PATH` scan.
+    app_module.shutil = SimpleNamespace(
+        which=lambda name: f"/usr/bin/{name}" if installed else None)
+    if home is not None:
+        app_module.os.environ["XDG_RUNTIME_DIR"] = str(home)
+    try:
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.plan_sig = None
+            app.render_plan(READ_PLAN, None)
+            await pilot.pause(0.2)
+            table = app.query_one("#work")
+            await _settle_table(pilot, table)
+            rows = [_cells(table, i) for i in range(table.row_count)]
+            styles = [str(getattr(table.get_row_at(i)[app.READ_COLUMN], "style", ""))
+                      for i in range(table.row_count)]
+            if click is not None:
+                if real_click:
+                    # THROUGH THE COMPOSITOR, because "a button" is a claim about
+                    # what the mouse can reach and `dispatch_row` cannot make it:
+                    # a cell nothing renders would still dispatch perfectly.
+                    await _click_row_index(pilot, table, click, scroll=True,
+                                           column=app.READ_COLUMN)
+                else:
+                    app.dispatch_row(click, column=app.READ_COLUMN)
+                await pilot.pause(0.2)
+            if key is not None:
+                table.move_cursor(row=0, animate=False)
+                await pilot.pause(0.1)
+                await pilot.press(key)
+                await pilot.pause(0.2)
+            return rows, styles, panes, opened, app.detail_text
+    finally:
+        app_module.shutil = real_shutil
+        if home is not None:
+            app_module.os.environ.pop("XDG_RUNTIME_DIR", None)
+
+
+def test_the_read_icon_sits_beside_the_verb_and_greys_with_nothing_to_open():
+    """A column of its own, next to the verb rather than past the title.
+
+    The issue weighed this against taking the row click over, and a column is what
+    it cost: a fifth glyph to learn, and a character of width in a pane that is
+    sometimes 45 wide. Beside the verb because that is where the habit already
+    points — "the action icons are at the front of the row" stays one thing to
+    learn rather than becoming two.
+    """
+    rows, styles, panes, _, _ = asyncio.run(_drive_read())
+    assert [r[_load_app().Dash.READ_COLUMN] for r in rows] == ["▥", "▥"], rows
+    # Live on the issue-backed item, grey on the line of plan that references
+    # nothing — the same "grey means not offered" the ⚒ and the ⚖ keep.
+    assert "green" in styles[0], styles
+    assert "grey30" in styles[1], styles
+    assert not panes, "rendering the icon started something"
+
+
+def test_the_read_icon_opens_gh_dash_in_the_seat_row_pinned_to_that_row(tmp_path):
+    """The pane, the config, and the one row in it.
+
+    `run_in_pane` is the same call the ⚖ makes and is reused rather than copied —
+    it splits the SEAT ROW, marks the pane `@qb_label` and not `@qb_seat`, and
+    re-equalises with `select-layout -E`, all of which has its own test above. What
+    is new here is what gets run in it.
+    """
+    rows, _, panes, opened, detail = asyncio.run(
+        _drive_read(click="plan:a", home=tmp_path, real_click=True))
+    assert len(panes) == 1, panes
+    name, command = panes[0]
+    assert name == "issue-327", name
+    assert command.startswith("gh-dash --config "), command
+    assert not opened, "the button that exists to stay in the terminal opened a browser"
+
+    path = command.split("--config ", 1)[1].strip("'")
+    assert path.startswith(str(tmp_path)), path
+    text = Path(path).read_text()
+    assert "prSections: []" in text
+    assert 'in:title "git and the board should work without a forge"' in text
+    # The sidebar is the whole reason this beats the table row already on screen.
+    assert "open: true" in text
+
+
+def test_a_second_click_on_the_same_row_rewrites_one_config(tmp_path):
+    """Named for the ITEM, so a morning of clicking one PR leaves one file. `/tmp`
+    is the fallback when `$XDG_RUNTIME_DIR` is unset and is not cleared at logout,
+    so the accumulating version would be permanent on exactly the machines that
+    can least afford it."""
+    asyncio.run(_drive_read(click="plan:a", home=tmp_path))
+    asyncio.run(_drive_read(click="plan:a", home=tmp_path))
+    assert [p.name for p in (tmp_path / "qb-dash").iterdir()] == \
+        ["issue-prisonblues-quarterback-327.yml"]
+
+
+def test_with_no_gh_dash_installed_the_column_greys_and_the_click_says_why():
+    """Degrade, do not guard — and SAY it, which is the one place this table breaks
+    its own falls-through-and-explains rule.
+
+    Everywhere else a dim icon means "no verb here" and the row's own explanation
+    is the better answer. Here one of the two reasons is a missing binary, a fact
+    about the machine that nothing else on this dashboard reports, so a click that
+    quietly explained the row would leave a reader pressing a button they have no
+    way to discover is unbuilt.
+    """
+    rows, styles, panes, opened, detail = asyncio.run(
+        _drive_read(click="plan:a", installed=False))
+    assert [r[_load_app().Dash.READ_COLUMN] for r in rows] == ["▥", "▥"], rows
+    assert all("grey30" in s for s in styles), styles
+    assert not panes and not opened
+    assert "gh-dash is not installed" in detail, detail
+    # …and where to go instead, because the browser has not gone anywhere.
+    assert "`o`" in detail, detail
+
+
+def test_a_row_with_nothing_to_open_says_that_rather_than_doing_nothing():
+    """A dim icon that swallows the click is indistinguishable from a broken one —
+    the rule `fix_plan_item` already keeps for the ⚒."""
+    _, _, panes, _, detail = asyncio.run(_drive_read(click="plan:b"))
+    assert not panes
+    assert "nothing to open here" in detail, detail
+    assert "a line of plan that is not an issue" in detail, detail
+
+
+def test_the_row_click_and_o_are_unchanged_by_the_new_button():
+    """The issue settled this: a new icon, and the row click keeps what it did.
+
+    `o` and the rest of the row are what a reader already has in their fingers,
+    and a button that quietly redefined them would be a second change nobody asked
+    for — the reason the alternative (row click → gh-dash, browser demoted to `o`)
+    was not taken.
+    """
+    async def drive():
+        app_module, app = _quiet_dash()
+        opened, panes = [], []
+        app.open_url = lambda url: opened.append(url)
+        app.run_in_pane = lambda name, command: panes.append(name)
+        async with app.run_test(size=(110, 46)) as pilot:
+            app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                                 agent="host")
+            app.plan_sig = None
+            app.render_plan(READ_PLAN, None)
+            await pilot.pause(0.2)
+            table = app.query_one("#work")
+            await _settle_table(pilot, table)
+            # Anywhere but the two icon columns: the row explains itself.
+            app.dispatch_row("plan:a", column=99)
+            explained = app.detail_text
+            table.move_cursor(row=0, animate=False)
+            await pilot.pause(0.1)
+            await pilot.press("o")
+            await pilot.pause(0.2)
+            return explained, opened, panes
+
+    explained, opened, panes = asyncio.run(drive())
+    assert "rank 1" in explained, explained
+    assert opened == ["https://github.com/prisonblues/quarterback/issues/327"], opened
+    assert not panes, "`o` stopped opening a browser"
+
+
+def test_v_does_from_the_keyboard_what_the_icon_does_from_the_mouse():
+    """Every other verb on this table has a key — `o`, `p`, `f` — and a button
+    reachable only by mouse would be the one that does not."""
+    _, _, panes, _, _ = asyncio.run(_drive_read(key="v"))
+    assert [n for n, _ in panes] == ["issue-327"], panes
+
+
+def test_both_lines_that_enumerate_the_clicks_name_the_new_one():
+    """The hint under the tables and `?` are the only two places a reader is told
+    what an icon does, and a fifth glyph that appears in neither is a glyph nobody
+    finds. They are asserted together because they have drifted apart before.
+    """
+    async def drive():
+        app_module, app = _quiet_dash()
+        async with app.run_test(size=(110, 46)) as pilot:
+            hint = _text(app.query_one("#detail"))
+            app.action_help()
+            await pilot.pause(0.1)
+            return hint, app.detail_text
+
+    hint, keys = asyncio.run(drive())
+    assert "▥" in hint, hint
+    assert "▥" in keys, keys
+    assert "v " in keys and "read it here" in keys, keys
