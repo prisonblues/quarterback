@@ -875,13 +875,14 @@ def host_attrs(flake: Path) -> list[str]:
 def resolve_attr(flake: Path, attr_arg: str | None, cfg: dict[str, str]) -> tuple[str, str]:
     """``(attr, "")`` or ``("", why-not)`` — which system output is this machine.
 
-    **The attribute is not the hostname**, and assuming it is fails silently in
-    the worst possible way: this fleet's `zeus` is `nixosConfigurations.desktop`,
-    so a tool that built `#zeus` would report "no such output" on the one machine
-    it was written for, and a tool that built the wrong host's `#hermes` would
-    hand a person a command that switches their desktop to a laptop's config. So
-    the hostname is only a first guess, checked against the flake's own names, and
-    the fallback is to ask each configuration what hostname it declares.
+    **The attribute need not be the hostname**, and assuming it is fails silently
+    in the worst possible way on a fleet where they differ: a tool that built
+    `#zeus` against a flake whose output is `desktop` would report "no such
+    output", and a tool that guessed the wrong host's `#hermes` would hand a
+    person a command that switches their desktop to a laptop's config. So the
+    hostname is only a first guess, checked against the flake's own names — where
+    it hits, as it does on this fleet, nothing is evaluated at all — and the
+    fallback is to ask each configuration what hostname it declares.
 
     That fallback evaluates configurations, which is slow and can fail — an
     installer image or a VM variant may not evaluate on this machine at all. A
