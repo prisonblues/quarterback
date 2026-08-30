@@ -4205,11 +4205,12 @@ work. Two genuinely different flakes still refuse, by name: picking the first wo
 a bump against a directory nobody rebuilds from, which looks exactly like a good proposal
 and does nothing at all.
 
-**The system attribute is not the hostname.** This fleet's `zeus` is
-`nixosConfigurations.desktop`. So the hostname is a first guess checked against the flake's
-own attribute names, and the fallback is to ask each configuration what `networking.hostName`
-it declares — correct, slow, and defeated by a host that does not evaluate here at all, which
-is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
+**The system attribute is not necessarily the hostname.** It is on this fleet — `zeus` is
+`nixosConfigurations.zeus` — and on a fleet like that nothing below ever runs. But it is not a
+rule, so the hostname is a first guess checked against the flake's own attribute names, and the
+fallback is to ask each configuration what `networking.hostName` it declares — correct, slow,
+and defeated by a host that does not evaluate here at all, which is what `--host` and
+`programs.quarterback-harness.consumer.attr` are for.
 
 #### What `--apply` refuses, and why each one
 

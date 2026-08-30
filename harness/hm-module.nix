@@ -416,10 +416,12 @@ in
           The `nixosConfigurations` attribute that IS this machine, when it is not
           simply the hostname. Emitted as `QUARTERBACK_CONSUMER_ATTR`.
 
-          Worth setting wherever the two differ — this fleet's `zeus` is
-          `nixosConfigurations.desktop` — because the fallback is to evaluate each
-          configuration in turn asking what hostname it declares, which is correct,
-          slow, and can be defeated by a host that does not evaluate here at all.
+          Worth setting wherever the two differ, and only there. `qb-bump` uses an
+          attribute NAMED AFTER this host without evaluating anything, so a fleet whose
+          outputs are its hostnames needs nothing here. The fallback it falls back TO —
+          evaluating each configuration in turn asking what hostname it declares — runs
+          only when no attribute carries this host's name, and it is correct, slow, and
+          defeatable by a host that does not evaluate here at all.
         '';
       };
 
