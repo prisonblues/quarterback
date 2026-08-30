@@ -3132,6 +3132,15 @@ async def _drive_a_watched_repos_pr() -> list[str]:
     app.run_in_pane = lambda name, command: started.append((name, command))
     app.run_in_window = lambda name, command: started.append((name, command))
 
+    # AND THE BROWSER, which is the other thing a click on this row can reach.
+    # A dim ⚖ falls through to "say what the row is", and for a PR row that is
+    # `open_pr` — so an unstubbed `open_url` here spends every run of this suite
+    # on a real `xdg-open` of another repo's PR. That tab is the test's own
+    # doing, and once the fleet ran this suite in parallel worktrees it arrived
+    # on a person's screen every few minutes with nothing to say why.
+    opened: list[str] = []
+    app.open_url = lambda url: opened.append(url)
+
     failures: list[str] = []
     async with app.run_test(size=(100, 44)):
         app.render_prs(_TWO_REPOS_PRS, None)
@@ -3139,6 +3148,7 @@ async def _drive_a_watched_repos_pr() -> list[str]:
             row = app.rows[str(rk.value)]
             named = f"{row['repo']}{row['ref']}"
             started.clear()
+            opened.clear()
             app.detail_text = ""
             app.dispatch_row(str(rk.value), column=app_module.Dash.VERB_COLUMN)
             if row["repo"] == app.repo_slug:
@@ -3150,10 +3160,14 @@ async def _drive_a_watched_repos_pr() -> list[str]:
                 failures.append(
                     f"⚖ on {named} launched {started[0][1]!r} — a paid review, in "
                     f"{app.repo_slug}, of whatever wears that number there")
-            elif row["repo"] not in app.detail_text:
+            elif not (row["repo"] in app.detail_text
+                      or any(row["repo"] in url for url in opened)):
+                # EITHER answer is the icon not swallowing the click: the row
+                # explains itself in the detail line, or it opens the PR it names.
                 failures.append(
-                    f"⚖ on {named} refused but said {app.detail_text!r} — a dim icon "
-                    "that swallows the click is indistinguishable from a broken one")
+                    f"⚖ on {named} refused but said {app.detail_text!r} and opened "
+                    f"{opened!r} — a dim icon that swallows the click is "
+                    "indistinguishable from a broken one")
     return failures
 
 
