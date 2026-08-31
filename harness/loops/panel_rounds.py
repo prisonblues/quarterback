@@ -1198,6 +1198,33 @@ class RoundTrend:
     #: itself sends null: "raised by no earlier round" is vacuous when there was no
     #: earlier round.
     new_findings: int | None = None
+    #
+    # #618's three columns, APPENDED for the reason `new_findings` was: dataclass
+    # field order is a constructor signature, and every positional `RoundTrend(round,
+    # reviewed, findings, p1p2, introduced, pr_chars)` in this repo's suites would
+    # silently re-bind columns if a field were inserted among them.
+    #: What the fix pass BEFORE this round wrote, split by whether anything can check
+    #: it — :func:`panel_seats.referee_split`'s three buckets, read back out of the
+    #: payload's ``round_stop.unrefereed_fix``.
+    #:
+    #: The block already printed `introduced` — how many of a round's findings the last
+    #: pass authored — and said nothing about what that pass DID. A pass that wrote 330
+    #: test lines and a pass that wrote 330 production lines are not the same event,
+    #: and until #618 the table rendered them identically: on lexray#1780 the fix
+    #: passes after round 1 wrote 1,313 lines of which 848 were test and doc, and the
+    #: trend block a reader checks for the shape of a cycle could not show it.
+    #:
+    #: None, never 0, wherever there was no pass to read: round 1, a round whose fix
+    #: range was unreadable, a round that reviewed nothing, and a payload written
+    #: before #554 recorded the split. `0 production lines` read off any of those is
+    #: the same fabrication `introduced` withholds a zero to avoid — and it is the
+    #: flattering direction, since it reads as a pass that wrote nothing.
+    production: int | None = None
+    #: The test half of that split. See :attr:`production`.
+    test: int | None = None
+    #: The prose half — comments, docstrings, documentation paths. See
+    #: :attr:`production`.
+    prose: int | None = None
 
 
 def attributed(counts: object) -> bool:
@@ -1308,6 +1335,43 @@ def _countable(payload: dict) -> list[dict] | None:
     return raised
 
 
+def _pass_churn(payload: dict) -> dict:
+    """What the fix pass before a round wrote, as `{kind: count-or-None}` (#618).
+
+    Read back out of the payload's own ``round_stop.unrefereed_fix`` — #554's block,
+    recorded on every round since it landed — rather than re-derived. The trend block's
+    standing rule: this round's row and the same round's row one round later have to be
+    the same numbers, and the only way to guarantee that is to read the number the
+    round itself published.
+
+    **``churn`` is the presence test and the three buckets are not.** A pass that
+    genuinely wrote nothing and a round that had no pass to read both record zeros in
+    every bucket, and the payload distinguishes them nowhere else — which is exactly
+    why `panel.py`'s own report line gates on ``churn`` before printing the split. So a
+    zero total is read as "not measured" here too, and every cell is withheld. The cost
+    is a real empty fix range rendering as unknown; the alternative is printing `0
+    production` for round 1, which is a claim about a fix pass that did not exist.
+
+    Tolerant of everything, on :func:`load_baseline`'s standing rule that a bad payload
+    costs a cell and never the review — and it degrades to None rather than to a
+    number, because every wrong number this block can print reads as convergence."""
+    stop = payload.get("round_stop")
+    return churn_cells((stop or {}).get("unrefereed_fix")
+                       if isinstance(stop, dict) else None)
+
+
+def churn_cells(split: dict | None) -> dict:
+    """One :func:`referee_state` mapping as the trend block's three cells (#618).
+
+    Split out of :func:`_pass_churn` because the CURRENT round does not have a payload
+    to read — it has the state it is about to write one from — and the two must apply
+    one rule. A round's own row and the same round's row one round later disagreeing
+    about what its fix pass wrote is the failure this whole block exists to prevent."""
+    if not isinstance(split, dict) or not _nonneg_int(split.get("churn")):
+        return {kind: None for kind in panel_seats.REFEREE_KINDS}
+    return {kind: _nonneg_int(split.get(kind)) for kind in panel_seats.REFEREE_KINDS}
+
+
 def _trend_row(was: int, payload: dict) -> RoundTrend:
     """Read one accepted baseline as a :class:`RoundTrend` row.
 
@@ -1368,7 +1432,13 @@ def _trend_row(was: int, payload: dict) -> RoundTrend:
         # refused round records the size of a PR it then did not review — and a
         # growth ratio computed from a round nobody read is a measurement of
         # nothing. `first_reviewed` beside it takes the same view (#298).
-        pr_chars=_whole_pr_chars(payload) if reviewed else None)
+        pr_chars=_whole_pr_chars(payload) if reviewed else None,
+        # #618's split, gated on `reviewed` for the reason every cell above is: a
+        # skipped round has no fix pass in front of it that anybody read, and three
+        # zeros there would say a pass wrote nothing when what happened is that
+        # nothing was looked at.
+        **(_pass_churn(payload) if reviewed
+           else {kind: None for kind in panel_seats.REFEREE_KINDS}))
 
 
 @dataclass
@@ -3473,6 +3543,59 @@ def unrefereed_fix_brake(panel: dict, notes: list[str]) -> bool:
     return False                                      # unreachable
 
 
+def guard_lines_brake(panel: dict, notes: list[str]) -> bool:
+    """`review_panel.escalate_on.guard_lines` (#618) — does a fix pass that wrote
+    more guard lines than `max_fix_guard_lines` allows END the cycle, or is the
+    crossing only reported?
+
+    Read per KEY through the same fallback its four siblings use and for the identical
+    reason: `review_panel` merges one level deep, so a repo writing `escalate_on` at
+    all replaces the default object wholesale.
+
+    **A flag whose threshold lives one key away**, which is `escalate_on.unrefereed_fix`
+    over :data:`panel_seats.UNREFEREED_MIN_CHURN` exactly. The number and the verdict
+    are separable decisions and #67 is the reason they have to be here: an instrument
+    earns a gate over a few dozen cycles or not at all, and this one has ONE — the five
+    rounds of lexray#1780. So a repo that writes a ceiling gets it measured and
+    reported, and has to say so a second time before a round ends on it. Writing the
+    threshold here as well would be one number in two files with two chances to
+    disagree.
+
+    **Off by default, and the asymmetry with `unrefereed_fix` is the whole argument.**
+    That rung is a PREDICATE — zero refereed lines — and a predicate has nothing to
+    calibrate, which is what made it shippable as a gate on one cycle's evidence. This
+    is a THRESHOLD, so the same evidence buys the weaker action only. `max_fix_growth`
+    ends a cycle on #188 and #236; this has one PR, and the dial is what keeps the
+    stronger reading one flag away rather than a release away.
+
+    ``false`` is a second spelling of ``null`` and is honoured as one; ``true`` is the
+    only other value, and anything else is a hard exit through
+    :func:`panel_seats._refuse_value` — the line every dial in this file draws between
+    an unknown key and a malformed value of a known one."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — `run()` calls
+        # that one first — but this function is public and is called directly by
+        # tests, so it does not rely on a sibling having been called before it.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return False                                  # unreachable
+    want = rules.get("guard_lines", ESCALATE_ON_DEFAULTS.get("guard_lines"))
+    if want is None or want is False or want == "":
+        return False
+    if want is True:
+        return True
+    _refuse_value("escalate_on.guard_lines", want,
+                  "true to end a cycle whose fix pass churned more guard lines than "
+                  "`max_fix_guard_lines` allows, or false/null to report the crossing "
+                  "and go on. The threshold is that key and is not written here")
+    return False                                      # unreachable
+
+
 def referee_state(split: dict | None, armed: bool) -> dict:
     """#554's measurement as this round read it, for `round_stop` and the payload.
 
@@ -3519,6 +3642,61 @@ def referee_state(split: dict | None, armed: bool) -> dict:
             "unrefereed": unrefereed,
             "share": round(unrefereed / churn, 4) if churn else None,
             "min_churn": panel_seats.UNREFEREED_MIN_CHURN, "over": over}
+
+
+def guard_churn_state(referee: dict | None, limit: int | None, armed: bool) -> dict:
+    """#618's measurement as this round read it, for `round_stop` and the payload.
+
+    ``referee`` is :func:`referee_state`'s own output and nothing else — the churn of
+    the pass that landed between the last round and this one, already classified. This
+    reads the SAME object rather than re-splitting the diff, on the rule every count in
+    this file follows: two derivations of one quantity are two things that can
+    disagree, and the report prints both numbers next to each other.
+
+    ``lines`` is `test + prose`, which is #554's `unrefereed` bucket. That is not a
+    coincidence and it is worth saying why the two features share a numerator: the
+    lines with no referee and the lines that are guard rather than guarded are the same
+    lines, so a second definition here would let a repo's budget (`unrefereed_line_weight`
+    prices exactly this bucket) and its ceiling count different things.
+
+    **It is a ceiling on the PASS and it does not bank.** ``referee`` is one round's fix
+    range; nothing earlier is in it, and nothing carries forward. A quiet round
+    therefore cannot fund a loud one, which is the case the ceiling exists for and the
+    thing a cumulative reading gets wrong — on lexray#1780 `guard_ratio` fell every
+    round of a five-round runaway because the runaway moved both halves of the
+    proportion together.
+
+    ``over`` is a property of the MEASUREMENT and takes no notice of ``armed``, on
+    :func:`injection_state`'s split rather than :func:`referee_state`'s: the whole point
+    of shipping this uncalibrated is that a repo may set a ceiling to WATCH it, and a
+    round that crossed a watched ceiling must record that it did. ``armed`` says
+    whether the crossing may also end the cycle, and `round_stop` publishes ``fired``
+    beside both.
+
+    Every field is present on every round, its three siblings' rule. ``limit: None`` is
+    the honest reading of "nothing was being checked", and it is the shipped one.
+
+    **``lines`` IS ``None`` WHERE NOBODY READ THE PASS, AND MUST NEVER BE A ZERO**
+    (found by a codex second opinion, which was right that the first draft had this
+    backwards). Round 1 has no pass to read and a rewritten branch has no readable
+    range, and a `0` published for either says a fix pass wrote no guard line when what
+    happened is that nothing was looked at — :func:`fix_surface_state`'s rule, and it
+    is the FLATTERING direction here, since "wrote nothing" is the strongest possible
+    version of the very claim this ceiling exists to make. The VERDICT was safe either
+    way — ``over: False``, the #500 posture its two neighbours take, so a round that
+    could not see the pass never ends a cycle on it — but the number a human reads was
+    not.
+
+    The presence test is ``churn``, on :func:`churn_cells`' terms and with its one
+    accepted conflation: a pass that genuinely churned nothing records zeros in every
+    bucket and is indistinguishable in this payload from a round that read no range.
+    That costs an empty fix range a printed `0` and buys never printing one for round
+    1."""
+    referee = referee or {}
+    lines = (int(referee.get("unrefereed") or 0)
+             if _nonneg_int(referee.get("churn")) else None)
+    return {"limit": limit, "lines": lines, "armed": bool(armed),
+            "over": bool(limit is not None and lines is not None and lines > limit)}
 
 
 def fix_surface_state(surface: object) -> dict | None:
@@ -4130,6 +4308,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                revert: dict | None = None,
                not_falling: dict | None = None,
                unrefereed: dict | None = None,
+               guard_churn: dict | None = None,
                surface: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
@@ -4651,6 +4830,42 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     line saying exactly why, never a merge and never a review that reads cleaner than
     it is; and ``escalate_on.unrefereed_fix: false`` switches it off in one line.
 
+    ``guard_churn`` is #618, and it is the SIXTH bound here — the only one measured per
+    FIX PASS rather than per PR, and the only one whose threshold ships unset.
+
+    **What it measures, and why the obvious statistic could not.** The panel already
+    reports `guard_ratio`: test and doc lines over source lines, cumulative over the
+    whole PR. On lexray#1780 that ratio read 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 across
+    five rounds in which source went 476 -> 941 and test went 883 -> 1,632. **It fell
+    monotonically through the runaway it was watching**, because a proportion cannot
+    tell "this change is well guarded" from "this change and its guards are both running
+    away" — the runaway moves numerator and denominator together. A ceiling on it would
+    have fired on none of those five rounds and would fire at round 1 on a heavily
+    guarded PR that never churned: wrong in both directions.
+
+    The per-pass DELTA is the quantity that can see the event. Rounds 2-5 wrote 380, 205,
+    205 and 58 lines of test and prose against 177, 116, 114 and 58 of production, and
+    that is a shape. :func:`guard_churn_state` reads it off ``unrefereed``'s own split,
+    so the ceiling and #554's budget weight count the same lines.
+
+    **It does not bank.** Each round's measurement is its own fix range and nothing
+    earlier. A quiet round cannot fund a loud one, which is the case a ceiling on a pass
+    exists for and the case a cumulative reading gets wrong.
+
+    **It ships UNCALIBRATED, and that is the answer rather than a placeholder.**
+    `max_fix_guard_lines` defaults to ``None``. The evidence is one cycle; a threshold
+    drawn between its quiet round's 58 lines and its loud round's 380 would be a number
+    chosen to fit one PR, which #67 forbids. So the count is taken and published every
+    round and nothing fires until a repo writes a number. `escalate_on.guard_lines` is
+    then a SECOND thing to write before a round can end on it, defaulting to false: a set
+    ceiling is watched, an armed one stops. That split is the whole design — the weaker
+    action first, the stronger one a flag away rather than baked in.
+
+    **The same two bounds as ``injection``, ``not_falling`` and ``unrefereed``**, and
+    deliberately NOT ``max_fix_growth``'s: that ceiling is applied by the caller and
+    forces a stop unconditionally, on years of measurement. This one may only turn a ``go
+    again`` into a STOP, and only the round rule 1 was buying.
+
     ``surface`` is #619, and it is the second argument to this function that decides
     nothing — reported, never gated. It is the set of files the last fix pass touched
     that no earlier round had read, measured in `panel.py` and arriving on a fixed
@@ -5124,6 +5339,37 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"`escalate_on.new_findings_not_falling` limit of {flattening['limit']} — "
             "the count is not coming down, and a human triages what is left rather "
             "than another fix pass")
+    # #618's rung, applied BETWEEN #505's and #554's, on the chain's ordering rule that
+    # the more specific truth wins the `reason`. `flat` says only that the work is not
+    # shrinking; this says HOW MUCH guard work the last pass wrote; `unchecked` says the
+    # pass wrote no refereed line at all, which is the sharper claim about the same
+    # quantity and takes the reason from it; `injected` names that pass as the author of
+    # this round's findings.
+    #
+    # **Two conditions the four rungs beside it do not have, and both are #67.** The
+    # ceiling has to be SET — it ships `None`, because one cycle is not a calibration —
+    # and `escalate_on.guard_lines` has to be ARMED, because a repo may reasonably set a
+    # ceiling to watch it. `over` is recorded either way (`guard_churn_state` keeps the
+    # measurement apart from the arming for `referee_state`'s reason), so a round that
+    # crossed a watched ceiling says so in the payload and in the report without ending
+    # anything.
+    #
+    # `going_again` carries the same two bounds its siblings take: `not stop` is the
+    # guarantee that it can only make a `go again` into a STOP, and the rest of it keeps
+    # the rule inside its own justification — the argument is about rule 1's input, so it
+    # may not cancel the repair round for a P1 an earlier round raised and this fix pass
+    # did not clear. That is a deliberate difference from `max_fix_growth`, which the
+    # CALLER applies unbounded: that ceiling has years of measurement behind it and this
+    # one has a single PR, so it takes the narrower of the two available shapes.
+    guarding = (guard_churn_state(None, None, False) if guard_churn is None
+                else guard_churn)
+    overguarded = bool(guarding["over"] and guarding["armed"] and going_again)
+    if overguarded:
+        stop, reason = True, (
+            f"the fix pass before this round churned {guarding['lines']} line(s) of "
+            f"test and prose, past the `max_fix_guard_lines` ceiling of "
+            f"{guarding['limit']} — that is guard work this round would be reviewing "
+            "instead of the change, and a human decides what of it was wanted")
     # #554, applied BETWEEN #505's rung and #489's so that the ordering matches what
     # each one knows. `flat` says only that the work is not shrinking; this says what
     # KIND of work the last pass did; `injected` names that pass as the author of this
@@ -5219,6 +5465,24 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "and not from provenance, so unlike `fix_injection` a rebase "
                        "between rounds cannot have disarmed it (#500): this stop is "
                        "that count, not convergence (#505)"]
+    # #618, and BEFORE #554's line for the reason its stop is applied first: a reader
+    # coming down the veto list meets how much the pass wrote, then what kind of work it
+    # was, then what it cost. Unconditional for `injected`'s reason — `overguarded` is
+    # only ever true on a round this rule itself stopped, so there is no `go again` round
+    # it can fire on.
+    #
+    # It says the ceiling is UNCALIBRATED out loud. Every other veto here rests on a
+    # number with a measurement behind it, and a reader deciding what to do about this
+    # stop needs to know that this one rests on a number their own repo wrote — which is
+    # also the honest reading of #67 on the one rung that could not satisfy it.
+    if overguarded:
+        veto = [*veto, f"the fix pass before this round churned {guarding['lines']} "
+                       "line(s) of test and prose — past the `max_fix_guard_lines` "
+                       f"ceiling of {guarding['limit']}, counted over THAT PASS and "
+                       "nothing earlier, so a quiet round cannot have funded it. The "
+                       "ceiling is a number this repo wrote and not one anybody has "
+                       "calibrated (#67): the shipped value is null, and this stop is "
+                       "that count against that number, not convergence (#618)"]
     # #554, and BEFORE #489's line for the reason its stop is applied first: a reader
     # coming down the veto list meets what the pass WAS, then the attribution saying
     # what it cost. Unconditional for `injected`'s reason — `unchecked` is only ever
@@ -5574,6 +5838,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT.
         "unrefereed_fix": {**refereeing, "fired": unchecked},
+        # #618's measurement, ALWAYS present for the reason its siblings are: a payload
+        # with no key and a round that measured no guard churn are different claims.
+        # `limit` is null on every repo that has not written one, which is every repo
+        # today, and that is the field a consumer reads to tell "under the ceiling" from
+        # "there was no ceiling". `over` is the measurement and `armed` is the policy,
+        # kept apart on `referee_state`'s terms; `fired` is the verdict, kept apart from
+        # both on `fix_injection`'s.
+        "guard_churn": {**guarding, "fired": overguarded},
         # #619's measurement, and the ONE block here whose key can be null: the files
         # the last fix pass touched that no earlier round had read. Reported and not
         # gated — #67's instrument-before-gate rule, and the gate has not been decided
@@ -5655,6 +5927,7 @@ __all__ = [
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
     "unrefereed_fix_brake", "referee_state", "fix_surface_state",
+    "guard_lines_brake", "guard_churn_state", "_pass_churn", "churn_cells",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

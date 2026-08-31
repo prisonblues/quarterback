@@ -63,8 +63,8 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The eleven, and where each one's default is written twice. `skip_title_patterns` and
-#: the rest of the block are not dials and are not listed.
+#: The thirteen, and where each one's default is written twice. `skip_title_patterns`
+#: and the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
     "file_deferral_issues": "DEFAULT_FILE_DEFERRAL_ISSUES",
@@ -74,6 +74,7 @@ DIALS = {
     "unrefereed_line_weight": "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "max_fix_guard_lines": "DEFAULT_MAX_FIX_GUARD_LINES",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
     "next_door_days": "DEFAULT_NEXT_DOOR_DAYS",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",

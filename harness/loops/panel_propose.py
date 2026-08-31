@@ -87,7 +87,15 @@ from collections.abc import Iterable   # noqa: E402
 #: asking again would buy a second copy. The growth ceiling (#165's
 #: `max_fix_growth`) is a stop about the SIZE of the change and not about the
 #: findings, and a seat's smallest change is not an answer to it.
-PROPOSE_ESCALATIONS = ("new_findings_not_falling", "unrefereed_fix",
+#: #618's `guard_lines` joins on the same rule, and it is the rung where the question
+#: is most nearly the answer. It fires because the last fix pass wrote more test and
+#: prose than the repo's ceiling allows — a fixer writing MORE than the findings asked
+#: for — and what this pass asks each seat is precisely "what is the SMALLEST change
+#: that resolves your findings". The growth ceiling is still absent for the reason
+#: below; the difference is that `max_fix_growth` is not an `escalate_on` rung at all
+#: and measures the whole PR, while this one measures the pass that answered these
+#: seats' findings and can be put back to them.
+PROPOSE_ESCALATIONS = ("new_findings_not_falling", "guard_lines", "unrefereed_fix",
                        "fix_injection", "premise_repeated", "premise_undecidable")
 
 
@@ -130,6 +138,14 @@ def escalations_fired(stop: dict | None) -> list[str]:
     # never reach `fired` and is never billed for the fan-out.
     if (stop.get("unrefereed_fix") or {}).get("fired"):
         fired.append("unrefereed_fix")
+    # #618, read on `fired` for the same reason — and off `guard_churn`, which is the
+    # MEASUREMENT's key while `guard_lines` is the DIAL's. The two names are deliberate:
+    # the payload block records a count that every round takes, and the rung is the
+    # question of whether that count may end a cycle. Its `armed` flag needs no separate
+    # check for `unrefereed_fix`'s reason — it is already a conjunct of `fired`, so a
+    # repo that only WATCHES a ceiling is never billed for the fan-out.
+    if (stop.get("guard_churn") or {}).get("fired"):
+        fired.append("guard_lines")
     if (stop.get("fix_injection") or {}).get("fired"):
         fired.append("fix_injection")
     premises = stop.get("premises") or {}

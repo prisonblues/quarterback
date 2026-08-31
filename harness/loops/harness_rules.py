@@ -1010,6 +1010,56 @@ DEFAULTS: dict = {
         # nulls, two independent answers, and either one settable from the board on its
         # own.
         "max_fix_growth_chars": 30_000,
+        # The GUARD half of that same ceiling, and the one dial here measured PER FIX
+        # PASS rather than per PR (#618). Test and prose lines ONE pass may churn.
+        #
+        # **The measurement, and it is the whole argument for the shape.** On
+        # lexray#1780 the five rounds of one cycle recorded a `guard_ratio` of
+        # 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 while source went 476 -> 941 and test
+        # went 883 -> 1,632 — both halves nearly doubled and THE RATIO FELL EVERY
+        # ROUND. A cumulative proportion cannot see a runaway, because the runaway
+        # moves its numerator and its denominator together. A `max_guard_ratio` would
+        # have fired on none of those five rounds, and would fire at round 1 on a PR
+        # heavily guarded from the outset that never churned at all: wrong in both
+        # directions, which is why there is no such key and there is not going to be
+        # one (see `escalate_on` below, where that decision is recorded in full).
+        #
+        # The per-round DELTA is the quantity that can see it. Rounds 2-5 wrote 380,
+        # 205, 205 and 58 lines of test and prose, against 177, 116, 114 and 58 lines
+        # of production code. That is a shape — a pass whose guard churn is three
+        # times its production churn, then twice, then level — and the cumulative
+        # ratio renders all four of them as a number quietly going down.
+        #
+        # **A ceiling on the PASS, not on the PR, and it does not BANK.** Each round
+        # reads the churn of its own fix range and nothing earlier, so a quiet round
+        # cannot fund a loud one — which is precisely the case the ceiling is for.
+        # That also makes it the same mechanical count `low_severity_fix_lines` is:
+        # `panel_seats.referee_split` over the fix range's own diff, never a forecast
+        # and never the fixer's judgement about its own work.
+        #
+        # **`None`, AND THAT IS THE HONEST ANSWER RATHER THAN A PLACEHOLDER.** The
+        # only cycle anyone has measured is the one above. Its quiet round wrote 58
+        # guard lines and its loud one 380, and a threshold drawn anywhere between
+        # them is a number chosen to fit one PR with its argument written afterwards —
+        # exactly the ceiling #67 says an instrument has to earn over a few dozen
+        # cycles first. So this ships UNSET: `round_stop` records the count every
+        # round, the round table prints it beside `introduced`, and nothing fires
+        # until somebody writes a number they can defend. Set it and the crossing is
+        # REPORTED; arm `escalate_on.guard_lines` as well and it ends the cycle.
+        #
+        # **It wakes nothing.** `budget.tokens_per_pr` was reverted to `null` on
+        # 2026-08-31 because `panel_caps.Budget.dormant` holds only while EVERY
+        # ceiling is None, so setting one woke a board call for every repo on the
+        # fleet. There is no such coupling here: the split this reads is computed on
+        # every round already (#554's `referee_state`), a repo that leaves this null
+        # runs exactly the round it ran before, and a repo that sets it makes no call
+        # anywhere. That was checked rather than assumed.
+        #
+        # `0` is refused, on `max_fix_growth_chars`' rule: a pass may not write zero
+        # test lines and still be a fix, so a ceiling of nothing would fire on every
+        # healthy pass carrying a regression test, and `null` is already the spelling
+        # for "do not check this".
+        "max_fix_guard_lines": None,
         # What a reviewer is asked to look FOR. `diff` asks for defects in the
         # change under review, and surfaces anything outside it as an observation
         # rather than as a finding a fix round must clear. `repo` is today's
@@ -1387,6 +1437,18 @@ DEFAULTS: dict = {
         # block that can stop a cycle rests on a fact rather than on a proportion, and
         # the rung below is the clearest case of it.
         #
+        # **WHAT DID COME OUT OF #618 IS A DELTA, AND IT IS NOT THIS RATIO — Rich's
+        # decision of 2026-08-31, which supersedes the "report-only forever" reading
+        # of the day before WITHOUT disturbing the paragraph above it.** The ratio
+        # stays report-only for the reason just given. What is bounded instead is the
+        # guard churn a SINGLE FIX PASS wrote (`max_fix_guard_lines`), which is the
+        # quantity the cumulative ratio went quiet on: same cycle, rounds 2-5, 380 /
+        # 205 / 205 / 58 lines of test and prose against 177 / 116 / 114 / 58 of
+        # production. `guard_lines` below is whether crossing that ceiling ENDS the
+        # cycle or is merely reported, and it is `false`: `max_fix_growth` ends a
+        # cycle on years of measurement and this has one PR, so the weaker action goes
+        # first and the stronger one is a dial away rather than baked in.
+        #
         # THERE IS NO SUCH NUMBER HERE. The rule is a predicate — the pass contains
         # zero refereed lines — and a predicate has nothing to calibrate. A fraction,
         # by contrast, would need one and would be wrong: a 5-line production fix
@@ -1429,9 +1491,40 @@ DEFAULTS: dict = {
         # `false` (or `null`) switches it off, exactly as `premise_undecidable`'s flag
         # does. `true` is the only other value: there is no number this could take,
         # and inventing one would be putting back the guess the predicate removes.
+        #
+        # #618's SIXTH rung, and the only one in this block that carries no number of
+        # its own: the threshold lives beside the measurement, in
+        # `max_fix_guard_lines`, and this answers the one question every key here
+        # answers — does crossing it end the cycle?
+        #
+        # **The two keys are a pair on `escalate_on.unrefereed_fix`'s precedent**,
+        # which is a bare flag over a constant (`panel_seats.UNREFEREED_MIN_CHURN`)
+        # for the same reason: the number and the verdict are separable decisions and
+        # a repo may reasonably want the first without the second. Here that is the
+        # WHOLE of the design. #67's rule is that an instrument earns a gate over a
+        # few dozen cycles or not at all, and this instrument has exactly one cycle
+        # behind it — so a repo that sets a ceiling gets it MEASURED and REPORTED, and
+        # has to say so again, in a second key, before a round ends on it.
+        #
+        # `false`, therefore, and it is the weaker of the two actions on purpose.
+        # `max_fix_growth` ends a cycle and has #188 and #236 behind it; this has
+        # lexray#1780 and nothing else. The dial exists so the answer is not baked in
+        # either way — a fleet that has watched the count for a few dozen cycles flips
+        # one flag rather than waiting for a release.
+        #
+        # It joins `panel_propose.PROPOSE_ESCALATIONS` like every other built rung —
+        # that tuple's rule is "every one of them", because a rule covering SOME
+        # escalations is one a reader has to memorise the membership of — and it is the
+        # rung where the fan-out's question is nearly its own answer. It fires because
+        # a fix pass wrote more guard work than the findings asked for; what the seats
+        # are then asked is "what is the smallest change that resolves your findings".
+        #
+        # A flag rather than a number for `unrefereed_fix`'s reason: the number is one
+        # key over, and two places to write a threshold is two places for them to
+        # disagree. `null` is read as `false`, as it is for both of its flag siblings.
         "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
                          "fix_injection": 0.5, "new_findings_not_falling": 1,
-                         "unrefereed_fix": True},
+                         "unrefereed_fix": True, "guard_lines": False},
         # #507, and it is NOT a fifth rung — which is why it is here and not inside
         # the block above. Every key in `escalate_on` answers one question: does this
         # end the cycle? This one ends nothing, extends nothing and cannot move a
@@ -2756,7 +2849,8 @@ class Dial(NamedTuple):
     for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
     `escalate_on.premise_repeated`, `escalate_on.fix_injection`,
     `escalate_on.new_findings_not_falling`, `escalate_on.premise_undecidable`,
-    `escalate_on.unrefereed_fix` and
+    `escalate_on.unrefereed_fix`, `escalate_on.guard_lines`,
+    `max_fix_guard_lines` and
     `max_diff_chars`, and means "inherit the default" for everything else — so a
     dial that took `null` generally would have one written value with two
     meanings.
@@ -2897,6 +2991,12 @@ BOARD_DIALS: dict[str, Dial] = {
     # one above.
     "review_panel.max_fix_growth_chars": Dial("number", True, "either",
         'how many chars past its round-1 size it may grow; whichever ceiling binds first'),
+    # #618's per-pass guard ceiling. `nullable` because `null` is its off switch and
+    # is also its shipped value: the count is uncalibrated, so a board that could
+    # only move the number and never clear it would be a channel that can arm an
+    # unearned ceiling and not disarm it.
+    "review_panel.max_fix_guard_lines": Dial("number", True, "either",
+        'test and prose lines ONE fix pass may write before the ceiling reports'),
     # What a cycle costs: how many rounds, how much of the change each seat reads,
     # how much diff it is handed, and whether a second model adjudicates.
     "review_panel.max_rounds": Dial("number", False, "either",
@@ -2935,6 +3035,12 @@ BOARD_DIALS: dict[str, Dial] = {
     # the rule exists to refuse.
     "review_panel.escalate_on.unrefereed_fix": Dial("flag", True, "either",
         'escalate when a fix pass wrote nothing but test and prose — nothing can check it'),
+    # #618's sixth rung, and the only one whose threshold is a different dial
+    # (`max_fix_guard_lines`). A `flag` on `unrefereed_fix`'s precedent: what it
+    # decides is whether the ceiling beside it ENDS a cycle or only reports, and a
+    # number here would be that ceiling written down a second time.
+    "review_panel.escalate_on.guard_lines": Dial("flag", True, "either",
+        'whether crossing max_fix_guard_lines ends the cycle, or is only reported'),
     # #507's constructive pass. `either`, because it is the one dial here whose two
     # directions cost different things and neither is a merge policy: switching it ON
     # spends a fan-out on cycles that escalate, switching it OFF sends a human to a
