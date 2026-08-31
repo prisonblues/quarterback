@@ -392,6 +392,21 @@ valid skip is a genuine false positive where re-examination
 confirms the code is correct. "Not worth the churn" is not valid.
 "Can do later" is not valid.
 
+**Before you fix a finding, write one line naming who consumes the
+code the fix would change** — the callers, from a search you ran, and
+where that code reaches a response or a stored artefact, the
+entitlement tier it is served to. Every finding gets one, before its
+patch, and it goes in your summary beside the finding.
+`/review-pr`'s step 3 has the full version and the instance it was
+written from (#616); the short reason is that the paragraph above
+allows a false positive and asks nothing at all in support of a fix,
+so refuting a wrong finding costs more than complying with it and
+the pass complies. One line owed either way removes the difference,
+and it is usually the refutation itself. `unknown` is allowed where
+a search could not settle it, and a finding whose consumers you
+could not establish is one you fix where it was raised and no
+further.
+
 One finding can be neither: it says the *approach* you chose is
 wrong rather than the code, and fixing it where it points means
 adding a special case to keep that approach standing (`/review-pr`'s

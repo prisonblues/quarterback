@@ -55,6 +55,7 @@ CHECK_NAME = "prose-consistency-tests"
 #: against each other in both directions.
 MEMBERS = (
     "test_fixer_escalation",
+    "test_fixer_consumers",
     "test_regression_test_redgreen",
     "test_commands_wired",
 )
@@ -198,6 +199,7 @@ def declared_reads() -> dict[str, frozenset[str]]:
 #: the declaration exactly the unenforced summary this module's docstring says it is not.
 GATES = {
     "test_fixer_escalation": ("doc", "docs/DEPLOY.md"),
+    "test_fixer_consumers": ("doc", "docs/DEPLOY.md"),
     "test_regression_test_redgreen": ("brief", "loops.md"),
     "test_commands_wired": ("_at", "harness/package.nix"),
 }

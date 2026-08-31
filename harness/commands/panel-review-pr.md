@@ -370,6 +370,17 @@ with these overrides:
   findings.** They are already exhaustively reviewed and judged — the sub-agent
   does NOT re-derive them. Paste the full **To fix** list, and the **SonarCloud**
   issues **where that seat ran**, into the brief as the findings to resolve.
+- **Replacing step 2 does NOT remove step 3's consumer line (#616), and this is the
+  path it was written for.** The brief owes one line per finding, before that finding's
+  patch, naming who calls the code the fix would change and — where it reaches a response
+  or a stored artefact — the entitlement tier it is served to. Nothing about a
+  panel-supplied list makes that cheaper to skip; it makes it easier, because the finding
+  arrives already verified by a seat and confirmed by the judge, and **that is exactly the
+  provenance the measured failure had**. On lexray#1780 round 3 a P2 carrying both was
+  wrong about what `html_preview` is for, the fix merged a paid glossary into the
+  anonymous teaser, and round 4 found the entitlement leak. Say in the brief that every
+  finding you are handing over gets its line whatever you and the judge already think of
+  it, and require the **Consumers** column in the summary table it returns.
 - Its job is to resolve **every panel-confirmed finding the round asked it to
   clear** — the **To fix** list, which is already filtered to the round's
   `fix_severity_floor` — plus every SonarCloud issue **on a round the `sonarqube` seat
@@ -1541,6 +1552,12 @@ Then the part that is new, and is the point of running more than one round:
   lines; do not fold them into the fixed count. It is a fix, so the temptation to relay
   it as one is real, and the sentence that gets lost in the rounding is the only reason
   the outcome exists. Say `Narrowed: none` when there were none.
+- **Consumers (#616):** the fixer's **Consumers** column arrives in the table you show
+  verbatim, so do not restate it. Say the two things reading the column tells you and the
+  table does not: any finding whose line came back `unknown`, and — for a finding the
+  fixer **refuted** — that the line and the refutation are the same sentence, which is the
+  column working. A finding fixed against a consumer set the line does not cover is the
+  failure it was built for, and it is worth a sentence of its own.
 - **Fix surface (#619):** `fix_surface` from the last round — how many files the fix
   passes touched that no earlier round had read, and which ones. Say it even when it is
   zero, and pair it with whatever the fixer declared in its summary's **Surface** line;
