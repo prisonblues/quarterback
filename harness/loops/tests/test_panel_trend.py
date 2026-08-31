@@ -221,8 +221,11 @@ def diverging() -> list:
     have demonstrated nothing about whether they catch anything.
     """
     return [panel.RoundTrend(1, True, 8, 2, None, 113_402),
-            panel.RoundTrend(2, True, 14, 5, 9, 236_187),
-            panel.RoundTrend(3, True, 15, 4, 13, 340_341)]
+            # #618's three cells carry the churn the fix passes of this very cycle
+            # wrote, which is the number the block could not show while the cycle ran:
+            # 330 test lines against 177 of production, then 205 against 116.
+            panel.RoundTrend(2, True, 14, 5, 9, 236_187, None, 177, 330, 50),
+            panel.RoundTrend(3, True, 15, 4, 13, 340_341, None, 116, 205, 0)]
 
 
 def _table(lines: list[str]) -> list[str]:
@@ -242,7 +245,7 @@ def test_one_round_is_not_a_trend():
 def test_the_block_emits_NO_density_figure():
     """**The issue's one hard constraint, asserted as an exact rendering.**
 
-    Five columns and no sixth. Findings-per-10k-chars fell 9.46 -> 7.97 -> 4.82
+    Eight columns and no ninth. Findings-per-10k-chars fell 9.46 -> 7.97 -> 4.82
     across exactly these rounds, reads as steady improvement, and describes a cycle
     that was diverging — it falls because the denominator is growing, which is the
     problem rather than evidence against it. Any per-size figure added here has to
@@ -252,10 +255,10 @@ def test_the_block_emits_NO_density_figure():
     Asserted whole rather than by searching for words a future column might not
     use: a test looking for "density" is passed by a column called "per 10k"."""
     assert _table(panel.cycle_trend_lines(diverging(), FIRST)) == [
-        "round  findings  P1/P2  introduced  whole PR  vs r1",
-        "   r1         8      2           —   113,402  1.00x",
-        "   r2        14      5     9 (64%)   236,187  2.08x",
-        "   r3        15      4    13 (87%)   340,341  3.00x",
+        "round  findings  P1/P2  introduced  prod  test  prose  whole PR  vs r1",
+        "   r1         8      2           —     —     —      —   113,402  1.00x",
+        "   r2        14      5     9 (64%)   177   330     50   236,187  2.08x",
+        "   r3        15      4    13 (87%)   116   205      0   340,341  3.00x",
     ]
 
 
@@ -317,7 +320,7 @@ def test_a_round_with_NO_findings_takes_no_share():
     rows = [panel.RoundTrend(1, True, 2, 0, None, 1000),
             panel.RoundTrend(2, True, 0, 0, 0, 1100)]
     assert _table(panel.cycle_trend_lines(rows, (1, 1000, "pr")))[2].split() \
-        == ["r2", "0", "0", "0", "1,100", "1.10x"]
+        == ["r2", "0", "0", "0", "?", "?", "?", "1,100", "1.10x"]
 
 
 # --------------------------------------------------------------------------
@@ -430,9 +433,17 @@ def test_round_TWO_prints_both_rounds_and_the_growth_between_them(
                    head="bbb222", files=5, baseline=[r1_path])
     table = _table([ln for ln in capsys.readouterr().out.splitlines()])
     assert table[0].startswith("round")
-    assert table[1].split() == ["r1", "1", "1", "—", f"{r1['pr_chars']:,}", "1.00x"]
-    # Two of the three are new; one of those sits on a line the fix pass wrote.
+    # Round 1 has no fix pass in front of it, so all three churn cells read `—`.
+    assert table[1].split() == ["r1", "1", "1", "—", "—", "—", "—",
+                                f"{r1['pr_chars']:,}", "1.00x"]
+    # Two of the three are new; one of those sits on a line the fix pass wrote. The
+    # churn cells are #618's, read off this round's own fix range: the fixture's fix
+    # pass added two production lines and nothing else, which is a fact about the pass
+    # that `introduced` beside it cannot state.
+    churn = r2["round_stop"]["unrefereed_fix"]
     assert table[2].split() == ["r2", "3", "2", "1", "(33%)",
+                                str(churn["production"]), str(churn["test"]),
+                                str(churn["prose"]),
                                 f"{r2['pr_chars']:,}",
                                 f"{r2['pr_chars'] / r1['pr_chars']:.2f}x"]
 
@@ -495,6 +506,9 @@ def test_the_payload_carries_the_block_as_data(monkeypatch, tmp_path):
     assert [t["round"] for t in r2["cycle_trend"]] == [1, 2]
     assert r2["cycle_trend"][0] == {"round": 1, "reviewed": True, "findings": 1,
                                     "p1p2": 1, "new_findings": 1, "introduced": None,
+                                    # #618's split: round 1 had no fix pass to read,
+                                    # and three nulls say so rather than three zeros.
+                                    "production": None, "test": None, "prose": None,
                                     "pr_chars": r1["pr_chars"], "growth": 1.0}
     assert r2["cycle_trend"][1]["introduced"] == 1
     # #505's column rides here too — the one cell in this block with a consumer other
@@ -612,7 +626,7 @@ def test_an_uncountable_round_prints_a_question_mark_not_the_word_None():
     rows = [panel.RoundTrend(1, True, 2, 1, None, 1000),
             panel.RoundTrend(2, True, None, None, None, 1200)]
     cells = _table(panel.cycle_trend_lines(rows, (1, 1000, "pr")))[2].split()
-    assert cells == ["r2", "?", "?", "?", "1,200", "1.20x"]
+    assert cells == ["r2", "?", "?", "?", "?", "?", "?", "1,200", "1.20x"]
 
 
 def test_an_introduced_count_bigger_than_the_findings_is_refused():

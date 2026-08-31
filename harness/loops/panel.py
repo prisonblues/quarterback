@@ -1149,7 +1149,21 @@ def _rounds_phrase(rounds: list[int]) -> str:
 #: added here must therefore sit beside BOTH the absolute count and the growth
 #: ratio, so that a reader cannot take it on its own — and the safest version, the
 #: one this is, adds none at all. `test_panel_trend.py` pins the absence.
-TREND_COLUMNS = ("round", "findings", "P1/P2", "introduced", "whole PR")
+#: **The three churn columns are #618's, and they sit beside `introduced` because
+#: that is the column they complete.** `introduced` says how many of a round's
+#: findings the pass before it authored; nothing said what that pass DID. A pass that
+#: wrote 330 test lines and a pass that wrote 330 production lines are not the same
+#: event, and this table rendered them identically — which is why lexray#1780's five
+#: rounds, in which the fix passes wrote 1,313 lines and 848 of them were test and
+#: doc, read as a flat cycle in the one block a reader consults for the shape of one.
+#: `round_stop.unrefereed_fix` had computed exactly this split since #554 and printed
+#: it in a line of its own, one round at a time, which is the form that cannot be read
+#: down.
+#:
+#: Three columns and not one combined cell: the whole value of this block is that a
+#: column can be read DOWN, and `177/330/50` cannot be.
+TREND_COLUMNS = ("round", "findings", "P1/P2", "introduced",
+                 "prod", "test", "prose", "whole PR")
 
 
 def _trend_cells(row: RoundTrend) -> list[str]:
@@ -1170,7 +1184,7 @@ def _trend_cells(row: RoundTrend) -> list[str]:
         # round's numbers did not survive" and the reader needs it at a glance.
         # Two words that fit under the `findings` header, so one skipped round in a
         # cycle cannot widen the column every other row is read down.
-        return [f"r{row.round}", "not run", "", "", ""]
+        return [f"r{row.round}", "not run", "", "", "", "", "", ""]
     n, severe = row.findings, row.p1p2
     if row.introduced is None:
         # `—` only where the question genuinely does not arise. Round 1 is the whole
@@ -1189,11 +1203,19 @@ def _trend_cells(row: RoundTrend) -> list[str]:
         # it is the number that survived.
         got = f"{row.introduced}"
     size = f"{row.pr_chars:,}" if row.pr_chars is not None else "?"
+    # #618's split, marked on `introduced`'s own two-mark rule and for its reason. A
+    # round with no fix pass in front of it was never asked (`—`, and round 1 is the
+    # whole of that case); a later round whose range was unreadable, or whose payload
+    # predates #554 recording the split, was asked and could not answer (`?`). One
+    # mark for both would make a cycle whose fix ranges went dark for two rounds read
+    # exactly like a cycle whose passes wrote nothing.
+    churn = [("—" if row.round == 1 else "?") if c is None else f"{c}"
+             for c in (row.production, row.test, row.prose)]
     # `?`, never `None`. A reviewed round whose finding buckets did not parse has no
     # count, and an f-string over the missing value would print the word `None` into
     # a numeric column — which reads as a value rather than as a gap.
     return [f"r{row.round}", "?" if n is None else f"{n}",
-            "?" if severe is None else f"{severe}", got, size]
+            "?" if severe is None else f"{severe}", got, *churn, size]
 
 
 def _trend_growth(row: RoundTrend, first_chars: int | None) -> str:
@@ -1240,7 +1262,12 @@ def _trend_record(row: RoundTrend, first_chars: int | None) -> dict:
             # used. `round_stop.new_findings_not_falling.counts` carries the same
             # series for the round it decided.
             "new_findings": row.new_findings,
-            "introduced": row.introduced, "pr_chars": row.pr_chars,
+            "introduced": row.introduced,
+            # #618's split, carried as three fields rather than as the rendered cells:
+            # a consumer plotting a cycle wants the numbers, and `null` is the same
+            # "not measured" the two marks in the report spell.
+            "production": row.production, "test": row.test, "prose": row.prose,
+            "pr_chars": row.pr_chars,
             "growth": (round(row.pr_chars / first_chars, 3)
                        if first_chars and row.reviewed and row.pr_chars is not None
                        else None)}
@@ -1308,6 +1335,9 @@ def cycle_trend_lines(rows: list[RoundTrend],
     out.append("Read the counts and the size TOGETHER — a finding count that holds "
                "while the PR grows is not convergence, and `introduced` is the share "
                "of each round's findings that the fix pass before it wrote. "
+               "`prod`/`test`/`prose` are what THAT pass churned, split by whether "
+               "anything can check it: a pass that wrote 330 test lines and a pass "
+               "that wrote 330 production lines are not the same event. "
                "`—` is a question that does not arise; `?` is one that could not be "
                "answered.")
     out.append("")
@@ -1497,6 +1527,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # whole panel has been paid for, and the round's stop is computed under one policy
     # resolved in one place.
     unrefereed_armed = unrefereed_fix_brake(panel, notes)
+    # #618's rung, read here for the four brakes' reason and at their moment. It is the
+    # only one that is TWO keys: the ceiling is `max_fix_guard_lines` on `dials` above
+    # and this is whether crossing it ends the cycle, which is the split #67 asks for on
+    # an instrument with one cycle behind it — a repo may set a number to watch it
+    # without arming a stop on it.
+    guard_lines_armed = guard_lines_brake(panel, notes)
+    # Said out loud rather than left to be discovered, on `max_fix_growth: null`'s
+    # precedent one function up: a repo that armed the flag and wrote no ceiling has a
+    # rung that can never fire, and a rung that ships unwired is the failure #169 names.
+    # The reverse pair — a ceiling with the flag off — is the SHIPPED arrangement and
+    # says nothing, because watching a count is what it is for.
+    if guard_lines_armed and dials.max_fix_guard_lines is None:
+        notes.append(
+            "`escalate_on.guard_lines` is armed and `max_fix_guard_lines` is null, so "
+            "there is no ceiling for it to act on and the rung cannot fire — write a "
+            "line count there, or drop the flag")
     # #507's constructive pass. Read at the same moment as the three brakes above, and
     # for their reason: a malformed value hard-exits before a seat is dispatched
     # rather than after a whole panel has been paid for. What it governs is not a
@@ -4120,6 +4166,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # payload came to disagree the first time.
     cycle_run = bool(in_cycle or prior_rounds)
 
+    # #554's measurement over the SAME fix range `injecting` was attributed against —
+    # `fix_diff`, whichever of the compare and the round's own increment supplied it —
+    # so the two rungs cannot end up accusing different passes. `None` where there is
+    # no range, which is `over: False` by construction: a round that could not see the
+    # pass does not end a cycle on what the pass contained. Reading `fix_diff` rather
+    # than the compare's own answer is what gets #504's reconstruction for free: a
+    # rewritten round that rebuilt its pass out of the local object store is measured
+    # here exactly as a linear one is, and a rewrite nothing could rebuild disarms
+    # this rung and #489's together.
+    #
+    # Cheap enough to compute on every attributable round rather than only where the
+    # brake is armed: it is one pass over a diff already in memory, and the payload
+    # records what the round KNEW — a repo that switched the rung off still gets to
+    # see that its fix pass wrote nothing checkable.
+    #
+    # ABOVE the trend block since #618, which is a move rather than an accident: this
+    # round's own trend row prints the split, `round_stop` bounds it, and the payload
+    # records it, so all three read ONE object. Deriving the row's cells from a second
+    # `referee_split` of the same diff is the duplicated-measurement failure this file
+    # keeps writing down — and here it would show up as a round whose table disagreed
+    # with its own veto line.
+    refereeing = referee_state(referee_split(fix_diff) if fix_diff else None,
+                               unrefereed_armed)
+
     # ---- #490: this round's own row of the cross-round trend block, and the earlier
     # rounds' rows beside it.
     #
@@ -4207,7 +4277,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                              # The whole PR, whatever this round reviewed (#298) —
                              # `review.diff`, which is what `pr_chars` records below
                              # and what `max_fix_growth` measures.
-                             pr_chars=len(review.diff))]
+                             pr_chars=len(review.diff),
+                             # #618's three columns for THIS round, off the same
+                             # `referee_state` the stop rule and the payload read, and
+                             # through the same reader an earlier round's row goes
+                             # through (`churn_cells`) — so this row and this same
+                             # row re-derived from this payload one round later are
+                             # the same numbers by construction.
+                             **churn_cells(refereeing))]
 
 
     # ---- #506: the remedy for the rule above, priced but not taken.
@@ -4234,22 +4311,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # computed twice: `over` is also the precondition for the extra API call under it,
     # and two `injection_state` calls could disagree about whether to make it.
     injecting = injection_state(provenance_counts, injection_limit)
-    # #554's measurement over the SAME fix range `injecting` was attributed against —
-    # `fix_diff`, whichever of the compare and the round's own increment supplied it —
-    # so the two rungs cannot end up accusing different passes. `None` where there is
-    # no range, which is `over: False` by construction: a round that could not see the
-    # pass does not end a cycle on what the pass contained. Reading `fix_diff` rather
-    # than the compare's own answer is what gets #504's reconstruction for free: a
-    # rewritten round that rebuilt its pass out of the local object store is measured
-    # here exactly as a linear one is, and a rewrite nothing could rebuild disarms
-    # this rung and #489's together.
-    #
-    # Cheap enough to compute on every attributable round rather than only where the
-    # brake is armed: it is one pass over a diff already in memory, and the payload
-    # records what the round KNEW — a repo that switched the rung off still gets to
-    # see that its fix pass wrote nothing checkable.
-    refereeing = referee_state(referee_split(fix_diff) if fix_diff else None,
-                               unrefereed_armed)
     # #619's measurement, over the SAME fix range `injecting` and `refereeing` were
     # taken against, so the three cannot end up describing different passes. It is
     # one set difference over payloads this round has already been handed: the files
@@ -4396,6 +4457,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # work. Empty on round 1 and on any round whose fix range could
                       # not be read.
                       unrefereed=refereeing,
+                      # #618's rung. The measurement is the SAME split `unrefereed`
+                      # carries — test plus prose over this pass's own fix range and
+                      # nothing earlier, so the ceiling cannot bank a quiet round into
+                      # a loud one — and the two keys arrive already resolved: the
+                      # ceiling off `dials`, the arming off `escalate_on`. Null limit
+                      # is `over: False` by construction, which is every repo today.
+                      guard_churn=guard_churn_state(refereeing,
+                                                    dials.max_fix_guard_lines,
+                                                    guard_lines_armed),
                       # #619's surface, on the contract `round_stop` states: the
                       # files the pass touched, the ones no earlier round had seen,
                       # the count, and the size of the set it was differenced
@@ -5395,6 +5465,40 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"**Refereed-ness of the last fix pass:** {rf['churn']} churned "
                      f"line(s) — {rf['test']} test, {rf['prose']} prose, "
                      f"{verdict}.{armed}")
+    # ---- guard churn against the per-pass ceiling (#618). Printed only where a
+    # ceiling was WRITTEN: with `max_fix_guard_lines` at its shipped null there is no
+    # number to be under, and a line reading "58 guard lines, no ceiling" on every
+    # round of every repo is the loud-and-wrong a reader learns to skip. The count
+    # itself is not lost by that — it is two of the three cells the round table now
+    # prints, and it is in `round_stop.guard_churn` either way.
+    #
+    # It says which of the two things a crossing DID, because this is the one
+    # instrument on this report whose action is configurable: `escalate_on.guard_lines`
+    # off makes the crossing a reading, and on makes it a stop.
+    gc = (payload.get("round_stop") or {}).get("guard_churn") or {}
+    if gc.get("limit") is not None and gc.get("lines") is not None:
+        ceiling = f"the {gc['limit']}-line `max_fix_guard_lines` ceiling"
+        if not gc["over"]:
+            said = f"under {ceiling} for this pass"
+        elif gc["fired"]:
+            # `fired`, NEVER `armed` (found by a codex second opinion). `armed` says
+            # the repo asked for a stop; `fired` says this round took one, and the two
+            # differ on every round the rung was bounded out of — one already stopped
+            # for something else, or going again for a P1 an earlier round raised and
+            # this pass did not clear. Written off `armed`, this sentence claimed the
+            # cycle ended here on rounds that went on to run.
+            said = (f"PAST {ceiling}, and `escalate_on.guard_lines` is armed — that is "
+                    "what ended this cycle")
+        elif gc["armed"]:
+            said = (f"PAST {ceiling}. `escalate_on.guard_lines` is armed and this round "
+                    "did not end on it: the rung may only turn a `go again` into a "
+                    "stop, and only the round rule 1 was buying")
+        else:
+            said = (f"PAST {ceiling}. `escalate_on.guard_lines` is off for this repo, "
+                    "so this is recorded and stops nothing")
+        lines.append(f"**Guard churn in the last fix pass:** {gc['lines']} test and "
+                     f"prose line(s) — {said}. Counted over THAT pass and nothing "
+                     "earlier, so a quiet round cannot fund a loud one.")
     # ---- new surface (#619), in the same register as the two above it: reported,
     # gating nothing. Printed from the round's own `surface` rather than back out of
     # `payload["round_stop"]`, because that block is null on a review-only run and

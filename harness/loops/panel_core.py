@@ -292,6 +292,17 @@ DEFAULT_MAX_FIX_GROWTH = 3.0
 #: a ceiling. None disables this half and leaves the multiple; `harness_rules` carries
 #: the calibration.
 DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
+#: The GUARD half of the same question, per PASS rather than per PR (#618): test and
+#: prose lines ONE fix pass may churn before the ceiling reports — or, where the repo
+#: arms `escalate_on.guard_lines`, ends the cycle.
+#:
+#: **`None`, and it is unset rather than off.** The only measurement anyone has is
+#: lexray#1780's five rounds, whose passes wrote 380, 205, 205 and 58 guard lines; a
+#: number drawn between the quiet round and the loud one on that single cycle would be
+#: a ceiling with its argument written afterwards, which is what #67 forbids. So the
+#: instrument ships measured and uncalibrated, and `harness_rules` carries the
+#: arithmetic and the reason a cumulative ratio could not do this job.
+DEFAULT_MAX_FIX_GUARD_LINES = None
 #: What a reviewer is asked to look for: defects in the change (`diff`), or in the
 #: change and everything it touches (`repo` — the pre-#165 posture).
 DEFAULT_REVIEWER_SCOPE = "diff"
@@ -2836,6 +2847,8 @@ __all__ = [
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "DEFAULT_MAX_FIX_GUARD_LINES",
+    "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
     "DEFAULT_FILE_DEFERRAL_ISSUES", "DEFERRAL_ISSUES_ALWAYS",

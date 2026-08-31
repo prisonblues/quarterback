@@ -1841,6 +1841,73 @@ def fix_growth_chars_limit(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+def fix_guard_lines_limit(panel: dict, notes: list[str]) -> int | None:
+    """`max_fix_guard_lines` — a positive whole number of test and prose lines ONE
+    fix pass may churn, or ``None`` for "do not check" (#618).
+
+    The GUARD half of the growth question, and the only one of the three measured per
+    PASS. :func:`fix_growth_limit` and :func:`fix_growth_chars_limit` both divide this
+    round's whole PR by the cycle's first round, which is a CUMULATIVE reading — and a
+    cumulative reading is exactly what went quiet on the cycle this was filed from:
+    `guard_ratio` fell 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 across five rounds in which
+    source and test both nearly doubled, because a proportion moves its numerator and
+    its denominator together. The per-pass delta is the quantity that can see the
+    event, and it does not BANK: each round reads the churn of its own fix range and
+    nothing earlier, so a quiet round cannot fund a loud one.
+
+    **Absent inherits the default and a written ``null`` switches it off** — the
+    distinction :func:`fix_growth_limit` draws — and here the two land in the same
+    place, because the shipped default IS ``None``. That is not an omission. The only
+    measurement anyone has is one cycle, whose passes wrote 380, 205, 205 and 58 guard
+    lines, and a threshold drawn between the quiet round and the loud one on a single
+    PR is the ceiling-with-its-argument-written-afterwards that #67 forbids. So the
+    count is taken and published every round and nothing fires until a repo writes a
+    number it can defend. The sentinel is kept anyway rather than collapsed into
+    ``.get()``: the two readings are different facts about a rules file, and the day
+    this earns a non-null default is the day the difference starts to matter.
+
+    ``0`` is refused rather than read as "a fix pass may write no test line at all".
+    That is not a stricter ceiling, it is a ceiling every healthy pass carrying a
+    regression test crosses — the "switch turned all the way on" failure
+    :func:`fix_growth_chars_limit` refuses for its own key, and ``null`` already spells
+    what an operator writing ``0`` here would have meant.
+
+    A bool is rejected before the integer read for :func:`low_severity_budget`'s
+    reason (``isinstance(True, int)`` is True, so `max_fix_guard_lines: false` — the
+    other way a hand writes "off" — would otherwise become a ONE-LINE ceiling, which
+    fires on every fix pass there is). An integral float counts and a fractional one
+    does not, since half a line is not a quantity a diff can report."""
+    raw = panel.get("max_fix_guard_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MAX_FIX_GUARD_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("max_fix_guard_lines", raw,
+                      f"{what} — lines of test and prose ONE fix pass may churn "
+                      "before the ceiling reports, or null to switch the check off")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
 def panel_flag(panel: dict, key: str, fallback: bool, notes: list[str]) -> bool:
     """One boolean `review_panel` setting, with `panel_preflight._flag`'s manners —
     the string spellings a hand writes (``"false"``, ``"off"``) and the bare ``0``/``1``
@@ -2064,7 +2131,8 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The twelve #165/#297/#492/#482/#554/#508 settings as this round applied them.
+    """The thirteen #165/#297/#492/#482/#554/#508/#618 settings as this round
+    applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -2080,6 +2148,11 @@ class Dials:
     unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
+    #: #618's per-PASS guard ceiling, and the one dial here whose shipped value is
+    #: `None` because nobody has calibrated it rather than because off is the right
+    #: answer. Carried on this object for its siblings' reason: the stop rule, the
+    #: report and the payload have to be reading ONE number.
+    max_fix_guard_lines: int | None = DEFAULT_MAX_FIX_GUARD_LINES
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
     next_door_days: int = DEFAULT_NEXT_DOOR_DAYS
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
@@ -2096,6 +2169,7 @@ class Dials:
                 "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
+                "max_fix_guard_lines": self.max_fix_guard_lines,
                 "reviewer_scope": self.reviewer_scope,
                 "next_door_days": self.next_door_days,
                 "require_failing_test": self.require_failing_test,
@@ -2270,6 +2344,16 @@ class Dials:
                   f"+{self.max_fix_growth_chars:,} chars"
                   if self.max_fix_growth_chars is not None else ""]
         growth = " or ".join(h for h in halves if h) or "off"
+        # #618's per-pass guard ceiling, appended to the same field rather than given
+        # one of its own: it is the third clause of one sentence about how much a fix
+        # pass may write, and a reader who saw it in a separate field would have to
+        # work out that it is a ceiling on the same thing. Said only when SET, which
+        # is the one exception to this line's "print it at the default too" rule and is
+        # earned: the shipped value is `None` for want of a calibration, so on every
+        # repo that has not written one the clause would report an absence rather than
+        # a policy. `guard_ratio` beside it in the report is what a reader has instead.
+        if self.max_fix_guard_lines is not None:
+            growth += (f", guard {self.max_fix_guard_lines} lines/pass")
         # Spelled as what it BOUNDS, not as its key: "below-P2 fix budget" says which
         # findings are on it without the reader holding `round_trigger_floor` in their
         # head, and it is printed even where the band is empty (`fix_severity_floor`
@@ -2303,7 +2387,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all twelve at once.
+    """Read, validate and report all thirteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2328,6 +2412,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
+        max_fix_guard_lines=fix_guard_lines_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
         next_door_days=next_door_days(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
@@ -4481,6 +4566,7 @@ __all__ = [
     "severity_floor", "deferral_issue_gate", "reviewer_scope",
     "low_severity_budget",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
+    "fix_guard_lines_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",
     "UNREFEREED_MIN_CHURN", "_suffix_of", "_comment_line",
