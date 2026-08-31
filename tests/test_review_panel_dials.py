@@ -44,6 +44,7 @@ DIALS = {
     "unrefereed_line_weight": 2,
     "max_fix_growth": 1.5,
     "max_fix_growth_chars": None,
+    "max_fix_guard_lines": 250,
     "reviewer_scope": "increment",
     "next_door_days": 30,
     "require_failing_test": False,
