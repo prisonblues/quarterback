@@ -5232,6 +5232,23 @@ def _has_file_list(run_id):
 #: complete overlap.
 SHARED_FILES_CAP = 200
 
+#: The default window a next-door hint may be drawn from, in days. Short on
+#: purpose: #508's whole argument is that the useful signal is "confirmed next
+#: door **this morning**", and a defect shape from six weeks ago in a file that
+#: has since been rewritten is noise wearing the same clothes. A caller that
+#: wants the wider window asks for it.
+NEXT_DOOR_DAYS = 7
+#: How many hints one call may carry. "A handful of lines in a prompt, not a
+#: second review" is the property #508 asks to keep, and it is kept HERE rather
+#: than left to each caller: this endpoint's output goes in front of a model, and
+#: an uncapped one would let a busy repo spend a reviewer's attention on a list.
+NEXT_DOOR_LIMIT = 20
+#: A hint's ``detail`` is the judge's synthesis and can run to paragraphs. The
+#: title says WHAT the defect was and the detail says how it went wrong; a
+#: reviewer needs enough of the second to recognise the shape and none of it to
+#: re-litigate the other PR.
+NEXT_DOOR_DETAIL_CHARS = 400
+
 
 def _capped(paths: list[str], total: int) -> dict:
     """The path list trimmed to the cap, with the number trimmed beside it.
@@ -5647,6 +5664,344 @@ async def pr_collisions(
         # announces itself, or the trimmed answer reads as the whole one.
         out[f"{cls}_dropped"] = max(0, len(buckets[cls]) - limit)
     return out
+
+
+def _hint_view(row, now: datetime) -> dict:
+    """One next-door hint, as the panel will read it.
+
+    Every field is evidence a reviewer can go and check: which PR, which run,
+    when, and the defect's own key. A hint that could not be traced back to the
+    round that confirmed it would be an assertion, and this endpoint's whole
+    contract is that it hands over *observations somebody else already
+    adjudicated* rather than conclusions about the caller's diff.
+    """
+    return {
+        "pr": row.pr,
+        "pr_title": row.pr_title,
+        "run_id": row.run_id,
+        "ts": row.ts.isoformat(),
+        # The decay term, pre-computed because it is what the prompt line says
+        # ("confirmed 1.2h ago, next door") and because a caller rendering it
+        # from `ts` would need this endpoint's clock rather than its own.
+        "age_hours": round((now - row.ts).total_seconds() / 3600.0, 1),
+        "file": row.file,
+        "line": row.line,
+        "severity": row.severity,
+        "title": row.title,
+        "detail": _cut_detail(row.detail),
+        "finding_key": row.finding_key,
+        # What happened to it next door, where anybody has said. `fixed` is the
+        # strongest form of this hint — somebody confirmed the defect AND acted
+        # on it — and null is the ordinary case, meaning only that nobody has
+        # recorded an outcome. `refuted` never reaches here; see the handler.
+        "outcome": row.outcome,
+    }
+
+
+def _cut_detail(detail: str | None) -> str | None:
+    """``detail`` trimmed to :data:`NEXT_DOOR_DETAIL_CHARS`, saying so when it cut.
+
+    An ellipsis rather than a silent truncation, for this repo's usual reason: a
+    trimmed answer that does not announce the trim reads as the whole one, and
+    here the reader is a model that would take a sentence ending mid-clause as
+    the sentence.
+    """
+    if detail is None or len(detail) <= NEXT_DOOR_DETAIL_CHARS:
+        return detail
+    return detail[:NEXT_DOOR_DETAIL_CHARS].rstrip() + "…"
+
+
+@router.get("/review/next-door")
+async def next_door(
+    _reader: str = Depends(reader),
+    repo: str = Query(..., description="github nameWithOwner"),
+    pr: int = Query(..., ge=1),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int = Query(NEXT_DOOR_DAYS, ge=1, le=3650,
+                      description="how far back a confirmed finding may have been made"),
+    limit: int = Query(NEXT_DOOR_LIMIT, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Defects confirmed on OTHER PRs, recently, in the files this PR touches (#508).
+
+    `finding_recurrence` (#67) chains a finding to earlier rounds of **its own
+    PR**, and that is the right table with the wrong scope for the thing this
+    fleet actually does wrong. The measured case is 2026-08-26: one panel
+    confirmed a P1 in `app.auth.delegated()` — the dev bypass consulted before the
+    credential check — and an hour later the identical shape shipped in
+    `app.auth.human()` on another PR, copied out of the same source function.
+    Codex reviewed that second diff and returned four other real defects, not that
+    one. Nothing found it but a peer who happened to read the PR with their own
+    fix an hour old in their head, and the round that missed it was a round 1, so
+    there was nothing for the per-PR chain to recur against.
+
+    This is that peer's memory, as a query: **one PR's file list, joined to every
+    confirmed finding another PR of the same repo made in those same files inside
+    the window.**
+
+    **A hint, and never a finding.** Nothing here asserts anything about the
+    caller's diff — every row is an observation about somebody else's, with the
+    run and the timestamp that produced it, and a reviewer must find the defect in
+    the diff in front of it before reporting one.
+
+    **Nothing enforces that, and it should not be described as though something
+    does.** This side refuses to publish anything shaped like a verdict, and the
+    prompt (:data:`panel_core.NEXT_DOOR_SLOT`) instructs the seat; an instruction
+    is not a mechanism. Nothing checks that a returned finding cites a line in the
+    current diff, carries evidence independent of the hint, or differs from the
+    text it was shown — so a seat that copies a hint back produces a finding this
+    endpoint cannot distinguish from one somebody found. Were that common, the
+    recurrence chain would eat its own tail and repetition would start scoring.
+
+    That is a known and deliberate gap rather than an oversight, on #67's rule
+    that the instrument comes before the gate: the measurement that would justify
+    provenance-tagging hints and refusing findings that merely echo one is the
+    measurement nobody has yet, and building the gate first is how the panel ends
+    up with a rule calibrated on nothing. What would close it is per-hint ids on
+    the wire, a textual-overlap check at judging time, and a record of which hints
+    a round was shown — which is a separate issue, and wants a few dozen cycles of
+    this shipped before anybody designs it.
+
+    **Confirmed only, and never `refuted`.** Two filters, and they are not the
+    same one. `verdict == "confirmed"` keeps out what a judge threw away — a
+    dismissed finding is not something to carry next door. The outcome join keeps
+    out the sharper case: a finding the judge confirmed and a fixer then *proved
+    wrong* (`POST /review/outcomes`, #77). That row is a known-false statement, and
+    putting a known-false statement in front of a reviewer as "this was confirmed
+    next door" is worse than sending nothing — it spends attention and it teaches
+    the wrong shape. Every other outcome rides along on the row, `fixed` included,
+    because "somebody confirmed this AND acted on it" is the strongest form this
+    hint takes.
+
+    **Other PRs only.** `pr != subject` is the whole point of the endpoint and not
+    a detail: this PR's own history is `GET /review/findings`, and folding the two
+    would make a round's own last complaint indistinguishable from a peer's.
+
+    **One row per (rival PR, finding_key), newest wins.** A rival that raised the
+    same defect in four rounds is one thing to know, not four, and four copies
+    would push the other rivals off the end of `limit`.
+
+    **The file join is exact, and that is the honest limit.** #508 asks for file,
+    symbol or key overlap; this does paths. A path is the one of the three the
+    board already stores exactly, it is what the motivating case turns on (both
+    defects were in `app/auth.py`), and `finding_key` embeds the file, so a key
+    match is a path match already. Symbol-level overlap needs the tree parsed and
+    is not attempted — an approximate join here would widen the population with
+    rows nobody can check, which is the failure mode a hint in a prompt can least
+    afford.
+
+    **Scope, said in the response because the numbers cannot show it.** This
+    answers over the PRs *this board has panelled* within the window, exactly as
+    `GET /review/collisions` does. A PR nobody ran a panel on leaves no findings
+    here and cannot contribute a hint, so an empty `hints` means "nothing among
+    the rounds I have seen", never "nothing happened". Read the subject's own
+    `files_complete` with it: if the subject's file list is a prefix, hints may
+    exist in files it never reported, and no row below can see that.
+    """
+    # Folded before anything is selected, for #326's reason: the subject lookup
+    # and the finding selection must not be asking about two spellings of one
+    # repository, or `hints: []` would be a fact about capitalisation.
+    repo = _asked_repo(repo)
+
+    # The subject's newest FILE-BEARING run, unbounded by the window — the same
+    # asymmetry `GET /review/collisions` documents, and for the same reason. A
+    # caller naming a PR is asking about that PR: `days` bounds which findings are
+    # current enough to be worth carrying, never how far back the board may look
+    # to learn what the subject itself touches.
+    subject_id = await session.scalar(
+        select(ReviewRun.id)
+        .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+               _has_file_list(ReviewRun.id))
+        .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    if subject_id is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no run of {repo}#{pr} recorded a changed-file list — "
+            "nothing to look for next door",
+        )
+    subject = await session.get(ReviewRun, subject_id)
+    assert subject is not None  # selected by id in this same session
+
+    files_recorded = await session.scalar(
+        select(func.count()).select_from(ReviewRunFile)
+        .where(ReviewRunFile.run_id == subject_id)
+    ) or 0
+
+    cutoff = _since_clause(since, days)
+
+    # The subject's paths as a JOIN and not an `IN (...)`. A PR may carry up to
+    # `MAX_CHANGED_FILES` paths, and the ingest cap is the only thing bounding
+    # them; `ix_review_run_files_path` is on (path, run_id) precisely so this
+    # direction is the indexed one.
+    subj_files = aliased(ReviewRunFile)
+    hints = (
+        select(
+            ReviewRun.pr.label("pr"),
+            ReviewRun.pr_title.label("pr_title"),
+            ReviewRun.id.label("run_id"),
+            ReviewRun.ts.label("ts"),
+            ReviewFinding.file.label("file"),
+            ReviewFinding.line.label("line"),
+            ReviewFinding.severity.label("severity"),
+            ReviewFinding.title.label("title"),
+            ReviewFinding.detail.label("detail"),
+            ReviewFinding.finding_key.label("finding_key"),
+            # Carried so the newest-observation pick can be filtered on it AFTER
+            # the pick rather than before — see the DISTINCT ON comment below.
+            ReviewFinding.verdict.label("verdict"),
+            # The stable final tie-break. `ts` and `run_id` are both equal for
+            # every finding of one run, so without this the cap chooses between
+            # them arbitrarily and two identical calls can return different eights.
+            ReviewFinding.id.label("finding_id"),
+            ReviewFindingOutcome.outcome.label("outcome"),
+        )
+        .join(ReviewFinding, ReviewFinding.run_id == ReviewRun.id)
+        .join(subj_files, sa_and(subj_files.run_id == subject_id,
+                                 subj_files.path == ReviewFinding.file))
+        # LEFT, not inner: the ordinary hint has no recorded outcome at all, and
+        # an inner join would silently reduce this endpoint to "findings somebody
+        # already filed an outcome for" — a small and unrepresentative slice.
+        .outerjoin(ReviewFindingOutcome,
+                   sa_and(ReviewFindingOutcome.repo == repo,
+                          ReviewFindingOutcome.pr == ReviewRun.pr,
+                          ReviewFindingOutcome.finding_key
+                          == ReviewFinding.finding_key))
+        .where(
+            ReviewRun.repo == repo,
+            ReviewRun.pr != pr,
+            # ADJUDICATIONS ONLY, and this predicate is what makes the
+            # newest-observation pick below mean what its comment says it means.
+            # `verdict` has four values, not two: `unjudged` is a finding the
+            # panel KEPT on a round whose judge never ran (`judged: false`, or
+            # `reason='unjudged'` on the finding — see `_verdict`), and `sonar`
+            # is a cross-run observation. Neither is a judgement about the
+            # defect, so neither may DISPLACE one. Without this, a round 2 that
+            # merely failed to reach its judge writes a newer row for the same
+            # key, wins the `DISTINCT ON` below, fails the `confirmed` test
+            # after it, and erases a live confirmation — the endpoint answers
+            # `hints: []` and a quiet week looks identical to a judge outage.
+            #
+            # It is narrowed HERE rather than after the pick, and that is the
+            # opposite of what the `confirmed` test below does, deliberately:
+            # excluding `dismissed` early would resurrect stale confirmations
+            # (the regression the comment below is about), while excluding
+            # non-adjudications early is what stops a non-verdict outranking a
+            # verdict. Both are "the newest thing that ACTUALLY judged this".
+            ReviewFinding.verdict.in_(("confirmed", "dismissed")),
+            # `IS NULL OR <> 'refuted'`, never a bare `<> 'refuted'`: SQL's
+            # three-valued logic drops every row whose outcome is NULL from a
+            # plain inequality, and those rows are the majority of the table and
+            # the ordinary case. Written the short way this filter would have
+            # returned only findings that HAVE an outcome and is not refuted —
+            # the same NULL trap `ck_review_findings_recurs_of_revisited`
+            # documents one table over.
+            sa_or(ReviewFindingOutcome.outcome.is_(None),
+                  ReviewFindingOutcome.outcome != "refuted"),
+        )
+        # Newest observation per (rival PR, defect). The ORDER BY leader must
+        # match the DISTINCT ON expressions — Postgres requires it — so the
+        # recency tiebreak rides behind them.
+        #
+        # **`verdict` is NOT filtered here, and that ordering is the point.** The
+        # obvious version puts `verdict == "confirmed"` in the WHERE above, which
+        # reads identically and is wrong: it removes the dismissals BEFORE the
+        # newest-per-key pick, so a defect confirmed in round 1 and DISMISSED by a
+        # later round has its dismissal deleted from the population and its stale
+        # confirmation resurrected as "the newest observation". The endpoint would
+        # then quote, as confirmed next door, a finding that PR's own judge has
+        # since thrown out — and `GET /review/findings` would disagree with it.
+        # So: pick the newest observation of each defect first, then ask what that
+        # observation said (below). The outcome table catches the `refuted` case
+        # and cannot catch this one, because a later judge dismissal is not an
+        # outcome.
+        .distinct(ReviewRun.pr, ReviewFinding.finding_key)
+        .order_by(ReviewRun.pr, ReviewFinding.finding_key,
+                  ReviewRun.ts.desc(), ReviewFinding.id.desc())
+    )
+    if cutoff is not None:
+        hints = hints.where(ReviewRun.ts >= cutoff)
+
+    inner = hints.subquery()
+    # The verdict test, AFTER the newest-per-key pick. A defect whose newest
+    # observation is a dismissal drops out here; one whose newest observation is a
+    # confirmation stays, whatever earlier rounds said about it.
+    picked = (
+        select(inner)
+        .where(inner.c.verdict == "confirmed")
+        .subquery()
+    )
+    # COUNTED, then FETCHED, rather than fetched and measured. `considered` has to
+    # be the pre-cap number — a cap that trims an answer announces itself — and the
+    # obvious way to get it is `len(rows)` over an unbounded select. That reads fine
+    # at `days=7` on this repo and is a trap at the argument this endpoint permits:
+    # `days=3650` over a busy monorepo selects every confirmed finding any PR ever
+    # made in any file this one touches, materialises all of them, and returns
+    # twenty. `GET /review/collisions` fetches its whole rival population the same
+    # way and gets away with it because a rival is one row per PR; a hint is one row
+    # per (PR, defect), which is the same population multiplied by however many
+    # things went wrong in it.
+    #
+    # Two queries against one subquery, so the number and the rows cannot disagree
+    # about what was selected.
+    #
+    # ONE statement, not two, and that is a correctness fix rather than a tuning
+    # one. A separate `SELECT count(*)` followed by a separate `SELECT … LIMIT`
+    # gets a separate SNAPSHOT under Postgres' default READ COMMITTED, so a run
+    # recorded between them makes `considered` describe a population the rows were
+    # not drawn from — `hints_dropped` then lies, and `considered` can even come
+    # back smaller than the number of rows returned. Sharing a subquery OBJECT
+    # shares no snapshot; only being one statement does.
+    rows = (await session.execute(
+        # Recency is the ranking, and the only one. Severity is deliberately NOT
+        # the leader: a P3 confirmed in this file an hour ago is the sentence
+        # #508 was filed about, and a P1 from six days ago in the same file is
+        # not more likely to be about the diff in front of the reviewer. Both
+        # are on the row for a caller that disagrees.
+        #
+        # `finding_id` closes the ordering: every finding of one run shares its
+        # `ts` and `run_id`, so those two alone leave the cap free to return a
+        # different eight on each identical call.
+        select(picked, func.count().over().label("considered"))
+        .order_by(picked.c.ts.desc(), picked.c.run_id.desc(),
+                  picked.c.finding_id.desc())
+        .limit(limit)
+    )).all()
+    # The window counts the whole pre-LIMIT population, so it is on every row and
+    # identical across them. No rows means none were selected, which is a count of
+    # zero — the one case the window cannot report, because there is no row to
+    # carry it.
+    considered = rows[0].considered if rows else 0
+
+    now = datetime.now(UTC)
+    return {
+        "repo": repo,
+        "pr": pr,
+        "run_id": subject_id,
+        "ts": subject.ts.isoformat(),
+        # The subject's completeness, first, because it bounds every answer
+        # below: a prefix file list under-reports its own next door, and no row
+        # here can see that from the other side of the join.
+        "changed_files_total": subject.changed_files_total,
+        "files_recorded": files_recorded,
+        "files_complete": files_complete(subject.changed_files_total, files_recorded),
+        "window": {"days": days, "since": since,
+                   "cutoff": cutoff.isoformat() if cutoff is not None else None},
+        # Pre-cap, always. `considered` counts what the window and the file join
+        # produced; `hints` is what fits, and `hints_dropped` is the difference —
+        # a cap that trims an answer announces itself, or the trimmed answer
+        # reads as the whole one.
+        "considered": considered,
+        "hints": [_hint_view(r, now) for r in rows],
+        "hints_dropped": max(0, considered - len(rows)),
+        "scope": "confirmed findings on other PRs this board has panelled "
+                 "within the window, in files this PR touches",
+        # Said on the wire and not only in the docstring, because it is the one
+        # property a consumer must implement and cannot infer from the payload.
+        "contract": "a hint, not a finding: a reviewer must find the defect in "
+                    "the diff under review before reporting it",
+    }
 
 
 @router.get("/review/needs-human")

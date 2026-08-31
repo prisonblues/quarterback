@@ -2282,7 +2282,8 @@ app/          FastAPI service
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
-                   /review/needs-human, /review/collisions, /review/spend
+                   /review/needs-human, /review/collisions, /review/next-door,
+                   /review/spend
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)

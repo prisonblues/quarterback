@@ -174,6 +174,15 @@ individually reasonable small fixes;
 against a production line's 1, because a production fix has an external referee in red/green,
 the suite and CI while a test fix has none — nothing tests a test — so a budget that prices
 them alike spends most of itself where nothing can check it (#554);
+`next_door_days` (**7**, `0` for none) is how far back a defect **confirmed on another pull
+request**, in a file this one also touches, may be carried in front of the reviewers as
+context — the per-PR recurrence chain cannot see one file over, and on 2026-08-26 a P1
+confirmed in `app.auth.delegated()` shipped again an hour later in `app.auth.human()` on a
+different PR, into a round 1 with nothing of its own to recur against (#508); it is a hint and
+never a finding, so a seat must find the defect in the diff in front of it before reporting
+one — an instruction the prompt carries and **nothing enforces or measures**, which is said
+plainly rather than dressed up, though the hint TEXT is mechanically flattened and capped
+because it is model output from other PRs quoted into a prompt that instructs a model;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
 whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
