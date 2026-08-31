@@ -2630,9 +2630,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # — `preland --require-earned-stop` HOLDs on it and the review queue
             # files it `unconverged` — which is exactly right: a PR that stopped
             # because the money ran out has not been reviewed to a conclusion.
+            #
+            # `converged: False` SAID rather than left out (#626). This dict is
+            # hand-built and not `round_stop`'s return, so every key the rate
+            # reads has to be written here or it is NULL on the board — and NULL
+            # is `unmeasured`, "the panel never said", which is the one thing this
+            # path is not. It said: the ceiling ended the cycle and no seat read
+            # the diff. Omitting it filed a budget termination as a cycle that
+            # might still be running, outside the denominator and in the
+            # flattering direction, which is exactly the number #637 recalibrates
+            # `escalate_on.fix_injection` against.
             refuse_payload["round_stop"] = {
-                "stop": True, "confident": False, "reason": pre.reason,
-                "veto": [caps.refusal],
+                "stop": True, "confident": False, "converged": False,
+                "reason": pre.reason, "veto": [caps.refusal],
             }
             refuse_payload["stop_reason"] = pre.reason
         # RECORDED, unlike the title-pattern skip, and that is the difference

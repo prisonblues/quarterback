@@ -215,6 +215,7 @@ async def test_an_outcome_recorded_under_capitals_settles_the_same_defect(client
     ("/review/collisions", {"pr": 1}),
     ("/review/needs-human", {}),
     ("/review/spend", {}),
+    ("/review/convergence", {}),
 ])
 @pytest.mark.parametrize("repo", NOT_A_REPO)
 async def test_every_review_read_refuses_a_spelling_that_is_not_a_repo(
