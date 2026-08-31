@@ -154,7 +154,7 @@ import panel_timing               # noqa: F401
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
 # the two saying it differently is how the three checks in #96 came to disagree.
-from preland import board_get, board_request, mergeability   # noqa: E402
+from preland import board_config, board_get, board_request, mergeability   # noqa: E402
 # #274's one door, and #279's escalation list read back through it.
 from needs_human import announce, digest as nh_digest   # noqa: E402
 
@@ -282,6 +282,18 @@ def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict]
     veto, a coverage gap, or anything a stop rule reads.
     """
     if days <= 0:
+        return [], ""
+    # A host on NO board is silent, and only that one. `board_request` reports an
+    # unresolvable config as an ordinary error with no HTTP status, so without
+    # this check a box that never had `QUARTERBACK_BASE_URL` set lands on the
+    # `if err:` arm below and gets a `config_notes` line on every round of every
+    # pull request — published as a public comment under `--post`. That is the
+    # note-that-gets-trained-away failure `NEXT_DOOR_ABSENT` exists to avoid, and
+    # `harness_rules._dial_body` already draws this exact line on this exact
+    # evidence: no URL is "this box is on no board" and is silent; a URL that
+    # resolves but a board that will not answer — a bad token included — is a
+    # MISCONFIGURED host that IS enrolled, and its operator is owed the sentence.
+    if not board_config()[0]:
         return [], ""
     body, err, code = board_request("review/next-door",
                                     {"repo": gh_repo, "pr": pr_number, "days": days,
@@ -2167,6 +2179,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if next_door_why:
             notes.append(next_door_why)
         next_door = next_door_brief(hints)
+        if next_door:
+            notes.append(next_door_note(hints))
 
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
@@ -2189,11 +2203,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # on an unrelated round months later. Substituted after the render, that
         # text is never scanned for fields. The token survives the `.format`
         # untouched because it contains no braces of its own.
+        #
+        # COUNT 1, not a global replace, and it is the price of swapping after the
+        # render: by then `{diff}` is filled, so the reviewed diff is part of the
+        # string being rewritten. This repo's own `panel_core.py` holds the
+        # `NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"` assignment and the token appears in
+        # `REVIEW_PROMPT` and in two test files, so a PR touching any of them puts
+        # the literal token in its own diff — and an unbounded replace rewrites it
+        # there. On the common path (`next_door == ""`) the seat is then shown
+        # `NEXT_DOOR_SLOT = ""`, code that does not exist, and is well placed to
+        # report a P1 about it. The template carries the token exactly once and it
+        # sits ahead of `{diff}`, so the first occurrence is always the slot.
         return (brief if reads_code else brief_blind).format(
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text, diff=review.material(budget)[0],
                             code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
-                        ).replace(NEXT_DOOR_SLOT, next_door)
+                        ).replace(NEXT_DOOR_SLOT, next_door, 1)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say

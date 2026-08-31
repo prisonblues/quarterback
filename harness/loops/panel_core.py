@@ -764,6 +764,44 @@ def next_door_brief(hints: list[dict]) -> str:
                                    lines="\n".join(_hint_line(h) for h in rows))
 
 
+def next_door_note(hints: list[dict]) -> str:
+    """What this round actually SHOWED its seats, for the record (#508).
+
+    :class:`Dials` records `next_door_days` — the window the round asked through —
+    and that is the setting, not the answer. Two rounds at the same window can be
+    handed different hints an hour apart, and the block that carries them is the
+    one thing in the reviewer prompt that varies between rounds of the same PR.
+    #508 leans on the prompt being byte-identical "so that comparing two rounds is
+    not also comparing two prompts"; the moment there ARE hints that stops being
+    true, and without this line nothing in the payload says by how much or from
+    where. So the round records the count and the rival PRs it quoted — enough to
+    go and read the same findings back, and cheap enough to sit in `config_notes`.
+
+    Only the two facts that are structurally safe to print, and that is a
+    deliberate omission rather than an oversight: the note lands in `config_notes`,
+    which `--post` publishes as a PUBLIC pull-request comment, and a hint's title,
+    file and key are all model-authored text off the wire. PR numbers are `int` or
+    they are not repeated at all, so no flattening is needed and none is relied on.
+    The titles are in the prompt, which is where a reader looking for them is.
+
+    `""` when there is nothing to say, on :func:`next_door_brief`'s rule: a round
+    with no hints must add no line, or the note is on every round of every PR and
+    is the kind that gets trained away.
+    """
+    rows = [h for h in hints if isinstance(h, dict)][:NEXT_DOOR_MAX]
+    if not rows:
+        return ""
+    # `sorted(set(...))` rather than payload order: the note is read by a person
+    # comparing two rounds, and a list whose order tracks recency ranking would
+    # differ between rounds that quoted the same PRs.
+    prs = sorted({h["pr"] for h in rows
+                  if isinstance(h.get("pr"), int) and not isinstance(h["pr"], bool)})
+    where = (" from " + ", ".join(f"#{n}" for n in prs)) if prs else ""
+    plural = "" if len(rows) == 1 else "s"
+    return (f"next-door context: {len(rows)} confirmed finding{plural}{where} "
+            f"shown to this round's reviewers (#508)")
+
+
 MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
 diff. Read the brief below before the manifest — the question you are being asked is not the one
 a diff review asks, and answering the other one would waste the round.
@@ -2756,7 +2794,7 @@ __all__ = [
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",
     "NEXT_DOOR_SLOT", "NEXT_DOOR_HEADING", "_NEXT_DOOR_BRIEF",
-    "NEXT_DOOR_MAX", "_hint_line", "next_door_brief",
+    "NEXT_DOOR_MAX", "_hint_line", "next_door_brief", "next_door_note",
     "NEXT_DOOR_TITLE_CHARS", "NEXT_DOOR_DETAIL_CHARS", "_one_line",
     "DEFAULT_NEXT_DOOR_DAYS", "NEXT_DOOR_DAYS_MAX",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",

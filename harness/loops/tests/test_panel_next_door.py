@@ -44,6 +44,7 @@ leaves the round exactly as correct as every round before this feature existed, 
 the note is for the operator who switched it on and sees nothing.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -102,12 +103,25 @@ def rendered(next_door: str, scope: str = "diff") -> str:
 # ---- the off path, and the byte-identical prompt ---------------------------
 
 
-def answering(monkeypatch, body, err="", code=200, seen=None):
+#: A host that IS on a board, which is what every test below except the two about
+#: configuration is implicitly about. Pinned rather than inherited, because
+#: `board_next_door` asks `board_config` whether this box is enrolled before it
+#: asks the board anything — and the answer on a developer's machine differs from
+#: the answer in CI, which would make half this file pass for the wrong reason.
+BOARD = ("https://qb.example", "tok", "")
+
+
+def answering(monkeypatch, body, err="", code=200, seen=None, board=BOARD):
     """Pin what the board says, at the one seam `board_next_door` reads it through."""
     def fake(path, params):
         if seen is not None:
             seen.update({"path": path, **params})
         return body, err, code
+    # `raising=False`: the red half of the red/green for the configuration tests
+    # runs against a `panel` that has not imported `board_config` yet, and a
+    # monkeypatch that raises there would report an AttributeError where the point
+    # is to see the assertion fail.
+    monkeypatch.setattr(panel, "board_config", lambda: board, raising=False)
     monkeypatch.setattr(panel, "board_request", fake)
 
 
@@ -480,19 +494,25 @@ def test_a_manifest_prompt_carries_no_slot_to_fill():
 # the copy is.
 
 
-def a_round(monkeypatch, prompts: list[str], panel_block: dict | None = None) -> None:
+def a_round(monkeypatch, prompts: list[str], panel_block: dict | None = None,
+            diff: str = "diff --git a/a.py b/a.py\n+x\n",
+            out=None) -> dict | None:
     """`run()` with every outside edge pinned, collecting what each seat was sent.
 
     Modelled on `test_panel_ci_brief`'s end-to-end round, and for its reason: the
     fact under test is that a value computed in `run()` reaches a seat, and the only
     place that can be observed is the call that dispatches one.
+
+    `out` is a path for the round's JSON, returned parsed — the second observable
+    this file needs, since what a round RECORDED about its hints is in the payload
+    and not in any prompt.
     """
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: {
         "github": "acme/board", "path": "/tmp/r",
         "review_panel": {} if panel_block is None else panel_block,
         "_rules_baseline": ".harness-rules.sample",
         "reviewers": {"claude": {"enabled": True, "model": "sonnet"}}})
-    monkeypatch.setattr(panel_core, "sh", gh_stub(diff="diff --git a/a.py b/a.py\n+x\n"))
+    monkeypatch.setattr(panel_core, "sh", gh_stub(diff=diff))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate",
                         lambda *a, **k: ([], None, panel.CoverageRuling()))
@@ -502,8 +522,10 @@ def a_round(monkeypatch, prompts: list[str], panel_block: dict | None = None) ->
         return panel.ReviewerRun([], None, 800, None)
 
     monkeypatch.setattr(panel, "review_llm", fake_review)
-    assert panel.run("board", 34, post=False, record=False) == 0
-    assert prompts, "no seat was dispatched"
+    assert panel.run("board", 34, post=False, record=False,
+                     json_file=None if out is None else str(out)) == 0
+    assert prompts or out is not None, "no seat was dispatched"
+    return None if out is None else json.loads(Path(out).read_text())
 
 
 def test_a_hint_reaches_the_seats_own_prompt_braces_and_all(monkeypatch):
@@ -555,3 +577,149 @@ def test_the_dial_off_reaches_the_seat_as_a_prompt_and_the_board_not_at_all(monk
     assert called == [], "the dial was off and the round called the board anyway"
     for p in prompts:
         assert panel_core.NEXT_DOOR_SLOT not in p and "NEXT DOOR" not in p
+
+
+# ---- a host on no board says nothing, on every round of every PR -----------
+#
+# `board_request` reports an unresolvable configuration as an ordinary error with
+# NO HTTP status, so both branches that grant silence — `NEXT_DOOR_ABSENT` and the
+# 404 — are missed and the round lands on `if err:`. On a box that is on no board
+# that is a `config_notes` line every round of every pull request, published as a
+# public comment under `--post`: the note that gets trained away, taking the one
+# that fires when something is genuinely wrong with it.
+
+
+def test_a_host_that_is_on_no_board_at_all_is_silent(monkeypatch):
+    """The ordinary state of a box nobody enrolled, and it is not a fault anybody
+    can act on. `harness_rules._dial_body` already draws this line on this
+    evidence and this is the same line: no URL is "not on a board"."""
+    called: list = []
+    monkeypatch.setattr(
+        panel, "board_config",
+        lambda: ("", "", "no board configured on this host — "
+                         "QUARTERBACK_BASE_URL is unset"), raising=False)
+    monkeypatch.setattr(panel, "board_request",
+                        lambda *a, **k: called.append(a)
+                        or (None, "no board configured on this host", None))
+    hints, why = panel.board_next_door("acme/app", 1, 7)
+    assert hints == []
+    assert why == "", "a box on no board must not annotate every round it runs"
+    assert called == [], "there was no board to ask and it was asked anyway"
+
+
+def test_a_configured_board_that_cannot_be_used_is_still_reported(monkeypatch):
+    """The narrowness of the silence above, asserted rather than assumed — and it
+    is the whole point of the distinction. A host with a URL and no usable TOKEN
+    is a MISCONFIGURED host that IS enrolled: it asked for this feature and is
+    getting nothing, and the operator is owed the sentence. Swallowing this
+    alongside "not on a board" is how a fleet-wide token expiry looks like a quiet
+    week."""
+    answering(monkeypatch, None, err="no board token — set QUARTERBACK_TOKEN",
+              code=None, board=("https://qb.example", "", "no board token"))
+    hints, why = panel.board_next_door("acme/app", 1, 7)
+    assert hints == []
+    assert "no board token" in why, "an enrolled host that cannot read is not silent"
+
+
+# ---- the swap is bounded to the slot, not to every match in the prompt -----
+#
+# The token is substituted AFTER `.format()`, which is right for the brace trap
+# above and puts the REVIEWED DIFF inside the string being rewritten. This repo
+# writes the token in its own source — `panel_core.NEXT_DOOR_SLOT`'s assignment,
+# `REVIEW_PROMPT`, and these two test files — so a PR touching any of them carries
+# the literal token in its diff, and an unbounded `str.replace` rewrites it there.
+
+#: A diff of the line that DEFINES the token. Not a contrived case: it is
+#: `panel_core.py:500`, and any PR that edits it looks exactly like this.
+TOKEN_IN_DIFF = ('diff --git a/harness/loops/panel_core.py '
+                 'b/harness/loops/panel_core.py\n'
+                 '--- a/harness/loops/panel_core.py\n'
+                 '+++ b/harness/loops/panel_core.py\n'
+                 '@@ -500,1 +500,1 @@\n'
+                 '-NEXT_DOOR_SLOT = "<<<OLD_NEXT_DOOR>>>"\n'
+                 '+NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"\n')
+
+#: The added line, as the seat must still see it.
+TOKEN_LINE = '+NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"'
+
+
+def test_a_diff_that_quotes_the_token_is_not_rewritten_by_the_hint_block(monkeypatch):
+    """With hints, an unbounded replace pastes the whole CONFIRMED NEXT DOOR block
+    into the middle of the reviewed diff — inside a hunk, under a `+`, attributed
+    to this PR. The reviewer is then asked to review a change nobody wrote."""
+    answering(monkeypatch, {"hints": [hint()]})
+    prompts: list[str] = []
+    a_round(monkeypatch, prompts, diff=TOKEN_IN_DIFF)
+    for p in prompts:
+        assert TOKEN_LINE in p, "the PR's own diff was rewritten by the swap"
+        assert panel_core.NEXT_DOOR_HEADING in p, "the real slot went unfilled"
+        assert p.count(panel_core.NEXT_DOOR_HEADING) == 1
+
+
+def test_a_diff_that_quotes_the_token_survives_a_round_with_no_hints(monkeypatch):
+    """**The common path, and the worse one.** With no hints the fill is `""`, so
+    an unbounded replace shows the seat `NEXT_DOOR_SLOT = ""` — code that does not
+    exist, in a file it was asked to review, and it is well placed to report a
+    fabricated P1 about it."""
+    answering(monkeypatch, {"hints": []})
+    prompts: list[str] = []
+    a_round(monkeypatch, prompts, diff=TOKEN_IN_DIFF)
+    for p in prompts:
+        assert TOKEN_LINE in p, "the seat was shown a line this PR does not contain"
+        assert 'NEXT_DOOR_SLOT = ""' not in p
+        assert panel_core.NEXT_DOOR_HEADING not in p
+
+
+def test_the_template_carries_the_token_once_and_before_the_diff():
+    """What makes `count=1` correct rather than merely narrower. The first
+    occurrence is the slot only while the template holds exactly one and it sits
+    ahead of `{diff}` — a second slot, or one moved below the diff, silently turns
+    the bound into the wrong fill."""
+    for tmpl in (panel_core.reviewer_brief("diff"), panel_core.reviewer_brief("repo")):
+        assert tmpl.count(panel_core.NEXT_DOOR_SLOT) == 1
+        assert tmpl.index(panel_core.NEXT_DOOR_SLOT) < tmpl.index("{diff}")
+
+
+# ---- the round records what it showed --------------------------------------
+
+
+def test_the_round_records_how_many_hints_it_showed_and_whose(monkeypatch, tmp_path):
+    """`Dials.next_door_days` records the WINDOW, which is the setting and not the
+    answer. #508 rests on the reviewer prompt being byte-identical between rounds
+    "so that comparing two rounds is not also comparing two prompts"; the moment
+    hints exist that is no longer true, and without this line the payload cannot
+    say by how much or from where."""
+    answering(monkeypatch, {"hints": [hint(),
+                                      hint(pr=77, finding_key="k2", title="another"),
+                                      hint(pr=493, finding_key="k3", title="third")]})
+    payload = a_round(monkeypatch, [], out=tmp_path / "r.json")
+    lines = [n for n in payload["config_notes"] if "next-door context" in n]
+    assert len(lines) == 1, "the round showed hints and recorded nothing about them"
+    assert "3 confirmed findings" in lines[0]
+    assert "#77" in lines[0] and "#493" in lines[0]
+
+
+def test_a_round_with_nothing_next_door_records_no_line_about_it(monkeypatch, tmp_path):
+    """The commonest round adds no note, on `next_door_brief`'s own rule: a line on
+    every round of every PR is a line that gets trained away."""
+    answering(monkeypatch, {"hints": []})
+    payload = a_round(monkeypatch, [], out=tmp_path / "r.json")
+    assert not any("next-door context" in n for n in payload["config_notes"])
+
+
+def test_the_record_names_each_rival_pr_once_and_counts_only_what_was_shown():
+    """Two properties of the line itself, both about it being comparable between
+    rounds: a PR quoted twice is named once, and the count is the number of hints
+    the prompt actually carried rather than the number the board sent — the
+    renderer caps at `NEXT_DOOR_MAX` and a note above that would describe a block
+    nobody saw."""
+    one = panel_core.next_door_note([hint(), hint(finding_key="k2")])
+    assert "2 confirmed findings" in one and one.count("#493") == 1
+
+    many = panel_core.next_door_note(
+        [hint(pr=n, finding_key=f"k{n}") for n in range(40)])
+    assert f"{panel_core.NEXT_DOOR_MAX} confirmed findings" in many
+
+    assert panel_core.next_door_note([]) == ""
+    assert panel_core.next_door_note([None, "not a hint"]) == ""
+    assert "1 confirmed finding " in panel_core.next_door_note([hint()])

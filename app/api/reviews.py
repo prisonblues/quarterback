@@ -5871,6 +5871,25 @@ async def next_door(
         .where(
             ReviewRun.repo == repo,
             ReviewRun.pr != pr,
+            # ADJUDICATIONS ONLY, and this predicate is what makes the
+            # newest-observation pick below mean what its comment says it means.
+            # `verdict` has four values, not two: `unjudged` is a finding the
+            # panel KEPT on a round whose judge never ran (`judged: false`, or
+            # `reason='unjudged'` on the finding — see `_verdict`), and `sonar`
+            # is a cross-run observation. Neither is a judgement about the
+            # defect, so neither may DISPLACE one. Without this, a round 2 that
+            # merely failed to reach its judge writes a newer row for the same
+            # key, wins the `DISTINCT ON` below, fails the `confirmed` test
+            # after it, and erases a live confirmation — the endpoint answers
+            # `hints: []` and a quiet week looks identical to a judge outage.
+            #
+            # It is narrowed HERE rather than after the pick, and that is the
+            # opposite of what the `confirmed` test below does, deliberately:
+            # excluding `dismissed` early would resurrect stale confirmations
+            # (the regression the comment below is about), while excluding
+            # non-adjudications early is what stops a non-verdict outranking a
+            # verdict. Both are "the newest thing that ACTUALLY judged this".
+            ReviewFinding.verdict.in_(("confirmed", "dismissed")),
             # `IS NULL OR <> 'refuted'`, never a bare `<> 'refuted'`: SQL's
             # three-valued logic drops every row whose outcome is NULL from a
             # plain inequality, and those rows are the majority of the table and

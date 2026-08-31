@@ -422,6 +422,69 @@ async def test_a_defect_a_later_round_dismissed_is_not_resurrected(client, repo)
     assert body["hints"] == [], "a dismissed defect was resurrected from an older round"
 
 
+async def test_a_later_round_that_never_judged_does_not_erase_the_confirmation(
+        client, repo):
+    """**The other half of the filter-order regression, and the one that reads as
+    a quiet week.**
+
+    ``verdict`` has four values, not two. A round that keeps a finding whose judge
+    said nothing marks it ``unjudged`` (:func:`app.api.reviews._verdict`), and that
+    row is NEWER than the confirmation it repeats. Picked by a ``DISTINCT ON`` that
+    looks at every verdict and then tested for ``confirmed`` afterwards, the
+    non-judgement wins the pick, fails the test, and takes the live confirmation
+    with it — ``hints: []``, which is exactly what a repo with nothing next door
+    looks like.
+
+    This is the motivating case's own shape: PR #1 confirms the ordering defect,
+    PR #1 round 2 raises it again with no judge behind it, and PR #2 is then told
+    nothing at all.
+    """
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("dev bypass before the credential check",
+                                 key="delegated-order")])
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("dev bypass before the credential check",
+                                 key="delegated-order", reason="unjudged")])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    assert titles(await next_door(client, repo, 2)) == \
+        ["dev bypass before the credential check"], \
+        "a round whose judge never spoke erased a confirmation"
+
+
+async def test_a_whole_round_with_no_judge_does_not_erase_the_confirmation(
+        client, repo):
+    """The same erasure through the other spelling, and the likelier one: the
+    finding carries no ``reason`` at all and the whole ROUND was unjudged —
+    ``judged: false``, which the ingest models deliberately for a judge that was
+    unavailable or a budget that ran out. Every finding of that round is
+    ``unjudged`` however it was written."""
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("ordering", key="delegated-order")])
+    await record(client, repo, 1, judged=False, changed_files=files(AUTH),
+                 to_fix=[finding("ordering", key="delegated-order")])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    assert titles(await next_door(client, repo, 2)) == ["ordering"], \
+        "an unjudged round erased a confirmation"
+
+
+async def test_a_sonar_observation_does_not_erase_the_confirmation(client, repo):
+    """The fourth verdict, and the one nobody thinks of as a verdict. A
+    ``sonar_findings`` row is stored ``sonar``: a cross-run observation, not an
+    adjudication of anything, and ``_score`` already excludes it from scoring one
+    function over. Sharing a key with a confirmed defect it must not displace it.
+    """
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 to_fix=[finding("shape", key="delegated-order")])
+    await record(client, repo, 1, changed_files=files(AUTH),
+                 sonar_findings=[finding("shape", key="delegated-order")])
+    await record(client, repo, 2, changed_files=files(AUTH))
+
+    assert titles(await next_door(client, repo, 2)) == ["shape"], \
+        "a sonar observation erased a confirmation"
+
+
 async def test_a_defect_dismissed_then_confirmed_again_is_carried(client, repo):
     """The same rule in the other direction, so the fix is a REORDERING and not a
     second exclusion: a defect the judge dismissed and a later round confirmed is
