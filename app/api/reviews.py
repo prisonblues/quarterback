@@ -355,7 +355,36 @@ this board must not learn the vocabulary), carried on ``GET /review/{id}`` besid
 the verdict, and refused whole rather than trimmed when it is too big to store —
 half a policy record is not a smaller policy, it is one no round ran under.
 
-The remaining twenty-five are listed in that test with the reasoning for each
+**#647 — the working behind a number this board already stores.** #643 stored
+the dial VALUES and left five keys on that list which are the working behind
+numbers this model already binds — ``provenance_counts`` since v2.26,
+``diff_chars`` since before it. All five are stored now, and the argument is one
+sentence: a stored answer whose denominator is not on the row is an answer nobody
+can recalibrate against.
+
+* ``fix_range_source`` (#512) — WHICH range answered: ``increment`` (the diff the
+  round reviewed), ``compare`` (the separate API fetch) or ``reconstructed``
+  (#504's rebuild after a rewritten history). The three are not one measurement:
+  the increment drops a base-branch merge's files and the compare range does not.
+* ``provenance_restored`` (#559) — how much of the fix range the round declined
+  to attribute because the cycle had already seen it, which earlier rounds it
+  compared against, and ``why`` where the comparison could not be made at all.
+* ``rules`` (#305) — which LAYER supplied each dial, with the reason and expiry
+  for a board dial. ``review_panel`` is ``Dials.as_dict()`` and does **not**
+  carry ``escalate_on``; this does, which makes it the only field on the row that
+  records the threshold a round ran under.
+* ``scope`` and ``since_sha`` — what the round actually reviewed. ``diff_chars``
+  is stored and is scope-dependent, so a consumer comparing it across a cycle's
+  rounds without these is comparing two different measurements.
+
+Two of them are objects and are stored the way ``review_panel`` is — opaque,
+whole-or-not-at-all, size-bounded, on ``GET /review/{id}`` only. Three are
+scalars and ride ``_run_view``, so every view carries them: they are exactly what
+a consumer slicing a POPULATION needs, and the rule ``merge_base`` and
+``base_sha`` already state is that a scalar whose whole point is cross-run
+comparison must not cost one fetch per run.
+
+The remaining twenty are listed in that test with the reasoning for each
 tier. None of them shares a name with a ``review_runs`` column, which the test
 also asserts: that pairing — a column that wants a value, and a payload sending
 it into ``extra="ignore"`` — is exactly the shape ``converged`` had.
@@ -1464,32 +1493,84 @@ PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
 #: verdict against six of its twelve dials would be checking it against a policy
 #: that never ran. See :func:`_dials_or_none`.
 MAX_DIALS_CHARS = 8192
+#: How big a stored ``rules`` may be, serialised (#647). Two orders larger than
+#: :data:`MAX_DIALS_CHARS` above because the object is: ``review_panel`` is twelve
+#: scalars, and ``rules`` is one entry per REVIEW DIAL — fifty-two of them on this
+#: repository, at 7,299 characters — each carrying the value, the layer that
+#: supplied it, and for a board dial its source, scope, reason, setter and expiry.
+#:
+#: Measured rather than picked. ``app/models/dial.py`` bounds a board dial's
+#: ``reason`` at 2,000 characters and its path at 200, so a repository whose every
+#: review dial came from the board with a maximal reason produces a record of about
+#: 148,000 characters — a configuration THIS board lets somebody create through
+#: ``POST /dial``. A bound under that would refuse a legitimate record, and the
+#: refusal is whole-object, so one long argument would cost the layer for all
+#: fifty-two dials.
+MAX_RULES_CHARS = 262144
+#: How big a stored ``provenance_restored`` may be, serialised (#647). Small, and
+#: it stays small: the block is two integers, two lists of ROUND NUMBERS and one
+#: sentence. ``files`` is a COUNT and not a list of paths, which is what keeps it
+#: from scaling with the size of the fix range it describes.
+MAX_RESTORED_CHARS = 8192
+#: How long ``scope`` or ``fix_range_source`` may be (#647). Both are one word out
+#: of the panel's own vocabulary, and anything past this is not a word — see
+#: :func:`_word_or_none`, which refuses rather than truncating for the reason every
+#: other refusal in this module does.
+MAX_SCOPE_CHARS = 64
 
 
-def _dials_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
-    """``review_panel`` as this board will store it, and why it did not (#643).
+def _has_nul(node: object) -> bool:
+    """Is there a NUL in any string anywhere in this parsed JSON value?
 
-    The dials a round applied, kept **verbatim and uninterpreted**. Every other
-    coercer in this module reads its value against a vocabulary the two sides
-    share — :data:`PROVENANCE`, :data:`PR_STATES` — and this one deliberately has
-    none: the board does not know what a dial means and must not learn, which is
-    the argument ``app/api/dials.py`` makes at length and the drift #305 was filed
-    over. So a dial name is not checked, a dial value is not coerced, and nothing
-    here derives one dial from another.
+    Postgres refuses ``\u0000`` inside a JSONB string — the one escape sequence
+    its JSON type cannot represent — so a value carrying one is a 500 at INSERT
+    unless ingest catches it first. Keys as well as values: a dial PATH with a NUL
+    in it fails the same way, and only a walk reaches both.
+
+    Bounded by the same recursion the JSON parser already survived to hand this
+    value over, so a payload deep enough to overflow here never got parsed.
+    """
+    if isinstance(node, str):
+        return "\x00" in node
+    if isinstance(node, Mapping):
+        return any(_has_nul(k) or _has_nul(x) for k, x in node.items())
+    if isinstance(node, (list, tuple)):
+        return any(_has_nul(x) for x in node)
+    return False
+
+
+def _opaque_or_none(v: object, *, field: str, cap: int,
+                    why_whole: str) -> tuple[dict[str, Any] | None, str]:
+    """A block this board stores VERBATIM and never interprets, or why it did not.
+
+    Three fields share this. ``review_panel`` (#643) is the dials a round applied;
+    ``rules`` (#305, stored by #647) is which LAYER supplied each of them;
+    ``provenance_restored`` (#559, stored by #647) is what a round declined to
+    attribute and against which earlier rounds. Every other coercer in this module
+    reads its value against a vocabulary the two sides share — :data:`PROVENANCE`,
+    :data:`PR_STATES` — and these deliberately have none: the board does not know
+    what a dial means and must not learn, which is the argument
+    ``app/api/dials.py`` makes at length and the drift #305 was filed over. So a
+    key is not checked, a value is not coerced, and nothing here derives one from
+    another.
+
+    One function and not three copies, because the three have to agree. They are
+    stored on one row and read together — a reader holding ``review_panel``'s
+    ``escalate_on.fix_injection`` against ``rules``' layer for the same dial is
+    reading a PAIR — and two implementations of "was this storable" eventually
+    disagree about which half of that pair survived.
 
     What is left to refuse is shape and size, and both refuse the WHOLE object
-    rather than part of it. A dial set with half its keys dropped is not a smaller
-    true policy, it is a policy that never ran, and a reader checking a round's
-    verdict against it would be checking against a fiction — the same collapse
-    :func:`_unread_paths` refuses when it returns ``None`` for a declaration it
-    could read nothing out of, one argument up.
+    rather than part of it — the same collapse :func:`_unread_paths` refuses when
+    it returns ``None`` for a declaration it could read nothing out of.
+    ``why_whole`` is the caller's one-line statement of what a trimmed version of
+    ITS block would falsely assert, because that is the part that is not generic.
 
-    Returns the pair ``(stored, why)``: ``why`` is ``""`` when nothing was
-    refused, and otherwise the one-line reason :func:`record_review` reports back
-    to the sender. Two answers from one function for :func:`_unread_paths`'s
-    reason — the validator stores and the response explains, and two
-    implementations of "was this usable" eventually disagree about a payload
-    nobody looked at twice.
+    Returns the pair ``(stored, why)``: ``why`` is ``""`` when nothing was refused,
+    and otherwise the one-line reason :func:`record_review` reports back to the
+    sender. Two answers from one function for :func:`_unread_paths`'s reason — the
+    validator stores and the response explains, and two implementations of "was
+    this usable" eventually disagree about a payload nobody looked at twice.
     """
     if v is None:
         return None, ""
@@ -1503,26 +1584,123 @@ def _dials_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
     # so starlette parses a body containing one and hands this validator a float
     # Postgres will not take in a JSONB column. Without the flag the refusal
     # happens at INSERT, as a 500 on a request that had already passed every
-    # check this module makes — a stored-policy record turning a panel round into
-    # a failed POST, which is the opposite of "a dropped field says so".
+    # check this module makes — a stored record turning a panel round into a
+    # failed POST, which is the opposite of "a dropped field says so".
     try:
         dumped = json.dumps(v, allow_nan=False)
     except (TypeError, ValueError):
-        return None, ("review_panel held a value this board cannot store as JSON "
-                      "— NaN, an infinity, or something that is not JSON at all")
+        return None, (f"{field} held a value this board cannot store as JSON "
+                      f"— NaN, an infinity, or something that is not JSON at all")
     # The other value Postgres refuses in JSONB, and it survives every check above:
-    # a NUL inside a string. `json.dumps` writes it as the six characters `\u0000`,
-    # which is what this looks for — the parsed value holds one real NUL and
-    # scanning the dump is the only place both keys and nested values are in reach.
-    if "\\u0000" in dumped:
-        return None, ("review_panel held a NUL inside a string, which Postgres "
-                      "refuses in a JSONB value")
-    if len(dumped) > MAX_DIALS_CHARS:
-        return None, (f"review_panel was {len(dumped)} characters, over the "
-                      f"{MAX_DIALS_CHARS} a stored policy record may be — refused "
-                      f"whole rather than trimmed, because half a dial set is not "
-                      f"a policy any round ran under")
+    # a NUL inside a string. Found by WALKING the parsed value rather than by
+    # scanning the dump for `\u0000`, which is what #643 did and which cannot tell
+    # the two apart: `json.dumps` writes a real NUL as the six characters
+    # `\u0000`, and it writes a string that literally CONTAINS those six characters
+    # as seven, with the backslash doubled — and the seven contain the six. So a
+    # board dial whose reason quoted an escape sequence had its whole rules record
+    # refused for holding a NUL it did not hold. The walk reaches keys and nested
+    # values, which was the dump's only advantage.
+    if _has_nul(v):
+        return None, (f"{field} held a NUL inside a string, which Postgres "
+                      f"refuses in a JSONB value")
+    if len(dumped) > cap:
+        return None, (f"{field} was {len(dumped)} characters, over the {cap} a "
+                      f"stored record may be — refused whole rather than trimmed, "
+                      f"because {why_whole}")
     return dict(v), ""
+
+
+def _dials_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``review_panel`` as this board will store it, and why it did not (#643).
+
+    The dials a round APPLIED. See :func:`_opaque_or_none` for what is refused and
+    why nothing here reads a dial's name; the one thing specific to this field is
+    what a trimmed dial set would assert, which is a policy no round ran under —
+    a reader checking a round's verdict against six of its twelve dials would be
+    checking it against a fiction.
+    """
+    return _opaque_or_none(v, field="review_panel", cap=MAX_DIALS_CHARS,
+                           why_whole=("half a dial set is not a smaller policy, "
+                                      "it is one no round ran under"))
+
+
+def _rules_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``rules`` as this board will store it, and why it did not (#305, #647).
+
+    WHICH LAYER supplied each dial — ``defaults``, ``sample``, ``overlay`` or
+    ``board`` — beside the value ``review_panel`` carries. It is the half of #305
+    that #643 did not store, and it is where ``escalate_on.fix_injection`` appears
+    at all: ``review_panel`` is ``Dials.as_dict()``, twelve settings, and
+    ``escalate_on`` is not among them.
+
+    Opaque for the same reason and then some. This board would have to learn the
+    resolution ORDER as well as the vocabulary to interpret a layer, and a second
+    implementation of "which file answered" is the drift #305 was filed over
+    rather than a convenience.
+
+    A trimmed record is worse here than anywhere else this rule applies: the whole
+    content of the field is a mapping from dial to source, so dropping half of it
+    leaves a reader with dials whose layer is absent and no way to tell that from
+    a dial the resolver never saw.
+    """
+    return _opaque_or_none(v, field="rules", cap=MAX_RULES_CHARS,
+                           why_whole=("a rules record with half its dials dropped "
+                                      "cannot be told from one whose resolver "
+                                      "never saw them"))
+
+
+def _restored_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``provenance_restored`` as this board will store it, and why not (#559, #647).
+
+    What the round declined to attribute because the cycle had already seen it:
+    ``count`` and ``files`` (a count, not a list), the ``rounds`` it compared
+    against, the ``unread`` rounds it could not read, and ``why`` where the
+    comparison could not be made at all.
+
+    Opaque on the rule above, and the reason is sharper than usual: this is the
+    filter that moves ``provenance_counts.introduced``, the number #637
+    recalibrates ``escalate_on.fix_injection`` against. A board that read a key out
+    of here would be a second implementation of #559's filter, free to disagree
+    with the panel about the same round — which is exactly what ``m6bc45ff1``
+    refuses for ``converged``.
+    """
+    return _opaque_or_none(v, field="provenance_restored", cap=MAX_RESTORED_CHARS,
+                           why_whole=("a restored count without the rounds it was "
+                                      "measured against is a number with no "
+                                      "denominator"))
+
+
+def _word_or_none(v: object) -> str | None:
+    """``scope`` or ``fix_range_source``: one word, verbatim, or nothing (#647).
+
+    **Stored against no vocabulary, and this is the coercer in this module that
+    has to justify NOT having one.** :meth:`ReviewIn._state` coerces anything
+    outside :data:`PR_STATES` to NULL, and the argument there is sound: GitHub's
+    states are a foreign, stable set, and a variant spelling stored verbatim
+    silently reclassifies a PR in the direction that hides work.
+
+    Neither half of that holds here. The set is not stable — ``fix_range_source``
+    was ``increment``/``compare`` when #512 published it and #504 added
+    ``reconstructed``, so a frozen set written in this file would have dropped the
+    third source on the release that introduced it, which is #647's own bug one
+    layer down and in the harder-to-notice direction. And a value outside the set
+    reclassifies nothing: a consumer grouping a population by this field gets an
+    extra group it can SEE, rather than a value folded into a group it cannot.
+
+    So the refusals are about being a WORD and not about which word. A non-string,
+    a blank and an over-long value all become NULL and are named back under
+    ``unreadable_fields`` — one signal rather than two, because unlike
+    ``review_panel`` there is only one way to get a one-word field wrong, and a
+    size refusal and a shape refusal here want the same fix.
+
+    Refused rather than truncated, on this module's standing rule: a truncated
+    ``increment`` is ``incre``, which is not a shorter true answer but a different
+    false one.
+    """
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    return s if s and len(s) <= MAX_SCOPE_CHARS else None
 
 
 def _unread_paths(v: object) -> tuple[list[str] | None, int]:
@@ -1762,6 +1940,55 @@ class ReviewIn(BaseModel):
     #: field here does. See :func:`_dials_or_none` for what is refused and why the
     #: refusal is whole-object.
     review_panel: dict[str, Any] | None = None
+    #: WHICH LAYER supplied each of those dials (#305, stored by #647) — and, for a
+    #: board dial, the reason somebody gave and when it lapses. Stored opaquely on
+    #: :func:`_rules_or_none`'s terms.
+    #:
+    #: A separate field from ``review_panel`` and not folded into it, because the
+    #: panel sends them separately and they are not co-extensive: ``review_panel``
+    #: is ``Dials.as_dict()``, the twelve #165/#297 settings, and ``rules.dials``
+    #: covers every dotted path under ``review_panel.`` and ``reviewers.`` — fifty
+    #: -two of them, ``escalate_on.fix_injection`` among them. Merging the two here
+    #: would be this board composing a record the panel never sent.
+    #:
+    #: Present on EVERY payload including the skips, unlike ``review_panel``: a
+    #: round that refused still resolved a policy, and "which rules did this repo
+    #: have when it refused" is exactly the question a refusal raises.
+    rules: dict[str, Any] | None = None
+    #: What the round declined to attribute because the cycle had already seen it
+    #: (#559, stored by #647): ``count``, ``files`` (a count), the ``rounds`` it
+    #: compared against, the ``unread`` rounds it could not read, and ``why`` where
+    #: the comparison could not be made at all. Opaque — :func:`_restored_or_none`.
+    #:
+    #: ``null`` is "the question did not arise", which covers a round outside a
+    #: cycle and round 2, whose only prior round IS the anchor. It is not the same
+    #: as a round that looked for restored lines and found none, and this model
+    #: keeps the two apart for the reason ``provenance_counts`` beside it does.
+    provenance_restored: dict[str, Any] | None = None
+    #: WHICH range the attribution read (#512, stored by #647): ``increment``,
+    #: ``compare`` or ``reconstructed``. Stored verbatim against no vocabulary —
+    #: :func:`_word_or_none` argues why this field of all fields must not have one.
+    #:
+    #: ``null`` where the question does not arise. The three are not one
+    #: measurement, so a consumer reading ``provenance_counts`` across a cycle's
+    #: rounds without this is comparing counts over denominators that changed.
+    fix_range_source: str | None = None
+    #: What this round actually REVIEWED — ``pr`` (the whole diff) or ``increment``
+    #: (the commits since ``since_sha``) — and the commit that increment starts
+    #: from. #647.
+    #:
+    #: Recorded rather than inferred from the round number, because the panel falls
+    #: back to ``pr`` whenever the anchor is missing or the fetch failed: "round 2"
+    #: does not imply "increment". ``diff_chars`` is stored and is scope-dependent,
+    #: which makes this the field that says whether two rounds' ``diff_chars`` are
+    #: the same measurement.
+    #:
+    #: ``since_sha`` goes through :func:`_sha_or_none` with the other three commit
+    #: ids, so the round's own anchor and the PR's base end are normalised by one
+    #: rule — a range assembled from them at read time must not compare a
+    #: normalised value against a raw one.
+    scope: str | None = None
+    since_sha: str | None = None
     #: Set by the validators, never by the caller: what was trimmed, what could
     #: not be read, and which bucket names this board did not recognise. All of it
     #: reported in the response, none of it storable by the sender.
@@ -1781,11 +2008,27 @@ class ReviewIn(BaseModel):
     #: refused has to guess which field to go and look at.
     merge_base_dropped: str | None = None
     base_sha_dropped: str | None = None
+    #: ...and the round's own anchor (#647), on exactly that argument: a producer
+    #: that sends a good merge base and a garbled ``since_sha`` has one bug, and
+    #: ``since_sha`` is the one of the three whose loss silently changes what
+    #: ``scope: increment`` means.
+    since_sha_dropped: str | None = None
     #: Why a ``review_panel`` that arrived was not stored, or ``""``. Its own
     #: signal rather than a line in ``unreadable_fields``: that list means "this
     #: value was not the SHAPE its field takes", and an object refused for its SIZE
     #: is a different sender fault wanting a different remedy.
     review_panel_dropped: str = ""
+    #: The same for the two blocks #647 stores, and their own fields for
+    #: ``base_sha_dropped``'s reason: a producer whose ``rules`` was refused for
+    #: its size and whose ``provenance_restored`` arrived intact has one bug, and a
+    #: reader told only that *something* was refused has to guess which.
+    #:
+    #: ``scope`` and ``fix_range_source`` have no such field on purpose. They are
+    #: one word each, there is only one way to get a one-word field wrong, and both
+    #: refusals want the same fix — so they are named in ``unreadable_fields`` and
+    #: nowhere else. See :func:`_word_or_none`.
+    rules_dropped: str = ""
+    provenance_restored_dropped: str = ""
     #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
     #: Tally keys that ARE a known bucket and whose count could not be believed —
@@ -1873,6 +2116,11 @@ class ReviewIn(BaseModel):
         head = v.get("head_sha")
         merge_base, base_sha = v.get("merge_base"), v.get("base_sha")
         dials = v.get("review_panel")
+        # #647's five. `since` is read here beside the other commit ids because it
+        # goes through the same `_sha_or_none` and earns the same drop signal.
+        rules, restored = v.get("rules"), v.get("provenance_restored")
+        scope, range_source = v.get("scope"), v.get("fix_range_source")
+        since = v.get("since_sha")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -1892,6 +2140,10 @@ class ReviewIn(BaseModel):
                                        and _sha_or_none(merge_base) is None else None),
                 "base_sha_dropped": (_echo(base_sha) if base_sha is not None
                                      and _sha_or_none(base_sha) is None else None),
+                # ...and the round's own anchor (#647). Third of three and not a
+                # merged flag, for the reason directly above.
+                "since_sha_dropped": (_echo(since) if since is not None
+                                      and _sha_or_none(since) is None else None),
                 # Keys this board has no column for. Named rather than dropped: a
                 # bucket the panel has started sending and the board silently
                 # ignores is #93 happening again, one release later.
@@ -1927,6 +2179,12 @@ class ReviewIn(BaseModel):
                 # this field takes" and the commonest refusal here is a shape that
                 # IS a mapping and is too big to store.
                 "review_panel_dropped": _dials_or_none(dials)[1],
+                # #647's two blocks, on the same rule and for the same reason. Each
+                # named on its own: `rules` is bounded two orders higher than the
+                # other two, so "one of them was too big" would send a producer to
+                # the wrong field.
+                "rules_dropped": _rules_or_none(rules)[1],
+                "provenance_restored_dropped": _restored_or_none(restored)[1],
                 "unreadable_fields": sorted(
                     name for name, val, ok in (
                         ("unread_files", unread, isinstance(unread, (str, list))),
@@ -1937,6 +2195,21 @@ class ReviewIn(BaseModel):
                         # which is a true statement about a skip and a false one
                         # about a reviewed round.
                         ("review_panel", dials, isinstance(dials, Mapping)),
+                        # #647's two blocks, on that same rule: a `rules` that is
+                        # not an object would land on the NULL that means "the
+                        # panel did not say", which is a claim about the payload's
+                        # AGE rather than about this round.
+                        ("rules", rules, isinstance(rules, Mapping)),
+                        ("provenance_restored", restored,
+                         isinstance(restored, Mapping)),
+                        # ...and #647's two words. One signal covers all three
+                        # ways to get them wrong — a non-string, a blank and an
+                        # over-long value — because a one-word field has one
+                        # remedy. `_word_or_none` says why there is no vocabulary
+                        # test in here as well.
+                        ("scope", scope, _word_or_none(scope) is not None),
+                        ("fix_range_source", range_source,
+                         _word_or_none(range_source) is not None),
                         # #67's two, on the same rule: `recurrence_counts:
                         # ["revisited"]` is a producer sending the wrong SHAPE, and
                         # it would otherwise land on NULL indistinguishable from a
@@ -1951,14 +2224,18 @@ class ReviewIn(BaseModel):
         """One repository, one stored spelling — :func:`_stored_repo`, and #326."""
         return _stored_repo(v)
 
-    @field_validator("head_sha", "merge_base", "base_sha", mode="before")
+    @field_validator("head_sha", "merge_base", "base_sha", "since_sha",
+                     mode="before")
     @classmethod
     def _commit_id(cls, v: object) -> str | None:
         """Every commit id on this model, coerced by one rule.
 
-        Listed on one validator rather than three copies: the head end and the
-        base end have to agree about what a commit id IS, or a range assembled
-        from them at read time compares a normalised value against a raw one."""
+        Listed on one validator rather than four copies: the head end and both
+        base ends have to agree about what a commit id IS, or a range assembled
+        from them at read time compares a normalised value against a raw one.
+        ``since_sha`` (#647) joined them for exactly that reason — under increment
+        scope the round's target is ``since_sha...head_sha``, so it is the other
+        end of a range whose head end is already normalised here."""
         return _sha_or_none(v)
 
     @field_validator("unread_files", mode="before")
@@ -1976,6 +2253,31 @@ class ReviewIn(BaseModel):
         """The dials verbatim, or None. See :func:`_dials_or_none` for why a
         refusal takes the whole object and why nothing here reads a dial's name."""
         return _dials_or_none(v)[0]
+
+    @field_validator("rules", mode="before")
+    @classmethod
+    def _rules(cls, v: object) -> dict[str, Any] | None:
+        """Which layer supplied each dial, verbatim or not at all — #305, #647.
+        See :func:`_rules_or_none`."""
+        return _rules_or_none(v)[0]
+
+    @field_validator("provenance_restored", mode="before")
+    @classmethod
+    def _restored(cls, v: object) -> dict[str, Any] | None:
+        """What the round declined to attribute, verbatim or not at all — #559,
+        #647. See :func:`_restored_or_none`."""
+        return _restored_or_none(v)[0]
+
+    @field_validator("scope", "fix_range_source", mode="before")
+    @classmethod
+    def _word(cls, v: object) -> str | None:
+        """One word, verbatim, or None (#647).
+
+        Both on one validator for :meth:`_commit_id`'s reason: they are read
+        together — ``fix_range_source: increment`` is only meaningful beside
+        ``scope: increment`` — and two coercions of "is this a word" would let one
+        of the pair survive a payload the other did not."""
+        return _word_or_none(v)
 
     @field_validator("provenance_counts", mode="before")
     @classmethod
@@ -2622,6 +2924,22 @@ async def record_review(
         # into "no panel ever said". Nothing on this board reads a dial out of it
         # — see `_dials_or_none` for why that is deliberate rather than pending.
         review_panel=body.review_panel,
+        # #647's four, on that same rule and stored beside the dial VALUES they
+        # explain. `rules` is the only field on this row that records the
+        # threshold a round ran under — `review_panel` is `Dials.as_dict()` and
+        # `escalate_on` is not in it — which is why a round that ran before this
+        # column cannot be recalibrated against, and why nothing here waits for a
+        # consumer to ask for it first.
+        rules=body.rules,
+        provenance_restored=body.provenance_restored,
+        fix_range_source=body.fix_range_source,
+        # What the round reviewed, and the anchor it reviewed from. Both stored
+        # even where they restate the default (`scope: "pr"` on a round 1), for
+        # `provenance_counts`' reason: NULL has to keep meaning "recorded before
+        # this column", and a board that only stored the interesting value would
+        # make every ordinary round indistinguishable from a pre-#647 one.
+        scope=body.scope,
+        since_sha=body.since_sha,
         recurrence_counts=body.recurrence_counts,
         premise_counts=body.premise_counts,
         changed_lines=body.changed_lines,
@@ -2878,6 +3196,14 @@ async def record_review(
     # way to tell its payload was disbelieved.
     if body.review_panel_dropped:
         dropped["review_panel_dropped"] = body.review_panel_dropped
+    # #647's two blocks, on that same argument. `rules` refused in silence reads as
+    # "the panel did not say which layer answered", which is a statement about a
+    # payload's age; `provenance_restored` refused in silence reads as "the
+    # question did not arise", which is what round 2 legitimately sends.
+    if body.rules_dropped:
+        dropped["rules_dropped"] = body.rules_dropped
+    if body.provenance_restored_dropped:
+        dropped["provenance_restored_dropped"] = body.provenance_restored_dropped
     # ...and the base end, each named rather than one flag for "a commit id was
     # refused". These two are what a pre-land verdict resolves against the repo,
     # so a producer sending a base it thinks was stored has to be told it was not.
@@ -2885,6 +3211,10 @@ async def record_review(
         dropped["merge_base_dropped"] = body.merge_base_dropped
     if body.base_sha_dropped is not None:
         dropped["base_sha_dropped"] = body.base_sha_dropped
+    # ...and the third, #647's. A `since_sha` the board refused leaves a round
+    # whose `scope` says `increment` with no anchor to say increment of WHAT.
+    if body.since_sha_dropped is not None:
+        dropped["since_sha_dropped"] = body.since_sha_dropped
     # Every provenance bucket this board did not recognise, from the findings and
     # from the run's own tally, named rather than swallowed.
     #
@@ -3632,6 +3962,23 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # first fetching each run one at a time.
         "merge_base": r.merge_base,
         "base_sha": r.base_sha,
+        # #647's three scalars, and they ride here for exactly the reason the two
+        # above do. `scope` says WHAT this round reviewed, so it is what makes
+        # `diff_chars` beside it comparable across a cycle's rounds at all;
+        # `since_sha` is the other end of that range; `fix_range_source` says which
+        # range the attribution behind `provenance_counts` actually read.
+        #
+        # A consumer recalibrating a threshold reads a POPULATION — #637 reads
+        # thousands of rounds — and the whole point of these three is to slice it.
+        # Detail-only would have meant one fetch per run to learn which rounds were
+        # measured the same way, which is the trade `merge_base` and `base_sha`
+        # already refused. The two OBJECTS #647 stores do not ride here, on
+        # `unread_files`' rule two keys down: `rules` is bounded at
+        # `MAX_RULES_CHARS` and `GET /reviews?limit=500` would serialise five
+        # hundred of them.
+        "scope": r.scope,
+        "since_sha": r.since_sha,
+        "fix_range_source": r.fix_range_source,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
         # two lines down, and for the same reason. The cost `changed_files` was
         # kept out of this view for is response SIZE: `unread_files` is bounded
@@ -7088,13 +7435,15 @@ async def get_review(
 ) -> dict:
     """One run in full — scorecards plus every finding and its verdict."""
     # `undefer`, explicitly: this is the ONE endpoint that publishes the unread
-    # paths, and the column is deferred so the list views never pay for them.
+    # paths and #647's `rules`, and both columns are deferred so the list views
+    # never pay for them — `rules` for the sharper version of the same argument,
+    # being the largest column on the table at `MAX_RULES_CHARS`.
     # Async SQLAlchemy cannot lazy-load, so without this the attribute access
     # below raises `MissingGreenlet` rather than quietly issuing a second query —
     # which is the failure mode worth having, since it cannot go unnoticed.
     run = await session.scalar(
         select(ReviewRun).where(ReviewRun.id == run_id)
-        .options(undefer(ReviewRun.unread_files))
+        .options(undefer(ReviewRun.unread_files), undefer(ReviewRun.rules))
     )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no review run {run_id}")
@@ -7154,6 +7503,18 @@ async def get_review(
         # pre-flight refusal, and every round recorded before the column — and `{}`
         # is a caller that sent an empty object.
         "review_panel": run.review_panel,
+        # #647: the LAYER behind each of those values, and the working behind the
+        # `provenance_counts` two keys up. Detail-only, on `review_panel`'s rule
+        # directly above — `rules` is one entry per review dial and a page of them
+        # is a config dump — while the three scalars beside them ride `_run_view`,
+        # because a population is what a recalibration reads.
+        #
+        # Unmasked, both of them. NULL on `rules` is a round recorded before the
+        # column; NULL on `provenance_restored` is a round where the question did
+        # not arise — outside a cycle, or round 2, whose only prior round is the
+        # anchor — and neither is the same as an empty object.
+        "rules": run.rules,
+        "provenance_restored": run.provenance_restored,
         # #113: what this round ASKED for, kept apart from the per-seat answer in
         # `reviewers[].code_blind`. A round with the setting on and every seat
         # blind is a configuration doing nothing, and only the difference shows it.
