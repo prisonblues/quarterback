@@ -2276,6 +2276,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # than claiming which commit produced the diff. The later commit is recorded
     # because it is the one the next round's fix range has to start from — and
     # "could not tell" (a None) leaves the earlier answer standing.
+    #
+    # `reviewed_from` is the head this round's material was built from, kept
+    # because `head_sha` is about to stop naming it (#106). The two consumers of
+    # this field want opposite ends of the move: provenance wants the later
+    # commit, and `ReviewScope.decide` — which has already run, a few dozen lines
+    # up — reviewed the increment ending at the EARLIER one. Nothing here
+    # reconciles that, and the veto built from this variable is the whole of the
+    # cheap half: it makes the resulting gap cost the round its confident stop
+    # instead of leaving it to be inferred from a prose note.
+    reviewed_from = head_sha
     moved_to = _head_sha_now(gh_repo, pr_number)
     if moved_to and moved_to != head_sha:
         notes.append(f"the PR head moved from {head_sha[:8]} to {moved_to[:8]} while this "
@@ -3608,6 +3618,35 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     manifest_veto = ([f"this round read a MANIFEST of a move, not the code — "
                       f"{pre.shape.moved:,} relocated lines went unread by every seat"]
                      if pre.verdict == "manifest" else [])
+    # The head moved mid-round, and under increment scope that opens a range no
+    # round of this cycle reviews (#106). `ReviewScope.decide` ran against the head
+    # this round STARTED with, so the target ends at `reviewed_from`; `head_sha` is
+    # now the later commit, and the next round's increment anchors on it. Everything
+    # between the two is past this round's target and before the next round's — read
+    # by nobody — while the payload carries a head that reads as though it were
+    # reviewed.
+    #
+    # A veto and not a resolution, deliberately. The field goes on recording the
+    # later commit because provenance needs it to; what changes is that a round with
+    # that gap in it can no longer stop `confident`, and `converged` is computed FROM
+    # `confident`, so a cycle cannot report convergence over commits it never read.
+    # This REPORTS the hole rather than closing it: separating "the head" from "the
+    # head this round reviewed" is what would close it, and until that exists a
+    # consumer treating `converged` as a merge gate is the case this veto is holding
+    # the line for.
+    #
+    # Increment scope only, which is where the gap is CERTAIN and not merely
+    # possible. Under whole-PR scope the next round re-reads the PR, so the range
+    # closes on its own — and that round's own material came from `gh pr diff` at a
+    # moment nothing here can date, so a veto would fire on rounds that did read the
+    # later commit. Not alert fatigue, on the same terms as `manifest_veto`: it fires
+    # on a push landing inside one round's window, not on every round of every repo.
+    moved_head_veto = (
+        [f"the head moved from {reviewed_from[:8]} to {head_sha[:8]} while this round ran, "
+         f"and this round reviewed the increment ENDING at {reviewed_from[:8]} — the commits "
+         f"in between are the review target of no round: this one stopped before them and "
+         f"the next one's increment starts after them"]
+        if target_scope == "increment" and reviewed_from != head_sha else [])
     # `ci_status` here is `review_ci_settled`'s answer — the one taken before the
     # seats were dispatched and after #501's bounded wait, which is the same value
     # the payload records and the report prints. Not re-read: a second fetch at the
@@ -3640,7 +3679,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                           ci_status=ci_status,
                           ci_declared_absent=ci_declared_absent,
                           coverage=ruled, acknowledged=ack_held)
-            + manifest_veto + judge_gaps + inherited + prior.problems)
+            + manifest_veto + moved_head_veto + judge_gaps + inherited + prior.problems)
     # An acknowledgement naming no obligation this round raised is almost always a
     # re-worded claim under a new key, which `_claim_norm` says plainly it cannot
     # absorb — so it is SAID rather than corrected. The alternative readings are a

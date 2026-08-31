@@ -1126,6 +1126,16 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   confident stop, until a later whole-PR round with nothing truncated closes the gap. A round
   that recorded a head but ran no reviewer at all (a title skip, or every seat failing)
   vetoes the round after it the same way: the anchor steps over code nobody read.
+  **A head that moves mid-round vetoes the round it moved under** (#106), and this one is
+  about the round's *own* coverage rather than an inherited gap. The scope is decided
+  against the head the round opened with, so its target ends there; `head_sha` is then
+  re-stamped to the later commit because that is where the next round's fix range starts —
+  and the commits between the two are the review target of no round at all. The veto is the
+  only thing that stops a cycle stamping `converged: true` over them. **It reports the hole
+  and does not close it.** Closing it means recording the head a round *reviewed* apart from
+  the head it *knows about*, which is one field and one payload key more than this is; until
+  that exists, a consumer that turns `converged` into an automatic merge gate would be
+  approving code no round read, and only the veto stands between the two.
 - **`--json-file` is a requirement, not a courtesy.** It is the next round's baseline, so
   a write that fails exits non-zero after the report: carrying on would leave round `r+1`
   calling every repeated finding new. Every non-error exit writes it, the skip-pattern one
@@ -2156,7 +2166,7 @@ Run-level fields it depends on:
 
 | field | what it is |
 |---|---|
-| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
+| `head_sha` | **v2.24.** The commit this round reviewed. Recorded because nothing else identified one — `base` holds a branch *name* — and the next round needs it twice over: as one end of the fix range, and (**v2.28**) as the anchor its increment is taken from. Re-read straight after the diff is fetched, which narrows the mid-round-push window without closing it: a push can land either side of the fetch and nothing can tell which, so a move is reported as a move (`config_notes`) rather than as a claim about which commit produced the diff, and the later commit is recorded because it is where the next round's fix range starts. **Under increment scope a move also takes a veto line** (#106): the round's target was decided against the earlier head and the next round anchors on the later one, so the commits between them are reviewed by no round, and `confident` — and with it `converged` — is false rather than the gap being left to be inferred from a note. That is a report of the hole and not a repair of it; the repair is a second field naming the head a round actually reviewed. Present on the **skipped** payload too: a skipped round is still the round the next one baselines against |
 | `unread_files` | **v2.24.** Files no reviewer that ran read in full, for the next round's `missed-unread`. A file counts as unread only if *every* running reviewer was cut on it, and a file straddling the cut counts as unread — half a file's hunks is not a read file. Empty on a payload whose `reviewed` is `false` means *no coverage at all* (a skipped round never fetched a diff to name files from), not "read everything" — the consumer tells the two apart by `reviewed` |
 | `provenance_counts` | **v2.24.** The per-round tally over the findings the cycle has to clear, so a consumer gets the shape of a round without walking every finding. `{}` where the question does not arise — outside a cycle, or in a cycle's round 1, which has no earlier round to attribute against. All-zero is the other statement: a round that could have attributed and had nothing to, which is what a **skipped** in-cycle round sends |
 | `fix_range_source` | **#512.** WHICH range the round attributed against, because the answers are not the same measurement and a reader comparing `introduced` across a cycle has to see the denominator change. `increment` — the diff the seats actually read, which is narrowed to the PR's own files and so drops a base-branch merge's; `compare` — the separate `gh api compare` fetch, used under `pr` scope and wherever the increment fell back; `reconstructed` (**#504**) — a rewritten branch's pass, rebuilt from the local object store by patch equivalence; `null` where the question does not arise (round 1, or a round with no range at all) |
