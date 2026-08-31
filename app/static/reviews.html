@@ -852,7 +852,38 @@ function renderRuns(runs){
   }
 }
 
-function renderTiles(s){
+// #626's headline, and the only tile on this page counted per CYCLE rather than
+// per run, per observation or per defect. It is rendered with its denominator
+// spelled out for that reason: "62%" beside four other percentages over four
+// other populations is a number a reader will compare with the ones next to it.
+//
+// `rate` is null wherever nothing was DECIDED, and the tile is dropped whole
+// rather than shown as 0%. A window of rounds recorded before the column existed
+// has no convergence rate — they sent the field and ingest dropped it — and 0%
+// is the claim "this fleet converges never", which is the worst available way to
+// render "not measured".
+function convergenceTile(c){
+  if (!c || !c.overall || c.overall.rate == null) return "";
+  const o = c.overall;
+  const undecided = o.open + o.unmeasured;
+  // This endpoint's "all time" is not the page's. It classifies a row per CYCLE
+  // in Python rather than aggregating in SQL, so it defaults to a lookback where
+  // `/review/stats` defaults to the whole table — and when the reader picks "all
+  // time" the header above says "since <first run>" while this tile is over a
+  // narrower window. It says which one. A denominator quietly taken over less
+  // than the page claims is the silent truncation this repo does not do.
+  const bounded = !$("days").value && c.window && c.window.since
+    ? ` · window from ${c.window.since.slice(0, 10)}` : "";
+  return `<div class="tile"><div class="n" style="color:${precColor(o.rate)}">${
+    pct(o.rate)}</div>
+    <div class="k">cycles ending in a confident dry round<br>
+      <span class="dim">${o.converged} of ${o.decided} decided${
+        undecided ? ` · ${o.open} still open · ${o.unmeasured} unmeasured` : ""}${
+        bounded}</span>
+    </div></div>`;
+}
+
+function renderTiles(s, convergence){
   $("window").textContent = s.window.since
     ? `since ${s.window.since.slice(0, 10)}`
     : (s.window.first_run ? `since ${s.window.first_run.slice(0, 10)}` : "");
@@ -911,21 +942,30 @@ function renderTiles(s){
       <div class="k">held up after the fix<br>
         <span class="dim">${out.fixed || 0} fixed · ${out.refuted || 0} refuted${
           signedOff}<br>${out.narrowed || 0} narrowed · ${out.deferred || 0} deferred
-          · ${out.superseded || 0} superseded · ${out.not_recorded || 0} unruled</span></div></div>`}`;
+          · ${out.superseded || 0} superseded · ${out.not_recorded || 0} unruled</span></div></div>`}
+    ${convergenceTile(convergence)}`;
 }
 
 async function load(){
   const judgedOnly = $("judged").checked;
-  const [statsRes, runsRes] = await Promise.all([
+  const [statsRes, runsRes, convRes] = await Promise.all([
     fetch("/review/stats?" + qs({ judged_only: judgedOnly }), { headers: { Accept: "application/json" } }),
     fetch("/reviews?" + qs({ limit: 50 }), { headers: { Accept: "application/json" } }),
+    // No `judged_only`: convergence is a property of how the loop FINISHED, and
+    // whether a judge adjudicated the findings is a different question. Passing
+    // the toggle through would make the headline move when a reader flipped a
+    // control that has nothing to do with it.
+    fetch("/review/convergence?" + qs({}), { headers: { Accept: "application/json" } }),
   ]);
   if (!statsRes.ok || !runsRes.ok){
     $("leaderboard").innerHTML = '<div class="empty">could not load review stats</div>';
     return;
   }
   const stats = await statsRes.json();
-  renderTiles(stats);
+  // The one tile that is allowed to be absent without the page failing: the rest
+  // of this view predates it and must still render against a board too old to
+  // serve it. `null` reaches `convergenceTile`, which drops the tile.
+  renderTiles(stats, convRes.ok ? await convRes.json() : null);
   renderLeaderboard(stats.by_model, judgedOnly);
   renderAgents(stats.by_agent);
   renderRuns(await runsRes.json());

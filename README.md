@@ -219,6 +219,29 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           (what survived the fix) — the GAP is the measurement. Read it
                           against outcomes_scored (fixed+refuted, the ratio's own
                           population) and confirmed_defects, never outcomes_recorded
+GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by_repo, by_size,
+                                                                     by_kind, by_shape, by_rounds,
+                                                                     marginal_by_round}
+                          the share of review CYCLES that ended in a confident dry round
+                          (#626) — the number the convergence epic is judged on. One cycle
+                          is one (repo, pr, cycle), its ending is its TERMINAL round's, and
+                          `rate` is converged / decided where decided is converged +
+                          unconverged. `open` (the loop went again) and `unmeasured` (the
+                          round predates `converged` and sent nothing) are published beside
+                          the rate and are NOT in its denominator; `rate` is **null, never
+                          0.0**, when nothing was decided. `converged` is strictly stronger
+                          than `stop_confident`: a below-floor policy stop (#165) is
+                          confident and NOT converged, which is why the review queue's
+                          `ready`/`land` gate stays the looser test. `open` holds abandoned
+                          cycles as well as live ones, so **`rate` is an upper bound** and
+                          not an estimate — #637 fits a threshold to it and has to read it
+                          that way. A caps refusal is NOT among them: it ends the cycle and
+                          counts `unconverged`, as `preland` and the review queue already
+                          call it. `by_rounds` is keyed `final_round`, the terminal round's
+                          NUMBER rather than a count of rounds recorded. **`days` defaults
+                          to 90** where the rest of `/review/*` defaults to all time: this
+                          one classifies a row per cycle in Python rather than aggregating
+                          in SQL, and the applied boundary is always in `window.since`
 GET   /review/spend      ?repo=&pr=&hours=                        -> {repo_window, fleet_window,
                                                                      pr_total}
                           what review has already COST, so a ceiling can be checked before
@@ -2285,7 +2308,7 @@ app/          FastAPI service
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
                    /review/needs-human, /review/collisions, /review/next-door,
-                   /review/spend
+                   /review/spend, /review/convergence
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)

@@ -282,6 +282,43 @@ class ReviewRun(Base):
     #: no way to judge how badly — which is the question this release exists to
     #: answer, and the one the operator is told to relay.
     stop_veto: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #: Whether this round was a **clean finish** — the one boolean the convergence
+    #: epic is judged on (#626), and strictly stronger than ``stop_confident``.
+    #:
+    #: The panel computes it in ``round_stop`` FROM ``confident`` and publishes it
+    #: on the round payload; this column is that answer stored verbatim. It is not
+    #: re-derived here and must never be: the conjuncts it is built from are the
+    #: round's own ``outstanding.fixable``, its below-floor set and its escalation
+    #: register, and the floors those are cut at are repo dials the board holds as
+    #: opaque JSON and does not interpret (``app.api.dials`` argues that at length).
+    #: A board-side derivation would therefore be a second implementation of a
+    #: policy the board cannot read, free to disagree with the panel about the
+    #: same round — and a convergence metric that can disagree with the panel is
+    #: worse than no metric, because the direction it drifts in is the flattering
+    #: one.
+    #:
+    #: Three states, and the third is why this is nullable with no backfill:
+    #:
+    #: * ``True`` — a stop, not capped, no veto, and nothing left: nothing a fix
+    #:   pass could take, nothing under the cleared floor, no escalation held.
+    #: * ``False`` — the round stopped or went again and it was not that. A
+    #:   below-floor policy stop is the case worth naming: it is ``stopped``,
+    #:   ``stop_confident`` **and** ``converged: False``, because real findings
+    #:   were left unfixed by policy (#165) and counting it would flatter the loop.
+    #: * ``NULL`` — the panel did not say. Every round recorded before this column,
+    #:   #631's own rounds included: they POSTed ``converged`` and ingest dropped
+    #:   it, so nothing on those rows says which they were. They are excluded from
+    #:   the rate ``GET /review/convergence`` publishes rather than counted as
+    #:   failures.
+    #:
+    #: This is NOT what ``app.review_queue`` gates ``ready``/``land`` on. That
+    #: gate is ``stopped`` + ``stop_confident`` + no outstanding findings, which
+    #: is strictly looser, and it stays looser deliberately: a below-floor policy
+    #: stop is a landable PR and an unconverged cycle at the same time. The two
+    #: questions are "may this land" and "did the loop finish cleanly", and
+    #: collapsing them would either block landings this repo's own policy allows
+    #: or count them as clean finishes they are not.
+    converged: Mapped[bool | None] = mapped_column(Boolean)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)
@@ -323,6 +360,29 @@ class ReviewRun(Base):
         # `stop_confident IS NULL` is "the panel didn't say".
         CheckConstraint("NOT (reviewed IS FALSE AND stop_confident IS TRUE)",
                         name="ck_review_runs_unreviewed_not_confident"),
+        # #626: `converged` is computed by the panel FROM `confident`, which is
+        # itself `stop and not capped and not veto and baseline_ok`. So a
+        # converged round is a stopped round and an earned one, by construction
+        # and not by coincidence — and the pair that must be unrepresentable here
+        # is a round claiming a clean finish while its own stop says it never
+        # stopped, or says the stop was not evidence.
+        #
+        # At the boundary rather than only at ingest, on the rule the three
+        # constraints above give: the API is not the only writer. A hand-rolled
+        # POST is coerced at ingest and told what was dropped
+        # (`ReviewIn._converged_cannot_outrun_the_stop`), so this constraint is
+        # unreachable from the endpoint — which is the point. It exists for the
+        # write path added later.
+        #
+        # NULL on any side passes. `converged IS NULL` is every row recorded
+        # before the column existed, and `stopped`/`stop_confident` NULL is a
+        # panel that never spoke; a constraint that refused those would make the
+        # migration unrunnable rather than make the rows honest.
+        CheckConstraint(
+            "NOT (converged IS TRUE AND "
+            "(stopped IS NOT TRUE OR stop_confident IS NOT TRUE))",
+            name="ck_review_runs_converged_implies_earned_stop",
+        ),
         # One repository, one stored spelling — at the boundary, so that the API
         # is not the only thing that remembers (#326, migration 0033).
         #
