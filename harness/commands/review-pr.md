@@ -66,13 +66,17 @@ standard is not "good enough" — it's "nothing left to improve".
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
 report prints them on its **Panel dials** line). Five of them define this pass:
 
-- **`fix_severity_floor`** (default `P3`) — the severity at or above which a
+- **`fix_severity_floor`** (default `P4`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
-  by this pass. A panel report puts those under their own heading, *Reported, not
-  this round's work*, marked 🔽; do not lift them into your list.
+  by this pass. **At the shipped default there is nothing below it**: `P4` is the
+  bottom rank, so a panel's **To fix** list carries the P4s too and the list you were
+  handed is the list you clear. Where a repo has raised the floor, a panel report puts
+  what falls below it under its own heading, *Reported, not this round's work*, marked
+  🔽; do not lift those into your list.
 - **`low_severity_fix_lines`** (default `40`) — the churned lines the WHOLE pass may
-  spend on findings below `round_trigger_floor` (`P2` by default, so this is the P3
-  band), **and on the test and doc work no finding asked for, at every severity**
+  spend on findings below `round_trigger_floor` (`P2` by default, so at the shipped
+  floors this band is the P3s and the P4s together),
+  **and on the test and doc work no finding asked for, at every severity**
   (step 3). A panel report marks the low-severity findings 💸. Step 3 has how to spend
   it; what matters here
   is that it is a budget for the round and not a cap per fix, because the failure it
@@ -249,8 +253,10 @@ decides which of them this pass fixes, and `low_severity_fix_lines` decides how 
 of the low tier it can afford.** At or above the floor they get fixed. Below
 it they are reported in step 6 with `Deferred` against them and left alone — that
 is the setting's judgement, already made, and re-making it by fixing them anyway is
-the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
-behaviour.
+the growth it exists to stop. **At the shipped `P4` it is all of them**, and nothing
+is below the floor at all: the floor lets the whole list through, and
+`low_severity_fix_lines` is then the only thing deciding how far down the pass
+actually reaches — which is why the counting in step 3 is not optional.
 
 **Then say what each finding IS, because that is what decides whether it can BLOCK.**
 Severity says how bad; this says what kind, and the two are orthogonal:
@@ -281,11 +287,40 @@ hold the cycle open on its own.
 
 #### 3. Fix everything
 
-Fix every finding at or above `fix_severity_floor` (`P3` by default, so P1, P2 and
-P3; `P4` means all of them). Write the missing tests (edge + error paths) — don't just
-note them. Update the stale docs. Propagate renames/patterns to
-sibling code. After fixing, re-read the full diff of your fixes and fix any new
-issues they introduce.
+Fix every finding at or above `fix_severity_floor` — `P4` by default, which is the
+bottom rank, so at the shipped setting **every finding you were handed gets fixed** and
+none of them is below the floor. Only a repo that has raised the floor has a below-floor
+tier, and those findings are reported and left alone.
+
+**The bar is unchanged: no finding on the list is noted and walked past.** What the
+rest of this section bounds is not how well you fix them — it is **where the work is
+allowed to land**. Thoroughness is spent inside the change under review, not around
+it, and the three commonest ways a pass leaks outside it each have an answer:
+
+- **The assertion that demonstrates the fix is part of the fix — write it.** The
+  finding's defect has to go red without your change and green with it; that is the
+  fix's own evidence and step 4 is where it is proved. **Every other line of test
+  work is an observation**: a path no finding asked about, a neighbouring assertion
+  you would strengthen, a fixture the suite would be better for. Real work, worth
+  recording, and **budgeted** — item 3 below prices it — so it **never blocks**, and
+  where the budget will not pay for it you write it up in step 6 instead of writing
+  it. That is not a finding left unfixed.
+- **A doc this change makes wrong is part of the fix — correct it.** A doc that was
+  already stale before this change is not: nothing in this diff made it wrong, so it
+  is an observation like any other, on the same budget and the same terms.
+- **A pattern repeated elsewhere is a finding to REPORT, not a licence to edit the
+  siblings.** Fix the instance the finding names. Then either say in step 6 that the
+  class exists and where it lives, or — where the narrow fix is complete but the
+  general form is not written — record it `narrowed` with that general form as its
+  note. Propagating a rename or a pattern into sibling code is fixing the class, and
+  **the surface rule immediately below governs it**: a file no round has read is a
+  declared decision, not a detail, and "the same shape is over there too" is not the
+  justification that declaration takes. Measured on lexray#1780, that propagation is
+  what pulled ten unreviewed files into the PR and wrote 848 lines of test and doc
+  nobody's finding had asked for.
+
+After fixing, re-read the full diff of your fixes and fix any new issues they
+introduce.
 
 **The blocking band has no line budget, and its constraint is SURFACE instead.**
 Findings at or above `round_trigger_floor` — P1 and P2 by default — get fixed however
@@ -989,6 +1024,16 @@ Under the old severity bands the fall-through went the other way, because a spar
 a tracker was the cheap error; under `shape` that spare line is the failure being fixed.
 `always` and `never` are the two ends, and any of `P1`..`P4` is the documented way back
 to the severity cut.
+
+**Nothing classifies for you, so the gate's silence is not a verdict.** No seat, no
+judge and no round payload emits a shape, and neither of the harness's two automatic
+deferral paths supplies one — a below-floor remainder is gated on severity alone, an
+unverifiable claim on its own exemption. Under `shape` every deferral the machine
+raises by itself therefore lands on `batch` and files nothing, which is right for a
+remainder (it IS a batch) and is **not** the harness telling you no issue is
+warranted. The category and single-item roads exist only where YOU classify a deferral
+and open the issue by hand — that judgement is yours, here and in §4b, and nothing
+upstream will have made it for you.
 
 Measured on this repo on 2026-08-26, roughly twenty open issues were panel
 deferred-finding exhaust and nothing else. **An escalation is

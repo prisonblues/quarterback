@@ -52,7 +52,7 @@ def test_the_files_a_pass_opened_are_the_ones_no_earlier_round_had_seen():
     is what a reviewer never had in front of it, and `prior_files` is the size of the
     left-hand side so a reader can see what the difference was taken against."""
     got = panel.fix_surface(_diff("app/sync.py", "nginx/site.conf"),
-                            {"app/sync.py", "app/read.py"})
+                            {"app/sync.py", "app/read.py"}, True)
     assert got == {"files": ["app/sync.py", "nginx/site.conf"],
                    "new_files": ["nginx/site.conf"], "count": 1, "prior_files": 2}
 
@@ -62,7 +62,7 @@ def test_a_pass_that_stayed_inside_the_change_measures_a_genuine_ZERO():
     one: the pass touched files and every one of them had already been reviewed. A
     payload that rendered this the same way it renders round 1 would make the good
     case indistinguishable from the blind one."""
-    got = panel.fix_surface(_diff("app/sync.py"), {"app/sync.py", "app/read.py"})
+    got = panel.fix_surface(_diff("app/sync.py"), {"app/sync.py", "app/read.py"}, True)
     assert got["count"] == 0 and got["new_files"] == []
     assert got["files"] == ["app/sync.py"] and got["prior_files"] == 2
 
@@ -71,18 +71,46 @@ def test_a_round_with_no_fix_range_to_read_measured_NOTHING():
     """Round 1 has no pass before it, and a rebased branch has no readable range —
     the same conditions `unrefereed_fix` is absent under. "The pass opened no new
     files" is a claim about a fix pass, and only one of those two things is ever true
-    of round 1."""
-    assert panel.fix_surface(None, {"app/sync.py"}) is None
-    assert panel.fix_surface("", {"app/sync.py"}) is None
+    of round 1. `None` is the range nobody could read, and it is now the ONLY diff
+    value that means that."""
+    assert panel.fix_surface(None, {"app/sync.py"}, True) is None
+
+
+def test_an_empty_fix_range_that_WAS_read_measures_a_zero_INVERTING_an_old_assertion():
+    """**This assertion used to read `fix_surface("", …) is None` and is inverted on
+    purpose.** An empty string is a range that was READ and held no file — an empty
+    commit, a revert that nets out, a pass whose files carried no attributable header
+    — and that is a measurement whose answer is zero, not a failure to measure. The
+    old reading hid the one shape a reviewer most wants to see: a fix pass that
+    opened nothing at all."""
+    got = panel.fix_surface("", {"app/sync.py", "app/read.py"}, True)
+    assert got == {"files": [], "new_files": [], "count": 0, "prior_files": 2}
 
 
 def test_a_cycle_with_no_readable_EARLIER_round_measured_nothing_either():
     """The third absence, and the one that is easiest to get wrong in the direction
-    that flatters nobody: with no prior file set every file the pass touched reads as
-    new, so a pass that opened nothing would be reported as having opened everything.
-    An unmeasurable pass must not be reported as a pass that opened nothing, and it
-    must not be reported as one that opened the world either."""
-    assert panel.fix_surface(_diff("app/sync.py"), set()) is None
+    that flatters nobody: with nothing known about what earlier rounds saw, every file
+    the pass touched reads as new, so a pass that opened nothing would be reported as
+    having opened everything. An unmeasurable pass must not be reported as a pass that
+    opened nothing, and it must not be reported as one that opened the world either.
+
+    It is the READABILITY flag that decides it and never the emptiness of the set —
+    the flag is `earlier_round_files`' own account of whether it read a payload, and
+    an empty diff beside it is refused for the same reason a full one is."""
+    assert panel.fix_surface(_diff("app/sync.py"), set(), False) is None
+    assert panel.fix_surface(_diff("app/sync.py"), {"app/sync.py"}, False) is None
+    assert panel.fix_surface("", set(), False) is None
+
+
+def test_an_earlier_round_that_saw_NO_file_still_measures_the_first_one_a_pass_opens():
+    """The transition the old `bool(prior_files)` inference reported as unmeasured, and
+    it is a real one: an earlier round whose surface was empty, and a fix pass that put
+    the first file in front of anybody. That is one new file, and calling it "nobody
+    looked" would drop the only case where every file the pass touched is genuinely
+    new and somebody can prove it."""
+    got = panel.fix_surface(_diff("app/new.py"), set(), True)
+    assert got == {"files": ["app/new.py"], "new_files": ["app/new.py"],
+                   "count": 1, "prior_files": 0}
 
 
 def test_a_chunk_with_no_path_is_dropped_rather_than_named():
@@ -91,8 +119,66 @@ def test_a_chunk_with_no_path_is_dropped_rather_than_named():
     file the pass opened, and counting one would put an unnamable entry in a list
     printed to a human."""
     noise = "some preamble nobody wrote as a diff\n" + _diff("app/new.py")
-    got = panel.fix_surface(noise, {"app/sync.py"})
+    got = panel.fix_surface(noise, {"app/sync.py"}, True)
     assert got["files"] == ["app/new.py"] and got["new_files"] == ["app/new.py"]
+
+
+# ------------------------------------- where the readability flag comes from
+
+def _payload(tmp_path, name, **fields):
+    """One round's `--baseline` JSON on disk, in the fields `earlier_round_files`
+    checks identity against."""
+    body = {"github": "acme/board", "pr": 34, "round": 1, "cycle": "cyc-1111",
+            "changed_files": [{"path": "app/sync.py"}], **fields}
+    p = tmp_path / name
+    p.write_text(json.dumps(body))
+    return str(p)
+
+
+def test_a_payload_of_this_cycle_that_recorded_no_file_is_still_a_READ_payload(
+        tmp_path):
+    """The fact that has to travel beside the set, because the set cannot carry it: an
+    empty result means "nobody looked" or "they looked and saw nothing", and only one
+    of those lets the next round call a file new."""
+    path = _payload(tmp_path, "r1.json", changed_files=[])
+    seen, read = panel.earlier_round_files([path], "acme/board", 34, 2, "cyc-1111")
+    assert seen == set() and read is True
+
+
+def test_a_payload_from_ANOTHER_cycle_is_not_a_read_of_THIS_cycle(tmp_path):
+    """It is skipped for the set — its files say nothing about what this cycle's rounds
+    were looking at — so it must be skipped for the flag too. A flag set on any file
+    that merely parsed would claim the surface was measured off payloads the
+    measurement then threw away."""
+    path = _payload(tmp_path, "other.json", cycle="cyc-9999")
+    assert panel.earlier_round_files([path], "acme/board", 34, 2,
+                                     "cyc-1111") == (set(), False)
+
+
+@pytest.mark.parametrize("fields,why", [
+    ({"github": "acme/other"}, "another repo"),
+    ({"pr": 99}, "another PR"),
+    ({"round": 2}, "not an EARLIER round"),
+    ({"round": "two"}, "a round number nobody can read"),
+])
+def test_a_payload_that_fails_any_identity_check_leaves_the_flag_down(
+        tmp_path, fields, why):
+    """Every check is a reason the payload describes some other round, and none of them
+    is evidence about this one — so each has to leave `read` false rather than merely
+    contribute no files. `why` names the case for the reader of a failure."""
+    path = _payload(tmp_path, "p.json", **fields)
+    assert panel.earlier_round_files([path], "acme/board", 34, 2,
+                                     "cyc-1111") == (set(), False), why
+
+
+def test_a_file_that_is_not_there_at_all_reads_nothing_and_says_so(tmp_path):
+    """The blind case that reaches `fix_surface` as `None`: no baseline was passed, or
+    the path does not parse. Read as "an earlier round saw no files" it would make
+    every file the fix pass touched new."""
+    assert panel.earlier_round_files([], "acme/board", 34, 2, "c") == (set(), False)
+    missing = str(tmp_path / "gone.json")
+    assert panel.earlier_round_files([missing], "acme/board", 34, 2,
+                                     "c") == (set(), False)
 
 
 # --------------------------------------------- how the payload carries the answer
@@ -165,8 +251,8 @@ def _compare(*files):
                                  for f in files]})
 
 
-def _round(monkeypatch, capsys, tmp_path, *, round_no=1, baseline=(), fix=(),
-           name="r"):
+def _round(monkeypatch, capsys, tmp_path, *, round_no=1, baseline=(),
+           fix=("app/sync.py",), name="r"):
     """One panel run whose fix range touched `fix`. Round 2 with a baseline is what
     makes the round ATTRIBUTABLE, which is the condition the measurement is taken
     under — round 1 has no pass to read. The head moves per round for the same
@@ -184,7 +270,7 @@ def _round(monkeypatch, capsys, tmp_path, *, round_no=1, baseline=(), fix=(),
               "headRefName": "h", "headRefOid": f"{round_no:040d}",
               "files": [{"path": "app/sync.py", "additions": 3, "deletions": 1}]},
         diff=_diff("app/sync.py"),
-        compare=_compare(*(fix or ("app/sync.py",)))))
+        compare=_compare(*fix)))
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: panel.ReviewerRun([], None, 10, []))
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
@@ -234,3 +320,34 @@ def test_a_pass_that_stayed_inside_the_change_says_so_rather_than_saying_nothing
     assert payload["round_stop"]["fix_surface"]["count"] == 0
     assert ("none of them are new — the pass stayed inside the change under review"
             in report)
+
+
+def test_a_fix_range_that_was_read_and_held_no_file_is_a_zero_with_its_own_sentence(
+        monkeypatch, capsys, tmp_path):
+    """An empty commit, or a revert that nets out: the compare came back with no file,
+    which is a range that WAS read and opened nothing. It is a measurement — `count:
+    0`, the contract's zero and not its null — and it gets its own sentence, because
+    "it touched 0 file(s) and none of them are new" reads like the instrument failing
+    rather than like a disciplined fix pass."""
+    _r1, _first, r1 = _round(monkeypatch, capsys, tmp_path)
+    report, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=2,
+                                baseline=[r1], fix=())
+    got = payload["round_stop"]["fix_surface"]
+    assert got == {"files": [], "new_files": [], "count": 0, "prior_files": 1}
+    assert ("**New surface in the last fix pass:** the fix range was read and held no "
+            "file — the pass opened nothing." in report)
+    assert "Measured against the 1 file(s) earlier rounds of this cycle recorded" in report
+    assert "it touched 0 file(s)" not in report
+    assert "none of them are new" not in report
+
+
+def test_a_round_two_handed_no_baseline_at_all_still_measures_NOTHING(
+        monkeypatch, capsys, tmp_path):
+    """The other half of the distinction, end to end: a standalone round 2 with no
+    `--baseline` has nothing saying what earlier rounds had in front of them, so every
+    file the pass touched would read as new on no evidence. Null, and no line at
+    all."""
+    report, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=2,
+                                baseline=[], fix=("app/sync.py", "app/new.py"))
+    assert payload["round_stop"]["fix_surface"] is None
+    assert "New surface in the last fix pass" not in report

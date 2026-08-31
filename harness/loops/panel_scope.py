@@ -2608,22 +2608,62 @@ def _branch_matches(branch: str, pattern: str) -> bool:
     return re.fullmatch("".join(out), branch) is not None
 
 
+def _branches_admit(branch: str, patterns: list[str]) -> bool:
+    """One ``branches:`` list, read the way GitHub reads it: the patterns are
+    evaluated IN ORDER and the LAST one that matches decides. A `!` pattern after a
+    positive excludes the ref; a positive after a `!` puts it back.
+
+    Order is the whole point, and this function exists because the code it replaces
+    threw it away. That version split the list by sign and gave every exclusion
+    unconditional precedence, so::
+
+        branches: ['**', '!release/**', 'release/special']
+
+    refused `release/special` — a branch GitHub runs, named explicitly, in the list.
+    A repo whose workflows all have that shape would be reported by
+    :func:`ci_unrunnable` as one where no run can ever exist, under a remedy telling
+    the operator to add a base branch that is already in the trigger list. That is
+    the #628 failure exactly — a confident falsehood with an unperformable
+    instruction beneath it — arriving through a second door, and the reason
+    :data:`_EVENT_NAME` says every ambiguity in this parser resolves to "a run may
+    exist".
+
+    The starting state is the other half of the rule. A list holding any positive
+    pattern is an allow-list, so a branch that nothing in it matches is out; a list
+    that is nothing BUT exclusions names what it refuses and admits everything else.
+    """
+    admitted = all(p.startswith("!") for p in patterns)
+    for p in patterns:
+        excluded = p.startswith("!")
+        if _branch_matches(branch, p[1:] if excluded else p):
+            admitted = not excluded
+    return admitted
+
+
 def _filter_admits(branch: str, f: dict) -> bool:
     """Does one event's branch filter admit ``branch``? An absent list is "every
     branch", which is why the two are read with ``is None`` rather than for
-    truthiness."""
+    truthiness.
+
+    The two keys are kept independent rather than merged into one ordered list:
+    GitHub refuses a workflow that uses `branches` and `branches-ignore` for the
+    same event, so there is no interleaving of them to get right, and inventing one
+    would be this reader deciding a question the file cannot ask.
+    """
     allow, deny = f.get("branches"), f.get("branches-ignore")
-    if deny is not None and any(_branch_matches(branch, p) for p in deny):
-        return False
+    if deny is not None:
+        if any(p.startswith("!") for p in deny):
+            # `branches-ignore` already means "not these", and GitHub does not state
+            # what a further negation inside it does. An unestablished list is no
+            # evidence for the one claim this module is not allowed to get wrong, so
+            # the exclusion is WITHDRAWN and the event admits — the direction
+            # :func:`workflow_triggers` takes with every shape it cannot read.
+            return True
+        if any(_branch_matches(branch, p) for p in deny):
+            return False
     if allow is None:
         return True
-    # A leading `!` is GitHub's exclusion inside `branches:`, and a list that is
-    # nothing BUT exclusions admits everything else.
-    no = [p[1:] for p in allow if p.startswith("!")]
-    yes = [p for p in allow if not p.startswith("!")]
-    if any(_branch_matches(branch, p) for p in no):
-        return False
-    return not yes or any(_branch_matches(branch, p) for p in yes)
+    return _branches_admit(branch, allow)
 
 
 def workflow_can_run(triggers: dict[str, dict], base: str, head_branch: str) -> bool:

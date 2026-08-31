@@ -77,11 +77,83 @@ def test_the_verdict_is_read_off_the_per_run_rows():
 
 def test_the_NEWEST_stopped_round_wins():
     """A PR can hold several ended cycles, and the question is whether the last thing
-    anybody recorded was a stop — not whether a stop ever happened."""
+    anybody recorded was a stop — not whether a stop ever happened. Here the newest
+    run IS that stop, so the verdict is terminal and the round on top of it is the
+    stop's own."""
     got, _why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
         "runs": [_run_row(2, cycle="old", reason="the first cycle stopped"),
                  _run_row(1, cycle="new", reason="and so did the second")]}))
     assert got["cycle"] == "new" and got["reason"] == "and so did the second"
+    assert got["terminal"] is True and got["latest_round"] == 1
+
+
+def test_a_stop_with_a_LATER_round_recorded_on_top_of_it_is_not_terminal():
+    """The wedge. Cycle A stopped; somebody passed `--new-cycle` and cycle B's round 1
+    legitimately said go again. Read as "the newest STOP decides", B's round 2 is
+    refused by A's stop — and the only way past a refusal is `--new-cycle`, which
+    starts a THIRD cycle rather than continuing B. So no PR that had ever stopped
+    could run a multi-round cycle again. The last RUN decides instead."""
+    got, why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
+        "runs": [_run_row(2, cycle="A", reason="the first cycle stopped"),
+                 _run_row(1, cycle="B", stopped=False, reason=None)]}))
+    assert why == ""
+    assert got["terminal"] is False
+    assert got["cycle"] == "A" and got["round"] == 2
+    assert got["latest_round"] == 1
+
+
+def test_the_non_terminal_record_still_comes_back_rather_than_being_swallowed():
+    """It is a true thing about the PR and a reader auditing the round is owed it —
+    the stop happened, and `latest_round` is what says why it is not this round's
+    ending. Returning `None` here would leave a refusal and a live cycle looking the
+    same from the payload."""
+    got, _why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
+        "runs": [_run_row(1, cycle="A", reason="84% introduced", confident=False),
+                 _run_row(2, cycle="A", stopped=False),
+                 _run_row(3, cycle="A", stopped=False)]}))
+    assert got["reason"] == "84% introduced" and got["confident"] is False
+    assert got["terminal"] is False and got["latest_round"] == 3
+
+
+def test_a_newest_run_nobody_can_read_is_REPORTED_rather_than_read_past():
+    """An older row that will not parse is one candidate among many and the rows around
+    it still answer the question. The newest row IS the question, so reading the PR's
+    current state off the rows underneath it is the "newest stop" mistake in another
+    costume — and it would resurrect the wedge for exactly the PRs whose latest row
+    went wrong."""
+    got, why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
+        "runs": [_run_row(1, reason="the cycle stopped"), "not an object at all"]}))
+    assert got is None
+    assert "newest run for this PR came back as a str, not an object" in why
+
+
+def test_an_older_run_nobody_can_read_is_still_skipped_in_silence():
+    """The other half of the same rule, so the first is a distinction rather than a
+    blanket refusal: a malformed row in the middle of the window leaves the newest one
+    still saying where the PR stands."""
+    got, why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
+        "runs": [17, _run_row(2, reason="the cycle stopped")]}))
+    assert why == "" and got["round"] == 2 and got["terminal"] is True
+
+
+def test_an_empty_run_list_in_a_TRUNCATED_window_is_reported_rather_than_read_as_calm():
+    """A defensive guard rather than a live path — the endpoint trims the OLDEST rows,
+    so a page of runs ends at the newest one and this pair cannot arise from a board
+    behaving as documented. If it ever does, the one row this function's question is
+    ABOUT is the row missing from the answer, and reading an empty page as "no cycle
+    ended here" is the inference from absence every other branch here refuses."""
+    got, why = panel.board_terminal_verdict("acme/board", 1780, get=_board({
+        "runs": [], "truncated": True}))
+    assert got is None
+    assert "listed no runs for this PR while also saying the window was truncated" in why
+
+
+def test_an_empty_run_list_on_a_WHOLE_window_is_simply_a_PR_nobody_has_reviewed():
+    """No truncation means the window speaks for the PR's whole history, and a history
+    with no runs in it holds no stop. Silent, because "we looked and found nothing" is
+    the ordinary answer and must not be dressed up as a failure to look."""
+    assert panel.board_terminal_verdict("acme/board", 1780,
+                                        get=_board({"runs": []})) == (None, "")
 
 
 def test_a_PR_whose_rounds_all_went_again_has_no_terminal_verdict():
@@ -237,6 +309,83 @@ def test_whether_the_branch_moved_since_the_stop_is_recorded_either_way(
                                head=moved_head, new_cycle=True)
     assert moved["preflight"]["prior_cycle"]["head_moved"] is True
     assert "The branch has moved since." in report
+
+
+#: Cycle A ended, then somebody started cycle B with `--new-cycle` and B's round 1
+#: said go again. This is what the board holds when B's round 2 asks — a stop, with a
+#: live cycle recorded on top of it.
+RESTARTED = (_run_row(2, cycle="cyc-A", reason="84% of new findings were introduced "
+                                               "by the fix pass", confident=False),
+             _run_row(1, cycle="cyc-B", stopped=False, reason=None))
+
+
+def test_a_round_continuing_a_cycle_started_ON_TOP_of_an_old_stop_RUNS(
+        monkeypatch, capsys, tmp_path):
+    """The wedge, end to end. Round 2 of the live cycle is not the round an old stop
+    has anything to say about, and refusing it was unescapable: `--new-cycle` is the
+    only way past the refusal and it starts a third cycle rather than continuing this
+    one, resetting the baseline and every convergence guard each time it is used."""
+    code, report, payload = _round(monkeypatch, capsys, tmp_path, runs=RESTARTED)
+    assert code == 0 and payload["reviewed"] is True
+    assert payload["preflight"]["verdict"] != "refuse"
+    assert "already ENDED" not in report
+    assert not [n for n in payload["config_notes"] if "--new-cycle" in n]
+
+
+def test_the_old_stop_still_rides_in_the_payload_of_the_round_that_ran_past_it(
+        monkeypatch, capsys, tmp_path):
+    """Auditable and gating nothing: the record is carried with `terminal: False`, so a
+    reader can see the stop the PR holds and see that it is not this round's ending.
+    `refused` is the field every renderer branches on and it has to track the gate
+    rather than the record's presence."""
+    _code, _report, payload = _round(monkeypatch, capsys, tmp_path, runs=RESTARTED)
+    pc = payload["preflight"]["prior_cycle"]
+    assert pc["terminal"] is False and pc["refused"] is False
+    assert pc["round"] == 2 and pc["cycle"] == "cyc-A" and pc["latest_round"] == 1
+    assert "introduced by the fix pass" in pc["reason"]
+
+
+def test_a_live_cycle_on_top_of_a_stop_narrates_NOTHING_about_having_stepped_past_it(
+        monkeypatch, capsys, tmp_path):
+    """The banner's every clause is about a verdict this round stepped past, and this
+    round stepped past nothing — it is round N of a cycle already under way, nobody
+    passed `--new-cycle` to reach here, and a banner saying they did would be the
+    report contradicting the flags it ran under."""
+    _code, report, _payload = _round(monkeypatch, capsys, tmp_path, runs=RESTARTED)
+    assert "**A previous cycle on this PR was already ENDED.**" not in report
+    assert "started with `--new-cycle`, so it is a NEW cycle" not in report
+    assert "That stop was **not** convergence" not in report
+
+
+def test_a_stop_that_IS_the_newest_run_still_refuses_however_many_cycles_precede_it(
+        monkeypatch, capsys, tmp_path):
+    """#617 itself, unchanged by the fix above: a cycle restarted and then stopped
+    AGAIN is a cycle waiting to be answered, and the last thing anybody recorded is
+    that stop."""
+    runs = (_run_row(2, cycle="cyc-A", reason="the first cycle stopped"),
+            _run_row(1, cycle="cyc-B", stopped=False, reason=None),
+            _run_row(2, cycle="cyc-B", reason="and the second stopped too"))
+    code, report, payload = _round(monkeypatch, capsys, tmp_path, runs=runs)
+    assert code == 0 and payload["reviewed"] is False
+    assert payload["preflight"]["verdict"] == "refuse"
+    pc = payload["preflight"]["prior_cycle"]
+    assert pc["terminal"] is True and pc["refused"] is True and pc["cycle"] == "cyc-B"
+    assert "already ENDED this cycle" in payload["skip_reason"]
+    assert "`--new-cycle` to start a genuinely new cycle" in report
+
+
+def test_a_newest_run_nobody_could_read_lets_the_round_run_and_says_so(
+        monkeypatch, capsys, tmp_path):
+    """Reported into `config_notes` on the same best-effort rule the unreachable board
+    takes: a row this cannot parse is "we could not look", which is not a refusal and
+    is not silence either."""
+    code, _report, payload = _round(monkeypatch, capsys, tmp_path,
+                                    runs=(_run_row(1), "a row nobody can read"))
+    assert code == 0 and payload["reviewed"] is True
+    assert payload["preflight"]["prior_cycle"] is None
+    assert any("newest run for this PR came back as a str" in n
+               and "this round ran without that check" in n
+               for n in payload["config_notes"])
 
 
 def test_a_board_that_could_not_be_asked_lets_the_round_run_and_says_so(

@@ -155,6 +155,108 @@ def test_an_exclusion_is_honoured_from_either_key():
     assert _scan({"c.yml": bang})[0] is not None
 
 
+# -------------------------------------------- `branches:` is read IN ORDER
+
+
+def _pr_on(*patterns):
+    """A workflow whose only trigger is `on.pull_request.branches`, in the order
+    given — which is the whole subject of this block."""
+    items = ", ".join(f"'{p}'" for p in patterns)
+    return f"name: ci\non:\n  pull_request:\n    branches: [{items}]\n"
+
+
+def test_a_branch_put_BACK_after_an_exclusion_is_one_GitHub_runs():
+    """The reported defect. `['**', '!release/**', 'release/special']` names
+    `release/special` explicitly, last, and GitHub's rule is that the last matching
+    pattern decides — so a run exists. Read by splitting the list into positives and
+    negatives, the exclusion won unconditionally and this scanner announced that no
+    run could EVER exist for the PR, under a remedy telling the operator to add a base
+    that was already in the trigger list. A confident falsehood with an unperformable
+    instruction beneath it is #628 exactly, arriving through a second door."""
+    wf = _pr_on("**", "!release/**", "release/special")
+    assert _scan({"c.yml": wf}, base="release/special") == (None, "")
+
+
+def test_the_put_back_works_from_an_all_exclusion_opening_too():
+    """`['!release/**', 'release/special']` is the same rule without the leading `**`,
+    and the positive still has the last word over the branch it names."""
+    wf = _pr_on("!release/**", "release/special")
+    assert _scan({"c.yml": wf}, base="release/special") == (None, "")
+
+
+def test_an_exclusion_that_matches_LAST_still_excludes():
+    """The other direction of the same rule, so "last match wins" is a rule rather than
+    a bias towards admitting: `release/1` is matched by the `**` and then taken back
+    out by the `!release/**` that follows it, and nothing after that names it."""
+    blocked, why = _scan({"c.yml": _pr_on("**", "!release/**", "release/special")},
+                         base="release/1")
+    assert why == "" and blocked is not None
+    assert "no workflow in this repo can produce a run" in blocked["reason"]
+
+
+def test_a_list_that_is_nothing_but_exclusions_admits_what_it_does_not_name():
+    """The starting state for a list with no positive in it: it names what it refuses,
+    and everything else runs."""
+    wf = _pr_on("!release/**", "!wip/**")
+    assert _scan({"c.yml": wf}, base="main") == (None, "")
+    assert _scan({"c.yml": wf}, base="wip/thing")[0] is not None
+
+
+def test_a_list_holding_any_positive_is_an_ALLOW_list():
+    """The other starting state, and the half a "last match wins" reading could lose:
+    a branch that nothing in the list matches is out, so a positive anywhere in the
+    list keeps the trigger list meaning what it says."""
+    wf = _pr_on("!release/**", "release/special")
+    blocked, why = _scan({"c.yml": wf}, base="main")
+    assert why == "" and blocked is not None
+    assert "add `main` to the trigger list" in blocked["remedy"]
+
+
+def test_order_is_read_left_to_right_and_not_from_the_most_specific_pattern():
+    """`['release/special', '!release/**']` is the same two patterns the other way
+    round, and it excludes the branch the previous test admits. A reader that ranked
+    patterns by specificity rather than by position would give both lists the same
+    answer, and one of them would be wrong."""
+    blocked, why = _scan({"c.yml": _pr_on("release/special", "!release/**")},
+                         base="release/special")
+    assert why == "" and blocked is not None
+
+
+def test_the_globs_keep_their_meanings_inside_an_ordered_list():
+    """`*` still does not cross a `/` and `**` still does, on either side of a `!` —
+    the ordering rule changed which pattern decides, not what a pattern matches."""
+    shallow = _pr_on("**", "!release/*")
+    assert _scan({"c.yml": shallow}, base="release/1")[0] is not None
+    assert _scan({"c.yml": shallow}, base="release/1/hotfix") == (None, "")
+
+    deep = _pr_on("**", "!release/**")
+    assert _scan({"c.yml": deep}, base="release/1/hotfix")[0] is not None
+
+
+def test_a_negation_inside_branches_ignore_WITHDRAWS_the_whole_filter():
+    """GitHub does not state what a `!` means inside `branches-ignore` — the key
+    already means "not these" — and an unestablished list is no evidence for the one
+    claim this module is not allowed to get wrong. So the exclusion is withdrawn and
+    the event admits, rather than the `!` item being matched as a branch literally
+    named `!main`. `fca` is refused by the same file without the negation, which is
+    what makes this a withdrawal rather than a no-op."""
+    plain = "name: ci\non:\n  pull_request:\n    branches-ignore: ['fca']\n"
+    assert _scan({"c.yml": plain})[0] is not None
+
+    withdrawn = "name: ci\non:\n  pull_request:\n    branches-ignore: ['fca', '!main']\n"
+    assert _scan({"c.yml": withdrawn}) == (None, "")
+
+
+def test_branches_ignore_stays_independent_of_branches():
+    """They are not merged into one ordered list: GitHub refuses a workflow that uses
+    both for the same event, so there is no interleaving to get right and inventing one
+    would be this reader deciding a question the file cannot ask. Each key still
+    answers on its own where it is the only one present."""
+    only_ignore = "name: ci\non:\n  pull_request:\n    branches-ignore: ['main']\n"
+    assert _scan({"c.yml": only_ignore}, base="fca") == (None, "")
+    assert _scan({"c.yml": only_ignore}, base="main")[0] is not None
+
+
 # ------------------------------------------------- every ambiguity fails OPEN
 
 def test_a_workflow_directory_that_could_not_be_read_withdraws_the_claim():

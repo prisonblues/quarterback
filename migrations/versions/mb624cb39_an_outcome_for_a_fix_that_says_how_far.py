@@ -57,6 +57,32 @@ the class would have taken — which is the only thing distinguishing this row f
 a `fixed` one. A bare `narrowed` is a `fixed` that has lost the word's whole
 content, and it would be the cheap exit this change must not create.
 
+## The downgrade refuses once the word is in use — it is one-way in practice
+
+`downgrade()` drops `ck_review_finding_outcomes_narrowed_note`, drops the widened
+vocabulary CHECK, and recreates the four-value one. PostgreSQL validates a CHECK
+against the existing rows as it adds it, so **that last step raises the moment a
+single `narrowed` row exists in `review_finding_outcomes`**, and the whole revision
+rolls back with it — Alembic runs it in one transaction (`migrations/env.py`) and
+Postgres has transactional DDL, so nothing is left half-applied to clean up.
+
+The refusal is deliberate and is argued in `downgrade()`'s own docstring: the
+alternative is quietly rewriting those rows to `fixed`, which destroys the one
+distinction the outcome exists to record. The operational consequence is worth saying
+out loud, though: **once the first production round has recorded a `narrowed`
+finding, this revision can no longer roll the app and the schema back together.**
+
+If a rollback is genuinely wanted, an operator has to clear the word out of the table
+first, and decide deliberately what each row becomes:
+
+    SELECT finding_key, note FROM review_finding_outcomes WHERE outcome = 'narrowed';
+
+Each of those is a real fix whose `note` carries the general form nobody wrote.
+Rewriting the row to `fixed` loses that sentence's meaning; deleting it loses the
+finding's outcome altogether. Either is a judgement about the record, which is exactly
+why the migration will not make it on an operator's behalf. Once the query returns no
+rows, `alembic downgrade` succeeds unchanged — there is nothing else to undo.
+
 ## The vocabulary is frozen here on purpose
 
 Five values spelled out rather than imported from `app.api.reviews`. #344's rule,

@@ -599,6 +599,17 @@ So, per finding — under `shape`, which is the default:
   issue, because a spare line on a tracker was the cheap error. Under `shape` that spare
   line is precisely the failure being fixed, so the cheap error is now the row.
 
+  **And nothing upstream classifies for you, so read the gate's silence carefully.**
+  No seat, no judge and no round payload emits a shape — the panel reports findings,
+  not ticket shapes — and neither of the harness's two automatic deferral paths
+  supplies one either: a below-floor remainder is gated on severity alone, an
+  unverifiable claim on its own exemption. So under `shape` **every deferral the
+  machine raises by itself lands in this bullet and files nothing.** That is the right
+  answer for a remainder, which IS a batch, and it is **not** the harness having
+  judged that no issue is warranted — it has not looked. The two roads above are
+  reachable only where you classify a deferral yourself and open the issue by hand,
+  which is what this section asks of you; if you do not make that call, nobody does.
+
   **The note is not optional here and it is the whole difference between a record and
   a dumping ground.** With an issue, the issue's title and body are what somebody
   reads later; with no issue, the note is. A row with neither is the markdown list this

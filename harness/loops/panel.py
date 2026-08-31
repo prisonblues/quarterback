@@ -260,9 +260,25 @@ def board_terminal_verdict(gh_repo: str, pr_number: int,
     raw at any window size, and the endpoint's docstring points callers at them
     for this reason.
 
-    The NEWEST stopped round wins. A PR can hold several ended cycles and the
-    question is whether the last thing anybody recorded was a stop, not whether a
-    stop ever happened.
+    **The LAST RUN decides, not the last stop.** The rows arrive chronologically,
+    so `runs[-1]` is where the PR stands as it stands now, and only a stop sitting
+    THERE is a cycle waiting to be answered. A stop with any round recorded after
+    it is a cycle somebody has already restarted, and a gate whose whole subject is
+    "an earlier round ended this" has nothing to say about one already under way.
+
+    Reading the newest STOP instead wedged every cycle after the first, which is
+    the defect this paragraph replaces: `--new-cycle` starts cycle B, B's round 1
+    legitimately says go again, and B's round 2 reads cycle A's months-old stop and
+    is refused. The only way past a refusal is `--new-cycle`, which starts a THIRD
+    cycle rather than continuing B — so no PR that had ever stopped could run a
+    multi-round cycle again, and the flag meant to unblock it reset the baseline
+    and every guard each time it was used.
+
+    The record still comes back when a live cycle sits on top of an older stop,
+    marked ``terminal: False``. It is a true thing about the PR and a reader
+    auditing the round can have it; it is simply not this round's ending, so
+    everything downstream keys the refusal on ``terminal`` rather than on the
+    record being present at all.
 
     An error is REPORTED and never returns "nothing" quietly, on
     :func:`board_escalations`' rule: "no terminal verdict" and "we could not find
@@ -287,6 +303,29 @@ def board_terminal_verdict(gh_repo: str, pr_number: int,
         return None, ("this board published no `runs` for the PR, so nothing says "
                       "whether an earlier round ended this cycle — either it "
                       "predates the field or no review run has been recorded here")
+    if not runs:
+        if body.get("truncated"):
+            # The window trims from the OLD end, so a page of runs ends at the
+            # newest one and this pair cannot arise from a board behaving as
+            # documented. If it ever does, the run this function's question is
+            # ABOUT is the one missing from the answer — and an empty page read as
+            # "no cycle ended here" would be the inference from absence that every
+            # other branch here refuses, made from the one row that decides.
+            return None, ("the board listed no runs for this PR while also saying "
+                          "the window was truncated, so the newest round is not in "
+                          "the answer and nothing in it says whether that round "
+                          "ended the cycle")
+        return None, ""
+    latest = runs[-1]
+    if not isinstance(latest, dict):
+        # An older row that will not parse is skipped in silence below — it is one
+        # candidate among many and the rows around it still answer the question.
+        # The newest row is the question, so a newest row nobody can read is
+        # reported: reading the PR's current state off the rows UNDERNEATH it is
+        # exactly the "newest stop" mistake in another costume.
+        return None, (f"the board's newest run for this PR came back as a "
+                      f"{type(latest).__name__}, not an object, so nothing says "
+                      "whether the round this PR now stands on ended the cycle")
     stopped = [r for r in runs if isinstance(r, dict) and r.get("stopped") is True]
     if not stopped:
         return None, ""
@@ -298,6 +337,16 @@ def board_terminal_verdict(gh_repo: str, pr_number: int,
             "confident": last.get("stop_confident"),
             "veto": last.get("stop_veto"),
             "run_id": last.get("id"),
+            # THE GATE'S ONLY QUESTION, and the one key a caller may refuse on:
+            # is that stop where the PR stands, or has a round been recorded since?
+            # `stopped[-1] is latest` when it is true — the newest stop and the
+            # newest run are then the same row — so nothing below has to be read
+            # twice to tell which cycle the fields describe.
+            "terminal": latest.get("stopped") is True,
+            # What makes `terminal` false, for a reader auditing the answer: the
+            # round the board has recorded most recently. Equal to `round` on a
+            # terminal verdict, and a later round on a cycle already under way.
+            "latest_round": latest.get("round"),
             # Whether the window this was found in speaks for the PR's whole
             # recorded history. It does not change the verdict — a stop inside the
             # window is a stop — but a reader auditing a refusal is owed the scope
@@ -391,9 +440,18 @@ def _fix_pass_files(diff: str) -> set[str]:
 
 
 def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
-                        round_no: int, cycle: str | None) -> set[str]:
-    """Every file an EARLIER round of this cycle had in front of it, out of the
-    `--baseline` payloads themselves.
+                        round_no: int, cycle: str | None) -> tuple[set[str], bool]:
+    """`(every file an EARLIER round of this cycle had in front of it, whether any
+    such payload was actually READ)`, out of the `--baseline` payloads themselves.
+
+    **The second half is a fact and not a summary of the first.** An empty set has
+    two causes — no payload survived the checks below, or one did and the round it
+    describes had no files — and they are opposite answers to the question
+    :func:`fix_surface` asks of them: the first means nobody knows what earlier
+    rounds saw, the second means they saw nothing and every file the fix pass
+    touched is genuinely new. Returned rather than inferred at the call site
+    because `bool(seen)` is precisely the inference that collapsed the two, and a
+    caller cannot recover from here what this loop threw away.
 
     Read here rather than off :class:`panel_rounds.Baseline`, which carries what
     earlier rounds FOUND and not what they were looking at. The payloads are read
@@ -410,6 +468,7 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
     the same files, and a second complaint about one file would be two.
     """
     seen: set[str] = set()
+    read = False
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
@@ -427,12 +486,20 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
             continue
         if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
             continue
+        # Set HERE, past every identity check and beside the union rather than at
+        # the top of the loop: "readable" has to mean an earlier round OF THIS
+        # CYCLE was read, since a payload from another cycle is no evidence about
+        # what this one's rounds were looking at. A flag set on any file that
+        # merely parsed would say the surface was measured off payloads this
+        # measurement then discarded.
+        read = True
         seen |= {str(f.get("path")) for f in (payload.get("changed_files") or [])
                  if isinstance(f, dict) and f.get("path")}
-    return seen
+    return seen, read
 
 
-def fix_surface(fix_diff: str | None, prior_files: set[str]) -> dict | None:
+def fix_surface(fix_diff: str | None, prior_files: set[str],
+                prior_read: bool) -> dict | None:
     """What SURFACE the last fix pass opened: the files it touched, and which of
     them no earlier round had in front of it.
 
@@ -465,10 +532,31 @@ def fix_surface(fix_diff: str | None, prior_files: set[str]) -> dict | None:
     must not be reported as a pass that opened nothing**, and it must not be
     reported as one that opened the world either; the answer is that nobody
     looked, and null is how this payload says that everywhere else.
+
+    **A ZERO IS NOT A NULL, and the two inputs have to say which they are.**
+    `panel_rounds.fix_surface_state` publishes ``count: 0`` as "a pass was measured
+    and opened no new file" and ``None`` as "nobody measured", and this is the
+    producer that has to keep them apart:
+
+    * ``fix_diff`` is ``None`` for a range nobody could read and a STRING for one
+      that was read, empty included. A fix range that came back holding nothing —
+      an empty commit, a revert that nets out, a pass whose files carried no
+      attributable header — is a measurement whose answer is zero, and reporting it
+      as "not measured" hides the one shape a reader most wants to see: a fix pass
+      that opened no surface at all.
+    * ``prior_read`` is :func:`earlier_round_files`' own account of whether it read
+      an earlier round of this cycle. It used to be inferred from ``prior_files``
+      being non-empty, which is false for the case that matters most: an earlier
+      round with an empty surface gaining its FIRST file is a real transition, and
+      inferring "unreadable" there reported the pass that made it as unmeasured.
+
+    So ``None`` is round 1 (the caller does not ask), an unreadable range, and
+    unreadable prior payloads. Everything else is a measurement, and a measurement
+    of zero is published as zero.
     """
-    files = _fix_pass_files(fix_diff) if fix_diff else set()
-    if not files or not prior_files:
+    if fix_diff is None or not prior_read:
         return None
+    files = _fix_pass_files(fix_diff)
     new = sorted(f for f in files if f not in prior_files)
     return {"files": sorted(files), "new_files": new, "count": len(new),
             "prior_files": len(prior_files)}
@@ -1841,6 +1929,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # not be checked rather than that there was nothing to find, and the round runs
     # exactly as it did before this existed.
     prior_cycle, prior_cycle_why = board_terminal_verdict(gh_repo, pr_number)
+    # Empty unless a TERMINAL verdict is what came back. Every sentence built from
+    # it says a cycle "ENDED", and a stop with later rounds recorded on top of it
+    # is a cycle that was restarted and is still running — so there is no such
+    # sentence to write, and the two readers of this below are both reached through
+    # `terminal` for that reason.
+    prior_said = ""
+    ended = bool(prior_cycle and prior_cycle.get("terminal"))
     if prior_cycle:
         # Whether the branch has moved since that verdict. It does not soften the
         # refusal — a fix pass after a stop is the shape #617 measured, not an
@@ -1848,12 +1943,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # pass `--new-cycle` wants to know whether anything happened in between.
         prior_cycle["head_moved"] = bool(prior_cycle.get("head_sha")
                                          and prior_cycle["head_sha"] != head_sha)
-        prior_cycle["refused"] = not new_cycle
-        prior_said = (
-            f"round {prior_cycle['round'] or '?'} of cycle "
-            f"`{str(prior_cycle['cycle'] or '?')[:12]}` ENDED this cycle "
-            f"{prior_cycle['ago'] or 'at an unrecorded time'} and said: "
-            f"{prior_cycle['reason'] or 'no reason recorded'}")
+        # `refused` is what the pre-flight notice keys its whole remedy list on, so
+        # it has to track the gate exactly rather than the record's presence: a
+        # round continuing a live cycle on a PR that stopped months ago was not
+        # refused, and a notice telling its operator to answer a stop they already
+        # answered is a remedy list with nothing actionable in it.
+        prior_cycle["refused"] = ended and not new_cycle
+        if ended:
+            prior_said = (
+                f"round {prior_cycle['round'] or '?'} of cycle "
+                f"`{str(prior_cycle['cycle'] or '?')[:12]}` ENDED this cycle "
+                f"{prior_cycle['ago'] or 'at an unrecorded time'} and said: "
+                f"{prior_cycle['reason'] or 'no reason recorded'}")
     elif prior_cycle_why:
         # Said in `config_notes` rather than swallowed, for `board_escalations`'
         # reason: this round may be continuing a cycle that was told to stop, and
@@ -1880,7 +1981,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "host's judgement about what its own seats can read; the ceiling "
                 "is a number a person set on the board for the fleet, and a local "
                 "flag that switched it off would make it advice again")
-    elif prior_cycle and not new_cycle:
+    elif ended and not new_cycle:
         # #617's refusal, and it is BELOW the spend ceiling for the reason the
         # ceiling is above mergeability: naming two preconditions in one refusal
         # gives the reader a remedy list containing something they cannot do. A
@@ -1900,7 +2001,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "cycle's guards connected. Pass --new-cycle to start a genuinely "
                 "new cycle once the thing that ended the last one has been answered")
         gate_overridable = False
-    elif prior_cycle and new_cycle:
+    elif ended and new_cycle:
         # The opt-in is recorded, loudly, and not just honoured. "The tool chose to
         # run" and "a caller overrode the tool" must never look alike — the same
         # rule `preflight.would_have` keeps for `--force`.
@@ -3793,10 +3894,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # argument written afterwards, and this repo's rule is that an instrument earns a
     # gate over a few dozen cycles or not at all. `round_stop` takes it, publishes it
     # as `round_stop.fix_surface`, and does not stop on it.
-    surface = (fix_surface(fix_diff,
-                           earlier_round_files(baseline or [], gh_repo, pr_number,
-                                               round_no, prior.cycle))
-               if attributable else None)
+    #
+    # Written out rather than folded into one expression because the two facts it
+    # needs are each half of a pair: the files earlier rounds saw travel with
+    # whether any earlier payload was READ, and the fix range travels with whether
+    # there was a range to read. Both halves decide `None` versus a measured zero,
+    # and both used to be guessed from emptiness here.
+    surface = None
+    if attributable:
+        seen, seen_read = earlier_round_files(baseline or [], gh_repo, pr_number,
+                                              round_no, prior.cycle)
+        # `_fix_range_diff` reports "nothing landed between rounds" and "the range
+        # changed no line" as a None with a `no-fix` verdict beside it — the same
+        # None it uses for a rewritten branch or an API refusal, which is right for
+        # provenance and wrong here. Surface CAN be measured over an empty range:
+        # the answer is that the pass opened nothing, and the empty string is how
+        # this hands over a range that was read and held no file. `no-fix` is the
+        # verdict's own word for it, so nothing is inferred from the None itself.
+        surface = fix_surface("" if fix_diff is None and range_kind == FIX_RANGE_NO_FIX
+                              else fix_diff, seen, seen_read)
     revert_cleared, revert_open = fix_pass_outcome(prior.fixed_findings, outstanding)
     # The commits inside the range, and the ONE extra `gh api` call this whole feature
     # makes — paid only on a round whose rate crossed the threshold, which is the
@@ -4751,7 +4867,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # sentence saying it did goes where a reader cannot skim past it. Only reachable
     # with --new-cycle: without the flag this round was refused above and never got
     # here.
-    if prior_cycle:
+    #
+    # `ended` and not `prior_cycle`, because the banner's every clause is about a
+    # verdict this round stepped PAST. A `terminal: False` record — an old stop with
+    # a live cycle running on top of it — is not one: this round is round N of that
+    # live cycle, nobody passed --new-cycle to reach here, and a banner saying they
+    # did would be the report contradicting the flags it ran under.
+    if ended:
         lines += [
             f"> ⚠️ **A previous cycle on this PR was already ENDED.** "
             f"{prior_said}."
@@ -4892,7 +5014,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # reading "0 of 0 files" would say a fix pass opened nothing when in fact
     # nothing was counted, which is the claim `fix_surface` returns None to avoid
     # making.
-    if surface:
+    #
+    # A range that WAS read and held no file gets its own sentence rather than that
+    # same "0 of 0" through the general clause below. It is a measurement — the
+    # contract's `count: 0`, not its null — and an empty commit or a revert that
+    # nets out is a real thing for a reader to know about a fix pass; but "it
+    # touched 0 file(s) and none of them are new" reads like the instrument
+    # failing, which is the reading this whole distinction exists to prevent.
+    if surface and not surface["files"]:
+        lines.append("**New surface in the last fix pass:** the fix range was read "
+                     "and held no file — the pass opened nothing. Measured against "
+                     f"the {surface['prior_files']} file(s) earlier rounds of this "
+                     "cycle recorded. Reported, not a threshold — nothing stops on "
+                     "this (#67).")
+    elif surface:
         opened = (f"**{surface['count']} of them had never been in front of a "
                   f"reviewer**" if surface["count"] else
                   "none of them are new — the pass stayed inside the change under "
