@@ -2791,6 +2791,48 @@ def test_an_orphaned_namespace_that_merely_shares_a_prefix_is_not_trusted(pushed
     assert "`refs/remotes/team/bob/main` is under `refs/remotes/`" in check.detail
 
 
+def test_a_destination_of_exactly_a_star_vouches_for_nothing(pushed):
+    """A bare `*` names no namespace, so it establishes ownership over none.
+
+    Found by review, and it was a divergence in the one direction this change exists to
+    close. `dst[:-1]` on a destination of `*` is the empty string, and `ref.startswith("")`
+    is True for every ref — so a single such refspec would vouch for the whole
+    `refs/remotes/` namespace, orphans included, and this row would answer where the sweep
+    refuses. The shell reaches the opposite answer (`${ref#""}` equals `$ref`, owning
+    nothing) and the shell is right.
+
+    Git accepts `+refs/tags/*:*` beside a normal refspec, and `git remote` does not object,
+    so this is a configuration a person can actually be running.
+    """
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/*")
+    _git(pushed, "config", "--add", "remote.origin.fetch", "+refs/tags/*:*")
+    _git(pushed, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown", check.detail
+    assert "`refs/remotes/ghost/main` is under `refs/remotes/`" in check.detail
+
+
+def test_a_refusal_states_the_fault_once_and_not_twice(pushed):
+    """Every refusal here is rendered by the caller as "<reason>, so what exists only on
+    this disk was not asked", so a reason closing on its own version of that clause said it
+    twice. The single-branch case is the likeliest of the five to be met in the wild — any
+    single-branch clone — and the older test asserted only that `refs/heads/*` appeared,
+    which is why nothing caught it."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/main:refs/remotes/origin/main")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert check.detail.count("exists only on this disk") == 1, check.detail
+    assert check.detail.count("exists nowhere else") == 1, check.detail
+
+
 def test_a_refspec_read_that_failed_is_not_a_remote_that_maps_nothing(pushed, monkeypatch):
     """An inspection that did not happen must not be reported as one that found nothing.
 

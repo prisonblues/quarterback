@@ -2484,10 +2484,16 @@ def _refspec_coverage(host: Host, remote: str) -> tuple[str | None, list[str]]:
             dest_why = (f"`{remote}` fetches `refs/heads/*` into `{dst}`, which is not "
                         "under `refs/remotes/` and so is not what this question subtracts")
     if not maps_every_head:
+        # Ends at the FAULT and not at the consequence: every refusal here is rendered
+        # by the caller as "<reason>, so what exists only on this disk was not asked",
+        # so a reason that closed on its own version of that clause said it twice. The
+        # single-branch case is the likeliest of the five to be met in the wild — any
+        # single-branch clone — and the test asserted only that `refs/heads/*` appeared,
+        # so nothing caught the doubling.
         return (dest_why or
                 f"`{remote}` does not fetch `refs/heads/*` — a single-branch or custom "
-                "refspec brings back some branches and not others, so a branch that IS on "
-                "the server would answer here as work that exists only on this disk"), []
+                "refspec brings back some branches and not others, so a branch that IS "
+                "on the server reads here as work that exists nowhere else"), []
     return None, covered
 
 
@@ -2523,7 +2529,18 @@ def _unowned_remote_ref(host: Host, covered: list[str]) -> str | None:
             continue
         # A fetch refspec takes at most one `*`, and it is a suffix wildcard: the
         # destination is a prefix and everything under it.
-        if any(ref.startswith(dst[:-1]) if dst.endswith("*") else ref == dst
+        #
+        # AN EMPTY PREFIX OWNS NOTHING, which is the whole of `dst[:-1] and`. A
+        # destination of exactly `*` — legal, and git accepts `+refs/tags/*:*`
+        # alongside a normal refspec — leaves `dst[:-1] == ""`, and
+        # `ref.startswith("")` is True for every ref, so one such spec would vouch
+        # for the entire `refs/remotes/` namespace including an orphan nothing
+        # refreshes. The shell reaches the opposite answer here (`${ref#""}` equals
+        # `$ref`, so it owns nothing) and the shell is right: a bare `*` names no
+        # namespace, so it establishes no ownership over one. Found by review, and
+        # it mattered because it was a divergence in the one direction this whole
+        # change exists to close.
+        if any(ref.startswith(dst[:-1]) if dst.endswith("*") and dst[:-1] else ref == dst
                for dst in covered):
             continue
         return (f"`{ref}` is under `refs/remotes/` and no remote's fetch refspec writes "
@@ -2662,7 +2679,7 @@ def check_unpushed(host: Host) -> Check:
     if orphan:
         return Check("unpushed", r,
                      f"{orphan}, so what exists only on this disk was not asked", "unknown",
-                     manual=f"git -C {r} for-each-ref --format='%(refname)' refs/remotes/")
+                     manual=f"git -C {r} update-ref -d <the ref named above>")
     everywhere = _no_remote_has(host, "--branches")
     tips = _branch_tips(host)
     if everywhere is None or tips is None:
