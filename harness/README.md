@@ -265,6 +265,25 @@ the row is the only record, so losing both would lose the finding.
 judgement: that the permission and its report ship together, that the cross-file references to
 step 3a resolve, and that `deferred` is a value the database accepts.
 
+**Every one of those outcomes is a refusal, and refusing was the expensive road** (#616). The
+brief permitted a false positive and asked nothing at all in support of a fix, so the whole
+burden of proof sat on refusal — and when a finding is wrong, complying is cheaper than
+disproving it, so the pass complies and the churn reads as diligence. Nothing could see it,
+because a fix for a non-defect looks exactly like a fix for a defect. So `review-pr.md`'s step 3
+now owes **one line per finding before its patch**, naming who consumes the code the fix would
+change: the callers, and for anything reaching a response or a stored artefact, the entitlement
+tier it is served to. It lands in a **Consumers** column in the step-6 table, so the summary
+carries it, and it is owed on **every** finding at every severity — the alternative, only the
+findings whose fix touches a response path, asks the fixer to classify its own work before doing
+the work that would tell it, which is the self-policing the requirement exists to remove. The
+measured instance is lexray#1780 round 3: a P2 verified by a seat and confirmed by the judge,
+wrong about what `html_preview` is for, fixed by merging the paid glossary into the anonymous
+teaser, and caught a round later as an entitlement leak. The refutation was one `grep` for
+callers and one docstring. `harness/tests/test_fixer_consumers.py` guards the same kind of wiring
+the escalation suite does — that the requirement is in every brief that runs a fix pass, that
+replacing `/review-pr`'s step 2 with a panel's findings does not take it out, and that the table
+a fixer copies has the column.
+
 The loop knows about it, which took a second change (#221). An escalated finding is outstanding
 and no fixer may touch it, so under the original stopping rule it earned another round every time
 until the cap ran out — the mechanism built to stop a cycle circling a premise guaranteed it ran

@@ -156,6 +156,17 @@ command -v codex >/dev/null && git diff | \
 ```
 Fold genuine bugs in; drop only clear false positives. Skip silently if absent.
 
+**Before you fix a finding, write one line naming who consumes the code the fix
+would change** — the callers, and where that code reaches a response or a stored
+artefact, the entitlement tier it is served to. Every finding gets one, before its
+patch, in your summary beside the finding; `unknown` is allowed where a search could
+not settle it, and then you fix that finding where it was raised and no further.
+`/review-pr`'s step 3 has the full version and the instance behind it (#616). The
+short reason: dropping a false positive is permitted and nothing is asked in support
+of a fix, so refuting a wrong finding costs more than complying with it and the pass
+complies — and unnecessary churn reads as diligence, because a fix for a non-defect
+looks exactly like a fix for a defect.
+
 Fix everything you find, then re-run the quality pipeline until clean.
 
 ## 8. Commit (in place)

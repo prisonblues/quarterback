@@ -292,6 +292,50 @@ bottom rank, so at the shipped setting **every finding you were handed gets fixe
 none of them is below the floor. Only a repo that has raised the floor has a below-floor
 tier, and those findings are reported and left alone.
 
+**Before you fix a finding, write one line naming who consumes the code the fix would
+change.** The callers, from a search you actually ran rather than from memory — and where
+that code reaches a response or a stored artefact, the entitlement tier it is served to.
+Every finding on the list gets one, before its patch, and it goes in the **Consumers**
+column of step 6's table.
+
+It is there to make refuting a finding cost the same as complying with it. This page
+allows a false positive — "a genuine false positive you re-examined and confirmed
+correct" — and asks nothing whatever in support of a fix, so the entire burden of proof
+sits on refusal. That asymmetry has a direction: when a finding is wrong, complying is
+cheaper than disproving it, so the pass complies, and the result is unnecessary churn that
+reads as diligence, invisible to every guard on this page because a fix for a non-defect
+looks exactly like a fix for a defect. One line owed either way removes the difference,
+and it is usually the refutation itself.
+
+lexray#1780, round 3, is what it costs to skip it. A P2 said an ingest-time preview
+permanently lost its Definitions section. A seat verified it, the master judge confirmed
+it, and it was **wrong**: `html_preview` is the free teaser, built inside
+`if not viewer_has_full_content_access():`, and an empty definitions panel is what it is
+for. The fix merged the paid glossary into it, and round 4 caught the result as a P2 —
+paid Handbook meanings rendered to anonymous viewers. A confirmed false positive became an
+entitlement leak in one pass. Disproving the original was one `grep` for the callers of
+`generate_preview_html` plus one docstring, ninety seconds, and nobody asked for it. The
+consumer line is that `grep`, owed before the patch instead of discovered after it.
+
+**Every finding, and not only the ones whose fix you judge to touch a response path.**
+The narrow rule asks the fixer to classify its own work before doing the work that would
+tell it — the actor policing itself, which is the failure this whole requirement is about
+— and round 3's fixer would have answered "no response path here", correctly by its own
+model of the code and wrongly in fact. The line is one sentence; the classification that
+would save you writing it is the judgement it exists to replace.
+
+**`unknown` is a permitted answer and it is not a free one.** Write it when you searched
+and the consumers are genuinely not determinable — dynamic dispatch, a public API with
+callers outside this repo — and say which it was. Then fix that finding at the point it
+was raised and no further: `unknown` plus a widened fix is the shape that produced the
+leak above.
+
+**It is not charged to `low_severity_fix_lines`.** That budget prices churn in the diff,
+and this line lands in your summary rather than in a file. A budget that has run out stops
+you fixing a finding; it never stops you saying who consumes the code, and a finding the
+budget did not reach still gets its line, because the line is what tells a later reader
+whether the finding was worth reaching.
+
 **The bar is unchanged: no finding on the list is noted and walked past.** What the
 rest of this section bounds is not how well you fix them — it is **where the work is
 allowed to land**. Thoroughness is spent inside the change under review, not around
@@ -876,17 +920,24 @@ Return this table as your final message:
 ## Review Summary — PR #<n> (<repo>)
 Files reviewed: N | Findings: N | Fixed: N | Narrowed: N | Deferred: N | Escalated: N | Refuted: N
 
-| # | Severity | Kind | Finding | Resolution |
-|---|----------|------|---------|------------|
-| 1 | P1 | regression | ... | Fixed: ... |
-| 2 | P2 | claim-miss | ... | Escalated — see the block below |
-| 3 | P2 | observation | ... | Narrowed — see the block below |
-| 4 | P3 | observation | ... | Deferred — see the block below |
-| 5 | P3 | observation | ... | Refuted: <the evidence it was not a defect> |
+| # | Severity | Kind | Consumers | Finding | Resolution |
+|---|----------|------|-----------|---------|------------|
+| 1 | P1 | regression | `sync_row` — 2 callers, both the admin task | ... | Fixed: ... |
+| 2 | P2 | claim-miss | `plan_next` — the CLI and the MCP tool | ... | Escalated — see the block below |
+| 3 | P2 | observation | `render_card` — one caller, served to signed-in members | ... | Narrowed — see the block below |
+| 4 | P3 | observation | `unknown` — dynamic dispatch, callers not determinable | ... | Deferred — see the block below |
+| 5 | P3 | observation | `generate_preview_html` — one caller, the anonymous teaser branch | ... | Refuted: <the evidence it was not a defect> |
 
 (`Kind` is step 2's classification — `claim-miss`, `regression` or `observation`.
 It is what a reader needs to tell a finding that blocks from one that does not,
 and it is not derivable from the severity column beside it.)
+
+(`Consumers` is step 3's line: who calls the code this finding's fix would change,
+and — where that code reaches a response or a stored artefact — the entitlement tier
+it is served to. Every row carries one, whatever became of the finding, because the
+column exists to make refuting cost what complying costs. Row 5 is the shape it was
+built for: the line and the refutation are the same sentence. `unknown` is allowed
+where a search could not settle it, and row 4 says what to write with it.)
 
 Narrowed — fixed where it was raised; the general form is not this pass's work
 - Finding: <the number above>
