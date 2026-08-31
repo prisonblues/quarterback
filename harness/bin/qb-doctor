@@ -2414,8 +2414,13 @@ def _no_remote_has(host: Host, rev: str) -> list[tuple[str, str]] | None:
     return found
 
 
-def _maps_every_head(host: Host, remote: str) -> bool:
-    """Does this remote's refspec bring back EVERY branch, or only some of them?
+def _refspec_coverage(host: Host, remote: str) -> tuple[str | None, list[str]]:
+    """Does this remote's refspec bring back EVERY branch, and land it where we look?
+
+    Returns `(why_refused, destinations)`. `why_refused` is None when the refspecs
+    establish coverage; `destinations` is the DESTINATION half of every refspec that
+    writes a tracking ref, which is what `_unowned_remote_ref` needs and the only thing
+    that can answer where a fetch would actually write.
 
     Codex's finding. A single-branch clone configures
     `+refs/heads/main:refs/remotes/origin/main`, so `refs/remotes/` is complete for `main`
@@ -2424,15 +2429,106 @@ def _maps_every_head(host: Host, remote: str) -> bool:
     failure this row was written to avoid, arriving through the refspec instead of through
     the comparison.
 
-    A remote with no `fetch` refspec at all answers False for the same reason: nothing
-    here can say what it would have brought back.
+    THREE MORE WAYS IN, AND ALL OF THEM QUIET (#611). This function used to compare the
+    SOURCE half of each refspec against `refs/heads/*` and nothing else, which `qb-catchup`
+    grew past for #573 while this stayed where it was — so on the same checkout the sweep
+    refused the question and this row answered it:
+
+    * A **negative refspec** — `^refs/heads/private/*` — holds branches back while a
+      positive spec elsewhere still satisfies a source-only check. The branches it holds
+      back are exactly the ones this row would then call work that exists nowhere else.
+      It disqualifies the whole repository and not merely this remote: a second remote
+      fetching `refs/heads/*` is a second SERVER, and nothing here can establish that it
+      holds what this one excludes.
+    * A **destination outside `refs/remotes/`** — `refs/heads/*:refs/cache/origin/*`
+      brings back every head and puts none of it where `--not --remotes` looks. Unlike an
+      exclusion it only matters when nothing ELSE brought the heads to where this question
+      looks, so a second refspec that does is coverage and refusing over the first would
+      be a false refusal on a legal configuration.
+    * **A read that failed is not a remote configured with nothing.** `git config
+      --get-all` exits 1 for "no such key", which is a FACT about the configuration, and
+      anything else is a git that would not answer. The old `rc != 0` conflated them, so
+      an inspection that never happened was reported as one that found nothing — and
+      because the caller read False as "refuse", that one failed safe by luck rather than
+      by design and would have flipped with the sense of the return.
     """
     rc, out, _ = run_cmd(["git", "-C", str(host.repo), "config", "--get-all",
                           f"remote.{remote}.fetch"])
+    if rc not in (0, 1):
+        return (f"git would not read `remote.{remote}.fetch` (exit {rc}), so what "
+                f"`{remote}` brings back was never inspected"), []
+    specs = [line.strip() for line in out.splitlines() if line.strip()]
+    if not specs:
+        return (f"`{remote}` has no fetch refspec at all, so nothing here can say which "
+                "branches it would bring back"), []
+
+    covered: list[str] = []
+    maps_every_head = False
+    dest_why: str | None = None
+    for spec in specs:
+        spec = spec.removeprefix("+")   # a leading + is "force", not part of the source
+        if spec.startswith("^"):
+            return (f"`{remote}` excludes `{spec[1:]}` from what it fetches, so some "
+                    "branches on the server have no ref here"), []
+        src, sep, dst = spec.partition(":")
+        # No colon at all: `remote.x.fetch = refs/heads/*` fetches into FETCH_HEAD and
+        # writes no tracking ref, so it establishes neither coverage nor ownership.
+        if not sep:
+            continue
+        covered.append(dst)
+        if src != "refs/heads/*":
+            continue
+        if dst.startswith("refs/remotes/"):
+            maps_every_head = True
+        else:
+            dest_why = (f"`{remote}` fetches `refs/heads/*` into `{dst}`, which is not "
+                        "under `refs/remotes/` and so is not what this question subtracts")
+    if not maps_every_head:
+        return (dest_why or
+                f"`{remote}` does not fetch `refs/heads/*` — a single-branch or custom "
+                "refspec brings back some branches and not others, so a branch that IS on "
+                "the server would answer here as work that exists only on this disk"), []
+    return None, covered
+
+
+def _unowned_remote_ref(host: Host, covered: list[str]) -> str | None:
+    """A ref under `refs/remotes/` that no configured refspec writes to, or None.
+
+    THE MIRROR IMAGE OF THE REFSPEC CHECK, and `qb-catchup`'s fourth guard (#573, #611).
+    `--not --remotes` trusts every ref under `refs/remotes/`; only what a CONFIGURED
+    REFSPEC WRITES is ever refreshed. A ref left behind by a remote somebody removed, or
+    written there by hand, is therefore a permanent licence for whatever it reaches to
+    read as safely elsewhere — and unlike a stale ref it never self-corrects, because
+    nothing is ever going to fetch it again.
+
+    OWNERSHIP IS A DESTINATION AND NEVER A NAME. Comparing the top path segment under
+    `refs/remotes/` against the configured remote NAMES answers a different question and
+    fails open twice over: a remote writing to `refs/remotes/origin/branches/*` does not
+    own `refs/remotes/origin/old`, and with `team/alice` configured a whole orphaned
+    `refs/remotes/team/bob/` reads as covered because a name shares its first segment.
+
+    OWNERSHIP IS A PREFIX AND NOT A LIVENESS CHECK, which is where this stops. A ref
+    inside a destination some refspec writes to is one a fetch WOULD refresh, not evidence
+    the remote still has that branch — `refs/remotes/origin/typo-branch` passes on the
+    prefix alone. Same already-accepted staleness hole as a deleted upstream, and the same
+    reason: the only cure is a prune, and this row never prunes.
+    """
+    rc, out, _ = run_cmd(["git", "-C", str(host.repo), "for-each-ref",
+                          "--format=%(refname)", "refs/remotes/"])
     if rc != 0:
-        return False
-    return any(spec.lstrip("+").split(":")[0] == "refs/heads/*"
-               for spec in (line.strip() for line in out.splitlines()) if spec)
+        return ("git would not list the refs under `refs/remotes/`, so whether they all "
+                "belong to a configured remote could not be established")
+    for ref in (line.strip() for line in out.splitlines()):
+        if not ref:
+            continue
+        # A fetch refspec takes at most one `*`, and it is a suffix wildcard: the
+        # destination is a prefix and everything under it.
+        if any(ref.startswith(dst[:-1]) if dst.endswith("*") else ref == dst
+               for dst in covered):
+            continue
+        return (f"`{ref}` is under `refs/remotes/` and no remote's fetch refspec writes "
+                "there, so this question would trust a ref that nothing here refreshes")
+    return None
 
 
 def _branch_tips(host: Host) -> list[tuple[str, str]] | None:
@@ -2541,6 +2637,11 @@ def check_unpushed(host: Host) -> Check:
     # refs of all of them, so refreshing `origin` and then trusting a month-old `upstream`
     # is the stale-ref fault this row is written against, happening one level up. Codex
     # found it; the memo means a repo with one remote still fetches once.
+    #
+    # WHERE EVERY CONFIGURED REMOTE ACTUALLY WRITES, accumulated across all of them. The
+    # ownership audit below asks whether a ref under `refs/remotes/` is one some remote
+    # refreshes, and the only thing that can answer that is a refspec DESTINATION.
+    covered: list[str] = []
     for remote in remotes:
         ok, why = fetched(host, remote)
         if not ok:
@@ -2548,13 +2649,20 @@ def check_unpushed(host: Host) -> Check:
                          "of every remote, so one that could not be refreshed reports work "
                          "as stranded that was pushed since", "unknown",
                          manual=f"git -C {r} fetch {remote}")
-        if not _maps_every_head(host, remote):
+        refused, destinations = _refspec_coverage(host, remote)
+        if refused:
             return Check("unpushed", r,
-                         f"`{remote}` does not fetch `refs/heads/*` — a single-branch or "
-                         "custom refspec brings back some branches and not others, so a "
-                         "branch that IS on the server would answer here as work that "
-                         "exists only on this disk", "unknown",
+                         f"{refused}, so what exists only on this disk was not asked",
+                         "unknown",
                          manual=f"git -C {r} config --get-all remote.{remote}.fetch")
+        covered.extend(destinations)
+    # Only once every remote's refspecs have established coverage: a repository already
+    # refusing on a refspec has no business auditing the refs those refspecs describe.
+    orphan = _unowned_remote_ref(host, covered)
+    if orphan:
+        return Check("unpushed", r,
+                     f"{orphan}, so what exists only on this disk was not asked", "unknown",
+                     manual=f"git -C {r} for-each-ref --format='%(refname)' refs/remotes/")
     everywhere = _no_remote_has(host, "--branches")
     tips = _branch_tips(host)
     if everywhere is None or tips is None:

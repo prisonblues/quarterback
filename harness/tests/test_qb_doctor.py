@@ -2669,6 +2669,182 @@ def test_a_refspec_that_does_not_bring_back_every_branch_is_unknown(pushed):
     assert "refs/heads/*" in check.detail
 
 
+# ------------------------------- the other three refspec guards, and the ref audit (#611)
+#
+# `qb-catchup` grew four guards on this same question for #573 and this row grew none of
+# them, so on the configurations below the sweep refused and the doctor answered — two
+# tools disagreeing about whether the work on one disk exists anywhere else. Each test
+# here is a row of #611's table, and its sibling in `test_qb_catchup.py` runs the same
+# configuration through the sweep; `test_the_two_tools_refuse_the_same_configurations`
+# there executes both against one checkout, which is what stops these drifting apart.
+#
+# Every one of them back-dates an unpushed commit, so a guard that failed to fire would
+# not merely answer — it would answer `fail`, and the assertion would read the difference.
+
+
+def test_a_negative_refspec_is_unknown_even_though_a_positive_one_covers_every_head(pushed):
+    """`^refs/heads/private/*` alongside `refs/heads/*` fetches everything except those,
+    and the positive spec still satisfies a source-only check. The branches it holds back
+    are exactly the ones this row would then call work that exists nowhere else."""
+    _git(pushed, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "excludes `refs/heads/private/*`" in check.detail
+
+
+def test_a_refspec_whose_destination_is_outside_refs_remotes_is_unknown(pushed):
+    """`refs/heads/*:refs/cache/origin/*` brings back every head and puts none of it where
+    `--not --remotes` looks — full coverage to a check that reads only the source half."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/cache/origin/*")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "which is not under `refs/remotes/`" in check.detail
+
+
+def test_a_second_refspec_that_does_land_in_refs_remotes_is_coverage(pushed):
+    """The two refspec faults are not the same kind of fault. An exclusion holds branches
+    back whatever else is configured; a destination outside `refs/remotes/` only matters
+    when nothing ELSE brought the heads to where the question looks. Refusing over the
+    first of two legal refspecs would be a false refusal on a working configuration."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/cache/origin/*")
+    _git(pushed, "config", "--add", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/*")
+    _git(pushed, "fetch", "-q", "origin")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "fail", check.detail
+    assert "not under `refs/remotes/`" not in check.detail
+
+
+def test_an_orphaned_namespace_under_refs_remotes_is_not_trusted(pushed):
+    """The mirror image of the refspec check. The query trusts every ref under
+    `refs/remotes/`; only what a configured refspec writes is ever refreshed. A ref left
+    by a removed remote never self-corrects, because nothing will fetch it again — so it
+    is a permanent licence for whatever it reaches to read as safely elsewhere."""
+    _git(pushed, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/ghost/main` is under `refs/remotes/`" in check.detail
+    assert "no remote's fetch refspec writes there" in check.detail
+
+
+def test_a_ref_written_directly_at_refs_remotes_is_not_missed(pushed):
+    """`refs/remotes/ghost` is a legal ref layout with no `<remote>/<branch>` shape to it
+    at all, and `--not --remotes` trusts it exactly like any other ref under
+    `refs/remotes/`. An enumeration that counted path segments dropped it on the floor."""
+    _git(pushed, "update-ref", "refs/remotes/ghost", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/ghost` is under `refs/remotes/`" in check.detail
+
+
+def test_a_ref_no_refspec_writes_to_is_not_trusted_because_the_remote_name_matches(pushed):
+    """OWNERSHIP IS A REFSPEC DESTINATION AND NEVER A REMOTE NAME.
+
+    `origin` fetches every head into `refs/remotes/origin/branches/*` — legal, still under
+    `refs/remotes/`, so coverage is satisfied and nothing refuses for that reason. It does
+    not write `refs/remotes/origin/old` and nothing here ever will. Inferring ownership
+    from the top path segment matching a configured NAME trusts that ref anyway, and
+    `--not --remotes` then subtracts a ref nothing refreshes."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/branches/*")
+    _git(pushed, "fetch", "-q", "origin")
+    _git(pushed, "update-ref", "-d", "refs/remotes/origin/main")
+    _git(pushed, "update-ref", "refs/remotes/origin/old", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/origin/old` is under `refs/remotes/`" in check.detail
+
+
+def test_an_orphaned_namespace_that_merely_shares_a_prefix_is_not_trusted(pushed, tmp_path):
+    """The looser half of the same fault. A remote name may itself contain a slash, and a
+    guard that accepted any namespace a configured name merely BEGAN with would read an
+    orphaned `refs/remotes/team/bob/` as covered because `team/alice` starts with `team/`.
+    Nothing will ever refresh it; asking the refspecs where they write tells them apart."""
+    _git(pushed, "remote", "add", "team/alice", str(tmp_path / "origin.git"))
+    _git(pushed, "fetch", "-q", "team/alice")
+    _git(pushed, "update-ref", "refs/remotes/team/bob/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/team/bob/main` is under `refs/remotes/`" in check.detail
+
+
+def test_a_refspec_read_that_failed_is_not_a_remote_that_maps_nothing(pushed, monkeypatch):
+    """An inspection that did not happen must not be reported as one that found nothing.
+
+    `git config --get-all` exits 1 for "no such key", which is a FACT about the
+    configuration; anything else is a git that would not answer. Conflating them names a
+    configuration fault that may not exist and sends the reader to fix the wrong thing."""
+    real = qd.run_cmd
+
+    def refuses_config(argv, **kwargs):
+        if argv[:1] == ["git"] and "--get-all" in argv:
+            return 4, "", "boom"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", refuses_config)
+    _commit(pushed, "mine-only", days_ago=19)
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "would not read `remote.origin.fetch` (exit 4)" in check.detail
+    assert "does not fetch" not in check.detail, "it named a fault it had not established"
+
+
+def test_a_remote_with_no_fetch_refspec_at_all_says_which_fault_it_is(pushed):
+    """The clean-but-empty answer, told apart from the failed read above. Both would
+    otherwise print the same sentence about `refs/heads/*`, and only one of them is true."""
+    _git(pushed, "config", "--unset-all", "remote.origin.fetch")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`origin` has no fetch refspec at all" in check.detail
+
+
+def test_an_inventory_of_refs_that_failed_refuses_rather_than_finding_nothing(
+        pushed, monkeypatch):
+    """The one guard here that could fail OPEN. A `for-each-ref` that died on a corrupt
+    ref or a permission yields no lines, and an audit that iterates nothing finds nothing
+    — so the question would be answered out of refs that were never checked."""
+    real = qd.run_cmd
+
+    def refuses_inventory(argv, **kwargs):
+        if argv[:1] == ["git"] and "for-each-ref" in argv and "refs/remotes/" in argv:
+            return 128, "", "boom"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", refuses_inventory)
+    _commit(pushed, "mine-only", days_ago=19)
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "would not list the refs under `refs/remotes/`" in check.detail
+
+
 def test_a_log_line_that_did_not_parse_is_not_read_as_nothing_stranded(pushed, monkeypatch):
     """Codex's finding, and the direction it fails in is the one that matters: a dropped
     line is a commit the row did not count, so a run where every line is unparseable

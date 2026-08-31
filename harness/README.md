@@ -1579,7 +1579,8 @@ A remote whose refspec does not bring back `refs/heads/*`, a negative refspec, a
 destination outside `refs/remotes/`, a ref under `refs/remotes/` that no remote's refspec
 writes to — each means the tracking refs this is measured against are not the set it
 trusts, so the sweep prints one `!` line saying which, and no worktree line claims
-anything about stranded work. An empty note would be indistinguishable from a clean
+anything about stranded work. **`qb-doctor`'s `unpushed` row refuses on the same four
+(#611)**, so the two tools no longer reach opposite verdicts about one disk. An empty note would be indistinguishable from a clean
 answer, which is how a safety claim gets made by accident.
 
 **A fetch that failed warns, and does not reassure.** It used to refuse the question
@@ -3413,7 +3414,17 @@ that failed, a configured remote that is not there, and — Codex's finding on t
 remote whose refspec does not bring back `refs/heads/*`, since a single-branch clone would
 otherwise report every feature branch on the server as work that exists only on this disk.
 **Every** remote is refreshed, not only the configured one, because `--not --remotes`
-subtracts the tracking refs of all of them. A remote that fetched cleanly and holds no
+subtracts the tracking refs of all of them.
+
+**And the same four refusals as the sweep, because it is the same question (#611).** A
+negative refspec, a destination outside `refs/remotes/`, a ref under `refs/remotes/` that no
+refspec writes to, and a `config` read that failed as against a remote with nothing
+configured — `qb-catchup` grew all four for #573 and this row grew none of them, so on any of
+those configurations the sweep refused and this answered, about the same commits on the same
+disk. The logic cannot be shared (one tool is shell, the other Python), so what holds them
+together is `test_the_two_tools_refuse_the_same_configurations`, which runs **both** against
+one checkout per configuration and fails the moment either side grows a guard the other
+has not. A remote that fetched cleanly and holds no
 branches is not an unknown: the query succeeded, and the answer is that nothing here has
 ever been pushed.
 
