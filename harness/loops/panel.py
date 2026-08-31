@@ -1003,6 +1003,10 @@ def _payload_defaults() -> dict:
         "provenance_counts": {},
         "fix_range_source": None,
         "fix_range_rebuilt": None,
+        # #559: nothing was attributed, so nothing was filtered out of the
+        # attribution. `null` here says the question did not arise, which is not
+        # the same as a round that looked for restored lines and found none.
+        "provenance_restored": None,
         # #490's cross-round rows. Empty on every path that reviewed nothing, and
         # that costs a later round nothing: the block is rebuilt from the raw
         # per-round fields of every baseline, so a skipped round leaves a row that
@@ -1899,6 +1903,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # able to tell from "not a cycle run".
                 "fix_range_source": None,
                 "fix_range_rebuilt": None,
+                "provenance_restored": None,
                 "provenance_counts": ({b: 0 for b in PROVENANCE}
                                       if skip_prior.rounds else {}),
                 # #67's two tallies follow the same rule, for the same reason.
@@ -2551,6 +2556,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "prior_findings": len(prior.keys),
             "fix_range_source": None,
             "fix_range_rebuilt": None,
+            "provenance_restored": None,
             "provenance_counts": ({b: 0 for b in PROVENANCE} if prior.rounds else {}),
             "recurrence_counts": ({b: 0 for b in RECURRENCE} if prior.rounds else {}),
             "premise_counts": ({b: 0 for b in (*PREMISE_VERDICTS, "not-said")}
@@ -3857,10 +3863,77 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # truthiness called it no range, `fix_diff is not None` called it a readable
     # range with no added lines — and that reading labels every new finding
     # `missed`, confidently, with no note to say the range was empty.
-    fix_added = _diff_added_lines(fix_diff) if fix_diff else {}
+    fix_added_text = _diff_added_text(fix_diff) if fix_diff else {}
+    fix_added = {f: set(lines) for f, lines in fix_added_text.items()}
     if attributable and not fix_diff:
         notes.append(f"provenance unavailable: {no_range_why} — new findings are recorded "
                      "as `unknown`, not attributed")
+    # ---- #559: a line RESTORED is not a line written, and a line diff cannot tell.
+    #
+    # `_provenance` places a finding by asking whether the fix pass ADDED the line it
+    # sits on, which is a question about position. A revert-of-a-revert answers yes
+    # about ~90 lines two earlier rounds had already reviewed, so the pass that
+    # repairs a bad revert — the correct answer to a `fix_injection` stop — inflates
+    # the statistic that produced the stop. #559's words: the remedy for the gate
+    # looks to the gate like the disease. Since #621 raised the cap to 6 that
+    # statistic is what ENDS cycles rather than a footnote on a round the cap was
+    # ending anyway, so the miscount now costs a cycle its remaining rounds.
+    #
+    # A round trip, and both ends go in. The earlier rounds' commits say the content
+    # was on the branch once; the ANCHOR says it is not there now, which is what
+    # separates a restoration from the fixer pasting a second copy of something the
+    # branch never lost. `head_round` is which round supplied the anchor — not this
+    # run's number, which can be ahead of it when a round was skipped — and the
+    # earlier heads are the rounds strictly before it.
+    earlier_heads = ({r: sha for r, sha in prior.head_shas.items()
+                      if prior.head_round is None or r < prior.head_round}
+                     if attributable else {})
+    # `anchor`, not `prior.head_sha`, for the reason the fix range itself uses it: an
+    # explicit `--since` is what the round attributed from, and reading the baseline
+    # here would compare against a commit no diff in this round was taken against.
+    anchored_at = ((prior.head_round, anchor)
+                   if attributable and anchor and prior.head_round is not None
+                   else None)
+    restored = (panel_scope.restored_lines(cfg.get("path") or "", fix_added_text,
+                                           earlier_heads, anchored_at)
+                if fix_added_text else
+                {"lines": {}, "count": 0, "files": 0, "rounds": [], "unread": [],
+                 "why": None})
+    # Subtracted for PROVENANCE ONLY, and `fix_added` is left whole for everything
+    # else. `_recurrence` asks where the fixer WORKED — a position, and it says so —
+    # and the fixer did put those lines back, so a restored block is still a place
+    # this round's findings can be standing on top of the last pass's work. What is
+    # wrong is only the claim that the pass AUTHORED them.
+    authored_added = ({f: lines - restored["lines"].get(f, set())
+                       for f, lines in fix_added.items()}
+                      if restored["count"] else fix_added)
+    if restored["count"]:
+        notes.append(
+            f"provenance excluded {restored['count']} RESTORED line(s) across "
+            f"{restored['files']} file(s) from attribution (#559): runs of at least "
+            f"{panel_scope.RESTORED_RUN_MIN} added lines byte-identical to lines this "
+            f"file already carried at round(s) {', '.join(str(r) for r in restored['rounds'])} "
+            "of this cycle. Those are lines the fix pass RESTORED, not lines it wrote, "
+            "and attributing them would score a revert-of-a-revert as the fixer "
+            "generating this round's work"
+            + (f". It could not read round(s) "
+               f"{', '.join(str(r) for r in restored['unread'])} of this cycle, so the "
+               "count is a floor" if restored["unread"] else ""))
+    elif restored["why"]:
+        notes.append(
+            "provenance could not tell RESTORED code from newly written code this "
+            f"round (#559): {restored['why']}. A fix pass that put already-reviewed "
+            "lines back reads here as having written them, so `introduced` — and "
+            "`escalate_on.fix_injection` with it — leans HIGH on this round")
+    elif restored["unread"]:
+        # Nothing excluded AND part of the cycle unreadable is its own answer, and
+        # the weakest of the three: this round found no restoration in the rounds it
+        # COULD read, which is not the same as there having been none.
+        notes.append(
+            "provenance found no restored lines to exclude (#559), but could not read "
+            f"round(s) {', '.join(str(r) for r in restored['unread'])} of this cycle "
+            "in the local checkout — so a restoration of what THOSE rounds reviewed "
+            "would still be attributed to the fix pass")
     # SAID either way, because a reconstruction is a different measurement from the
     # one every other round makes and a reader comparing `introduced` across a cycle
     # has to be able to see where the denominator changed under them. The failure is
@@ -3954,13 +4027,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         board's column already means "the panel did not say"."""
         if not attributable or not is_new(c):
             return None
-        return _provenance(c.file or "", c.line, fix_added, prior.unread_files,
+        return _provenance(c.file or "", c.line, authored_added, prior.unread_files,
                            bool(fix_diff), all_unread=prior.read_nothing)
 
     # Counted over `outstanding` — the findings the cycle actually has to clear —
     # so the tally matches `new_findings` rather than roping in the dismissed
     # ones, which no fixer will ever touch. ONE pass rather than one per bucket:
-    # `provenance_of` walks `fix_added` through `_same_file` on every call.
+    # `provenance_of` walks `authored_added` through `_same_file` on every call.
     #
     # Kept as a LIST of (finding, bucket) rather than tallied straight into a
     # Counter, because #506 needs the findings themselves and not only how many
@@ -4934,6 +5007,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # not, so a reader comparing `introduced` across rounds has to be able to
         # see that the denominator's provenance changed under them.
         "fix_range_source": fix_range_source,
+        # #559's working, published for #512's reason and one more. `count`/`files`
+        # are how much of the fix range this round declined to attribute because the
+        # cycle had already seen it, `rounds` names the earlier heads it compared
+        # against, and `why` is set instead where the comparison could not be made at
+        # all. `null` outside a cycle and on any round with no earlier head to compare
+        # against — round 2, where the only prior round IS the anchor.
+        #
+        # The extra reason is #637: recalibrating `escalate_on.fix_injection` needs to
+        # know whether a round's `introduced` was measured against a filtered range or
+        # an unfiltered one, and a threshold fitted across both is fitted to a
+        # denominator that changed under it.
+        "provenance_restored": ({k: restored[k]
+                                 for k in ("count", "files", "rounds", "unread", "why")}
+                                if attributable and (restored["count"] or restored["why"]
+                                                     or restored["rounds"]) else None),
         # #504's working, published rather than left in a sentence. `null` on every
         # round that did not have to rebuild — which is nearly all of them — and
         # otherwise the commits it named, how many the last round had reviewed, how

@@ -3730,18 +3730,43 @@ def _ask_gist(reply: str, limit: int = 120) -> str:
 
 
 
-def _diff_added_lines(diff: str) -> dict[str, set[int]]:
-    """Map each changed file (repo-relative, the `b/` side) to the set of line
-    numbers it ADDS on the new-file side — the code this PR actually wrote. Used
-    to scope SonarCloud's main-branch issues down to the PR's own lines (its
-    "new code" view) rather than every pre-existing issue in a touched file, and
-    to place a finding inside (or outside) the fix range for :func:`_provenance`.
+def _diff_added_text(diff: str) -> dict[str, dict[int, str]]:
+    """Map each changed file (repo-relative, the `b/` side) to `{line number: the
+    TEXT of that line}` for every line it ADDS on the new-file side.
+
+    The same walk :func:`_diff_added_lines` has always made, keeping the line's
+    content rather than throwing it away — and the reason to keep it is #559.
+    Position says a line is new to this range; only content can say whether it is
+    new to the CYCLE. A revert-of-a-revert adds ninety lines an earlier round
+    already reviewed, and to a walk that records line numbers alone that is
+    indistinguishable from a fixer writing ninety lines. `panel_scope.restored_lines`
+    is what asks the second question, and this is what gives it something to ask it
+    with.
+
+    The `+` sign is stripped and nothing else is: no strip, no case fold, no
+    whitespace normalisation. What the restoration filter compares is bytes against
+    bytes at an earlier commit, and a normalisation here would silently widen that
+    into "looks a bit like", which is the difference between a filter that excludes
+    restorations and one that excludes any line resembling one.
+
+    `split("\\n")` rather than the `splitlines()` this walk used until #559 (found
+    by Codex). A diff's record separator is the newline and nothing else, while
+    `splitlines()` also breaks on `\\x0b`, `\\x0c` and `\\u2028` — so a form feed
+    inside a source line counted as two added lines and shifted every line number
+    after it, which places findings against the wrong lines. A `\\r` stays in the
+    text where the diff had one; whether two lines differing only in their
+    terminator are the same line is the COMPARISON's question, and
+    :func:`panel_scope._restored_in_file` answers it there rather than by having
+    this walk quietly decide it.
     """
-    out: dict[str, set[int]] = {}
+    out: dict[str, dict[int, str]] = {}
     cur = None
     newln = 0
     in_hunk = False
-    for line in diff.splitlines():
+    rows = diff.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()       # the trailing newline, not a final empty line
+    for line in rows:
         if line.startswith("diff --git "):
             cur, in_hunk = _diff_file_path(line), False
         elif line.startswith("+++ ") and not in_hunk:
@@ -3757,13 +3782,27 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
             m = re.search(r"\+(\d+)", line)
             newln = int(m.group(1)) if m else 0
         elif line.startswith("+"):
-            out.setdefault(cur, set()).add(newln)
+            out.setdefault(cur, {})[newln] = line[1:]
             newln += 1
         elif line.startswith("-"):
             pass  # old-side only — new-side line counter doesn't advance
         else:
             newln += 1  # context line advances the new-side counter
     return out
+
+
+def _diff_added_lines(diff: str) -> dict[str, set[int]]:
+    """Map each changed file (repo-relative, the `b/` side) to the set of line
+    numbers it ADDS on the new-file side — the code this PR actually wrote. Used
+    to scope SonarCloud's main-branch issues down to the PR's own lines (its
+    "new code" view) rather than every pre-existing issue in a touched file, and
+    to place a finding inside (or outside) the fix range for :func:`_provenance`.
+
+    One walk under both of these, since #559 gave the other caller a use for the
+    line's text: two parsers over one diff format is two places for the `+++`
+    ambiguity above to be got right, and they would drift.
+    """
+    return {f: set(lines) for f, lines in _diff_added_text(diff).items()}
 
 
 #: What a changed file counts as when the panel asks how much APPARATUS a change is
@@ -4460,6 +4499,6 @@ __all__ = [
     "pi_args", "grok_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
     "SeatParsed", "SeatTurn", "run_seat", "review_llm",
-    "ask_llm", "_ask_gist", "_diff_added_lines", "_diff_files_cut",
+    "ask_llm", "_ask_gist", "_diff_added_text", "_diff_added_lines", "_diff_files_cut",
     "panel_scope",
 ]

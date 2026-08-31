@@ -797,6 +797,389 @@ def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
         return None
 
 
+#: How many CONSECUTIVE added lines have to be byte-identical to consecutive lines
+#: in the same file at an earlier round's commit before :func:`restored_lines` will
+#: call them a restoration rather than authorship (#559).
+#:
+#: **Five, and the whole design of this filter is in that number.** #559's proposal
+#: was per-LINE — exclude any added line identical to a line present at an earlier
+#: head — and per-line is too wide by a wide margin. A blank line, a `}`, a
+#: `    return None`, a `        continue` and a closing bracket are byte-identical
+#: to lines already in almost any file of any size, so a per-line rule quietly
+#: excludes a large share of every fix pass ever written, on files that were never
+#: reverted at all. The failure directions here are not symmetric in KIND but they
+#: are both real: excluding too little leaves #559's bug, and excluding too much
+#: turns `escalate_on.fix_injection` into a brake that cannot fire — and a brake
+#: that never fires is worse than the miscount it replaced, because the miscount at
+#: least announces itself by stopping cycles.
+#:
+#: A RUN is what tells the two apart, because restoration is a block phenomenon by
+#: construction: a revert-of-a-revert brings back contiguous spans of a file exactly
+#: as they were, and coincidence does not produce five consecutive byte-identical
+#: lines twice in one file. lexray `343d1f15`, the motivating case, restored ~90
+#: lines in contiguous blocks and is caught at any run length; a 4-line guard the
+#: fixer happened to restore is not, and stays attributed. That asymmetry is
+#: deliberate: where this filter is unsure it leaves the line with the fixer, so
+#: `introduced` remains the FLOOR the threshold at 0.5 is argued from.
+#:
+#: A constant and not a dial, on :func:`_provenance`'s own terms: nothing is
+#: configured per repo about what counts as a line, and a knob here would be a
+#: second threshold to calibrate on top of the one #637 is already trying to
+#: calibrate.
+RESTORED_RUN_MIN = 5
+
+#: How many file-versions a single round's restoration filter will read out of the
+#: local object store before declining. Files times earlier rounds, and both ends
+#: are bounded already (the compare API caps a range at 300 files, a cycle is a
+#: handful of rounds), so this is the product that is not — and a `git show` per
+#: pair on a wide fix pass late in a long cycle is a delay on a path nothing gates
+#: on. Declining outright rather than reading a prefix, for the reason every
+#: refusal in :func:`reconstruct_fix_range` declines: a filter applied to some of
+#: the files and not others is a number nobody can correct for, where a decline is
+#: one the round can state.
+RESTORED_MAX_READS = 400
+
+#: How many times a line may occur in one earlier version and still serve as the
+#: anchor :func:`_holds` searches from. A five-line window whose RAREST line is
+#: commoner than this in the same file is refused rather than searched: nothing in
+#: it is distinctive, which is what generated, tabular or minified content looks
+#: like, and calling five such lines a restoration is a guess. It is also what keeps
+#: the matching linear — the shape found on review was a substring scan of a file up
+#: to `FIX_RANGE_MAX_CHARS` long PER WINDOW, with the windows bounded by the same
+#: figure, which is a quadratic nothing above it bounds. Refusing leaves those lines
+#: attributed, the direction every boundary in this filter errs in.
+RESTORED_MAX_REPEATS = 64
+
+
+def _lf(row: str) -> str:
+    """One line with its CRLF carriage return taken off, and nothing else touched.
+
+    See :func:`_restored_in_file` for why the comparison normalises this and only
+    this. One `\\r`, not `rstrip`, because trailing whitespace inside a line is
+    content the earlier round either had or did not."""
+    return row[:-1] if row.endswith("\r") else row
+
+
+def _runs(nums: list[int]) -> list[list[int]]:
+    """`[1, 2, 3, 9, 10]` -> `[[1, 2, 3], [9, 10]]` — maximal runs of consecutive
+    integers, in order. The added-line numbers of one diff hunk are such a run."""
+    out: list[list[int]] = []
+    for n in sorted(nums):
+        if out and n == out[-1][-1] + 1:
+            out[-1].append(n)
+        else:
+            out.append([n])
+    return out
+
+
+def _rows(body: str) -> list[str]:
+    """A file's content as the lines the comparison is made over.
+
+    `split("\\n")` and never `splitlines()` (found by Codex): a diff's record
+    separator is the newline and nothing else, while `splitlines()` also breaks on
+    `\\x0b`, `\\x0c` and `\\u2028`, so a form feed inside a source line would count as
+    two lines and shift every line number after it.
+
+    The trailing `\\r` goes, via :func:`_lf`, on this side and on the added-line
+    side alike. Two lines whose only difference is the terminator therefore compare
+    equal, which means a CRLF-to-LF conversion inside a fix pass reads as
+    restoration — the intended answer rather than an accident: the CONTENT is what
+    an earlier round reviewed, the fixer authored none of it, and a defect the pass
+    really did introduce changed something other than a line ending and so matches
+    nothing. What settles it is the alternative. :func:`_git` runs
+    `subprocess.run(text=True)`, whose universal-newline translation collapses
+    `\\r\\n` on the way out of `git show` while the compare API's patch keeps it, so
+    leaving this implicit would decide a brake by which side of the comparison a
+    carriage return happened to survive on, which is not a rule anybody could
+    state. Nothing else is normalised: no strip, no case fold, no whitespace
+    collapse — indentation is most of what a code line is."""
+    rows = [_lf(r) for r in body.split("\n")]
+    if rows and rows[-1] == "":
+        rows.pop()   # the trailing newline, not a final empty line
+    return rows
+
+
+def _holds(rows: list[str], index: dict[str, list[int]], window: list[str]) -> bool:
+    """Does `rows` carry `window` as CONSECUTIVE lines? `index` is
+    :func:`_line_index` over the same rows.
+
+    Anchored on the RAREST line of the window rather than the first, and that is
+    the whole performance story (found by Codex, second pass). Searching the joined
+    file text for each window's joined text is a substring scan of up to
+    :data:`panel_core.FIX_RANGE_MAX_CHARS` per window, and the windows are bounded
+    by the same figure — so one large generated file could put a review round into
+    a quadratic that nothing above it bounds. An index turns each window into a
+    handful of list-slice comparisons instead, and taking the rarest line as the
+    anchor keeps that handful small on exactly the repetitive files where the first
+    line would not.
+
+    A window whose rarest line still occurs more than :data:`RESTORED_MAX_REPEATS`
+    times is refused rather than searched. Nothing in it is distinctive, which is
+    what generated, tabular or minified content looks like, and calling five such
+    lines a restoration is a guess — so this leaves them attributed, the direction
+    every boundary in this filter errs in."""
+    spots: list[int] | None = None
+    off = 0
+    for i, text in enumerate(window):
+        at = index.get(text)
+        if not at:
+            return False
+        if spots is None or len(at) < len(spots):
+            spots, off = at, i
+    if spots is None or len(spots) > RESTORED_MAX_REPEATS:
+        return False
+    for p in spots:
+        start = p - off
+        if start >= 0 and rows[start:start + len(window)] == window:
+            return True
+    return False
+
+
+def _line_index(rows: list[str]) -> dict[str, list[int]]:
+    """`{line text: every position it sits at}`, for :func:`_holds`."""
+    out: dict[str, list[int]] = {}
+    for i, row in enumerate(rows):
+        out.setdefault(row, []).append(i)
+    return out
+
+
+def _restored_in_file(lines: dict[int, str], versions: list[str],
+                      anchor: str | None) -> set[int]:
+    """Which of this file's added line numbers sit inside a run of at least
+    :data:`RESTORED_RUN_MIN` consecutive added lines that appears VERBATIM and
+    contiguously in one of `versions` — the file's content at an earlier round's
+    commit — and does NOT appear in `anchor`, its content at the commit the fix
+    range starts from.
+
+    **Both halves, because restoration is a round trip.** A block that the cycle
+    still carried at the anchor never left the branch, so a copy of it showing up
+    as added is the fixer duplicating code — authorship, and a copy-paste defect is
+    one of the commoner things a fix pass introduces. It was not enough to leave
+    the anchor out of `versions` (found by Codex, second pass): a helper present in
+    round 1 AND at the anchor matches round 1 on its own, and a fresh copy of it
+    was excluded. `anchor` is None only where that commit did not carry the file at
+    all, which says the same thing more simply — nothing of it was there to still
+    be there.
+
+    The match is on a sliding window rather than on whole runs, so a block that was
+    restored and then edited at one end still has its untouched middle excluded
+    while the edited end stays with the fixer. A window straddling the boundary
+    between restored and newly written lines cannot match, which is what leaves the
+    last few lines of a restored block attributed — under-exclusion, and the
+    direction this errs in everywhere."""
+    out: set[int] = set()
+    runs = [r for r in _runs(list(lines)) if len(r) >= RESTORED_RUN_MIN]
+    if not runs:
+        return out
+    still = _rows(anchor) if anchor is not None else []
+    still_at = _line_index(still)
+    for body in versions:
+        rows = _rows(body)
+        index = _line_index(rows)
+        for run in runs:
+            text = [_lf(lines[n]) for n in run]
+            for i in range(len(run) - RESTORED_RUN_MIN + 1):
+                window = text[i:i + RESTORED_RUN_MIN]
+                if set(run[i:i + RESTORED_RUN_MIN]) <= out:
+                    continue    # already excluded by an earlier version
+                if _holds(rows, index, window) and not _holds(still, still_at, window):
+                    out.update(run[i:i + RESTORED_RUN_MIN])
+    return out
+
+def _blobs(repo_path: str, sha: str, files: list[str]) -> tuple[dict[str, str], set[str]]:
+    """`({path: content at `sha`}, {paths it could not read})` for the paths named.
+
+    A file that commit did not HAVE is in neither: absence is ordinary — the cycle
+    created it later, or a rename moved it — and there are no restored lines in a
+    file that was not there. A file it DID have and this could not hold is a hole,
+    and the two have to be told apart (found by Codex), or a failed read files
+    itself under "the file did not exist yet" and the caller reports a filtered
+    number it did not compute.
+
+    `git ls-tree` is what separates them, one call per commit rather than one per
+    file. `-r` because a path with a directory in it is not a top-level tree entry,
+    and `--` because a path out of a diff is a pathspec and one beginning `-` must
+    not read as an option. A tree that cannot be listed at all makes every path a
+    hole, which is the honest reading: this cannot say what that commit held.
+
+    The size ceiling is the fix range's own. A file past it is not what a fix pass
+    puts a block of back, and holding several versions of one in memory to find out
+    is the cost this refuses — but it is a version this did not read, so it comes
+    back as a hole rather than as a silence."""
+    listed = _git(repo_path, "ls-tree", "-r", "--name-only", sha, "--", *files)
+    if listed is None:
+        return {}, set(files)
+    held: dict[str, str] = {}
+    holes: set[str] = set()
+    at = set(listed.splitlines())
+    for path in files:
+        if path not in at:
+            continue
+        body = _git(repo_path, "show", f"{sha}:{path}")
+        if body is None or len(body) > FIX_RANGE_MAX_CHARS:
+            holes.add(path)
+            continue
+        held[path] = body
+    return held, holes
+
+
+def restored_lines(repo_path: str, added: dict[str, dict[int, str]],
+                   earlier_heads: dict[int, str],
+                   anchor: tuple[int, str] | None) -> dict:
+    """Added lines that are RESTORED rather than written: the ones an earlier round
+    of this cycle already had in front of it, byte for byte, in the same file (#559).
+
+    Returns `{"lines", "count", "files", "rounds", "unread", "why"}` and never
+    raises. `lines` maps a file to the added line numbers provenance must not
+    attribute to the fix pass; `rounds` names the earlier rounds it compared
+    against and `unread` the ones it could not read in full; `why` is set — and
+    `lines` empty — for every way this could not be computed at all. The caller says
+    which of the three it got, in `config_notes`.
+
+    **The bug this exists for.** :func:`_provenance` attributes an added line by
+    POSITION: it is in the range between the last round's commit and this one, so
+    the fix pass wrote it. A revert-of-a-revert satisfies that and means the
+    opposite. lexray `343d1f15` restored ~90 lines that rounds 1 and 2 had already
+    reviewed, every one of them an added line in the range, every one attributed to
+    the pass that brought them back — and `escalate_on.fix_injection` ends a cycle
+    on that number. #559's words for it: *the remedy for the gate looks to the gate
+    like the disease*. The pass repairing a bad revert is the CORRECT response to a
+    `fix_injection` stop, and it inflates the statistic that produced the stop.
+
+    Not #504's case and not fixed by anything in the baseline chain. A rewrite is a
+    range that cannot be read; this range reads perfectly and what is wrong is the
+    MEANING. `--baseline` keys findings on content, so a restored FINDING correctly
+    stops counting as new — attribution is computed over LINES, which nothing in
+    that chain touches, so a round can report "0 findings no earlier round raised"
+    and a high `introduced` share at the same time.
+
+    **Restoration is a ROUND TRIP, and both ends are checked.** `earlier_heads` are
+    the heads of rounds strictly BEFORE the one the range is anchored on — the
+    content has to have been on the branch once — and `anchor` is `(round, sha)` for
+    the commit the range starts from, where it must NOT still be. Leaving the anchor
+    merely out of `earlier_heads` was the first shape of this and is not enough
+    (found by Codex): a helper carried by round 1 and by the anchor alike matches
+    round 1 on its own, so a fresh copy the fixer pasted was excluded as a
+    restoration. A copy-paste defect is one of the commoner things a fix pass
+    introduces, and it must stay `introduced`. The motivating case passes both ends
+    — the revert took the block off the branch between rounds 2 and 3, and the
+    repair put it back between 3 and 4 — which is what a round trip is.
+
+    **Local git, and a decline where there is none.** Reading a file at a commit is
+    `git show`, and the panel's other reader of the object store
+    (:func:`reconstruct_fix_range`) already establishes both the road and the
+    contract: a repair that cannot run leaves the round exactly as it found it and
+    says so. The alternative was one `contents` API call per file per round, which
+    is the same answer bought over the network on the critical path of every round
+    past the second.
+
+    :func:`_blobs` reads a commit's copy of the files in hand, and tells a file that
+    commit did not have from one it had and this could not read.
+
+    A hole in an EARLIER head is REPORTED and does not decline the round, which is the one place this
+    parts from :func:`reconstruct_fix_range`'s refuse-every-inexact-shape rule, and
+    the reason is the direction of the error. An over-attributing reconstruction
+    breaks the floor `escalate_on.fix_injection` is argued from; a filter that read
+    three of a cycle's four earlier heads excludes at most what those three could
+    not see, so it lands BETWEEN the unfiltered number and the exact one and cannot
+    push `introduced` below the truth. Declining there would put the round back on
+    the unfiltered count — the #559 bug entire — in the case the filter is most
+    needed, since a rewrite orphaning one earlier head is exactly when a cycle has
+    been reverting things. `unread` names the rounds it could not read and the round
+    says so beside the count.
+
+    A hole in the ANCHOR is the opposite and takes that file out of the filter
+    altogether: the round trip cannot be established without it, and excluding on
+    the older head alone is the false positive above."""
+    out: dict = {"lines": {}, "count": 0, "files": 0, "rounds": [], "unread": [],
+                 "why": None}
+    if not earlier_heads or not added:
+        # VACUOUS rather than blind, and the distinction is #500's. Round 2 has one
+        # earlier round and it is the anchor, so there is no older commit a line
+        # could have been restored from — nothing was missed, and a note here would
+        # fire on every cycle's second round to say that nothing happened.
+        return out
+    # Only files with a long enough run of added lines can produce a match at all,
+    # so they are the only ones worth a read — and pruning here is what keeps the
+    # bound below from declining on a wide fix pass that had one restorable hunk.
+    files = sorted(f for f, lines in added.items()
+                   if any(len(r) >= RESTORED_RUN_MIN for r in _runs(list(lines))))
+    if not files:
+        return out
+    if not repo_path:
+        out["why"] = ("no local checkout is configured for this repo, and reading a "
+                      "file as an earlier round saw it is git rather than the "
+                      "compare API")
+        return out
+    if anchor is None or not _is_ref(anchor[1]):
+        # No default on the parameter, and no filtering without it. Half the round
+        # trip is not a weaker version of the test, it is the false positive: an
+        # older head alone matches code the branch never lost, and the fixer's fresh
+        # copy of it comes out of the count. `_is_ref` for the reason the earlier
+        # heads get it below — this value reaches `git ls-tree` in argv.
+        out["why"] = ("the commit the fix range starts from is not one this can ask git "
+                      "about, so a block the branch STILL carries could not be told from "
+                      "one the fix pass brought back")
+        return out
+    heads: list[tuple[int, str]] = []
+    unread: set[int] = set()
+    for rnd in sorted(earlier_heads):
+        sha = earlier_heads[rnd]
+        # `_is_ref` before `rev-parse`, on :func:`reconstruct_fix_range`'s reason: a
+        # value starting `-` reads as an OPTION in argv, and a decline that names the
+        # wrong cause sends an operator after a commit rather than after the
+        # malformed baseline that carries it.
+        if not (_is_ref(sha) and _git(repo_path, "rev-parse", "--verify", "--quiet",
+                                      f"{sha}^{{commit}}") is not None):
+            unread.add(rnd)
+            continue
+        heads.append((rnd, sha))
+    if not heads:
+        out["unread"] = sorted(unread)
+        out["why"] = (f"none of the {len(earlier_heads)} earlier round head(s) of this "
+                      f"cycle is in the checkout at {repo_path} — a commit a rewrite "
+                      "orphaned stays reachable only where somebody still holds it")
+        return out
+    if len(files) * len(heads) > RESTORED_MAX_READS:
+        out["why"] = (f"{len(files)} file(s) across {len(heads)} earlier round(s) is more "
+                      f"than the {RESTORED_MAX_READS} file-versions this will read out of "
+                      "the object store — a filter applied to some of the files and not "
+                      "others is a number nobody can correct for")
+        return out
+    # The anchor's own copy of each file, which is what tells a restoration from a
+    # copy: content the branch STILL CARRIED there never left it. Read first,
+    # because a file whose anchor version cannot be had is one this must not filter
+    # at all — the round trip cannot be established, and excluding on the older head
+    # alone is exactly the false positive this pass added the read to stop.
+    at_anchor, anchor_holes = _blobs(repo_path, anchor[1], files)
+    if anchor_holes:
+        unread.add(anchor[0])
+        files = [f for f in files if f not in anchor_holes]
+        if not files:
+            out["unread"] = sorted(unread)
+            out["why"] = ("the commit the fix range starts from could not be read out of "
+                          f"the checkout at {repo_path}, so a block the branch still "
+                          "carried there could not be told from one the fix pass brought "
+                          "back")
+            return out
+    versions: dict[str, list[str]] = {}
+    for rnd, sha in heads:
+        held, holes = _blobs(repo_path, sha, files)
+        if holes:
+            unread.add(rnd)
+        for path, body in held.items():
+            versions.setdefault(path, []).append(body)
+    for path, bodies in versions.items():
+        hit = _restored_in_file(added[path], bodies, at_anchor.get(path))
+        if hit:
+            out["lines"][path] = hit
+    out["count"] = sum(len(v) for v in out["lines"].values())
+    out["files"] = len(out["lines"])
+    out["rounds"] = [rnd for rnd, _sha in heads]
+    out["unread"] = sorted(unread)
+    return out
+
+
 #: The buckets :func:`_provenance` sorts a new finding into. `unknown` is a real
 #: answer and not a failure — it is what an unreadable fix range or an
 #: unplaceable finding honestly leaves.
@@ -842,6 +1225,14 @@ def _provenance(file: str, line: int | None, added: dict[str, set[int]],
       wrote. Every one of those misses the set by a line or two and comes back
       `missed`. So the split is biased toward `missed` in BOTH directions, and the
       `introduced` count should be read as a floor rather than as a measurement.
+
+    A THIRD limit, and the one this no longer has: an added line was taken as a line
+    the fix pass WROTE, which a revert-of-a-revert makes false about ninety already-
+    reviewed lines at once. That is #559, and it is fixed one layer up rather than
+    here — the caller subtracts :func:`restored_lines`' verdict from `added` before
+    calling this, so what arrives is the lines the pass authored rather than every
+    line it touched, and the round says in `config_notes` how many were taken out.
+    This function is unchanged by it and stays a pure question about a set.
 
     #41 (review the increment) HAS LANDED — `--scope increment`, v2.28, the default
     — and #512 is what acted on it: a round that reviewed the increment now
@@ -3226,7 +3617,11 @@ __all__ = [
     "_git", "_patch_ids", "reconstruct_fix_range",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
-    "_base_tip_now", "PROVENANCE", "_provenance",
+    "_base_tip_now",
+    "RESTORED_RUN_MIN", "RESTORED_MAX_READS", "RESTORED_MAX_REPEATS",
+    "_lf", "_runs", "_rows", "_line_index", "_holds", "_restored_in_file", "_blobs",
+    "restored_lines",
+    "PROVENANCE", "_provenance",
     "RECURRENCE", "SITE_RADIUS", "_recurrence",
     "DIFF_PREAMBLE", "_diff_by_file", "_diff_subset", "_fit_parts",
     "review_ci_settled", "CI_SETTLE_WAIT", "CI_SETTLE_POLL",

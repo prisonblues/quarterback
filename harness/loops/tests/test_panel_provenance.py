@@ -726,9 +726,15 @@ def _cfg(**budgets) -> dict:
 
 
 def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
-                 cfg=None, compare=None, moves_to=None, compare_diff=""):
+                 cfg=None, compare=None, moves_to=None, compare_diff="",
+                 max_rounds=2):
     """One panel run with every subprocess replaced, so what is under test is the
-    payload the panel builds rather than any CLI."""
+    payload the panel builds rather than any CLI.
+
+    `max_rounds` stays at 2 — the cap every test in this file was written under —
+    and is a parameter only because #559 needs a THIRD round to have anything to
+    compare against: its filter reads the rounds before the anchor, and round 3 is
+    the first that has one. `run()` refuses a round past its cap outright."""
     # One shared double (conftest.gh_stub) rather than a bespoke one: it knows
     # every `gh` call panel.py makes, so a call added later is answered here
     # instead of falling through and degrading the round in silence (128-F09).
@@ -768,7 +774,8 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
     monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
     out = tmp_path / f"r{round_no}.json"
     assert panel.run("e2e", 77, post=False, json_file=str(out), record=False,
-                     round_no=round_no, baseline=list(baseline), max_rounds=2) == 0
+                     round_no=round_no, baseline=list(baseline),
+                     max_rounds=max_rounds) == 0
     return str(out), json.loads(out.read_text())
 
 
