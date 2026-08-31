@@ -591,3 +591,136 @@ def test_recurrence_still_knows_the_fixer_WROTE_there(monkeypatch, tmp_path):
     # assertion is for is that recurrence still places the finding ON the pass's
     # lines after provenance has stopped attributing them to it.
     assert r3["to_fix"][0]["recurrence"] == "revisited"
+
+
+# --------------------------------------------------------------------------
+# The refusals, and which way each of them has to read
+# --------------------------------------------------------------------------
+
+
+def _repeated(copies: int) -> str:
+    """`app/table.py` carrying `BLOCK` `copies` times, blank-separated."""
+    return "\n".join(["import os", "", *sum(([*BLOCK, ""] for _ in range(copies)), []),
+                      "TAIL = 1"]) + "\n"
+
+
+def test_a_window_REFUSED_at_the_ANCHOR_is_dropped_rather_than_read_as_absent(
+        tmp_path, monkeypatch):
+    """Found on review, and it is the direction that matters.
+
+    `RESTORED_MAX_REPEATS` refuses a window whose rarest line is too common to be
+    distinctive. On the earlier head that refusal leaves the lines attributed — this
+    filter's standing direction. On the ANCHOR the sense flips: the anchor is asked
+    whether the branch STILL carries the block, and a refusal collapsed into `False`
+    reads as "no, it lost it", which is the half of the round trip that ADMITS the
+    exclusion. A guard against guessing about repetitive content then makes the
+    guess itself, in the one direction that takes lines out of `introduced`.
+
+    Here the block is at the anchor five times over, so nothing was restored — the
+    fixer pasted a sixth copy and wrote every one of those five lines. The earlier
+    head carries it twice, under the ceiling, so that side matches; the anchor
+    carries it five times, over the ceiling, so that side is refused. The lines must
+    stay with the fixer."""
+    monkeypatch.setattr(panel_scope, "RESTORED_MAX_REPEATS", 3)
+    early, anchor_body = _repeated(2), _repeated(5)
+    r, (v1, v2) = _repo_at(tmp_path, early, anchor_body)
+    paste = "@@ -30,0 +31,5 @@\n" + "".join(f"+{ln}\n" for ln in BLOCK)
+    assert len(_added(paste)["app/sync.py"]) == 5
+
+    got = panel_scope.restored_lines(str(r.path), _added(paste), {1: v1}, (2, v2))
+    assert got["why"] is None
+    assert got["lines"] == {} and got["count"] == 0
+
+    # And the two sides of the round trip in isolation, which is where the
+    # asymmetry lives: the earlier head answers, the anchor refuses, and a refusal
+    # is None rather than False.
+    window = [panel_scope._lf(ln) for ln in BLOCK]
+    early_rows = panel_scope._rows(early)
+    anchor_rows = panel_scope._rows(anchor_body)
+    assert panel_scope._holds(early_rows, panel_scope._line_index(early_rows),
+                              window) is True
+    assert panel_scope._holds(anchor_rows, panel_scope._line_index(anchor_rows),
+                              window) is None
+
+
+def test_a_window_refused_at_the_EARLIER_head_still_leaves_the_lines_attributed(
+        tmp_path, monkeypatch):
+    """The other side of the same ceiling, and it reads the ordinary way. A window
+    the earlier head is too repetitive to search is not evidence the block was ever
+    on the branch, so it is not excluded — the refusal and the honest miss agree
+    here, which is exactly why the anchor's disagreement went unnoticed."""
+    monkeypatch.setattr(panel_scope, "RESTORED_MAX_REPEATS", 3)
+    r, (v1, v2) = _repo_at(tmp_path, _repeated(5), V2)
+    paste = "@@ -2,0 +3,5 @@\n" + "".join(f"+{ln}\n" for ln in BLOCK)
+
+    got = panel_scope.restored_lines(str(r.path), _added(paste), {1: v1}, (2, v2))
+    assert got["why"] is None and got["lines"] == {}
+
+
+def test_an_earlier_head_INSIDE_the_range_is_not_evidence_the_content_predates_it(
+        tmp_path):
+    """Found on review. `--since` older than the last round's head.
+
+    `earlier_heads` is "rounds numbered below `prior.head_round`" while the anchor
+    comes from `--since`, and the two disagree the moment `--since` names something
+    older than that round's head. Round 2's head then sits INSIDE the range being
+    attributed, and feeding it in says the block predates a range the fix pass wrote
+    it in the middle of — six lines the fixer demonstrably authored, out of
+    `introduced`. In the limit it filters out most of the range and
+    `escalate_on.fix_injection` cannot fire at all.
+
+    Ancestry is the test, not the round number: round 2's head is a DESCENDANT of
+    the anchor, so it is dropped and named in `unread` — the same answer this filter
+    gives for any round it could not use."""
+    r, (c1, c2, _c3) = _repo_at(tmp_path, V2, V1, V3)
+
+    # Anchor at round 1's head, as `--since` would set it, while the baseline's
+    # `head_round` is 3 — so both earlier heads are offered.
+    got = panel_scope.restored_lines(str(r.path), _added(RESTORE_PATCH),
+                                     {1: c1, 2: c2}, (3, c1))
+
+    assert got["why"] is None
+    assert got["lines"] == {} and got["count"] == 0
+    assert got["rounds"] == [1] and got["unread"] == [2]
+
+
+def test_an_ANCHOR_that_is_not_in_the_checkout_says_so_about_the_anchor(tmp_path):
+    """The ancestry test above needs the anchor to resolve, and a decline has to
+    name the commit that is missing. Reporting this as "none of the earlier heads is
+    here" would send an operator after SHAs the checkout has."""
+    r, (v1,) = _repo_at(tmp_path, V1)
+
+    got = panel_scope.restored_lines(str(r.path), _added(RESTORE_PATCH),
+                                     {1: v1}, (2, "b" * 40))
+    assert got["lines"] == {} and "fix range starts from is not in the checkout" in got["why"]
+
+
+# --------------------------------------------------------------------------
+# A path git would have quoted
+# --------------------------------------------------------------------------
+
+
+def test_a_NON_ASCII_path_is_read_and_not_filed_under_never_existed(tmp_path):
+    """Found on review. `git ls-tree` C-quotes any path outside ASCII, so
+    `app/café.py` comes back as `"app/caf\\303\\251.py"` — while the diff side is
+    UNQUOTED by `_diff_file_path`. The two spellings never matched, `path not in at`
+    sent the file down the "the commit did not have this" road, and the round
+    reported that it looked and found nothing: no exclusion, no hole, no `unread`,
+    no note. That defeats exactly the distinction `_blobs` exists to draw. `-z` puts
+    both sides on the same spelling."""
+    path = "app/café.py"
+    r = _new_repo(tmp_path)
+    (r.path / "app").mkdir()
+    shas = []
+    for body in (V1, V2, V3):
+        r.write(path, body)
+        r.git("add", path)
+        r.git("commit", "-q", "-m", "v")
+        shas.append(r.at("HEAD"))
+    v1, v2, _v3 = shas
+
+    got = panel_scope.restored_lines(str(r.path), _added(RESTORE_PATCH, path),
+                                     {1: v1}, (2, v2))
+
+    assert got["why"] is None and got["unread"] == []
+    assert got["lines"] == {path: {3, 4, 5, 6, 7, 8}} and got["count"] == 6

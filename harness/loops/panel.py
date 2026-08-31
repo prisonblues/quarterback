@@ -3930,6 +3930,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `anchor`, not `prior.head_sha`, for the reason the fix range itself uses it: an
     # explicit `--since` is what the round attributed from, and reading the baseline
     # here would compare against a commit no diff in this round was taken against.
+    #
+    # That is not on its own enough to make the pair correct, and the comment above
+    # this one used to claim it was (found on review). `earlier_heads` is still
+    # "rounds numbered below `prior.head_round`", so when `--since` names a commit
+    # OLDER than that round's head the two disagree and a head sitting INSIDE the
+    # range being attributed is handed over as evidence the content predates it —
+    # which excludes everything the fix passes wrote in between. `restored_lines`
+    # closes it at the other end, by dropping any head that is not an ancestor of the
+    # anchor and naming the round in `unread`; what is passed here is a candidate
+    # list, not a verified one.
     anchored_at = ((prior.head_round, anchor)
                    if attributable and anchor and prior.head_round is not None
                    else None)

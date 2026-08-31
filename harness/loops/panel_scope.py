@@ -846,8 +846,14 @@ RESTORED_MAX_READS = 400
 #: like, and calling five such lines a restoration is a guess. It is also what keeps
 #: the matching linear — the shape found on review was a substring scan of a file up
 #: to `FIX_RANGE_MAX_CHARS` long PER WINDOW, with the windows bounded by the same
-#: figure, which is a quadratic nothing above it bounds. Refusing leaves those lines
-#: attributed, the direction every boundary in this filter errs in.
+#: figure, which is a quadratic nothing above it bounds. A refusal is reported as
+#: REFUSED and never as "not there" — :func:`_holds` answers None for it — because
+#: the two calls read the answer in opposite directions and only one of them can
+#: treat a refusal as a negative. On the earlier head, absent means no match and
+#: the lines stay attributed; on the ANCHOR, absent means the branch had LOST the
+#: block, which is half of what admits the exclusion. Collapsing the refusal into
+#: False there turned a guard against guessing about repetitive content into the
+#: guess itself, in the one direction that takes lines OUT of `introduced`.
 RESTORED_MAX_REPEATS = 64
 
 
@@ -899,9 +905,11 @@ def _rows(body: str) -> list[str]:
     return rows
 
 
-def _holds(rows: list[str], index: dict[str, list[int]], window: list[str]) -> bool:
-    """Does `rows` carry `window` as CONSECUTIVE lines? `index` is
-    :func:`_line_index` over the same rows.
+def _holds(rows: list[str], index: dict[str, list[int]],
+           window: list[str]) -> bool | None:
+    """Does `rows` carry `window` as CONSECUTIVE lines? True, False, or None for
+    REFUSED — see below, and it is three answers rather than two on purpose.
+    `index` is :func:`_line_index` over the same rows.
 
     Anchored on the RAREST line of the window rather than the first, and that is
     the whole performance story (found by Codex, second pass). Searching the joined
@@ -916,8 +924,20 @@ def _holds(rows: list[str], index: dict[str, list[int]], window: list[str]) -> b
     A window whose rarest line still occurs more than :data:`RESTORED_MAX_REPEATS`
     times is refused rather than searched. Nothing in it is distinctive, which is
     what generated, tabular or minified content looks like, and calling five such
-    lines a restoration is a guess — so this leaves them attributed, the direction
-    every boundary in this filter errs in."""
+    lines a restoration is a guess.
+
+    **A refusal is None and not False, because the callers read the answer in
+    opposite directions.** :func:`_restored_in_file` asks this twice per window: of
+    an earlier head, where a MATCH is what puts the block on the branch once, and of
+    the ANCHOR, where a MISS is what says the branch had since lost it. A refusal
+    folded into False leaves the window attributed on the first call — the direction
+    every boundary in this filter errs in — and on the second it reads as "the
+    anchor does not carry this", which ADMITS the exclusion. The same guard would
+    then take a fix pass's genuinely new lines out of `introduced` on exactly the
+    repetitive generated file it exists to refuse to guess about, and since #631
+    made `escalate_on.fix_injection` the rung that ends cycles, a brake that
+    under-counts is a cycle that does not stop. Three answers, and each caller says
+    what a refusal means where it stands."""
     spots: list[int] | None = None
     off = 0
     for i, text in enumerate(window):
@@ -926,8 +946,10 @@ def _holds(rows: list[str], index: dict[str, list[int]], window: list[str]) -> b
             return False
         if spots is None or len(at) < len(spots):
             spots, off = at, i
-    if spots is None or len(spots) > RESTORED_MAX_REPEATS:
+    if spots is None:
         return False
+    if len(spots) > RESTORED_MAX_REPEATS:
+        return None
     for p in spots:
         start = p - off
         if start >= 0 and rows[start:start + len(window)] == window:
@@ -982,7 +1004,16 @@ def _restored_in_file(lines: dict[int, str], versions: list[str],
                 window = text[i:i + RESTORED_RUN_MIN]
                 if set(run[i:i + RESTORED_RUN_MIN]) <= out:
                     continue    # already excluded by an earlier version
-                if _holds(rows, index, window) and not _holds(still, still_at, window):
+                # Both halves have to be a definite answer, and `is` rather than
+                # truthiness says so: :func:`_holds` returns None for a window it
+                # REFUSED to search, and on the anchor side a falsy refusal reads as
+                # "the branch had lost this" — which is the half that admits the
+                # exclusion. A window this could not search at the anchor is dropped
+                # from the filter, the same rule an unreadable anchor blob gets one
+                # level up, and for the same reason: the round trip is not
+                # established, so the lines stay with the fixer.
+                if (_holds(rows, index, window) is True
+                        and _holds(still, still_at, window) is False):
                     out.update(run[i:i + RESTORED_RUN_MIN])
     return out
 
@@ -1002,16 +1033,27 @@ def _blobs(repo_path: str, sha: str, files: list[str]) -> tuple[dict[str, str], 
     not read as an option. A tree that cannot be listed at all makes every path a
     hole, which is the honest reading: this cannot say what that commit held.
 
+    `-z`, and it is a correctness fix rather than a tidiness one (found on review).
+    Line-terminated `ls-tree` C-QUOTES any path outside ASCII — `app/café.py` comes
+    back as `"app/caf\\303\\251.py"` — while :func:`panel_core._diff_file_path`
+    UNQUOTES the diff side, so the two spellings never compare equal and every
+    non-ASCII path fell through `path not in at` into "the commit did not have this
+    file". That is the silence this function exists to stop: no hole, no `unread`,
+    no note, and a round that reports it looked and found nothing. NUL-separated
+    output is the raw bytes of the path, so the comparison is against the same
+    spelling the diff produced. A quoting-free `ls-tree` also cannot emit an empty
+    record, so dropping the empty tail split leaves nothing real out.
+
     The size ceiling is the fix range's own. A file past it is not what a fix pass
     puts a block of back, and holding several versions of one in memory to find out
     is the cost this refuses — but it is a version this did not read, so it comes
     back as a hole rather than as a silence."""
-    listed = _git(repo_path, "ls-tree", "-r", "--name-only", sha, "--", *files)
+    listed = _git(repo_path, "ls-tree", "-r", "-z", "--name-only", sha, "--", *files)
     if listed is None:
         return {}, set(files)
     held: dict[str, str] = {}
     holes: set[str] = set()
-    at = set(listed.splitlines())
+    at = {p for p in listed.split("\0") if p}
     for path in files:
         if path not in at:
             continue
@@ -1064,6 +1106,16 @@ def restored_lines(repo_path: str, added: dict[str, dict[int, str]],
     introduces, and it must stay `introduced`. The motivating case passes both ends
     — the revert took the block off the branch between rounds 2 and 3, and the
     repair put it back between 3 and 4 — which is what a round trip is.
+
+    **"Earlier" is ancestry, not the round number.** A head is used only if it is an
+    ancestor of the anchor, and one that is not is named in `unread` and left out. A
+    lower round number is what the CALLER has to hand and it is not the same claim:
+    an explicit `--since` can anchor the range on a commit older than the last
+    round's head, and then a head from a lower-numbered round sits INSIDE the range
+    being attributed. Taking it as evidence says the content predates a range it was
+    written in the middle of, and everything the fix passes wrote between the two
+    comes out of `introduced` — which in the limit filters out most of the range and
+    leaves `escalate_on.fix_injection` unable to fire at all.
 
     **Local git, and a decline where there is none.** Reading a file at a commit is
     `git show`, and the panel's other reader of the object store
@@ -1121,6 +1173,16 @@ def restored_lines(repo_path: str, added: dict[str, dict[int, str]],
                       "about, so a block the branch STILL carries could not be told from "
                       "one the fix pass brought back")
         return out
+    if _git(repo_path, "rev-parse", "--verify", "--quiet",
+            f"{anchor[1]}^{{commit}}") is None:
+        # Resolved BEFORE the heads, because every head is now tested against it and
+        # a decline has to name the commit that is actually missing. Without this the
+        # ancestry test below fails for all of them and the round is told none of its
+        # earlier heads is in the checkout, sending an operator after the wrong SHAs.
+        out["why"] = ("the commit the fix range starts from is not in the checkout at "
+                      f"{repo_path}, so a block the branch still carried there could "
+                      "not be told from one the fix pass brought back")
+        return out
     heads: list[tuple[int, str]] = []
     unread: set[int] = set()
     for rnd in sorted(earlier_heads):
@@ -1133,12 +1195,28 @@ def restored_lines(repo_path: str, added: dict[str, dict[int, str]],
                                       f"{sha}^{{commit}}") is not None):
             unread.add(rnd)
             continue
+        # And it has to sit BEFORE the anchor, not merely have a lower round number
+        # (found on review). `earlier_heads` is "rounds < prior.head_round" while the
+        # anchor can come from an explicit `--since` naming something OLDER than that
+        # round's head — and then a head with a lower number sits INSIDE the range
+        # being attributed. Feeding it in as evidence says the content predates a
+        # range it was written in the middle of, and every line the fix passes wrote
+        # between the two comes out of `introduced`. One `merge-base --is-ancestor`
+        # per head settles it; the dropped rounds go in `unread`, which is this
+        # filter's standing answer for a round it could not use, and the count stays
+        # the floor rather than dipping below it.
+        if _git(repo_path, "merge-base", "--is-ancestor", sha, anchor[1]) is None:
+            unread.add(rnd)
+            continue
         heads.append((rnd, sha))
     if not heads:
         out["unread"] = sorted(unread)
         out["why"] = (f"none of the {len(earlier_heads)} earlier round head(s) of this "
-                      f"cycle is in the checkout at {repo_path} — a commit a rewrite "
-                      "orphaned stays reachable only where somebody still holds it")
+                      f"cycle is in the checkout at {repo_path} as an ancestor of the "
+                      "commit the fix range starts from — a commit a rewrite orphaned "
+                      "stays reachable only where somebody still holds it, and one that "
+                      "is not an ancestor sits inside the range being attributed rather "
+                      "than before it")
         return out
     if len(files) * len(heads) > RESTORED_MAX_READS:
         out["unread"] = sorted(unread)
