@@ -232,7 +232,16 @@ GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by
                           0.0**, when nothing was decided. `converged` is strictly stronger
                           than `stop_confident`: a below-floor policy stop (#165) is
                           confident and NOT converged, which is why the review queue's
-                          `ready`/`land` gate stays the looser test
+                          `ready`/`land` gate stays the looser test. `open` holds abandoned
+                          cycles as well as live ones, so **`rate` is an upper bound** and
+                          not an estimate — #637 fits a threshold to it and has to read it
+                          that way. A caps refusal is NOT among them: it ends the cycle and
+                          counts `unconverged`, as `preland` and the review queue already
+                          call it. `by_rounds` is keyed `final_round`, the terminal round's
+                          NUMBER rather than a count of rounds recorded. **`days` defaults
+                          to 90** where the rest of `/review/*` defaults to all time: this
+                          one classifies a row per cycle in Python rather than aggregating
+                          in SQL, and the applied boundary is always in `window.since`
 GET   /review/spend      ?repo=&pr=&hours=                        -> {repo_window, fleet_window,
                                                                      pr_total}
                           what review has already COST, so a ceiling can be checked before

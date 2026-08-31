@@ -557,6 +557,30 @@ def test_a_budget_stop_is_recorded_as_a_stop_that_was_not_convergence(
     assert recorded[0]["reviewers"]["claude"]["ran"] is False
 
 
+def test_a_budget_stop_says_it_did_not_converge_rather_than_leaving_it_null(
+        monkeypatch, tmp_path):
+    """The refusal's `round_stop` is hand-built, so a key it forgets is NULL (#626).
+
+    `GET /review/convergence` reads NULL as `unmeasured` — "the panel never said"
+    — and a caps refusal is the one path that definitely did say: the ceiling
+    ended the cycle and no seat read the diff. Left out, the row was dropped from
+    the aggregate for having reviewed nothing, the cycle's terminal round became
+    the last round that said "go again", and a budget termination was filed
+    `open`: maybe still running, outside the denominator, in the flattering
+    direction. #637 recalibrates a threshold against exactly that rate.
+    """
+    payload, _, recorded = _run(
+        monkeypatch, tmp_path, record=True,
+        panel_cfg={"budget": {"runs_per_day": 1}},
+        spend_body=spend(repo_window={"runs": 2, "rows": 4, "measured_rows": 4,
+                                      "tokens": 5}))
+    assert payload["round_stop"]["converged"] is False
+    assert recorded[0]["round_stop"]["converged"] is False
+    # Said, not derived: `converged` is absent from a payload that never reached a
+    # stopping rule, and False is a different statement from that.
+    assert "converged" in payload["round_stop"]
+
+
 def test_a_size_refusal_is_still_not_a_stop(monkeypatch, tmp_path):
     """The narrowness of the field above. "This round could not usefully read the
     diff" leaves the cycle open; a ceiling ends it. Setting `round_stop` on both

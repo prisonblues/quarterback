@@ -866,11 +866,20 @@ function convergenceTile(c){
   if (!c || !c.overall || c.overall.rate == null) return "";
   const o = c.overall;
   const undecided = o.open + o.unmeasured;
+  // This endpoint's "all time" is not the page's. It classifies a row per CYCLE
+  // in Python rather than aggregating in SQL, so it defaults to a lookback where
+  // `/review/stats` defaults to the whole table — and when the reader picks "all
+  // time" the header above says "since <first run>" while this tile is over a
+  // narrower window. It says which one. A denominator quietly taken over less
+  // than the page claims is the silent truncation this repo does not do.
+  const bounded = !$("days").value && c.window && c.window.since
+    ? ` · window from ${c.window.since.slice(0, 10)}` : "";
   return `<div class="tile"><div class="n" style="color:${precColor(o.rate)}">${
     pct(o.rate)}</div>
     <div class="k">cycles ending in a confident dry round<br>
       <span class="dim">${o.converged} of ${o.decided} decided${
-        undecided ? ` · ${o.open} still open · ${o.unmeasured} unmeasured` : ""}</span>
+        undecided ? ` · ${o.open} still open · ${o.unmeasured} unmeasured` : ""}${
+        bounded}</span>
     </div></div>`;
 }
 

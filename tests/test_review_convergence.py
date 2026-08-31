@@ -322,7 +322,9 @@ async def test_the_rate_is_over_cycles_and_not_over_rounds(client):
     assert agg["overall"]["rate"] == 1.0
     # ...and the round it converged AT, which is the successor to this issue's
     # original headline: a cap of 6 buys nothing if nothing ever converges at 5.
-    assert [r["rounds"] for r in agg["by_rounds"]] == [4]
+    # Keyed `final_round`: it is the terminal round's NUMBER, which is not the
+    # count of rounds the cycle took wherever one went unrecorded.
+    assert [r["final_round"] for r in agg["by_rounds"]] == [4]
 
 
 async def test_two_cycles_on_one_pr_are_two_cycles(client):
@@ -514,3 +516,178 @@ async def test_the_endpoint_is_behind_the_read_token(client):
     """A read like every other on this router — the population it summarises is
     which pull requests this fleet cannot finish reviewing."""
     assert (await client.get("/review/convergence")).status_code == 401
+
+
+# ---- what the review of #641 turned up -------------------------------------
+
+def test_a_degenerate_title_is_classified_without_backtracking():
+    """`_PR_KIND_RE` has three `\\s*` in a row and an optional group between two
+    of them, so *m* spaces split across the stars at each of *n* give-backs from
+    `[a-z]+` is cubic. `pr_title` is `Text` with no length cap at the model or at
+    `ReviewIn`, so one write token can store a title that makes this run for
+    seconds — durably, and on the event loop.
+
+    Asserted on behaviour rather than on the pattern: the answer is still
+    `other`, and it arrives at once. The bound is generous because a wall clock
+    on a loaded box is not a benchmark; the pre-fix number was 12.5s for the same
+    input and no plausible machine noise reaches it.
+    """
+    import time
+    for size in (2_000, 4_000):
+        degenerate = "a" * size + " " * size
+        began = time.monotonic()
+        assert _pr_kind(degenerate) == "other"
+        assert time.monotonic() - began < 1.0, f"backtracked on {size} chars"
+
+
+def test_the_bound_on_the_title_does_not_cost_a_title_that_classifies():
+    """The cheap fix is a stricter regex, and it loses these. The cap is on the
+    INPUT for that reason: every subject that classified before still does."""
+    assert _pr_kind("feat (x) ! : spaced") == "feat"
+    assert _pr_kind("  fix(api)!: leading space") == "fix"
+    # ...and a kind pushed past the scan window is `other`, not a wrong kind.
+    assert _pr_kind(" " * 200 + "feat: too far in") == "other"
+
+
+async def test_the_endpoint_stays_fast_with_a_degenerate_title_stored(client):
+    """End to end, because the regex runs SYNCHRONOUSLY inside an async endpoint:
+    a slow classifier does not block one request, it blocks the worker. The panel
+    page fires this on every load, with no filters."""
+    import time
+    repo = "acme/c626-redos"
+    await record(client, repo, 6060, cycle="c1", to_fix=[],
+                 pr_title="a" * 4_000 + " " * 4_000, round_stop=stop())
+    began = time.monotonic()
+    agg = await convergence(client, repo)
+    assert time.monotonic() - began < 5.0, "the endpoint backtracked on a title"
+    assert {r["kind"] for r in agg["by_kind"]} == {"other"}
+
+
+def test_a_changed_line_count_that_cannot_be_one_is_unknown():
+    """`POST /review` accepts `changed_lines: -5` — nothing bounds the field — and
+    a negative count fell through the band loop keeping its initialised value,
+    landing in `xs`. That is the band where a convergence rate looks best, and
+    the same argument the NULL case already makes applies whole: nobody credibly
+    said how big this was."""
+    assert _pr_size(-1) == "unknown"
+    assert _pr_size(-5000) == "unknown"
+    assert _pr_size(0) == "xs"
+
+
+async def test_a_cycle_the_budget_ended_is_counted_and_not_filed_open(client):
+    """The bias that matters, because #637 fits a threshold to this number.
+
+    A caps refusal reviews nothing and records `stop: True, confident: False,
+    converged: False`. It used to be excluded by `reviewed IS NOT FALSE`, so the
+    cycle's terminal round was the last round that said "go again" and the whole
+    cycle was `open` — filed as maybe-still-running, outside the denominator, in
+    the direction that flatters. It is an ending, and it is `unconverged`, which
+    is what `preland` and the review queue have always called it.
+    """
+    repo = "acme/c626-budget"
+    await record(client, repo, 6061, cycle="c1", round=1,
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6061, cycle="c1", round=2, to_fix=[],
+                 reviewed=False,
+                 skip_reason="refused: 1,200,000 of 1,000,000 tokens",
+                 round_stop={"stop": True, "confident": False, "converged": False,
+                             "reason": "repo spend ceiling reached",
+                             "veto": ["1,200,000 of 1,000,000 tokens"]})
+
+    agg = await convergence(client, repo)
+    assert agg["overall"]["unconverged"] == 1
+    assert agg["overall"]["open"] == 0
+    assert agg["overall"]["decided"] == 1
+    assert agg["overall"]["rate"] == 0.0
+
+
+async def test_a_title_skipped_merge_is_still_not_the_cycles_ending(client):
+    """The other half of the same widening, and the one it must not cost.
+
+    A merge panelled under a title skip inherits the cycle id and reaches no
+    stopping rule, so its `round_stop` is None and `converged` is NULL. The
+    clause added for budget stops keys on a convergence verdict having been
+    PUBLISHED, so this row stays excluded and the cycle keeps the ending its last
+    real round gave it.
+    """
+    repo = "acme/c626-skipmerge"
+    await record(client, repo, 6062, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop())
+    await record(client, repo, 6062, cycle="c1", round=2, to_fix=[],
+                 reviewed=False, skip_reason="title matches skip pattern /^Merge /")
+
+    agg = await convergence(client, repo)
+    assert agg["overall"]["converged"] == 1
+    assert agg["overall"]["unmeasured"] == 0
+    assert agg["overall"]["cycles"] == 1
+
+
+async def test_a_converged_round_a_later_round_ran_past_is_not_a_marginal_win(
+        client):
+    """`marginal_by_round.converged` counted every round with `converged IS TRUE`,
+    on the reasoning that a cycle does not continue past a clean finish.
+
+    True of today's panel and enforced by nothing — #617 exists because rounds
+    have run past a cycle's end. Counted on the TERMINAL round only, "how many
+    cycles ended at round N having converged" is true by construction rather than
+    by an invariant a producer can change without knowing.
+    """
+    repo = "acme/c626-pastend"
+    await record(client, repo, 6063, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop())
+    await record(client, repo, 6063, cycle="c1", round=2,
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+
+    rows = {r["round"]: r for r in (await convergence(client, repo))
+            ["marginal_by_round"]}
+    # Round 1 converged and round 2 ran anyway. The cycle did not end converged,
+    # and round 1 is not where it ended.
+    assert rows[1]["converged"] == 0
+    assert rows[1]["rounds"] == 1
+    assert rows[2]["converged"] == 0
+    # The coverage marker moves with its numerator: both are over terminal rounds.
+    assert rows[1]["converged_runs"] == 0
+    assert rows[2]["converged_runs"] == 1
+
+
+async def test_the_window_is_bounded_by_default_and_says_so(client):
+    """This endpoint pulls one row per CYCLE and classifies each in Python on the
+    event loop — 1.32s unfiltered over 200k rows against 0.05s for
+    `/review/stats`, growing linearly. The panel page calls it with no filters.
+
+    So it defaults to a lookback where the other `/review/*` reads default to all
+    time, and the boundary it applied is in `window.since`: a bounded answer says
+    it is bounded.
+    """
+    repo = "acme/c626-window"
+    await record(client, repo, 6064, cycle="c1", to_fix=[], round_stop=stop())
+
+    r = await client.get(f"/review/convergence?repo={repo}", headers=AGENT)
+    assert r.status_code == 200, r.text
+    assert r.json()["window"]["since"] is not None, "an unbounded default scan"
+    # Older than the default window: present on the board, outside the answer.
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO review_runs (author, repo, pr, round, cycle, ts, "
+            "stopped, stop_confident, converged) VALUES "
+            "('laptop/x', :repo, 9, 1, 'ancient', now() - interval '400 days', "
+            "true, true, true)"), {"repo": repo})
+    assert (await convergence(client, repo))["overall"]["cycles"] == 1
+    wide = await client.get(f"/review/convergence?repo={repo}&days=3650",
+                            headers=AGENT)
+    assert wide.json()["overall"]["cycles"] == 2, "days= no longer widens it"
+
+
+def test_the_page_says_which_window_the_tile_was_answered_over():
+    """The page's "all time" is not this endpoint's, and the tile has to say so.
+
+    `/review/stats` defaults to the whole table and this one defaults to a
+    lookback, so a reader who picks "all time" gets a header reading "since
+    <first run>" over a tile counted across a narrower window. No JS runner here
+    either, so this greps the file that ships — the same crude guard the null-rate
+    rule gets, for the same reason.
+    """
+    page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
+    assert 'window from ' in page, "the tile must name the window it was bounded to"

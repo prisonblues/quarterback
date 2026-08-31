@@ -4800,7 +4800,22 @@ PR_KINDS: frozenset[str] = frozenset({
 #: both discarded: they are orthogonal to the axis this splits on, and a grid
 #: that separated ``feat`` from ``feat!`` would halve every cell to answer a
 #: question nobody asked here.
+#:
+#: Three ``\s*`` in sequence, and the middle group is optional — so on a title
+#: whose prefix never matches, *m* spaces can be split across the three stars in
+#: O(m²) ways at each of the *n* positions ``[a-z]+`` can give back. That is
+#: cubic backtracking on input a stranger controls, and the guard is on the
+#: CALLER: :func:`_pr_kind` matches a bounded prefix. Do not remove that slice
+#: without replacing this pattern with one that cannot backtrack — a possessive
+#: or atomic form loses ``feat (x) ! : spaced``, which today classifies.
 _PR_KIND_RE = re.compile(r"^\s*([a-z]+)\s*(?:\([^)]*\))?\s*!?\s*:")
+
+#: How much of a title :func:`_pr_kind` looks at. A conventional-commit subject
+#: puts its kind in the first handful of characters; nothing legitimate needs a
+#: hundred and twenty. The cap is what keeps :data:`_PR_KIND_RE`'s backtracking
+#: bounded, and it is a cap on the INPUT rather than on the pattern because
+#: every title that classifies today still classifies, spaces and all.
+_PR_KIND_SCAN = 120
 
 
 def _pr_kind(title: str | None) -> str:
@@ -4811,18 +4826,35 @@ def _pr_kind(title: str | None) -> str:
     was recorded and it is not a conventional-commit subject", which is most
     human-authored pull requests. Folding the first into the second would put
     rows nobody classified into a bucket that claims they were.
+
+    Matched against the first :data:`_PR_KIND_SCAN` characters and not the whole
+    title, which is a DENIAL-OF-SERVICE fix and not a tidy-up. ``pr_title`` is
+    ``Text`` with no length cap at either the model or ``ReviewIn``, so any
+    holder of a write token can store one row whose title makes this regex
+    backtrack for seconds; the row is durable, ``/review/convergence`` runs the
+    classifier synchronously inside an async endpoint, and ``reviews.html`` calls
+    that endpoint on every panel page load. 4,000 letters followed by 4,000
+    spaces took 12.5s end to end and blocked the whole worker while it did.
     """
     if not title or not title.strip():
         return "unknown"
-    m = _PR_KIND_RE.match(title.lower())
+    m = _PR_KIND_RE.match(title.lower()[:_PR_KIND_SCAN])
     if m and m.group(1) in PR_KINDS:
         return m.group(1)
     return "other"
 
 
 def _pr_size(changed_lines: int | None) -> str:
-    """A PR's size band from its changed-line count, or ``unknown``."""
-    if changed_lines is None:
+    """A PR's size band from its changed-line count, or ``unknown``.
+
+    A NEGATIVE count is ``unknown`` too, on the argument the NULL case already
+    makes. ``POST /review`` accepts ``changed_lines: -5`` — nothing bounds the
+    field — and a count that cannot be a count is "nobody credibly said", not
+    "this PR was tiny". Left to fall through the loop it would keep ``band``'s
+    initialised value and land in ``xs``, the band where a convergence rate looks
+    best, which is the one direction a size classifier must not fail in.
+    """
+    if changed_lines is None or changed_lines < 0:
         return "unknown"
     band = PR_SIZE_BANDS[0][0]
     for name, low in PR_SIZE_BANDS:
@@ -4854,6 +4886,26 @@ def _cycle_ending(stopped: bool | None, converged: bool | None) -> str:
       no ending to count, and putting it in the denominator would report every
       in-flight cycle as a failure while it is in flight.
     * then the two that are the measurement.
+
+    **``open`` biases the rate UPWARD, and the bias is not symmetric.** An
+    abandoned cycle is a cycle that did not converge, so every one of them sits
+    outside a denominator it belongs in; a cycle still running might have gone
+    either way. There is no matching bucket of hidden convergences. So the
+    published rate is an upper bound on the true one and should be read as one —
+    which matters most to #637, whose recalibration of
+    ``escalate_on.fix_injection`` is measured against exactly this number and
+    would otherwise fit a threshold to an optimistic population. ``open`` is
+    published beside the rate rather than netted into it so the size of the
+    doubt is visible; it is not an estimate of it.
+
+    Budget terminations are NOT among them, and that is a fix rather than an
+    assumption: a caps refusal used to land here — the panel wrote its refusal
+    ``round_stop`` by hand and left ``converged`` out, so the row was NULL and the
+    endpoint dropped it for having reviewed nothing, leaving "go again" as the
+    cycle's last word. The panel now says ``converged: False`` on that path and
+    this endpoint reads it, so a cycle that ended because the money ran out is
+    counted ``unconverged``, which is what ``preland`` and ``app.review_queue``
+    have always called it.
 
     ``stopped`` is read with an identity test, never for truthiness, for the
     reason its column docstring gives: NULL is "the panel did not say", and read
@@ -4891,6 +4943,11 @@ def _rate(t: Mapping[str, int]) -> dict:
     ``decided``. The gap is ``open`` plus ``unmeasured``, and it is published
     beside the rate rather than netted out of it because the honest reading of
     "62% converged" depends entirely on whether the other 38% were measured.
+
+    ``rate`` is an UPPER BOUND on the true rate, not an estimate of it: ``open``
+    holds abandoned cycles as well as live ones, and an abandoned cycle is a
+    non-convergence sitting outside its own denominator with nothing symmetrical
+    on the other side. :func:`_cycle_ending` has the argument.
     """
     decided = t["converged"] + t["unconverged"]
     return {
@@ -4901,13 +4958,31 @@ def _rate(t: Mapping[str, int]) -> dict:
     }
 
 
+#: Default lookback for ``/review/convergence`` when the caller names no window.
+#:
+#: The other ``/review/*`` reads default to all time and get away with it because
+#: they aggregate in SQL and return O(groups); this one pulls ONE ROW PER CYCLE
+#: back into Python and classifies each in a loop, so its cost is O(cycles) on
+#: the event loop. Measured at 200k rows: 1.32s unfiltered against 0.05s for
+#: `/review/stats` over the same table, growing linearly — ~7s at a million. The
+#: panel page calls it with no filters on every load.
+#:
+#: A window rather than a row cap, and the difference is what the response can
+#: honestly say. `window.since` states the boundary in terms a reader can
+#: reason about and reproduce; a cap would truncate on whatever order the rows
+#: came back in, so `by_repo` and `by_shape` would report rates over an
+#: arbitrary subset that nobody could name or repeat. All time is still
+#: reachable — pass `since` — and it is then the caller's own choice.
+CONVERGENCE_DEFAULT_DAYS = 90
+
+
 @router.get("/review/convergence")
 async def review_convergence(
     _reader: str = Depends(reader),
     repo: str | None = Query(None),
     author: str | None = Query(None),
     since: str | None = Query(None, description="ISO timestamp"),
-    days: int | None = Query(None, ge=1, le=3650),
+    days: int = Query(CONVERGENCE_DEFAULT_DAYS, ge=1, le=3650),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
     """The share of review CYCLES that ended in a confident dry round (#626).
@@ -4963,11 +5038,25 @@ async def review_convergence(
     population grows, which is why the two margins are published beside it rather
     than left to be summed out of it.
 
-    ``by_rounds`` is keyed by how many rounds the cycle took — the terminal
-    round's own number — and is the successor to this issue's original headline.
-    It is what says whether a cap of 6 buys anything a cap of 3 did not: if no
-    cycle in the window ever converged at round 5, the rounds after 4 are being
-    paid for and not used.
+    **``by_kind`` splits on an author's own declaration, not on a measurement.**
+    The kind is free text the PR's author typed, and nothing checks it: a
+    refactor titled ``feat:`` is indistinguishable here from a feature, and a
+    fleet whose agents prefix by habit rather than by content will produce a
+    clean-looking split of nothing. That matters because this cell is meant to
+    inform a policy decision — how many rounds to buy for which kind of work —
+    and the confidence a grid invites is not available from this signal. Read it
+    as a hypothesis to check against the diffs, never as the finding.
+    (``unknown`` versus ``other`` is a different distinction and a real one: see
+    :func:`_pr_kind`.)
+
+    ``by_rounds`` is keyed by ``final_round``, the terminal round's own NUMBER,
+    and is the successor to this issue's original headline. It is what says
+    whether a cap of 6 buys anything a cap of 3 did not: if no cycle in the
+    window ever converged at round 5, the rounds after 4 are being paid for and
+    not used. It is not a count of the rounds the cycle took — the two differ
+    wherever a round went unrecorded or fell outside this window — and the key
+    says which of the two it is, because a cap is set in round numbers and that
+    is the question being asked.
 
     ``marginal_by_round`` is the original ask kept intact, and it is measured per
     ROUND rather than per cycle: for round N across the window, how many rounds
@@ -4976,6 +5065,18 @@ async def review_convergence(
     ``new_findings`` against ``new_findings_runs`` and never against ``rounds``:
     the column is nullable and NULL means the panel did not say, so a window with
     older rounds in it reports an honest sum over a fraction of the population.
+
+    ## The window
+
+    Unlike the other ``/review/*`` reads this one defaults to a lookback
+    (:data:`CONVERGENCE_DEFAULT_DAYS` days) rather than to all time, and the
+    reason is cost rather than taste: every other endpoint on this router
+    aggregates in SQL and returns one row per group, while this one fetches one
+    row per cycle and classifies each in Python on the event loop. Unfiltered
+    over 200k rows that is 1.32s against 0.05s for ``/review/stats``, and it
+    grows linearly. The applied boundary is always in ``window.since``, and
+    ``since`` overrides ``days``, so a caller who wants all of it can ask for all
+    of it and own the wait.
 
     ## What this does not do
 
@@ -5009,7 +5110,21 @@ async def review_convergence(
     # whose PR later had a merge panelled as `unmeasured`. `/review/findings`
     # excludes them from its own newest-run selection for exactly this reason,
     # and the argument is the same one.
-    filters.append(_review_happened())
+    #
+    # ...but `reviewed IS NOT FALSE` alone throws out the CAPS REFUSAL with it,
+    # and that one is an ending. The panel refuses a round whose diff is past
+    # every seat's budget, reviews nothing (`reviewed: False`) and records
+    # `stop: True, confident: False, converged: False`: the ceiling ended the
+    # cycle. Dropped, the cycle's terminal round became the last round that said
+    # "go again" and the whole cycle was filed `open` — outside the denominator,
+    # counted as maybe-still-running, in the flattering direction. So the test is
+    # widened by exactly one clause: a run that reviewed nothing is still read
+    # when it PUBLISHED A CONVERGENCE VERDICT. A title skip does not (its
+    # `round_stop` is None, so `converged` is NULL) and stays excluded, which is
+    # the property the paragraph above needs. `_review_happened()` itself is
+    # untouched — six other queries mean "a review happened" by it and this one
+    # means "a round that can end a cycle".
+    filters.append(sa_or(_review_happened(), ReviewRun.converged.isnot(None)))
 
     # Cycles that are cycles. Counted rather than silently dropped: a window made
     # entirely of one-shot reads would otherwise answer `cycles: 0` — which is
@@ -5037,12 +5152,18 @@ async def review_convergence(
     # a retry, a board that was down and caught up — has a later `ts` than the
     # round after it. The panel numbers the rounds and that numbering is the
     # cycle's own account of its order; `ts` is when the board heard about it.
+    #
+    # `marginal_by_round` reads this same subquery rather than the table, so
+    # "terminal" is defined once. Two definitions of the cycle's last round in
+    # one endpoint is the drift this issue exists to end, one query down.
     ranked = (
         select(
+            ReviewRun.id.label("id"),
             ReviewRun.repo.label("repo"),
             ReviewRun.stopped.label("stopped"),
             ReviewRun.converged.label("converged"),
-            ReviewRun.round.label("rounds"),
+            ReviewRun.round.label("final_round"),
+            ReviewRun.new_findings.label("new_findings"),
             ReviewRun.changed_lines.label("changed_lines"),
             ReviewRun.pr_title.label("pr_title"),
             func.row_number()
@@ -5079,26 +5200,39 @@ async def review_convergence(
         size, kind = _pr_size(c.changed_lines), _pr_kind(c.pr_title)
         overall[ending] += 1
         for table, key in ((by_repo, c.repo), (by_size, size), (by_kind, kind),
-                           (by_shape, (size, kind)), (by_rounds, c.rounds)):
+                           (by_shape, (size, kind)), (by_rounds, c.final_round)):
             table.setdefault(key, _tally())[ending] += 1
 
-    # This issue's original headline, per round rather than per cycle. `converged`
-    # is counted on rounds that were the cycle's LAST — which for a converged
-    # round is every one of them, since a cycle does not continue past a clean
-    # finish — so "how many cycles converged at round N" needs no second join.
+    # This issue's original headline, per round rather than per cycle: over the
+    # window, how many rounds numbered N ran and what they raised.
+    #
+    # `converged` is counted on the cycle's TERMINAL round only — `rn == 1` off
+    # the same subquery the cycle grain came from — so "how many cycles ENDED at
+    # round N having converged" is true by construction. It used to count every
+    # round with `converged IS TRUE`, on the reasoning that a cycle does not
+    # continue past a clean finish. That is a property of today's panel and of
+    # nothing else: nothing in this schema forbids a round after a converged one,
+    # and #617 exists because rounds have in fact run past a cycle's end. An
+    # unenforced invariant load-bearing in an aggregate is a wrong number waiting
+    # for a producer to change.
+    #
+    # `converged_runs` filters on the same `rn == 1`, because a coverage marker
+    # over a different population than its numerator is worse than none.
+    terminal = ranked.c.rn == 1
     marginal = (
         await session.execute(
             select(
-                ReviewRun.round,
-                func.count(ReviewRun.id),
-                func.sum(ReviewRun.new_findings),
-                func.count(ReviewRun.id).filter(ReviewRun.new_findings.isnot(None)),
-                func.count(ReviewRun.id).filter(ReviewRun.converged.is_(True)),
-                func.count(ReviewRun.id).filter(ReviewRun.converged.isnot(None)),
+                ranked.c.final_round,
+                func.count(ranked.c.id),
+                func.sum(ranked.c.new_findings),
+                func.count(ranked.c.id).filter(ranked.c.new_findings.isnot(None)),
+                func.count(ranked.c.id).filter(
+                    sa_and(ranked.c.converged.is_(True), terminal)),
+                func.count(ranked.c.id).filter(
+                    sa_and(ranked.c.converged.isnot(None), terminal)),
             )
-            .where(*in_cycle)
-            .group_by(ReviewRun.round)
-            .order_by(ReviewRun.round)
+            .group_by(ranked.c.final_round)
+            .order_by(ranked.c.final_round)
         )
     ).all()
 
@@ -5129,7 +5263,14 @@ async def review_convergence(
                      for (s, k), v in sorted(by_shape.items(),
                                              key=lambda kv: (_size_order((kv[0][0], None)),
                                                              kv[0][1]))],
-        "by_rounds": [{"rounds": k, **_rate(v)} for k, v in sorted(by_rounds.items())],
+        # Keyed `final_round` and not `rounds`. The number is the terminal round's
+        # own NUMBER, which is not the count of rounds the cycle took: they differ
+        # wherever a round went unrecorded or was filtered out of this window. The
+        # question this answers is about the number — a cap is set in round
+        # numbers — so the number is right and the old label was the wrong word
+        # for it.
+        "by_rounds": [{"final_round": k, **_rate(v)}
+                      for k, v in sorted(by_rounds.items())],
         "marginal_by_round": [
             {"round": rnd,
              "rounds": int(n or 0),
