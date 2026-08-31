@@ -1416,6 +1416,22 @@ class Baseline:
     #: see above — and the briefs name that round to the reviewers, so it has to
     #: travel with the sha rather than being guessed from this run's round number.
     head_round: int | None = None
+    #: EVERY accepted round's head commit, `round -> sha`, validated by the same
+    #: rule ``head_sha`` is (#559).
+    #:
+    #: ``head_sha`` alone answers "where does the fix range START", which has one
+    #: right answer and takes the latest. This answers a different question — *had
+    #: this cycle already seen these exact lines?* — and for that the earlier rounds
+    #: are the whole point. :func:`panel_scope.restored_lines` reads the entries
+    #: BEFORE the anchor's round to tell a fix pass that restored already-reviewed
+    #: code from one that wrote it, which position alone cannot do: a
+    #: revert-of-a-revert adds ninety reviewed lines and a line diff calls every one
+    #: of them the fixer's own work.
+    #:
+    #: A dict rather than a list because the round number is what selects "earlier",
+    #: and empty for a cycle whose payloads all predate ``head_sha`` — which reads as
+    #: "nothing to compare against" and leaves attribution exactly where it was.
+    head_shas: dict[int, str] = field(default_factory=dict)
     #: What the round that supplied ``head_sha`` asked its fixer to fix — file
     #: spelling -> the finding keys raised against it. #67's other end of the
     #: recurrence chain (:func:`panel_scope._recurrence`): a new finding standing
@@ -2108,6 +2124,12 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                                   "rather than attributing against whatever that names")
                 continue
             b.head_sha, b.head_round, anchor_payload = sha, was, payload
+            # Banked for every round, not only the newest, because #559's filter
+            # needs the ones this loop is walking PAST. Written after the same
+            # validation the anchor gets — an unvalidated sha here would reach
+            # `git show` — and a later payload for one round overwrites an
+            # earlier one, which is the tie-break `ordered` already settled.
+            b.head_shas[was] = sha
         # What that anchor round asked its fixer to fix (#67). Read off the SAME
         # payload the anchor came from and no other: the fix range this round
         # attributes against runs from that commit, so those are the complaints
