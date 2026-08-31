@@ -1469,19 +1469,37 @@ DEFAULTS: dict = {
         # `config_notes` when it escalates — a repo that declined this must not be
         # indistinguishable from one where the pass silently did not run.
         "propose_on_escalation": True,
-        # #55's spend ceiling. FOUR OF THE FIVE ARE `None`, and that is the feature
-        # rather than a placeholder: `None` means "no ceiling", so a fleet that
-        # installs this release spends exactly what it spent before on every ceiling
-        # a human has not written. A cap that arrived switched on at a number nobody
-        # chose would be the same mistake as a review nobody configured
-        # (`review_refusal`) — which is why the fifth value, `tokens_per_pr`, is
-        # dated, attributed and argued on its own line below rather than inherited.
+        # #55's spend ceiling. ALL FIVE ARE `None`, and that is the feature rather
+        # than a placeholder: `None` means "no ceiling", so a fleet that installs this
+        # release spends exactly what it spent before on every ceiling a human has not
+        # written. A cap that arrived switched on at a number nobody chose would be
+        # the same mistake as a review nobody configured (`review_refusal`).
         #
-        # ONE CONSEQUENCE OF THAT FIFTH VALUE, recorded here because it is a property
-        # of the block rather than of the key: the panel made NO board call at all
-        # while every one of these was `None`, and from 2026-08-30 it makes one on
-        # every run. That buys a request, not a refusal — the other four still mean
-        # no ceiling — and `tokens_per_pr: null` restores the cheap path.
+        # A FIFTH VALUE WAS SET HERE AND REVERTED THE SAME DAY (2026-08-31). The
+        # argument for it is still good and is kept in full below; what killed it is a
+        # property of the BLOCK and not of the key, which is why it is recorded here.
+        #
+        # `Budget.dormant` is true only while EVERY one of these is `None`, and a
+        # dormant budget returns from `panel_caps.check` before any board call. Set one
+        # key and the whole block wakes for every repo on the fleet — including every
+        # repo with an empty `review_panel`, which is most of them. Then a `fetch_spend`
+        # that cannot answer (no board configured, a 401, a 404, or a 5s `SPEND_TIMEOUT`
+        # against `pr_total`, an unbounded aggregate over `ReviewReviewer`) reaches
+        # `_unverified(..., headless=True)` and returns a REFUSAL — before any seat runs,
+        # and not overridable by `--force`.
+        #
+        # `run-loop.sh` exports `HARNESS_UNATTENDED=1`, so that is the autonomous fleet
+        # loop: an unreachable board would have stopped review altogether rather than
+        # spending without a ceiling. The loops suite already documents the board 503ing
+        # under `-n 8`, so this was not hypothetical.
+        #
+        # And the trade bought nothing, which is what settles it. Dormant ALREADY meant
+        # "no ceiling", so six rounds were affordable without the key; setting it bought
+        # a ceiling nobody had asked for plus a hard board dependency on the one path
+        # that cannot ask a human. The runaway stop is still wanted — it needs the
+        # unattended path to WARN on an unverifiable spend rather than refuse, or #483's
+        # per-round allowance with the per-PR total derived from it, and neither is
+        # built. Set this key again when one of them is.
         #
         # UNITS. Tokens are input + output, which is `/review/stats`' own
         # `billable` — cached input is a slice OF input and reasoning sits inside
@@ -1510,8 +1528,12 @@ DEFAULTS: dict = {
             "runs_per_day": None,
             # This PR's whole life, across every cycle and every head it has had.
             #
-            # **20,000,000, as of 2026-08-30 — Rich's number, taken on #621 beside
-            # `max_rounds: 6` so that the later rounds can be afforded (#483, #626).**
+            # **`None`. It was 20,000,000 for one day — Rich's number, taken on #621
+            # on 2026-08-30 beside `max_rounds: 6` so that the later rounds could be
+            # afforded (#483, #626), and reverted on 2026-08-31. The argument below is
+            # about the NUMBER and still holds; what it does not reach is the block
+            # property recorded at the top of `budget`, which is what the revert was
+            # for. Read the rest as the case to make again, not as what ships.**
             #
             # BE CLEAR WHAT IT DOES: IT TIGHTENS, IT DOES NOT RAISE. There is no
             # per-PR ceiling in force anywhere today — no fleet dial, no repo dial,
@@ -1541,7 +1563,13 @@ DEFAULTS: dict = {
             # running today, which is no ceiling. A board dial of the same name still
             # beats this, and that is the point of `BOARD_DIALS`: the repo under
             # review cannot raise a ceiling the board has stated.
-            "tokens_per_pr": 20_000_000,
+            #
+            # THE WAY BACK IS THE SETTING, as of 2026-08-31 — see the block comment
+            # above for why. Everything argued here still holds about the NUMBER; what
+            # it does not account for is that setting any key at all wakes the budget
+            # fleet-wide and turns an unanswerable board into a refusal on the
+            # unattended path.
+            "tokens_per_pr": None,
             "runs_per_pr": None,
             # Every watched repo combined, over the same rolling window. Meant for
             # the fleet scope (`POST /dials` with no `repo`); set per repo it still
