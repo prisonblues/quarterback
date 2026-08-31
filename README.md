@@ -188,6 +188,7 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, premise_counts_unusable]
                                                                     [, needs_human_unknown]
                                                                     [, needs_human_refused]
+                                                                    [, review_panel_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
@@ -196,7 +197,8 @@ GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scoreca
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance
-                                                                 + recurrence/premise_verdict)
+                                                                 + recurrence/premise_verdict
+                                                                 + review_panel, the dials it ran under)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -1045,6 +1047,20 @@ unbelievable count, a field whose value is not the shape that field takes: each 
 `POST /review` response under its own key and goes to the service log, because a response nobody
 stores is not a record and `qb record-review` prints only the run id. That is the machine-readable
 half of the panel↔board drift check #65 asks for.
+
+**And a key the ingest has no field for at all fails the suite (#643).** The signal above can only
+speak about a value it recognised the FIELD of; `ReviewIn` is `extra="ignore"`, so a top-level key
+the panel sends and the model does not name went on the floor with nothing said anywhere. That
+happened five times — `head_sha`, `unread_files`, the provenance pair, `converged`, `review_panel`
+— each caught by a human months later. `tests/test_payload_key_drift.py` reads the panel's payload
+keys out of `harness/loops/panel.py` and holds whatever `ReviewIn` does not bind against a
+hand-written list of the twenty-five keys that are dropped on purpose, so a new one has to be
+named — as a field, as a key the panel stops sending, or as a line on that list — rather than
+disappearing. The list is written out and not computed, because a computed one passes forever.
+
+`review_panel`, the dial set a round APPLIED, is stored since #643 rather than dropped: it is the
+policy `converged` was decided under, and until now that verdict sat on a row carrying none of the
+floors it was cut at. Opaque JSONB, never interpreted here, on `GET /review/{id}` only.
 
 ## Releases
 
@@ -2349,6 +2365,9 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
                    in harness/templates/)
   test_migration_ids.py              the frozen legacy ids and the rule that a
                    new revision is never a chain number (no database)
+  test_payload_key_drift.py          every top-level key panel.py sends against
+                   what ReviewIn binds, so a key the ingest would silently drop
+                   fails on the commit that adds it (#643; no database)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)
