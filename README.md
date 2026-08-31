@@ -189,16 +189,24 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, needs_human_unknown]
                                                                     [, needs_human_refused]
                                                                     [, review_panel_dropped]
+                                                                    [, rules_dropped]
+                                                                    [, provenance_restored_dropped]
+                                                                    [, since_sha_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
-                                                                  unread_files as a count)
+                                                                  unread_files as a count,
+                                                                  + scope/since_sha/fix_range_source,
+                                                                  what each round measured)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance
                                                                  + recurrence/premise_verdict
-                                                                 + review_panel, the dials it ran under)
+                                                                 + review_panel, the dials it ran under
+                                                                 + rules, which layer set each of them
+                                                                 + provenance_restored, what it did
+                                                                   not attribute)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -1051,16 +1059,30 @@ half of the panel↔board drift check #65 asks for.
 **And a key the ingest has no field for at all fails the suite (#643).** The signal above can only
 speak about a value it recognised the FIELD of; `ReviewIn` is `extra="ignore"`, so a top-level key
 the panel sends and the model does not name went on the floor with nothing said anywhere. That
-happened five times — `head_sha`, `unread_files`, the provenance pair, `converged`, `review_panel`
-— each caught by a human months later. `tests/test_payload_key_drift.py` reads the panel's payload
-keys out of `harness/loops/panel.py` and holds whatever `ReviewIn` does not bind against a
-hand-written list of the twenty-five keys that are dropped on purpose, so a new one has to be
-named — as a field, as a key the panel stops sending, or as a line on that list — rather than
-disappearing. The list is written out and not computed, because a computed one passes forever.
+happened six times — `head_sha`, `unread_files`, the provenance pair, `converged`, `review_panel`,
+and the provenance working #647 stores — each of the first five caught by a human months later.
+`tests/test_payload_key_drift.py` reads the panel's payload keys out of `harness/loops/panel.py`
+and holds whatever `ReviewIn` does not bind against a hand-written list of the keys that are
+dropped on purpose (twenty-five at #643, twenty now), so a new one has to be named — as a field, as
+a key the panel stops sending, or as a line on that list — rather than disappearing. The list is
+written out and not computed, because a computed one passes forever.
 
 `review_panel`, the dial set a round APPLIED, is stored since #643 rather than dropped: it is the
 policy `converged` was decided under, and until now that verdict sat on a row carrying none of the
 floors it was cut at. Opaque JSONB, never interpreted here, on `GET /review/{id}` only.
+
+**And the working behind a count this board already stores (#647).** The sixth instance was the
+first the list itself found: five of its twenty-five entries were the provenance behind
+`provenance_counts`, which has ridden every view since v2.26. `rules` (#305) is which LAYER
+supplied each dial — and the only field on the row carrying `escalate_on.fix_injection`, since
+`review_panel` is `Dials.as_dict()` and `escalate_on` is not in it. `provenance_restored` (#559) is
+what the round declined to attribute, the filter that moves `introduced`. `fix_range_source` (#512)
+is which range answered — `increment`, `compare` or `reconstructed`. `scope`/`since_sha` are what
+the round actually reviewed, which is what makes the stored `diff_chars` comparable across a cycle.
+
+The two objects are opaque JSONB on `GET /review/{id}`, refused whole rather than trimmed. The
+three scalars ride `GET /reviews` too, on `merge_base`'s rule: a recalibration reads a population
+and slices it on these, and detail-only would mean one fetch per run.
 
 ## Releases
 
@@ -2368,6 +2390,9 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_payload_key_drift.py          every top-level key panel.py sends against
                    what ReviewIn binds, so a key the ingest would silently drop
                    fails on the commit that adds it (#643; no database)
+  test_review_provenance_working.py  what a stored count was measured against —
+                   rules, provenance_restored, fix_range_source, scope,
+                   since_sha — round-tripped and refused (#647)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)

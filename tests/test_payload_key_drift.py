@@ -3,10 +3,16 @@
 ``ReviewIn`` is declared ``populate_by_name=True`` with no ``extra=``, so
 pydantic v2's default ``extra="ignore"`` applies: a top-level key on the panel's
 payload that the model does not name is discarded without a word, without a log
-line, and without a 422. That has now happened **five times** — ``head_sha``,
-``unread_files``, the provenance pair, ``converged`` (#626), and ``review_panel``,
-which this issue's PR stores. Every one was found by a human noticing a number
-was missing, months apart. Nothing failed.
+line, and without a 422. That has now happened **six times** — ``head_sha``,
+``unread_files``, the provenance pair, ``converged`` (#626), ``review_panel``
+(#643), and the provenance working #647 stores: ``rules``, ``fix_range_source``,
+``provenance_restored``, ``scope`` and ``since_sha``. Every one of the first five
+was found by a human noticing a number was missing, months apart. Nothing failed.
+
+The sixth is the first that was found by this file: #643 wrote the list, #647 read
+it and asked which of the twenty-five entries were dropped because somebody decided
+to and which were dropped because nobody had looked. Five of them were the second
+kind.
 
 This file is what fails.
 
@@ -85,20 +91,17 @@ DROPPED_BY_DESIGN = frozenset({
     "local_suite",          # #548's record of what stood in for CI
     "ci_failing",           # which checks were red; `ci_status` is the stored verdict
     "ci_unrunnable",        # #628, null on every round that did not establish it
-    # ---- Provenance working. `provenance_counts` — the answer — IS stored; these
-    # say how it was reached, and #637 wants at least two of them. See the PR body:
-    # they are one design job and not this one.
-    "fix_range_source",     # #512: `increment` or `compare`
-    "provenance_restored",  # #559: what the attribution declined to count, and why
+    # ---- Provenance working. Four of this tier came OFF the list in #647 —
+    # `fix_range_source`, `provenance_restored`, `scope` and `since_sha` — because
+    # they say what `provenance_counts` was MEASURED AGAINST. This one is still
+    # dropped, and on a narrower argument than "nobody has asked": it is a
+    # correspondence between two histories rather than a property of the round's
+    # measurement, and #647 stored the four that change what a stored count means.
     "fix_range_rebuilt",    # #504: the correspondence a rewritten history forced
-    # ---- Scope. `diff_chars` is stored and is scope-dependent, so a consumer
-    # comparing it across rounds needs these — which is an argument for storing
-    # them, made in its own issue rather than here.
-    "scope",                # "pr" or "increment"
-    "since_sha",            # the increment's anchor
     # ---- Configuration, as opposed to policy. `review_panel` — the dials as
-    # APPLIED — is stored since #643; these two say how the round was set up.
-    "rules",                # #305: WHICH LAYER supplied each dial
+    # APPLIED — is stored since #643 and `rules` — which LAYER supplied each of
+    # them — since #647; these two say how the round was set UP, and neither
+    # changes the reading of a number on the row.
     "diff_budgets",         # per-seat char budgets; the per-seat answer is on the seat
     "reviewers_ran",        # which seats answered; `review_reviewers` has the rows
 })
@@ -213,7 +216,7 @@ def test_the_scan_actually_found_the_panels_payloads(panel_source):
 
 def test_every_dropped_key_is_one_somebody_decided_to_drop(panel_source):
     """The check itself. Green today, and it is meant to be: the point is what it
-    does on the commit that adds the twenty-seventh key.
+    does on the commit that adds the twenty-first key.
 
     Two assertions, not one equality, because the two directions are different
     events with different remedies. A key in the payload and not on the list is
@@ -284,3 +287,37 @@ def test_review_panel_is_bound_and_no_longer_dropped(panel_source):
     assert "review_panel" in review_in_accepts()
     assert "review_panel" in {c.name for c in ReviewRun.__table__.columns}
     assert "review_panel" not in DROPPED_BY_DESIGN
+
+
+#: The keys #647 took off :data:`DROPPED_BY_DESIGN`. Written out here as well as
+#: removed from the list above, because the two assertions are different: removing
+#: an entry says "this is no longer exempt", and this says "it is BOUND" — and a
+#: key deleted from the list while nobody added the field fails the drift test with
+#: a message about a stale entry, which names the wrong repair.
+PROVENANCE_WORKING = ("rules", "fix_range_source", "provenance_restored",
+                      "scope", "since_sha")
+
+
+def test_the_provenance_working_is_bound_and_no_longer_dropped(panel_source):
+    """#647: the working behind a count this board already stores.
+
+    Asserted by name for the reason ``review_panel``'s test above is, and the
+    reason is specific to each: ``rules`` is the only key of the five that carries
+    ``review_panel.escalate_on.fix_injection``, because ``review_panel`` is
+    ``Dials.as_dict()`` and ``escalate_on`` is not in it; ``fix_range_source`` and
+    ``provenance_restored`` say what ``provenance_counts`` was measured against;
+    ``scope`` and ``since_sha`` say what the round reviewed, which is what makes
+    the stored ``diff_chars`` comparable across a cycle.
+
+    Four assertions each rather than one, because the halves fail differently. A
+    field on ``ReviewIn`` with no column stores nothing; a column with no field is
+    the ``converged`` shape exactly; and an entry left on the allow-list would
+    swallow the key again if the field were ever removed.
+    """
+    payload, accepted = panel_payload_keys(panel_source), review_in_accepts()
+    columns = {c.name for c in ReviewRun.__table__.columns}
+    for key in PROVENANCE_WORKING:
+        assert key in payload, f"the panel no longer sends {key}"
+        assert key in accepted, f"ReviewIn does not bind {key}"
+        assert key in columns, f"review_runs has no column for {key}"
+        assert key not in DROPPED_BY_DESIGN, f"{key} is still exempted"

@@ -99,6 +99,42 @@ class ReviewRun(Base):
     #: read it — it costs its own lookup, and the skip path deliberately does not
     #: pay for one — never zero, never the merge base standing in.
     base_sha: Mapped[str | None] = mapped_column(Text)
+    #: What this round actually REVIEWED, and the commit it reviewed from (#647) —
+    #: ``pr`` (the whole diff) or ``increment`` (the commits since
+    #: :attr:`since_sha`, with the rest of the PR as context).
+    #:
+    #: Not inferable from :attr:`round`. The panel falls back to ``pr`` whenever the
+    #: anchor is missing or the fetch failed, so "round 2" does not imply
+    #: "increment" — and :attr:`diff_chars` is scope-dependent, which makes this the
+    #: field that says whether two rounds' ``diff_chars`` are the same measurement
+    #: or two different ones. A consumer that compares them without reading this
+    #: first is comparing a whole PR against a commit range.
+    #:
+    #: Stored verbatim against no vocabulary: see ``reviews._word_or_none``. NULL is
+    #: "the panel did not say", which is every run recorded before this column.
+    #: ``since_sha`` is a commit id normalised by the same rule as
+    #: :attr:`head_sha` and the two base ends, because under increment scope the
+    #: round's target is ``since_sha...head_sha`` and a range with one end
+    #: normalised and one raw compares badly.
+    scope: Mapped[str | None] = mapped_column(Text)
+    since_sha: Mapped[str | None] = mapped_column(Text)
+    #: WHICH range the attribution behind :attr:`provenance_counts` read (#512,
+    #: stored by #647): ``increment`` — the diff this round reviewed — ``compare``,
+    #: the separate API fetch used under ``pr`` scope and wherever the increment
+    #: fell back, or ``reconstructed``, #504's rebuild after a rewritten history.
+    #:
+    #: The three are not one measurement: the increment drops a base-branch merge's
+    #: files and the compare range does not. So a consumer holding ``introduced``
+    #: counts across a cycle's rounds without this is holding counts whose
+    #: denominator changed underneath it — which is the trap #642's changelog
+    #: names and the reason #637 cannot recalibrate a threshold without this column.
+    #:
+    #: NULL where the question does not arise (round 1 attributes nothing) and for
+    #: every run recorded before the column. Stored verbatim, and deliberately not
+    #: against a frozen set of the three: #512 published two and #504 added the
+    #: third, so a set written on this board would have dropped ``reconstructed``
+    #: on the release that introduced it.
+    fix_range_source: Mapped[str | None] = mapped_column(Text)
     #: Paths NO reviewer that ran read in full — the round's own coverage hole,
     #: banked for the NEXT round's ``missed-unread`` bucket. A file only lands
     #: here if every seat was truncated out of it: one seat that read it means the
@@ -188,6 +224,64 @@ class ReviewRun(Base):
     #: accident — every skip and refusal path, which resolve a policy but never
     #: apply one. ``{}`` is a caller that sent an empty object.
     review_panel: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: WHICH LAYER supplied each of those dials (#305, stored by #647) —
+    #: ``defaults``, ``sample``, ``overlay`` or ``board`` — with the source and,
+    #: for a board dial, the reason somebody gave, who set it, its scope and when
+    #: it lapses. ``rules`` on the round payload, which is
+    #: ``panel_core.rules_record(cfg)``.
+    #:
+    #: **The pair with :attr:`review_panel`, and #305 is why.** A dial VALUE with
+    #: no provenance is a value a reader has to go and guess the source of, from
+    #: three files and a resolution order: ``.harness-rules.sample`` stated both
+    #: floors at P2 while five rounds put P4 findings in ``to_fix``, and nothing in
+    #: any round's artefact could settle which was describing the run. #643 stored
+    #: the values; this is the other half.
+    #:
+    #: It is also the ONLY field on this row that records
+    #: ``escalate_on.fix_injection``. :attr:`review_panel` is
+    #: ``panel_seats.Dials.as_dict()`` — twelve settings — and ``escalate_on`` is
+    #: not among them; ``rules.dials`` covers every dotted path under
+    #: ``review_panel.`` and ``reviewers.``, fifty-two on this repository. A
+    #: recalibration of a threshold against a population that does not say what the
+    #: threshold was during each round is guesswork with extra steps.
+    #:
+    #: **Opaque JSON**, on :attr:`review_panel`'s terms and then some: interpreting
+    #: a layer would mean this board learning the resolution ORDER as well as the
+    #: vocabulary, and a second implementation of "which file answered" is the
+    #: drift #305 was filed over rather than a convenience.
+    #:
+    #: NULL = the panel did not say. Every run recorded before this column — and
+    #: unlike :attr:`review_panel`, NOT the skip and refusal paths: those never
+    #: apply a review policy but they certainly resolve one, and the panel sends
+    #: this on every exit for exactly that reason.
+    #: **Deferred**, on :attr:`unread_files`' argument and for a sharper version of
+    #: it. This is the largest column on the table — ``reviews.MAX_RULES_CHARS`` is
+    #: two orders above the bound on :attr:`review_panel` beside it — and no list
+    #: view publishes it, so a ``GET /reviews?limit=500`` that fetched it would have
+    #: Postgres ship five hundred configuration records to the app to serialise none
+    #: of them. Async SQLAlchemy cannot lazy-load, so reading ``run.rules`` off a run
+    #: this session did not undefer raises ``MissingGreenlet``; ``GET /review/{id}``
+    #: asks with ``undefer()`` and nothing else should need to.
+    rules: Mapped[dict[str, Any] | None] = mapped_column(JSONB, deferred=True)
+    #: How much of the fix range the round declined to attribute because the cycle
+    #: had already seen it (#559, stored by #647): ``count`` and ``files`` (a
+    #: count, not a list of paths), the ``rounds`` it compared against, the
+    #: ``unread`` rounds it could not read, and ``why`` where the comparison could
+    #: not be made at all.
+    #:
+    #: The working behind :attr:`provenance_counts`, which is the answer. This is
+    #: the filter that moves ``introduced``, so a threshold fitted across rounds
+    #: where it ran and rounds where it did not is a threshold fitted to a
+    #: denominator that changed underneath it.
+    #:
+    #: **Opaque JSON.** A board that read a key out of here would be a second
+    #: implementation of #559's filter, free to disagree with the panel about the
+    #: same round — which is what ``m6bc45ff1`` refuses for :attr:`converged`.
+    #:
+    #: NULL = the question did not arise. Outside a cycle, and in round 2, whose
+    #: only prior round IS the anchor. Not the same as a round that looked for
+    #: restored lines and found none, which sends a ``count`` of 0.
+    provenance_restored: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     changed_lines: Mapped[int | None] = mapped_column(Integer)
     #: GitHub's own count of the PR's changed files (v2.23), stored beside the
     #: rows in :class:`ReviewRunFile` rather than derived from them. When the two
