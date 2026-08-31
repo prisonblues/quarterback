@@ -75,6 +75,7 @@ DIALS = {
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
+    "next_door_days": "DEFAULT_NEXT_DOOR_DAYS",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",
     "max_rounds": "DEFAULT_MAX_ROUNDS",
 }
@@ -244,6 +245,7 @@ BAD_VALUES = [
     ("max_fix_growth", "lots", "is not a number"),
     ("max_fix_growth_chars", "a lot", "a whole number"),
     ("reviewer_scope", "everything", "diff, repo"),
+    ("next_door_days", "soon", "a whole number of days"),
     ("require_failing_test", "sometimes", "true or false"),
     ("max_rounds", 2.5, "whole number of rounds >= 1"),
 ]
@@ -1295,7 +1297,16 @@ def test_no_scope_slot_survives_into_a_reviewers_prompt(scope):
     brief = panel_core.reviewer_brief(scope)
     for slot in (panel_core.REVIEWER_SCOPE_SLOT, panel_core.RELATED_CODE_SLOT):
         assert slot not in brief, f"{slot} was never substituted for scope {scope!r}"
-    assert "<<<" not in brief.replace("<<<CODE_ACCESS_BRIEF>>>", "")
+    # `NEXT_DOOR_SLOT` is the third token and is deliberately NOT swapped here:
+    # `panel.prompt_for` fills it AFTER its `.format`, because the block is built
+    # from model-authored finding titles and a brace in one would otherwise be
+    # read as a format field (#508). So the assertion for it is the opposite of
+    # the two above — it must still be present, or the fill lands nowhere and no
+    # round is any the wiser.
+    assert panel_core.NEXT_DOOR_SLOT in brief
+    survivors = (brief.replace("<<<CODE_ACCESS_BRIEF>>>", "")
+                      .replace(panel_core.NEXT_DOOR_SLOT, ""))
+    assert "<<<" not in survivors
 
 
 def test_the_two_briefs_still_take_the_same_format_keys():

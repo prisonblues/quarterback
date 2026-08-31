@@ -8,7 +8,8 @@ set +e  # Don't exit on errors — try all cleanup steps
 #   --config <path>      Config file path (default: .worktree.json in repo root)
 #   --keep-branch        Don't delete the git branch
 #   --keep-db            Don't drop the isolated database
-#   --force              Tear down even if another live agent holds the worktree
+#   --force              Tear down even if another live agent holds the worktree,
+#                        or the branch carries commits its PR never took
 #   --keep-claim         Don't hand back the board claim on the issue this
 #                        worktree's branch names (#337)
 
@@ -347,6 +348,67 @@ if [[ -d "$WORKTREE_DIR" && "$FORCE" != true ]]; then
   unreachable board."
     fi
 fi
+
+# ============================================
+# IS THERE WORK ON THE BRANCH THE PR NEVER TOOK?
+# ============================================
+# Deleting the branch is the step that actually loses commits, and the commits
+# most at risk are the ones added AFTER the PR was opened AND never pushed — the
+# post-merge tweak that exists in exactly one place. Three were found sitting in
+# reapable worktrees here.
+#
+# The test is deliberately base-independent. Comparing against the default branch
+# is the obvious check and it is wrong wherever PRs do not target it: lexray
+# merges into `fca` and `test` while `main` sits frozen, so `git branch --merged
+# main` calls every branch unmerged. The PR's own head SHA is the honest
+# waterline — anything past it is work the PR never carried.
+#
+# Best-effort and advisory: no gh, no network, no PR, or an object we do not have
+# locally all mean "cannot tell", and cannot-tell must never block a teardown.
+# --force and --keep-branch both skip it, the latter because a kept branch keeps
+# its commits.
+# Sets PR_HEAD and PR_POST_PR rather than echoing: command substitution would
+# run this in a subshell and drop PR_HEAD on the floor, leaving the refusal
+# unable to show what it is protecting.
+# >>> post-pr-guard
+PR_HEAD=""
+PR_POST_PR=""
+post_pr_commits() {
+    local repo="$1" branch="$2"
+    PR_HEAD=""; PR_POST_PR=""
+    command -v gh >/dev/null 2>&1 || return 1
+    PR_HEAD=$(cd "$repo" && timeout 20 gh pr list --head "$branch" --state all \
+                --json headRefOid -q '.[0].headRefOid' 2>/dev/null) || return 1
+    [[ -n "$PR_HEAD" ]] || return 1
+    # An absent object makes `git log a..b` fail, and a bare `| wc -l` would read
+    # that as 0 — "nothing to lose" on precisely the branch we cannot vouch for.
+    git -C "$repo" cat-file -e "$PR_HEAD" 2>/dev/null || return 1
+    # `--not --remotes` is what makes this about LOSS rather than tidiness:
+    # `remove-worktree` only ever deletes the local branch, so a commit that is
+    # already on some remote survives it. Refusing those would block the reaping
+    # this guard exists alongside, for work that is in no danger. A stale
+    # remote-tracking ref makes this over-refuse, which is the safe direction.
+    PR_POST_PR=$(git -C "$repo" log --oneline "$PR_HEAD".."$branch" \
+                   --not --remotes 2>/dev/null | wc -l) || return 1
+    return 0
+}
+
+if [[ "$FORCE" != true && "$KEEP_BRANCH" != true && -n "$RESOLVED_BRANCH" ]]; then
+    # `git -C` throughout: a bare `cd` here would silently relocate every step
+    # that follows.
+    post_pr_commits "$MAIN_REPO" "$RESOLVED_BRANCH" || PR_POST_PR=""
+    if [[ -n "$PR_POST_PR" && "$PR_POST_PR" -gt 0 ]]; then
+        echo "" >&2
+        git -C "$MAIN_REPO" log --oneline "$PR_HEAD".."$RESOLVED_BRANCH" \
+            --not --remotes 2>/dev/null \
+            | sed 's/^/    /' >&2
+        die "Branch $RESOLVED_BRANCH has $PR_POST_PR commit(s) its PR never carried (above).
+  Deleting the branch would be their only copy's last stop.
+  Push them, or re-run with --keep-branch to drop just the worktree,
+  or --force if you have looked and do not want them."
+    fi
+fi
+# <<< post-pr-guard
 
 echo -e "${GREEN}Removing worktree for branch: $BRANCH_NAME${NC}"
 echo -e "  Main repo: $MAIN_REPO"

@@ -154,7 +154,7 @@ import panel_timing               # noqa: F401
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
 # the two saying it differently is how the three checks in #96 came to disagree.
-from preland import board_get, mergeability   # noqa: E402
+from preland import board_config, board_get, board_request, mergeability   # noqa: E402
 # #274's one door, and #279's escalation list read back through it.
 from needs_human import announce, digest as nh_digest   # noqa: E402
 
@@ -372,6 +372,119 @@ def _age_of(ts: object) -> str:
         # out as "1 hour ago" on one machine and "2 hours ago" on the next.
         when = when.replace(tzinfo=timezone.utc)
     return _ago(max(0.0, (datetime.now(timezone.utc) - when).total_seconds()))
+
+
+#: What `GET /review/next-door` calls the hint list (#508). Named for the reason
+#: :data:`NEEDS_HUMAN_KEYS` is: two things read it, the fetch below and the note
+#: it writes when a board is too old to publish it.
+NEXT_DOOR_KEY = "hints"
+
+#: What a board that does not serve #508 answers — **422, and NOT 404.**
+#:
+#: The obvious guess is 404, and taking it costs a real diagnostic. `GET
+#: /review/{run_id}` is declared on the same prefix with an `int` path parameter,
+#: so on a board predating this endpoint the path falls through to it,
+#: `next-door` fails that validation, and FastAPI answers **422**. That is what
+#: the live board really returned the day this was written. It reads like "your
+#: request was malformed" and means "this board is older than the feature".
+#:
+#: **404 is therefore NOT absence, and treating it as absence hides a real
+#: answer.** `/review/next-door` raises 404 itself, for one specific and
+#: reportable thing: no run of this PR ever recorded a changed-file list, so the
+#: board cannot tell what this PR touches and has nothing to look for. Folded in
+#: with "old board" that becomes silence, and the round loses the one sentence
+#: that explains why its reviewers were told nothing — while `{run_id}` guarantees
+#: no board with a `/review` prefix can 404 for route absence anyway.
+#:
+#: The 422 branch is a CAPABILITY answer and is silent, on the distinction
+#: `preland.check_queue` draws for its own 404 and the reason `board_request`
+#: returns the status at all: a round is not less correct without hints, and a
+#: note on every round of every PR is a note that gets trained away.
+#:
+#: A 422 from a board that DOES have the route would mean the parameters were
+#: refused, and the only parameter this sends that could be is `days` — clamped
+#: to `NEXT_DOOR_DAYS_MAX` before it leaves, precisely so this branch cannot
+#: swallow a real one. That is an assumption about validation this code controls,
+#: and it is written down here so the next parameter added is checked against it.
+NEXT_DOOR_ABSENT = (422,)
+
+#: The board answered, and the answer is about THIS PR rather than about the
+#: board: no run of it recorded a changed-file list. Reported, because it is
+#: actionable in a way "the board is old" is not — it means this PR has never been
+#: panelled with file recording, and the fix is a round, not an upgrade.
+NEXT_DOOR_NO_FILES = 404
+
+
+def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict], str]:
+    """`(defects confirmed next door, why there are none)` for this PR (#508).
+
+    The read half of #508. `finding_recurrence` chains a finding to earlier rounds
+    of its own PR; this asks the board the question that measurement cannot reach —
+    *what did a panel confirm on ANOTHER pull request, this week, in a file this
+    diff touches?* — and hands the answer to the seats as context.
+
+    `days == 0` is the dial's off position and returns "" as the reason, not an
+    error: a round that was told not to look has not failed to find anything. It
+    makes no board call at all, so switching the dial off costs nothing and cannot
+    fail.
+
+    **An error returns no hints and SAYS SO, and the difference from
+    :func:`board_escalations` is worth stating because it looks like the same
+    shape and is not.** There, a silent empty list lets a round count an escalated
+    finding as clearable, so absence is dangerous. Here absence is merely a round
+    that reviews the way every round did before #508 — the hints are a hint, and
+    nothing downstream is less correct without them. The note is still reported,
+    because a repo that switched this on and sees nothing in its prompts is owed
+    the reason, and because "the board is unreachable" is worth knowing on a round
+    that is about to make several other board calls. It must never become a
+    veto, a coverage gap, or anything a stop rule reads.
+    """
+    if days <= 0:
+        return [], ""
+    # A host on NO board is silent, and only that one. `board_request` reports an
+    # unresolvable config as an ordinary error with no HTTP status, so without
+    # this check a box that never had `QUARTERBACK_BASE_URL` set lands on the
+    # `if err:` arm below and gets a `config_notes` line on every round of every
+    # pull request — published as a public comment under `--post`. That is the
+    # note-that-gets-trained-away failure `NEXT_DOOR_ABSENT` exists to avoid, and
+    # `harness_rules._dial_body` already draws this exact line on this exact
+    # evidence: no URL is "this box is on no board" and is silent; a URL that
+    # resolves but a board that will not answer — a bad token included — is a
+    # MISCONFIGURED host that IS enrolled, and its operator is owed the sentence.
+    if not board_config()[0]:
+        return [], ""
+    body, err, code = board_request("review/next-door",
+                                    {"repo": gh_repo, "pr": pr_number, "days": days,
+                                     "limit": NEXT_DOOR_MAX})
+    if code in NEXT_DOOR_ABSENT:
+        # Silent, deliberately. See `NEXT_DOOR_ABSENT`: this is a board older than
+        # the feature, which is the ordinary state of a fleet mid-rollout and not
+        # a fault anybody can act on.
+        return [], ""
+    if code == NEXT_DOOR_NO_FILES:
+        return [], ("next-door context: the board has no changed-file list for "
+                    f"{gh_repo}#{pr_number}, so it could not look for defects "
+                    "confirmed in these files on other PRs")
+    if err:
+        return [], (f"next-door context: {err} — this round's reviewers were not "
+                    "told what was confirmed in these files on other PRs")
+    if not isinstance(body, dict):
+        return [], ("next-door context: the board answered /review/next-door "
+                    f"with a {type(body).__name__}, not an object")
+    hints = body.get(NEXT_DOOR_KEY)
+    if hints is None:
+        # NOT the capability case, which is the whole reason this branch says
+        # something rather than nothing. A board older than #508 has no such
+        # endpoint and answers 404 or 422, and `NEXT_DOOR_ABSENT` above has
+        # already swallowed both in silence; reaching HERE means the endpoint
+        # answered and then omitted the field, which no shipped version does.
+        # Reported plainly rather than guessed at.
+        return [], ("next-door context: the board answered /review/next-door "
+                    f"with no `{NEXT_DOOR_KEY}`")
+    if not isinstance(hints, list):
+        return [], (f"next-door context: `{NEXT_DOOR_KEY}` came back as a "
+                    f"{type(hints).__name__}, not a list")
+    return [h for h in hints if isinstance(h, dict)], ""
 
 
 def announce_escalations(payload: dict, cfg: dict) -> list[str]:
@@ -2780,6 +2893,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "diff rather than the other way round — a seat with an assertion and no "
             "evidence is worse off than one with a short diff")
 
+    # #508's next-door hints, fetched once for the round and rendered once. A
+    # MANIFEST round asks for none and is given none: its whole instruction is
+    # "do not review the moved code", and a list of defects confirmed in these
+    # files is an invitation to do exactly that. `MOVE_MANIFEST_PROMPT` carries no
+    # `NEXT_DOOR_SLOT` either, so the swap below is a no-op there twice over —
+    # belt and braces, because the two templates are selected by one ternary and
+    # the next slot added here will be added by somebody reading this line.
+    next_door: str = ""
+    if pre.verdict != "manifest":
+        hints, next_door_why = board_next_door(gh_repo, pr_number,
+                                               dials.next_door_days)
+        if next_door_why:
+            notes.append(next_door_why)
+        next_door = next_door_brief(hints)
+        if next_door:
+            notes.append(next_door_note(hints))
+
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
         # `fit_argv_budget` takes this as a single-arg render, and antigravity is
@@ -2801,10 +2931,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # under that header and above the evidence it is to be tested against. A
         # sixth format key would also have to be added to two templates and a
         # manifest prompt in a module this change does not touch.
+        #
+        # `.format` FIRST, then the slot swap — the ordering `panel_rounds` uses
+        # for `JUDGE_CODE_SLOT`, and here it is load-bearing rather than tidy.
+        # `next_door` is built from model-authored finding titles, so a reviewer
+        # who once wrote a brace into a title would make `.format` raise KeyError
+        # on an unrelated round months later. Substituted after the render, that
+        # text is never scanned for fields. The token survives the `.format`
+        # untouched because it contains no braces of its own.
+        #
+        # COUNT 1, not a global replace, and it is the price of swapping after the
+        # render: by then `{diff}` is filled, so the reviewed diff is part of the
+        # string being rewritten. This repo's own `panel_core.py` holds the
+        # `NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"` assignment and the token appears in
+        # `REVIEW_PROMPT` and in two test files, so a PR touching any of them puts
+        # the literal token in its own diff — and an unbounded replace rewrites it
+        # there. On the common path (`next_door == ""`) the seat is then shown
+        # `NEXT_DOOR_SLOT = ""`, code that does not exist, and is well placed to
+        # report a P1 about it. The template carries the token exactly once and it
+        # sits ahead of `{diff}`, so the first occurrence is always the slot. #550's
+        # claim block does not change that: it rides INSIDE the `{diff}` slot, so a
+        # PR whose own title or body quotes the token still quotes it after the
+        # template's, and the bounded replace still lands on the template's.
         return (brief if reads_code else brief_blind).format(
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text, diff=claim + review.material(budget)[0],
-                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF)
+                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
+                        ).replace(NEXT_DOOR_SLOT, next_door, 1)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say

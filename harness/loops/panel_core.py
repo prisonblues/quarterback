@@ -295,6 +295,28 @@ DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
 #: What a reviewer is asked to look for: defects in the change (`diff`), or in the
 #: change and everything it touches (`repo` — the pre-#165 posture).
 DEFAULT_REVIEWER_SCOPE = "diff"
+#: How far back a next-door hint may be drawn from, in days, and `0` to send none
+#: (#508). Seven, matching the board's own default, because the signal this carries
+#: decays fast: the measured case is a defect shape confirmed in one PR and shipped
+#: in another ONE HOUR later, and a confirmed finding from six weeks ago in a file
+#: that has since been rewritten is noise wearing the same clothes.
+#:
+#: A dial rather than a constant because the block costs prompt budget on every
+#: round of every PR, and the seat it costs most is the one that cannot read a
+#: prompt off stdin. `0` is the whole off switch: no board call, no slot fill, and a
+#: prompt byte-identical to the pre-#508 one.
+DEFAULT_NEXT_DOOR_DAYS = 7
+#: The widest window `GET /review/next-door` will accept, mirrored here so the dial
+#: cannot ask for one the board refuses. Ten years, i.e. "everything this board
+#: holds".
+#:
+#: Mirrored rather than discovered, because the alternative is worse in the one
+#: direction that matters: a repo writing `next_door_days: 5000` would send
+#: `days=5000`, the board would answer **HTTP 422**, and the round would get a note
+#: and no hints — the operator having asked for a WIDER window and silently
+#: received none. A duplicated constant that drifts costs a note; the version
+#: without it costs the feature.
+NEXT_DOOR_DAYS_MAX = 3650
 REVIEWER_SCOPES = ("diff", "repo")
 #: May a fixer answer "real, and not this change's job"? See `harness_rules`.
 DEFAULT_FIXER_MAY_DEFER = True
@@ -509,6 +531,73 @@ REVIEWER_SCOPE_SLOT = "<<<REVIEWER_SCOPE>>>"
 #: it likes.
 RELATED_CODE_SLOT = "<<<RELATED_CODE>>>"
 
+#: Where #508's next-door hints land in the reviewer's brief. A literal token
+#: swapped with `str.replace`, for the reason :data:`JUDGE_CODE_SLOT` is one and
+#: then some: `REVIEW_PROMPT` is rendered by `.format()` in `panel.py`, and this
+#: block is built from **model-authored finding titles**, so a `{}` field would
+#: turn every stray brace a reviewer ever wrote into a `KeyError` on a round that
+#: has nothing to do with it. The swap therefore happens AFTER the `.format`, the
+#: way `panel_rounds` swaps :data:`JUDGE_CODE_SLOT` after rendering the judge —
+#: the token survives `.format` untouched because it contains no braces.
+#:
+#: Swapped for the empty string whenever there is nothing next door, which is the
+#: common case, so a round with no hints sends a prompt BYTE-IDENTICAL to the one
+#: it has always sent. Same discipline as :data:`JUDGE_RECURRENCE_SLOT`, and it
+#: exists so that comparing two rounds is not also comparing two prompts.
+#:
+#: It sits on a line of its own and the brief supplies its own trailing newline,
+#: so an empty fill leaves no blank paragraph behind.
+NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"
+
+#: The heading of a rendered next-door block, and the sentence that keeps it a
+#: hint. Split out as a constant because two things must agree on it: the
+#: renderer, and the test that asserts a hint cannot be reported unaltered.
+NEXT_DOOR_HEADING = "CONFIRMED NEXT DOOR — context, not findings"
+
+#: The instruction that asks for the one property #508 wants kept: *a hint cannot
+#: become a finding on its own*.
+#:
+#: **It is an instruction and not a mechanism, and the difference is worth saying
+#: plainly** — an earlier draft of this comment called it "the enforcement", which
+#: is the exact substitution #183 is about. Nothing downstream checks that a
+#: finding cites a line in this diff, carries evidence independent of the hint, or
+#: differs from the text the seat was shown. A seat that copies a hint back
+#: produces a finding nothing here can tell from a found one. What this paragraph
+#: buys is that the instruction is at least present, unambiguous and adjacent to
+#: the list; what it does not buy is any assurance that it was followed.
+#:
+#: :func:`_one_line` is the part that IS mechanical, and it is deliberately narrow:
+#: it removes the structural attack (a hint forging a bullet or occupying a line of
+#: its own), not the semantic one.
+#:
+#: The failure it guards against is specific and cheap to fall into: a reviewer
+#: handed "this was confirmed an hour ago in this file" reports it back as its
+#: own finding without checking, the judge confirms it, and the next round's
+#: hints include it. The chain then eats its own tail and a seat is rewarded for
+#: repeating what it was told. So the block says, in order, what the lines are,
+#: what they are not, and what the seat must do before any of them may appear in
+#: its reply.
+_NEXT_DOOR_BRIEF = """{heading}. These defects were confirmed by a panel on OTHER pull
+requests in this repository, recently, in files THIS diff also touches. They are given to you
+because a defect shape that just landed next door is the one most likely to be in front of you
+and the least likely to be noticed — an agent copying an ordering out of a shared helper ships
+the same bug in the same file an hour later, and that is a real measurement on this repo, not a
+hypothetical.
+
+They are NOT findings about this diff, and NOT a checklist to report back. Nobody has looked for
+any of them here. Each one may be irrelevant, already handled, or about code this change does not
+contain.
+
+**Report one ONLY if you find it yourself in the material below, and describe it as you found it
+here — the file and line in THIS diff.** Never cite a line below as evidence, never report one
+because it is listed, and if the same shape is genuinely absent from this change, say nothing
+about it at all. A finding that exists only because it was listed here is a false positive with a
+citation, and it is worse than a missed defect: it survives review.
+
+{lines}
+
+"""
+
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
 senior reviewer whose bar is "nothing left to improve". Report EVERYTHING you spot, across every
 dimension below — do NOT self-censor a finding because it seems "minor" or "just style". A later
@@ -516,7 +605,7 @@ master judge filters false positives; your job is breadth, not triage.
 
 <<<REVIEWER_SCOPE>>>
 
-Review for:
+<<<NEXT_DOOR>>>Review for:
 - Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
 - Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
 - Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
@@ -603,6 +692,164 @@ def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE, reads_code: bool = True)
         para = _REPO_SCOPE_NO_TOOLS
     return (REVIEW_PROMPT.replace(REVIEWER_SCOPE_SLOT, para)
             .replace(RELATED_CODE_SLOT, related))
+
+
+#: How many next-door hints a round will actually send, whatever the board is
+#: willing to serve. `GET /review/next-door` caps at 20 and takes a `limit`; this
+#: is smaller because the two caps answer different questions. The board's bounds
+#: a *response*; this bounds a **reviewer's attention**, which is the scarce thing
+#: — every line here is a line not spent on the diff, and #508 asks for "a handful
+#: of lines in a prompt, not a second review". Eight is a handful.
+NEXT_DOOR_MAX = 8
+
+
+#: The longest a hint's title may be in a prompt, and the longest its detail.
+#: The board caps `detail` too; this caps both again for `NEXT_DOOR_MAX`'s reason —
+#: the far cap bounds a response and this one bounds a reviewer's attention, and a
+#: caller trusting only the far one is trusting a number it does not control.
+NEXT_DOOR_TITLE_CHARS = 200
+NEXT_DOOR_DETAIL_CHARS = 400
+
+#: Anything that could end a hint's line or start a new one. Collapsed to a single
+#: space by :func:`_one_line`.
+_HINT_BREAK = re.compile(r"\s+")
+#: Control characters, which no finding title has a use for and which can move a
+#: terminal's cursor or a model's attention. Deleted rather than escaped.
+_HINT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: object, cap: int) -> str:
+    """Untrusted text flattened to ONE line and cut to `cap`.
+
+    **The thing this prevents is not a crash.** A hint's title and detail are
+    written by the reviewers of OTHER pull requests — model output, quoted into a
+    prompt that instructs a model. Interpolated raw, a title carrying newlines
+    escapes its bullet and becomes free text at the same indent as the brief above
+    it, so it can:
+
+    * emit a line of its own that reads as an instruction ("IGNORE THE ABOVE …"),
+      arriving inside a block whose whole purpose is to be read as instruction;
+    * forge further `- P1 file:line — …` bullets **indistinguishable from the real
+      ones**, since the renderer is the only thing that knows how many there were.
+
+    That is prompt injection with a short path: any seat on any PR can write the
+    payload into a finding title, the judge confirms the finding for unrelated
+    reasons, and it is quoted at every PR touching that file for the next week. It
+    needs no attacker either — a legitimate multi-line detail mangles the block on
+    its own.
+
+    So the text is flattened, not escaped: a hint is one line by construction, and
+    a title that wanted two was already wrong. Control characters go entirely.
+    Truncation says so, for `_cut_detail`'s reason on the board side — a sentence
+    ending mid-clause reads to a model as the sentence.
+
+    Not a claim to have solved prompt injection. It removes the structural half —
+    a hint can no longer forge a bullet or occupy a line of its own — and what
+    remains is one bounded, clearly-attributed span of prose inside a bullet, which
+    is the same exposure the diff itself already carries.
+    """
+    flat = _HINT_BREAK.sub(" ", _HINT_CONTROL.sub("", str(text or ""))).strip()
+    if len(flat) <= cap:
+        return flat
+    return flat[:cap].rstrip() + "…"
+
+
+def _hint_line(h: dict) -> str:
+    """One hint as one line, with the evidence to check it and nothing else.
+
+    Deliberately terse and deliberately complete: the PR number and the age are
+    what let a reviewer decide the line is stale or irrelevant WITHOUT taking it
+    on trust, and a hint a reviewer cannot dismiss on its own evidence is one it
+    will report to be safe.
+    """
+    # The path is flattened with everything else: it is a string off the wire, and
+    # "no path has a newline in it" is an assumption rather than a guarantee.
+    where = _one_line(h.get("file"), NEXT_DOOR_TITLE_CHARS) or "?"
+    line_no = h.get("line")
+    # `isinstance` rather than truthiness: a line number arriving as "3\n- P1 …"
+    # would otherwise be formatted straight into the bullet, which is the same
+    # escape by a quieter door.
+    if isinstance(line_no, int) and not isinstance(line_no, bool) and line_no > 0:
+        where = f"{where}:{line_no}"
+    age = h.get("age_hours")
+    when = f"{age:g}h ago" if isinstance(age, int | float) else "recently"
+    # `fixed` is worth saying and the rest are not: it means somebody confirmed
+    # this AND acted on it, which is the strongest form the hint takes. A bare
+    # `deferred` or `superseded` would read as a verdict on THIS diff, which is
+    # the one thing the block must never imply.
+    fixed = " and fixed there" if h.get("outcome") == "fixed" else ""
+    # A severity outside the vocabulary is not echoed. `SEVERITIES` is a closed set
+    # and anything else is either drift or a payload; `P?` says "the board sent
+    # something this does not recognise" without quoting it.
+    sev = h.get("severity") if h.get("severity") in SEVERITIES else "P?"
+    pr = h.get("pr")
+    pr_txt = pr if isinstance(pr, int) and not isinstance(pr, bool) else "?"
+    title = _one_line(h.get("title"), NEXT_DOOR_TITLE_CHARS) or "(untitled)"
+    line = (f"- {sev} {where} — {title} "
+            f"[confirmed on PR #{pr_txt} {when}{fixed}]")
+    detail = _one_line(h.get("detail"), NEXT_DOOR_DETAIL_CHARS)
+    if detail:
+        line += f"\n    {detail}"
+    return line
+
+
+def next_door_brief(hints: list[dict]) -> str:
+    """#508's block for :data:`NEXT_DOOR_SLOT`, or `""` when there is nothing.
+
+    The empty return is the important one and is not a degenerate case: most
+    rounds have no confirmed finding next door, and on those the slot is swapped
+    for nothing at all, leaving the reviewer prompt byte-identical to the one this
+    panel has always sent. A block saying "no recent findings nearby" would be a
+    new sentence on every round in exchange for no information — and it would make
+    every round's prompt differ from every archived round's.
+
+    Capped at :data:`NEXT_DOOR_MAX` here as well as at the board, because the two
+    caps are different promises and a caller that trusted only the far one would
+    be trusting a number it does not control.
+    """
+    rows = [h for h in hints if isinstance(h, dict)][:NEXT_DOOR_MAX]
+    if not rows:
+        return ""
+    return _NEXT_DOOR_BRIEF.format(heading=NEXT_DOOR_HEADING,
+                                   lines="\n".join(_hint_line(h) for h in rows))
+
+
+def next_door_note(hints: list[dict]) -> str:
+    """What this round actually SHOWED its seats, for the record (#508).
+
+    :class:`Dials` records `next_door_days` — the window the round asked through —
+    and that is the setting, not the answer. Two rounds at the same window can be
+    handed different hints an hour apart, and the block that carries them is the
+    one thing in the reviewer prompt that varies between rounds of the same PR.
+    #508 leans on the prompt being byte-identical "so that comparing two rounds is
+    not also comparing two prompts"; the moment there ARE hints that stops being
+    true, and without this line nothing in the payload says by how much or from
+    where. So the round records the count and the rival PRs it quoted — enough to
+    go and read the same findings back, and cheap enough to sit in `config_notes`.
+
+    Only the two facts that are structurally safe to print, and that is a
+    deliberate omission rather than an oversight: the note lands in `config_notes`,
+    which `--post` publishes as a PUBLIC pull-request comment, and a hint's title,
+    file and key are all model-authored text off the wire. PR numbers are `int` or
+    they are not repeated at all, so no flattening is needed and none is relied on.
+    The titles are in the prompt, which is where a reader looking for them is.
+
+    `""` when there is nothing to say, on :func:`next_door_brief`'s rule: a round
+    with no hints must add no line, or the note is on every round of every PR and
+    is the kind that gets trained away.
+    """
+    rows = [h for h in hints if isinstance(h, dict)][:NEXT_DOOR_MAX]
+    if not rows:
+        return ""
+    # `sorted(set(...))` rather than payload order: the note is read by a person
+    # comparing two rounds, and a list whose order tracks recency ranking would
+    # differ between rounds that quoted the same PRs.
+    prs = sorted({h["pr"] for h in rows
+                  if isinstance(h.get("pr"), int) and not isinstance(h["pr"], bool)})
+    where = (" from " + ", ".join(f"#{n}" for n in prs)) if prs else ""
+    plural = "" if len(rows) == 1 else "s"
+    return (f"next-door context: {len(rows)} confirmed finding{plural}{where} "
+            f"shown to this round's reviewers (#508)")
 
 
 MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
@@ -2599,6 +2846,10 @@ __all__ = [
     "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",
+    "NEXT_DOOR_SLOT", "NEXT_DOOR_HEADING", "_NEXT_DOOR_BRIEF",
+    "NEXT_DOOR_MAX", "_hint_line", "next_door_brief", "next_door_note",
+    "NEXT_DOOR_TITLE_CHARS", "NEXT_DOOR_DETAIL_CHARS", "_one_line",
+    "DEFAULT_NEXT_DOOR_DAYS", "NEXT_DOOR_DAYS_MAX",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",

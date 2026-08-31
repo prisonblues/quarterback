@@ -276,7 +276,34 @@ turns the merge off.
      correctly waiting for a land that already happened. It expires on its own, but a lease
      nobody released is a queue that jams for the length of its TTL.
 
-6. **Report** the outcome: implemented / reviewed / your place in the line / pre-land verdict and
+6. **Tear the worktree down — only if you merged.** A hold leaves everything standing; the branch
+   is still being worked. On a merge, this loop is the last thing that will ever run in that
+   worktree, and nothing else reaps it. `create-worktree` starts a stack per worktree — for lexray
+   an app container plus a huey consumer with four workers, 1–2 GB a pair — and every workflow that
+   says "`/drop-worktree` when the PR merges" is addressing a session that has usually ended by the
+   time the merge happens. So the instruction lands on nobody: 45 containers holding 16.7 GB
+   accumulated on zeus this way and OOM-killed the compositor on 2026-08-31.
+
+   From a fresh shell (it is already at the main checkout, which is what `git worktree remove`
+   needs), using the create-name — the worktree dir's suffix after `<project>-`:
+
+   ```bash
+   remove-worktree "$CREATE_NAME"
+   ```
+
+   That drops the containers, the nginx block, the isolated DB, the port entry and the directory,
+   and hands back the board claim on the issue the create-name names. Best-effort: if it refuses,
+   say so in the report and carry on — a failed teardown must not turn a successful land into a
+   failure.
+
+   - **It refuses a branch carrying commits its PR never took**, which is the guard working, not an
+     error: something was committed after the PR and deleting the branch would be its last stop.
+     Push them and re-run, or `--keep-branch` to drop only the worktree. Do **not** reach for
+     `--force` on your own initiative.
+   - **`--delete-branch` on the merge does not do this.** It deletes the remote branch; the
+     worktree, its containers and its DB are all still here. See the hazard below.
+
+7. **Report** the outcome: implemented / reviewed / your place in the line / pre-land verdict and
    any actions taken / merged-or-held, and the confidence reasoning. Quote the verdict; do not
    paraphrase it. A stand-down says its position and what it is waiting on; a proceed says it
    checked and found the line clear. Neither is allowed to be silent about the queue — a stop

@@ -452,6 +452,37 @@ def _no_board_reads(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_next_door_fetch(monkeypatch):
+    """No test asks a real board what was confirmed next door (#508).
+
+    Autouse and unconditional, on `_no_escalation_posts`' rule and for exactly its
+    failure mode: `board_next_door` runs on EVERY round, resolves the board out of
+    this HOST's site config, and on an enrolled machine therefore makes a live HTTP
+    call per round — while the header of this file says in capitals that the suite
+    does not talk to a board. In the nix sandbox there is no board and nothing
+    happens, which is why CI would never have found it.
+
+    It was not found by reading, either. It surfaced as four unrelated e2e panel
+    tests going red on an assertion about `config_notes` being empty, because the
+    live board answered 422 (it predates the endpoint) and the round dutifully
+    reported that it could not fetch. A leak that announces itself in somebody
+    else's assertion is the good case; the same call succeeding against a real
+    board would have made these tests mean different things on two machines, which
+    is the leak this whole file exists to close.
+
+    Stubbed at `board_next_door` rather than at `board_request` so that the reason
+    a round has no hints is "nothing was asked", not "the board said no" — the
+    second would put a note in every report and change what the e2e tests assert.
+
+    `test_panel_next_door.py` is the file this would blind, and it restores the
+    real function explicitly (`_the_real_fetch`) rather than opting out: a test of
+    this function that silently ran against the stub would assert on `([], "")` and
+    pass whatever the function did.
+    """
+    monkeypatch.setattr(panel, "board_next_door", lambda *a, **k: ([], ""))
+
+
+@pytest.fixture(autouse=True)
 def recorded_runs(monkeypatch):
     """No test records a real run on a real board (#94), and here is the list of
     what it would have recorded.
