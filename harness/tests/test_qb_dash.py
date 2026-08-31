@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -42,6 +43,34 @@ def _load_app():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+@pytest.fixture(autouse=True)
+def _no_real_browser(monkeypatch):
+    """The module docstring's promise, enforced rather than remembered.
+
+    "With the browser and tmux calls stubbed" was already written at the top of
+    this file when a test spent every run of the suite on a real `xdg-open` of
+    another repo's PR — the convention was there, only nothing checked it. A
+    test that reaches the launcher now fails loudly and names itself, which is
+    the difference between a tab a person cannot trace and a red test.
+
+    NARROW ON PURPOSE, and a pass-through for everything else: `Popen` is how
+    the harness talks to `git` and to a private tmux server, and several tests
+    here mean to. Only `xdg-open` — the one target that escapes the machine and
+    lands on somebody's screen — is refused.
+    """
+    real_popen = subprocess.Popen
+
+    def guarded(args, *rest, **kwargs):
+        argv = args if isinstance(args, (list, tuple)) else [args]
+        if argv and str(argv[0]) == "xdg-open":
+            raise AssertionError(
+                f"a test reached the real browser: xdg-open {' '.join(map(str, argv[1:]))}. "
+                "Stub `app.open_url` — a suite that opens Chrome is its own bug.")
+        return real_popen(args, *rest, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", guarded)
 
 
 # TWO conditions, and keeping them apart is what lets any of this run in CI.
@@ -3132,13 +3161,33 @@ async def _drive_a_watched_repos_pr() -> list[str]:
     app.run_in_pane = lambda name, command: started.append((name, command))
     app.run_in_window = lambda name, command: started.append((name, command))
 
+    # AND THE BROWSER, which is the other thing a click on this row can reach.
+    # A dim ⚖ falls through to "say what the row is", and for a PR row that is
+    # `open_pr` — so an unstubbed `open_url` here spends every run of this suite
+    # on a real `xdg-open` of another repo's PR. That tab is the test's own
+    # doing, and once the fleet ran this suite in parallel worktrees it arrived
+    # on a person's screen every few minutes with nothing to say why.
+    #
+    # STUBBED AT `open_url` rather than lower, so `open_pr` still runs and the
+    # URL it builds is still the thing asserted below. A stub on `open_pr`
+    # would prevent the tab and stop covering the `/pull/<number>` it names.
+    opened: list[str] = []
+    app.open_url = lambda url: opened.append(url)
+
     failures: list[str] = []
     async with app.run_test(size=(100, 44)):
         app.render_prs(_TWO_REPOS_PRS, None)
         for rk in list(app.query_one("#work").rows):
             row = app.rows[str(rk.value)]
             named = f"{row['repo']}{row['ref']}"
+            # What the fall-through must reach: THIS row's PR, not merely
+            # something with this row's repo in it. `open_pr` builds it the same
+            # way, so the assertion pins the URL construction as well as the
+            # routing — a number taken from the wrong record still reads as the
+            # right repo, and that is the confusion the whole test is about.
+            expected = f"https://github.com/{row['repo']}/pull/{row['pr']['number']}"
             started.clear()
+            opened.clear()
             app.detail_text = ""
             app.dispatch_row(str(rk.value), column=app_module.Dash.VERB_COLUMN)
             if row["repo"] == app.repo_slug:
@@ -3146,14 +3195,19 @@ async def _drive_a_watched_repos_pr() -> list[str]:
                     failures.append(
                         "⚖ on this dashboard's OWN PR started nothing — the guard "
                         f"is refusing everything, not just another repo's ({app.detail_text})")
+                elif opened:
+                    failures.append(
+                        f"⚖ on {named} started the review and ALSO opened {opened!r} — "
+                        "the verb acted, so the row should not have fallen through")
             elif started:
                 failures.append(
                     f"⚖ on {named} launched {started[0][1]!r} — a paid review, in "
                     f"{app.repo_slug}, of whatever wears that number there")
-            elif row["repo"] not in app.detail_text:
+            elif opened != [expected]:
                 failures.append(
-                    f"⚖ on {named} refused but said {app.detail_text!r} — a dim icon "
-                    "that swallows the click is indistinguishable from a broken one")
+                    f"⚖ on {named} refused but opened {opened!r}, not [{expected!r}] — "
+                    "a dim icon that swallows the click is indistinguishable from a "
+                    "broken one, and the one it does not swallow must be its own")
     return failures
 
 
