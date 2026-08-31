@@ -72,7 +72,10 @@ def test_a_narrowed_finding_does_not_buy_another_round():
     assert panel.round_stop(2, 5, [], [c], [], repeated=[c.key])["stop"] is False
     d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key], narrowed=[c.key])
     assert d["stop"] is True
-    assert "dry" in d["reason"]
+    # And it says WHY, in its own words. Not "dry": see the section on the reason
+    # below, which is the whole of what this stop may not borrow.
+    assert "answered at the point they were raised" in d["reason"]
+    assert "dry" not in d["reason"]
 
 
 def test_it_clears_rather_than_merely_stopping_the_finding_counting():
@@ -141,6 +144,104 @@ def test_the_register_reported_is_the_one_this_ROUND_raised():
     c = judged("P2")
     d = panel.round_stop(2, 5, [], [c], [], narrowed=[c.key, STRANGER])
     assert d["narrowed"] == [c.key]
+
+
+# ------------------------------------------- the word the stop may NOT borrow
+
+def test_a_narrowing_never_lends_the_round_the_word_dry():
+    """The one thing a narrowing may not buy, and the reason it is a bug rather than a
+    wording preference. `--narrowed` is passed on the round AFTER the pass that
+    declared it, and only keys this round raised are honoured — so every narrowing
+    honoured here is a finding a fresh panel put up again after a fixer said it had
+    answered it. Reported as "dry — nothing raised that an earlier round had not",
+    that is the payload asserting the opposite of what happened, in the round where it
+    matters most: a judge-confirmed P1, raised a second time, cleared on the fixer's
+    own say-so. `quiet_repeats` earns its own reason for exactly this reason one rule
+    up, and a narrowing had none."""
+    c = judged("P1")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key], narrowed=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True
+    assert "dry" not in d["reason"]
+    assert "answered at the point they were raised" in d["reason"]
+    assert "general form declined" in d["reason"]
+
+
+def test_the_reason_counts_the_narrowings_at_or_above_the_trigger_floor():
+    """A P1 answered narrowly and a P4 answered narrowly are the same mechanism and
+    not the same news, and the reason is the only place a reader of the PR comment
+    meets either. So the count is said out loud — and it is the TRIGGER floor, the
+    dial that decides what is worth another round, because that is the question a
+    narrowing answered in the negative."""
+    loud, quiet = judged("P1"), judged("P4", "a nit", file="b.py")
+    d = panel.round_stop(2, 5, [], [loud, quiet], [],
+                         repeated=[loud.key, quiet.key],
+                         narrowed=[loud.key, quiet.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True
+    assert "2 finding(s) were answered" in d["reason"]
+    assert "1 of them at or above the P2 round trigger floor" in d["reason"]
+    # And the clause is absent rather than reading "0 of them" when nothing was
+    # above the floor: a count of zero in a sentence about severity invites the
+    # reader to look for the finding it is counting.
+    only_quiet = panel.round_stop(2, 5, [], [quiet], [], repeated=[quiet.key],
+                                  narrowed=[quiet.key], trigger_floor="P2",
+                                  cleared_floor="P4")
+    assert "round trigger floor" not in only_quiet["reason"]
+
+
+def test_a_narrowed_P1_still_keeps_its_confidence_and_still_converges():
+    """The decision, pinned so that the next reader knows it was taken rather than
+    missed (review of #631). A narrowing at any severity costs no veto line, no
+    `confident` and no `converged` — the asymmetry with `escalated`, which costs all
+    three, is the point: an escalation names work nobody has done and a human owes an
+    answer on, a narrowing names work that was done and bounded. Charging it would
+    leave a fixer's only clean way out of a cycle the class-wide fix, which is the
+    pressure #615 exists to remove. What it costs instead is the reason line above,
+    two lines of justification and a board row — a bill the caller collects."""
+    c = judged("P1")
+    d = panel.round_stop(2, 5, [], [c], [], repeated=[c.key], narrowed=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["veto"] == []
+    assert d["confident"] is True and d["converged"] is True
+    assert d["outstanding"]["handed_to"] == "nobody"
+    # The discriminator: the SAME P1, escalated instead of narrowed, pays all three.
+    e = panel.round_stop(2, 5, [], [c], [], repeated=[c.key], escalated=[c.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert e["veto"] and e["confident"] is False and e["converged"] is False
+
+
+def test_an_escalation_beside_a_narrowing_still_owns_the_reason():
+    """The chain's own rule — the most specific TRUE thing wins — applied where the
+    two outcomes meet. An open question a human owes an answer on says more about why
+    a cycle ended than an answer a fixer has already given, so the escalation keeps
+    the `reason` and the veto it always took, and the narrowing is reported in
+    `round_stop.narrowed` where it always was."""
+    held = judged("P1")
+    answered = judged("P2", "a different defect", file="b.py")
+    d = panel.round_stop(2, 5, [], [held, answered], [],
+                         repeated=[held.key, answered.key],
+                         escalated=[held.key], narrowed=[answered.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True
+    assert "escalated finding(s) await a human" in d["reason"]
+    assert d["narrowed"] == [answered.key]
+    assert d["confident"] is False
+
+
+def test_a_below_floor_stop_beside_a_narrowing_keeps_its_own_reason():
+    """The other side of the ordering, and the reason it is safe: both floor stops
+    say "reported, not fixed here", which is a true statement about work that is still
+    open and is not the word this fix is about. Nothing falls through to "dry"."""
+    quiet = judged("P4", "a nit", file="b.py")
+    answered = judged("P2")
+    d = panel.round_stop(2, 5, [quiet.key], [quiet, answered], [],
+                         repeated=[answered.key], narrowed=[answered.key],
+                         trigger_floor="P2", cleared_floor="P4")
+    assert d["stop"] is True
+    assert "none at or above the P2 round trigger floor" in d["reason"]
+    assert "dry" not in d["reason"]
+    assert d["narrowed"] == [answered.key]
 
 
 # -------------------------------- what a fixer may NOT buy with the word

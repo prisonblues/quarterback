@@ -1619,11 +1619,16 @@ def test_and_with_no_budget_that_same_repeat_is_still_work_a_fix_pass_may_take(
 
 
 def test_the_budget_is_inert_where_the_two_floors_meet(monkeypatch, capsys, tmp_path):
-    """This repo's own configuration, and it must be a no-op rather than a mis-applied
-    one. `.harness-rules.sample` has set both floors to P2 since 2026-08-20, so there
-    is no band: every finding is either unconditional or below the floor, and a budget
-    with nothing to spend it on must not mark, must not move a floor, and must not
-    change which findings a round is asked to clear."""
+    """The floors meeting, which must be a no-op rather than a mis-applied one. With
+    both at P2 there is no band: every finding is either unconditional or below the
+    floor, and a budget with nothing to spend it on must not mark, must not move a
+    floor, and must not change which findings a round is asked to clear.
+
+    Configured here rather than read off `.harness-rules.sample`, which no longer
+    answers this: it ran P2/P2 from 2026-08-20, P3/P2 from 2026-08-22, and since
+    2026-08-30 (#621) it is `fix_severity_floor: P4` with `round_trigger_floor: P2` —
+    a band two tiers wide. The invariant this pins is about the floors meeting, so it
+    names the values it means."""
     report, payload, _ = run(monkeypatch, capsys, tmp_path,
                              [finding("P2", "a race"), finding("P3", "a nit")],
                              config=cfg(fix_severity_floor="P2",

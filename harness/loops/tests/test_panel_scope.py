@@ -1067,12 +1067,12 @@ def budget_for_partial_context() -> int:
 
     It is the number that reaches `material` as well as the number a repo would write,
     which is worth saying because #550 puts the PR's own claim in the same slot and
-    charges it to the same budget. It costs nothing here: the claim block may take at
-    most a quarter of the tightest budget in the panel and is dropped whole below the
-    floor, and a budget this tight is far under it — so these rounds send no claim and
-    the assertions below are about the priority order alone. A change that made the
-    claim bite would arrive as a `config_notes` line rather than as silently shorter
-    material."""
+    charges it to the same budget. It costs nothing here, and since #631 charged the
+    JUDGE for the claim too the reason is worth spelling out: the block may take at
+    most a quarter of the budget it is charged to, and this one is far under that — so
+    the judge's rounds here send no claim and the assertions below are about the
+    priority order alone. A change that made the claim bite would arrive as a
+    `config_notes` line rather than as silently shorter material."""
     want = overhead(SCOPED) + 250 + len(INCREMENT)
     target, context = SCOPED.material(want)[1:]
     assert target == len(INCREMENT), "the budget must not cut the target"

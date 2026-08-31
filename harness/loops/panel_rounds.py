@@ -4313,6 +4313,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     escalation, which is an open question a human owes an answer to, where this is an
     answer already given.
 
+    **But the stop SAYS SO, by name.** A round whose quiet was bought by a narrowing
+    gets its own ``reason`` — never "dry", which is a claim that nothing was raised —
+    and the reason counts how many of the cleared keys were at or above the trigger
+    floor, because a P1 answered narrowly and a P4 answered narrowly are the same
+    mechanism and not the same news. The keys are repeats by construction: the flag
+    is passed on the round after the pass that declared it, and only the keys THIS
+    round raised are honoured, so every one of them is a finding a fresh panel put up
+    again after a fixer said it was answered.
+
+    **And that is the whole of the charge.** Costing ``confident`` or ``converged`` at
+    or above the trigger floor was considered on the review of #631 and declined: it
+    would leave a fixer's only way to end a cycle cleanly the class-wide fix, which is
+    the pressure this outcome exists to remove, and it would price an ANSWER as though
+    it were an open question. The asymmetry with ``escalated`` — which costs a veto,
+    ``confident`` and ``converged`` — is the point rather than an oversight: one names
+    work nobody has done, the other names work that was done and bounded. What a
+    narrowing costs is two lines of justification, a board row and, where the general
+    form is itself a claim-miss, an issue; that bill is the caller's to collect, and
+    the reason line is what tells a human there is one outstanding.
+
     **Why clearing is the point rather than a leniency.** A fixer that cannot answer a
     finding partially will answer it maximally, because the maximal answer is the only
     one that fully satisfies a brief which says "never note a problem and move on".
@@ -4936,6 +4956,41 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # something untrue about why the loop stopped.
         stop, reason = True, (f"nothing left that a fix round can clear — "
                               f"{len(blocking)} escalated finding(s) await a human")
+    elif narrowed_cleared:
+        # #615's own stop, and it is `quiet_repeats`' argument applied to the fourth
+        # outcome. A narrowing CLEARS — that is the whole of the feature and nothing
+        # here revisits it — but a round that stopped because a fix pass declared
+        # findings answered AT THE POINT THEY WERE RAISED did not stop because
+        # nothing was raised, and "dry" is the one word this payload is organised
+        # against lending to a round that was not.
+        #
+        # The keys here are repeats by construction. `--narrowed` is passed on the
+        # round that follows the pass which declared it and on no other
+        # (`panel-review-pr.md`), and `narrowed_cleared` is bounded to the keys THIS
+        # round raised — so every key in it is a finding a fresh panel put up again
+        # after the fix pass said it had answered it. Without this branch the loudest
+        # such round there is, a judge-confirmed P1 cleared on the fixer's own
+        # say-so, reported "dry — nothing raised that an earlier round had not" with
+        # `converged: True` beside it.
+        #
+        # The trigger-floor count is said OUT LOUD, because it is the one number that
+        # separates a P1 answered narrowly from a P4 answered narrowly and nothing
+        # else in the reason carries it. It costs no confidence: see the docstring —
+        # an escalation is an open question a human owes an answer to, a narrowing is
+        # an answer already given, and charging it a veto rebuilds the pressure to
+        # write the class-wide fix that #615 exists to remove.
+        #
+        # BELOW `blocking` and below the two floor stops, on the chain's own rule
+        # that the most specific TRUE thing wins: each of those names work that is
+        # still open, and an answer already given says less than an open question.
+        # Above the dry branch, which is the only one it must never fall through to.
+        loud = sorted(k for k in narrowed_cleared if above(k, trigger_floor))
+        stop, reason = True, (
+            f"nothing left that a fix round can clear — {len(narrowed_cleared)} "
+            "finding(s) were answered at the point they were raised and the general "
+            "form declined"
+            + (f", {len(loud)} of them at or above the {trigger_floor} round trigger "
+               "floor" if loud else ""))
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")

@@ -413,3 +413,64 @@ def test_a_cycle_nobody_stopped_costs_the_round_nothing(monkeypatch, capsys,
     assert payload["preflight"]["prior_cycle"] is None
     assert "already ENDED" not in report
     assert not [n for n in payload["config_notes"] if "--new-cycle" in n]
+
+
+# ------------------------------------------- the flag resets nothing, so it says so
+
+def _argv(*extra):
+    return ["panel.py", "--repo", "board", "--pr", "34", "--new-cycle", *extra]
+
+
+def _cli(monkeypatch, *extra):
+    monkeypatch.setattr(sys, "argv", _argv(*extra))
+    with pytest.raises(SystemExit) as refused:
+        panel.main()
+    return str(refused.value)
+
+
+@pytest.mark.parametrize("carried", [
+    ("--round", "3"),
+    ("--baseline", "/tmp/r1.json"),
+    ("--round", "3", "--baseline", "/tmp/r1.json", "--baseline", "/tmp/r2.json"),
+])
+def test_new_cycle_refuses_the_old_cycles_round_counter_and_baseline(
+        monkeypatch, carried):
+    """The flag READ nothing but the gate. `new_cycle` reaches three lines — the
+    refusal, its override and the banner — and touches neither `round_no` nor
+    `--baseline` nor the cycle id, while the banner it prints says its round counter,
+    its baseline and every convergence guard start from scratch and that nothing below
+    is measured against the earlier cycle.
+
+    So `--pr N --round 3 --baseline r1.json r2.json --new-cycle` walked past the
+    refusal and then measured `fix_injection`, `premise_repeated`, `max_fix_growth`
+    and the trend table against the very cycle the banner had just disclaimed. Refused
+    rather than reworded: `--round` and `--baseline` are how a caller CONTINUES a
+    cycle, and a flag that silently discarded a baseline it was handed would throw
+    away findings somebody passed on purpose."""
+    said = _cli(monkeypatch, *carried)
+    assert "--new-cycle is round 1 of a fresh cycle" in said, carried
+    assert "it does not reset anything" in said
+
+
+def test_the_three_legitimate_uses_of_the_flag_all_still_run(monkeypatch):
+    """None of them carries a round counter or a baseline: a genuinely new cycle,
+    #629's verification pass on the final capped fix — which `panel-review-pr.md`
+    forbids `--round`/`--baseline` on in as many words — and a re-review after the
+    branch moved. `--max-rounds` is how the new cycle declares its cap, and `--round
+    1` is what a caller spells explicitly; both reach `run()`."""
+    monkeypatch.setattr(panel, "run", lambda *a, **k: 0)
+    for allowed in ((), ("--max-rounds", "6"), ("--round", "1"),
+                    ("--reviewers", "claude")):
+        monkeypatch.setattr(sys, "argv", _argv(*allowed))
+        assert panel.main() == 0, allowed
+
+
+def test_the_banner_says_what_makes_the_reset_true_rather_than_asserting_it(
+        monkeypatch, capsys, tmp_path):
+    """A banner that only claims a reset is a banner a reader cannot check. It names
+    the refusal that guarantees it — a run carrying the old counter and baseline never
+    reaches here — so the sentence and the mechanism are in the same paragraph."""
+    _code, report, _payload = _round(monkeypatch, capsys, tmp_path, runs=STOPPED,
+                                     new_cycle=True)
+    assert "it is round 1, it carries no baseline" in report
+    assert "REFUSES `--round` and `--baseline`" in report

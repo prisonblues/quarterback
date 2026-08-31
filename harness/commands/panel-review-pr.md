@@ -207,9 +207,19 @@ lexray#1780's rounds 3-5 would have hit: three standalone workflows that ran on 
 round 2 stopped the cycle on `fix_injection`, each of them round 1 of its own cycle with
 none of the convergence guards connected. **`--new-cycle`** is the opt-in that starts a
 genuinely new cycle — it mints a fresh cycle rather than continuing one that was told to
-stop, resets the round counter and every guard, and puts a banner at the top of the report
-naming the round that stopped, its reason, how long ago, whether that stop was convergence
-and whether the branch has moved since.
+stop, and puts a banner at the top of the report naming the round that stopped, its
+reason, how long ago, whether that stop was convergence and whether the branch has moved
+since.
+
+**It is ROUND 1, and it takes neither `--round` (2 or more) nor `--baseline` — both are
+REFUSED.** The flag opens the gate; it does not reset anything, and there is nothing for
+it to reset that the caller does not control. A run passing the old cycle's round counter
+and baseline alongside it is a continuation whatever the banner says, and every guard —
+`fix_injection`, `premise_repeated`, `max_fix_growth`, the trend table — would go on being
+measured against the cycle the banner had just said nothing was measured against.
+`--max-rounds` is fine and is how a new cycle declares its cap; the **rounds after this
+one continue the new cycle with `--round`/`--baseline` and WITHOUT the flag**, because a
+live cycle's own rounds make the earlier stop non-terminal and the gate no longer fires.
 
 Three legitimate runs meet this refusal, and all three take `--new-cycle`:
 
