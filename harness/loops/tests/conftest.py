@@ -424,6 +424,34 @@ def _no_escalation_posts(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_board_reads(monkeypatch):
+    """No test READS a real board either, and this is the read half of the two
+    fixtures above.
+
+    `board_terminal_verdict` (#617) is called on every round, unconditionally and
+    before any gate — so every panel test that does not stub it puts an HTTPS
+    request to whatever board THIS host's site config names. On an enrolled
+    workstation that is a live board, which makes the whole suite depend on a
+    remote service being up: under `-n 8` it answers some of those requests with a
+    503, the round appends *"the board could not be asked …"* to `config_notes`,
+    and the several tests asserting `config_notes == []` go red in a different
+    combination on every run. Nothing is wrong with the code under test, and
+    nothing about the failure says so.
+
+    The answer given is `{"runs": []}` — a board that holds no recorded run for
+    this PR, which is what the live board says for the fictional repos this suite
+    uses, and which `board_terminal_verdict` reads as "no cycle ended here" in
+    silence. So the fixture changes no assertion; it only stops them depending on
+    the network.
+
+    A test about the board answers for itself: `monkeypatch` inside the test runs
+    after this and wins, which is how `test_panel_prior_cycle` drives every verdict
+    in this module.
+    """
+    monkeypatch.setattr(panel, "board_get", lambda path, params: ({"runs": []}, ""))
+
+
+@pytest.fixture(autouse=True)
 def _no_next_door_fetch(monkeypatch):
     """No test asks a real board what was confirmed next door (#508).
 

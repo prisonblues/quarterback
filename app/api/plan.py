@@ -3300,11 +3300,14 @@ async def _pr_evidence(session: AsyncSession,
     state_runs = {(r.repo.lower(), r.pr): r for r in await session.scalars(_newest())}
     runs = list(await session.scalars(_newest(ReviewRun.reviewed.isnot(False))))
     # Confirmed findings on those runs, and which of them somebody has recorded an
-    # outcome for. All four outcomes count as answered, `deferred` included: it
+    # outcome for. All five outcomes count as answered, `deferred` included: it
     # says the work was moved to an issue, which is a decision, and treating it as
     # outstanding would keep an item at the head of the plan for a finding
-    # somebody has already dealt with. NO outcome row is what counts as open —
-    # nobody has said, which is neither fixed nor refuted (v2.37).
+    # somebody has already dealt with. `narrowed` (#615) needs no argument here at
+    # all — the code changed and the finding as raised is answered — and it is
+    # covered without a code change because this reads the PRESENCE of a row and
+    # not its value. NO outcome row is what counts as open — nobody has said,
+    # which is neither fixed nor refuted (v2.37).
     confirmed: dict[int, set[str]] = {}
     if runs:
         for run_id, key in await session.execute(

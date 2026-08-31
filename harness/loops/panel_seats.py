@@ -1428,19 +1428,26 @@ def severity_floor(panel: dict, key: str, fallback: str, notes: list[str]) -> st
     return got
 
 
-def deferral_issue_floor(panel: dict, notes: list[str]) -> str:
-    """`file_deferral_issues` — one of ``SEVERITIES``, ``"always"`` or ``"never"``.
+def deferral_issue_gate(panel: dict, notes: list[str]) -> str:
+    """`file_deferral_issues` — one of ``DEFERRAL_ISSUE_WORDS`` or ``SEVERITIES``.
 
     Which deferrals get a GitHub issue as well as the board row every deferral gets
-    anyway (#482). Not :func:`severity_floor` with a wider vocabulary, because the
-    two ends are words rather than bands: `"below P4"` names no band this panel has,
-    and `P0` is deliberately absent from ``SEVERITIES`` — so `"never"` would be
-    unwritable and `"always"` would have to be spelled `P4`, which reads as a
-    severity judgement about a decision that is not one.
+    anyway (#482). **Named a gate and not a floor since #620**, because at its
+    shipped value it is not a comparison: `shape` asks what shape the ticket would
+    be — a category or one substantive item, against a round's leftovers swept into
+    one — and no severity band can spell that question, let alone its answer. The
+    bands remain legal and remain a floor when one is written, which is the
+    documented way back to the cut this ran under until 2026-08-30.
+
+    Not :func:`severity_floor` with a wider vocabulary, and the two ends made that
+    true before `shape` did: `"below P4"` names no band this panel has and `P0` is
+    deliberately absent from ``SEVERITIES``, so `"never"` would be unwritable and
+    `"always"` would have to be spelled `P4`, which reads as a severity judgement
+    about a decision that is not one.
 
     Case-insensitive on both halves, and normalised to the spelling each half uses
     everywhere else: a band comes back upper-cased like every other severity in the
-    panel, an end lower-cased like every other word in a rules file. Unset — missing,
+    panel, a word lower-cased like every other word in a rules file. Unset — missing,
     null or ``""`` — takes the default silently, the reading every setting here gives
     it. Anything else is refused (:func:`_refuse_value`), because a repo that wrote
     `file_deferral_issues: "P-2"` meaning "the tail stays off the tracker" and
@@ -1450,14 +1457,18 @@ def deferral_issue_floor(panel: dict, notes: list[str]) -> str:
     if want is None or want == "":
         return DEFAULT_FILE_DEFERRAL_ISSUES
     if isinstance(want, str):
-        if want.strip().lower() in DEFERRAL_ISSUE_ENDS:
+        if want.strip().lower() in DEFERRAL_ISSUE_WORDS:
             return want.strip().lower()
         got = _severity(want, "")
         if got:
             return got
+    # Built off the constants rather than spelled, so a word added to the vocabulary
+    # reaches the refusal too — the drift `_KIND_HINTS` is built this way to avoid.
+    # The last item takes the "or" so the list stays a sentence at three words as it
+    # was at two.
     _refuse_value("file_deferral_issues", want,
-                  f"one of {', '.join(SEVERITIES)}, "
-                  f"{' or '.join(DEFERRAL_ISSUE_ENDS)} (case-insensitive)")
+                  f"one of {', '.join(SEVERITIES + DEFERRAL_ISSUE_WORDS[:-1])} "
+                  f"or {DEFERRAL_ISSUE_WORDS[-1]} (case-insensitive)")
 
 
 def reviewer_scope(panel: dict, notes: list[str]) -> str:
@@ -2152,12 +2163,31 @@ class Dials:
                     and not severity_at_least(severity, self.round_trigger_floor))
 
     def files_issue(self, severity: str, escalated: bool = False,
-                    unresolvable: bool = False) -> bool:
-        """Does a deferral at this severity get a GitHub issue as well as its row?
+                    unresolvable: bool = False, shape: str = "") -> bool:
+        """Does this deferral get a GitHub issue as well as its row?
 
         The board row is not in question and never is: every deferral gets one, at
         every setting of this dial. What this answers is whether a SECOND copy is
         opened on a human's tracker (#482).
+
+        **`shape` is what the gate reads at its shipped value (#620)**, and `severity`
+        is what it reads under a band. The two are not alternatives dressed up as one
+        argument: severity is a property of a FINDING and shape is a property of the
+        TICKET the orchestrator is about to open — a category, one substantive named
+        item, or a batch of a round's leftovers (:data:`DEFERRAL_SHAPES`) — so a cut
+        anywhere on P1..P4 files some batches and blocks some single items, which is
+        the failure #620 measured. Both arguments are taken because both settings are
+        legal, and each is ignored by the setting it is not the question for.
+
+        **AN UNCLASSIFIED DEFERRAL IS A BATCH AND GETS NO ISSUE**, which is the one
+        place this function's safe direction inverts. Under a band an unreadable
+        severity files (below), because the cost of an issue nobody needed is a line
+        on a tracker. Under `shape` that IS the cost: a batch on a tracker with no
+        drain is the twenty issues carrying 345 findings and zero closures that ended
+        the severity cut. So the default is the answer that cannot mint a ticket
+        nobody reads, and it is reached by testing membership of the two shapes that
+        DO file — every caller that says nothing, and every spelling this panel does
+        not know, lands on batch without a case of its own.
 
         **An ESCALATION is exempt at every setting**, which is why this takes a second
         argument rather than reading severity alone. Two of §4b's three roads to
@@ -2181,11 +2211,14 @@ class Dials:
         one `exempt` flag because they are two different reasons and the next person
         to change one must not silently change the other.
 
-        An unreadable or absent severity files the issue. That is the safe direction
-        and the only one: the cost of an issue nobody needed is one line on a tracker,
-        and the cost of silently withholding one is the finding living solely in a row
-        whose severity nothing could read — which is the dumping ground this dial
-        exists to avoid, arriving through the back door."""
+        An unreadable or absent severity files the issue UNDER A BAND. That is the
+        safe direction there and the only one: the cost of an issue nobody needed is
+        one line on a tracker, and the cost of silently withholding one is the finding
+        living solely in a row whose severity nothing could read — which is the
+        dumping ground this dial exists to avoid, arriving through the back door.
+        Under `shape` the same reasoning points the other way, for the reason given
+        above; the two rules are allowed to disagree because they are answers to
+        different questions."""
         if escalated or unresolvable:
             return True
         gate = self.file_deferral_issues
@@ -2193,6 +2226,8 @@ class Dials:
             return True
         if gate == DEFERRAL_ISSUES_NEVER:
             return False
+        if gate == DEFERRAL_ISSUES_SHAPE:
+            return str(shape).strip().lower() in DEFERRAL_ISSUE_SHAPES
         band = _severity(severity, "")
         return not band or severity_at_least(band, gate)
 
@@ -2205,6 +2240,17 @@ class Dials:
         if self.file_deferral_issues == DEFERRAL_ISSUES_NEVER:
             return ("no deferral gets a GitHub issue — board rows only "
                     "(an escalation and an unverifiable claim still do)")
+        # Said as the SHAPE question rather than as the dial's word, on this method's
+        # own rule: the orchestrator acts on this after the round, and "shape" on its
+        # own tells it nothing about which way to act. The batch clause carries "at
+        # any severity" because that is the half a reader schooled on the bands will
+        # otherwise supply wrongly from memory.
+        if self.file_deferral_issues == DEFERRAL_ISSUES_SHAPE:
+            return ("a deferral naming a category or one substantive item gets a "
+                    "GitHub issue; a batch of leftovers gets board rows and no "
+                    "issue at any severity, and so does a deferral nobody "
+                    "classified (an escalation and an unverifiable claim always "
+                    "get one)")
         return (f"deferrals at/above {self.file_deferral_issues} get a GitHub issue, "
                 "below it a board row only (an escalation and an unverifiable claim "
                 "always get one)")
@@ -2273,7 +2319,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     dials = Dials(
         fixer_may_defer=panel_flag(panel, "fixer_may_defer",
                                    DEFAULT_FIXER_MAY_DEFER, notes),
-        file_deferral_issues=deferral_issue_floor(panel, notes),
+        file_deferral_issues=deferral_issue_gate(panel, notes),
         fix_severity_floor=severity_floor(panel, "fix_severity_floor",
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
@@ -4393,7 +4439,7 @@ __all__ = [
     "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "deferral_issue_floor", "reviewer_scope",
+    "severity_floor", "deferral_issue_gate", "reviewer_scope",
     "low_severity_budget",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",

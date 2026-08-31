@@ -504,7 +504,7 @@ def test_a_below_floor_policy_stop_is_over_the_rate_and_still_proposes_nothing()
     to one would arrive on a confident, converged verdict."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_injection(9, 1), revert=_armed())
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False

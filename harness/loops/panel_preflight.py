@@ -877,6 +877,24 @@ class Preflight:
     #: never the problem. `reason` says WHAT; this says which QUESTION was asked,
     #: which is the part a renderer has to branch on.
     gate: str = ""
+    #: The cycle-ending verdict an earlier round already recorded for this PR, when
+    #: the board held one (#617). The record, not the sentence — `gate` above
+    #: carries the words. Null when the board said there was none, AND when it could
+    #: not be reached: "there was no terminal verdict" and "we could not ask" are
+    #: different answers and only the caller's `config_notes` tells them apart.
+    #:
+    #: Its ``refused`` key is what says whether this verdict is the one that stopped
+    #: the round, as opposed to one the caller stepped past with `--new-cycle`.
+    #: Renderers branch on that rather than on the record's presence: a `--new-cycle`
+    #: round still carries the verdict it overrode, and a refusal notice that read
+    #: presence alone would print a prior-cycle remedy list under a mergeability
+    #: refusal that happened to land on the same PR.
+    #:
+    #: It rides on the pre-flight verdict rather than in its own payload block
+    #: because it IS one: the question "is this round worth running at all" is what
+    #: this class answers, and a cycle that was told to stop is the cheapest
+    #: possible no.
+    prior_cycle: dict | None = None
     thresholds: dict = field(default_factory=dict)
     #: The manifest, on a ``manifest`` verdict and nowhere else. Carried rather
     #: than rebuilt by the caller because the verdict is made by MEASURING it —
@@ -948,12 +966,14 @@ class Preflight:
                 "cap_unit": self.cap_unit if self.ceiling else None,
                 "over_cap": round(self.over, 2) if self.ceiling else None,
                 "forced": self.forced, "would_have": self.would_have or None,
+                "prior_cycle": self.prior_cycle,
                 "thresholds": self.thresholds, "shape": self.shape.as_dict()}
 
 
 def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
               notes: list[str], forced: bool = False,
-              installed=None, gate: str = "", gate_overridable: bool = True) -> Preflight:
+              installed=None, gate: str = "", gate_overridable: bool = True,
+              prior_cycle: dict | None = None) -> Preflight:
     """Rule on a round before it is dispatched.
 
     `gate` is a PRECONDITION that has already failed — a sentence saying why this
@@ -962,15 +982,24 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
     `--force` overrides it through exactly the same machinery that overrides a
     size refusal — **unless the caller says otherwise**.
 
-    `gate_overridable=False` is #55's spend ceiling and is the one refusal on this
-    path that `--force` may not turn into a run. Everything else here is a
-    judgement about what THIS host's seats can usefully read, which is exactly the
-    kind of judgement an operator standing in front of it may overrule; a ceiling
-    is fleet policy set by a person on the board, and a local flag that switched it
-    off would make it advice again — which is the state #55 exists to end. The
-    refusal is still recorded and posted through the identical machinery, so a
-    reader cannot tell the two apart by how loudly they arrive, only by whether
-    `--force` moved them.
+    `gate_overridable=False` is #55's spend ceiling and #617's prior terminal
+    verdict — the two refusals on this path that `--force` may not turn into a run.
+    Everything else here is a judgement about what THIS host's seats can usefully
+    read, which is exactly the kind of judgement an operator standing in front of it
+    may overrule; a ceiling is fleet policy set by a person on the board, and a
+    local flag that switched it off would make it advice again — which is the state
+    #55 exists to end. A cycle that was told to stop is the same shape one level up:
+    `--force` says "this diff is worth reading anyway", which is not an answer to
+    "an earlier round already ended this cycle", and the flag that IS an answer to
+    that (`--new-cycle`) says so in its own name. The refusal is still recorded and
+    posted through the identical machinery, so a reader cannot tell the two apart by
+    how loudly they arrive, only by which flag moved them.
+
+    `prior_cycle` is the RECORD behind #617's gate, carried through so the payload
+    holds what the board said rather than only the sentence built from it. It
+    decides nothing here — the caller has already turned it into `gate`, or not —
+    and its only job is to reach `Preflight.as_dict` and :func:`refusal_report`,
+    which owes a reader different prose from the one a mergeability refusal owes.
 
     It arrives as a parameter rather than being asked here because
     the question is not about the diff: `panel.run` reads the PR's mergeability off
@@ -1063,9 +1092,11 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
         if name != "run" and forced:
             return Preflight("run", f"--force: {forced_reason or reason}", shape,
                              ceiling, over, forced=True, would_have=name,
-                             gate=gate, thresholds=thresholds)
+                             gate=gate, prior_cycle=prior_cycle,
+                             thresholds=thresholds)
         return Preflight(name, reason, shape, ceiling, over,
-                         gate=gate, thresholds=thresholds, manifest=manifest)
+                         gate=gate, prior_cycle=prior_cycle,
+                         thresholds=thresholds, manifest=manifest)
 
     # BEFORE any size question, because a precondition is not a budget: a branch
     # that cannot merge is not reviewable at any ceiling, and refusing it for its
@@ -1079,7 +1110,7 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
         # because there is exactly one caller and the alternative is a `forced`
         # parameter that sometimes means forced — see the docstring.
         return Preflight("refuse", gate, shape, ceiling, over,
-                         gate=gate, thresholds=thresholds)
+                         gate=gate, prior_cycle=prior_cycle, thresholds=thresholds)
     if gate:
         return verdict("refuse", gate)
     if ceiling is None:
@@ -1604,6 +1635,41 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
         + (f" / {s.nbytes:,} bytes" if s.nbytes != s.chars else "")
         + f", {s.files:,} file(s), +{s.added:,} / -{s.removed:,} non-blank lines",
     ]
+    if pre.gate and (pre.prior_cycle or {}).get("refused"):
+        # #617. The remedies below this are about a branch that cannot merge, and
+        # every one of them is the wrong instruction here: rebasing does not undo a
+        # stop, `require_mergeable` has nothing to do with it, and `--force` cannot
+        # move this gate at all. A refusal notice whose remedy list the reader
+        # cannot act on is how a gate becomes advice, which is #628's complaint
+        # about the CI line arriving here.
+        pc = pre.prior_cycle
+        ago = pc.get("ago") or "an unknown time ago"
+        lines += [
+            "  - the size was not the problem, and no ceiling was consulted: an "
+            "earlier round already ended this cycle.",
+            "",
+            "**The verdict this round would have overwritten:**",
+            f"  - round {pc.get('round') or '?'} of cycle "
+            f"`{str(pc.get('cycle') or '?')[:12]}` stopped the cycle {ago}, at "
+            f"`{str(pc.get('head_sha') or '?')[:12]}`.",
+            f"  - it said: {pc.get('reason') or 'no reason recorded'}",
+            ("  - and it was NOT convergence — the cycle stopped with work "
+             "outstanding." if pc.get("confident") is False else
+             "  - it recorded a confident stop: the cycle was reviewed to a "
+             "conclusion." if pc.get("confident") else
+             "  - whether that stop was earned was not recorded."),
+            "",
+            "**What to do,** in the order they are worth doing:",
+            "  1. Answer the stop. A terminal verdict names what a fix pass "
+            "cannot clear; another review round is not the reply to it.",
+            "  2. `--new-cycle` to start a genuinely new cycle on this PR, once "
+            "the thing that ended the last one has been dealt with. It mints a "
+            "fresh cycle rather than continuing one that was told to stop.",
+            "  3. `--force` does NOT move this gate, and deliberately: it says "
+            "this diff is worth reading anyway, which is not an answer to the "
+            "question this refusal asked.",
+        ]
+        return "\n".join(lines)
     if pre.gate:
         # A precondition refusal, and every line below the diff's own size would be
         # about a budget question this round never reached. The size is still

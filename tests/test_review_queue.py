@@ -490,6 +490,40 @@ async def test_recorded_outcomes_clear_findings_and_move_the_pr_off_unresolved(c
     assert after["state"] == "ready"                # stopped, and nothing outstanding
 
 
+async def test_a_narrowed_finding_clears_the_queue_the_way_a_fixed_one_does(client):
+    """#615's fifth outcome, and the half of it the queue decides.
+
+    `narrowed` says the finding is real and this pass repaired it at the point it
+    was raised, with the general form left for another change. That is a FIX, so it
+    clears for the plainest reason of the five: the code changed and the finding as
+    raised is answered. Left out of the clearing set the queue would hold a PR open
+    on a defect somebody has already repaired — which is exactly the pressure the
+    word exists to remove, since a fixer that cannot say "fixed here, not
+    everywhere" fixes the class instead, and the class-wide fix is what edits files
+    nobody reviewed.
+    """
+    await record(client, 7331, findings=2, head_sha=SHA_A, round=2,
+                 round_stop={"stop": True, "reason": "round cap (2) reached",
+                             "confident": True})
+    before = entry(await ask(client, [snapshot(7331)]), 7331)
+    assert before["state"] == "unresolved" and before["last_run"]["outstanding"] == 2
+
+    keys = [_derive_key(FINDING["file"], f"{FINDING['title']} {i}") for i in range(2)]
+    r = await client.post("/review/outcomes", headers=AGENT, json={
+        "repo": REPO, "pr": 7331,
+        "outcomes": [{"key": k, "outcome": "narrowed",
+                      "note": "the general form is a rule over every caller"}
+                     for k in keys]})
+    assert r.status_code in (200, 201), r.text
+    assert r.json()["recorded"] == keys
+
+    after = entry(await ask(client, [snapshot(7331)]), 7331)
+    assert after["last_run"]["confirmed"] == 2      # the round still said what it said
+    assert after["last_run"]["cleared"] == 2
+    assert after["last_run"]["outstanding"] == 0
+    assert after["state"] == "ready"
+
+
 async def test_an_exempting_plan_item_takes_a_pr_out_of_the_line_and_says_which(client):
     """Written as an AGENT until #335, and that was the hole this suite could not see.
 

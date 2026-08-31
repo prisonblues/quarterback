@@ -90,13 +90,20 @@ RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback fi
 CLUSTER_WINDOW = 10
 ACCOUNT_CHARS = 240  # per-reviewer account shown under a merged finding in the report
 
-# Panel -> fix -> panel. Two is the default because one is provably not enough:
-# the fixer's own commit is otherwise read by nobody, and structural fixes beget
-# new interactions that no earlier round could have seen because they did not
-# exist until the fix was written. It is a cap on the CALLER's loop, used here
-# only to decide whether a round that still has work left stopped because it was
-# done or because it ran out of rounds.
-DEFAULT_MAX_ROUNDS = 2
+# Panel -> fix -> panel. One is provably not enough: the fixer's own commit is
+# otherwise read by nobody, and structural fixes beget new interactions that no
+# earlier round could have seen because they did not exist until the fix was
+# written. It is a cap on the CALLER's loop, used here only to decide whether a
+# round that still has work left stopped because it was done or because it ran out
+# of rounds.
+#
+# **6 as of 2026-08-30, from 2 (#621).** THE CAP IS A BACKSTOP AGAINST RUNNING
+# FOREVER AND NOT A CONVERGENCE MECHANISM, and 2 was being asked to be both: a cycle
+# that ends on the cap has produced a fix nobody read and a remainder handed to
+# somebody, which is the opposite of the confident dry round the cap was being
+# credited with. What ends a cycle from here is `escalate_on`, `fix_injection` first.
+# `harness_rules.DEFAULTS` carries the evidence and the way back.
+DEFAULT_MAX_ROUNDS = 6
 
 # What a round past the first REVIEWS. "increment" makes the review target the
 # diff between the previous round's head and this one's — the fix commit, which
@@ -211,14 +218,21 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 # documented default and the applied default disagreeing, silently, in the direction
 # nobody checks.
 
-#: Findings at or above this severity are what a fix round is asked to clear. P3 and
-#: not P2: severity is model-authored and wrong sometimes, and the defect class a P2
-#: floor systematically misses is correctness expressed as craft. `harness_rules`
-#: carries the argument.
-DEFAULT_FIX_SEVERITY_FLOOR = "P3"
+#: Findings at or above this severity are what a fix round is asked to clear. Not P2:
+#: severity is model-authored and wrong sometimes, and the defect class a P2 floor
+#: systematically misses is correctness expressed as craft.
+#:
+#: **P4 as of 2026-08-30, from P3 (#621).** This is not the blocking band and has not
+#: been since #297 — `round_trigger_floor` is, and it stays at P2. Admitting P4 adds
+#: no obligation: it puts the P3 AND P4 band inside `low_severity_fix_lines`' budget,
+#: where before P3 was the whole of that band and P4 sat outside every rule, so which
+#: of them a round actually takes is decided cheapest-first by a count rather than by
+#: the fixer's judgement. `harness_rules` carries the argument.
+DEFAULT_FIX_SEVERITY_FLOOR = "P4"
 #: New findings at or above this severity are what buys another round. Stays P2 while
-#: the fix floor is P3, deliberately: fixing a P3 inside a pass that is already open
-#: costs one edit; letting one buy a whole new round costs a panel plus a fix pass.
+#: the fix floor reaches to P4, deliberately: fixing a low-severity finding inside a
+#: pass that is already open costs one edit; letting one buy a whole new round costs a
+#: panel plus a fix pass. It is the gap between the two that the budget pays for.
 DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: Churned lines the whole round may spend fixing findings BELOW the trigger floor —
 #: the tier the fix floor admits and the measurement does not. 40 because the failure
@@ -308,17 +322,53 @@ REVIEWER_SCOPES = ("diff", "repo")
 DEFAULT_FIXER_MAY_DEFER = True
 #: Which deferrals get a GitHub ISSUE as well as their board row (#482). Every
 #: deferral is recorded either way — this decides only whether a second copy is
-#: opened on a human's tracker. `P2` because the board row and the issue coincide
-#: for a P1/P2 deferral and do not for the P3/P4 tail, which is where the volume is.
-#: `harness_rules` carries the measurement.
-DEFAULT_FILE_DEFERRAL_ISSUES = "P2"
-#: The two ends of that dial, which are not severities: `always` is the pre-#482
-#: behaviour (an issue for every deferral) and `never` files none at all. Spelled as
-#: words rather than as `P4`/`P0` because a floor "below P4" has no band to name and
-#: `P0` is deliberately not a severity this panel has (see `SEVERITIES`).
+#: opened on a human's tracker.
+#:
+#: **`shape` since 2026-08-30 (#620), and it is not a floor.** The question is no
+#: longer how severe the deferral is but what shape the TICKET would be, because
+#: severity is a property of a finding and batchness is a property of the ticket —
+#: so a cut anywhere on P1..P4 files some batches and blocks some single items,
+#: which is backwards. The count that ended the severity cut: twenty open issues on
+#: this repo were panel deferred-finding exhaust carrying 345 findings, every one of
+#: them a BATCH, and not one had ever been closed. The bands still work and are the
+#: documented way back; `harness_rules` carries the measurement and the argument.
+DEFAULT_FILE_DEFERRAL_ISSUES = "shape"
+#: The three WORDS this dial takes beside the P1..P4 bands, none of which a band can
+#: spell. `shape` is the rule above. `always` is the pre-#482 behaviour (an issue for
+#: every deferral) and `never` files none at all — spelled as words rather than as
+#: `P4`/`P0` because a floor "below P4" has no band to name and `P0` is deliberately
+#: not a severity this panel has (see `SEVERITIES`).
+#:
+#: Two tuples and not one, mirroring `harness_rules._DEFERRAL_GATE_WORDS`: the ends
+#: are the off and on extremes, `shape` is a policy, and it is the JOINED tuple every
+#: reader here checks against — so a word added to either reaches all of them.
+DEFERRAL_ISSUES_SHAPE = "shape"
 DEFERRAL_ISSUES_ALWAYS = "always"
 DEFERRAL_ISSUES_NEVER = "never"
 DEFERRAL_ISSUE_ENDS = (DEFERRAL_ISSUES_ALWAYS, DEFERRAL_ISSUES_NEVER)
+DEFERRAL_ISSUE_WORDS = (DEFERRAL_ISSUES_SHAPE,) + DEFERRAL_ISSUE_ENDS
+#: The three shapes a deferral can have under `shape`, and the two of them that earn
+#: an issue. A CATEGORY is one standing item for a recurring class ("the ingest
+#: layer's error paths are untested"), which a human can work as a batch. An ITEM is
+#: one named defect, decision owed or piece of complexity with real substance behind
+#: it, and it earns an issue whatever severity it carries. A BATCH is a round's
+#: leftovers swept into one ticket — board rows and never an issue, whatever its
+#: severity mix, a P1 in the pile included: twenty P3s in one issue is not a
+#: deferral, it is a transfer of the problem to a human.
+#:
+#: **AN UNCLASSIFIED DEFERRAL IS A BATCH**, which is where this parts company with
+#: every band above it and is the whole direction of the rule. Under a band an
+#: unreadable severity FILES the issue, because the cost of one issue nobody needed
+#: is a line on a tracker. Here that cost is the failure — a ticket nobody reads is
+#: what the twenty were — so the safe direction inverts and the answer that cannot
+#: mint one is the default. Membership is tested rather than batchness, so every
+#: spelling this panel does not recognise arrives at it without a special case.
+DEFERRAL_SHAPE_CATEGORY = "category"
+DEFERRAL_SHAPE_ITEM = "item"
+DEFERRAL_SHAPE_BATCH = "batch"
+DEFERRAL_SHAPES = (DEFERRAL_SHAPE_CATEGORY, DEFERRAL_SHAPE_ITEM,
+                   DEFERRAL_SHAPE_BATCH)
+DEFERRAL_ISSUE_SHAPES = (DEFERRAL_SHAPE_CATEGORY, DEFERRAL_SHAPE_ITEM)
 #: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
 DEFAULT_REQUIRE_FAILING_TEST = False
 #: Lines an integration merge may put into a PR's OWN files and still leave the
@@ -2790,6 +2840,9 @@ __all__ = [
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
     "DEFAULT_FILE_DEFERRAL_ISSUES", "DEFERRAL_ISSUES_ALWAYS",
     "DEFERRAL_ISSUES_NEVER", "DEFERRAL_ISSUE_ENDS",
+    "DEFERRAL_ISSUES_SHAPE", "DEFERRAL_ISSUE_WORDS",
+    "DEFERRAL_SHAPE_CATEGORY", "DEFERRAL_SHAPE_ITEM", "DEFERRAL_SHAPE_BATCH",
+    "DEFERRAL_SHAPES", "DEFERRAL_ISSUE_SHAPES",
     "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",

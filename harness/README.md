@@ -156,9 +156,13 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 PR and the 67.3% tail beside it is not.
 
 So `.harness-rules.sample` now carries ten `review_panel` dials (#165, #297, #492, #482), and what they
-bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
-is asked to clear, and below it a finding is reported, marked and recorded rather than
-fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
+bound is the tail rather than the signal: `fix_severity_floor` (**P4** as of 2026-08-30,
+from P3 — #621) is what a fix round is asked to clear, and below it a finding is reported,
+marked and recorded rather than fixed. Admitting P4 — 31.3% of findings, and the tier that
+actually ballooned #236 — adds no obligation: it is not the blocking band and has not been
+since #297, so what changes is that P4 joins P3 INSIDE `low_severity_fix_lines`' budget
+rather than sitting outside every rule, and a count decides cheapest-first which of them a
+round takes;
 `round_trigger_floor` (**P2**) is what a NEW finding needs to buy another round, which is
 the rule that mattered most, because from round 2 the thing under review IS the previous
 round's fix and a termination test fed by its own output can only end on the cap — the
@@ -189,10 +193,15 @@ whichever is crossed first binds, because a pure multiple hands its rope out in 
 the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
 stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
-not have; `max_rounds` (**2**) surfaces the existing cap; `file_deferral_issues` (**P2**) decides which
-deferrals get a GitHub issue as well as the board row every deferral gets anyway, which is the
-tail arriving one step downstream of the floor — the floor keeps a P4 out of the fix pass and
-the bookkeeping then filed it as a ticket, twenty times over on this repo alone (#482); and
+not have; `max_rounds` (**6** as of 2026-08-30, from 2 — #621) surfaces the existing cap, which is
+a backstop against a cycle running forever and not a convergence mechanism: what ends a cycle is
+`escalate_on`, `fix_injection` first; `file_deferral_issues` (**shape** as of 2026-08-30, from P2 —
+#620) decides which deferrals get a GitHub issue as well as the board row every deferral gets
+anyway, and it asks what shape the TICKET would be rather than how severe the finding is — a
+category or one substantive named item gets an issue, a batch of a round's leftovers gets rows and
+never one. The tail was arriving one step downstream of the floor: the floor kept a P4 out of the
+fix pass and the bookkeeping then filed it as a ticket, twenty times over on this repo alone, every
+one of them a batch and not one ever closed (#482, #620); and
 `require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
 because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
@@ -231,17 +240,26 @@ same row; the fixer owes two justifying lines and the orchestrator still owns th
 **A deferral always gets a board row; `review_panel.file_deferral_issues` decides which ones
 also get a GitHub issue** (#482). The two were being treated as one record and they are not: the
 row chains by finding key across rounds, feeds `/panel` and keeps the leaderboard honest, while
-the issue is a work item on somebody's tracker. Those coincide for a P1 or P2 deferral and do not
-for the P3/P4 tail, which is where the volume is — measured on this repo on 2026-08-26, roughly
-twenty open issues were panel deferred-finding exhaust and nothing else, and #283 is a rescue
-*from* one of them. At or above the gate the orchestrator opens the issue and names it in
-`deferred_to` as before; below it the row carries no `deferred_to` (the column is nullable, the
-API accepts it, and `/panel` renders a targetless row rather than breaking) and a one-line `note`
-instead, which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read
-that write exists for. The default is `P2`; `always` is the pre-#482 behaviour and `never` files
+the issue is a work item on somebody's tracker. **Since #620 the gate asks what shape the ticket
+would be, not how severe the finding is**: a CATEGORY — one standing item for a recurring class —
+or a SINGLE NAMED ITEM with real substance behind it gets an issue whatever severity it carries,
+while a BATCH, a round's leftovers swept into one ticket, gets board rows and never an issue,
+whatever its severity mix. Twenty P3s in one issue is not a deferral, it is a transfer of the
+problem to a human. Severity could not express that, because severity is a property of a finding
+and batchness is a property of the ticket, so a cut anywhere on P1..P4 files some batches and
+blocks some single items. The measurement, taken on this repo on 2026-08-26 and re-counted on
+2026-08-30: twenty open issues were panel deferred-finding exhaust and nothing else, carrying 345
+findings, every one of them a batch, and not one had ever been closed — #283 is a rescue *from*
+one of them. **A deferral nobody classified is a batch**, because that is the answer that cannot
+mint a ticket nobody reads. Where an issue is opened the orchestrator names it in `deferred_to` as
+before; where it is not, the row carries no `deferred_to` (the column is nullable, the API accepts
+it, and `/panel` renders a targetless row rather than breaking) and a one-line `note` instead,
+which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read that
+write exists for. The default is `shape`; the P1..P4 bands still work and are the way back to the
+severity cut this ran under until 2026-08-30, `always` is the pre-#482 behaviour and `never` files
 none. **An escalation is exempt at every setting**, because its issue asks a question rather than
-filing a task, and if the board write fails the orchestrator files the issue anyway — below the
-gate the row is the only record, so losing both would lose the finding.
+filing a task, and if the board write fails the orchestrator files the issue anyway — without one
+the row is the only record, so losing both would lose the finding.
 
 `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to

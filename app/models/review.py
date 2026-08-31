@@ -916,14 +916,17 @@ class ReviewFindingOutcome(Base):
     pr: Mapped[int] = mapped_column(Integer, nullable=False)
     finding_key: Mapped[str] = mapped_column(Text, nullable=False)
 
-    #: One of :data:`app.api.reviews.OUTCOMES` — fixed | refuted | deferred |
-    #: superseded. Constrained in the database as well as at ingest: this table
-    #: feeds a published precision figure, and an unknown value would silently
-    #: leave the numerator while still counting as coverage.
+    #: One of :data:`app.api.reviews.OUTCOMES` — fixed | narrowed | refuted |
+    #: deferred | superseded. Constrained in the database as well as at ingest:
+    #: this table feeds a published precision figure, and an unknown value would
+    #: silently leave the numerator while still counting as coverage.
     outcome: Mapped[str] = mapped_column(Text, nullable=False)
-    #: Why — required by the API for ``refuted`` and optional otherwise. A bare
-    #: `refuted` flag is a confident assertion with nothing behind it, which is
-    #: the failure this whole feature exists to measure, arriving one level up.
+    #: Why — required by the API for ``refuted`` and for ``narrowed``, optional
+    #: otherwise. A bare `refuted` flag is a confident assertion with nothing
+    #: behind it, which is the failure this whole feature exists to measure,
+    #: arriving one level up. A bare `narrowed` fails in the mirror image: the
+    #: note is where the general form the fix did NOT take is written, so without
+    #: it the row says only "fixed, sort of" and #615's whole distinction is gone.
     note: Mapped[str | None] = mapped_column(Text)
     #: Where a ``deferred`` finding went: an issue ref. #66, #69, #72, #74 and the
     #: backlogs after them park findings in a markdown list with no state at all,
@@ -976,8 +979,14 @@ class ReviewFindingOutcome(Base):
         # reasoning as `ck_review_runs_repo_canonical` (#326, migration 0033).
         CheckConstraint(r"repo = lower(btrim(repo, E' \t\n\r\f\013'))",
                         name="ck_review_finding_outcomes_repo_canonical"),
+        # `narrowed` is #615's fifth member and it is a FIX, not a refusal: the
+        # finding is real, the fix answers it at the point it was raised, and the
+        # general form is not that pass's work. It is here rather than expressed
+        # as a `fixed` with a note because "I fixed this" and "I fixed the
+        # instance of this" are different facts, and the round-stop machinery and
+        # the leaderboard read them apart.
         CheckConstraint(
-            "outcome IN ('fixed', 'refuted', 'deferred', 'superseded')",
+            "outcome IN ('fixed', 'narrowed', 'refuted', 'deferred', 'superseded')",
             name="ck_review_finding_outcomes_vocabulary",
         ),
         # The evidence rule, at the boundary rather than only in the API. A bare
@@ -987,9 +996,9 @@ class ReviewFindingOutcome(Base):
         # NOT NULL rather than non-empty: the API already collapses whitespace to
         # NULL, so the two agree, and a CHECK that has to reason about trimming
         # would be a second opinion about what counts as a note.
-        # The two "the value must actually say something" rules, at the boundary
-        # rather than only in the API — for a backfill, an admin script, or the
-        # next write path. Three things each of them gets right:
+        # The three "the value must actually say something" rules, at the
+        # boundary rather than only in the API — for a backfill, an admin script,
+        # or the next write path. Four things each of them gets right:
         #
         # * the NOT NULL is not redundant beside the trim test. **A CHECK passes
         #   when its expression evaluates to NULL**, so the trim alone would let a
@@ -1002,12 +1011,24 @@ class ReviewFindingOutcome(Base):
         #   not read off a doc page). The set would have trimmed v's off both ends
         #   and refused a note of "v" as empty: a rule about whitespace quietly
         #   deciding a letter of the alphabet does not count as evidence.
-        # * they mirror the API's two required-field rules exactly, so a row this
-        #   service would refuse cannot arrive by another door.
+        # * they mirror the API's three required-field rules exactly, so a row
+        #   this service would refuse cannot arrive by another door.
         CheckConstraint(
             r"outcome <> 'refuted' OR (note IS NOT NULL "
             r"AND btrim(note, E' \t\n\r\f\013') <> '')",
             name="ck_review_finding_outcomes_refuted_note",
+        ),
+        # The same rule again for `narrowed` (#615), as its own constraint rather
+        # than by widening the one above: the two are required for different
+        # reasons and a caller is owed the one that applies to it, and a CHECK
+        # named `..._refuted_note` that also refuses a narrowed row is a name that
+        # lies to whoever reads the error. What the note carries here is the
+        # general form — what fixing the class would have taken — which is the
+        # only thing distinguishing this row from a `fixed` one.
+        CheckConstraint(
+            r"outcome <> 'narrowed' OR (note IS NOT NULL "
+            r"AND btrim(note, E' \t\n\r\f\013') <> '')",
+            name="ck_review_finding_outcomes_narrowed_note",
         ),
         CheckConstraint(
             "outcome <> 'superseded' OR (superseded_by IS NOT NULL "

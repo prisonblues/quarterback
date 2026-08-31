@@ -202,8 +202,10 @@ POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,             
                                                                                      rejected,
                                                                                      unattested_refutations}
                           what HAPPENED to a defect once somebody acted on it:
-                          fixed | refuted | deferred | superseded, one per (repo, pr, key).
-                          `refuted` needs its reasoning and `superseded` needs the key that
+                          fixed | narrowed | refuted | deferred | superseded, one per
+                          (repo, pr, key). `refuted` needs its reasoning, `narrowed` (#615 —
+                          real, fixed where it was raised, general form not this pass's work)
+                          needs that general form, and `superseded` needs the key that
                           replaced it; rejections are per item and named, never a 422 for the
                           batch; a repeat FILLS a field and an overwrite is an `amended`
                           revision; 201 created / 200 updated / 422 nothing accepted.

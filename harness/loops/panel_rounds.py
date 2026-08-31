@@ -3499,6 +3499,45 @@ def referee_state(split: dict | None, armed: bool) -> dict:
             "min_churn": panel_seats.UNREFEREED_MIN_CHURN, "over": over}
 
 
+def fix_surface_state(surface: object) -> dict | None:
+    """#619's measurement as `round_stop` publishes it, or ``None`` where there was
+    none to make.
+
+    ``surface`` is `panel.py`'s reading of the fix range: the files the last fix pass
+    touched, and the subset of them that no earlier round's diff contained. The
+    quantity is SURFACE and not size, which is the point of it — every other number
+    downstream of a fix pass counts lines or findings (`max_fix_growth`,
+    `max_fix_growth_chars`, `fix_injection`), and a fix that adds fifteen lines to two
+    nginx templates nobody had reviewed is invisible to all three. On lexray#1780 it
+    was the P1: round 3's pass touched twelve files, seven of them never in front of a
+    reviewer, and both of the cycle's later P1s were in that new surface.
+
+    **REPORTED AND NOT GATED, on #67's rule.** Nothing in :func:`round_stop` reads this
+    to move ``stop``, and the decision to gate it — `max_fix_new_files`, or report-only
+    — has not been taken. #619 asks for the instrument first in as many words, and the
+    comment beside #67's other withheld tallies in `panel.py` argues the same thing for
+    them.
+
+    **``None`` IS THE ANSWER "NOT MEASURED", AND IT MUST NEVER BECOME A ZERO.** Round 1
+    has no fix pass to read and a rewritten branch has no readable range — the same
+    conditions under which `unrefereed_fix` has nothing to say — and a payload that
+    published ``count: 0`` for those would be claiming a pass opened no new files when
+    what happened is that nobody looked. So a mapping carrying neither ``count`` nor
+    ``new_files`` is treated as an absent measurement rather than as an empty one; a
+    mapping carrying either is normalised and published in full, ``count`` from the
+    caller where it gave one and from ``new_files`` where it did not."""
+    if not isinstance(surface, dict):
+        return None
+    count, raw_new = _nonneg_int(surface.get("count")), surface.get("new_files")
+    if count is None and raw_new is None:
+        return None
+    new_files = [str(f) for f in (raw_new or ())]
+    return {"files": [str(f) for f in (surface.get("files") or ())],
+            "new_files": new_files,
+            "count": len(new_files) if count is None else count,
+            "prior_files": _nonneg_int(surface.get("prior_files"))}
+
+
 # --------------------------------------------------------------------- #506: and the
 # fix pass that did it is STILL ON THE BRANCH.
 #
@@ -4062,12 +4101,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                baseline_ok: bool = True, repeated: Iterable[str] = (),
                escalated: Iterable[str] = (), *,
                trigger_floor: str = NO_SEVERITY_FLOOR,
-               fix_floor: str = NO_SEVERITY_FLOOR,
+               cleared_floor: str = NO_SEVERITY_FLOOR,
+               narrowed: Iterable[str] = (),
                premises: dict | None = None,
                injection: dict | None = None,
                revert: dict | None = None,
                not_falling: dict | None = None,
-               unrefereed: dict | None = None) -> dict:
+               unrefereed: dict | None = None,
+               surface: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -4087,7 +4128,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     1. findings this round that no earlier round raised, **at or above**
        ``trigger_floor`` -> go again;
-    2. a P1/P2 still outstanding **at or above** ``fix_floor``, or a Sonar hard-gate
+    2. a P1/P2 still outstanding **at or above** ``cleared_floor``, or a Sonar hard-gate
        issue still outstanding at **any** severity -> go again, whatever
        anyone declared (a blocker
        raised again is a blocker that was not fixed) — **except one in**
@@ -4101,20 +4142,45 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
        veto line, ``confident`` is false, and ``reason`` says a human is owed an
        answer;
     3. ``repeated`` — the KEYS of findings an earlier round already raised that
-       are STILL outstanding, at any severity **at or above** ``fix_floor``
-       -> go again. The fixer was told
-       about them and they are still there, and ``/panel-review-pr``'s bar is
-       every finding fixed, not every P1/P2. This used to only cost the stop its
-       confidence, which ended the cycle with a judge-confirmed defect present and
-       nothing acting on the veto that said so. Keys rather than a count so the
-       escalation filter below can subtract the escalated ones: a count computed
-       before this function sees it puts the jam straight back, filtered by
+       are STILL outstanding, **at or above** ``trigger_floor`` -> go again. The
+       fixer was told about them and they are still there. This used to only cost
+       the stop its confidence, which ended the cycle with a judge-confirmed defect
+       present and nothing acting on the veto that said so. Keys rather than a count
+       so the escalation filter below can subtract the escalated ones: a count
+       computed before this function sees it puts the jam straight back, filtered by
        whichever caller remembered to, which is not a rule but a convention with
        one participant;
     4. otherwise dry -> stop.
 
+    **RULE 3 TAKES THE TRIGGER FLOOR AND NOT THE CLEARED ONE, and that is the
+    convergence fix (#621).** The rule it replaces bounded the repeat by
+    ``cleared_floor`` — anything the fix pass was ASKED to clear and did not. That was
+    sound while the two floors sat a tier apart, and it stops being sound the moment
+    the fix floor drops far enough that a pass may spend its budget on P3/P4 work: a
+    single unpaid P3 is then a finding the fixer was asked to clear, did not, and can
+    only close by WRITING LINES — and writing lines is what authors the next round's
+    findings, which is the loop this whole branch exists to break. The decided rule is
+    that **a repeated finding keeps the cycle going only if it would have bought a
+    round in the first place.** A finding under the trigger floor never bought one
+    when it was new and does not buy one by being raised twice; it is reported — in
+    ``repeated_below_trigger_floor``, in the stop's own ``reason``, and in
+    ``outstanding.fixable`` where a fix pass could still take it — and the cycle stops.
+    Reported is the load-bearing half of that sentence: such a round is NOT dry, and it
+    says which findings it stood down on rather than borrowing the word, on exactly the
+    terms #165's below-floor branch already set for new findings.
+
+    What that does NOT change, said explicitly because each is the kind of thing a
+    reader assumes went with it: a repeated **P1/P2 still goes again**, under rule 2
+    and under rule 3 both — rule 2's bound is untouched, and a P1/P2 is at or above
+    any trigger floor a repo can set. A **Sonar hard-gate issue** keeps exactly the
+    standing it has today: ``exempt`` is a property of the KEY and not of one rule, so
+    it passes both floors at every rule, and a still-open gate issue goes again
+    however Sonar graded it. **Escalations are still subtracted before every rule**,
+    and so are ``narrowed`` keys — the filters run once, in front of all four, and
+    this changes neither.
+
     The cap is what stops rule 3 running forever when two reviewers disagree
-    about a P4 — the cycle ends either way, and a cap reached with work
+    about a P2 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence.
 
     **``outstanding`` IS THE SECOND QUESTION, AND IT IS NOT THE ONE ``stop``
@@ -4156,9 +4222,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     **THE TWO FLOORS (#165), and why there are two.** Both default to
     :data:`NO_SEVERITY_FLOOR`, so a caller that has not heard of them gets exactly
     the behaviour above; `panel.py` passes the repo's
-    ``review_panel.round_trigger_floor`` and ``fix_severity_floor``.
+    ``review_panel.round_trigger_floor`` and :attr:`panel_seats.Dials.cleared_floor`
+    — which is the ``fix_severity_floor`` until a budget is in force and the cut
+    afterwards, and is NOT ``Dials.fix_floor``. The parameter is called
+    ``cleared_floor`` because that is the concept it carries and because the other
+    name is live one module over holding a different value (#549); the payload key
+    follows it.
 
-    ``trigger_floor`` bounds rule 1 alone: a new finding below it is still counted,
+    ``trigger_floor`` bounds rules 1 and 3: a new finding below it is still counted,
     still reported and still in the payload, it simply does not by itself buy a
     panel, a fix pass and another panel. That rule is the one the measurement
     indicts. From round 2 the thing under review IS the previous round's fix, so
@@ -4167,17 +4238,27 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     test fed by its own output can only end on the cap, which is what all seven
     panels did.
 
-    ``fix_floor`` bounds rules 2 and 3, and it has to or the other dial does
-    nothing. A finding below the fix floor is one the fix round was never asked to
-    clear, so it is outstanding every round by construction: rule 3's own
-    justification — "the fixer was told about them and they are still there" — is
-    simply false of it, and left unbounded it would go again until the cap on a P3
-    nobody ever intended to fix. Rule 2 takes the same bound for the same reason,
-    which matters only where the fix floor is ``P1``: at ``P2`` every P1/P2 is
-    already at or above it and the filter is a no-op. Read the other way round, that
-    is the honest scope of "``P4`` restores the old behaviour" — true of rules 1 and
-    3, and vacuous for rule 2, whose bar is the hardcoded ``("P1", "P2")`` tuple, so
-    a floor can only ever RAISE it and only ``P1`` moves it at all.
+    ``cleared_floor`` bounds rule 2 alone, and it bounds the DISPOSAL below. A
+    finding under it is one the fix round was never asked to clear, so it is
+    outstanding every round by construction and no rule may read that as the fixer
+    having failed. Rule 2 takes the bound for that reason, which matters only where
+    the floor is ``P1``: at ``P2`` every P1/P2 is already at or above it and the
+    filter is a no-op. Read the other way round, that is the honest scope of "``P4``
+    restores the old behaviour" — true of rule 1, and vacuous for rule 2, whose bar
+    is the hardcoded ``("P1", "P2")`` tuple, so a floor can only ever RAISE it and
+    only ``P1`` moves it at all.
+
+    **The two floors now bound different rules because they answer different
+    questions, and rule 3 asks the first one.** ``trigger_floor`` answers *is this
+    finding worth another panel, another fix pass and another panel?*;
+    ``cleared_floor`` answers *was this finding this pass's work?*. Rule 3 is a
+    question about whether to spend another round, so it takes the round dial —
+    which also makes the two rules that can extend the cycle bounded by one number a
+    repo sets once, instead of by whichever of two dials the reader guessed. Rule 2
+    and the disposal are questions about work, so they keep the work dial. The one
+    consequence worth naming: a finding above the cleared floor and below the trigger
+    floor is a finding a fix pass IS asked to clear and whose non-clearance buys no
+    round — reported, in ``outstanding.fixable``, and not a reason to go again.
 
     **NEITHER FLOOR APPLIES TO A SONAR HARD-GATE ISSUE**, at any rule. A finding with
     ``verdict == "sonar"`` in ``outstanding`` is a red quality gate, not a judged
@@ -4218,6 +4299,65 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     every later round its confidence. A round that is genuinely dry is reported as
     dry even while the cycle's register is non-empty; the open question lives in
     the relay and its issue, which is where a human is looking for it.
+
+    ``narrowed`` is #615, and it is the SECOND filter in front of the four rules. The
+    fixer's vocabulary was ``fixed | refuted | deferred`` plus escalation, and all four
+    answer *whether* to act; none of them answers *how far*. Rich's decision adds the
+    fourth outcome: the finding is real, this pass fixed it **at the point it was
+    raised**, and the general form is not this pass's work.
+
+    **It CLEARS.** A narrowed key is subtracted alongside the escalated ones, before
+    the rules, so it is not outstanding under rule 2, rule 3 does not count it, and it
+    is in neither ``outstanding.fixable`` nor ``below_floor``. It takes NO veto line
+    and costs the round no confidence — that is the whole difference from an
+    escalation, which is an open question a human owes an answer to, where this is an
+    answer already given.
+
+    **But the stop SAYS SO, by name.** A round whose quiet was bought by a narrowing
+    gets its own ``reason`` — never "dry", which is a claim that nothing was raised —
+    and the reason counts how many of the cleared keys were at or above the trigger
+    floor, because a P1 answered narrowly and a P4 answered narrowly are the same
+    mechanism and not the same news. The keys are repeats by construction: the flag
+    is passed on the round after the pass that declared it, and only the keys THIS
+    round raised are honoured, so every one of them is a finding a fresh panel put up
+    again after a fixer said it was answered.
+
+    **And that is the whole of the charge.** Costing ``confident`` or ``converged`` at
+    or above the trigger floor was considered on the review of #631 and declined: it
+    would leave a fixer's only way to end a cycle cleanly the class-wide fix, which is
+    the pressure this outcome exists to remove, and it would price an ANSWER as though
+    it were an open question. The asymmetry with ``escalated`` — which costs a veto,
+    ``confident`` and ``converged`` — is the point rather than an oversight: one names
+    work nobody has done, the other names work that was done and bounded. What a
+    narrowing costs is two lines of justification, a board row and, where the general
+    form is itself a claim-miss, an issue; that bill is the caller's to collect, and
+    the reason line is what tells a human there is one outstanding.
+
+    **Why clearing is the point rather than a leniency.** A fixer that cannot answer a
+    finding partially will answer it maximally, because the maximal answer is the only
+    one that fully satisfies a brief which says "never note a problem and move on".
+    The maximal answer is what makes a pass edit files the finding never named, and
+    those files are where the next round's findings come from — one finding about one
+    route became server-level nginx ``gzip``, and the round after that was a P1
+    (lexray#1780, and ``surface`` below is the instrument for the same failure). Give
+    the partial answer a name and let it CLEAR, and it becomes reachable; leave it
+    counting as outstanding and rule 3 holds the cycle open until somebody writes the
+    class-wide fix, which is the pressure this branch exists to remove wearing a
+    kinder name.
+
+    It is not free. A narrowing owes two lines — why the narrow fix is complete for the
+    finding as raised, and what the general form would be — and a board row, and a
+    GitHub issue **only where the general form is itself a claim-miss**. None of that
+    is enforceable here: this function sees keys, and the cost is the caller's to
+    collect (``panel-review-pr.md``). What this function does guarantee is the one
+    thing a fixer could otherwise buy with the word: a **Sonar hard-gate issue cannot
+    be narrowed away**. See the comment on ``answered``.
+
+    The register carries the same two caveats the escalated one does, one paragraph
+    up, and for the same reasons — the keys are a claim by the agent that wrote the
+    fix, and a key is not a finding, so a fresh panel that words the defect
+    differently mints a key this cannot match and the finding is simply outstanding
+    again.
 
     **A stop that is HOLDING an escalation is never reported as convergence.** It
     takes a veto line, which costs ``confident`` by the existing rule, and it says
@@ -4489,6 +4629,33 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     line saying exactly why, never a merge and never a review that reads cleaner than
     it is; and ``escalate_on.unrefereed_fix: false`` switches it off in one line.
 
+    ``surface`` is #619, and it is the second argument to this function that decides
+    nothing — reported, never gated. It is the set of files the last fix pass touched
+    that no earlier round had read, measured in `panel.py` and arriving on a fixed
+    contract (``files``, ``new_files``, ``count``, ``prior_files``), or ``None`` where
+    there was no measurement to make.
+
+    **It is a quantity none of the other dials can see.** Everything downstream of a
+    fix pass counts lines or findings — ``max_fix_growth`` at 3.0x,
+    ``max_fix_growth_chars`` at 30,000, ``fix_injection`` at 0.5 — and a fix that adds
+    fifteen lines to two nginx templates nobody had reviewed is invisible to all three.
+    Surface is not size. On lexray#1780 round 3's pass touched twelve files and seven
+    of them had never been in front of a reviewer; both of the cycle's later P1s were
+    in that new surface, and ten of the PR's files arrived from a fix pass rather than
+    from the change under review. ``reviewer_scope`` bounds where a REVIEWER's findings
+    may land and nothing bounded where a FIXER's edits may.
+
+    **It is the instrument for the failure ``narrowed`` gives a vocabulary to**, which
+    is why the two arrived together: that one lets a fixer decline the class-wide fix,
+    this one counts the rounds where it was available and went unused.
+
+    **No gate, on #67's rule.** Nothing here reads it to move ``stop``, and the choice
+    between a dial (``max_fix_new_files``) and report-only has not been made. The
+    payload's ``fix_surface`` is null rather than zero where the measurement could not
+    be taken, on :func:`fix_surface_state`'s argument: round 1 has no pass to read, and
+    "the pass opened no new files" is a claim about a fix pass where what happened is
+    that nobody looked.
+
     ``revert`` is #506, and it is the only argument to this function that DECIDES
     NOTHING. Every other one can move ``stop``; this one cannot, in either direction.
     It exists because ending the cycle on ``injection`` is half an answer — **the fix
@@ -4515,6 +4682,27 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     is ``blind`` records that instead of naming a range it cannot see. ``offered`` is
     the field that says a proposal was actually put, and it is ``fired``'s counterpart
     one rule down.
+
+    **``converged`` (#626) is the payload saying, in one boolean, whether this was a
+    clean finish** — and it exists because until now the reader had to assemble that
+    from four fields and could assemble it wrong. It is true only where the cycle
+    STOPPED, ``confident``, with no veto line, nothing outstanding and no escalation
+    held; false in every other stop and on every ``go again``.
+
+    It is computed FROM ``confident`` rather than beside it, so a capped stop and a
+    vetoed stop are false here by construction rather than by two expressions
+    agreeing. Then it is stricter: it also requires ``outstanding.fixable``,
+    ``below_floor`` and the held escalations to be empty — the disposal's own "nothing
+    is outstanding — the cycle ends with nothing to hand on".
+
+    That strictness is where the judgement is, so it is stated. A below-floor policy
+    stop keeps its ``confident: True`` — #165 argues that at length and nothing here
+    revisits it — and is nevertheless NOT converged, because its ``reason`` is
+    "reported, not fixed here" rather than "dry" and the metric this field serves is
+    the share of cycles ending in a confident **dry** round. Counting it would count a
+    cycle that ended with real findings unfixed by policy as a clean finish. The
+    asymmetry is deliberate: a false negative costs such a round nothing it had, and a
+    false positive is the one reading this field exists to make impossible.
 
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
@@ -4559,7 +4747,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #
     # A `dict` is deliberately NOT rejected: it iterates its keys, which is correct
     # and is what the production call site passes (the register itself).
-    for name, value in (("repeated", repeated), ("escalated", escalated)):
+    for name, value in (("repeated", repeated), ("escalated", escalated),
+                        ("narrowed", narrowed)):
         if isinstance(value, str):
             raise TypeError(
                 f"round_stop({name}=...) takes a COLLECTION of finding keys, not one "
@@ -4568,31 +4757,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         if isinstance(value, int):
             raise TypeError(
                 f"round_stop({name}=...) takes finding KEYS, not a count ({value!r}): "
-                "the escalated ones are subtracted here, and a count computed by the "
-                "caller cannot express that")
-    held = frozenset(k for k in escalated if k)
-    # The escalated keys THIS round actually saw. The register is a property of
-    # the cycle and only grows; what is blocking is a property of the round, and
-    # conflating them meant one stale or mistyped key made every later round of
-    # the cycle non-confident forever — including rounds that were genuinely dry,
-    # and including after a human had answered the premise and the code moved.
-    # A permanently vetoed cycle is the "loud and wrong" a reader learns to
-    # ignore, which is worse than the jam this whole rule closes.
-    blocking = held & ({*new_keys} | {c.key for c in outstanding})
-    # The work a fix round can actually clear, under names of their own. The
-    # subtraction happens ONCE, before the rules, because every rule below asks
-    # "is there work outstanding" and an escalated finding is precisely work the
-    # cycle has been forbidden to do — but the parameters keep meaning what they
-    # are called, so the cap message and anything else downstream that wants "what
-    # the cycle still has to clear, escalations and all" can still say so.
-    clearable_new = [k for k in new_keys if k not in held]
-    clearable = [c for c in outstanding if c.key not in held]
+                "the escalated and the narrowed ones are subtracted here by key, and a "
+                "count computed by the caller cannot express that")
     # Severity by key, off `outstanding` — which carries it for the same findings
     # `new_keys` and `repeated` name. Deriving it here rather than widening either
     # parameter keeps every existing caller's contract: they pass bare keys today,
     # and a key whose severity this cannot find is treated as ABOVE the floor (the
     # `SEVERITIES[0]` fallback), so an unrecognised key costs a round rather than
     # silently dropping a finding out of the loop.
+    #
+    # This and `exempt` sit ABOVE the escalation/narrowing filters rather than below
+    # them because `answered` reads `exempt` — a Sonar gate issue may not be narrowed
+    # away — and the filters are what the four rules are applied to. Nothing here
+    # depends on them in return: both are read straight off `outstanding`.
     severity = {c.key: c.severity for c in outstanding}
     # SONAR'S HARD-GATE ISSUES ARE EXEMPT FROM BOTH FLOORS, AT EVERY RULE, whatever
     # severity Sonar itself gave them — and Sonar's own severities are routinely P3
@@ -4623,11 +4800,88 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         return (key in exempt
                 or severity_at_least(severity.get(key, SEVERITIES[0]), floor))
 
+    held = frozenset(k for k in escalated if k)
+    # The escalated keys THIS round actually saw. The register is a property of
+    # the cycle and only grows; what is blocking is a property of the round, and
+    # conflating them meant one stale or mistyped key made every later round of
+    # the cycle non-confident forever — including rounds that were genuinely dry,
+    # and including after a human had answered the premise and the code moved.
+    # A permanently vetoed cycle is the "loud and wrong" a reader learns to
+    # ignore, which is worse than the jam this whole rule closes.
+    blocking = held & ({*new_keys} | {c.key for c in outstanding})
+    # #615's fourth outcome, and the SECOND filter in front of the four rules. A
+    # `narrowed` finding is one the fix pass answered AT THE POINT IT WAS RAISED,
+    # declaring the general form a separate change — so unlike an escalation it is
+    # answered rather than forbidden, and it CLEARS: it is not outstanding, rule 3
+    # does not count it, and no veto line is owed for it.
+    #
+    # Why it has to clear rather than merely soften the stop: the vocabulary was
+    # `fixed | refuted | deferred` plus escalation, and none of those is "I fixed this
+    # one and not its class". A fixer with no way to answer a finding partially
+    # answers it MAXIMALLY — which is what makes a pass touch files the finding never
+    # named (#619), and the files a fix pass pulls in are where the next round's
+    # findings come from. Measured on lexray#1780: one finding about one route became
+    # server-level nginx `gzip`, and the round after that was a P1. Leaving `narrowed`
+    # as a flavour of "still outstanding" would leave rule 3 holding the cycle open
+    # until somebody wrote the class-wide fix, which is the same pressure under a
+    # kinder name.
+    #
+    # A SONAR HARD-GATE ISSUE CANNOT BE NARROWED, and the guard is here rather than in
+    # a rule for the reason the `exempt` comment above gives: the exemption is a
+    # property of the KEY. Narrowing is a judgement about how far to fix a judged
+    # finding; a red quality gate is not a judgement and keeps the PR unmergeable at
+    # any severity, so "answered at the point it was raised" is not something a caller
+    # gets to say about one. Subtracting it would end the cycle confident with the
+    # gate still red — the exact bug `outstanding = to_fix + sonar` was written to fix,
+    # arriving through a third door.
+    answered = frozenset(k for k in narrowed if k) - exempt
+    #: The narrowed keys THIS round actually raised, on `blocking`'s terms and for its
+    #: reason: the register is a property of the cycle and what was subtracted is a
+    #: property of the round, and a payload that reported the first would go on
+    #: crediting a narrowing long after the code moved.
+    narrowed_cleared = answered & ({*new_keys} | {c.key for c in outstanding})
+    # The work a fix round can actually clear, under names of their own. The
+    # subtraction happens ONCE, before the rules, because every rule below asks
+    # "is there work outstanding" and an escalated finding is precisely work the
+    # cycle has been forbidden to do — and a narrowed one is work it has already
+    # done — but the parameters keep meaning what they are called, so the cap
+    # message and anything else downstream that wants "what the cycle still has to
+    # clear, escalations and all" can still say so.
+    #
+    # ONE subtracted set for the rules and TWO reported ones, because the rules ask
+    # the same question of both ("is there work here a fix round can clear?") and a
+    # reader asks different ones ("what is a human owed?" against "what did the fixer
+    # decline to generalise?"). Folding them into one name would make an escalation
+    # and a narrowing indistinguishable in the payload; keeping two subtractions would
+    # be two places for the filter to fall out of step.
+    cleared_out = held | answered
+    clearable_new = [k for k in new_keys if k not in cleared_out]
+    clearable = [c for c in outstanding if c.key not in cleared_out]
     #: New findings that buy a round, and the ones that were raised and do not.
     triggering = [k for k in clearable_new if above(k, trigger_floor)]
     quiet_new = [k for k in clearable_new if not above(k, trigger_floor)]
+    # Rule 3, at the TRIGGER floor and not the cleared one (#621). The rule is "would
+    # this finding have bought a round when it was new?", and a finding that never
+    # bought one does not start buying them by being raised twice. Bounded by
+    # `cleared_floor` it did: at a fix floor low enough for a budget to reach P3/P4,
+    # one unpaid sub-trigger finding is outstanding every round by construction, and
+    # the only move that closes it is the fixer writing lines — which is what authors
+    # the next round's findings. Rules 2 and the disposal keep the cleared floor;
+    # `exempt` still carries a Sonar gate issue past both, and `held`/`answered` are
+    # still subtracted in front of all four.
     repeats = len({k for k in repeated
-                   if k and k not in held and above(k, fix_floor)})
+                   if k and k not in cleared_out and above(k, trigger_floor)})
+    #: What the new floor stood down on: an earlier round raised them, they are still
+    #: outstanding, and they are under the trigger floor. Counted so that the stop can
+    #: SAY so. #621's decision is that these are "reported and do not go again", and
+    #: the reporting half is not optional — a round holding one is not dry, and letting
+    #: it fall through to the dry branch would put a judge-confirmed defect the fixer
+    #: was told about behind the word this whole payload is organised against. #165's
+    #: below-floor branch for NEW findings already settled the shape: a policy stop
+    #: names what it left, keeps its confidence, and takes no veto line, because the
+    #: repo said which findings are worth a round and the round obeyed.
+    quiet_repeats = {k for k in repeated
+                     if k and k not in cleared_out and not above(k, trigger_floor)}
     # Rule 2. The hardcoded ``("P1", "P2")`` is what makes the exemption necessary
     # HERE as well as in `above`: without the first clause a P3 gate issue could not
     # be a blocker at all, however red the gate, so a still-open one had to fall
@@ -4636,7 +4890,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     blockers = [c for c in clearable
                 if c.key in exempt
                 or (c.severity in ("P1", "P2")
-                    and severity_at_least(c.severity, fix_floor))]
+                    and severity_at_least(c.severity, cleared_floor))]
     #: How many of them are gate issues rather than judged P1/P2s — the `reason`
     #: has to be true of what it counted, and "P1/P2 still outstanding" is not true
     #: of a P3 `python:S1128`.
@@ -4654,19 +4908,21 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # `outstanding`), so the union changes nothing there and closes the gap for every
     # other caller.
     work = ({c.key for c in outstanding} | {k for k in new_keys if k}
-            | {k for k in repeated if k}) - held
-    #: Split by the FIX floor at both rules, never the trigger floor. #165's two dials
-    #: answer different questions — which findings buy another ROUND, and which a fix
-    #: pass was asked to CLEAR — and a disposal is the second question. A finding above
-    #: the trigger floor and below the fix floor bought this cycle its rounds and was
-    #: never work anybody was asked to do.
-    fixable = sorted(k for k in work if above(k, fix_floor))
+            | {k for k in repeated if k}) - cleared_out
+    #: Split by the CLEARED floor on both sides, never the trigger floor. #165's two
+    #: dials answer different questions — which findings buy another ROUND, and which a
+    #: fix pass was asked to CLEAR — and a disposal is the second question. Since #621
+    #: moved rule 3 onto the trigger floor this is the ONLY reader of the cleared floor
+    #: besides rule 2, and it is why the two are still separate dials: a finding above
+    #: the cleared floor and below the trigger one is work a fix pass can take and no
+    #: reason to spend another round, which is exactly what `fixable` is for.
+    fixable = sorted(k for k in work if above(k, cleared_floor))
     #: Reported, not fixed here, and NOT handed to anybody — the repo's own policy.
     #: #165 is explicit that a below-floor stop is a POLICY stop and not a failure, so
     #: listing these as work awaiting a fixer would re-open a decision the repo has
     #: already taken. They are named because the alternative is silence, and silence
     #: about them is what lets a below-floor stop read as a dry one.
-    below_floor = sorted(k for k in work if not above(k, fix_floor))
+    below_floor = sorted(k for k in work if not above(k, cleared_floor))
     if triggering:
         stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
@@ -4685,12 +4941,56 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         stop, reason = True, (
             f"{len(quiet_new)} new finding(s), none at or above the "
             f"{trigger_floor} round trigger floor — reported, not fixed here")
+    elif quiet_repeats:
+        # After `quiet_new` for its own reason one rule up — the most specific true
+        # thing wins, and "this round found something new" says more than "this round
+        # still carries something old". Before the escalation stop and the dry branch
+        # because both would be false here.
+        stop, reason = True, (
+            f"{len(quiet_repeats)} finding(s) an earlier round raised are still "
+            f"outstanding, none at or above the {trigger_floor} round trigger floor "
+            "— reported, not fixed here")
     elif blocking:
         # Not "dry": something WAS raised and is unanswered. A reader reconciling
         # "dry" against a PR carrying an open premise question would be told
         # something untrue about why the loop stopped.
         stop, reason = True, (f"nothing left that a fix round can clear — "
                               f"{len(blocking)} escalated finding(s) await a human")
+    elif narrowed_cleared:
+        # #615's own stop, and it is `quiet_repeats`' argument applied to the fourth
+        # outcome. A narrowing CLEARS — that is the whole of the feature and nothing
+        # here revisits it — but a round that stopped because a fix pass declared
+        # findings answered AT THE POINT THEY WERE RAISED did not stop because
+        # nothing was raised, and "dry" is the one word this payload is organised
+        # against lending to a round that was not.
+        #
+        # The keys here are repeats by construction. `--narrowed` is passed on the
+        # round that follows the pass which declared it and on no other
+        # (`panel-review-pr.md`), and `narrowed_cleared` is bounded to the keys THIS
+        # round raised — so every key in it is a finding a fresh panel put up again
+        # after the fix pass said it had answered it. Without this branch the loudest
+        # such round there is, a judge-confirmed P1 cleared on the fixer's own
+        # say-so, reported "dry — nothing raised that an earlier round had not" with
+        # `converged: True` beside it.
+        #
+        # The trigger-floor count is said OUT LOUD, because it is the one number that
+        # separates a P1 answered narrowly from a P4 answered narrowly and nothing
+        # else in the reason carries it. It costs no confidence: see the docstring —
+        # an escalation is an open question a human owes an answer to, a narrowing is
+        # an answer already given, and charging it a veto rebuilds the pressure to
+        # write the class-wide fix that #615 exists to remove.
+        #
+        # BELOW `blocking` and below the two floor stops, on the chain's own rule
+        # that the most specific TRUE thing wins: each of those names work that is
+        # still open, and an answer already given says less than an open question.
+        # Above the dry branch, which is the only one it must never fall through to.
+        loud = sorted(k for k in narrowed_cleared if above(k, trigger_floor))
+        stop, reason = True, (
+            f"nothing left that a fix round can clear — {len(narrowed_cleared)} "
+            "finding(s) were answered at the point they were raised and the general "
+            "form declined"
+            + (f", {len(loud)} of them at or above the {trigger_floor} round trigger "
+               "floor" if loud else ""))
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -5094,8 +5394,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         why = ("nothing is outstanding — the cycle ends with nothing to hand on"
                if not below_floor else
                f"{len(below_floor)} finding(s) are outstanding and every one is under "
-               f"the {fix_floor} fix floor: the repo's own policy is that these are "
-               "reported and not fixed here, so nothing is handed on (#165)")
+               f"the {cleared_floor} cleared floor: the repo's own policy is that "
+               "these are reported and not fixed here, so nothing is handed on (#165)")
+    # Computed here rather than inline in the payload so that `converged` below is
+    # built FROM it and cannot drift out of step with it: a capped or vetoed stop is
+    # then unable to read as a clean finish by construction rather than by two
+    # expressions agreeing.
+    confident = bool(stop and not capped and not veto and baseline_ok)
     return {
         "stop": stop,
         "reason": reason,
@@ -5106,10 +5411,45 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # question wants the second. Sorted, so a round that declares the same set
         # twice writes the same bytes and a diff means something changed.
         "escalated_outstanding": sorted(blocking),
+        # What this ROUND cleared narrowly (#615), on `escalated_outstanding`'s terms:
+        # the register it was given, narrowed to the keys this round raised. These are
+        # the findings that did NOT count at any rule and are not in `outstanding`
+        # below, so a reader reconciling this round's finding count against the
+        # disposal would otherwise find them missing from both and conclude the payload
+        # had dropped them. No veto is owed and none is taken: a narrowing is an answer,
+        # not an open question — the two lines of justification and the board row it
+        # owes are the caller's (`panel-review-pr.md`), and an issue is owed only where
+        # the general form is itself a claim-miss.
+        "narrowed": sorted(narrowed_cleared),
         # "Nothing left to find" is a claim; "the counter hit zero" is not the
         # same claim, and the difference is exactly what a reader of a clean
         # verdict needs to see.
-        "confident": bool(stop and not capped and not veto and baseline_ok),
+        "confident": confident,
+        # #626, and it is the number this whole convergence epic is judged on: the
+        # share of cycles ending in a confident dry round. Every field it is built
+        # from was already here and a reader had to ASSEMBLE it — `stop` and
+        # `confident` and an empty `veto` and an empty `outstanding.fixable` and an
+        # empty `escalated_outstanding` — which is four joins to answer one question,
+        # and four places to get it wrong in the direction that flatters the loop.
+        #
+        # `confident` carries the first four conjuncts (a stop, not capped, no veto,
+        # a baseline that loaded), so a CAPPED stop and a VETOED stop are both false
+        # here by construction — that is the guarantee, and it is why this is computed
+        # off `confident` rather than beside it: the two cannot disagree.
+        #
+        # The rest is "and nothing was left": nothing a fix pass could take
+        # (`fixable`), nothing under the cleared floor either (`below_floor`), and no
+        # escalation being held (`blocking`). That is exactly the disposal's own
+        # "nothing is outstanding — the cycle ends with nothing to hand on", and it is
+        # deliberately STRICTER than `confident`. A below-floor policy stop is a
+        # legitimate configured convergence and keeps its confidence (#165 argues that
+        # at length and nothing here revisits it) — but its `reason` is "reported, not
+        # fixed here" rather than "dry", and a metric that counted it would be counting
+        # a cycle that ended with real findings unfixed by policy as a clean finish.
+        # False here costs such a round nothing; a false TRUE would be the one reading
+        # this field exists to make impossible.
+        "converged": bool(confident and not fixable and not below_floor
+                          and not blocking),
         "veto": veto,
         "round": round_no,
         "max_rounds": max_rounds,
@@ -5119,9 +5459,24 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # is the count that would otherwise be invisible: those findings ARE in
         # the payload's buckets, and nothing else says they were new and did not
         # buy a round.
+        # #549: the second is `Dials.cleared_floor` and is published under that name.
+        # It used to be published as `fix_floor` while `Dials.fix_floor` — live, one
+        # module over, with its own docstring — held a DIFFERENT value at the shipped
+        # defaults (`P2` here against `P3` there). An orchestrator briefing a fixer
+        # from the JSON rather than from the report briefed the wrong floor and
+        # silently dropped a whole band out of the round's work. Concept three under
+        # concept two's name is not two concepts sharing a name loosely; the test at
+        # `test_panel_dials.py::test_the_dials_answer_the_three_floor_questions_separately`
+        # already writes the invariant down and only the serialisation disagreed.
         "trigger_floor": trigger_floor,
-        "fix_floor": fix_floor,
+        "cleared_floor": cleared_floor,
         "new_below_trigger_floor": sorted(quiet_new),
+        # #621's counterpart to the line above, and there for its reason: these
+        # findings ARE in the payload's buckets, and nothing else says an earlier
+        # round raised them and they still did not buy this one. The pair is what
+        # lets an aggregator tell a repo that its trigger floor is where the cycle's
+        # unfinished work is going, rather than only that the cycle stopped.
+        "repeated_below_trigger_floor": sorted(quiet_repeats),
         # #84's register as this round read it, and ALWAYS present — an absent key
         # and "nothing was declared" are different claims, and a consumer that had
         # to tell them apart would be reading a payload's age rather than a cycle's
@@ -5197,6 +5552,15 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT.
         "unrefereed_fix": {**refereeing, "fired": unchecked},
+        # #619's measurement, and the ONE block here whose key can be null: the files
+        # the last fix pass touched that no earlier round had read. Reported and not
+        # gated — #67's instrument-before-gate rule, and the gate has not been decided
+        # — so unlike its four siblings it has no `fired` field, because there is no
+        # verdict to have. Null where it could not be measured (round 1, or no readable
+        # fix range), never a zero: `fix_surface_state` has the argument, and the short
+        # of it is that "no pass opened a new file" and "nobody looked" are different
+        # claims and only one of them is ever true of round 1.
+        "fix_surface": fix_surface_state(surface),
         # #42, and it is the only block here that is not about whether to go again.
         # Every other field answers "should another PANEL run"; this one answers the
         # second question `stop` was being read as answering and was never computed
@@ -5226,6 +5590,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             "fixable": fixable,
             "below_floor": below_floor,
             "escalated": sorted(blocking),
+            # #615, and here for the same reason `escalated` is repeated here: this
+            # block is the whole answer to "who gets what is left", and a narrowed
+            # finding is the one class that is in none of the three lists above
+            # because it was ANSWERED. Absent, a reader joining the round's findings
+            # against this block would find them nowhere and read the gap as a
+            # dropped finding rather than as a fixer's declared decision.
+            "narrowed": sorted(narrowed_cleared),
             # null on a `go again`, where no disposal is being made; otherwise
             # `fixer`, `human` or `nobody`. `why` is the sentence a relay repeats.
             "handed_to": handed_to,
@@ -5261,7 +5632,7 @@ __all__ = [
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
-    "unrefereed_fix_brake", "referee_state",
+    "unrefereed_fix_brake", "referee_state", "fix_surface_state",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",

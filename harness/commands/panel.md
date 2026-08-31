@@ -1,6 +1,6 @@
 # Loops — Reviewer Panel
 
-@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults.
+@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate where the repo enables that seat) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults.
 @arguments $ARGS: <pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)
 
 Run the reviewer panel over a pull request. Each reviewer (and the master judge)
@@ -10,7 +10,8 @@ test coverage and whether the tests present are load-bearing, docs, related code
 naming, complexity, style, DRY), ranked P1–P4,
 with the "nothing left to improve" standard. The master keeps every genuine
 finding (style and polish included) and drops only true false positives — the
-panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
+panel just adds independent reviewers on top of that bar, plus the hard CI gate and —
+where the repo enables the `sonarqube` seat — the SonarCloud one.
 
 1. Parse `$ARGS`: **every** integer is a **PR number** — `12`, `#12`, `12,14` and `12 14 19` all
    parse; an optional non-numeric word (not a `--flag`) is the **repo** (default: the cwd's repo).
@@ -62,15 +63,31 @@ panel just adds independent reviewers + hard CI/Sonar gates on top of that bar.
      definitions) and say explicitly that its correctness is carried over from when it landed
      on the base branch, not established here.
 6. Show the user the output: **To fix** (master-confirmed, any reviewer count), **Dismissed by
-   master**, **SonarCloud issues**, any skipped reviewers, and the **Coverage declared** block —
+   master**, **SonarCloud issues** where the `sonarqube` seat ran, any skipped reviewers, and the
+   **Coverage declared** block —
    what each reviewer said it could not assess, and any reviewer the panel truncated. A clean
    panel whose reviewers each read half the diff is not a clean PR, and the finding list alone
    cannot tell you which one you got. Confirm whether the summary was
    posted to the PR. If the panel ran on a hand-picked set, say so — "reviewed by codex alone" is a
    materially weaker claim than "reviewed by the panel", and the reader of the PR comment can't tell
    the difference from the findings. For a multi-PR run, give that block per PR plus a
-   one-line-per-PR roll-up (PR · to-fix count · SonarCloud gate · posted?), and name any PR whose
+   one-line-per-PR roll-up (PR · to-fix count · SonarCloud gate, or `n/a` where the seat did not
+   run · posted?), and name any PR whose
    agent stopped early rather than letting the roll-up imply it was panelled.
+
+   **"The hard gate is clear" may only be said about a round that had one.** `sonarqube` is
+   `enabled: false` in this repo's rules and off in the harness defaults, and it is being switched
+   off across the fleet while the convergence work is proven — so most rounds have no SonarCloud
+   block, and an empty one would be a claim that a gate looked and found nothing. Read
+   `reviewers_ran`, and where the seat did not run say there was no gate rather than reporting a
+   clear one.
+
+   **Two kinds of "skipped", and only one is a coverage gap.** A seat the repo has **configured
+   off** is a decision somebody took: state it once as configuration if it is worth stating at all,
+   and do not warn about it every round — that is how a reader learns to skim the line where the
+   other kind appears. A seat **configured on that did not run** — missing CLI, dead login, a
+   crash — makes the review thinner than the one that was asked for and nobody chose that: report
+   it every time, with what its absence cost.
 
 7. **Land-readiness: report it, never offer it.** If the user wants to know whether the PR could
    merge, `python3 ~/.claude/loops/preland.py --pr <pr> --repo <path>` answers it, and reporting
@@ -87,9 +104,15 @@ Notes:
   merges, and never offers to merge; pass `--no-post` for a silent read-only run. It reviews the
   PR **as it is now**: use `/panel-review-pr` when the fix that follows should itself be reviewed,
   which is what its rounds are for, and when the review should end with an offer to land.
-- First run needs `op signin` once (the SonarCloud token then caches), `codex login` for the Codex
-  reviewer, `agy` auth for the Antigravity one and `grok login` for the Grok one; missing reviewers
-  are reported as skipped, not fatal.
+- `sonarqube` is off in the harness defaults and `enabled: false` in this repo's
+  `.harness-rules.sample`, and it is being switched off across the fleet while the convergence work
+  is proven. That is a temporary deactivation of a seat that comes back, not the removal of the
+  hard-gate concept: where a repo turns it on, its issues are a hard gate and MUST end up resolved.
+  Where it is off there is no gate on the round, and step 6 is where that has to be said rather
+  than implied.
+- First run needs `op signin` once where that seat is on (the SonarCloud token then caches),
+  `codex login` for the Codex reviewer, `agy` auth for the Antigravity one and `grok login` for the
+  Grok one; missing reviewers are reported as skipped, not fatal.
 - `antigravity`, `pi` and `grok` are off unless a repo's `.harness-rules` enables them — each is a
   workstation-only CLI on a personal account, so none reaches the work box. `--reviewers` still runs
   them on demand anywhere the CLI exists.
