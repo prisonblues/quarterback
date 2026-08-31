@@ -1141,6 +1141,7 @@ def restored_lines(repo_path: str, added: dict[str, dict[int, str]],
                       "orphaned stays reachable only where somebody still holds it")
         return out
     if len(files) * len(heads) > RESTORED_MAX_READS:
+        out["unread"] = sorted(unread)
         out["why"] = (f"{len(files)} file(s) across {len(heads)} earlier round(s) is more "
                       f"than the {RESTORED_MAX_READS} file-versions this will read out of "
                       "the object store — a filter applied to some of the files and not "
