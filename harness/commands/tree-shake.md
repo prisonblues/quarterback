@@ -18,9 +18,28 @@ cleans their DB, containers, nginx block, port, and dir in one go):
 
 - List live worktrees: `git worktree list`.
 - For each linked worktree (not the main checkout), check whether its branch is
-  done — e.g. its PR is merged (`gh pr view <branch> --json state,mergedAt` or
-  `gh pr list --head <branch> --state merged`) or the branch is fully merged
-  into the default branch (`git branch --merged`).
+  done — its PR is merged (`gh pr view <branch> --json state,mergedAt` or
+  `gh pr list --head <branch> --state merged`).
+- **Do not judge "done" against the default branch.** `git branch --merged main`
+  is only meaningful where PRs actually target the default branch, and in at
+  least one repo here they do not: lexray merges into `fca` and `test` while
+  `main` sits frozen, so that check calls every branch unmerged.
+- **A merged PR does not mean the branch holds nothing.** Commits added *after*
+  the PR — the post-merge tweak nobody pushed — die with the branch, and
+  `remove-worktree` deletes the branch unless `--keep-branch`. Compare against
+  the PR's own head SHA, which is base-independent:
+  ```bash
+  head=$(gh pr list --head "$br" --state all --json headRefOid -q '.[0].headRefOid')
+  git cat-file -e "$head" || echo "cannot verify — treat as in-progress"
+  git log --oneline "$head".."$br" --not --remotes    # non-empty => do not reap
+  ```
+  `--not --remotes` is what makes this about loss rather than tidiness:
+  `remove-worktree` deletes only the *local* branch, so a post-PR commit already
+  pushed somewhere survives the teardown and must not block it.
+  The `cat-file` guard is load-bearing: with the object absent `git log` fails and
+  a bare `| wc -l` reads 0, i.e. "nothing to lose" on exactly the branch you
+  cannot vouch for. `remove-worktree` refuses these itself, but classify them as
+  in-progress here so the user is not offered them in the first place.
 - **A merged PR does not mean nobody is in there.** Run
   `worktree-holder <path>` on every candidate before offering it for teardown,
   and treat exit 3 as in-progress no matter what its PR says — an agent can be
