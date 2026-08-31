@@ -5119,14 +5119,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #: repo said which findings are worth a round and the round obeyed.
     quiet_repeats = {k for k in repeated
                      if k and k not in cleared_out and not above(k, trigger_floor)}
-    # Rule 2. The hardcoded ``("P1", "P2")`` is what makes the exemption necessary
-    # HERE as well as in `above`: without the first clause a P3 gate issue could not
-    # be a blocker at all, however red the gate, so a still-open one had to fall
-    # through to rule 3 and would be lost with it the moment `repeated` did not
-    # carry the key (a round whose baseline could not be attributed, for one).
+    # Rule 2. The hardcoded ``("P1", "P2")`` — :data:`panel_core.BLOCKING_SEVERITIES`
+    # since #78, named rather than spelled because the corroboration threshold has to
+    # read the same set to know which findings it may never stand down — is what makes
+    # the exemption necessary HERE as well as in `above`: without the first clause a
+    # P3 gate issue could not be a blocker at all, however red the gate, so a
+    # still-open one had to fall through to rule 3 and would be lost with it the moment
+    # `repeated` did not carry the key (a round whose baseline could not be attributed,
+    # for one).
     blockers = [c for c in clearable
                 if c.key in exempt
-                or (c.severity in ("P1", "P2")
+                or (c.severity in BLOCKING_SEVERITIES
                     and severity_at_least(c.severity, cleared_floor))]
     #: How many of them are gate issues rather than judged P1/P2s — the `reason`
     #: has to be true of what it counted, and "P1/P2 still outstanding" is not true

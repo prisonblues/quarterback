@@ -746,3 +746,28 @@ def test_a_name_the_table_does_not_know_gets_no_scope_verdict():
     on the scope line, which is not where the mistake is."""
     assert hr.dial_scope_problem("tempo", "acme/widget") == ""
 
+
+
+def test_a_board_written_severity_map_is_normalised_like_every_other_severity(
+        repo, monkeypatch):
+    """#78's `threshold_by_severity` is the one dial whose value is a MAPPING, so the
+    normalisation every floor gets has to reach its KEYS. A board that stored
+    `{"p3": 2}` and a rules file that wrote `{"P3": 2}` are one policy; two bands is
+    what a reader could not tell apart, in the layer a person writing into a settings
+    endpoint cannot see."""
+    board(monkeypatch, dial("review_panel.threshold_by_severity", {" p3 ": 2}))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["review_panel"]["threshold_by_severity"] == {"P3": 2}
+
+
+def test_a_severity_map_with_a_band_nothing_answers_to_is_refused_at_the_board(
+        repo, monkeypatch, capsys):
+    """VALUES ARE CHECKED, NOT JUST NAMES, and for a mapping that has to reach inside
+    it. A board row carrying `{"P0": 2}` would otherwise be reported as in force and
+    applied by nothing, which is the state this whole layer's refusals exist to
+    prevent."""
+    hr._reported.clear()
+    board(monkeypatch, dial("review_panel.threshold_by_severity", {"P0": 2}))
+    cfg = hr.resolve_repo(str(repo))
+    assert cfg["review_panel"]["threshold_by_severity"] == {}
+    assert "must be keyed by severity band" in capsys.readouterr().err
