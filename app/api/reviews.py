@@ -324,6 +324,41 @@ Three rules make the number worth reading:
   and ``human_refuted``, which is what makes the declaration falsifiable rather
   than free. ``scripts/needs_human_labels.py`` projects the vocabulary onto the
   ``needs-human/*`` GitHub labels, so #63's stated signal is real.
+
+**#643 — a fifth dropped key, and the check that stops there being a sixth.** The
+v2.26 note above records three fields the panel sent and this model discarded
+without a word; #626 added ``converged`` as the fourth. Each was found by a human
+noticing a number was missing, months apart, and nothing ever failed. The reason
+is at the top of :class:`ReviewIn`: ``extra="ignore"`` is pydantic's default and
+this model does not override it, so a key the panel sends and this model does not
+name goes on the floor.
+
+``tests/test_payload_key_drift.py`` is the check that was missing. It reads every
+top-level key the panel's payloads carry out of ``harness/loops/panel.py`` — by
+``ast``, not by import, for the reason ``tests/test_post_type_drift.py`` gives —
+and compares them against this model's field names **and aliases**. What is left
+over is what ingest drops, and the test holds it against a hand-written list of
+the keys that are dropped **on purpose**. So a key added to the payload fails the
+suite on the commit that adds it, and the only way past is to name it: as a field
+here, or as a line on that list. Neither is silence, which is the whole point.
+
+The list is written out rather than computed. A computed one would pass forever,
+which is the failure mode of every check this class of bug has survived.
+
+``review_panel`` is the one key that came off that list rather than going onto
+it. It is the dial set a round APPLIED — the twelve #165/#297 settings — and it
+is what ``converged`` was decided under: two of that flag's conjuncts are cut at
+``cleared_floor``, which is a function of three dials in this object, so a reader
+handed ``converged`` had no way to check it against anything. It is stored
+opaquely and nothing here reads a dial out of it (``app/api/dials.py`` argues why
+this board must not learn the vocabulary), carried on ``GET /review/{id}`` beside
+the verdict, and refused whole rather than trimmed when it is too big to store —
+half a policy record is not a smaller policy, it is one no round ran under.
+
+The remaining twenty-five are listed in that test with the reasoning for each
+tier. None of them shares a name with a ``review_runs`` column, which the test
+also asserts: that pairing — a column that wants a value, and a payload sending
+it into ``extra="ignore"`` — is exactly the shape ``converged`` had.
 """
 
 from __future__ import annotations
@@ -1418,6 +1453,76 @@ MAX_CHANGED_FILES = 5000
 #: The states GitHub reports for a PR. Anything else is recorded as NULL rather
 #: than verbatim — see :meth:`ReviewIn._state`.
 PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+#: How big a stored ``review_panel`` may be, serialised. The panel sends twelve
+#: scalars — a few hundred characters — and this leaves room for the block to grow
+#: several times over while still bounding what one authenticated-but-unbounded
+#: sender can put in a JSONB column it never has to justify the contents of.
+#:
+#: The bound REFUSES rather than trims, unlike ``MAX_CHANGED_FILES`` one constant
+#: up, and the difference is the point: a truncated file list is a shorter true
+#: list, whereas half a policy record is a false one. A reader holding a round's
+#: verdict against six of its twelve dials would be checking it against a policy
+#: that never ran. See :func:`_dials_or_none`.
+MAX_DIALS_CHARS = 8192
+
+
+def _dials_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``review_panel`` as this board will store it, and why it did not (#643).
+
+    The dials a round applied, kept **verbatim and uninterpreted**. Every other
+    coercer in this module reads its value against a vocabulary the two sides
+    share — :data:`PROVENANCE`, :data:`PR_STATES` — and this one deliberately has
+    none: the board does not know what a dial means and must not learn, which is
+    the argument ``app/api/dials.py`` makes at length and the drift #305 was filed
+    over. So a dial name is not checked, a dial value is not coerced, and nothing
+    here derives one dial from another.
+
+    What is left to refuse is shape and size, and both refuse the WHOLE object
+    rather than part of it. A dial set with half its keys dropped is not a smaller
+    true policy, it is a policy that never ran, and a reader checking a round's
+    verdict against it would be checking against a fiction — the same collapse
+    :func:`_unread_paths` refuses when it returns ``None`` for a declaration it
+    could read nothing out of, one argument up.
+
+    Returns the pair ``(stored, why)``: ``why`` is ``""`` when nothing was
+    refused, and otherwise the one-line reason :func:`record_review` reports back
+    to the sender. Two answers from one function for :func:`_unread_paths`'s
+    reason — the validator stores and the response explains, and two
+    implementations of "was this usable" eventually disagree about a payload
+    nobody looked at twice.
+    """
+    if v is None:
+        return None, ""
+    if not isinstance(v, Mapping):
+        # Named in `unreadable_fields` beside the other wrong-shaped values, not
+        # here: that list is the coarsest drop signal and this one belongs on it.
+        return None, ""
+    # `allow_nan=False`, which is NOT the default and is the whole reason this
+    # goes through `json.dumps` rather than a length estimate. Python's JSON
+    # reader accepts the non-standard `NaN`, `Infinity` and `-Infinity` literals,
+    # so starlette parses a body containing one and hands this validator a float
+    # Postgres will not take in a JSONB column. Without the flag the refusal
+    # happens at INSERT, as a 500 on a request that had already passed every
+    # check this module makes — a stored-policy record turning a panel round into
+    # a failed POST, which is the opposite of "a dropped field says so".
+    try:
+        dumped = json.dumps(v, allow_nan=False)
+    except (TypeError, ValueError):
+        return None, ("review_panel held a value this board cannot store as JSON "
+                      "— NaN, an infinity, or something that is not JSON at all")
+    # The other value Postgres refuses in JSONB, and it survives every check above:
+    # a NUL inside a string. `json.dumps` writes it as the six characters `\u0000`,
+    # which is what this looks for — the parsed value holds one real NUL and
+    # scanning the dump is the only place both keys and nested values are in reach.
+    if "\\u0000" in dumped:
+        return None, ("review_panel held a NUL inside a string, which Postgres "
+                      "refuses in a JSONB value")
+    if len(dumped) > MAX_DIALS_CHARS:
+        return None, (f"review_panel was {len(dumped)} characters, over the "
+                      f"{MAX_DIALS_CHARS} a stored policy record may be — refused "
+                      f"whole rather than trimmed, because half a dial set is not "
+                      f"a policy any round ran under")
+    return dict(v), ""
 
 
 def _unread_paths(v: object) -> tuple[list[str] | None, int]:
@@ -1645,6 +1750,18 @@ class ReviewIn(BaseModel):
     #: against some other denominator would silently invent.
     recurrence_counts: dict[str, int] | None = None
     premise_counts: dict[str, int] | None = None
+    #: The review dials this round APPLIED, stored verbatim and never interpreted
+    #: — #643, and the fifth field the panel has been sending into ``extra=
+    #: "ignore"``. It is the policy ``converged`` was decided under, which is the
+    #: one thing a reader could not check the stored verdict against.
+    #:
+    #: Absent / ``null`` is "the panel did not say", which is also every skip and
+    #: refusal path: those resolve a policy and never apply one, so the panel sends
+    #: null there deliberately. ``{}`` is a caller that sent an empty object, and
+    #: the two stay apart on this model for the reason every other three-state
+    #: field here does. See :func:`_dials_or_none` for what is refused and why the
+    #: refusal is whole-object.
+    review_panel: dict[str, Any] | None = None
     #: Set by the validators, never by the caller: what was trimmed, what could
     #: not be read, and which bucket names this board did not recognise. All of it
     #: reported in the response, none of it storable by the sender.
@@ -1664,6 +1781,11 @@ class ReviewIn(BaseModel):
     #: refused has to guess which field to go and look at.
     merge_base_dropped: str | None = None
     base_sha_dropped: str | None = None
+    #: Why a ``review_panel`` that arrived was not stored, or ``""``. Its own
+    #: signal rather than a line in ``unreadable_fields``: that list means "this
+    #: value was not the SHAPE its field takes", and an object refused for its SIZE
+    #: is a different sender fault wanting a different remedy.
+    review_panel_dropped: str = ""
     #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
     #: Tally keys that ARE a known bucket and whose count could not be believed —
@@ -1750,6 +1872,7 @@ class ReviewIn(BaseModel):
         _, unusable = _unread_paths(unread)
         head = v.get("head_sha")
         merge_base, base_sha = v.get("merge_base"), v.get("base_sha")
+        dials = v.get("review_panel")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -1799,10 +1922,21 @@ class ReviewIn(BaseModel):
                 "recurrence_counts_unusable": recurs_unusable,
                 "premise_counts_unknown": premise_unknown,
                 "premise_counts_unusable": premise_unusable,
+                # Why a dial set was refused — its own key, because
+                # `unreadable_fields` below can only say "that was not the shape
+                # this field takes" and the commonest refusal here is a shape that
+                # IS a mapping and is too big to store.
+                "review_panel_dropped": _dials_or_none(dials)[1],
                 "unreadable_fields": sorted(
                     name for name, val, ok in (
                         ("unread_files", unread, isinstance(unread, (str, list))),
                         ("provenance_counts", counts, isinstance(counts, Mapping)),
+                        # `review_panel: "P2"` is a producer sending the wrong
+                        # SHAPE for a policy record, and without this it would land
+                        # on the NULL that means "this round applied no policy" —
+                        # which is a true statement about a skip and a false one
+                        # about a reviewed round.
+                        ("review_panel", dials, isinstance(dials, Mapping)),
                         # #67's two, on the same rule: `recurrence_counts:
                         # ["revisited"]` is a producer sending the wrong SHAPE, and
                         # it would otherwise land on NULL indistinguishable from a
@@ -1835,6 +1969,13 @@ class ReviewIn(BaseModel):
         empty list. What it could not read is counted in ``unread_files_unusable``
         and named back by :func:`record_review`."""
         return _unread_paths(v)[0]
+
+    @field_validator("review_panel", mode="before")
+    @classmethod
+    def _dials(cls, v: object) -> dict[str, Any] | None:
+        """The dials verbatim, or None. See :func:`_dials_or_none` for why a
+        refusal takes the whole object and why nothing here reads a dial's name."""
+        return _dials_or_none(v)[0]
 
     @field_validator("provenance_counts", mode="before")
     @classmethod
@@ -2476,6 +2617,11 @@ async def record_review(
         # carries a fact — "the question does not arise" — that no derivation
         # from findings could express.
         provenance_counts=body.provenance_counts,
+        # Verbatim, `{}` included, on `provenance_counts`' rule one line up: an
+        # empty object is a caller that sent one, and `or None` would rewrite it
+        # into "no panel ever said". Nothing on this board reads a dial out of it
+        # — see `_dials_or_none` for why that is deliberate rather than pending.
+        review_panel=body.review_panel,
         recurrence_counts=body.recurrence_counts,
         premise_counts=body.premise_counts,
         changed_lines=body.changed_lines,
@@ -2726,6 +2872,12 @@ async def record_review(
         dropped["converged_dropped"] = (
             "converged: true was sent with a round_stop that did not stop, or "
             "whose stop was not confident")
+    # #643. A dial set that arrived and was not stored, with the reason: a policy
+    # record refused in silence reads exactly like a round that applied no policy,
+    # which is what the skip paths legitimately send, so the sender would have no
+    # way to tell its payload was disbelieved.
+    if body.review_panel_dropped:
+        dropped["review_panel_dropped"] = body.review_panel_dropped
     # ...and the base end, each named rather than one flag for "a commit id was
     # refused". These two are what a pre-land verdict resolves against the repo,
     # so a producer sending a base it thinks was stored has to be told it was not.
@@ -6988,6 +7140,20 @@ async def get_review(
         # was cut, and folding one into the other on read would hand every
         # consumer the collapse the storage side is built to prevent.
         "unread_files": run.unread_files,
+        # #643: the policy this round ran under, beside the verdict it produced.
+        # `_run_view` above carries `converged`, `stopped` and `stop_confident`;
+        # this is the dial set those were computed against, which is what makes
+        # them checkable rather than merely stored.
+        #
+        # HERE and not in `_run_view`, on `unread_files`' rule two keys up: ingest
+        # bounds one of these at `MAX_DIALS_CHARS` and `GET /reviews?limit=500`
+        # would serialise five hundred of them. One run's policy is a fair payload;
+        # a page of policies is a config dump.
+        #
+        # Unmasked: NULL is a round that applied no policy — every skip, every
+        # pre-flight refusal, and every round recorded before the column — and `{}`
+        # is a caller that sent an empty object.
+        "review_panel": run.review_panel,
         # #113: what this round ASKED for, kept apart from the per-seat answer in
         # `reviewers[].code_blind`. A round with the setting on and every seat
         # blind is a configuration doing nothing, and only the difference shows it.

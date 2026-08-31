@@ -167,6 +167,27 @@ class ReviewRun(Base):
     #: to be inferred from a shortfall against a denominator stored elsewhere.
     recurrence_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     premise_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: The review dials this round ran under, as the panel APPLIED them (#643) —
+    #: ``review_panel`` on the round payload, which is ``panel_seats.Dials.as_dict()``.
+    #:
+    #: **Opaque JSON, deliberately.** This board does not know what any dial means
+    #: and must not learn (``app/api/dials.py`` argues that at length; a second
+    #: place that knew what ``review_panel.max_rounds`` was is the drift #305
+    #: exists to end). It is stored so a reader can hold a round's verdict against
+    #: the policy it was computed under — which is the one check nothing could make
+    #: before, because ``converged``'s below-floor conjunct is cut at
+    #: ``cleared_floor`` and that floor lived nowhere on the row.
+    #:
+    #: Not a replacement for :attr:`converged`. A stored answer still beats a
+    #: reconstruction, and the migration for that column says why a board-side
+    #: derivation would be free to disagree with the panel about the same round.
+    #: This is the working, beside the answer.
+    #:
+    #: NULL = the panel did not say. That is every run recorded before this column,
+    #: every run whose payload predates the field, and — by design rather than by
+    #: accident — every skip and refusal path, which resolve a policy but never
+    #: apply one. ``{}`` is a caller that sent an empty object.
+    review_panel: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     changed_lines: Mapped[int | None] = mapped_column(Integer)
     #: GitHub's own count of the PR's changed files (v2.23), stored beside the
     #: rows in :class:`ReviewRunFile` rather than derived from them. When the two
