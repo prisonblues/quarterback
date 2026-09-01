@@ -294,11 +294,19 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
 #: How many 0.05s reads `_click_row` spends waiting for a pane to stop moving.
 #: The loop leaves the moment two consecutive reads agree, so on a healthy run this
 #: costs 0.1s whatever it is set to and the ceiling is paid only when something is
-#: genuinely wrong. It is a COUNT OF READS rather than a wall-clock deadline because
-#: `pilot.pause` yields to the app's event loop: under CPU contention each pause
-#: returns later, so the same 60 reads that took 3s idle can take far longer — which
-#: is #644's mechanism, and it is why the old 60 expired on a loaded box while the
-#: pane was still perfectly capable of settling.
+#: genuinely wrong.
+#:
+#: A count of READS, and stated precisely because the imprecise version is
+#: misleading: every unsuccessful read still costs a `pilot.pause(0.05)`, so this is
+#: also a wall-clock floor of 12s that STRETCHES under contention rather than a
+#: quantity independent of time. The old 60 was a 3s floor by the same arithmetic.
+#:
+#: The distinction that survives is about what is guaranteed. A real deadline
+#: (`while time.monotonic() < start + N`) expires while the app is descheduled, so a
+#: loaded box buys the pane FEWER chances to settle exactly when it needs more. A
+#: read count guarantees 240 observations however long the scheduler takes to
+#: deliver them. That is why the shape is a count and not a deadline; the 4x is what
+#: makes the count large enough to survive a box under load.
 _SETTLE_READS = int(os.environ.get("QB_DASH_SETTLE_READS", "240"))
 
 
