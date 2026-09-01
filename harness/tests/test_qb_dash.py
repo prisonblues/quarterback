@@ -244,8 +244,13 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
     # positions and handed the click whatever the new ones put there. Both were
     # seen on this suite, a few runs apart, which is the signature of a paint that
     # has not caught up rather than of anything the dashboard did.
+    # FROM y=0 ON A TABLE WITH NO HEADER. Every table here had one when this was
+    # written, so the scan started below it — and on the chip bar, which is
+    # `show_header=False` and one line tall, `range(1, 1)` is empty and the helper
+    # reported a row that was on screen and under the mouse as unreachable.
+    top = 1 if table.show_header else 0
     for _ in range(40):
-        for y in range(1, table.region.height):
+        for y in range(top, table.region.height):
             for dx in (range(table.region.width) if column is not None else (x,)):
                 meta = table.screen.get_style_at(table.region.offset.x + dx,
                                                  table.region.offset.y + y).meta
@@ -4316,3 +4321,76 @@ def test_a_changed_filter_does_redraw_the_bar():
     app.repo_filter = "lexray"
     app.render_agents()
     assert len(builds) == 2, builds
+
+
+# ---- the chip bar, against the real widget -----------------------------------
+#
+# Every test above stubs the table, and a second opinion put the cost plainly:
+# they all pass while the real widget resets its scroll on every poll, throws
+# during column reconstruction, or hands a click metadata from a rendering that
+# is gone. That was not hypothetical — switching the columns to keyed ones broke
+# a seat test the stubs could not see, because only those route `#chips` through
+# `_Sink`. These drive a pilot instead, and they are the ones that would catch it.
+
+
+async def _chip_pilot(repos, click: int | None = None):
+    """The dashboard with a fixture fleet, and optionally a real click on a chip.
+
+    THE FIXTURE IS RE-ASSERTED after the pause. The workers started at mount reach
+    the live board, and one landing here replaces the fleet under the assertion —
+    which is what made a hand-run of this print three chips once and two the next
+    time. Stubbing them out before `run_test` is not enough; they are already in
+    flight by the time the context manager yields.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues", "refresh_seats", "refresh_limits"):
+            setattr(app, name, lambda: None)
+        # AND the render the workers call back into. Stubbing the fetchers is not
+        # enough: one started at mount is already in flight by the time this line
+        # runs, and it lands as `render_board(live_data)` — which replaces the
+        # fixture fleet and redraws the bar from whatever repos the real board is
+        # busy with. This test passed alone and failed in the file for exactly
+        # that reason, which is the shape of a race rather than of a defect.
+        app.render_board = lambda *a, **k: None
+        if app.scope.on:
+            app.scope = app.scope.toggled()
+            app.build_columns()
+        app.board = _fleet(*repos)
+        app.render_agents()
+        await pilot.pause(0.2)
+        app.board = _fleet(*repos)
+        app.render_agents()
+        await pilot.pause(0.1)
+        bar = app.query_one("#chips")
+        keys = [str(c.key.value) for c in bar.ordered_columns]
+        if click is not None:
+            await _click_row_index(pilot, bar, "chips", column=click)
+            await pilot.pause(0.2)
+        return keys, bar.row_count, bar.has_class("empty"), app.repo_filter
+
+
+def test_the_real_bar_draws_a_column_per_repo_keyed_by_its_name():
+    """`add_column(name, key=name)` against the actual DataTable, which the stubs
+    cannot check: they accept any signature and return whatever they like."""
+    keys, rows, hidden, _ = asyncio.run(_chip_pilot(
+        ["quarterback", "lexray", "prisonblues/quarterback", "selfhost"]))
+    assert not hidden
+    assert rows == 1
+    assert keys == ["lexray", "quarterback", "selfhost"], keys
+
+
+def test_a_real_click_on_a_real_chip_filters_to_it():
+    """Through `ClickTable.on_click` and the cell metadata, rather than by calling
+    `dispatch_row` with a number a test chose. The click has to land on the chip
+    the compositor actually drew."""
+    _, _, _, filtered = asyncio.run(_chip_pilot(
+        ["quarterback", "lexray", "selfhost"], click=2))
+    assert filtered == "selfhost", filtered
+
+
+def test_the_real_bar_hides_itself_when_the_fleet_is_one_repo():
+    _, _, hidden, _ = asyncio.run(_chip_pilot(["quarterback", "quarterback"]))
+    assert hidden
