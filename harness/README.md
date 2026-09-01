@@ -2119,10 +2119,10 @@ would close a seat and leave the board holding its lease for the rest of a TTL.
 
 #### The dash — WORK IN PROGRESS
 
-`qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
-along the bottom (the **tape**) is the event stream. `qb-dash` is the same views rendered
-without interaction, for a box that cannot import `textual` — which is the whole of what it
-is for since #426. It is not a lesser default any more; it is the fallback.
+`qb-dash` is a fourth pane for the right-hand side: fleet state, where the board pane
+along the bottom (the **tape**) is the event stream. There was a second renderer of the same
+views without interaction, for a box that cannot import `textual`; it is gone, and
+`qb-dash-tui` is now a second name for the one that is left rather than a second thing.
 
 **TWO TABLES, because there are two questions** ([#589](https://github.com/prisonblues/quarterback/issues/589)):
 
@@ -2545,8 +2545,8 @@ setting: the repo supplies a default, the board states the value in force, and t
 that answered is part of the answer ([#305](https://github.com/prisonblues/quarterback/issues/305)).
 Until [#477](https://github.com/prisonblues/quarterback/issues/477) **no screen showed one**
 — a dial was set from an endpoint and read back by one function in `panel_seats.py`, so the
-value governing every round on the fleet was invisible on `qb-dash`, `qb-dash-tui`,
-`qb-board` and the web board alike. That was tolerable while a dial only configured what a
+value governing every round on the fleet was invisible on the dashboard, `qb-board`
+and the web board alike. That was tolerable while a dial only configured what a
 review round costs; it stops being tolerable with `tempo` (#474), which is the answer to
 *"is this fleet working right now, and how hard"*.
 
@@ -2898,25 +2898,24 @@ is the only place it can surface at all. Do not read a quiet dashboard as a uniq
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
 happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
-empty string for a screen with no dash**. The default is the clickable `qb-dash-tui`
-since #426, falling back to the plain `qb-dash` on a box where `textual` cannot be
-imported.
+empty string for a screen with no dash**. It runs `qb-dash`, and there is nothing to
+choose: one renderer, so `dash_cmd` no longer probes for one.
 
-It was the other way round for four days longer than it should have been. The plain
-one was the default because the TUI keyed its seat rows by seat NAME, every screen
-numbers its seats from 1, and a second screen anywhere on the box turned that pane
-into a `DuplicateKey` traceback — a pane you look at when something is wrong must
-not be the thing that breaks first. #208 and #209 closed that on 2026-08-20 (seat
-rows key on the tmux pane id now, which is unique box-wide) and nothing pointed back
-at the decision the fix released, so the workaround simply stayed.
+It took a while to get there. The plain renderer held this slot until #426, because
+the clickable one keyed its seat rows by seat NAME, every screen numbers its seats
+from 1, and a second screen anywhere on the box turned that pane into a `DuplicateKey`
+traceback — a pane you look at when something is wrong must not be the thing that
+breaks first. #208 and #209 closed that on 2026-08-20 (seat rows key on the tmux pane
+id now, which is unique box-wide), and nothing pointed back at the decision the fix
+released, so the workaround stayed four days longer than it should have.
 
-**The probe is now a dependency check rather than a crash check**, and the inversion
-is the point. `dash_cmd` asks `qb-dash --can-tui`, which runs the launcher's own
-interpreter search and so cannot disagree with the launch that follows — one search,
-not two that drift. `qb-dash` on PATH is still the gate: a partial install carrying
-only the TUI entry point falls to the placeholder rather than being promoted, and
-with neither installed the pane holds a shell and a line saying which command to
-set, rather than the screen quietly being one pane short.
+**The `--can-tui` probe is gone with the renderer it chose between.** It asked whether
+`textual` could be imported here, which was worth asking only while there was a lesser
+thing to fall back to. Losing it also loses the trap it carried: it resolved `qb-dash`
+on PATH a second time, so a checkout's `bin` ahead of the installed profile could have
+the probe answer for one install while a different one did the running. `qb-dash` on
+PATH is still the gate — with none installed the pane holds a shell and a line saying
+which command to set, rather than the screen quietly being one pane short.
 
 `QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
 wants before it wraps — **and never more than a third of the window**. That ceiling is
@@ -4379,8 +4378,8 @@ to the file that just ran, the name is what gets printed.
   **And it tells the board** (#262). A marker file answers the question for the pane it
   is written on, which is half of what a fleet is: cross-machine it is not there to read,
   and same-machine nothing read it. So the same call POSTs the stage to `/lease/stage`,
-  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`,
-  `qb-dash` and `qb-dash-tui` all show it — and emits one `status` post on the live stream
+  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`
+  and `qb-dash` all show it — and emits one `status` post on the live stream
   when it *changes*, so a follower hears about a transition rather than polling for it.
   `qb-stage` is the right place to say it because it is the only thing in the system that
   is *told* the stage; the lifecycle hook reading this marker on each heartbeat would need

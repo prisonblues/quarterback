@@ -210,12 +210,15 @@ def test_the_tui_pass_proves_each_named_module_actually_ran():
 def test_the_tui_pass_checks_each_named_module_separately():
     """One run over both would report `N passed` while one contributed nothing.
 
-    ``test_qb_dash.py`` is skip-guarded on textual and ``test_qb_dash_plain.py`` on rich.
+    ``test_qb_dash.py`` is skip-guarded on textual and ``test_qb_dials_surface.py`` on rich.
     Collected together, either one skipping in full is invisible: the other's passes
     satisfy the grep.
     """
     body = _harness_steps()[TUI_STEP]
-    assert re.search(r"for\s+\w+\s+in\s+harness/\S+\.py\s+harness/\S+\.py", body), (
+    # `[\s\\]` and not `\s`: the list is long enough to wrap, and a backslash-newline
+    # between two suites still names them separately. Matching only literal whitespace
+    # made this red for a reflow that changed nothing about what the step runs.
+    assert re.search(r"for\s+\w+\s+in\s+harness/\S+\.py[\s\\]+harness/\S+\.py", body), (
         "the tui pass no longer iterates its modules one at a time. Both dashboard "
         "modules in a single pytest run means one of them can skip entirely and the "
         "`N passed` guard still passes on the other one's tests."

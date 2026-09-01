@@ -711,7 +711,7 @@ def test_a_wrapprogram_wrapper_is_compared_against_the_file_it_wraps(tmp_path):
     it. The honest comparison is against `.qb-dash-wrapped`, which is the script."""
     src, installed = tmp_path / "src", tmp_path / "installed"
     src.mkdir(), installed.mkdir()
-    body = 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n'
+    body = 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n'
     (src / "qb-dash").write_text(f"#!/bin/sh\n{body}")
     _wrapper(installed, "qb-dash", body)
 
@@ -725,8 +725,8 @@ def test_a_stale_wrapped_script_is_still_reported_through_its_wrapper(tmp_path):
     goes stale like any other, and the whole row exists to say so."""
     src, installed = tmp_path / "src", tmp_path / "installed"
     src.mkdir(), installed.mkdir()
-    (src / "qb-dash").write_text('#!/bin/sh\nexec "$QB_DASH_PYTHON" qb-dash.py --new "$@"\n')
-    _wrapper(installed, "qb-dash", 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n')
+    (src / "qb-dash").write_text('#!/bin/sh\nexec "$QB_DASH_PYTHON" qb-dash-tui.py --new "$@"\n')
+    _wrapper(installed, "qb-dash", 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n')
 
     differ, _ = qd._harness_drift(src, installed)
     assert differ == {"qb-dash"}
@@ -776,7 +776,7 @@ def test_an_install_that_matches_through_both_artefacts_is_ok_and_still_sees_abs
     installed.mkdir(parents=True)
     (src / "qb-thing").write_text("#!/bin/sh\nexec qb \"$@\"\n")
     (installed / "qb-thing").write_text(f"{STORE_SHEBANG}\nexec qb \"$@\"\n")
-    body = 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n'
+    body = 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n'
     (src / "qb-dash").write_text(f"#!/bin/sh\n{body}")
     _wrapper(installed, "qb-dash", body)
 

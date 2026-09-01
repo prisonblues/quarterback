@@ -2866,24 +2866,19 @@ def test_killing_a_named_screen_needs_no_repo(screen):
 DASH_STUB = "printf dash-stub; sleep 300"
 
 
-def dash_stubs(tmp_path, *names, can_tui=True, dir=None):
+def dash_stubs(tmp_path, *names, dir=None):
     """A bin directory holding a stub for each name, each printing its own marker.
 
     Every other dash test pins QB_SEATS_DASH to a command, which says nothing about
-    how an UNSET one resolves — the PATH probe, its preference order, and the
-    placeholder when neither binary is there had no coverage at all. These stubs are
+    how an UNSET one resolves — the PATH lookup, which name it reaches for, and the
+    placeholder when the binary is not there had no coverage at all. These stubs are
     what let that be asserted without consulting the machine the suite runs on.
 
-    `--can-tui` IS ANSWERED BEFORE THE MARKER, and the order is the point: since
-    #426 `dash_cmd` probes with `qb-dash --can-tui`, and a stub that ignored its
-    arguments would print its marker and then `sleep 300` — hanging the resolution
-    rather than answering it, in a helper whose whole job is to answer without
-    consulting the machine. `can_tui=False` is how a box with rich but no textual
-    is simulated, which is the fallback path and cannot otherwise be reached here.
+    THE MARKER CARRIES THE ARGUMENTS, because the name alone has not said which
+    renderer was asked for since the review of #426 made them one binary and a flag.
+    There is one renderer now and `dash_cmd` passes no flag at all, so what the
+    arguments pin is that it passes NOTHING — see the test below.
 
-    THE MARKER CARRIES THE ARGUMENTS, because since the review of #426 the two
-    renderers are one binary and a flag — `qb-dash --tui` rather than a separate
-    `qb-dash-tui` — so the name alone no longer says which one was asked for.
     `dir=` puts the stubs somewhere other than the default, which is how a PATH
     carrying two half-installs is built.
     """
@@ -2893,7 +2888,6 @@ def dash_stubs(tmp_path, *names, can_tui=True, dir=None):
         stub = d / name
         stub.write_text(
             "#!/bin/sh\n"
-            f'[ "$1" = --can-tui ] && exit {0 if can_tui else 1}\n'
             f'printf "{name}-ran $*"\nexec sleep 300\n')
         stub.chmod(0o755)
     return d
@@ -2906,12 +2900,10 @@ def test_a_dash_pane_is_built_by_default(screen, tmp_path):
     Unset, not empty: this is the resolution path, so QB_SEATS_DASH is removed from
     the environment rather than set to a stub.
 
-    BOTH renderers are stubbed and the PATH carries no real dash, which this test
-    did not need until #426. It prepended one stub to the machine's own PATH, and
-    that was safe only while `dash_cmd` consulted nothing else — the flip made it
-    look for `qb-dash-tui` too, the installed one answered from further down the
-    real PATH, and the pane ran the machine's dashboard against the live board.
-    A resolution test that reaches the host it runs on is not testing resolution.
+    BOTH names are stubbed and the PATH carries no real dash. `dash_cmd` reaches for
+    only one of them now, but a resolution test that can fall through to the host it
+    runs on is not testing resolution — it ran the machine's own dashboard against
+    the live board once already, when #426 made this look for a second name.
     """
     del screen.env["QB_SEATS_DASH"]
     bindir = dash_stubs(tmp_path, "qb-dash", "qb-dash-tui")
@@ -2919,67 +2911,47 @@ def test_a_dash_pane_is_built_by_default(screen, tmp_path):
     screen("-n", "2")
     dash = pane_id(screen, "dash")
     assert dash, "no pane labelled 'dash'"
-    # Which renderer is a different test's question; this one is only that the
-    # pane exists and something ran in it.
+    # WHICH name ran is the next test's question; this one is only that the pane
+    # exists and something came up in it.
     assert "-ran" in wait_for_pane(screen, dash, "-ran")
 
 
-def test_the_default_dash_is_the_tui_when_textual_is_there(screen, tmp_path):
-    """The clickable renderer is the default since #426.
+def test_the_dash_pane_runs_qb_dash_with_no_flag(screen, tmp_path):
+    """One renderer, so `dash_cmd` names it and says nothing else.
 
-    It was `qb-dash` under a comment saying the plain one was not better and should
-    give up the slot "the moment #209 is fixed": the TUI keyed its seat rows by seat
-    NAME, every screen numbers its seats from 1, and a second screen anywhere on the
-    box turned this pane into a Textual DuplicateKey traceback. #209 and #208 closed
-    on 2026-08-20 — seat rows key on the tmux pane id now — and the workaround then
-    outlived its bug by four days because nothing pointed back at this decision.
+    It emitted `qb-dash --tui` from #426 until the plain renderer was retired, and
+    before #426 a bare `qb-dash` that meant the OTHER one. A stale `--tui` would
+    still work — the launcher accepts and ignores it — which is exactly why this is
+    pinned on the arguments: the flag surviving here would be invisible in use and
+    would keep alive the idea that there is something to choose.
 
-    Both installed, so this pins the PREFERENCE ORDER rather than availability.
-
-    Asserted on the FLAG rather than on the binary: the review of #426 collapsed
-    the launch onto the same `qb-dash` the probe ran, so what says "the clickable
-    one" is `--tui` and not a second name.
+    Both names installed, so this pins WHICH ONE is reached for rather than what
+    happened to be available.
     """
     del screen.env["QB_SEATS_DASH"]
     bindir = dash_stubs(tmp_path, "qb-dash", "qb-dash-tui")
-    screen.env["PATH"] = f"{bindir}:{screen.env['PATH']}"
-    screen("-n", "1")
-    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
-    assert "qb-dash-ran --tui" in seen, seen
-
-
-def test_without_textual_the_default_falls_back_to_the_plain_dash(screen, tmp_path):
-    """A box with rich but no textual gets the plain renderer, not an error pane.
-
-    This is the half of #426 that keeps the plain dash alive: a checkout whose
-    mcp/.venv was built without the `tui` extra is not a broken install, and the
-    probe is a DEPENDENCY check rather than the crash check it replaced. Simulated
-    by a `qb-dash` stub that answers `--can-tui` with 1, which is exactly what the
-    real launcher does when no interpreter on the box can import textual.
-    """
-    del screen.env["QB_SEATS_DASH"]
-    bindir = dash_stubs(tmp_path, "qb-dash", "qb-dash-tui", can_tui=False)
-    screen.env["PATH"] = f"{bindir}:{screen.env['PATH']}"
+    screen.env["PATH"] = f"{bindir}:{path_with_no_dash_on_it(tmp_path, screen)}"
     screen("-n", "1")
     seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
     assert "qb-dash-ran" in seen, seen
-    assert "--tui" not in seen, "the TUI ran without textual to run it on"
+    assert "--tui" not in seen, "dash_cmd still passes a flag with nothing to select"
+    assert "qb-dash-tui-ran" not in seen, "dash_cmd reached for the alias, not qb-dash"
 
 
-def test_the_install_that_answers_the_probe_is_the_install_that_runs(screen, tmp_path):
-    """One resolution, not two — the defect a review of #426 caught before it landed.
+def test_only_qb_dash_is_resolved_and_the_alias_is_never_reached_for(screen, tmp_path):
+    """One name, not two — the defect a review of #426 caught before it landed.
 
     `dash_cmd` asked `qb-dash --can-tui` and then launched `qb-dash-tui`, resolving
-    the name a second time. That is not the same question twice: `qb-dash-tui` is a
+    a name a second time. That is not the same question twice: `qb-dash-tui` is a
     name rather than an implementation and execs the `qb-dash` BESIDE IT, ignoring
     PATH entirely. So a box carrying the two entry points in two directories — a
     checkout's bin ahead of the installed profile, which the comment above
-    `dash_cmd` calls the normal case — probed one install and ran another, and the
-    yes it acted on was about neither the interpreter nor the renderer that came up.
+    `dash_cmd` calls the normal case — probed one install and ran another.
 
-    Built here as the skew it actually is: a `qb-dash` that says yes in the first
-    directory, a `qb-dash-tui` from some other install further down. Nothing from
-    the second may run.
+    The probe is gone with the renderer it chose between, and this is what stops it
+    coming back by the side door. Built as the skew it actually is: a `qb-dash` in
+    the first directory, a `qb-dash-tui` from some other install further down.
+    Nothing from the second may run.
     """
     del screen.env["QB_SEATS_DASH"]
     first = dash_stubs(tmp_path, "qb-dash", dir="checkout-bin")
@@ -2988,59 +2960,21 @@ def test_the_install_that_answers_the_probe_is_the_install_that_runs(screen, tmp
         f"{first}:{second}:{path_with_no_dash_on_it(tmp_path, screen)}"
     screen("-n", "1")
     seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
-    assert "qb-dash-ran --tui" in seen, seen
-    assert "qb-dash-tui-ran" not in seen, \
-        "the probe answered for one install and the launch ran another"
-
-
-def test_a_qb_dash_too_old_to_know_the_probe_falls_back_instead_of_hanging(screen,
-                                                                            tmp_path):
-    """The upgrade window, which is the one case the probe could have made worse.
-
-    `dash_cmd` runs `qb-dash --can-tui` SYNCHRONOUSLY while building the screen. A
-    `qb-dash` predating #426 does not know the flag: it passes it through to the
-    renderer, argparse rejects it as an unrecognized argument and it exits 2. That
-    is the answer we want — anything nonzero means "not the TUI" — and the screen
-    comes up on the plain renderer until the harness is rebuilt.
-
-    Pinned because the failure it rules out is silent and expensive: an older
-    `qb-dash` that treated the flag as no flag at all would START THE DASHBOARD
-    here, and `dash_cmd` would block until somebody killed it — a seat screen that
-    never finishes building, from a probe added to improve it. Exit 2 with a usage
-    message on stderr is exactly what the shipped one does, so that is what the
-    stub does.
-    """
-    del screen.env["QB_SEATS_DASH"]
-    bindir = tmp_path / "oldbin"
-    bindir.mkdir(parents=True, exist_ok=True)
-    old = bindir / "qb-dash"
-    old.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = --can-tui ]; then\n'
-        '  echo "qb-dash: error: unrecognized arguments: --can-tui" >&2\n'
-        "  exit 2\n"
-        "fi\n"
-        "printf qb-dash-ran\nexec sleep 300\n")
-    old.chmod(0o755)
-    tui = bindir / "qb-dash-tui"
-    tui.write_text("#!/bin/sh\nprintf qb-dash-tui-ran\nexec sleep 300\n")
-    tui.chmod(0o755)
-
-    screen.env["PATH"] = f"{bindir}:{path_with_no_dash_on_it(tmp_path, screen)}"
-    assert screen("-n", "1").returncode == 0
-    seen = wait_for_pane(screen, pane_id(screen, "dash"), "qb-dash-ran")
     assert "qb-dash-ran" in seen, seen
-    assert "qb-dash-tui-ran" not in seen, "an old qb-dash was read as a yes"
+    assert "qb-dash-tui-ran" not in seen, \
+        "dash_cmd resolved a second name from a different install"
 
 
 def test_the_tui_alone_on_path_is_still_not_promoted(screen, tmp_path):
     """`qb-dash` on PATH stays the gate, and that survives #426's flip.
 
     A partial install carrying only the TUI entry point falls to the placeholder
-    rather than being promoted. The old reason was that the TUI crashed; the
-    surviving reason is narrower and still good — a half-installed harness should
-    say so rather than improvise, and the probe itself is `qb-dash --can-tui`, so
-    without `qb-dash` there is nothing to ask.
+    rather than being promoted. The reasons keep being replaced and the behaviour
+    keeps being right: first that the TUI crashed, then that the probe was spelt
+    `qb-dash --can-tui` and had nothing to ask without it. Both are gone. What is
+    left is the plain one — a half-installed harness should say so rather than
+    improvise — and the placeholder NAMES the entry point that is present, which
+    is the whole reason this is a message and not a shrug.
     """
     del screen.env["QB_SEATS_DASH"]
     only_tui = dash_stubs(tmp_path / "tui-only", "qb-dash-tui")
